@@ -39,11 +39,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    parallel_state,
     tensor_model_parallel_all_reduce,
-)
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -78,8 +74,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -88,6 +84,7 @@ from sglang.srt.layers.quantization import CompressedTensorsConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
     CompressedTensorsWNA16AMXEPMoEMethod,
+    CompressedTensorsWNA16MoEMethod,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -115,6 +112,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.single_batch_overlap import SboFlags
@@ -311,14 +309,6 @@ def _get_sum_extend_prefix_lens(forward_batch):
     )
 
 
-def _is_extend_without_speculative(forward_batch):
-    return (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
-    )
-
-
 def _support_mha_one_shot(attn: DeepseekV2AttentionMLA, forward_batch, backend_name):
     attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
     sum_seq_lens = (
@@ -337,7 +327,7 @@ def _handle_attention_backend(
 
     if (
         not disable_ragged
-        and _is_extend_without_speculative(forward_batch)
+        and forward_batch.forward_mode.is_extend_without_speculative()
         and (
             (
                 sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
@@ -380,7 +370,7 @@ def handle_attention_fa4(attn, forward_batch):
 
 def handle_attention_trtllm_mla(attn, forward_batch):
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    if _is_extend_without_speculative(forward_batch) and (
+    if forward_batch.forward_mode.is_extend_without_speculative() and (
         not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
     ):
         return AttnForwardMethod.MHA_CHUNKED_KV
@@ -389,7 +379,7 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 
 
 def handle_attention_aiter(attn, forward_batch):
-    if _is_extend_without_speculative(forward_batch):
+    if forward_batch.forward_mode.is_extend_without_speculative():
         if is_dp_attention_enabled():
             if sum(forward_batch.extend_prefix_lens_cpu) == 0:
                 return AttnForwardMethod.MHA
@@ -402,6 +392,37 @@ def handle_attention_aiter(attn, forward_batch):
 
 
 def handle_attention_nsa(attn, forward_batch):
+    """
+    Select MHA or MLA based on sequence length for optimal performance.
+
+    - Decode: MLA (avoids per-token decompression)
+    - Prefill <= 2048: MHA (topk ineffective, MHA has lower FLOPs)
+    - Prefill > 2048: MLA (topk filtering reduces computation significantly)
+
+    TODO: B200 (SM100) MHA path is temporarily disabled due to FA4 gpqa accuracy issues.
+    """
+    if forward_batch.forward_mode.is_decode_or_idle():
+        return AttnForwardMethod.MLA
+
+    if forward_batch.forward_mode.is_extend_without_speculative():
+        assert forward_batch.seq_lens_cpu is not None
+        max_kv_len = forward_batch.seq_lens_cpu.max().item()
+
+        # MHA path enabled for both H200 (SM90, FA3) and B200 (SM100, TRTLLm ragged)
+        # B200 uses trtllm_ragged_attention_deepseek kernel instead of FA4
+        supports_mha = _device_sm in [90, 100]
+
+        # Check if kvcache dtype is bfloat16
+        kv_dtype_is_bf16 = forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+
+        if max_kv_len <= attn.indexer.index_topk and supports_mha and kv_dtype_is_bf16:
+            # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
+            # Check if total sequence length fits in chunk capacity
+            sum_seq_lens = sum(forward_batch.seq_lens_cpu)
+            # Use MHA_ONE_SHOT for best performance
+            if sum_seq_lens <= forward_batch.get_max_chunk_capacity():
+                return AttnForwardMethod.MHA_ONE_SHOT
+
     return AttnForwardMethod.MLA
 
 
@@ -411,7 +432,7 @@ def handle_attention_triton(attn, forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     if (
-        _is_extend_without_speculative(forward_batch)
+        forward_batch.forward_mode.is_extend_without_speculative()
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         return AttnForwardMethod.MHA
@@ -484,7 +505,8 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            x,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
         return x
 
@@ -507,7 +529,7 @@ class MoEGate(nn.Module):
                 torch.bfloat16
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
-                and should_use_flashinfer_trtllm_moe()
+                and get_moe_runner_backend().is_flashinfer_trtllm()
                 else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
@@ -751,21 +773,20 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
-            if isinstance(
-                self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
-            ):
-                topk_output.topk_weights.mul_(self.routed_scaling_factor)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda:
+            if (
+                not _is_cuda
+                or isinstance(
+                    self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
+                )
+                or isinstance(
+                    self.experts.quant_method, CompressedTensorsWNA16MoEMethod
+                )
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-            final_hidden_states_out = torch.empty_like(final_hidden_states)
-
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
-        sm.tag(final_hidden_states)
+        final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -820,15 +841,18 @@ class DeepseekV2MoE(nn.Module):
                 else {}
             ),
         )
-        if not _is_cuda and not _use_aiter:
+        if (
+            not _is_cuda
+            and not _use_aiter
+            or isinstance(
+                self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
+            )
+            or isinstance(self.experts.quant_method, CompressedTensorsWNA16MoEMethod)
+        ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
-            sm.tag(final_hidden_states)
+            final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -897,7 +921,9 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:
@@ -1478,8 +1504,21 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q_lora = self.q_a_layernorm(q)
+            q = self.q_b_proj(q_lora)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+
+            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+            if self.use_nsa:
+                _ = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                    return_indices=False,
+                )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -3467,6 +3506,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
+                use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
@@ -3534,8 +3574,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
+                    maybe_executor_submit(
+                        executor=executor,
+                        futures=futures,
+                        use_async=use_async_loading,
+                        func=weight_loader,
+                        func_args=(param, loaded_weight, shard_id),
                     )
                     break
                 else:
@@ -3546,15 +3590,20 @@ class DeepseekV2ForCausalLM(nn.Module):
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        futures.append(
-                            executor.submit(
-                                weight_loader,
+                        maybe_executor_submit(
+                            executor=executor,
+                            futures=futures,
+                            use_async=use_async_loading,
+                            func=weight_loader,
+                            func_args=(
                                 param,
                                 loaded_weight,
                                 name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
+                            ),
+                            func_kwargs={
+                                "shard_id": shard_id,
+                                "expert_id": expert_id,
+                            },
                         )
                         break
                     else:
@@ -3614,8 +3663,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                futures.append(
-                                    executor.submit(weight_loader, param, fused_weight)
+                                maybe_executor_submit(
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(param, fused_weight),
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
@@ -3661,8 +3714,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                futures.append(
-                                    executor.submit(weight_loader, param, fused_weight)
+                                maybe_executor_submit(
+                                    executor,
+                                    futures,
+                                    use_async_loading,
+                                    weight_loader,
+                                    param,
+                                    fused_weight,
                                 )
                                 cached_wk_and_weights_proj.pop(wk_name)
                                 cached_wk_and_weights_proj.pop(weights_proj_name)
@@ -3687,8 +3745,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            futures.append(
-                                executor.submit(weight_loader, param, loaded_weight)
+                            maybe_executor_submit(
+                                executor=executor,
+                                futures=futures,
+                                use_async=use_async_loading,
+                                func=weight_loader,
+                                func_args=(param, loaded_weight),
                             )
 
             # Wait for all tasks to complete and raise any exceptions.

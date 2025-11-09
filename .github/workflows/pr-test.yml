@@ -301,7 +301,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -322,7 +322,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 13
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
   unit-test-backend-2-gpu:
     needs: [check-changes, sgl-kernel-build-wheels]
@@ -821,7 +821,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
   unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, sgl-kernel-build-wheels-arm]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-gb200
@@ -841,7 +841,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 45

@@ -84,6 +84,7 @@ subtle = "2.6"
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
 openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
+openmetrics-parser = "0.4.4"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
@@ -127,6 +128,13 @@ opt-level = "z"     # Optimize for size
 lto = "fat"         # Full LTO for smaller binaries
 codegen-units = 1   # Better optimization, slower compile
 strip = true        # Strip debug symbols
+
+[profile.ci]
+inherits = "release"
+opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
+lto = "thin"        # Thin LTO - good balance
+codegen-units = 16  # More parallelization for faster builds
+strip = true
 
 [profile.dev]
 opt-level = 0

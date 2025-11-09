@@ -31,6 +31,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs import (
     FalconH1Config,
+    JetNemotronConfig,
     KimiLinearConfig,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -56,7 +57,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
-    set_symm_mem_all_reduce,
+    set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -608,7 +609,7 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
-        set_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
         if not self.is_draft_worker:
             if self.device == "cpu":
@@ -862,6 +863,7 @@ class ModelRunner:
         model_path: str,
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
+        recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -916,6 +918,9 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+        if recapture_cuda_graph and self.device == "cuda":
+            self.init_device_graphs()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -1370,7 +1375,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
             return config
         return None
 
