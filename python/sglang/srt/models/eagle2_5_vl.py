@@ -120,7 +120,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         )
 
         # Logits processor
-        self.logits_processor = LogitsProcessor(self.config)
+        self.logits_processor = LogitsProcessor(self.config.text_config)
 
         # MLP connector (matches Eagle2.5 architecture)
         vit_hidden_size = config.vision_config.hidden_size
