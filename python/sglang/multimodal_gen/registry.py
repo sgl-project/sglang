@@ -200,7 +200,6 @@ def _register_models():
         sampling_param_cls=HunyuanSamplingParams,
         pipeline_config_cls=HunyuanConfig,
         model_path_to_name_mappings={
-            "FastVideo/FastHunyuan-diffusers": "hunyuan",
             "hunyuanvideo-community/HunyuanVideo": "hunyuan",
         },
         model_name_detectors=[("hunyuan", lambda id: "hunyuan" in id.lower())],
