@@ -361,9 +361,7 @@ class PiecewiseCudaGraphRunner:
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
-                out_cache_loc=torch.zeros(
-                    (num_tokens,), device=self.device, dtype=self._cache_loc_dtype()
-                ),
+                out_cache_loc=out_cache_loc,
                 seq_lens_sum=num_tokens,
                 encoder_lens=None,
                 return_logprob=False,
