@@ -770,29 +770,12 @@ class DecodeTransferQueue:
 
                 indices_to_remove.add(i)
                 decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
-
-                decode_req.req.check_finished()
-                if decode_req.req.finished():
-                    # finish immediately
-                    decode_req.req.time_stats.forward_entry_time = (
-                        decode_req.req.time_stats.completion_time
-                    ) = time.perf_counter()
-                    self.scheduler.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
-                    self.tree_cache.cache_finished_req(decode_req.req)
-                    trace_slice_end(
-                        RequestStage.DECODE_QUICK_FINISH,
-                        decode_req.req.rid,
-                        thread_finish_flag=True,
-                    )
-                else:
-                    transferred_reqs.append(decode_req.req)
-                    trace_slice_end(
-                        RequestStage.DECODE_TRANSFERRED,
-                        decode_req.req.rid,
-                        auto_next_anon=True,
-                    )
+                transferred_reqs.append(decode_req.req)
+                trace_slice_end(
+                    RequestStage.DECODE_TRANSFERRED,
+                    decode_req.req.rid,
+                    auto_next_anon=True,
+                )
 
             elif poll in [
                 KVPoll.Bootstrapping,
