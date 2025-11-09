@@ -59,23 +59,24 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
     def test_bench_one_batch(self):
         failed_variants = []
 
-        for variant_config in self.variants:
-            with self.subTest(variant=variant_config["name"]):
-                results, success = self.runner.run_benchmark_for_model(
-                    model_path=self.model,
-                    batch_sizes=self.batch_sizes,
-                    input_lens=self.input_lens,
-                    output_lens=self.output_lens,
-                    other_args=variant_config["other_args"],
-                    variant=variant_config["name"],
-                )
+        try:
+            for variant_config in self.variants:
+                with self.subTest(variant=variant_config["name"]):
+                    results, success = self.runner.run_benchmark_for_model(
+                        model_path=self.model,
+                        batch_sizes=self.batch_sizes,
+                        input_lens=self.input_lens,
+                        output_lens=self.output_lens,
+                        other_args=variant_config["other_args"],
+                        variant=variant_config["name"],
+                    )
 
-                if not success:
-                    failed_variants.append(variant_config["name"])
+                    if not success:
+                        failed_variants.append(variant_config["name"])
 
-                self.runner.add_report(results)
-
-        self.runner.write_final_report()
+                    self.runner.add_report(results)
+        finally:
+            self.runner.write_final_report()
 
         if failed_variants:
             raise AssertionError(
