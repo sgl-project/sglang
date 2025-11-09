@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
-from aiter.utility.fp4_utils import e8m0_shuffle
 from aiter.ops.shuffle import shuffle_weight
+from aiter.utility.fp4_utils import e8m0_shuffle
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
