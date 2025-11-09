@@ -31,6 +31,7 @@ from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.server_utils import validate_parser_model_compatibility
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -579,7 +580,12 @@ class ServerArgs:
         self._handle_deprecated_args()
 
         # Validate parser-model compatibility.
-        self._validate_parser_model_compatibility()
+        validate_parser_model_compatibility(
+            self.tool_call_parser,
+            self.reasoning_parser,
+            self.model_path,
+            self.get_hf_config,
+        )
 
         # Set missing default values.
         self._handle_missing_default_values()
@@ -660,108 +666,6 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
-
-    def _validate_parser_model_compatibility(self):
-        """Validate that parser selections are compatible with the loaded model."""
-        # Skip validation if both parsers are None
-        if self.tool_call_parser is None and self.reasoning_parser is None:
-            return
-
-        # Define parser-to-model mappings
-        # Each entry maps parser name patterns to expected model name patterns
-        parser_model_map = {
-            "qwen": ["qwen"],
-            "qwen25": ["qwen"],
-            "qwen3": ["qwen"],
-            "qwen3_coder": ["qwen"],
-            "gpt-oss": ["gpt-oss", "gpt_oss"],
-            "deepseek": ["deepseek"],
-            "deepseekv3": ["deepseek"],
-            "deepseekv31": ["deepseek"],
-            "glm": ["glm", "chatglm"],
-            "glm45": ["glm", "chatglm"],
-            "kimi": ["kimi", "moonshot"],
-            "kimi_k2": ["kimi", "moonshot"],
-            "mistral": ["mistral"],
-            "llama3": ["llama"],
-            "pythonic": [],  # Generic parser, no specific model
-            "step3": ["step"],
-            "minimax": ["minimax"],
-        }
-
-        # Reverse mapping: suggest parsers based on detected model type
-        model_parser_suggestions = {
-            "qwen": "qwen",
-            "gpt-oss": "gpt-oss",
-            "gpt_oss": "gpt-oss",
-            "deepseek": "deepseek",
-            "glm": "glm",
-            "chatglm": "glm",
-            "kimi": "kimi",
-            "moonshot": "kimi",
-            "mistral": "mistral",
-            "llama": "llama3",
-            "step": "step3",
-            "minimax": "minimax",
-        }
-
-        # Try to get model information
-        model_path_lower = self.model_path.lower()
-        model_type = None
-
-        try:
-            hf_config = self.get_hf_config()
-            if hasattr(hf_config, "model_type"):
-                model_type = hf_config.model_type.lower()
-        except Exception:
-            # If we can't load the config, just use the model path
-            pass
-
-        def check_parser_compatibility(parser_name: str, parser_type: str):
-            """Check if a parser is compatible with the model."""
-            if parser_name is None:
-                return
-
-            parser_lower = parser_name.lower()
-            expected_model_patterns = parser_model_map.get(parser_lower, [])
-
-            # Skip validation for generic parsers
-            if not expected_model_patterns:
-                return
-
-            # Check if model matches any expected pattern
-            is_compatible = False
-            for pattern in expected_model_patterns:
-                if pattern in model_path_lower or (
-                    model_type and pattern in model_type
-                ):
-                    is_compatible = True
-                    break
-
-            if not is_compatible:
-                # Try to suggest a better parser
-                suggested_parser = None
-                for model_pattern, suggested in model_parser_suggestions.items():
-                    if model_pattern in model_path_lower or (
-                        model_type and model_pattern in model_type
-                    ):
-                        suggested_parser = suggested
-                        break
-
-                suggestion_text = (
-                    f" Consider using '{suggested_parser}' parser instead."
-                    if suggested_parser
-                    else ""
-                )
-
-                logger.warning(
-                    f"{parser_type} '{parser_name}' may not be compatible with "
-                    f"model '{self.model_path}'.{suggestion_text}"
-                )
-
-        # Validate both parsers
-        check_parser_compatibility(self.tool_call_parser, "tool_call_parser")
-        check_parser_compatibility(self.reasoning_parser, "reasoning_parser")
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
