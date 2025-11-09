@@ -719,9 +719,7 @@ class WanTransformer3DModel(CachableDiT):
         else:
             encoder_hidden_states_image = None
 
-        # print(f"731 {hidden_states.shape=}")
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
-
         p_t, p_h, p_w = self.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
@@ -745,10 +743,8 @@ class WanTransformer3DModel(CachableDiT):
         )
 
         hidden_states = self.patch_embedding(hidden_states)
-        # print(f"756 {hidden_states.shape=}")
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
-        # print(f"757 {hidden_states.shape=}")
-        # print(f"757 {timestep.shape=}")
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
             # ti2v

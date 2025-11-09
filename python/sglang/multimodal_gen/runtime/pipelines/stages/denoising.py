@@ -670,6 +670,75 @@ class DenoisingStage(PipelineStage):
         assert current_model is not None, "The model for the current step is not set."
         return current_model, current_guidance_scale
 
+    def expand_timestep_before_forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        t_device,
+        target_dtype,
+        seq_len,
+        reserved_frames_mask,
+    ):
+        bsz = batch.raw_latent_shape[0]
+        # expand timestep
+        if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
+            # Explicitly cast t_device to the target float type at the beginning.
+            # This ensures any precision-based rounding (e.g., float32(999.0) -> bfloat16(1000.0))
+            # is applied consistently *before* it's used by any rank.
+            t_device_rounded = t_device.to(target_dtype)
+
+            local_seq_len = seq_len
+            if get_sp_world_size() > 1 and getattr(
+                batch, "did_sp_shard_latents", False
+            ):
+                local_seq_len = seq_len // get_sp_world_size()
+
+            if get_sp_parallel_rank() == 0 and reserved_frames_mask is not None:
+                # Rank 0 has the first frame, create a special timestep tensor
+                # NOTE: The spatial downsampling in the next line is suspicious but kept
+                # to match original model's potential training configuration.
+                temp_ts = (
+                    reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded
+                ).flatten()
+
+                # Pad to full local sequence length
+                temp_ts = torch.cat(
+                    [
+                        temp_ts,
+                        temp_ts.new_ones(local_seq_len - temp_ts.size(0))
+                        * t_device_rounded,
+                    ]
+                )
+                timestep = temp_ts.unsqueeze(0).repeat(bsz, 1)
+            else:
+                # Other ranks get a uniform timestep tensor of the correct shape [B, local_seq_len]
+                timestep = t_device.repeat(bsz, local_seq_len)
+        else:
+            timestep = t_device.repeat(bsz)
+        return timestep
+
+    def post_forward_for_ti2v_task(
+        self, batch: Req, server_args: ServerArgs, reserved_frames_mask, latents, z
+    ):
+        """
+        For Wan2.2 ti2v task, global first frame should be replaced with encoded image after each timestep
+        """
+        if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
+            # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
+            # This ensures the first frame is always the condition image after each step.
+            # This is only applied on rank 0, where z is not None.
+            if z is not None and reserved_frames_mask is not None:
+                # z: [1, C, 1, H, W]
+                # latents: [1, C, T_local, H, W]
+                # reserved_frames_mask: [C, T_local, H, W]
+                # Unsqueeze mask to [1, C, T_local, H, W] for broadcasting.
+                # z will broadcast along the time dimension.
+                latents = (
+                    1.0 - reserved_frames_mask.unsqueeze(0)
+                ) * z + reserved_frames_mask.unsqueeze(0) * latents
+
+        return latents
+
     @torch.no_grad()
     def forward(
         self,
@@ -751,51 +820,14 @@ class DenoisingStage(PipelineStage):
                             [latent_model_input, batch.image_latent], dim=1
                         ).to(target_dtype)
 
-                    # expand timestep
-                    if (
-                        server_args.pipeline_config.ti2v_task
-                        and batch.pil_image is not None
-                    ):
-                        # Explicitly cast t_device to the target float type at the beginning.
-                        # This ensures any precision-based rounding (e.g., float32(999.0) -> bfloat16(1000.0))
-                        # is applied consistently *before* it's used by any rank.
-                        t_device_rounded = t_device.to(target_dtype)
-
-                        local_seq_len = seq_len
-                        if get_sp_world_size() > 1 and getattr(
-                            batch, "did_sp_shard_latents", False
-                        ):
-                            local_seq_len = seq_len // get_sp_world_size()
-
-                        if (
-                            get_sp_parallel_rank() == 0
-                            and reserved_frames_mask is not None
-                        ):
-                            # Rank 0 has the first frame, create a special timestep tensor
-                            # NOTE: The spatial downsampling in the next line is suspicious but kept
-                            # to match original model's potential training configuration.
-                            temp_ts = (
-                                reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded
-                            ).flatten()
-
-                            # Pad to full local sequence length
-                            temp_ts = torch.cat(
-                                [
-                                    temp_ts,
-                                    temp_ts.new_ones(local_seq_len - temp_ts.size(0))
-                                    * t_device_rounded,
-                                ]
-                            )
-                            timestep = temp_ts.unsqueeze(0).repeat(
-                                latent_model_input.shape[0], 1
-                            )
-                        else:
-                            # Other ranks get a uniform timestep tensor of the correct shape [B, local_seq_len]
-                            timestep = t_device.repeat(
-                                latent_model_input.shape[0], local_seq_len
-                            )
-                    else:
-                        timestep = t_device.repeat(latent_model_input.shape[0])
+                    timestep = self.expand_timestep_before_forward(
+                        batch,
+                        server_args,
+                        t_device,
+                        target_dtype,
+                        seq_len,
+                        reserved_frames_mask,
+                    )
 
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t_device
@@ -830,22 +862,10 @@ class DenoisingStage(PipelineStage):
                         **extra_step_kwargs,
                         return_dict=False,
                     )[0]
-                    if (
-                        server_args.pipeline_config.ti2v_task
-                        and batch.pil_image is not None
-                    ):
-                        # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
-                        # This ensures the first frame is always the condition image after each step.
-                        # This is only applied on rank 0, where z is not None.
-                        if z is not None and reserved_frames_mask is not None:
-                            # z: [1, C, 1, H, W]
-                            # latents: [1, C, T_local, H, W]
-                            # reserved_frames_mask: [C, T_local, H, W]
-                            # Unsqueeze mask to [1, C, T_local, H, W] for broadcasting.
-                            # z will broadcast along the time dimension.
-                            latents = (
-                                1.0 - reserved_frames_mask.unsqueeze(0)
-                            ) * z + reserved_frames_mask.unsqueeze(0) * latents
+
+                    latents = self.post_forward_for_ti2v_task(
+                        batch, server_args, reserved_frames_mask, latents, z
+                    )
 
                     # save trajectory latents if needed
                     if batch.return_trajectory_latents:
