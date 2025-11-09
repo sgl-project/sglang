@@ -86,7 +86,8 @@ class EagleVisionHead(nn.Module):
         self.act = QuickGELU()
 
         # Probe component (matches probe parameter)
-        self.probe = nn.Parameter(torch.randn(config.hidden_size))
+        # Checkpoint has shape [1, 1, hidden_size], so initialize accordingly
+        self.probe = nn.Parameter(torch.randn(1, 1, config.hidden_size))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Layer norm
@@ -109,8 +110,8 @@ class EagleVisionHead(nn.Module):
         mlp_output = self.act(mlp_output)
         mlp_output = self.mlp.fc2(mlp_output)
 
-        # Add probe
-        output = mlp_output + self.probe.unsqueeze(0).unsqueeze(0)
+        # Add probe (already has batch/seq dimensions)
+        output = mlp_output + self.probe
 
         return output
 
