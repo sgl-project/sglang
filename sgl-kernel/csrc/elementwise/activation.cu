@@ -85,7 +85,9 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
 void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
 #if USE_ROCM
@@ -94,7 +96,6 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     sgl_hip::activation::act_and_mul_kernel<c_type, silu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
@@ -120,7 +121,9 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
 #if USE_ROCM
@@ -129,7 +132,6 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     sgl_hip::activation::act_and_mul_kernel<c_type, gelu_tanh>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
@@ -157,7 +159,9 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
 void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
 #if USE_ROCM
@@ -166,7 +170,6 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     sgl_hip::activation::act_and_mul_kernel<c_type, gelu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
