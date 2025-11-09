@@ -9,11 +9,13 @@ from sglang.test.test_utils import CustomTestCase
 class TestServedModelNameValidation(CustomTestCase):
     def test_served_model_name_with_colon_raises_error(self):
         """Test that served_model_name containing a colon raises an AssertionError."""
+        server_args = ServerArgs(
+            model_path="meta-llama/Meta-Llama-3.1-8B-Instruct",
+            served_model_name="my-model:adapter",
+        )
+
         with self.assertRaises(AssertionError) as context:
-            ServerArgs(
-                model_path="meta-llama/Meta-Llama-3.1-8B-Instruct",
-                served_model_name="my-model:adapter",
-            )
+            server_args.check_server_args()
 
         self.assertIn(
             "served_model_name cannot contain a colon", str(context.exception)
@@ -27,6 +29,8 @@ class TestServedModelNameValidation(CustomTestCase):
             served_model_name="my-custom-model-name",
         )
         self.assertEqual(server_args.served_model_name, "my-custom-model-name")
+        # Should not raise when check_server_args is called
+        server_args.check_server_args()
 
 
 class TestPrepareServerArgs(CustomTestCase):
