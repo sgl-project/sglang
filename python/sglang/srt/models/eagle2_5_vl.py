@@ -95,6 +95,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             config.vision_config,
             quant_config,
             prefix=add_prefix("vision_model", prefix),
+            use_eagle_head=True,  # Enable Eagle2.5 vision head
         )
 
         # Language model
