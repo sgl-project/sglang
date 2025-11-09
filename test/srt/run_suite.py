@@ -180,7 +180,6 @@ suites = {
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
-        TestFile("test_flashinfer_trtllm_gen_moe_backend.py", 300),
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
@@ -220,6 +219,7 @@ suites = {
         TestFile("test_deepseek_v3_deterministic.py", 240),
     ],
     "nightly-4-gpu-b200": [
+        TestFile("test_flashinfer_trtllm_gen_moe_backend.py", 300),
         TestFile("test_fp4_moe.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
     ],
