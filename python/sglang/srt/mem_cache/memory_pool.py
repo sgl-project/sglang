@@ -339,6 +339,7 @@ class MambaPool:
             :, src_index
         ]
         if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+            # For radix cache: last_steps is required to be copied because it is used to calculate the correct conv state and ssm state in the spec decoding kernel
             self.mamba_cache.last_steps[dst_index] = self.mamba_cache.last_steps[
                 src_index
             ]
