@@ -12,6 +12,9 @@ from sglang.test.test_utils import (
 
 
 class TestDisaggregationDPAttention(TestDisaggregationBase):
+    PREFILL_DP_SIZE = 4
+    DECODE_DP_SIZE = 4
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -37,9 +40,9 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            str(cls.PREFILL_DP_SIZE),
             "--dp",
-            "2",
+            str(cls.PREFILL_DP_SIZE),
             "--enable-dp-attention",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
@@ -57,12 +60,12 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            str(cls.DECODE_DP_SIZE),
             "--dp",
-            "2",
+            str(cls.DECODE_DP_SIZE),
             "--enable-dp-attention",
             "--base-gpu-id",
-            "2",
+            str(cls.PREFILL_DP_SIZE),
             "--prefill-round-robin-balance",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
@@ -77,7 +80,7 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1400,
             max_new_tokens=512,
             parallel=128,
             host=f"http://{self.base_host}",

@@ -158,7 +158,6 @@ suites = {
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 291),
-        TestFile("test_disaggregation_dp_attention.py", 155),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
@@ -168,6 +167,7 @@ suites = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
+        TestFile("test_disaggregation_dp_attention.py", 155),
         TestFile("models/test_kimi_k2_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
