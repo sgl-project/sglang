@@ -1685,7 +1685,7 @@ class CustomTestCase(unittest.TestCase):
         )
 
     def setUp(self):
-        print(f"[Test Method] {self._testMethodName}", flush=True)
+        print(f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}")
 
 
 def dump_bench_raw_result(
