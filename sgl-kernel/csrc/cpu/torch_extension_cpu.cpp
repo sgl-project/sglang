@@ -237,8 +237,8 @@ std::string init_cpu_threads_env(const std::string& cpu_ids);
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
     const at::Tensor& dt_bias,
-    at::Tensor& q,
-    at::Tensor& k,
+    const at::Tensor& q,
+    const at::Tensor& k,
     const at::Tensor& v,
     const at::Tensor& a,
     const at::Tensor& b,

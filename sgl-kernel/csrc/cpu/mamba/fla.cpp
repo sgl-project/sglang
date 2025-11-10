@@ -25,8 +25,8 @@ inline at::vec::Vectorized<float> softplus(const at::vec::Vectorized<float>& x, 
 
 template <typename scalar_t>
 void fused_sigmoid_gating_delta_rule_update_kernel_impl(
-    scalar_t* __restrict__ q_ptr,
-    scalar_t* __restrict__ k_ptr,
+    const scalar_t* __restrict__ q_ptr,
+    const scalar_t* __restrict__ k_ptr,
     const scalar_t* __restrict__ v_ptr,
     const float* __restrict__ A_log_ptr,
     const scalar_t* __restrict__ a_ptr,
@@ -235,8 +235,8 @@ void fused_gdn_gating_kernel_impl(
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
     const at::Tensor& dt_bias,
-    at::Tensor& q,
-    at::Tensor& k,
+    const at::Tensor& q,
+    const at::Tensor& k,
     const at::Tensor& v,
     const at::Tensor& a,
     const at::Tensor& b,
