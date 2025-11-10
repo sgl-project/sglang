@@ -75,18 +75,12 @@ class CommonKVManager(BaseKVManager):
             self.server_socket.setsockopt(zmq.IPV6, 1)
         self.request_status: Dict[int, KVPoll] = {}
 
-        if self.disaggregation_mode in [
-            DisaggregationMode.PREFILL,
-            DisaggregationMode.ENCODE,
-        ]:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._register_to_bootstrap()
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
             self.pp_group = get_pp_group()
-        elif self.disaggregation_mode in [
-            DisaggregationMode.DECODE,
-            DisaggregationMode.LANGUAGE,
-        ]:
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
