@@ -228,6 +228,8 @@ class SnapKVPress(ScorerPress):
         if attentions is not None:
             attn_weights = attentions[..., -self.window_size :, : -self.window_size]
         else:
+            if kwargs is None or "position_embeddings" not in kwargs:
+                raise ValueError("`position_embeddings` must be provided in kwargs when `attentions` is not available.")
             attn_weights = self.compute_window_attention(
                 module,
                 hidden_states,
