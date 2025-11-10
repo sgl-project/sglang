@@ -35,7 +35,6 @@ def set_forward_context(
     forward_batch: ForwardBatch, attention_layers: List[Any], quant_config: Any
 ):
     global _forward_context
-    prev_forward_context = _forward_context
     _forward_context = ForwardContext()
     _forward_context.set_forward_batch(forward_batch)
     _forward_context.set_attention_layers(attention_layers)
@@ -43,4 +42,4 @@ def set_forward_context(
     try:
         yield
     finally:
-        _forward_context = prev_forward_context
+        _forward_context = None

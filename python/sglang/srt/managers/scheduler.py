@@ -113,7 +113,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_embedding_cache
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -827,7 +827,7 @@ class Scheduler(
         )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
-        init_embedding_cache(embedding_cache_size * 1024 * 1024)
+        init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -1963,6 +1963,10 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
 
+        # Place holder handling for pd-disagg decode event loop
+        if batch.forward_mode.is_prebuilt():
+            return self._run_batch_prebuilt(batch)
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -2093,10 +2097,10 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
-
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-
+        elif batch.forward_mode.is_prebuilt():
+            self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 if result.copy_done is not None:
@@ -2439,15 +2443,13 @@ class Scheduler(
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    if hasattr(decode_req.kv_receiver, "abort"):
-                        decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    if hasattr(decode_req.kv_receiver, "abort"):
-                        decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver.abort()
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
