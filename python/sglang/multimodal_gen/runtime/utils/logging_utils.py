@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import warnings
+from contextlib import contextmanager
 from functools import lru_cache, partial
 from logging import Logger
 from types import MethodType
@@ -376,7 +377,38 @@ def configure_logger(server_args, prefix: str = ""):
     set_uvicorn_logging_configs()
 
 
-def suppress_other_loggers():
+@contextmanager
+def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
+    """
+    A context manager to temporarily suppress specified loggers.
+
+    Args:
+        not_suppress_on_main_rank (bool): If True, loggers will not be
+            suppressed on the main process (rank 0).
+    """
+    # This is a global setting that we want to apply to all ranks
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
+
+    should_suppress = True
+    if not_suppress_on_main_rank:
+        rank, _ = _get_rank_info()
+        if rank == 0:
+            should_suppress = False
+
+    loggers_to_suppress = ["urllib3"]
+    original_levels = {}
+
+    if should_suppress:
+        for logger_name in loggers_to_suppress:
+            logger = logging.getLogger(logger_name)
+            original_levels[logger_name] = logger.level
+            logger.setLevel(logging.WARNING)
+
+    try:
+        yield
+    finally:
+        if should_suppress:
+            for logger_name, level in original_levels.items():
+                logging.getLogger(logger_name).setLevel(level)
