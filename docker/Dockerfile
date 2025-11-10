@@ -142,7 +142,7 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 RUN set -eux; \
     if [ "${CUDA_VERSION%%.*}" != "13" ]; then \
-      pip install nvidia-nvshmem-cu12==3.4.5 \
+      pip install nvidia-nvshmem-cu12==3.4.5 ; \
     fi && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
