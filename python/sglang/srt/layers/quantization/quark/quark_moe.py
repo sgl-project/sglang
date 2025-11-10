@@ -13,7 +13,7 @@ from aiter.utility.fp4_utils import e8m0_shuffle
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_shuffle_moe = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
 
 __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 
@@ -168,9 +169,14 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         # layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
         layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
-        # Pre-suffle weight
-        layer.w13_weight.data = shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
-        layer.w2_weight.data = shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
+        # Pre-shuffle weight
+        if _is_shuffle_moe:
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight.contiguous(), (16, 16)
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.contiguous(), (16, 16)
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
