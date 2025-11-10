@@ -51,11 +51,13 @@ jobs:
         with:
           filters: |
             main_package:
-              - added|modified|deleted|renamed: "python/**"
-              - added|modified|deleted|renamed: "!python/sglang/multimodal_gen/**"
-              - added|modified|deleted|renamed: "scripts/ci/**"
-              - added|modified|deleted|renamed: "test/**"
-              - added|modified|deleted|renamed: ".github/workflows/pr-test.yml"
+              pattern:
+                - "python/**"
+                - "scripts/ci/**"
+                - "test/**"
+                - ".github/workflows/pr-test.yml"
+              ignore:
+                - "python/sglang/multimodal_gen/**"
             sgl_kernel:
               - "sgl-kernel/**"
             multimodal_gen:
