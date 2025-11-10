@@ -8,6 +8,7 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.linear import UnquantizedLinearMethod
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -20,6 +21,11 @@ from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
+
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEType
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
+
+if TYPE_CHECKING:
     from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -288,122 +294,96 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.CUTLASS, moe_runner_config)
 
     def apply(
         self,
         layer: Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        topk_weights, topk_ids, _ = topk_output
-
-        output = cutlass_w4a8_moe(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_weights,
-            topk_ids,
-            self.a_strides1,
-            self.b_strides1,
-            self.c_strides1,
-            self.a_strides2,
-            self.b_strides2,
-            self.c_strides2,
-            self.s_strides13,
-            self.s_strides2,
-            self.expert_offsets,
-            self.problem_sizes1,
-            self.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
-        )
-        if self.moe_runner_config.routed_scaling_factor is not None:
-            output *= self.moe_runner_config.routed_scaling_factor
-        return StandardCombineInput(hidden_states=output)
+        if self.runner.runner_backend.is_cutlass():
+            quant_info = CutlassMoeQuantInfo(
+                moe_type=CutlassMoEType.W4A8,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                expert_offsets=self.expert_offsets,
+                problem_sizes1=self.problem_sizes1,
+                problem_sizes2=self.problem_sizes2,
+                a_strides1=self.a_strides1,
+                b_strides1=self.b_strides1,
+                c_strides1=self.c_strides1,
+                a_strides2=self.a_strides2,
+                b_strides2=self.b_strides2,
+                c_strides2=self.c_strides2,
+                s_strides13=self.s_strides13,
+                s_strides2=self.s_strides2,
+                w13_input_scale=layer.w13_input_scale,
+                w2_input_scale=layer.w2_input_scale,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
     def apply_deepep_ll(
         self,
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
-
-        hidden_states, _, topk_ids, _, masked_m, _ = dispatch_output
-
-        output = cutlass_w4a8_moe_deepep_ll(
-            hidden_states,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_ids,
-            masked_m,
-            layer.quant_method.a_strides1,
-            layer.quant_method.b_strides1,
-            layer.quant_method.c_strides1,
-            layer.quant_method.a_strides2,
-            layer.quant_method.b_strides2,
-            layer.quant_method.c_strides2,
-            layer.quant_method.s_strides13,
-            layer.quant_method.s_strides2,
-            layer.quant_method.expert_offsets,
-            layer.quant_method.problem_sizes1,
-            layer.quant_method.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
+        quant_info = CutlassMoeQuantInfo(
+            moe_type=CutlassMoEType.W4A8,
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            expert_offsets=self.expert_offsets,
+            problem_sizes1=self.problem_sizes1,
+            problem_sizes2=self.problem_sizes2,
+            a_strides1=self.a_strides1,
+            b_strides1=self.b_strides1,
+            c_strides1=self.c_strides1,
+            a_strides2=self.a_strides2,
+            b_strides2=self.b_strides2,
+            c_strides2=self.c_strides2,
+            s_strides13=self.s_strides13,
+            s_strides2=self.s_strides2,
+            w13_input_scale=layer.w13_input_scale,
+            w2_input_scale=layer.w2_input_scale,
         )
-
-        return output
+        combine_input = self.runner.run(dispatch_output, quant_info)
+        return combine_input.hidden_states
 
     def apply_deepep_normal(
         self,
         layer: DeepEPMoE,
         dispatch_output: DeepEPNormalDispatchOutput,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
-            cutlass_w4a8_moe_deepep_normal,
-        )
-
-        hidden_states, topk_idx, topk_weights = (
-            dispatch_output.hidden_states,
-            dispatch_output.topk_ids,
-            dispatch_output.topk_weights,
-        )
+        hidden_states = dispatch_output.hidden_states
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
 
         num_tokens = hidden_states.shape[0]
-        if num_tokens > 0:
-            return cutlass_w4a8_moe_deepep_normal(
-                hidden_states,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-                topk_weights,
-                topk_idx,
-                self.a_strides1,
-                self.b_strides1,
-                self.c_strides1,
-                self.a_strides2,
-                self.b_strides2,
-                self.c_strides2,
-                self.s_strides13,
-                self.s_strides2,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                layer.w13_input_scale,
-                layer.w2_input_scale,
-            )
-        else:
+        if num_tokens == 0:
             return hidden_states
+
+        quant_info = CutlassMoeQuantInfo(
+            moe_type=CutlassMoEType.W4A8,
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            expert_offsets=self.expert_offsets,
+            problem_sizes1=self.problem_sizes1,
+            problem_sizes2=self.problem_sizes2,
+            a_strides1=self.a_strides1,
+            b_strides1=self.b_strides1,
+            c_strides1=self.c_strides1,
+            a_strides2=self.a_strides2,
+            b_strides2=self.b_strides2,
+            c_strides2=self.c_strides2,
+            s_strides13=self.s_strides13,
+            s_strides2=self.s_strides2,
+            w13_input_scale=layer.w13_input_scale,
+            w2_input_scale=layer.w2_input_scale,
+        )
+        combine_input = self.runner.run(dispatch_output, quant_info)
+        return combine_input.hidden_states
