@@ -998,6 +998,8 @@ class SchedulerOutputProcessorMixin:
 
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
+                    rids=rids,
+                    http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
                     queue_time=queue_times,
@@ -1029,8 +1031,6 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
-                    rids=rids,
-                    http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
@@ -1083,6 +1083,8 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
+                rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
                 queue_time=queue_times,
                 forward_entry_time=forward_entry_times,
                 prefill_delay=prefill_delays,
@@ -1091,10 +1093,8 @@ class SchedulerOutputProcessorMixin:
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
-                http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
-                rids=rids,
             )
         )
