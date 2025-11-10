@@ -20,6 +20,7 @@ The radix tree data structure for managing the hybrid (full and SWA) KV cache.
 """
 
 import heapq
+import time
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -336,6 +337,7 @@ class SWARadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         is_eagle: bool = False,
+        enable_metrics: bool = False,
     ):
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
@@ -360,6 +362,9 @@ class SWARadixCache(BasePrefixCache):
             self.key_convert_fn = _convert_to_bigram_key
         else:
             self.key_convert_fn = lambda key: key
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         self.sliding_window_size = sliding_window_size
         self.reset()
@@ -589,7 +594,7 @@ class SWARadixCache(BasePrefixCache):
     def evict(self, full_num_tokens: int, swa_num_tokens: int = 0) -> None:
         if self.disable:
             return
-
+        start_time = time.perf_counter()
         full_num_evicted = 0
         swa_num_evicted = 0
         if full_num_tokens > 0:
@@ -668,6 +673,16 @@ class SWARadixCache(BasePrefixCache):
                     self._iteratively_delete_tombstone_leaf(x)
 
                 x = x_next
+
+        if (
+            full_num_evicted > 0 or swa_num_evicted > 0
+        ) and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(
+                full_num_evicted + swa_num_evicted
+            )
 
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
