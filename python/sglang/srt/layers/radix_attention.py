@@ -81,6 +81,7 @@ class RadixAttention(nn.Module):
         self.k_scale_float = None
         self.v_scale_float = None
         self.quant_method = None
+
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if self.quant_method is not None:

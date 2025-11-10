@@ -1640,8 +1640,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
-    # TODO rename later (currently use diff name to avoid confusion)
-    def set_index_k_and_scale_buffer(
+    def set_index_k_scale_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
