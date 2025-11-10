@@ -20,13 +20,13 @@ if TYPE_CHECKING:
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
-    def prepare_for_prebuilt_extend(self: ScheduleBatch):
+    def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
         Adapted from .prepare_for_extend().
         """
 
-        self.forward_mode = ForwardMode.EXTEND
+        self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
@@ -100,7 +100,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
-    def process_prebuilt_extend(
+    def process_prebuilt(
         self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
     ):
         """Assign the buffered last input id to schedule batch"""

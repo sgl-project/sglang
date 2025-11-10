@@ -690,7 +690,7 @@ class WanTransformer3DModel(CachableDiT):
         d = self.hidden_size // self.num_attention_heads
         self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
 
-        self.rope = NDRotaryEmbedding(
+        self.rotary_emb = NDRotaryEmbedding(
             rope_dim_list=self.rope_dim_list,
             rope_theta=10000,
             dtype=torch.float32 if current_platform.is_mps() else torch.float64,
@@ -725,7 +725,8 @@ class WanTransformer3DModel(CachableDiT):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        freqs_cos, freqs_sin = self.rope.forward_from_grid(
+        # The rotary embedding layer correctly handles SP offsets internally.
+        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
             (
                 post_patch_num_frames * self.sp_size,
                 post_patch_height,
@@ -746,6 +747,7 @@ class WanTransformer3DModel(CachableDiT):
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
+            # ti2v
             ts_seq_len = timestep.shape[1]
             timestep = timestep.flatten()  # batch_size * seq_len
         else:
