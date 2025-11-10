@@ -65,50 +65,40 @@ impl HAServerHandler {
     pub async fn graceful_shutdown(&self) -> Result<()> {
         log::info!("Starting graceful shutdown for node {}", self.self_name);
 
-        // 1. Update self status to LEAVING
-        let mut state = self.state.write();
-        if let Some(self_node) = state.get_mut(&self.self_name) {
-            if self_node.status == NodeStatus::Leaving as i32 {
-                log::info!("Node {} is already in LEAVING state", self.self_name);
-                drop(state);
+        let (leaving_node, alive_nodes) = {
+            let state = self.state.read();
+
+            let mut self_node = if let Some(self_node) = state.get(&self.self_name) {
+                self_node.clone()
+            } else {
+                self.signal_tx.send(()).ok();
+                return Ok(());
+            };
+
+            if self_node.status != NodeStatus::Leaving as i32 {
+                self_node.status = NodeStatus::Leaving as i32;
+                self_node.version += 1;
+
+                let alive_nodes = state
+                    .values()
+                    .filter(|node| {
+                        node.status == NodeStatus::Alive as i32 // include self
+                    })
+                    .cloned()
+                    .collect::<Vec<NodeState>>();
+                (self_node.clone(), alive_nodes)
+            } else {
                 self.signal_tx.send(()).ok();
                 return Ok(());
             }
-
-            self_node.status = NodeStatus::Leaving as i32;
-            self_node.version += 1;
-            log::info!(
-                "Updated self status to LEAVING, version: {}",
-                self_node.version
-            );
-        } else {
-            log::warn!("Self node {} not found in state", self.self_name);
-            drop(state);
-            self.signal_tx.send(()).ok();
-            return Ok(());
-        }
-
-        // 2. Create LEAVING state update for broadcasting
-        let leaving_node = state.get(&self.self_name).cloned().unwrap();
-        let alive_nodes: Vec<NodeState> = state
-            .values()
-            .filter(|node| node.name != self.self_name && node.status == NodeStatus::Alive as i32)
-            .cloned()
-            .collect();
-        drop(state);
-
-        if alive_nodes.is_empty() {
-            log::info!("No alive nodes to broadcast LEAVING status to");
-            self.signal_tx.send(()).ok();
-            return Ok(());
-        }
+        };
 
         log::info!(
             "Broadcasting LEAVING status to {} alive nodes",
             alive_nodes.len()
         );
 
-        // 3. Broadcast LEAVING status to all alive nodes
+        // Broadcast LEAVING status to all alive nodes
         let (success_count, total_count) = broadcast_node_states(
             vec![leaving_node],
             alive_nodes,
@@ -122,7 +112,7 @@ impl HAServerHandler {
             total_count
         );
 
-        // 4. Wait a bit more for state propagation
+        // Wait a bit more for state propagation
         let propagation_delay = Duration::from_secs(1);
         log::info!(
             "Waiting {} seconds for LEAVING status propagation",
@@ -130,10 +120,8 @@ impl HAServerHandler {
         );
         tokio::time::sleep(propagation_delay).await;
 
-        // 5. Send shutdown signal
         log::info!("Sending shutdown signal");
         self.signal_tx.send(()).ok();
-
         Ok(())
     }
 
