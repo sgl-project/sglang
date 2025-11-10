@@ -28,7 +28,7 @@ Updates sgl-kernel version across all relevant files following the pattern from 
 
 **Usage:**
 ```bash
-python scripts/release/bump_kernel_version.py 0.3.12
+python scripts/release/bump_kernel_version.py 0.3.15
 ```
 
 **Files updated:**
@@ -89,6 +89,6 @@ python scripts/release/bump_kernel_version.py 0.3.12
 ## Version Format Validation
 
 - **SGLang versions:** `X.Y.Z` or `X.Y.ZrcN` (e.g., `0.5.3` or `0.5.3rc0`)
-- **Kernel versions:** `X.Y.Z` (e.g., `0.3.12`)
+- **Kernel versions:** `X.Y.Z` (e.g., `0.3.15`)
 
 The scripts will validate the version format and exit with an error if invalid.
