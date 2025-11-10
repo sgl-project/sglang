@@ -85,13 +85,14 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        
+
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Fully Connected
