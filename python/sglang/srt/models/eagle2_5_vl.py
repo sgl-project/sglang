@@ -27,7 +27,7 @@ from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3 import Qwen3Model
+from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix
 
@@ -99,7 +99,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         )
 
         # Language model
-        self.language_model = Qwen3Model(
+        self.language_model = Qwen2Model(
             config=config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
@@ -122,42 +122,104 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         # Logits processor
         self.logits_processor = LogitsProcessor(self.config.text_config)
 
-        # MLP connector (matches Eagle2.5 architecture)
+        # MLP connector (matches Eagle2.5 architecture from NVIDIA)
         vit_hidden_size = config.vision_config.hidden_size
         llm_hidden_size = config.text_config.hidden_size
 
-        # Hardcode mlp1 dimensions to match Eagle2.5 checkpoint exactly
-        # Based on checkpoint parameters: mlp1.0, mlp1.1, mlp1.3
-        self.mlp1 = nn.Sequential(
-            nn.LayerNorm(4608),  # mlp1.0 - matches checkpoint dimensions
-            nn.Linear(4608, 3584),  # mlp1.1 - matches checkpoint dimensions
-            nn.GELU(),
-            nn.Linear(3584, 3584),  # mlp1.3 - matches checkpoint dimensions
-        )
+        # Build MLP connector based on configuration
+        # Note: use_pixel_shuffle determines if we need to handle pixel-shuffled dimensions
+        if config.mlp_connector_layers == 2:
+            # Two-layer MLP with layer norm
+            # When pixel_shuffle is used, input dim = vit_hidden_size * (1/downsample_ratio)^2
+            input_dim = vit_hidden_size * int(1 / config.downsample_ratio) ** 2
+            self.mlp1 = nn.Sequential(
+                nn.LayerNorm(input_dim),
+                nn.Linear(input_dim, llm_hidden_size),
+                nn.GELU(),
+                nn.Linear(llm_hidden_size, llm_hidden_size),
+            )
+        elif config.mlp_connector_layers == 1 and config.use_pixel_shuffle:
+            # Single-layer MLP with pixel shuffle
+            input_dim = vit_hidden_size * int(1 / config.downsample_ratio) ** 2
+            self.mlp1 = nn.Sequential(
+                nn.Linear(input_dim, llm_hidden_size),
+            )
+        elif config.mlp_connector_layers == 1 and not config.use_pixel_shuffle:
+            # Single-layer MLP without pixel shuffle
+            self.mlp1 = nn.Sequential(
+                nn.Linear(vit_hidden_size, llm_hidden_size),
+            )
+        else:
+            raise NotImplementedError(
+                f"{config.mlp_connector_layers} layers is not implemented."
+            )
 
         # Special tokens
         self.image_token_index = config.image_token_index
+
+    def pixel_shuffle(self, x, scale_factor=0.5):
+        """Pixel shuffle operation for downsampling vision features."""
+        # Reshape to spatial grid
+        h = w = int(x.shape[1] ** 0.5)
+        x = x.reshape(x.shape[0], h, w, -1)
+
+        # Pixel shuffle
+        n, w, h, c = x.size()
+        # N, W, H, C --> N, W, H * scale, C // scale
+        x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+        # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
+        x = x.permute(0, 2, 1, 3).contiguous()
+        # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
+        x = x.view(
+            n,
+            int(h * scale_factor),
+            int(w * scale_factor),
+            int(c / (scale_factor * scale_factor)),
+        )
+
+        x = x.permute(0, 2, 1, 3).contiguous()
+
+        # Reshape back to sequence
+        x = x.reshape(x.shape[0], -1, x.shape[-1])
+        return x
+
+    def feature_compression(self, vit_embeds):
+        """Compress vision features using pixel shuffle and MLP."""
+        if self.config.use_pixel_shuffle:
+            vit_embeds = self.pixel_shuffle(
+                vit_embeds, scale_factor=self.config.downsample_ratio
+            )
+        vit_embeds = self.mlp1(vit_embeds)
+        return vit_embeds
+
+    def extract_feature(self, pixel_values):
+        """Extract and compress vision features."""
+        if self.config.select_layer == -1:
+            vit_embeds = self.vision_model(pixel_values=pixel_values)
+        else:
+            # For select_layer != -1, we need to get hidden states
+            # This requires the vision model to output hidden states
+            vit_embeds = self.vision_model(pixel_values=pixel_values)
+            # Note: In NVIDIA's implementation, they access hidden_states[select_layer]
+            # For now, we use the last hidden state as the base implementation
+
+        vit_embeds = self.feature_compression(vit_embeds)
+        return vit_embeds
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Extract image features using SigLIP vision model with MLP connector."""
         # Concatenate all image features
         pixel_values = torch.cat([item.feature for item in items], dim=0)
-        # SigLIP doesn't use grid_thw, it processes images directly
-        image_embeds = self.vision_model(pixel_values)
-
-        # Apply MLP connector (matches Eagle2.5 architecture)
-        image_embeds = self.mlp1(image_embeds)
+        # Extract and compress features
+        image_embeds = self.extract_feature(pixel_values)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Extract video features using SigLIP vision model with MLP connector."""
         # Concatenate all video frame features
         pixel_values = torch.cat([item.feature for item in items], dim=0)
-        # SigLIP doesn't use grid_thw, treat video frames like images
-        video_embeds = self.vision_model(pixel_values)
-
-        # Apply MLP connector (matches Eagle2.5 architecture)
-        video_embeds = self.mlp1(video_embeds)
+        # Extract and compress features
+        video_embeds = self.extract_feature(pixel_values)
         return video_embeds
 
     @property

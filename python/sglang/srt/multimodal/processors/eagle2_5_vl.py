@@ -113,8 +113,8 @@ class Eagle2_5_VLProcessor(SGLangBaseProcessor):
             model_path, trust_remote_code=True, **kwargs
         )
 
-        # Eagle2.5 specific attributes
-        self.image_token_index = 151669  # From config
+        # Eagle2.5 specific attributes (NVIDIA's default is 151667)
+        self.image_token_index = 151667  # From config
         self.downsample_ratio = 0.5
         self.dynamic_image_size = True
         self.force_image_size = 224

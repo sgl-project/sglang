@@ -56,9 +56,9 @@ class SiglipVisionEmbeddings(nn.Module):
         return embeddings
 
 
-# Eagle2.5 Vision Head (matches checkpoint parameters)
-class EagleVisionHead(nn.Module):
-    """Vision head for Eagle2.5 model matching checkpoint parameter structure."""
+# Eagle2.5 Vision Head - matches NVIDIA's SiglipMultiheadAttentionPoolingHead
+class SiglipMultiheadAttentionPoolingHead(nn.Module):
+    """Multihead Attention Pooling for Eagle2.5."""
 
     def __init__(
         self,
@@ -67,57 +67,29 @@ class EagleVisionHead(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.hidden_size = config.hidden_size
-
-        # Layer norm (matches layernorm.weight)
-        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-        # Attention components with direct attributes for correct parameter names
-        # Match checkpoint dimensions: in_proj has (3 * hidden_size) out_features
-        self.attention = nn.Module()
-        self.attention.in_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size)
-        self.attention.proj = nn.Linear(config.hidden_size, config.hidden_size)
-
-        # MLP components with direct attributes
-        self.mlp = nn.Module()
-        self.mlp.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.mlp.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
-
-        # Activation for MLP
-        self.act = QuickGELU()
-
-        # Probe component (matches probe parameter)
-        # Checkpoint has shape [1, 1, hidden_size], so initialize accordingly
         self.probe = nn.Parameter(torch.randn(1, 1, config.hidden_size))
+        self.attention = nn.MultiheadAttention(
+            config.hidden_size, config.num_attention_heads, batch_first=True
+        )
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.mlp = SiglipMLP(
+            config,
+            act_layer=QuickGELU,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Layer norm
-        hidden_states = self.layernorm(hidden_states)
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        batch_size = hidden_state.shape[0]
+        probe = self.probe.repeat(batch_size, 1, 1)
 
-        # Self-attention with separate projections
-        # QKV projection (checkpoint has 4 * hidden_size, take first 3 for QKV)
-        qkv_proj = self.attention.in_proj(hidden_states)
-        qkv = qkv_proj[
-            :, :, : 3 * self.hidden_size
-        ]  # Take first 3*hidden_size dimensions
-        q, k, v = qkv.chunk(3, dim=-1)
+        hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
 
-        # Simple self-attention (no masking for vision)
-        # For vision head, use simplified attention - just pass through v
-        attn_output = v
+        residual = hidden_state
+        hidden_state = self.layernorm(hidden_state)
+        hidden_state = residual + self.mlp(hidden_state)
 
-        # Output projection
-        attn_output = self.attention.proj(attn_output)
-
-        # MLP
-        mlp_output = self.mlp.fc1(attn_output)
-        mlp_output = self.act(mlp_output)
-        mlp_output = self.mlp.fc2(mlp_output)
-
-        # Add probe (already has batch/seq dimensions)
-        output = mlp_output + self.probe
-
-        return output
+        return hidden_state[:, 0]
 
 
 # Copied from sglang.srt.models.clip.CLIPMLP
@@ -311,10 +283,10 @@ class SiglipVisionTransformer(nn.Module):
         # VisionAttention in SiglipEncoderLayer is multihead attention
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
-        # Optional Eagle2.5 head
+        # Eagle2.5 multihead attention pooling head (always present for Eagle2.5)
         self.use_eagle_head = use_eagle_head
         if use_eagle_head:
-            self.head = EagleVisionHead(
+            self.head = SiglipMultiheadAttentionPoolingHead(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("head", prefix),
