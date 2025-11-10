@@ -24,33 +24,11 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 DraftWorkerClass = Callable[..., Any]
 DraftWorkerFactory = Callable[..., Any]
 
-<<<<<<< HEAD
-class SpeculativeAlgorithm(IntEnum):
-    NONE = auto()
-    EAGLE = auto()
-    EAGLE3 = auto()
-    STANDALONE = auto()
-    NGRAM = auto()
-    SIMPLE_EAGLE = auto()
-=======
->>>>>>> main
 
 class _SpeculativeAlgorithmMeta(type):
     def __iter__(cls) -> Iterator["SpeculativeAlgorithm"]:
         return iter(cls._registration_order)
 
-<<<<<<< HEAD
-    def is_eagle(self):
-        return self in [
-            SpeculativeAlgorithm.EAGLE,
-            SpeculativeAlgorithm.EAGLE3,
-            SpeculativeAlgorithm.SIMPLE_EAGLE,
-        ]
-
-    def is_simple_eagle(self):
-        return self == SpeculativeAlgorithm.SIMPLE_EAGLE
-=======
->>>>>>> main
 
 class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     """Registry-backed representation of speculative decoding algorithms."""
@@ -63,22 +41,6 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     _flags: DefaultDict[str, Set[int]] = defaultdict(set)
     _next_value: int = 0
 
-<<<<<<< HEAD
-    @lru_cache(maxsize=None)
-    @staticmethod
-    def from_string(name: str):
-        name_map = {
-            "EAGLE": SpeculativeAlgorithm.EAGLE,
-            "EAGLE3": SpeculativeAlgorithm.EAGLE3,
-            "SIMPLE_EAGLE": SpeculativeAlgorithm.SIMPLE_EAGLE,
-            "STANDALONE": SpeculativeAlgorithm.STANDALONE,
-            "NGRAM": SpeculativeAlgorithm.NGRAM,
-            None: SpeculativeAlgorithm.NONE,
-        }
-        if name is not None:
-            name = name.upper()
-        return name_map[name]
-=======
     def __init__(
         self,
         name: str,
@@ -366,7 +328,6 @@ register_speculative_algorithm(
     worker_cls=_create_ngram_worker,
     flags=("NGRAM",),
 )
->>>>>>> main
 
 
 class SpecInputType(IntEnum):

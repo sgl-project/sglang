@@ -488,10 +488,6 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             # self.init_device_graphs()
-<<<<<<< HEAD
-=======
-            # NOTE: hard code, we init target model cuda graphs in simple_eagle
->>>>>>> main
             if self.spec_algorithm.is_simple_eagle():
                 self.graph_runner = None
                 self.graph_mem_usage = 0
