@@ -44,7 +44,7 @@ def test_main(
         args.hidden,
         min(num_nodes, 4),
         args.num_topk,
-        args.num_experts,
+        (args.num_experts // num_ranks) * num_ranks,
     )
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
