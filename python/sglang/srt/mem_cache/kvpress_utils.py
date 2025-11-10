@@ -7,20 +7,10 @@
 
 
 import logging
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Generator
 
 import torch
 from torch import nn
-from transformers import (
-    LlamaForCausalLM,
-    MistralForCausalLM,
-    Phi3ForCausalLM,
-    PreTrainedModel,
-    QuantizedCache,
-    Qwen2ForCausalLM,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +59,6 @@ class BasePress:
 
         raise NotImplementedError("compress method must be implemented in subclass")
 
-    
 
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -96,7 +85,9 @@ class ScorerPress(BasePress):
     compression_ratio: float = 0.0
 
     def __post_init__(self):
-        assert 0 <= self.compression_ratio < 1, "Compression ratio must be between 0 and 1"
+        assert (
+            0 <= self.compression_ratio < 1
+        ), "Compression ratio must be between 0 and 1"
 
     def score(
         self,
@@ -140,7 +131,7 @@ class ScorerPress(BasePress):
         values = values.gather(2, indices).contiguous()
 
         return keys, values
-    
+
 
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -168,7 +159,9 @@ class SnapKVPress(ScorerPress):
     kernel_size: int = 5
 
     @staticmethod
-    def compute_window_attention(module, hidden_states, keys, window_size, position_embeddings):
+    def compute_window_attention(
+        module, hidden_states, keys, window_size, position_embeddings
+    ):
         """
         Compute the last window_size queries and associated attention weights for the first q_len - window_size keys.
         """
@@ -185,22 +178,32 @@ class SnapKVPress(ScorerPress):
             qkv = module.qkv_proj(hidden_states[:, -window_size:])
             query_states = qkv[..., : num_heads * head_dim]
         else:
-            raise NotImplementedError(f"SnapKV not yet implemented for {module.__class__}.")
+            raise NotImplementedError(
+                f"SnapKV not yet implemented for {module.__class__}."
+            )
 
-        query_states = query_states.view(bsz, window_size, num_heads, head_dim).transpose(1, 2)
+        query_states = query_states.view(
+            bsz, window_size, num_heads, head_dim
+        ).transpose(1, 2)
 
         # Apply RoPE
         cos, sin = position_embeddings
         cos, sin = cos[:, -window_size:], sin[:, -window_size:]
-        query_states = (query_states * cos.unsqueeze(1)) + (rotate_half(query_states) * sin.unsqueeze(1))
+        query_states = (query_states * cos.unsqueeze(1)) + (
+            rotate_half(query_states) * sin.unsqueeze(1)
+        )
 
         # Compute attention for first q_len - window_size tokens
         key_states = repeat_kv(keys, num_key_value_groups)
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+        attn_weights = torch.matmul(
+            query_states, key_states.transpose(2, 3)
+        ) / math.sqrt(head_dim)
         attention_mask = torch.ones_like(attn_weights) * float("-inf")
         attention_mask = torch.triu(attention_mask, diagonal=q_len - window_size + 1)
         attn_weights += attention_mask
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
         attn_weights = attn_weights[..., :-window_size]
 
         return attn_weights
@@ -218,20 +221,33 @@ class SnapKVPress(ScorerPress):
         bsz, num_key_value_heads, q_len, _ = keys.shape
         num_key_value_groups = module.config.num_attention_heads // num_key_value_heads
 
-        assert q_len > self.window_size, "Query length should be greater than the window size"
+        assert (
+            q_len > self.window_size
+        ), "Query length should be greater than the window size"
 
         if attentions is not None:
             attn_weights = attentions[..., -self.window_size :, : -self.window_size]
         else:
             attn_weights = self.compute_window_attention(
-                module, hidden_states, keys, self.window_size, kwargs["position_embeddings"]
+                module,
+                hidden_states,
+                keys,
+                self.window_size,
+                kwargs["position_embeddings"],
             )
 
         scores = attn_weights.mean(dim=-2)
-        scores = F.avg_pool1d(scores, kernel_size=self.kernel_size, padding=self.kernel_size // 2, stride=1)
+        scores = F.avg_pool1d(
+            scores,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            stride=1,
+        )
 
         # Average per group (https://github.com/FasterDecoding/SnapKV/issues/22)
-        scores = scores.view(bsz, num_key_value_heads, num_key_value_groups, q_len - self.window_size)
+        scores = scores.view(
+            bsz, num_key_value_heads, num_key_value_groups, q_len - self.window_size
+        )
         scores = scores.mean(2)
 
         # Add back the observation window. Use max score to make sure the window is not pruned.
