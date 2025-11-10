@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation \
+    -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple \
     py-spy \
     vllm \
     transformer_engine[pytorch] \

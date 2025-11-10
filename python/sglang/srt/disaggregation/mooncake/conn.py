@@ -303,19 +303,24 @@ class MooncakeKVManager(CommonKVManager):
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-            kv_item_len = item_lens[0]
+            # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
+            # Use correct item lengths for K and V separately
+            if layers_current_pp_stage > len(dst_k_ptrs):
+                logger.error(
+                    f"layers_current_pp_stage is out of range: {layers_current_pp_stage=}, {len(dst_k_ptrs)}"
+                )
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    kv_item_len,
+                    item_lens[layer_id],  # K item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    kv_item_len,
+                    item_lens[layers_current_pp_stage + layer_id],  # V item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
