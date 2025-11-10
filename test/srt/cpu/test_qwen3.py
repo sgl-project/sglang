@@ -78,10 +78,10 @@ class TestQwen3(CustomTestCase):
             mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_k_dim, head_v_dim
         )
         atol = rtol = precision[mixed_qkv.dtype]
-        self.assertTrue(torch.allclose(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(z, z_ref, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(b, b_ref, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(a, a_ref, atol=atol, rtol=rtol))
+        torch.testing.assert_close(mixed_qkv, mixed_qkv_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(b, b_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(a, a_ref, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
