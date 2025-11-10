@@ -27,12 +27,17 @@ class PassManager:
         updated = False
         for pass_ in self.passes:
             pass_instance = pass_()
-            if callable(pass_instance):
-                results = pass_instance(self.graph_module)
-            else:
-                results = torch.fx.replace_pattern(
-                    self.graph_module, pass_.pattern, pass_.replacement
-                )
+            results = []
+            try:
+                if callable(pass_instance):
+                    results = pass_instance(self.graph_module)
+                else:
+                    results = torch.fx.replace_pattern(
+                        self.graph_module, pass_.pattern, pass_.replacement
+                    )
+            except:
+                # pass was not applied
+                pass
 
             if not updated:
                 updated = len(results) != 0
