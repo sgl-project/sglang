@@ -40,6 +40,12 @@ dev = [
     "requests>=2.25.0",
 ]
 
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
+]
 
 [tool.maturin]
 python-source = "py_src"

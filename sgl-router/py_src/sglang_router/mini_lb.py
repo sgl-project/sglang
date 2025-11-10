@@ -17,21 +17,14 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang_router.router_args import RouterArgs
-
-try:
-    from sglang.srt.tracing.trace import (
-        process_tracing_init,
-        trace_get_remote_propagate_context,
-        trace_req_finish,
-        trace_req_start,
-        trace_set_thread_info,
-        trace_slice_end,
-        trace_slice_start,
-    )
-
-    trace_package_imported = True
-except ImportError:
-    trace_package_imported = False
+from sglang_router.trace import (
+    process_tracing_init,
+    trace_get_remote_propagate_context,
+    trace_req_finish,
+    trace_req_start,
+    trace_slice_end,
+    trace_slice_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +56,6 @@ class MiniLoadBalancer:
         self.decode_urls = router_args.decode_urls
         self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
         self.enable_trace = router_args.enable_trace
-        if self.enable_trace and not trace_package_imported:
-            logger.warning(
-                "Tracing is not supported in this environment. Please install sglang."
-            )
-            self.enable_trace = False
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -92,7 +80,6 @@ class MiniLoadBalancer:
         lb = self
         if self.enable_trace:
             process_tracing_init(self.otlp_traces_endpoint, "sglang")
-            trace_set_thread_info("Mini lb")
         uvicorn.run(app, host=self.host, port=self.port)
 
     def select_pair(self):
@@ -458,7 +445,7 @@ async def handle_completion_request(request_data: dict):
 def _generate_bootstrap_room():
     bootstrap_room = random.randint(0, 2**63 - 1)
     if lb.enable_trace:
-        trace_req_start(bootstrap_room, bootstrap_room, role="router")
+        trace_req_start(bootstrap_room)
         trace_slice_start("mini_lb_launch", bootstrap_room)
     return bootstrap_room
 
