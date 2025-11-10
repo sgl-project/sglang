@@ -48,6 +48,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     NSATokenToKVPool,
@@ -313,23 +314,7 @@ class SchedulerDisaggregationPrefillMixin:
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.chunked_req:
-                # Move the chunked request out of the batch so that we can merge
-                # only finished requests to running_batch.
-                self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-                if self.enable_overlap:
-                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                    self.chunked_req.tmp_end_idx = min(
-                        len(self.chunked_req.fill_ids),
-                        len(self.chunked_req.origin_input_ids),
-                    )
-                else:
-                    self.send_kv_chunk(self.chunked_req)
-                # chunked request keeps its rid but will get a new req_pool_idx
-                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
-                self.running_batch.batch_is_full = False
+        self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
         if self.require_mlp_sync:
@@ -484,7 +469,7 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        self.tree_cache.cache_finished_req(req)
+                        release_kv_cache(req, self.tree_cache)
                         prepare_abort(
                             req,
                             error_message,
@@ -550,7 +535,7 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                self.tree_cache.cache_finished_req(req)  # unlock the tree
+                release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -563,7 +548,7 @@ class SchedulerDisaggregationPrefillMixin:
                 except Exception as e:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
-                self.tree_cache.cache_finished_req(req)  # unlock the tree
+                release_kv_cache(req, self.tree_cache)  # unlock the tree
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -611,6 +596,25 @@ class SchedulerDisaggregationPrefillMixin:
                 transferred_rids.append(req.rid)
 
         return transferred_rids
+
+    def process_prefill_chunk(self: Scheduler) -> None:
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.chunked_req:
+                # Move the chunked request out of the batch so that we can merge
+                # only finished requests to running_batch.
+                self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
+                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+                if self.enable_overlap:
+                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                    self.chunked_req.tmp_end_idx = min(
+                        len(self.chunked_req.fill_ids),
+                        len(self.chunked_req.origin_input_ids),
+                    )
+                else:
+                    self.send_kv_chunk(self.chunked_req)
+                # chunked request keeps its rid but will get a new req_pool_idx
+                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                self.running_batch.batch_is_full = False
 
     def send_kv_chunk(
         self: Scheduler,
