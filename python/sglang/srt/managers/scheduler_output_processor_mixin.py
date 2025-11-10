@@ -45,18 +45,17 @@ class SchedulerOutputProcessorMixin:
     def process_batch_result_prebuilt_extend(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
-            for req in batch.reqs:
-                req.check_finished()
-                if req.finished():
-                    req.time_stats.forward_entry_time = (
-                        req.time_stats.completion_time
-                    ) = time.perf_counter()
-                    trace_slice_end(
-                        RequestStage.DECODE_QUICK_FINISH,
-                        req.rid,
-                        thread_finish_flag=True,
-                    )
-                    self.tree_cache.cache_finished_req(req)
+            req.check_finished()
+            if req.finished():
+                req.time_stats.forward_entry_time = req.time_stats.completion_time = (
+                    time.perf_counter()
+                )
+                trace_slice_end(
+                    RequestStage.DECODE_QUICK_FINISH,
+                    req.rid,
+                    thread_finish_flag=True,
+                )
+                self.tree_cache.cache_finished_req(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
