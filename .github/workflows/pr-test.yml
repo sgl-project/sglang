@@ -50,6 +50,8 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           filters: |
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
             main_package:
               pattern:
                 - "python/**"
@@ -60,8 +62,6 @@ jobs:
                 - "python/sglang/multimodal_gen/**"
             sgl_kernel:
               - "sgl-kernel/**"
-            multimodal_gen:
-              - "python/sglang/multimodal_gen/**"
 
   # =============================================== sgl-kernel ====================================================
 
