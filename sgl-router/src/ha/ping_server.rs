@@ -1,19 +1,18 @@
-use anyhow::Result;
-
 use std::net::SocketAddr;
-use tonic::transport::Server;
-use tonic::{Response, Status};
+
+use anyhow::Result;
+use tonic::{transport::Server, Response, Status};
 use tracing as log;
 use tracing::instrument;
 
-use super::gossip::{
-    self,
-    gossip_server::{Gossip, GossipServer},
-    GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq,
+use super::{
+    gossip::{
+        self,
+        gossip_server::{Gossip, GossipServer},
+        GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq,
+    },
+    try_ping, ClusterState,
 };
-
-use super::try_ping;
-use super::ClusterState;
 
 #[derive(Debug)]
 pub struct GossipService {

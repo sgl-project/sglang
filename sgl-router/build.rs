@@ -16,10 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate both client and server code
         .build_server(true)
         .build_client(true)
-        .compile_protos(
-            &["src/ha/proto/gossip.proto"],
-            &["src/ha/proto"],
-        )?;
+        .compile_protos(&["src/ha/proto/gossip.proto"], &["src/ha/proto"])?;
 
     println!("cargo:warning=Protobuf compilation completed successfully");
 

@@ -1,18 +1,19 @@
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    time::Duration,
+};
+
 use anyhow::Result;
-
 use rand::seq::{IndexedRandom, SliceRandom};
-use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
-
-use std::time::Duration;
-
 use tracing as log;
 use tracing::instrument;
 
-use super::gossip::{gossip_message, NodeState, NodeStatus, Ping, PingReq, StateSync};
-
-use super::service::{broadcast_node_states, try_ping};
-use super::ClusterState;
+use super::{
+    gossip::{gossip_message, NodeState, NodeStatus, Ping, PingReq, StateSync},
+    service::{broadcast_node_states, try_ping},
+    ClusterState,
+};
 
 pub struct HAController {
     state: ClusterState,
@@ -46,12 +47,12 @@ impl HAController {
             log::info!("Round {} Status:{:?}", cnt, read_state.read());
             let peer = if cnt == 0 {
                 self.init_peer.map(|init_peer| NodeState {
-                        name: "init_peer".to_string(),
-                        address: init_peer.to_string(),
-                        status: NodeStatus::Suspected as i32,
-                        version: 1,
-                        metadata: HashMap::new(),
-                    })
+                    name: "init_peer".to_string(),
+                    address: init_peer.to_string(),
+                    status: NodeStatus::Suspected as i32,
+                    version: 1,
+                    metadata: HashMap::new(),
+                })
             } else {
                 let mut map = init_state.read().clone();
                 map.retain(|k, v| {

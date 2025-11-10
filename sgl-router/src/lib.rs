@@ -8,6 +8,7 @@ pub mod core;
 pub mod data_connector;
 #[cfg(feature = "grpc-client")]
 pub mod grpc_client;
+pub mod ha;
 pub mod mcp;
 pub mod metrics;
 pub mod middleware;
@@ -20,7 +21,6 @@ pub mod service_discovery;
 pub mod tokenizer;
 pub mod tool_parser;
 pub mod tree;
-pub mod ha;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]

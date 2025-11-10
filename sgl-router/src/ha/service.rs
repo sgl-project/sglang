@@ -1,11 +1,13 @@
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
+
 use anyhow::Result;
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
-
 use tonic::Request;
 use tracing as log;
 
@@ -18,8 +20,7 @@ use gossip::{
     StateSync,
 };
 
-use crate::ha::controller::HAController;
-use crate::ha::ping_server::GossipService;
+use crate::ha::{controller::HAController, ping_server::GossipService};
 
 pub type ClusterState = Arc<RwLock<BTreeMap<String, NodeState>>>;
 
@@ -376,13 +377,15 @@ macro_rules! ha_run {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Once;
+
     use tokio::net::TcpListener;
     use tracing as log;
     use tracing_subscriber::{
         filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
     };
+
+    use super::*;
     static INIT: Once = Once::new();
     fn init() {
         INIT.call_once(|| {
