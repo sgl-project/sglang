@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
-from typing import Any, cast
+from typing import Any
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
@@ -313,19 +313,6 @@ class PipelineConfig:
         )
 
     @classmethod
-    def from_pretrained(cls, model_path: str) -> "PipelineConfig":
-        """
-        use the pipeline class setting from model_path to match the pipeline config
-        """
-        from sglang.multimodal_gen.configs.pipelines.registry import (
-            get_pipeline_config_cls_from_name,
-        )
-
-        pipeline_config_cls = get_pipeline_config_cls_from_name(model_path)
-
-        return cast(PipelineConfig, pipeline_config_cls(model_path=model_path))
-
-    @classmethod
     def from_kwargs(
         cls, kwargs: dict[str, Any], config_cli_prefix: str = ""
     ) -> "PipelineConfig":
@@ -334,9 +321,7 @@ class PipelineConfig:
         kwargs: dictionary of kwargs
         config_cli_prefix: prefix of CLI arguments for this PipelineConfig instance
         """
-        from sglang.multimodal_gen.configs.pipelines.registry import (
-            get_pipeline_config_cls_from_name,
-        )
+        from sglang.multimodal_gen.registry import get_model_info
 
         prefix_with_dot = (
             f"{config_cli_prefix}." if (config_cli_prefix.strip() != "") else ""
@@ -352,17 +337,17 @@ class PipelineConfig:
             raise ValueError("model_path is required in kwargs")
 
         # 1. Get the pipeline config class from the registry
-        pipeline_config_cls = get_pipeline_config_cls_from_name(model_path)
+        model_info = get_model_info(model_path)
 
         # 2. Instantiate PipelineConfig
-        if pipeline_config_cls is None:
+        if model_info is None:
             logger.warning(
-                "Couldn't find pipeline config for %s. Using the default pipeline config.",
+                "Couldn't find model info for %s. Using the default pipeline config.",
                 model_path,
             )
             pipeline_config = cls()
         else:
-            pipeline_config = pipeline_config_cls()
+            pipeline_config = model_info.pipeline_config_cls()
 
         # 3. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
