@@ -39,6 +39,50 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+# ---- Back-compat shims (temporary; prefer plain lists for radix_cache) ----
+
+
+class RadixKey:
+    def __init__(self, token_ids=None, extra_key=None):
+        # Accept list/tuple/torch.Tensor
+        if token_ids is None:
+            token_ids = []
+        self.token_ids = token_ids
+        self.extra_key = extra_key
+
+    def __len__(self):
+        return len(self.token_ids)
+
+    def __iter__(self):
+        # Yield Python ints if underlying is a tensor
+        if hasattr(self.token_ids, "__iter__"):
+            for x in self.token_ids:
+                if hasattr(x, "item"):
+                    try:
+                        yield int(x.item())
+                        continue
+                    except Exception:
+                        pass
+                yield x
+        else:
+            return iter(())
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return RadixKey(self.token_ids[idx], self.extra_key)
+        x = self.token_ids[idx]
+        if hasattr(x, "item"):
+            try:
+                return int(x.item())
+            except Exception:
+                pass
+        return x
+
+
+def get_child_key(key: "RadixKey"):
+    # For page_size == 1 callers (e.g., Mamba). Intentional minimal behavior.
+    return key[0]
+
 
 class TreeNode:
 
