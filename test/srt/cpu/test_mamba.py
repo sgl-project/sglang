@@ -111,7 +111,7 @@ class TestMambaAttention(CustomTestCase):
             g = torch_gdn_gating(A_log, a, dt_bias)
             g_sgl = torch.ops.sgl_kernel.fused_gdn_gating_cpu(A_log, a, dt_bias)
             atol = rtol = precision[g.dtype]
-            self.assertTrue(torch.allclose(g, g_sgl, atol=atol, rtol=rtol))
+            torch.testing.assert_close(g, g_sgl, atol=atol, rtol=rtol)
 
     def test_fused_sigmoid_gating_delta_rule_update(self):
         batch_size = 1
@@ -183,13 +183,11 @@ class TestMambaAttention(CustomTestCase):
         )
         last_recurrent_state = ssm_states[cache_indices]
         atol = rtol = precision[core_attn_out.dtype]
-        self.assertTrue(
-            torch.allclose(core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
         )
-        self.assertTrue(
-            torch.allclose(
-                last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
-            )
+        torch.testing.assert_close(
+            last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
         )
 
 
