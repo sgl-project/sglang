@@ -693,6 +693,50 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+        idx = decode_req.metadata_buffer_index
+        (
+            output_id,
+            cached_tokens,
+            output_token_logprobs_val,
+            output_token_logprobs_idx,
+            output_top_logprobs_val,
+            output_top_logprobs_idx,
+            output_topk_p,
+            output_topk_index,
+            output_hidden_states,
+        ) = self.metadata_buffers.get_buf(idx)
+
+        decode_req.req.output_ids.append(output_id[0].item())
+        decode_req.req.cached_tokens = cached_tokens[0].item()
+        if not self.spec_algorithm.is_none():
+            decode_req.req.output_topk_p = output_topk_p
+            decode_req.req.output_topk_index = output_topk_index
+            decode_req.req.hidden_states_tensor = output_hidden_states
+
+        if decode_req.req.return_logprob:
+            decode_req.req.output_token_logprobs_val.append(
+                output_token_logprobs_val[0].item()
+            )
+            decode_req.req.output_token_logprobs_idx.append(
+                output_token_logprobs_idx[0].item()
+            )
+            decode_req.req.output_top_logprobs_val.append(
+                output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
+            )
+            decode_req.req.output_top_logprobs_idx.append(
+                output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
+            )
+
+        decode_req.kv_receiver.clear()
+        decode_req.kv_receiver = None
+        trace_slice_end(
+            RequestStage.DECODE_TRANSFERRED,
+            decode_req.req.rid,
+            auto_next_anon=True,
+        )
+        decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+
     def pop_transferred(self) -> List[Req]:
         if not self.queue:
             return []
@@ -725,57 +769,9 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-
-                idx = decode_req.metadata_buffer_index
-                (
-                    output_id,
-                    cached_tokens,
-                    output_token_logprobs_val,
-                    output_token_logprobs_idx,
-                    output_top_logprobs_val,
-                    output_top_logprobs_idx,
-                    output_topk_p,
-                    output_topk_index,
-                    output_hidden_states,
-                ) = self.metadata_buffers.get_buf(idx)
-
-                decode_req.req.output_ids.append(output_id[0].item())
-                decode_req.req.cached_tokens = cached_tokens[0].item()
-                if not self.spec_algorithm.is_none():
-                    decode_req.req.output_topk_p = output_topk_p
-                    decode_req.req.output_topk_index = output_topk_index
-                    decode_req.req.hidden_states_tensor = output_hidden_states
-
-                if decode_req.req.return_logprob:
-                    decode_req.req.output_token_logprobs_val.append(
-                        output_token_logprobs_val[0].item()
-                    )
-                    decode_req.req.output_token_logprobs_idx.append(
-                        output_token_logprobs_idx[0].item()
-                    )
-                    decode_req.req.output_top_logprobs_val.append(
-                        output_top_logprobs_val[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-                    decode_req.req.output_top_logprobs_idx.append(
-                        output_top_logprobs_idx[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
-
+                self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
-                decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
                 transferred_reqs.append(decode_req.req)
-                trace_slice_end(
-                    RequestStage.DECODE_TRANSFERRED,
-                    decode_req.req.rid,
-                    auto_next_anon=True,
-                )
-
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
