@@ -173,8 +173,18 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         r"^model\.layers\.(\d+)\.self_attn\.(?:qkv_proj|o_proj)$"
     )
 
-    def should_apply_lora(self, module_name: str) -> bool:
+    def _should_apply_lora(self, module_name: str) -> bool:
         return bool(self._lora_pattern_moe.match(module_name))
+
+    def map_lora_module_name(self, module_name: str) -> Optional[str]:
+        """
+        Returns the LoRA weight name corresponding to the given model module if LoRA
+        should be applied to it.
+        """
+        if not self._should_apply_lora(module_name):
+            return None
+
+        return module_name.split(".")[-1]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

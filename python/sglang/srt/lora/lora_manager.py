@@ -16,7 +16,7 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
 
@@ -298,9 +298,13 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
-                target_module = get_target_module_name(
-                    module_name, self.memory_pool.target_modules
+                target_module = self.module_name_to_lora_target.get(
+                    module_name,
+                    get_target_module_name(
+                        module_name, self.memory_pool.target_modules
+                    ),
                 )
+
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
                         target_module=target_module,
@@ -447,20 +451,36 @@ class LoRAManager:
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
 
-        for module_name, module in self.base_model.named_modules():
-            # TODO (lifuhuang): in the future, we should consider generalizing the
-            # should_apply_lora function to support mapping by full module name instead
-            # of just the last part (e.g., "qkv_proj") to support scenarios with multiple
-            # attention stacks (e.g., multimodal models).
-            # See: https://github.com/sgl-project/sglang/issues/6608
-            if getattr(
-                self.base_model, "should_apply_lora", None
-            ) and not self.base_model.should_apply_lora(module_name):
-                continue
+        # These are used if a model owner wants to explicitly map a module to a LoRA target
+        # EG: map_lora_module_name(model.layers.0.self_attn.qkv_proj) -> qkv_proj
+        self.module_name_to_lora_target: Dict[str, str] = {}
+        map_lora_func: Optional[Callable[[str], Optional[str]]] = getattr(
+            self.base_model, "map_lora_module_name", None
+        )
 
-            # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
-                layer_id = get_layer_id(module_name)
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
+        for module_name, module in self.base_model.named_modules():
+            # To see if this module should be converted to a LoRA module, first check if the
+            # model owner provided the map_lora_module_name hook. If not, then use the default
+            # heuristic of checking if the suffix of the module name is included in target_names.
+            if map_lora_func is not None:
+                lora_target = map_lora_func(module_name)
+                if lora_target is None:
+                    continue
+
+                norm_lora_target = next(
+                    iter(get_normalized_target_modules([lora_target]))
                 )
+                if norm_lora_target not in self.target_modules:
+                    raise RuntimeError(
+                        f"LoRA target of {lora_target} for {module_name} is not a target module"
+                    )
+
+                self.module_name_to_lora_target[module_name] = norm_lora_target
+            else:
+                if module_name.split(".")[-1] not in self.target_modules:
+                    continue
+
+            layer_id = get_layer_id(module_name)
+            self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                module_name, module
+            )
