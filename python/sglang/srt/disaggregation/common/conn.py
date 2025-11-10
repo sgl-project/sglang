@@ -163,6 +163,16 @@ class CommonKVManager(BaseKVManager):
             dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
         ]
         layers_current_pp_stage = len(src_k_ptrs)
+
+        # Validate that src and dst have compatible layer counts
+        if len(src_k_ptrs) != len(dst_k_ptrs):
+            logger.warning_once(
+                f"KV layer count mismatch: src has {len(src_k_ptrs)} layers, "
+                f"dst has {len(dst_k_ptrs)} layers ({dst_num_total_layers=}, {start_layer=}, {end_layer=}). "
+                f"Using minimum ({layers_current_pp_stage=}) layers. "
+                f"This may indicate a hybrid model configuration mismatch."
+            )
+
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
