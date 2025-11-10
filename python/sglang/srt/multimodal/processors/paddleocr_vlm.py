@@ -12,18 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List, Optional, Tuple, Union
-
 import asyncio
 import math
+from typing import List, Optional, Tuple, Union
 
 import torch
 from PIL import Image
+
 from sglang.srt.models.paddleocr_vl import PaddleOCRVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+
 
 def smart_resize(
     height: int,
@@ -65,6 +66,7 @@ def smart_resize(
         w_bar = math.ceil(width * beta / factor) * factor
     return h_bar, w_bar
 
+
 def resize_image(image, min_pixels, max_pixels, factor) -> Image.Image:
     width, height = image.size
     resized_height, resized_width = smart_resize(
@@ -77,8 +79,10 @@ def resize_image(image, min_pixels, max_pixels, factor) -> Image.Image:
     image = image.resize((resized_width, resized_height))
     return image
 
+
 async def resize_image_async(image, min_pixels, max_pixels, factor):
     return resize_image(image, min_pixels, max_pixels, factor)
+
 
 class PaddleOCRVLImageProcessor(BaseMultimodalProcessor):
     models = [PaddleOCRVLForConditionalGeneration]
@@ -238,13 +242,9 @@ class PaddleOCRVLImageProcessor(BaseMultimodalProcessor):
                     )
 
                     range_tensor = torch.arange(llm_grid_t).view(-1, 1)
-                    expanded_range = range_tensor.expand(
-                        -1, llm_grid_h * llm_grid_w
-                    )
+                    expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
 
-                    time_tensor = (
-                        expanded_range * second_per_grid_t * tokens_per_second
-                    )
+                    time_tensor = expanded_range * second_per_grid_t * tokens_per_second
 
                     time_tensor_long = time_tensor.long()
                     t_index = time_tensor_long.flatten()
