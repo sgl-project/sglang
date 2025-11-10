@@ -25,14 +25,6 @@ def tensor_torch2ms(x: torch.Tensor):
     if x is None or not isinstance(x, torch.Tensor):
         return x
 
-    if x.device.type == "cpu":
-        # TODO: dlpack support CPU, for now will slow down the weight loading
-        if x.dtype == torch.bfloat16:
-            return ms.Tensor(
-                x.contiguous().to(torch.float32).numpy(), dtype=ms.bfloat16
-            )
-        return ms.Tensor(x.contiguous().numpy())
-
     # torch tensor -> dlpack -> mindspore tensor
     pt_dlpack = torch.utils.dlpack.to_dlpack(x)
     ms_tensor = ms.utils.dlpack.from_dlpack(pt_dlpack)
@@ -42,13 +34,6 @@ def tensor_torch2ms(x: torch.Tensor):
 def tensor_ms2torch(x: ms.Tensor):
     if x is None or not isinstance(x, ms.Tensor):
         return x
-
-    if x.device == "CPU":  # TODO: dlpack support CPU
-        if x.dtype == ms.bfloat16:
-            return torch.tensor(
-                x.contiguous().to(ms.float32).asnumpy(), dtype=torch.bfloat16
-            )
-        return torch.tensor(x.contiguous().asnumpy())
 
     # ms tensor -> dlpack -> torch tensor
     ms_dlpack = ms.utils.dlpack.to_dlpack(x)
