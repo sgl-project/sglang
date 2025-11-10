@@ -207,7 +207,7 @@ class BenchArgs:
             nargs="+",
             default=["CPU", "GPU"],
             choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
-            help="Profiler activities: CPU, GPU, CUDA_PROFILER. If CPU/GPU, use torch profiler. If CUDA_PROFILER, use CUDA profiler.",
+            help="Profiler activities: CPU, GPU, XPU, CUDA_PROFILER. If CPU/GPU/XPU, use torch profiler. If CUDA_PROFILER, use CUDA profiler.",
         )
         parser.add_argument(
             "--profile-stage",
