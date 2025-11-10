@@ -487,7 +487,14 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_device_graphs()
+            # self.init_device_graphs()
+            # NOTE: hard code, we init target model cuda graphs in simple_eagle
+            if self.spec_algorithm.is_simple_eagle():
+                self.graph_runner = None
+                self.graph_mem_usage = 0
+                logger.info("We init target model cuda graphs in simple eagle....")
+            else:
+                self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -2185,6 +2192,7 @@ class ModelRunner:
         )
         can_run_graph = bool(
             mode_check()
+            and not self.spec_algorithm.is_simple_eagle()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
@@ -2201,7 +2209,10 @@ class ModelRunner:
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
 
-        if forward_batch.forward_mode.is_decode():
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_simple_verify()
+        ):
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
