@@ -593,44 +593,6 @@ def create_draft_kv_indices(
     if bid == 0:
         tl.store(kv_indptr, 0)
 
-
-@triton.jit
-def create_draft_kv_indices(
-    kv_indptr,
-    kv_indices,
-    req_pool,
-    req_to_token,
-    seq_lens,
-    expand_factor: tl.constexpr,  # only support ==2 currently
-    row_stride: tl.constexpr,
-    num_tokens_upper: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 64
-    bid = tl.program_id(0)
-    source_row_id = tl.load(req_pool + bid)
-    batch_offset = tl.arange(0, num_tokens_upper)
-    seq_len_data = tl.load(seq_lens + batch_offset, mask=batch_offset < bid)
-    seq_len = tl.load(seq_lens + bid)
-    cum_seq_len = tl.sum(seq_len_data)
-    kv_offset = cum_seq_len * 2 - bid  # only for expand_factor==1 currently
-    kv_indices_ptr = kv_indices + kv_offset
-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
-
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < seq_len - 1
-        data = tl.load(req_to_token + source_row_id * row_stride + offset, mask=mask)
-        tl.store(kv_indices_ptr + offset, data, mask=mask)
-        tl.store(kv_indices_ptr + seq_len - 1 + offset, data, mask=mask)
-
-    data = tl.load(req_to_token + source_row_id * row_stride + seq_len - 1)
-    tl.store(kv_indices_ptr + seq_len * 2 - 2, data)
-
-    tl.store(kv_indptr + bid * expand_factor + 1, kv_offset + seq_len - 1)
-    tl.store(kv_indptr + bid * expand_factor + 2, kv_offset + seq_len * 2 - 1)
-    if bid == 0:
-        tl.store(kv_indptr, 0)
-
 def traverse_tree(
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
