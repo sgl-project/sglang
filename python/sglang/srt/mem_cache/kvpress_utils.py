@@ -110,8 +110,8 @@ class ScorerPress(BasePress):
         hidden_states: torch.Tensor,
         keys: torch.Tensor,
         values: torch.Tensor,
-        attentions: torch.Tensor,
-        kwargs: dict,
+        attentions: Optional[torch.Tensor],
+        kwargs: Optional[dict],
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         if self.compression_ratio == 0:
