@@ -10,6 +10,7 @@ from sglang.srt.utils import kill_process_tree
 
 def run_server(server_args):
     """Run the server based on server_args.grpc_mode."""
+    print("testing")
     if server_args.grpc_mode:
         from sglang.srt.entrypoints.grpc_server import serve_grpc
 
