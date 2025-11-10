@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
@@ -47,7 +48,11 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+
+# Reuse this workspace buffer across all NSA backend instances
+global_workspace_buffer = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +235,20 @@ class NativeSparseAttnBackend(AttentionBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+
+        # Allocate global workspace buffer for TRTLLm ragged attention kernel (SM100/B200)
+        device_sm_major = torch.cuda.get_device_capability()[0]
+        if device_sm_major >= 10:
+            global global_workspace_buffer
+            if global_workspace_buffer is None:
+                global_workspace_buffer = torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_workspace_buffer
+        else:
+            self.workspace_buffer = None
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -823,7 +842,23 @@ class NativeSparseAttnBackend(AttentionBackend):
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
 
-        # Do absorbed multi-latent attention
+        # Detect MHA mode: multi KV heads (vs MLA with single KV head)
+        is_mha_mode = (layer.tp_k_head_num == layer.tp_q_head_num) and (
+            layer.tp_k_head_num > 1
+        )
+
+        # Use MHA kernel if in MHA_ONE_SHOT mode
+        if is_mha_mode and k is not None and v is not None and q_rope is None:
+            return self._forward_standard_mha(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+            )
+
+        # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
@@ -1153,6 +1188,74 @@ class NativeSparseAttnBackend(AttentionBackend):
             is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
         return o
+
+    def _forward_standard_mha(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+    ) -> torch.Tensor:
+        """Standard MHA using FlashAttention varlen for MHA_ONE_SHOT mode."""
+        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+        # MHA_ONE_SHOT: k/v include all tokens (prefix + current)
+        cu_seqlens_q = metadata.cu_seqlens_q
+        cu_seqlens_k = metadata.cu_seqlens_k
+        max_seqlen_k = metadata.max_seq_len_k
+        causal = True
+
+        # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
+        assert len(cu_seqlens_q) == len(cu_seqlens_k), (
+            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q)-1} requests, "
+            f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
+        )
+
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
+        device_sm_major = torch.cuda.get_device_capability()[0]
+        if device_sm_major >= 10:
+            import flashinfer
+
+            seq_lens = metadata.cache_seqlens_int32
+            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=seq_lens,
+                max_q_len=metadata.max_seq_len_q,
+                max_kv_len=max_seqlen_k,
+                bmm1_scale=layer.scaling,
+                bmm2_scale=1.0,
+                o_sf_scale=1.0,
+                batch_size=forward_batch.batch_size,
+                window_left=-1,
+                cum_seq_lens_q=cu_seqlens_q,
+                cum_seq_lens_kv=cu_seqlens_k,
+                enable_pdl=False,
+                is_causal=causal,
+                return_lse=False,
+            )
+
+        # Use FA3 for SM90 (Hopper/H200)
+        fa_version = 3
+
+        return flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=layer.scaling,
+            causal=causal,
+            ver=fa_version,
+        )
 
     def _forward_tilelang(
         self,

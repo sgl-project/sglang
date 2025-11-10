@@ -1,0 +1,104 @@
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-c"]
+
+WORKDIR /sgl-workspace/sglang
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    git \
+    ca-certificates \
+    openssh-server \
+    zsh \
+    vim \
+    curl \
+    gcc-11 \
+    g++-11 \
+    clang-11 \
+    libnuma1 libnuma-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install oh-my-zsh and plugins
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+    && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
+    && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+
+# Set up C++20 compilers for ThunderKittens
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 --slave /usr/bin/g++ g++ /usr/bin/g++-11
+
+# Set CUDA environment variables
+ENV CUDA_HOME=/usr/local/cuda-12.8
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:$LD_LIBRARY_PATH
+
+# Install uv and source its environment
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    echo 'source $HOME/.local/bin/env' >> /root/.zshrc
+
+# Copy just the pyproject.toml first to leverage Docker cache
+COPY python/pyproject.toml python/
+
+# Create a dummy README to satisfy the installation
+RUN mkdir -p python && echo "# Placeholder" > python/README.md
+
+# Create and activate virtual environment with specific Python version and seed
+RUN source $HOME/.local/bin/env && \
+    uv venv --python 3.12 --seed /opt/venv && \
+    source /opt/venv/bin/activate && \
+    uv pip install nvitop && \
+    uv pip install --no-cache-dir --upgrade pip && \
+    uv pip install --no-cache-dir --prerelease=allow./python[diffusion]
+
+COPY . .
+
+# Install dependencies using uv and set up shell configuration
+RUN source $HOME/.local/bin/env && \
+    source /opt/venv/bin/activate && \
+    git config --unset-all http.https://github.com/.extraheader || true && \
+    echo 'source /opt/venv/bin/activate' >> /root/.zshrc && \
+    echo 'if [ -n "$ZSH_VERSION" ] && [ -f ~/.zshrc ]; then . ~/.zshrc; elif [ -f ~/.bashrc ]; then . ~/.bashrc; fi' > /root/.profile
+
+# Set PATH to include venv bin
+ENV PATH=/opt/venv/bin:$PATH
+
+# Configure zsh
+COPY --chown=root:root <<-"EOF" /root/.zshrc
+export ZSH="/root/.oh-my-zsh"
+
+source $HOME/.local/bin/env
+source /opt/venv/bin/activate
+
+## Theme
+ZSH_THEME="robbyrussell"
+
+## Plugins
+plugins=(
+    git
+    z
+    zsh-autosuggestions
+    zsh-syntax-highlighting
+)
+
+source $ZSH/oh-my-zsh.sh
+
+## Aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias vi='vim'
+
+## Enhanced history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt HIST_IGNORE_ALL_DUPS
+setopt HIST_FIND_NO_DUPS
+setopt INC_APPEND_HISTORY
+EOF
+
+
+EXPOSE 22
+
+CMD ["/bin/zsh"]
