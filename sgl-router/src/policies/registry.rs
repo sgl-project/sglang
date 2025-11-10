@@ -391,18 +391,16 @@ impl PolicyRegistry {
 
     pub fn init_pd_bucket_policies(&self, prefill_workers: &[Arc<dyn Worker>]) {
         // Initialize prefill policy if it's bucket
-        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
-            if prefill_policy.name() == "bucket" {
-                if let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>() {
-                    if !prefill_workers.is_empty() {
-                        debug!(
-                            "Initializing prefill bucket policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        bucket.init_prefill_worker_urls(prefill_workers);
-                    }
-                }
-            }
+        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref()
+            && prefill_policy.name() == "bucket"
+            && let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>()
+            && !prefill_workers.is_empty()
+        {
+            debug!(
+                "Initializing prefill bucket policy with {} workers",
+                prefill_workers.len()
+            );
+            bucket.init_prefill_worker_urls(prefill_workers);
         }
     }
 }

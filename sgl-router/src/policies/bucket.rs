@@ -2,10 +2,12 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, SystemTime},
+    thread,
 };
 
+use dashmap::DashMap;
 use rand::Rng;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 use uuid::Uuid;
 
 use super::{get_healthy_worker_indices, BucketConfig, LoadBalancingPolicy};
@@ -14,12 +16,21 @@ use crate::core::Worker;
 #[derive(Debug)]
 pub struct BucketPolicy {
     config: BucketConfig,
-    bucket: Arc<RwLock<Bucket>>,
+    buckets: Arc<DashMap<String, Arc<RwLock<Bucket>>>>,
+    adjustment_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Default for BucketPolicy {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for BucketPolicy {
+    fn drop(&mut self) {
+        if let Some(handle) = self.adjustment_handle.take() {
+            drop(handle);
+        }
     }
 }
 
@@ -29,48 +40,170 @@ impl BucketPolicy {
     }
 
     pub fn with_config(config: BucketConfig) -> Self {
-        let bucket = Arc::new(RwLock::new(Bucket::new(
-            config.bucket_adjust_interval_secs * 1000,
-        ))); // convert to ms
+        let buckets = Arc::new(DashMap::<String,Arc<RwLock<Bucket>>>::new());
 
-        let bucket_clone = Arc::clone(&bucket);
-        tokio::spawn(async move {
-            loop {
-                {
-                    let mut buc = bucket_clone.write().unwrap();
-                    buc.adjust_boundary();
+        let adjustment_handle = {
+            let buckets_clone = Arc::clone(&buckets);
+            
+            let interval_secs = config.bucket_adjust_interval_secs;
+
+            Some(thread::spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(interval_secs as u64));
+
+                    for bucket_ref in buckets_clone.iter() {
+                        let model_id = bucket_ref.key();
+                        let bucket = bucket_ref.value();
+                        match bucket.write() {
+                            OK(mut bucket_guard) => {
+                                bucket_guard.adjust_boundary();
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to acquire write lock for bucket {}: {}", model_id, e);
+                            }
+                        }
+                    }
                 }
+            }))
+        }
 
-                tokio::time::sleep(Duration::from_secs(
-                    config.bucket_adjust_interval_secs as u64,
-                ))
-                .await;
-            }
-        });
-
-        Self { config, bucket }
+        Self {
+            config,
+            buckets,
+            adjustment_handle,
+        }
     }
 
     pub fn init_prefill_worker_urls(&self, prefill_workers: &[Arc<dyn Worker>]) {
-        let prefill_worker_urls: Vec<String> = prefill_workers
+        // Group workers by model
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> =
+            HashMap::new();
+        for worker in prefill_workers {
+            // Use "default" for unknown/empty model_ids for backward compatibility
+            let model_id = worker.model_id();
+            let model_key = if model_id.is_empty() || model_id == "unknown" {
+                "default"
+            } else {
+                model_id
+            };
+            model_workers
+                .entry(model_key.to_string())
+                .or_default()
+                .push(worker);
+        }
+        // Initialize bucket for each model
+        for (model_key, model_workers) in model_workers {
+            let bucket = self
+                .buckets
+                .entry(model_key)
+                .or_insert_with(|| {
+                    Arc::new(RwLock::new(Bucket::new(
+                        self.config.bucket_adjust_interval_secs * 1000,
+                    )))
+                })
+                .clone();
+
+            let worker_urls: Vec<String> = model_workers
             .iter()
             .map(|worker| worker.url().to_string())
             .collect();
 
-        let mut bucket = self.bucket.write().unwrap();
-        bucket.init_prefill_worker_urls(prefill_worker_urls);
+            let lock_result = bucket.write();
+            if let Ok(mut bucket_guard) = lock_result {
+                bucket_guard.init_prefill_worker_urls(worker_urls);
+            } else {
+                eprintln!("Failed to acquire write lock for bucket initialization");
+            }
+        }
     }
 
-    pub fn add_prefill_url(&self, url: String) {
-        let buc = self.bucket.write().unwrap();
-        let mut prefill_worker_urls = buc.prefill_worker_urls.lock().unwrap();
-        prefill_worker_urls.push(url);
+    pub fn add_prefill_url(&self, worker: &dyn Worker) {
+        let model_id = worker.model_id();
+        let model_key = if model_id.is_empty() || model_id == "unknown" {
+            "default"
+        } else {
+            model_id
+        };
+        let bucket = self
+            .buckets
+            .entry(model_key.to_string())
+            .or_insert_with(|| {
+                Arc::new(RwLock::new(Bucket::new(
+                    self.config.bucket_adjust_interval_secs * 1000,
+                )))
+            })
+            .clone();
+
+        let lock_result = bucket.write();
+        if let Ok(mut bucket_guard) = lock_result {
+            let worker_url = worker.url().to_string();
+
+            let prefill_worker_urls_clone = {
+                let mut prefill_worker_urls = bucket_guard.prefill_worker_urls.lock().unwrap();
+                if !prefill_worker_urls.contains(&worker_url) {
+                    prefill_worker_urls.push(worker_url.clone());
+                }
+                let cloned = prefill_worker_urls.clone();
+
+                let mut chars_per_url = bucket_guard.chars_per_url.lock().unwrap();
+                chars_per_url.entry(worker_url.clone()).or_insert(0);
+
+                cloned
+            };
+
+            bucket_guard.init_prefill_worker_urls(prefill_worker_urls_clone);
+
+            info!(
+                "Added worker {} to bucket for model {}",
+                worker_url, model_key
+            );
+        } else {
+            error!("Failed to acquire write lock for bucket of model {}", model_key);
+        }
     }
 
     pub fn remove_prefill_url(&self, url: &str) {
-        let buc = self.bucket.write().unwrap();
-        let mut prefill_worker_urls = buc.prefill_worker_urls.lock().unwrap();
-        prefill_worker_urls.retain(|worker_url| worker_url != url);
+        let model_id = worker.model_id();
+        let model_key = if model_id.is_empty() || model_id == "unknown" {
+            "default"
+        } else {
+            model_id
+        };
+
+        if let Some(bucket_entry) = self.buckets.get(model_key) {
+            let bucket = bucket_entry.value();
+            let worker_url = worker.url.to_string();
+
+            let lock_result = bucket.write();
+            if let Ok(mut bucket_guard) = lock_result {
+                let (updated_len, updated_urls) = {
+                    let mut prefill_worker_urls = bucket_guard.prefill_worker_urls.lock().unwrap();
+                    prefill_worker_urls.retain(|u| u != &worker_url);
+                    let len = prefill_worker_urls.len();
+                    let urls_clone = prefill_worker_urls.clone();
+
+                    let mut chars_per_url = bucket_guard.chars_per_url.lock().unwrap();
+                    chars_per_url.remove(&worker_url);
+
+                    (len, urls_clone)
+                };
+
+                bucket_guard.bucket_cnt = updated_len;
+
+                if updated_len > 0 {
+                    bucket_guard.init_prefill_worker_urls(updated_urls);
+                }
+
+                info!(
+                    "Removed worker {} from bucket for model {} (remaining workers: {})",
+                    worker_url, model_key, bucket_guard.bucket_cnt
+                );
+            } else {
+                error!("Failed to acquire write lock for bucket of model {}", model_key);
+            }
+        } else {
+            warn!("No bucket found for model {} when trying to remove worker", model_key);
+        }
     }
 }
 
@@ -91,61 +224,73 @@ impl LoadBalancingPolicy for BucketPolicy {
             Some(text) => text.chars().count(),
         };
 
-        let buc_arc = Arc::clone(&self.bucket);
-        let choiced_url_snapshot;
-        let chars_per_url_snapshot;
-        {
-            let buc = buc_arc.read().unwrap();
-            choiced_url_snapshot = buc.find_boundary(char_count);
-            chars_per_url_snapshot = buc.chars_per_url.lock().unwrap().clone();
-        }
-
-        let max_load = chars_per_url_snapshot.values().copied().max().unwrap_or(0);
-        let min_load = chars_per_url_snapshot.values().copied().min().unwrap_or(0);
-        let abs_diff = max_load.saturating_sub(min_load);
-        let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
-
-        //Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold.
-        // balance_abs_threshold = 1
-        let is_imbalanced =
-            abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
-        info!(
-            "Current PD instance status | is_imbalanced={}",
-            is_imbalanced
-        );
-        let mut rng = rand::rng();
-        let prefill_url = if is_imbalanced {
-            info!("select prefill instance by Load Balance policy");
-            let min_url = chars_per_url_snapshot
-                .iter()
-                .min_by_key(|(_, &chars)| chars)
-                .map(|(url, _)| url.clone())
-                .unwrap_or_else(|| {
-                    let prefill_idx = rng.random_range(0..healthy_indices.len());
-                    let url = workers[prefill_idx].url();
-                    warn!("No URL found, randomly selecting: {}", url);
-                    url.to_string()
-                });
-            min_url
+        // Determine the model for this set of workers (router pre-filters by model)
+        // All workers should be from the same model
+        let first_model = workers[healthy_indices[0]].model_id();
+        let model_key = if first_model.is_empty() || first_model == "unknown" {
+            "default"
         } else {
-            info!("select prefill instance by Bucket policy");
-            if choiced_url_snapshot.is_empty() {
-                let prefill_idx = rng.random_range(0..healthy_indices.len());
-                let selected_url = workers[prefill_idx].url();
-                warn!("Boundary not found, randomly selection: {}", selected_url);
-                selected_url.to_string()
-            } else {
-                choiced_url_snapshot
-            }
+            first_model
         };
 
-        {
-            let mut buc = buc_arc.write().unwrap();
-            buc.post_process_request(char_count, prefill_url.clone());
+        let bucket = self.buckets.get(model_key).map(|entry| entry.value().clone());
+        let prefill_url = if let Some(bucket) = bucket {
+            let (choiced_url, chars_per_url_snapshot) = {
+                let buc = bucket.read().unwrap();
+                let chars_per_url_snapshot = buc.chars_per_url.lock().unwrap().clone();
+                let choiced_url = buc.find_boundary(char_count);
+                (choiced_url, chars_per_url_snapshot)
+            };
+            let max_load = chars_per_url_snapshot.values().copied().max().unwrap_or(0);
+            let min_load = chars_per_url_snapshot.values().copied().min().unwrap_or(0);
+            let abs_diff = max_load.saturating_sub(min_load);
+            let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
+            let is_imbalanced = abs_diff > self.config.balance_abs_threshold
+                && max_load as f32 > rel_threshold;
+            info!("Current PD instance status | is_imbalanced={}", is_imbalanced);
+            
+            let mut rng = rand::rng();
+            let prefill_url = if is_imbalanced {
+                info!("select prefill instance by Load Balance policy");
+                let min_url = chars_per_url_snapshot
+                    .iter()
+                    .min_by_key(|(_, &chars)| chars)
+                    .map(|(url, _)| url.clone())
+                    .unwrap_or_else(|| {
+                        let idx = rng.random_range(0..healthy_indices.len());
+                        let url = workers[healthy_indices[idx]].url();
+                        warn!("No URL found, randomly selecting: {}", url);
+                        url.to_string()
+                    })
+            } else {
+                info!("select prefill instance by Bucket policy");
+                match choiced_url {
+                    Some(url) if !url.is_empty() => url,
+                    _ => {
+                        let idx = rng.random_range(0..healthy_indices.len());
+                        let selected_url = workers[healthy_indices[idx]].url();
+                        warn!("Boundary not found, randomly selection: {}", selected_url);
+                        selected_url.to_string()
+                    }
+                }
+            };
+
+            {
+                let mut buc = bucket.write().unwrap();
+                buc.post_process_request(char_count, prefill_url.clone());
+            }
+
+            prefill_url
+        } else {
+            warn!("No bucket found for model {}, randomly selecting healthy worker", model_key);
+            let mut rng = rand::rng();
+            let idx = rng.random_range(0..healthy_indices.len());
+            let selected_worker = &workers[healthy_indices[idx]];
+            let prefill_url = selected_worker.url().to_string();
+            prefill_url
         }
 
-        let prefill_idx = workers.iter().position(|w| w.url() == prefill_url)?;
-        Some(prefill_idx)
+        workers.iter().position(|w| w.url() == prefill_url)
     }
 
     fn select_worker_pair(
@@ -331,7 +476,7 @@ impl Bucket {
         self.load_total = self.load_total.saturating_add(char_cnt);
     }
 
-    pub fn find_boundary(&self, char_count: usize) -> String {
+    pub fn find_boundary(&self, char_count: usize) -> Option<String> {
         let mut left = 0;
         let mut right = self.boundary.len();
         let mut _steps = 0;
@@ -346,10 +491,10 @@ impl Bucket {
             } else if char_count > range[1] {
                 left = mid + 1;
             } else {
-                return self.boundary[mid].url.clone();
+                return Some(self.boundary[mid].url.clone());
             }
         }
-        "".to_string()
+        None
     }
 
     pub fn get_total_load(&self) -> usize {
@@ -380,11 +525,11 @@ impl Bucket {
             return;
         }
 
-        if self.bucket_cnt == 0 {
-            return;
-        }
         self.update_workers_cnt();
         let worker_cnt = self.bucket_cnt;
+        if worker_cnt == 0 {
+            return;
+        }
         let new_single_bucket_load = self.get_total_load() / worker_cnt;
         let old_single_bucket_load = self.bucket_load;
 
