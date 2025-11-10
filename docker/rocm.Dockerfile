@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.4.post2 --build-arg GPU_ARCH=gfx942 -t v0.5.4.post2-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.4.post2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.4.post2-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.4.post2 --build-arg GPU_ARCH=gfx950 -t v0.5.4.post2-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5 --build-arg GPU_ARCH=gfx942 -t v0.5.5-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.5-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5 --build-arg GPU_ARCH=gfx950 -t v0.5.5-rocm700-mi35x -f rocm.Dockerfile .
 
 
 # Default base images
@@ -31,7 +31,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.6.post1"
+ENV AITER_COMMIT="v0.1.6.post3"
 ENV NO_DEPS_FLAG=""
 
 # ===============================
@@ -42,7 +42,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.6.post1"
+ENV AITER_COMMIT="v0.1.6.post3"
 ENV NO_DEPS_FLAG=""
 
 # ===============================
@@ -67,7 +67,7 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="7c22adb0d2c1616e3cfefb2dc6bf01c23c3df768"
+ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 
 ARG TILELANG_REPO="https://github.com/HaiShaw/tilelang.git"
 ARG TILELANG_BRANCH="dsv32-mi35x"
