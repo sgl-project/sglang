@@ -97,11 +97,15 @@ class TritonLoRABackend(BaseLoRABackend):
         return lora_output
 
     def init_cuda_graph_batch_info(
-        self, cuda_graph_batch_info: LoRABatchInfo, max_bs_in_cuda_graph: int
+        self,
+        cuda_graph_batch_info: LoRABatchInfo,
+        max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
     ):
         # Initialize seg_lens and seg_indptr for CUDA graph as they remain constant
         # across batches.
-        cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph].fill_(1)
+        cuda_graph_batch_info.max_len = num_tokens_per_bs
+        cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph].fill_(num_tokens_per_bs)
         torch.cumsum(
             cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
             dim=0,

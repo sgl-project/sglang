@@ -99,6 +99,7 @@ class BaseLoRABackend:
         self,
         cuda_graph_batch_info: LoRABatchInfo,
         max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
     ):
         """Initialize the batch info for CUDA Graph mode.
 
@@ -108,6 +109,7 @@ class BaseLoRABackend:
         Args:
             cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
+            num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
 

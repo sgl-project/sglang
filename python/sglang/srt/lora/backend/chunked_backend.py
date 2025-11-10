@@ -52,7 +52,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         # For simple lora B, we use slice offsets [0, output_dim]
         output_dim = weights.shape[-2]
@@ -75,7 +75,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -107,7 +107,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -262,14 +262,23 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         with torch.device("cpu"):
             seq_weight_indices = torch.tensor(seq_weight_indices, dtype=torch.int32)
 
-            seg_lens_cpu = (
-                torch.tensor(
+            if forward_batch.forward_mode.is_decode():
+                seg_lens_cpu = torch.ones(forward_batch.batch_size, dtype=torch.int32)
+            elif forward_batch.forward_mode.is_target_verify():
+                seg_lens_cpu = torch.full(
+                    size=(forward_batch.batch_size,),
+                    fill_value=forward_batch.spec_info.draft_token_num,
+                    dtype=torch.int32,
+                )
+            elif forward_batch.forward_mode.is_extend():
+                seg_lens_cpu = torch.tensor(
                     forward_batch.extend_seq_lens_cpu,
                     dtype=torch.int32,
                 )
-                if forward_batch.forward_mode.is_extend()
-                else torch.ones(forward_batch.batch_size, dtype=torch.int32)
-            )
+            else:
+                raise ValueError(
+                    f"Unsupported forward mode: {forward_batch.forward_mode}"
+                )
 
             row_weight_indices = torch.repeat_interleave(
                 seq_weight_indices, seg_lens_cpu
