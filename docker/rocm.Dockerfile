@@ -106,11 +106,11 @@ RUN git clone ${AITER_REPO} \
  && git submodule update --init --recursive
 RUN cd aiter \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-          HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+          HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST AITER_MXFP4_MOE_SF=1 python setup.py develop; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-          PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+          PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST AITER_MXFP4_MOE_SF=1 python setup.py develop; \
         else \
-          GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+          GPU_ARCHS=$GPU_ARCH_LIST AITER_MXFP4_MOE_SF=1 python setup.py develop; \
         fi
 
 # -----------------------
@@ -295,6 +295,7 @@ RUN python3 -m pip install --no-cache-dir \
 
 # -----------------------
 # Performance environment variable.
+ENV AITER_MXFP4_MOE_SF=1
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
