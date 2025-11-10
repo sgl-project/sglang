@@ -819,6 +819,10 @@ class ServerArgs:
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
+            # For piecewise cuda graphs
+            if self.enable_piecewise_cuda_graph:
+                reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
+
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
                 if gpu_mem is not None
@@ -900,6 +904,9 @@ class ServerArgs:
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
         if model_arch in ["DeepseekV3ForCausalLM"] and not is_deepseek_nsa(hf_config):
+            if self.enable_piecewise_cuda_graph:
+                logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
+
             if is_cuda() and is_sm100_supported():
                 if (
                     self.attention_backend is None
