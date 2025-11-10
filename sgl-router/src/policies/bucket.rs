@@ -55,7 +55,7 @@ impl BucketPolicy {
                         let model_id = bucket_ref.key();
                         let bucket = bucket_ref.value();
                         match bucket.write() {
-                            OK(mut bucket_guard) => {
+                            Ok(mut bucket_guard) => {
                                 bucket_guard.adjust_boundary();
                             }
                             Err(e) => {
@@ -65,7 +65,7 @@ impl BucketPolicy {
                     }
                 }
             }))
-        }
+        };
 
         Self {
             config,
@@ -162,7 +162,7 @@ impl BucketPolicy {
         }
     }
 
-    pub fn remove_prefill_url(&self, url: &str) {
+    pub fn remove_prefill_url(&self, worker: &dyn Worker) {
         let model_id = worker.model_id();
         let model_key = if model_id.is_empty() || model_id == "unknown" {
             "default"
@@ -172,7 +172,7 @@ impl BucketPolicy {
 
         if let Some(bucket_entry) = self.buckets.get(model_key) {
             let bucket = bucket_entry.value();
-            let worker_url = worker.url.to_string();
+            let worker_url = worker.url().to_string();
 
             let lock_result = bucket.write();
             if let Ok(mut bucket_guard) = lock_result {
@@ -261,7 +261,8 @@ impl LoadBalancingPolicy for BucketPolicy {
                         let url = workers[healthy_indices[idx]].url();
                         warn!("No URL found, randomly selecting: {}", url);
                         url.to_string()
-                    })
+                    });
+                min_url
             } else {
                 info!("select prefill instance by Bucket policy");
                 match choiced_url {
@@ -288,7 +289,7 @@ impl LoadBalancingPolicy for BucketPolicy {
             let selected_worker = &workers[healthy_indices[idx]];
             let prefill_url = selected_worker.url().to_string();
             prefill_url
-        }
+        };
 
         workers.iter().position(|w| w.url() == prefill_url)
     }
