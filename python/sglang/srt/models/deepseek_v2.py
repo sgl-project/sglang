@@ -52,6 +52,7 @@ from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
@@ -1553,13 +1554,16 @@ class DeepseekV2AttentionMLA(nn.Module):
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
-            # If FP8, need to dequantize first
-            if self.kv_cache_dtype == "fp8_e4m3":
-                from sglang.srt.layers.attention.nsa.dequant_k_cache import (
-                    dequantize_k_cache_paged,
+            # If FP8 with NSA, need to dequantize first (NSA uses DeepSeek-specific FP8 format)
+            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
+                # Reuse pre-computed page_table_1_flattened from nsa_backend metadata
+                kv_indices = (
+                    forward_batch.attn_backend.forward_metadata.page_table_1_flattened
                 )
+                assert (
+                    kv_indices is not None
+                ), "page_table_1_flattened should have been generated for FP8 MHA path"
 
-                kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
                 kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
                     self.attn_mha.layer_id
                 )
