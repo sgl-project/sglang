@@ -1,16 +1,20 @@
 // Factory and registry for creating model-specific reasoning parsers.
 // Now with parser pooling support for efficient reuse across requests.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use tokio::sync::Mutex;
 
-use crate::reasoning_parser::parsers::{
-    BaseReasoningParser, DeepSeekR1Parser, Glm45Parser, KimiParser, Qwen3Parser,
-    QwenThinkingParser, Step3Parser,
+use crate::reasoning_parser::{
+    parsers::{
+        BaseReasoningParser, DeepSeekR1Parser, Glm45Parser, KimiParser, Qwen3Parser,
+        QwenThinkingParser, Step3Parser,
+    },
+    traits::{ParseError, ParserConfig, ReasoningParser},
 };
-use crate::reasoning_parser::traits::{ParseError, ParserConfig, ReasoningParser};
 
 /// Type alias for pooled parser instances.
 /// Uses tokio::Mutex to avoid blocking the async executor.
@@ -402,8 +406,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_high_concurrency_parser_access() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Instant;
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Instant,
+        };
 
         let factory = ParserFactory::new();
         let num_tasks = 100;

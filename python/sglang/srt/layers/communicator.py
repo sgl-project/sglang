@@ -15,13 +15,17 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -34,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_global_dp_buffer,
     get_local_dp_buffer,
+    is_allocation_symmetric,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import (
@@ -212,6 +217,32 @@ class LayerCommunicator:
             )
         )
 
+        self._speculative_algo = SpeculativeAlgorithm.from_string(
+            get_global_server_args().speculative_algorithm
+        )
+
+    def prepare_attn_and_capture_last_layer_outputs(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+    ):
+        hidden_states, residual = self.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if captured_last_layer_outputs is not None:
+            gathered_last_layer_output = self._communicate_simple_fn(
+                hidden_states=residual,
+                forward_batch=forward_batch,
+                context=self._context,
+            )
+            if gathered_last_layer_output is residual:
+                # Clone to avoid modifying the original residual by Custom RMSNorm inplace operation
+                gathered_last_layer_output = residual.clone()
+            captured_last_layer_outputs.append(gathered_last_layer_output)
+        return hidden_states, residual
+
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
@@ -237,7 +268,7 @@ class LayerCommunicator:
                     residual = hidden_states
 
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
-                        hidden_states = fused_rms_mxfp4_quant(
+                        hidden_states, *_, _ = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
                             self.input_layernorm.variance_epsilon,
@@ -250,7 +281,7 @@ class LayerCommunicator:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
-                        hidden_states, residual = fused_rms_mxfp4_quant(
+                        hidden_states, *_, residual = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
                             self.input_layernorm.variance_epsilon,
@@ -315,13 +346,10 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        speculative_algo = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
-        )
         if (
             is_dp_attention_enabled()
-            and speculative_algo is not None
-            and speculative_algo.is_eagle()
+            and self._speculative_algo is not None
+            and self._speculative_algo.is_eagle()
         ):
             return False
 
@@ -336,6 +364,7 @@ class LayerCommunicator:
         static_conditions_met = (
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
+            and not is_dp_attention_enabled()
             and get_global_server_args().enable_flashinfer_allreduce_fusion
             and _is_flashinfer_available
         )
@@ -516,7 +545,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
                 residual = hidden_states
-                hidden_states = layernorm(hidden_states)
+                with use_symmetric_memory(
+                    get_tp_group(),
+                    disabled=not is_allocation_symmetric(),
+                ):
+                    hidden_states = layernorm(hidden_states)
+
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),
                 hidden_states,
