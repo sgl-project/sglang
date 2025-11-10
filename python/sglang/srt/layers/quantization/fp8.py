@@ -1190,10 +1190,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         activation = self.moe_runner_config.activation
         routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
-        from flashinfer import RoutingMethodType
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 
         from sglang.srt.layers.moe.topk import TopKOutputChecker
+        from sglang.srt.layers.moe.utils import RoutingMethodType
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
         router_logits = topk_output.router_logits
