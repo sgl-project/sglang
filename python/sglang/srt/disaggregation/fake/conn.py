@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -49,10 +49,13 @@ class FakeKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        state_indices: Optional[List[int]] = None,
         embedding_index: Optional[int] = None,
     ):
         self.has_sent = True
-        logger.debug(f"FakeKVSender send with kv_indices: {kv_indices}")
+        logger.debug(
+            f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}, embedding_index: {embedding_index}"
+        )
 
     def send_embedding(
         self,
@@ -93,6 +96,7 @@ class FakeKVReceiver(BaseKVReceiver):
         self,
         kv_indices: Optional[list[int]] = None,
         aux_index: Optional[int] = None,
+        state_indices: Optional[List[int]] = None,
         embedding_indices: Optional[list[int]] = None,
         allocated_tokens: Optional[int] = None,
     ):

@@ -23,7 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     align,
     direct_register_custom_op,
@@ -67,7 +67,7 @@ if _is_hip:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
         try:
-            import vllm._C
+            import vllm._C  # noqa: F401
         except ImportError:
             raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
 
@@ -459,7 +459,7 @@ def create_per_token_group_quant_fp8_output_scale(
                 x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
                 device=device,
                 dtype=torch.float32,
-            ).permute(-1, -2)[: x_shape[-2], :]
+            ).transpose(-1, -2)[: x_shape[-2], :]
         else:
             return torch.empty(
                 (x_shape[-1] // group_size,) + x_shape[:-1],
@@ -1831,3 +1831,21 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
+
+
+if _is_cuda:
+    if enable_sgl_per_token_group_quant_8bit:
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_8bit")
+        def _(
+            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        ):
+            return
+
+    else:
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_fp8")
+        def _(
+            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        ):
+            return

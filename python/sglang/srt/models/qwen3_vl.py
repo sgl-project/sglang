@@ -14,13 +14,13 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
+import re
 from functools import lru_cache, partial
-from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -31,22 +31,29 @@ from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
 
 # === Vision Encoder === #
 
@@ -196,7 +203,7 @@ class Qwen3_VisionBlock(nn.Module):
         return x
 
 
-class Qwen3_VisionPatchMerger(nn.Module):
+class Qwen3VLMoeVisionPatchMerger(nn.Module):
 
     def __init__(
         self,
@@ -246,7 +253,7 @@ class Qwen3_VisionPatchMerger(nn.Module):
         return out
 
 
-class Qwen3_VisionTransformer(nn.Module):
+class Qwen3VLMoeVisionModel(nn.Module):
 
     def __init__(
         self,
@@ -263,10 +270,10 @@ class Qwen3_VisionTransformer(nn.Module):
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = vision_config.temporal_patch_size
+        # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
-
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
@@ -286,7 +293,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 for layer_idx in range(vision_config.depth)
             ]
         )
-        self.merger = Qwen3_VisionPatchMerger(
+        self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
             norm_layer=norm_layer,
@@ -297,7 +304,7 @@ class Qwen3_VisionTransformer(nn.Module):
 
         self.deepstack_merger_list = nn.ModuleList(
             [
-                Qwen3_VisionPatchMerger(
+                Qwen3VLMoeVisionPatchMerger(
                     dim=vision_config.out_hidden_size,
                     context_dim=self.hidden_size,
                     spatial_merge_size=self.spatial_merge_size,
@@ -452,15 +459,16 @@ class Qwen3_VisionTransformer(nn.Module):
         position_embeddings = (emb.cos(), emb.sin())
 
         # compute cu_seqlens
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0)
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], device=grid_thw.device),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
+                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
+                cu_seqlens.to(torch.int32),
             ]
         )
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
-        # max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
         x = x.unsqueeze(1)
 
         deepstack_feature_lists = []
@@ -602,37 +610,60 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         config: Qwen3VLConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
 
-        self.config = config
-        self.visual = Qwen3_VisionTransformer(
+        self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
             quant_config=quant_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
         )
 
-        self.model = Qwen3LLMModel(
-            config=config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
+        # TODO: make it more elegant
+        if language_model_cls is Qwen3LLMModel:
+            self.config: Qwen3VLConfig = config  # for qwen3-vl
+        else:
+            self.config = config.text_config  # for qwen3-omni
 
-        if config.tie_word_embeddings:
+        self.is_multimodal_embedding = False
+        if (
+            hasattr(config, "is_multimodal_embedding")
+            and config.is_multimodal_embedding
+        ):
+            # build a dummy model for text embedding
+            self.model = nn.Module()
+            model_prefix = add_prefix("model", prefix)
+            self.model.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", model_prefix),
+            )
+            setattr(self.model, "get_input_embeddings", lambda: self.model.embed_tokens)
+            self.is_multimodal_embedding = True
+        else:
+            self.model = language_model_cls(
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+
+        if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
+                self.config.vocab_size,
+                self.config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
@@ -640,10 +671,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # deepstack
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-
-    @property
-    def use_deepstack(self) -> bool:
-        return hasattr(self, "deepstack_visual_indexes")
+        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
     def separate_deepstack_embeds(self, embedding):
         assert (
@@ -684,12 +712,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    _lora_pattern = re.compile(
+        r"^model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        get_multimodal_embedding: bool = False,
     ):
         """Run forward pass for Qwen3-VL.
 
@@ -723,7 +759,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             multimodal_model=self,
             positions=positions,
             use_deepstack=self.use_deepstack,
+            get_multimodal_embedding=get_multimodal_embedding,
         )
+
+        if get_multimodal_embedding:
+            return EmbeddingPoolerOutput(embeddings=hidden_states)
 
         if not get_embedding:
             return self.logits_processor(

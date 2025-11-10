@@ -129,6 +129,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
             priority=request.priority,
+            dimensions=request.dimensions,
         )
 
         return adapted_request, request
