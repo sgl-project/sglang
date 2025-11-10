@@ -376,6 +376,7 @@ class MambaRadixCache(BasePrefixCache):
             not self.disable
             and req is not None
             and req.mamba_pool_copy_ping_pong_idx is None
+            and cow_mamba
         ):
             copy_index = self.req_to_token_pool.mamba_pool.alloc(2)
             if copy_index is None:
@@ -384,7 +385,7 @@ class MambaRadixCache(BasePrefixCache):
                 assert copy_index is not None, "Can not alloc mamba cache"
             # rank0_log(f"DEBUG: match_prefix, {req.rid=}, {copy_index=}")
             req.mamba_pool_copy_ping_pong_idx = copy_index
-            req.mamba_pool_copy_next_idx = 0
+            req.mamba_pool_copy_next_idx = req.mamba_pool_copy_current_idx = 0
 
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -402,7 +403,9 @@ class MambaRadixCache(BasePrefixCache):
         # copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
             assert req.req_pool_idx is None  # req_pool_idx is uninitialed
-
+            ping_pong_idx = req.mamba_pool_copy_ping_pong_idx[
+                req.mamba_pool_copy_next_idx
+            ].unsqueeze(-1)
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
@@ -415,11 +418,13 @@ class MambaRadixCache(BasePrefixCache):
                     assert dst_index is not None, "Can not alloc mamba cache"
                 src_index = last_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                self.req_to_token_pool.mamba_pool.copy_from(src_index, ping_pong_idx)
                 req.mamba_pool_idx = dst_index[0]
             else:
                 src_index = last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                self.req_to_token_pool.mamba_pool.copy_from(src_index, ping_pong_idx)
 
         if value:
             value = torch.cat(value)
@@ -482,11 +487,13 @@ class MambaRadixCache(BasePrefixCache):
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
         mamba_value = (
-            req.mamba_pool_copy_ping_pong_idx[1 - req.mamba_pool_copy_next_idx]
+            req.mamba_pool_copy_ping_pong_idx[req.mamba_pool_copy_current_idx]
             .unsqueeze(-1)
             .clone()
         )
 
+        # Open it for debug in page_size = 1
+        # self._check_consistent(req, mamba_value.squeeze(-1))
         new_prefix_len, mamba_exist = self.insert(
             RadixKey(token_ids[:page_aligned_len], req.extra_key),
             page_aligned_kv_indices,
@@ -502,7 +509,7 @@ class MambaRadixCache(BasePrefixCache):
             self.req_to_token_pool.mamba_pool.free(mamba_value)
 
         mamba_value_other = (
-            req.mamba_pool_copy_ping_pong_idx[req.mamba_pool_copy_next_idx]
+            req.mamba_pool_copy_ping_pong_idx[1 - req.mamba_pool_copy_current_idx]
             .unsqueeze(-1)
             .clone()
         )
@@ -514,6 +521,21 @@ class MambaRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
 
+    def _check_consistent(self, req: Req, mamba_value) -> None:
+        ssm_expect = self.req_to_token_pool.mamba_pool.mamba_cache.temporal[
+            :, req.mamba_pool_idx
+        ]
+        ssm_actual = self.req_to_token_pool.mamba_pool.mamba_cache.temporal[
+            :, mamba_value
+        ]
+        assert torch.equal(ssm_expect, ssm_actual)
+
+        conv_expect = self.req_to_token_pool.mamba_pool.mamba_cache.conv[
+            :, req.mamba_pool_idx
+        ]
+        conv_actual = self.req_to_token_pool.mamba_pool.mamba_cache.conv[:, mamba_value]
+        assert torch.equal(conv_expect, conv_actual)
+
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
@@ -521,7 +543,7 @@ class MambaRadixCache(BasePrefixCache):
                 req.req_pool_idx, : len(req.fill_ids)
             ]
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         token_ids = req.fill_ids
@@ -539,11 +561,15 @@ class MambaRadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
+        assert req.mamba_pool_copy_current_idx is not None
         mamba_value = (
-            req.mamba_pool_copy_ping_pong_idx[1 - req.mamba_pool_copy_next_idx]
+            req.mamba_pool_copy_ping_pong_idx[req.mamba_pool_copy_current_idx]
             .unsqueeze(-1)
             .clone()
         )
+
+        # Open it for debug in page_size = 1
+        # self._check_consistent(req, mamba_value.squeeze(-1))
         # radix tree mamba value is forked from req space
         mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
 
@@ -925,9 +951,13 @@ class MambaRadixCache(BasePrefixCache):
             node.mamba_value = mamba_value
             self.mamba_evictable_size_ += len(mamba_value)
             self.mamba_lru_list.insert_mru(node)
+            self.full_lru_list.reset_node_mru(node)
+            node.last_access_time = time.monotonic()
         else:
             mamba_value_exist = True
             self.mamba_lru_list.reset_node_mru(node)
+            self.full_lru_list.reset_node_mru(node)
+            node.last_access_time = time.monotonic()
 
         return total_prefix_length, mamba_value_exist
 

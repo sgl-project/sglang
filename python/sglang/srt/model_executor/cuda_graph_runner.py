@@ -773,6 +773,11 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        self.mamba_pool_copy_indices[:raw_bs].copy_(
+            forward_batch.mamba_pool_copy_indices
+        )
+        self.mamba_copy_mask.fill_(False)
+        self.mamba_copy_mask[:raw_bs].copy_(forward_batch.mamba_copy_mask)
 
         seq_lens_cpu = None
         if forward_batch.seq_lens_cpu is not None:

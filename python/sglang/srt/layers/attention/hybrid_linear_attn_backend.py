@@ -501,9 +501,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                 intermediate_cache_indices=forward_batch.mamba_pool_copy_indices,
-                intermediate_positions=forward_batch.mamba_store_extend_seqlen - 1,
+                intermediate_positions=forward_batch.mamba_store_extend_seqlen,
                 intermediate_cu_seqlens=intermediate_cu_seqlens,
             ).transpose(0, 1)[:seq_len]
+            # debug for page size = 1
+            # assert torch.equal(
+            #     conv_states_to_use[forward_batch.mamba_pool_copy_indices],
+            #     conv_states_to_use[cache_indices],
+            # )
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -557,16 +562,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cu_seqlens=query_start_loc,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
-                    intermediate_positions=forward_batch.mamba_store_extend_seqlen - 1,
+                    intermediate_positions=forward_batch.mamba_store_extend_seqlen,
                     intermediate_cu_seqlens=intermediate_cu_seqlens,
                 )
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
-            mask = forward_batch.mamba_store_extend_seqlen - 1 > 0
-            ssm_states[forward_batch.mamba_pool_copy_indices[mask]] = (
-                intermediate_state[mask]
-            )
+            ssm_states[forward_batch.mamba_pool_copy_indices] = intermediate_state
+            # debug for page size = 1
+            # assert torch.equal(intermediate_state, last_recurrent_state)
 
         return core_attn_out
 

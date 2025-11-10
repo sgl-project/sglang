@@ -492,6 +492,7 @@ class Req:
         self.mamba_pool_copy_last_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
+        self.mamba_pool_copy_current_idx: Optional[int] = None  # 0 or 1
 
         # Check finish
         self.tokenizer = None
