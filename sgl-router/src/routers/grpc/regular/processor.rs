@@ -197,16 +197,14 @@ impl ResponseProcessor {
         };
 
         // Step 6: Build ChatChoice
-        let choice = ChatChoice {
+        Ok(ChatChoice {
             index: index as u32,
             message: chat_message,
             logprobs,
             finish_reason: Some(final_finish_reason_str.to_string()),
             matched_stop,
             hidden_states: None,
-        };
-
-        Ok(choice)
+        })
     }
 
     /// Process non-streaming chat response (collects all responses and builds final response)
@@ -289,14 +287,14 @@ impl ResponseProcessor {
         let usage = response_formatting::build_usage(&all_responses);
 
         // Build final ChatCompletionResponse
-        let response = response_formatting::build_chat_response(
-            choices,
-            &dispatch,
-            dispatch.model.clone(),
-            usage,
-        );
-
-        Ok(response)
+        Ok(
+            ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
+                .created(dispatch.created)
+                .choices(choices)
+                .usage(usage)
+                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .build(),
+        )
     }
 
     /// Parse tool calls using model-specific parser

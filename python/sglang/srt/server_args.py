@@ -152,6 +152,8 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
@@ -202,6 +204,10 @@ def add_radix_supported_deterministic_attention_backend_choices(choices):
 
 def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
+
+
+def add_rl_on_policy_target_choices(choices):
+    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
 def add_mamba_ssm_dtype_choices(choices):
@@ -432,9 +438,9 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
-    # Ktransformers
-    kt_amx_weight_path: Optional[str] = None
-    kt_amx_method: Optional[str] = None
+    # Ktransformers/AMX expert parallelism
+    kt_weight_path: Optional[str] = None
+    kt_method: Optional[str] = None
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
@@ -597,9 +603,6 @@ class ServerArgs:
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
-
-        # Handle Ktransformers specific configs
-        self._handle_ktransformers_configs()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -907,24 +910,38 @@ class ServerArgs:
                     logger.info(
                         "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                     )
-                if not self.enable_dp_attention:
+                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
+                if not self.enable_dp_attention and self.nnodes == 1:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if self.moe_a2a_backend == "none" and self.moe_runner_backend == "auto":
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
-                    )
-                    if self.quantization is None:
-                        # Default DeepSeek V3/R1 native FP8 when not explicitly set,
-                        # Because we need this condition for an assertion in
-                        # flashinfer_trtllm MoE runner backend.
+                quantization_config = getattr(hf_config, "quantization_config", None)
+                quant_method = (
+                    quantization_config.get("quant_method")
+                    if quantization_config is not None
+                    else None
+                )
+                if self.quantization is None:
+                    # Default DeepSeek V3/R1 native FP8 when not explicitly set,
+                    # Because we need this condition for an assertion in
+                    # flashinfer_trtllm MoE runner backend.
+                    if quant_method is None:
                         self.quantization = "fp8"
                         logger.info(
                             "Quantization not specified, default to fp8 for DeepSeek on sm100"
                         )
+                    else:
+                        self.quantization = quant_method
+                if (
+                    self.moe_a2a_backend == "none"
+                    and self.moe_runner_backend == "auto"
+                    and self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
+                    )
 
         elif model_arch in ["GptOssForCausalLM"]:
             if (
@@ -951,7 +968,8 @@ class ServerArgs:
             )
 
             if is_blackwell_supported():
-                if not self.enable_dp_attention:
+                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
+                if not self.enable_dp_attention and self.nnodes == 1:
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
@@ -989,7 +1007,8 @@ class ServerArgs:
                 "aiter",
                 "triton",
                 "trtllm_mha",
-            }, "fa3, aiter, triton, or trtllm_mha is required for Llama4 model"
+                "intel_xpu",
+            }, "fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model"
             if is_sm100_supported() and self.attention_backend is None:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(
@@ -1247,9 +1266,9 @@ class ServerArgs:
             raise ValueError(
                 "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
             )
-        if self.prefill_attention_backend == "fa4":
+        if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
             logger.warning(
-                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 128."
+                f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
             )
             self.page_size = 128
 
@@ -1325,39 +1344,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-    def _handle_ktransformers_configs(self):
-        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-            CompressedTensorsWNA16AMXEPMoEMethod,
-            override_config,
-        )
-
-        num_hidden_layers = None
-        if self.kt_max_deferred_experts_per_token is not None:
-            try:
-                model_config = self.get_model_config()
-                base_config = (
-                    getattr(model_config, "hf_text_config", None)
-                    or model_config.hf_config
-                )
-                num_hidden_layers = getattr(base_config, "num_hidden_layers", None)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to load model config for kt_max_deferred_experts_per_token: %s",
-                    exc,
-                )
-
-        override_config(
-            CompressedTensorsWNA16AMXEPMoEMethod,
-            self.kt_num_gpu_experts,
-            self.kt_cpuinfer,
-            self.kt_threadpool_count,
-            self.kt_amx_weight_path,
-            self.kt_amx_method,
-            self.chunked_prefill_size,
-            self.kt_max_deferred_experts_per_token,
-            num_hidden_layers,
-        )
-
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
@@ -1380,7 +1366,7 @@ class ServerArgs:
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
                 self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            ), "modelopt_fp4 quantization is required for Flashinfer Cutlass MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -3031,12 +3017,12 @@ class ServerArgs:
 
         # Ktransformer server args
         parser.add_argument(
-            "--kt-amx-weight-path",
+            "--kt-weight-path",
             type=str,
             help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
         )
         parser.add_argument(
-            "--kt-amx-method",
+            "--kt-method",
             type=str,
             default="AMXINT4",
             help="[ktransformers parameter] Quantization formats for CPU execution.",
@@ -3061,9 +3047,8 @@ class ServerArgs:
             "--kt-max-deferred-experts-per-token",
             type=int,
             default=ServerArgs.kt_max_deferred_experts_per_token,
-            help="Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+            help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
-
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
@@ -3413,7 +3398,7 @@ class ServerArgs:
             "--rl-on-policy-target",
             type=str,
             default=ServerArgs.rl_on_policy_target,
-            choices=["fsdp"],
+            choices=RL_ON_POLICY_TARGET_CHOICES,
             help="The training system that SGLang needs to match for true on-policy.",
         )
 
@@ -3692,6 +3677,13 @@ class ServerArgs:
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
+
+        # Check served model name to not have colon as it is reserved for LoRA adapter syntax
+        assert ":" not in self.served_model_name, (
+            "served_model_name cannot contain a colon (':') character. "
+            "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
+            f"Invalid value: '{self.served_model_name}'"
+        )
 
         # Check LoRA
         self.check_lora_server_args()
@@ -4010,7 +4002,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
-DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
 
 
 @dataclasses.dataclass
