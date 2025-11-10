@@ -141,8 +141,8 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: List[torch.Tensor]
-        intermediate_conv_window: torch.Tensor
+        intermediate_ssm: torch.Tensor
+        intermediate_conv_window: List[torch.Tensor]
 
     def __init__(
         self,
