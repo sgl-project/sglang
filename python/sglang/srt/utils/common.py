@@ -2690,6 +2690,7 @@ def log_info_on_rank0(logger, msg):
     except:
         logger.info(msg)
 
+
 def load_json_config(data: str):
     try:
         return orjson.loads(data)
