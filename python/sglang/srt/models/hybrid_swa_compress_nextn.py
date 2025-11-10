@@ -7,7 +7,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, enable_moe_dense_fully_dp
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     is_dp_attention_enabled,
@@ -74,7 +74,12 @@ class HybridSWACompressedMTPLayer(nn.Module):
         self.is_layer_sparse = False
         # TODO: 这里只有第一层MTP是Ture，后续应该都是False
         is_previous_layer_sparse = True
-        mlp_tp_rank, mlp_tp_size = None, None
+
+        if enable_moe_dense_fully_dp():
+            print("enable_moe_dense_fully_dp")
+            mlp_tp_rank, mlp_tp_size = 0, 1
+        else:
+            mlp_tp_rank, mlp_tp_size = None, None
         self.mlp = HybridSWACompressedMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -195,8 +200,13 @@ class HybridSWACompressedModelNextN(nn.Module):
             forward_batch=forward_batch,
             residual=None,
         )
-        hidden_states = residual + hidden_states
-        hidden_states = self.final_layernorm(hidden_states)
+
+        if not forward_batch.forward_mode.is_idle():
+            if residual is not None:
+                hidden_states, _ = self.final_layernorm(hidden_states, residual)
+            else:
+                hidden_states = self.final_layernorm(hidden_states)
+
         return hidden_states
 
 
