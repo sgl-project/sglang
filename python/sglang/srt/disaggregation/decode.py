@@ -854,7 +854,10 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         if batch.inner_idle_batch is not None:
-            return self.run_batch(batch.inner_idle_batch)
+            idle_batch = batch.inner_idle_batch
+            # Reset the inner idle batch to avoid reusing it.
+            batch.inner_idle_batch = None
+            return self.run_batch(idle_batch)
 
         return GenerationBatchResult()
 
