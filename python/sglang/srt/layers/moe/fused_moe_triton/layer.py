@@ -549,7 +549,7 @@ class FusedMoE(torch.nn.Module):
         # WARN: This makes the `expert_id` mean "local" and "global" in different cases
         if not getattr(param, "_sglang_require_global_experts", False):
             expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-            if expert_id < 0 or expert_id >= self.num_experts:
+            if expert_id < 0 or expert_id >= self.num_local_experts:
                 return
 
         if isinstance(
@@ -853,7 +853,7 @@ class FusedMoE(torch.nn.Module):
             self.expert_mask_gpu = (
                 (
                     (self.dispatcher.local_expert_mapping >= 0)
-                    & (self.dispatcher.local_expert_mapping < self.num_experts)
+                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
                 )
                 .to(torch.int32)
                 .to(device="cuda")
