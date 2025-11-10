@@ -64,11 +64,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
-from sglang.srt.layers.moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
-    get_global_experts_capturer,
-    set_global_experts_capturer,
-)
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -680,17 +676,6 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
-    def init_routed_experts_capturer(self):
-        set_global_experts_capturer(
-            RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts,
-                model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
-                max_running_requests=self.max_running_requests,
-                device=self.device,
-            )
-        )
-
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
@@ -853,9 +838,6 @@ class Scheduler(
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
         init_embedding_cache(embedding_cache_size * 1024 * 1024)
-
-        # Init routed experts capturer
-        self.init_routed_experts_capturer()
 
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
