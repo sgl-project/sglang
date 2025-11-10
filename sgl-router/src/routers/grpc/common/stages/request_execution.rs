@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 
 use super::PipelineStage;
 use crate::{
@@ -35,17 +36,21 @@ impl RequestExecutionStage {
 #[async_trait]
 impl PipelineStage for RequestExecutionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let proto_request = ctx
-            .state
-            .proto_request
-            .take()
-            .ok_or_else(|| error::internal_error("Proto request not built"))?;
+        let proto_request = ctx.state.proto_request.take().ok_or_else(|| {
+            error!(
+                function = "RequestExecutionStage::execute",
+                "Proto request not built"
+            );
+            error::internal_error("Proto request not built")
+        })?;
 
-        let clients = ctx
-            .state
-            .clients
-            .as_mut()
-            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
+        let clients = ctx.state.clients.as_mut().ok_or_else(|| {
+            error!(
+                function = "RequestExecutionStage::execute",
+                "Client acquisition not completed"
+            );
+            error::internal_error("Client acquisition not completed")
+        })?;
 
         let result = match self.mode {
             ExecutionMode::Single => self.execute_single(proto_request, clients).await?,
@@ -70,14 +75,22 @@ impl RequestExecutionStage {
         proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
-        let client = clients
-            .single_mut()
-            .ok_or_else(|| error::internal_error("Expected single client but got dual"))?;
+        let client = clients.single_mut().ok_or_else(|| {
+            error!(
+                function = "execute_single",
+                "Expected single client but got dual"
+            );
+            error::internal_error("Expected single client but got dual")
+        })?;
 
-        let stream = client
-            .generate(proto_request)
-            .await
-            .map_err(|e| error::internal_error(format!("Failed to start generation: {}", e)))?;
+        let stream = client.generate(proto_request).await.map_err(|e| {
+            error!(
+                function = "execute_single",
+                error = %e,
+                "Failed to start generation"
+            );
+            error::internal_error(format!("Failed to start generation: {}", e))
+        })?;
 
         Ok(ExecutionResult::Single { stream })
     }
@@ -87,9 +100,13 @@ impl RequestExecutionStage {
         proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
-        let (prefill_client, decode_client) = clients
-            .dual_mut()
-            .ok_or_else(|| error::internal_error("Expected dual clients but got single"))?;
+        let (prefill_client, decode_client) = clients.dual_mut().ok_or_else(|| {
+            error!(
+                function = "execute_dual_dispatch",
+                "Expected dual clients but got single"
+            );
+            error::internal_error("Expected dual clients but got single")
+        })?;
 
         let prefill_request = proto_request.clone();
         let decode_request = proto_request;
@@ -103,6 +120,11 @@ impl RequestExecutionStage {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
+                error!(
+                    function = "execute_dual_dispatch",
+                    error = %e,
+                    "Prefill worker failed to start"
+                );
                 return Err(error::internal_error(format!(
                     "Prefill worker failed to start: {}",
                     e
@@ -114,6 +136,11 @@ impl RequestExecutionStage {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
+                error!(
+                    function = "execute_dual_dispatch",
+                    error = %e,
+                    "Decode worker failed to start"
+                );
                 return Err(error::internal_error(format!(
                     "Decode worker failed to start: {}",
                     e
