@@ -764,8 +764,7 @@ class DecodeTransferQueue:
                         ].tolist()
                     )
 
-                if hasattr(decode_req.kv_receiver, "clear"):
-                    decode_req.kv_receiver.clear()
+                decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
 
                 indices_to_remove.add(i)
