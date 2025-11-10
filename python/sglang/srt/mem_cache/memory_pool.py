@@ -17,9 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.srt.configs.mamba_utils import (
-    BaseLinearStateParams,
-)
+from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
