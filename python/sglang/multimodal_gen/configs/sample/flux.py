@@ -15,4 +15,4 @@ class FluxSamplingParams(SamplingParams):
     # Denoising stage
     guidance_scale: float = 1.0
     negative_prompt: str = None
-    num_inference_steps: int = 50
+    # num_inference_steps: int = 50
