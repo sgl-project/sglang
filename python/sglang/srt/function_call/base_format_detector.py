@@ -8,6 +8,7 @@ from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -75,19 +76,21 @@ class BaseFormatDetector(ABC):
         results = []
         for act in action:
             name = act.get("name")
-            if name and name in tool_indices:
-                results.append(
-                    ToolCallItem(
-                        tool_index=-1,  # Caller should update this based on the actual tools array called
-                        name=name,
-                        parameters=json.dumps(
-                            act.get("parameters") or act.get("arguments", {}),
-                            ensure_ascii=False,
-                        ),
-                    )
-                )
-            else:
+            if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
+                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                    continue  # Skip unknown tools (default legacy behavior)
+
+            results.append(
+                ToolCallItem(
+                    tool_index=-1,  # Caller should update this based on the actual tools array called
+                    name=name,
+                    parameters=json.dumps(
+                        act.get("parameters") or act.get("arguments", {}),
+                        ensure_ascii=False,
+                    ),
+                )
+            )
 
         return results
 
@@ -265,18 +268,26 @@ class BaseFormatDetector(ABC):
                         # Only remove the processed portion, keep unprocessed content
                         self._buffer = current_text[start_idx + end_idx :]
 
-                        if self.current_tool_id < len(self.prev_tool_call_arr):
-                            self.prev_tool_call_arr[self.current_tool_id].clear()
-                        self.current_tool_name_sent = False
-                        self.streamed_args_for_tool[self.current_tool_id] = ""
-                        self.current_tool_id += 1
-
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
                         prev_args_json = json.dumps(prev_arguments)
                         if cur_args_json != prev_args_json:
                             prefix = _find_common_prefix(prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]
+
+                    # Update prev_tool_call_arr with current state
+                    if self.current_tool_id >= 0:
+                        # Ensure prev_tool_call_arr is large enough
+                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                            self.prev_tool_call_arr.append({})
+                        self.prev_tool_call_arr[self.current_tool_id] = (
+                            current_tool_call
+                        )
+
+                    # Advance to next tool if complete
+                    if is_current_complete:
+                        self.current_tool_name_sent = False
+                        self.current_tool_id += 1
 
                     # Send the argument diff if there's something new
                     if argument_diff is not None:
@@ -294,17 +305,7 @@ class BaseFormatDetector(ABC):
                                 )
                             ],
                         )
-                        if not is_current_complete:
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += argument_diff
-
-            # Update prev_tool_call_arr with current state
-            if self.current_tool_id >= 0:
-                # Ensure prev_tool_call_arr is large enough
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
+                        self.streamed_args_for_tool[tool_index_to_use] += argument_diff
 
             return res
 
