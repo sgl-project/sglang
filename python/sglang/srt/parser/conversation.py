@@ -66,6 +66,7 @@ class SeparatorStyle(IntEnum):
     QWEN2_AUDIO = auto()
     GEMMA3 = auto()
     MPT = auto()
+    PADDLE_OCR = auto()
 
 
 @dataclasses.dataclass
@@ -374,6 +375,22 @@ class Conversation:
                 else:
                     ret += role + "\n"
 
+            return ret
+        elif self.sep_style == SeparatorStyle.PADDLE_OCR:
+            ret = system_prompt
+            for role, message in self.messages:
+                if message:
+                    ret += role + ": "
+                    if role == self.roles[0]:
+                        if self.image_token in message:
+                            ret += message.replace(self.image_token + "\n", self.image_token)
+                        else:
+                            ret += message
+                        ret += "\n"
+                    else:
+                        ret += message + self.sep
+                else:
+                    ret += role + ": "  # must be end with a space
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
