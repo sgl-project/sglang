@@ -111,78 +111,122 @@ class DynamicShortConvolution(nn.Module):
 
         Returns:
             out: (cu_seq_len, hidden_size)
-            conv_state: (batch_size, hidden_size, kernel_size - 1)
+            new_conv_state: (batch_size, hidden_size, kernel_size - 1)
         """
 
-        x_seqs = self._continuous_to_seqs(x, seq_lens=seq_lens)
-        conv_state = einops.rearrange(conv_state, "b d k -> b k d")
-        x_seqs = [torch.cat([conv_state[i], x_seqs[i]]) for i in range(len(x_seqs))]
-        x = self._seqs_to_batch(
-            x_seqs
-        )  # (batch_size, max_seq_len + kernel_size - 1, hidden_size)
+        batch_size = seq_lens.shape[0]
+        cu_seq_len, _ = x.shape
 
-        x = einops.rearrange(x, "b l d -> b d l")
+        # Interleave conv_state and x.
+        conv_state_indices, x_indices = self._get_interleave_indices(
+            conv_state_size=self.kernel_size - 1,
+            cu_seq_len=x.shape[0],
+            seq_lens=seq_lens,
+        )  # (batch_size * (kernel_size - 1),), (cu_seq_len,)
 
-        new_conv_state = x[
-            :, :, -(self.kernel_size - 1) :
-        ]  # (batch_size, hidden_size, kernel_size - 1)
+        flatten_conv_state = einops.rearrange(conv_state, "b d k -> (b k) d")
 
-        x = x.unfold(
-            dimension=-1, size=self.kernel_size, step=1
-        )  # (batch_size, hidden_size, max_seq_len, kernel_size)
-        x = einops.rearrange(x, "b d l k -> b l d k")
+        interleaved = torch.empty(
+            cu_seq_len + batch_size * (self.kernel_size - 1),
+            self.hidden_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
 
-        kernels = self.kernel_generator(
-            generator_input
-        )  # (cu_seq_len, hidden_size * kernel_size)
+        interleaved.scatter_(
+            dim=0,
+            index=conv_state_indices.unsqueeze(1).expand(-1, self.hidden_size),
+            src=flatten_conv_state,
+        )
+        interleaved.scatter_(
+            dim=0,
+            index=x_indices.unsqueeze(1).expand(-1, self.hidden_size),
+            src=x,
+        )
+
+        # Generate convolution kernels.
+        kernels = self.kernel_generator(generator_input)
         kernels = einops.rearrange(
             kernels,
             "l (d k) -> l d k",
             d=self.hidden_size,
             k=self.kernel_size,
-        )
-        kernels = self._seqs_to_batch(
-            self._continuous_to_seqs(kernels, seq_lens=seq_lens)
-        )  # (batch_size, max_seq_len, hidden_size, kernel_size)
+        )  # (cu_seq_len, hidden_size, kernel_size)
 
-        out = (x * kernels).sum(dim=-1)  # (batch_size, max_seq_len, hidden_size)
+        # Unfold combined_conv_x.
+        unfolded_interleaved = interleaved.unfold(
+            dimension=0,
+            size=self.kernel_size,
+            step=1,
+        )  # (cu_seq_len + (batch_size - 1) * (kernel_size - 1), hidden_size, kernel_size)
 
-        out = self._batch_to_continuous(
-            out, seq_lens=seq_lens
-        )  # (cu_seq_len, hidden_size)
+        unfolded_interleaved = torch.gather(
+            unfolded_interleaved,
+            0,
+            (x_indices - (self.kernel_size - 1))
+            .unsqueeze(1)
+            .unsqueeze(2)
+            .expand(-1, self.hidden_size, self.kernel_size),
+        )  # (cu_seq_len, hidden_size, kernel_size)
 
+        # Apply dynamic convolution.
+        out = (unfolded_interleaved * kernels).sum(dim=-1)  # (cu_seq_len, hidden_size)
         out = nn.functional.silu(out)
+
+        # Update conv_state.
+        new_conv_state = unfolded_interleaved[
+            torch.cumsum(seq_lens, dim=0) - 1, :, 1:
+        ]  # (cu_seq_len, hidden_size, kernel_size - 1)
 
         return out, new_conv_state
 
-    def _batch_to_continuous(
-        self,
-        x: torch.Tensor,
+    @staticmethod
+    def _get_interleave_indices(
         *,
+        conv_state_size: int,
+        cu_seq_len: int,
         seq_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.cat([x[i, -seq_lens[i] :] for i in range(seq_lens.size(0))])
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gets the interleave indices to interleave conv_state and x.
 
-    def _continuous_to_seqs(
-        self,
-        x: torch.Tensor,
-        *,
-        seq_lens: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        return [
-            x[(seq_lens[:i].sum()) : (seq_lens[: i + 1].sum())]
-            for i in range(seq_lens.size(0))
-        ]
+        Args:
+            conv_state_size: The size of conv_state to be prepended for each sequence.
+            cu_seq_len: The cumulative sequence length.
+            seq_lens: the lengths of each sequence in shape (batch_size,).
 
-    def _seqs_to_batch(
-        self,
-        seqs: list[torch.Tensor],
-    ) -> torch.Tensor:
-        return nn.utils.rnn.pad_sequence(
-            seqs,
-            batch_first=True,
-            padding_side="left",
-        )
+        Returns:
+            - The interleave indices of conv_state in shape (batch_size * conv_state_size,).
+            - The interleave indices of x in shape (cu_seq_len,).
+        """
+
+        device = seq_lens.device
+
+        batch_size = seq_lens.shape[0]
+
+        seq_ends_in_x = torch.cumsum(seq_lens, dim=0)
+
+        seq_starts_in_x = nn.functional.pad(seq_ends_in_x[:-1], (1, 0))
+
+        seq_starts = (
+            seq_starts_in_x + torch.arange(batch_size, device=device) * conv_state_size
+        )  # (batch_size,)
+
+        conv_state_indices = (
+            seq_starts.unsqueeze(1)
+            + torch.arange(conv_state_size, device=device).unsqueeze(0)
+        ).flatten()  # (batch_size * conv_state_size,)
+
+        x_indices_in_x = torch.arange(cu_seq_len, device=device)
+
+        seq_ids = torch.searchsorted(
+            seq_ends_in_x, x_indices_in_x, side="right"
+        )  # (cu_seq_len,)
+
+        shifts = (seq_ids + 1) * conv_state_size
+
+        x_indices = x_indices_in_x + shifts
+
+        return conv_state_indices, x_indices
 
 
 class JetBlock(nn.Module):
@@ -300,6 +344,7 @@ class JetBlock(nn.Module):
                 if forward_batch.extend_seq_lens is not None
                 else torch.ones(
                     (forward_batch.batch_size,),
+                    device=hidden_states.device,
                     dtype=torch.long,
                 )
             ),
