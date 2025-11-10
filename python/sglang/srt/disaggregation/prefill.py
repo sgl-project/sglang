@@ -357,12 +357,10 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
-
-            if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
-
-            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+            else:
                 self.self_check_during_idle()
+
+            self.process_disagg_prefill_inflight_queue()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -390,14 +388,12 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
+            elif batch is None:
+                self.self_check_during_idle()
 
-            if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
+            self.process_disagg_prefill_inflight_queue()
 
             self.launch_batch_sample_if_needed(batch_result)
-
-            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
-                self.self_check_during_idle()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
