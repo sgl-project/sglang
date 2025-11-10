@@ -5,13 +5,12 @@ These tests focus on testing the router configuration logic in isolation,
 including validation of configuration parameters and their interactions.
 """
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sglang_router.launch_router import RouterArgs, launch_router
 from sglang_router.router import policy_from_str
-from sglang_router_rs import PolicyType
+from sglang_router.sglang_router_rs import PolicyType
 
 
 class TestRouterConfigValidation:

@@ -34,6 +34,7 @@ class RouterArgs:
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
+    bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
@@ -94,6 +95,8 @@ class RouterArgs:
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # MCP server configuration
+    mcp_config_path: Optional[str] = None
     # Backend selection
     backend: str = "sglang"
     # History backend configuration
@@ -106,6 +109,13 @@ class RouterArgs:
     oracle_pool_min: int = 1
     oracle_pool_max: int = 16
     oracle_pool_timeout_secs: int = 30
+    # mTLS configuration for worker communication
+    client_cert_path: Optional[str] = None
+    client_key_path: Optional[str] = None
+    ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
+    # Trace
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
 
     @staticmethod
     def add_cli_args(
@@ -158,7 +168,7 @@ class RouterArgs:
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "bucket"],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
@@ -224,6 +234,12 @@ class RouterArgs:
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
+        )
+        parser.add_argument(
+            f"--{prefix}bucket-adjust-interval-secs",
+            type=int,
+            default=RouterArgs.bucket_adjust_interval_secs,
+            help="Interval in seconds between bucket boundary adjustment operations",
         )
         parser.add_argument(
             f"--{prefix}eviction-interval-secs",
@@ -508,6 +524,13 @@ class RouterArgs:
             default=None,
             help="Specify the parser for handling tool-call interactions",
         )
+        # MCP server configuration
+        parser.add_argument(
+            f"--{prefix}mcp-config-path",
+            type=str,
+            default=None,
+            help="Path to MCP (Model Context Protocol) server configuration file",
+        )
         # Backend selection
         parser.add_argument(
             f"--{prefix}backend",
@@ -574,6 +597,37 @@ class RouterArgs:
                 os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
             ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
+        )
+        # mTLS configuration
+        parser.add_argument(
+            f"--{prefix}client-cert-path",
+            type=str,
+            default=None,
+            help="Path to client certificate for mTLS authentication with workers",
+        )
+        parser.add_argument(
+            f"--{prefix}client-key-path",
+            type=str,
+            default=None,
+            help="Path to client private key for mTLS authentication with workers",
+        )
+        parser.add_argument(
+            f"--{prefix}ca-cert-paths",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            f"--{prefix}otlp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
     @classmethod
