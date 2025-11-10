@@ -315,8 +315,16 @@ def _log_softmax_kernel(
     output_row_start_ptr = output_ptr + row_idx * output_row_stride
 
     # Step 1: Find maximum value in the row for numerical stability
-    max_val = -float("inf")
-    for col_offset in range(0, n_cols, BLOCK_SIZE):
+    # Load first block to infer dtype and initialize max_val with correct type
+    col_idx_init = tl.arange(0, BLOCK_SIZE)
+    mask_init = col_idx_init < n_cols
+    vals_init = tl.load(
+        row_start_ptr + col_idx_init, mask=mask_init, other=-float("inf")
+    )
+    max_val = tl.max(vals_init)
+
+    # Continue with remaining blocks
+    for col_offset in range(BLOCK_SIZE, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
 
@@ -327,7 +335,9 @@ def _log_softmax_kernel(
         max_val = tl.max(tl.maximum(vals, max_val))
 
     # Step 2: Compute sum of exp(x - max_val)
-    sum_exp = 0.0
+    # Initialize sum_exp with correct dtype by using tl.sum on a zero vector
+    sum_exp = tl.sum(tl.zeros([1], dtype=max_val.dtype))
+
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
