@@ -9,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
 )
 
 
@@ -51,6 +52,7 @@ class TestEpDeepGEMM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        # cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -66,6 +68,8 @@ class TestEpDeepGEMM(CustomTestCase):
                 "fp8",
                 "--moe-runner-backend",
                 "deep_gemm",
+                "--moe-a2a-backend",
+                "pplx",
             ],
         )
 

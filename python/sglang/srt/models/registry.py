@@ -91,11 +91,7 @@ def import_model_classes(package_name: str):
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
-            try:
-                module = importlib.import_module(name)
-            except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}: {e}")
-                continue
+            module = importlib.import_module(name)
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(
