@@ -613,6 +613,57 @@ def ep_scatter(
     )
     return
 
+@triton.jit
+def _compute_m_indices_kernel(
+    num_recv_tokens_per_expert,
+    m_indices,
+    num_experts: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_EXPERT_NUM: tl.constexpr,
+):
+    cur_expert = tl.program_id(0)
+
+    offset_cumsum = tl.arange(0, BLOCK_EXPERT_NUM)
+    tokens_per_expert = tl.load(
+        num_recv_tokens_per_expert + offset_cumsum,
+        mask=offset_cumsum < num_experts,
+        other=0,
+    )
+    cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
+    mask = (offset_cumsum == cur_expert)
+    cur_expert_start = tl.sum(cumsum * mask.to(cumsum.dtype), axis=0)
+    cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+
+    m_indices_start_ptr = m_indices + cur_expert_start
+    off_expert = tl.arange(0, BLOCK_E)
+
+    for start_m in tl.range(0, cur_expert_token_num, BLOCK_E, num_stages=4):
+        tl.store(
+            m_indices_start_ptr + start_m + off_expert,
+            cur_expert,
+            mask=off_expert < cur_expert_token_num - start_m,
+        )
+
+@torch.no_grad()
+def compute_m_indices(
+    num_recv_tokens_per_expert: torch.Tensor,
+    m_indices: torch.Tensor,
+):
+    BLOCK_E = 128  # token num of per expert is aligned to 128
+    num_warps = 8
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    grid = num_experts
+
+    _compute_m_indices_kernel[(grid,)](
+        num_recv_tokens_per_expert,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+    return
+
 
 @triton.jit
 def _fwd_kernel_ep_gather(

@@ -26,6 +26,10 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.pplx import (
+        PplxDispatchOutput,
+        PplxCombineInput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -586,4 +590,66 @@ def post_permute_deep_gemm_to_deepep_normal(
         hidden_states=gather_out,
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
+    )
+
+
+@register_pre_permute("pplx", "deep_gemm")
+def pre_permute_pplx_to_deep_gemm(
+    dispatch_output: PplxDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    
+    from sglang.srt.layers.moe.ep_moe.kernels import compute_m_indices
+
+    (
+        hidden_states,
+        hidden_states_scale,
+        num_recv_tokens_per_expert,
+        num_input_tokens,
+        topk_ids,
+        topk_weights,
+    ) = dispatch_output
+    assert runner_config.activation == "silu"
+
+    running_state["all_tokens"] = hidden_states.shape[0]
+    running_state["num_input_tokens"] = num_input_tokens
+
+    hidden_states_shape = hidden_states.shape
+    hidden_states_device = hidden_states.device
+    hidden_states_dtype = hidden_states.dtype
+
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    m_indices = torch.empty(hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32)
+    compute_m_indices(num_recv_tokens_per_expert, m_indices)
+
+    return DeepGemmRunnerInput(
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("deep_gemm", "pplx")
+def post_permute_deep_gemm_to_pplx(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> PplxCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.pplx import PplxCombineInput
+
+    return PplxCombineInput(
+        hidden_states=runner_output.hidden_states,
+        num_input_tokens=running_state["num_input_tokens"],
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+        hidden_states_scale=runner_output.hidden_states_scale,
     )

@@ -35,6 +35,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.pplx import PplxDispatcher
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -90,6 +91,8 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
+    elif a2a_backend.is_pplx():
+        return PplxDispatcher(moe_runner_config)
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
 

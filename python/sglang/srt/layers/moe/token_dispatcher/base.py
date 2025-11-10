@@ -58,6 +58,7 @@ class DispatchOutputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    PPLX = "pplx"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -73,6 +74,9 @@ class DispatchOutputFormat(Enum):
             DispatchOutputFormat.DEEPEP_NORMAL,
             DispatchOutputFormat.DEEPEP_LL,
         ]
+    
+    def is_pplx(self) -> bool:
+        return self == DispatchOutputFormat.PPLX
 
 
 @runtime_checkable
