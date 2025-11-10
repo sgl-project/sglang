@@ -11,6 +11,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
@@ -94,14 +95,12 @@ logger = logging.getLogger(__name__)
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
-USE_CUTLASS_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
-    "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM", "true"
-)
+
 # TODO make it true by default when the DeepEP PR is merged
 CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
 )
-
+FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
@@ -1006,7 +1005,26 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
+        if FLASHINFER_FP4_GEMM_BACKEND == "trtllm":
+            # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
+            # FlashInfer provides nvfp4_quantize to quantize + shuffle the
+            # layout but we use our own quantization so we have to call
+            # shuffles ourselves.
+            from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
+            weight = layer.weight
+            scale = layer.weight_scale
+            epilogue_tile_m = 128
+            weight = shuffle_matrix_a(weight.view(torch.uint8), epilogue_tile_m)
+            scale = (
+                shuffle_matrix_sf_a(scale.view(torch.uint8), epilogue_tile_m)
+                .reshape(scale.shape)
+                .view(torch.float8_e4m3fn)
+            )
+
+            layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
+            layer.weight = Parameter(weight, requires_grad=False)
+            return
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
         scale_ndim = scales.ndim
@@ -1056,6 +1074,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
+        # TODO(shuw@nvidia.com)
+        # Remove the default after flashinfer bumped to 0.5.1
+        backend = (
+            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+        )
         out = fp4_gemm(
             x_fp4,
             w,
@@ -1063,7 +1086,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
-            **(dict(backend="cutlass") if USE_CUTLASS_BACKEND_FOR_FP4_GEMM else dict()),
+            **(dict(backend=backend)),
         )
         if bias is not None:
             out = out + bias
@@ -1451,7 +1474,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         layer.dispatcher.set_quant_config(
-            {"input_global_scale": layer.w13_input_scale_quant}
+            {
+                "input_global_scale": (
+                    layer.w13_input_scale_quant if CUTEDSL_MOE_NVFP4_DISPATCH else None
+                )
+            }
         )
 
         # Validate weight scales
@@ -1688,7 +1715,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def apply_without_routing_weights(
         self,
         layer: FusedMoE,
-        x: torch.Tensor,
+        x: tuple[torch.Tensor, Optional[torch.Tensor]],
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
         down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
