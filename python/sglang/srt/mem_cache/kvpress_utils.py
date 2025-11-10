@@ -214,8 +214,8 @@ class SnapKVPress(ScorerPress):
         hidden_states: torch.Tensor,
         keys: torch.Tensor,
         values: torch.Tensor,
-        attentions: torch.Tensor,
-        kwargs,
+        attentions: Optional[torch.Tensor],
+        kwargs: Optional[dict],
     ) -> torch.Tensor:
 
         bsz, num_key_value_heads, q_len, _ = keys.shape
