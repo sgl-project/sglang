@@ -784,7 +784,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
-            # TODO: the k, v should be already compressed here
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
