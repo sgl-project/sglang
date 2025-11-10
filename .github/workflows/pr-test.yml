@@ -50,8 +50,6 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           filters: |
-            multimodal_gen:
-              - "python/sglang/multimodal_gen/**"
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
               - "python/*.toml"
@@ -60,6 +58,8 @@ jobs:
               - ".github/workflows/pr-test.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
 
   # =============================================== sgl-kernel ====================================================
 
