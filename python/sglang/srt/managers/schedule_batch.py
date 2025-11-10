@@ -1010,6 +1010,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
     # For DP attention
+    inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False

@@ -356,10 +356,10 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def is_in_ci():
-    from sglang.test.test_utils import is_in_ci
+def is_in_ci() -> bool:
+    import os
 
-    return is_in_ci()
+    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("true", "1")
 
 
 def print_highlight(html_content: str):

@@ -217,6 +217,7 @@ class CudaPlatformBase(Platform):
         elif selected_backend == AttentionBackendEnum.FA3:
             if is_blackwell():
                 raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
+            target_backend = AttentionBackendEnum.FA3
         elif selected_backend:
             raise ValueError(f"Invalid attention backend for {cls.device_name}")
         else:

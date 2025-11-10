@@ -143,7 +143,7 @@ SERVER_ARGS=(
   --ring-degree=2
 )
 
-sglang serve $SERVER_ARGS
+sglang serve "${SERVER_ARGS[@]}"
 ```
 
 - **--model-path**: Which model to load. The example uses `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
@@ -265,7 +265,7 @@ SAMPLING_ARGS=(
   --output-file-name "A curious raccoon.mp4"
 )
 
-sglang generate $SERVER_ARGS $SAMPLING_ARGS
+sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 ```
 
 Once the generation task has finished, the server will shut down automatically.

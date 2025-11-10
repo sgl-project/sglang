@@ -46,6 +46,8 @@ class TimeStats:
     # TODO: correct set them
     bootstrap_duration: float = 0.0
     alloc_waiting_duration: float = 0.0
+    prefill_start_time: float = 0.0
+    prefill_end_time: float = 0.0
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time

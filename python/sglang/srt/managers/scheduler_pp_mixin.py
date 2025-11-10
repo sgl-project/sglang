@@ -1,10 +1,15 @@
-from typing import List, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj, require_mlp_sync
+from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
 
 
 class SchedulerPPMixin:
@@ -132,7 +137,7 @@ class SchedulerPPMixin:
                 self.self_check_during_idle()
 
     @DynamicGradMode()
-    def event_loop_pp_disagg_prefill(self):
+    def event_loop_pp_disagg_prefill(self: Scheduler):
         """
         An event loop for the prefill server in pipeline parallelism.
 
@@ -238,7 +243,7 @@ class SchedulerPPMixin:
                 self.process_prefill_chunk()
 
                 batch = self.get_new_batch_prefill()
-                if require_mlp_sync(self.server_args):
+                if self.require_mlp_sync:
                     batch = self.prepare_mlp_sync_batch(batch)
                 mbs[mb_id] = batch
 

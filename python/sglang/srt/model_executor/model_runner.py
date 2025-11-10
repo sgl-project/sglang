@@ -31,6 +31,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs import (
     FalconH1Config,
+    JetNemotronConfig,
     KimiLinearConfig,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -336,8 +337,13 @@ class ModelRunner:
         ):
             self.attention_layers = []
             for layer in self.model.model.layers:
-                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
-                    self.attention_layers.append(layer.self_attn.attn)
+                if hasattr(layer, "self_attn"):
+                    if hasattr(layer.self_attn, "attn"):
+                        self.attention_layers.append(layer.self_attn.attn)
+                    elif hasattr(layer.self_attn, "attn_mqa"):
+                        # For DeepSeek model
+                        self.attention_layers.append(layer.self_attn.attn_mqa)
+
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
                 # TODO(yuwei): support Non-Standard GQA
                 log_info_on_rank0(
@@ -1374,7 +1380,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
             return config
         return None
 
@@ -2074,9 +2080,6 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not skip_attn_backend_init:
-            self.attn_backend.init_forward_metadata(forward_batch)
-
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2085,9 +2088,14 @@ class ModelRunner:
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
-        if self.piecewise_cuda_graph_runner is not None:
-            if self.piecewise_cuda_graph_runner.can_run(forward_batch):
-                return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+        if (
+            self.piecewise_cuda_graph_runner is not None
+            and self.piecewise_cuda_graph_runner.can_run(forward_batch)
+        ):
+            return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+
+        if not skip_attn_backend_init:
+            self.attn_backend.init_forward_metadata(forward_batch)
 
         return self.model.forward(
             forward_batch.input_ids,

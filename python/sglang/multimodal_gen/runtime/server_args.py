@@ -808,6 +808,17 @@ class ServerArgs:
                 f"Ring degree not set, " f"using default value {self.ring_degree}"
             )
 
+        if self.ring_degree > 1:
+            if self.attention_backend != None and self.attention_backend != "fa3":
+                raise ValueError(
+                    "Ring Attention is only supported for fa3 backend for now"
+                )
+            else:
+                self.attention_backend = "fa3"
+                logger.info(
+                    "Ring Attention is currently only supported for fa3, attention_backend has been automatically set to fa3"
+                )
+
         if self.sp_degree == -1:
             self.sp_degree = self.ring_degree * self.ulysses_degree
             logger.info(
