@@ -902,10 +902,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         Current policy:
         - Respect explicit server flag `enable_tokenizer_batch_encode`.
         - Or, if no request has text or multimodal input (all use pre-tokenized input_ids or input_embeds), batch the requests without tokenization.
+        - Batch tokenization does not support DP attention yet, and it will make everything goes to the first rank currently
         """
         return batch_size > 0 and (
             self.server_args.enable_tokenizer_batch_encode
-            or not self._batch_has_text(batch_size, requests)
+            or (
+                (not self.server_args.enable_dp_attention)
+                and (not self._batch_has_text(batch_size, requests))
+            )
         )
 
     def _send_one_request(
@@ -996,7 +1000,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         finish_reason.get("type") == "abort"
                         and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
                     ):
-                        raise ValueError(finish_reason["message"])
+                        if not obj.stream:
+                            raise ValueError(finish_reason["message"])
+                        else:
+                            yield out
+                            break
 
                     if finish_reason.get("type") == "abort" and finish_reason.get(
                         "status_code"
@@ -1013,11 +1021,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
                             await self.lora_registry.release(state.obj.lora_id)
-
-                        raise fastapi.HTTPException(
-                            status_code=finish_reason["status_code"],
-                            detail=finish_reason["message"],
-                        )
+                        if not obj.stream:
+                            raise fastapi.HTTPException(
+                                status_code=finish_reason["status_code"],
+                                detail=finish_reason["message"],
+                            )
+                        else:
+                            yield out
+                            break
                 yield out
                 break
 

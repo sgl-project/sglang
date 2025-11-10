@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 
 use super::{chat::ChatResponseProcessingStage, generate::GenerateResponseProcessingStage};
 use crate::routers::grpc::{
@@ -40,9 +41,15 @@ impl PipelineStage for ResponseProcessingStage {
         match &ctx.input.request_type {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
-            RequestType::Responses(_) => Err(error::bad_request(
-                "Responses API processing must be handled by responses handler".to_string(),
-            )),
+            RequestType::Responses(_) => {
+                error!(
+                    function = "ResponseProcessingStage::execute",
+                    "Responses API not supported in regular pipeline"
+                );
+                Err(error::bad_request(
+                    "Responses API processing must be handled by responses handler".to_string(),
+                ))
+            }
         }
     }
 
