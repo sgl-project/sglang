@@ -1,7 +1,9 @@
 """
 Unit tests for TokenizerManager helper methods.
+
 This tests the refactored tokenization functionality including input format detection,
 tokenizer input preparation, and result extraction logic.
+
 Usage:
 python3 -m unittest test_tokenizer_manager.TestInputFormatDetection
 python3 -m unittest test_tokenizer_manager.TestTokenizerInputPreparation
