@@ -28,6 +28,7 @@ jobs:
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -51,11 +52,14 @@ jobs:
           filters: |
             main_package:
               - "python/**"
+              - "!python/sglang/multimodal_gen/**"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
 
   # =============================================== sgl-kernel ====================================================
 
@@ -110,7 +114,11 @@ jobs:
     steps:
       - name: Cleanup
         run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
+          if [ -d "$GITHUB_WORKSPACE" ]; then
+            sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+          else
+            echo "$GITHUB_WORKSPACE does not exist, nothing to clean"
+          fi
 
       - uses: actions/checkout@v4
         with:
@@ -233,6 +241,19 @@ jobs:
 
           echo "All benchmark tests completed!"
 
+  # =============================================== multimodal_gen ====================================================
+  multimodal-gen-test:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run placeholder test
+        run: |
+          echo "Running multimodal_gen tests..."
+          echo "This is a placeholder for future tests."
+
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
   # cuda13-kernel-smoke-test:
@@ -301,7 +322,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -322,7 +343,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 13
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
   unit-test-backend-2-gpu:
     needs: [check-changes, sgl-kernel-build-wheels]
@@ -858,6 +879,8 @@ jobs:
         sgl-kernel-unit-test,
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
+
+        multimodal-gen-test,
 
         unit-test-frontend,
         unit-test-backend-1-gpu,

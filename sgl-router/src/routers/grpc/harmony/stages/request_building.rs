@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::debug;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::routers::grpc::{
@@ -30,18 +30,22 @@ impl HarmonyRequestBuildingStage {
 impl PipelineStage for HarmonyRequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         // Get preparation output
-        let prep = ctx
-            .state
-            .preparation
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(
+                function = "HarmonyRequestBuildingStage::execute",
+                "Preparation stage not completed"
+            );
+            error::internal_error("Preparation not completed")
+        })?;
 
         // Get clients
-        let clients = ctx
-            .state
-            .clients
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
+        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
+            error!(
+                function = "HarmonyRequestBuildingStage::execute",
+                "Client acquisition stage not completed"
+            );
+            error::internal_error("Client acquisition not completed")
+        })?;
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
@@ -52,6 +56,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             RequestType::Chat(_) => format!("chatcmpl-{}", Uuid::new_v4()),
             RequestType::Responses(_) => format!("responses-{}", Uuid::new_v4()),
             RequestType::Generate(_) => {
+                error!(
+                    function = "HarmonyRequestBuildingStage::execute",
+                    "Generate request type not supported for Harmony models"
+                );
                 return Err(error::bad_request(
                     "Generate requests are not supported with Harmony models".to_string(),
                 ));
@@ -67,7 +75,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                 let body = prep.filtered_request.as_ref().unwrap_or(request.as_ref());
 
                 builder_client
-                    .build_generate_request(
+                    .build_generate_request_from_chat(
                         request_id,
                         body,
                         placeholder_processed_text,
@@ -75,7 +83,14 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                         None,
                         prep.tool_constraints.clone(),
                     )
-                    .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?
+                    .map_err(|e| {
+                        error!(
+                            function = "HarmonyRequestBuildingStage::execute",
+                            error = %e,
+                            "Failed to build generate request from chat"
+                        );
+                        error::bad_request(format!("Invalid request parameters: {}", e))
+                    })?
             }
             RequestType::Responses(request) => builder_client
                 .build_generate_request_from_responses(
@@ -86,7 +101,14 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     prep.harmony_stop_ids.clone(),
                     prep.tool_constraints.clone(),
                 )
-                .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?,
+                .map_err(|e| {
+                    error!(
+                        function = "HarmonyRequestBuildingStage::execute",
+                        error = %e,
+                        "Failed to build generate request from responses"
+                    );
+                    error::bad_request(format!("Invalid request parameters: {}", e))
+                })?,
             _ => unreachable!(),
         };
 
