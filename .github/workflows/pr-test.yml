@@ -54,11 +54,10 @@ jobs:
               - "python/sglang/multimodal_gen/**"
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/sglang/*.py"
-              - "python/*.py"
-              - "python/setup.py"
+              - "python/**"
               - "scripts/ci/**"
               - "test/**"
+              - ".github/workflows/pr-test.yml"
             sgl_kernel:
               - "sgl-kernel/**"
 
