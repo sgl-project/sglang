@@ -3,16 +3,27 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from enum import IntEnum
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
 from aiter.utility.fp4_utils import e8m0_shuffle
 
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.rocm_moe_utils import ActivationMethod
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import is_hip, set_weight_attrs
+from sglang.srt.utils import direct_register_custom_op, is_hip, set_weight_attrs
+
+
+class QuantTypeMethod(IntEnum):
+    No = 0
+    per_Tensor = 1
+    per_Token = 2
+    per_1x32 = 3
+    per_1x128 = 4
+    per_128x128 = 5
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -31,6 +42,61 @@ OCP_MX_BLOCK_SIZE = 32
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuarkConfig
+
+
+def rocm_aiter_fused_moe_impl(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_type_method: int = QuantTypeMethod.per_1x32.value,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    activation_method: int = ActivationMethod.SILU.value,
+    doweight_stage1: bool = False,
+) -> torch.Tensor:
+
+    from aiter import ActivationType, QuantType
+
+    quant_type = QuantType(quant_type_method)
+    activation = ActivationType(activation_method)
+
+    return fused_moe(
+        x,
+        w13_weight,
+        w2_weight,
+        topk_weights,
+        topk_ids,
+        quant_type=quant_type,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        activation=activation,
+        doweight_stage1=doweight_stage1,
+    )
+
+
+def rocm_aiter_fused_moe_fake(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_type_method: int = QuantTypeMethod.per_1x32.value,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    activation_method: int = ActivationMethod.SILU.value,
+    doweight_stage1: bool = False,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="rocm_aiter_fused_moe",
+    op_func=rocm_aiter_fused_moe_impl,
+    mutates_args=[],
+    fake_impl=rocm_aiter_fused_moe_fake,
+)
 
 
 class QuarkMoEMethod(FusedMoEMethodBase):
@@ -196,19 +262,19 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
-        output = fused_moe(
+        output = torch.ops.sglang.rocm_aiter_fused_moe(
             x,
             w13_weight,
             w2_weight,
             topk_weights,
             topk_ids,
-            quant_type=QuantType.per_1x32,
+            quant_type_method=QuantTypeMethod.per_1x32.value,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            activation=(
-                ActivationType.Silu
+            activation_method=(
+                ActivationMethod.SILU.value
                 if moe_runner_config.activation == "silu"
-                else ActivationType.Gelu
+                else ActivationMethod.GELU.value
             ),
             doweight_stage1=False,
         )
