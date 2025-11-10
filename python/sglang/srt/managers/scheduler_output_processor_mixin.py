@@ -55,7 +55,7 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                self.tree_cache.cache_finished_req(req)
+                release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
