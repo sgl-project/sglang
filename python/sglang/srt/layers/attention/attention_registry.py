@@ -31,30 +31,33 @@ def create_flashinfer_backend(runner):
         kv_last_page_len_buf = None
 
         # Init streams
+        kv_indptr_buf = None
+        kv_last_page_len_buf = None
         if runner.server_args.speculative_algorithm in ["EAGLE", "SIMPLE_EAGLE"]:
             if (
                 not hasattr(runner, "plan_stream_for_flashinfer")
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-
-        # NOTE: Add for setting max-running-requests. If max-running-requests <= cuda graph capture bs, it will raise error.
-        if runner.server_args.speculative_algorithm == "SIMPLE_EAGLE":
-            kv_indptr_buf = torch.zeros(
-                (runner.req_to_token_pool.size * 2 + 1,),
-                dtype=torch.int32,
-                device=runner.device,
+            if runner.server_args.speculative_algorithm == "SIMPLE_EAGLE":
+                kv_indptr_buf = torch.zeros(
+                    (runner.req_to_token_pool.size * 2 + 1,),
+                    dtype=torch.int32,
+                    device=runner.device,
+                )
+                kv_last_page_len_buf = torch.ones(
+                    (runner.req_to_token_pool.size * 2,),
+                    dtype=torch.int32,
+                    device=runner.device,
+                )
+            return FlashInferAttnBackend(
+                runner,
+                kv_indptr_buf=kv_indptr_buf,
+                kv_last_page_len_buf=kv_last_page_len_buf,
             )
-            kv_last_page_len_buf = torch.ones(
-                (runner.req_to_token_pool.size * 2,),
-                dtype=torch.int32,
-                device=runner.device,
-            )
-        return FlashInferAttnBackend(
-            runner,
-            kv_indptr_buf=kv_indptr_buf,
-            kv_last_page_len_buf=kv_last_page_len_buf,
-        )
+        # return FlashInferAttnBackend(
+        #     runner, init_new_workspace=runner.init_new_workspace
+        # )
     else:
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
@@ -207,6 +210,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             GDNAttnBackend,
             HybridLinearAttnBackend,
+            KimiLinearAttnBackend,
             Mamba2AttnBackend,
         )
         from sglang.srt.utils import is_blackwell, is_npu
@@ -225,6 +229,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
+        elif runner.kimi_linear_config is not None:
+            linear_attn_backend = KimiLinearAttnBackend(runner)
         else:
             raise ValueError(
                 "Expected hybrid GDN or NemotronH models, but got unknown model."
@@ -235,3 +241,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     return full_attn_backend
+
+
+@register_attention_backend("intel_xpu")
+def create_intel_xpu_backend(runner):
+    from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+    return XPUAttentionBackend(runner)

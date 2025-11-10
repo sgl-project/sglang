@@ -19,16 +19,22 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
-if is_cuda():
+if _is_cuda:
     from sgl_kernel import fast_topk
-elif is_hip():
+elif _is_hip:
     from sgl_kernel import fast_topk
+else:
+    from sglang.srt.utils.common import fast_topk
 
 
 logger = logging.getLogger(__name__)
@@ -39,8 +45,7 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = is_cuda()  # This kernel is only available for CUDA now
-
+TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
 
 @triton.jit
 def create_extend_spec_info(
@@ -64,7 +69,6 @@ def create_extend_spec_info(
     offset = tl.load(accept_len_cum + pid) - 1
     verified_id_data = tl.load(verified_id + offset)
     tl.store(new_verified_id + pid, verified_id_data)
-
 
 @triton.jit
 def create_extend_after_decode_spec_info(
@@ -125,6 +129,36 @@ def assign_req_to_token_pool(
         tl.store(token_pool + save_offset, data, mask=mask)
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
+
+
+def assign_req_to_token_pool_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+):
+    if _is_cuda or _is_hip:
+        assign_req_to_token_pool[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+            next_power_of_2(batch_size),
+        )
+    elif _is_npu:
+        import sgl_kernel_npu  # noqa: F401
+
+        torch.ops.npu.cache_loc_assign(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+        )
 
 
 @triton.jit
@@ -355,7 +389,7 @@ def get_target_cache_loc(
     )
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -405,7 +439,7 @@ def filter_finished_cache_loc_kernel(
     )
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def create_accept_length_filter(
     accept_length: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -419,7 +453,7 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -437,7 +471,7 @@ def select_top_k_tokens(
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device="cuda")
+            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
@@ -559,6 +593,43 @@ def create_draft_kv_indices(
     if bid == 0:
         tl.store(kv_indptr, 0)
 
+
+@triton.jit
+def create_draft_kv_indices(
+    kv_indptr,
+    kv_indices,
+    req_pool,
+    req_to_token,
+    seq_lens,
+    expand_factor: tl.constexpr,  # only support ==2 currently
+    row_stride: tl.constexpr,
+    num_tokens_upper: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 64
+    bid = tl.program_id(0)
+    source_row_id = tl.load(req_pool + bid)
+    batch_offset = tl.arange(0, num_tokens_upper)
+    seq_len_data = tl.load(seq_lens + batch_offset, mask=batch_offset < bid)
+    seq_len = tl.load(seq_lens + bid)
+    cum_seq_len = tl.sum(seq_len_data)
+    kv_offset = cum_seq_len * 2 - bid  # only for expand_factor==1 currently
+    kv_indices_ptr = kv_indices + kv_offset
+    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < seq_len - 1
+        data = tl.load(req_to_token + source_row_id * row_stride + offset, mask=mask)
+        tl.store(kv_indices_ptr + offset, data, mask=mask)
+        tl.store(kv_indices_ptr + seq_len - 1 + offset, data, mask=mask)
+
+    data = tl.load(req_to_token + source_row_id * row_stride + seq_len - 1)
+    tl.store(kv_indices_ptr + seq_len * 2 - 2, data)
+
+    tl.store(kv_indptr + bid * expand_factor + 1, kv_offset + seq_len - 1)
+    tl.store(kv_indptr + bid * expand_factor + 2, kv_offset + seq_len * 2 - 1)
+    if bid == 0:
+        tl.store(kv_indptr, 0)
 
 def traverse_tree(
     retrieve_next_token: torch.Tensor,

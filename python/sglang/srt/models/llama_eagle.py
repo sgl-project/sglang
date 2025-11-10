@@ -24,6 +24,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import LlamaConfig
+from sglang.srt.layers.communicator import LayerCommunicator
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -51,6 +52,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         if layer_id == 0:
             del self.input_layernorm
             setattr(self, "input_layernorm", lambda x: x)
+            self.layer_communicator = LayerCommunicator(
+                layer_scatter_modes=self.layer_scatter_modes,
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+            )
 
 
 class LlamaModel(nn.Module):

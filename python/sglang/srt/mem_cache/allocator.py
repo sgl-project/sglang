@@ -484,29 +484,93 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-            self.seen_max_num_extend_tokens_next_power_of_2,
-        )
+     # 初始化两个指针，用于追踪在输出数组和空闲页列表中的当前位置
+        current_out_offset = 0
+        current_free_page_offset = 0
 
+        # 遍历batch中的每一个请求
+        for i in range(bs):
+            pre_len = prefix_lens[i].item()
+            seq_len = seq_lens[i].item()
+            last = last_loc[i].item()
+            
+            extend_len = seq_len - pre_len
+            if extend_len == 0:
+                continue
+
+            # --- Part 1: 填充旧的、未满的页面 ---
+            num_part1 = 0
+            if pre_len > 0:
+                # 计算当前页还剩多少空间
+                slots_left_in_page = self.page_size - (pre_len % self.page_size)
+                if pre_len % self.page_size == 0: # 如果刚好对齐，则剩余空间为0
+                    slots_left_in_page = 0
+                
+                # 能在当前页填充的数量，是“剩余空间”和“需要扩展长度”中的较小值
+                num_part1 = min(extend_len, slots_left_in_page)
+
+                if num_part1 > 0:
+                    # 生成要填充的连续槽位地址
+                    part1_indices = torch.arange(last + 1, last + 1 + num_part1, device=self.device)
+                    # 写入输出数组
+                    out_indices[current_out_offset : current_out_offset + num_part1] = part1_indices
+                    # 更新指针和剩余长度
+                    current_out_offset += num_part1
+            
+            remaining_len = extend_len - num_part1
+
+            # --- Part 2 & 3: 分配并填充全新的页面 ---
+            if remaining_len > 0:
+                # 计算需要多少个全新的页面
+                num_new_pages = (remaining_len + self.page_size - 1) // self.page_size
+                
+                # 检查是否有足够的空闲页
+                if current_free_page_offset + num_new_pages > len(self.free_pages):
+                    # 这个错误意味着预估的内存不足，应该向上抛出异常
+                    raise RuntimeError(f"Allocator OOM: Not enough free pages. "
+                                     f"Needed {num_new_pages}, but only {len(self.free_pages) - current_free_page_offset} available.")
+
+                # 从空闲页列表中“取出”所需的页号
+                pages_to_use = self.free_pages[current_free_page_offset : current_free_page_offset + num_new_pages]
+                
+                # 更新空闲页指针
+                current_free_page_offset += num_new_pages
+
+                # 使用矢量化操作，一次性生成所有新页包含的所有槽位地址
+                # (pages_to_use[:, None] 将页号变成列向量，用于广播)
+                new_slots = (
+                    pages_to_use[:, None] * self.page_size
+                    + torch.arange(self.page_size, device=self.device)
+                ).view(-1)
+                
+                # 从生成的所有新槽位中，只取我们需要的 remaining_len 个
+                part2_3_indices = new_slots[:remaining_len]
+                
+                # 写入输出数组
+                out_indices[current_out_offset : current_out_offset + remaining_len] = part2_3_indices
+                # 更新指针
+                current_out_offset += remaining_len
+        
+        # --- KERNEL REPLACEMENT - END ---
+        
+        
+        # logger.info("--- [ALLOC_EXTEND DEBUG] AFTER KERNEL EXECUTION ---")
+        unique_vals, counts = torch.unique(out_indices, return_counts=True)
+        is_correct = (len(unique_vals) == len(out_indices))
+        
+        # logger.info(f"Validation Result: {'SUCCESS' if is_correct else 'FAILURE'}")
+        # logger.info(f"  - out_indices length: {len(out_indices)}")
+        # logger.info(f"  - unique values count: {len(unique_vals)}")
+
+        # 检查我们的实现是否正确，这是一个可选的调试步骤
         if self.debug_mode:
-            assert len(torch.unique(out_indices)) == len(out_indices)
+            assert len(torch.unique(out_indices)) == len(out_indices), "PyTorch implementation produced duplicate indices!"
 
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            prefix_lens=prefix_lens_cpu,
-        )
-        if num_new_pages > len(self.free_pages):
-            return None
+        # 更新 free_pages 列表，减去我们实际用掉的页
+        # 注意：我们不能直接用 get_num_new_pages，因为它依赖CPU list，且逻辑可能与我们这里的不同
+        # 我们已经通过 current_free_page_offset 精确地追踪了消耗的页数
+        self.free_pages = self.free_pages[current_free_page_offset:]
 
-        self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
     def alloc_decode(

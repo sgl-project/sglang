@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class SchedulerProfilerMixin:
     def init_profiler(self):
         self.torch_profiler = None
-        self.torch_profiler_output_dir: Optional[str] = None
+        self.torch_profiler_output_dir: Optional[Path] = None
         self.profiler_activities: Optional[List[str]] = None
         self.profile_id: Optional[str] = None
         self.profiler_start_forward_ct: Optional[int] = None
@@ -69,7 +69,7 @@ class SchedulerProfilerMixin:
         if activities is None:
             activities = ["CPU", "GPU"]
 
-        self.torch_profiler_output_dir = output_dir
+        self.torch_profiler_output_dir = Path(output_dir).expanduser()
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
@@ -139,7 +139,7 @@ class SchedulerProfilerMixin:
                 schema.writeSchema(connection)
                 connection.commit()
                 del connection
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(self.cpu_group)
 
             self.rpd_profiler = rpdTracerControl()
             self.rpd_profiler.setPythonTrace(True)
@@ -213,8 +213,7 @@ class SchedulerProfilerMixin:
                 message="Profiling is not in progress. Call /start_profile first.",
             )
 
-        if not Path(self.torch_profiler_output_dir).exists():
-            Path(self.torch_profiler_output_dir).mkdir(parents=True, exist_ok=True)
+        self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
@@ -237,14 +236,14 @@ class SchedulerProfilerMixin:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(self.cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
             self.rpd_profiler.flush()
 
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(self.cpu_group)
             if self.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
