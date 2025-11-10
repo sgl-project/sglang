@@ -410,13 +410,15 @@ class Indexer(CustomOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
             index_k=k_fp8,
@@ -555,14 +557,15 @@ class Indexer(CustomOp):
             return None
 
         # Determine if should skip topk based on sequence length
-        should_skip = False
-        if not forward_batch.forward_mode.is_decode_or_idle():
+        # We can only skip the logits computation if cuda graph is not involved
+        skip_logits_computation = False
+        if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                should_skip = max_kv_len <= self.index_topk
+                skip_logits_computation = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation
-        if should_skip:
+        if skip_logits_computation:
             return self._forward_cuda_k_only(
                 x,
                 positions,
@@ -596,7 +599,7 @@ class Indexer(CustomOp):
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
             index_k=k_fp8,
