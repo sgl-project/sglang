@@ -31,6 +31,7 @@ from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils import supports_custom_op
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -1824,6 +1825,12 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
+
+        if is_npu() and not supports_custom_op():
+            logger.warning(
+                "Torch compile is disabled because custom ops are not supported"
+            )
+            self.enable_torch_compile = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

@@ -27,6 +27,8 @@ import sglang.srt.model_executor.cuda_graph_runner
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import supports_custom_op
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,10 @@ if TYPE_CHECKING:
 
 from torch._dynamo.eval_frame import DisableContext
 
+from sglang.srt.compilation.custom_ops import (
+    _set_dp_buffer_len,
+    _set_is_extend_in_batch,
+)
 from sglang.srt.compilation.npu.npu_graph_compiler import NpuGraphCompiler
 from sglang.srt.compilation.npu.patch_dynamo import (
     patch_dynamo_context,
@@ -71,6 +77,19 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
+
+    def _init_dp_gathered_buffer(
+        self, global_dp_buffer_len: int, local_dp_buffer_len: int, dp_max_padding: bool
+    ):
+        if supports_custom_op() and get_global_server_args().enable_torch_compile:
+            _set_dp_buffer_len(
+                global_dp_buffer_len, local_dp_buffer_len, dp_max_padding
+            )
+            _set_is_extend_in_batch(False)
+        else:
+            super()._init_dp_gathered_buffer(
+                global_dp_buffer_len, local_dp_buffer_len, dp_max_padding
+            )
 
     def _capture_graph(self, graph, pool, stream, run_once_fn, bs: int):
         if self.enable_torch_compile:

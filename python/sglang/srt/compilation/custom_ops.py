@@ -26,13 +26,14 @@ def _set_dp_buffer_len(
     is_max_len: bool,
     global_num_tokens: Optional[List[int]] = None,
 ) -> None:
+    global set_dp_buffer_len_original
     sglang.srt.layers.dp_attention.set_dp_buffer_len(
         global_dp_buffer_len, num_tokens, is_max_len, global_num_tokens
     )
 
 
 @_set_dp_buffer_len.register_fake
-def _set_dp_buffer_len_register_fake(
+def _set_dp_buffer_len_fake(
     global_dp_buffer_len: Optional[int],
     num_tokens: Optional[int],
     is_max_len: bool,

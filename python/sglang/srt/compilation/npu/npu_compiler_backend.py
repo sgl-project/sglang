@@ -18,9 +18,9 @@ import torch
 from torch._dynamo.eval_frame import DisableContext
 
 from sglang.srt.compilation.npu.pass_manager import PassManager
-from sglang.srt.compilation.npu.passes.w8a8_int8.div_fuse import DivFuse
-from sglang.srt.compilation.npu.passes.w8a8_int8.erase_copy import EraseCopy
-from sglang.srt.compilation.npu.passes.w8a8_int8.npu_add_rms_norm_quant_fuse import (
+from sglang.srt.compilation.npu.passes.w8a8_int8 import (
+    DivFuse,
+    EraseCopy,
     NpuAddRmsNormQuantFuse,
 )
 

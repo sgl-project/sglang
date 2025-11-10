@@ -39,6 +39,8 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
     get_attention_tp_size,
+    set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
@@ -74,11 +76,6 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 _is_hip = is_hip()
-
-from sglang.srt.compilation.npu.custom_ops import (
-    _set_dp_buffer_len,
-    _set_is_extend_in_batch,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +537,12 @@ class CudaGraphRunner:
     def _create_device_graph(self):
         return torch.cuda.CUDAGraph()
 
+    def _init_dp_gathered_buffer(
+        self, global_dp_buffer_len: int, local_dp_buffer_len: int, dp_max_padding: bool
+    ):
+        set_dp_buffer_len(global_dp_buffer_len, local_dp_buffer_len, dp_max_padding)
+        set_is_extend_in_batch(False)
+
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = self._create_device_graph()
         stream = self.stream
@@ -663,12 +666,12 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            _set_dp_buffer_len(
+
+            self._init_dp_gathered_buffer(
                 global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
             )
-            _set_is_extend_in_batch(False)
 
             kwargs = {}
             if (
