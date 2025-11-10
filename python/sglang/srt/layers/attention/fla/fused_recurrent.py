@@ -456,6 +456,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     if IS_SPEC_DECODING:
         cache_idx = tl.load(h0_indices + i_n)
 
+    # In normal decoding, T is 1, so we dont loop here
+    # In target verify, T is the number of target tokens, so we loop here
     for step_idx in range(0, T):
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx = 0 should use the b_h from USE_INITIAL_STATE
