@@ -20,8 +20,8 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
-from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -55,7 +55,7 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                self.tree_cache.cache_finished_req(req)
+                release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -102,26 +102,8 @@ class SchedulerOutputProcessorMixin:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if self.enable_overlap and req.is_retracted and len(req.output_ids) > 0:
-                    req_idx = batch.req_pool_indices[i]
-                    seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                    pos = batch.req_to_token_pool.req_to_token[req_idx][
-                        seq_len - 1 : seq_len
-                    ]
-                    self.token_to_kv_pool_allocator.free(pos)
-                    continue
-
-                if (
-                    self.is_mixed_chunk
-                    and self.enable_overlap
-                    and (req.finished() or req.is_retracted)
-                ):
-                    # Free the one delayed token for the mixed decode batch
-                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
-                    continue
-
-                if req.is_retracted:
+                if req.finished() or req.is_retracted:
+                    # decode req in mixed batch or retracted req
                     continue
 
                 if req.is_chunked <= 0:
@@ -130,7 +112,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
+                        release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
@@ -259,7 +241,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
+                        release_kv_cache(req, self.tree_cache)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -327,42 +309,17 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # NOTE: in any case, we should check finish here
+        # if finished, also clean up committed kv cache and over-allocated kv cache here
+
         # Check finish condition
-        # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
-        # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
-                indices_to_free = None
-                if batch.spec_algorithm.is_eagle():
-                    from sglang.srt.speculative.eagle_info import EagleDraftInput
-
-                    end_p = allocate_lens_list[i]
-                    start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
-                    if self.page_size > 1:
-                        start_p = ceil_div(start_p, self.page_size) * self.page_size
-
-                    indices_to_free = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx
-                    ][start_p:end_p]
-
-                else:
-                    if self.page_size == 1:
-                        # Free the one extra delayed token
-                        indices_to_free = batch.out_cache_loc[i : i + 1]
-                    else:
-                        if (
-                            len(req.origin_input_ids) + len(req.output_ids) - 1
-                        ) % self.page_size == 0:
-                            # Only free when the extra token is in a new page
-                            indices_to_free = batch.out_cache_loc[i : i + 1]
-
-                if indices_to_free is not None:
-                    self.token_to_kv_pool_allocator.free(indices_to_free)
-                continue
-
-            if req.is_retracted:
+                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
+                # (currently not, e.g. Eagle V1 still check finish during forward)
+                # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
             new_accepted_len = 1
@@ -376,27 +333,12 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
-                if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
-                    # FIXME(lsyin): fix the messy logic here
-                    # 1) when not overlap (v2 impl), we free the extra tokens in the req
-                    # 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration.
-                    start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
-                    end_p = allocate_lens_list[i]
-
-                    if self.page_size > 1:
-                        start_p = ceil_div(start_p, self.page_size) * self.page_size
-
-                    indices_to_free = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx
-                    ][start_p:end_p]
-                    self.token_to_kv_pool_allocator.free(indices_to_free)
-
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                    # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
+                    # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        self.tree_cache.cache_finished_req(req)
+                        release_kv_cache(req, self.tree_cache)
                 else:
-                    self.tree_cache.cache_finished_req(req)
+                    release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
 
