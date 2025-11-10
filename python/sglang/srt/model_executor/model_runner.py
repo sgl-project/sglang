@@ -869,6 +869,7 @@ class ModelRunner:
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
+        is_draft_model: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -920,8 +921,12 @@ class ModelRunner:
                 return False, message
 
         self.model = model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        if is_draft_model:
+            self.server_args.speculative_draft_model_path = model_path
+            self.server_args.speculative_draft_model_load_format = load_format
+        else:
+            self.server_args.model_path = model_path
+            self.server_args.load_format = load_format
         self.load_config = load_config
 
         if recapture_cuda_graph and self.device == "cuda":

@@ -1072,6 +1072,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     load_format: Optional[str] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Whether the new weights are draft model weights used for speculative decoding
+    is_draft_model: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
     # Whether to update weights asynchronously

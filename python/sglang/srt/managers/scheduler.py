@@ -462,6 +462,9 @@ class Scheduler(
         else:
             self.grammar_backend = None
 
+        # Init weight update queue used for prevent weight update while running request remains
+        self.pending_weight_update_queue: List[Req] = []
+
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
             self.schedule_policy,
@@ -971,6 +974,8 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
+                # If the running batch is empty and there are pending weight update requests, process them
+                self.maybe_process_pending_weight_update()
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
@@ -1127,6 +1132,16 @@ class Scheduler(
             ):
                 self.return_health_check_ct += 1
                 continue
+
+            if isinstance(recv_req, UpdateWeightFromDiskReqInput):
+                if not self.running_batch.is_empty():
+                    self.pending_weight_update_queue.append(recv_req)
+                    continue
+                else:
+                    output = self._request_dispatcher(recv_req)
+                    if output is not None:
+                        self.send_to_tokenizer.send_output(output, recv_req)
+                    continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -2115,6 +2130,15 @@ class Scheduler(
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_output(HealthCheckOutput())
+
+    def maybe_process_pending_weight_update(self):
+        if self._is_no_request() and self.pending_weight_update_queue:
+            logger.info("Processing pending weight update requests")
+            for req in self.pending_weight_update_queue:
+                output = self._request_dispatcher(req)
+                if output is not None:
+                    self.send_to_tokenizer.send_output(output, req)
+            self.pending_weight_update_queue.clear()
 
     def move_ready_grammar_requests(self):
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
