@@ -1133,15 +1133,12 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
-            if isinstance(recv_req, UpdateWeightFromDiskReqInput):
-                if not self.running_batch.is_empty():
-                    self.pending_weight_update_queue.append(recv_req)
-                    continue
-                else:
-                    output = self._request_dispatcher(recv_req)
-                    if output is not None:
-                        self.send_to_tokenizer.send_output(output, recv_req)
-                    continue
+            if (
+                isinstance(recv_req, UpdateWeightFromDiskReqInput)
+                and not self.running_batch.is_empty()
+            ):
+                self.pending_weight_update_queue.append(recv_req)
+                continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
