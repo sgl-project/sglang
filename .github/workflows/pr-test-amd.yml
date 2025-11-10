@@ -64,7 +64,7 @@ jobs:
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    # if: needs.check-changes.outputs.sgl_kernel == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -100,8 +100,8 @@ jobs:
 
   unit-test-frontend-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -129,9 +129,9 @@ jobs:
           docker exec -w /sglang-checkout/test/lang ci_sglang python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu-amd:
-    needs: [check-changes, unit-test-frontend-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    needs: [check-changes]
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -160,8 +160,8 @@ jobs:
 
   unit-test-backend-2-gpu-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -189,9 +189,9 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu-amd:
-    needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    needs: [check-changes]
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -220,8 +220,8 @@ jobs:
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -265,8 +265,8 @@ jobs:
 
   performance-test-1-gpu-part-2-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -303,9 +303,9 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   performance-test-2-gpu-amd:
-    needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    needs: [check-changes]
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -353,8 +353,8 @@ jobs:
 
   accuracy-test-1-gpu-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
@@ -383,9 +383,9 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
 
   accuracy-test-2-gpu-amd:
-    needs: [check-changes, accuracy-test-1-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    needs: [check-changes]
+    # if: always() && !failure() && !cancelled() &&
+      # ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
       matrix:
