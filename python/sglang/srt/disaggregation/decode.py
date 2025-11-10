@@ -588,7 +588,7 @@ class DecodePreallocQueue:
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
             self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt_extend()
+            and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
             allocatable_tokens -= self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
@@ -693,6 +693,50 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+        idx = decode_req.metadata_buffer_index
+        (
+            output_id,
+            cached_tokens,
+            output_token_logprobs_val,
+            output_token_logprobs_idx,
+            output_top_logprobs_val,
+            output_top_logprobs_idx,
+            output_topk_p,
+            output_topk_index,
+            output_hidden_states,
+        ) = self.metadata_buffers.get_buf(idx)
+
+        decode_req.req.output_ids.append(output_id[0].item())
+        decode_req.req.cached_tokens = cached_tokens[0].item()
+        if not self.spec_algorithm.is_none():
+            decode_req.req.output_topk_p = output_topk_p
+            decode_req.req.output_topk_index = output_topk_index
+            decode_req.req.hidden_states_tensor = output_hidden_states
+
+        if decode_req.req.return_logprob:
+            decode_req.req.output_token_logprobs_val.append(
+                output_token_logprobs_val[0].item()
+            )
+            decode_req.req.output_token_logprobs_idx.append(
+                output_token_logprobs_idx[0].item()
+            )
+            decode_req.req.output_top_logprobs_val.append(
+                output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
+            )
+            decode_req.req.output_top_logprobs_idx.append(
+                output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
+            )
+
+        decode_req.kv_receiver.clear()
+        decode_req.kv_receiver = None
+        trace_slice_end(
+            RequestStage.DECODE_TRANSFERRED,
+            decode_req.req.rid,
+            auto_next_anon=True,
+        )
+        decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+
     def pop_transferred(self) -> List[Req]:
         if not self.queue:
             return []
@@ -725,58 +769,9 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-
-                idx = decode_req.metadata_buffer_index
-                (
-                    output_id,
-                    cached_tokens,
-                    output_token_logprobs_val,
-                    output_token_logprobs_idx,
-                    output_top_logprobs_val,
-                    output_top_logprobs_idx,
-                    output_topk_p,
-                    output_topk_index,
-                    output_hidden_states,
-                ) = self.metadata_buffers.get_buf(idx)
-
-                decode_req.req.output_ids.append(output_id[0].item())
-                decode_req.req.cached_tokens = cached_tokens[0].item()
-                if not self.spec_algorithm.is_none():
-                    decode_req.req.output_topk_p = output_topk_p
-                    decode_req.req.output_topk_index = output_topk_index
-                    decode_req.req.hidden_states_tensor = output_hidden_states
-
-                if decode_req.req.return_logprob:
-                    decode_req.req.output_token_logprobs_val.append(
-                        output_token_logprobs_val[0].item()
-                    )
-                    decode_req.req.output_token_logprobs_idx.append(
-                        output_token_logprobs_idx[0].item()
-                    )
-                    decode_req.req.output_top_logprobs_val.append(
-                        output_top_logprobs_val[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-                    decode_req.req.output_top_logprobs_idx.append(
-                        output_top_logprobs_idx[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-
-                if hasattr(decode_req.kv_receiver, "clear"):
-                    decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
-
+                self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
-                decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
                 transferred_reqs.append(decode_req.req)
-                trace_slice_end(
-                    RequestStage.DECODE_TRANSFERRED,
-                    decode_req.req.rid,
-                    auto_next_anon=True,
-                )
-
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -850,11 +845,14 @@ class SchedulerDisaggregationDecodeMixin:
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
-    def _run_batch_prebuilt_extend(
+    def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         if batch.inner_idle_batch is not None:
-            return self.run_batch(batch.inner_idle_batch)
+            idle_batch = batch.inner_idle_batch
+            # Reset the inner idle batch to avoid reusing it.
+            batch.inner_idle_batch = None
+            return self.run_batch(idle_batch)
 
         return GenerationBatchResult()
 
@@ -864,7 +862,7 @@ class SchedulerDisaggregationDecodeMixin:
         """Create fake completed prefill if possible and merge with running batch"""
         # Merge the prefill batch into the running batch
         last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_prebuilt_extend():
+        if last_batch and last_batch.forward_mode.is_prebuilt():
             # chunked prefill doesn't happen in decode instance.
             assert self.chunked_req is None
             # Filter finished batches.
@@ -947,8 +945,8 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         # construct fake completed prefill
-        new_batch.prepare_for_prebuilt_extend()
-        new_batch.process_prebuilt_extend(self.server_args, self.model_config)
+        new_batch.prepare_for_prebuilt()
+        new_batch.process_prebuilt(self.server_args, self.model_config)
 
         return new_batch
 
