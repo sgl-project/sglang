@@ -72,11 +72,11 @@ class RouterTracePropagateContext:
                 },
             }
         else:
-            return {"root_span": carrier, "prev_span": "None"}
+            return {"root_span": carrier, "prev_span": None}
 
 
 # global variables
-reqs_context: Dict[str, RouterTraceReqContext] = {}
+reqs_context: Dict[int, RouterTraceReqContext] = {}
 
 __get_cur_time_ns = lambda: int(time.time() * 1e9)
 
@@ -94,7 +94,7 @@ def __get_host_id() -> str:
         try:
             with open("/etc/machine-id", "r") as f:
                 return f.read().strip()
-        except:
+        except Exception:
             pass
 
     mac = uuid.getnode()
@@ -170,7 +170,7 @@ def trace_get_remote_propagate_context(bootstrap_room_list: List[int]):
 
 
 def trace_req_start(
-    bootstrap_room: Optional[int] = None,
+    bootstrap_room: int,
     ts: Optional[int] = None,
 ):
     if not tracing_enabled:
@@ -181,7 +181,6 @@ def trace_req_start(
     pid = threading.get_native_id()
 
     # create req context and root span
-    bootstrap_room = 0 if bootstrap_room is None else bootstrap_room
     req_context = RouterTraceReqContext(
         bootstrap_room=bootstrap_room,
     )
