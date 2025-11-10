@@ -48,6 +48,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -383,9 +384,15 @@ class ForwardBatch:
             )
 
         if enable_num_token_non_padded(model_runner.server_args):
-            ret.num_token_non_padded = torch.tensor(
-                len(batch.input_ids), dtype=torch.int32
-            ).to(device, non_blocking=True)
+            if get_moe_a2a_backend().is_pplx():
+                # The PPLX backend does not support num_token_non_padded
+                ret.num_token_non_padded = torch.tensor(
+                    2147483647, dtype=torch.int32
+                ).to(device, non_blocking=True)
+            else:
+                ret.num_token_non_padded = torch.tensor(
+                    len(batch.input_ids), dtype=torch.int32
+                ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync

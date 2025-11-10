@@ -275,7 +275,7 @@ class BailingMoESparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
+                    if not get_moe_a2a_backend().is_none()
                     else {}
                 ),
             )

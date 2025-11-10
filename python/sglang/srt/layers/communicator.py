@@ -140,10 +140,10 @@ class LayerScatterModes:
                 ScatterMode.SCATTERED
                 if (
                     # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-                    not get_moe_a2a_backend().is_none()
+                    get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
-                else ScatterMode.FULL
+                else ScatterMode.TP_ATTN_FULL if get_moe_a2a_backend().is_pplx() else ScatterMode.FULL
             )
         else:
             return (

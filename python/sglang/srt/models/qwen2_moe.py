@@ -181,7 +181,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_expert", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
+                    if not get_moe_a2a_backend().is_none()
                     else {}
                 ),
             )
@@ -189,7 +189,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.shared_expert = None
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if get_moe_a2a_backend().is_deepep():
+        if not get_moe_a2a_backend().is_none():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (

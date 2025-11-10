@@ -405,14 +405,15 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
+                    if not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
             )
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        self._enable_a2a_moe = not get_moe_a2a_backend().is_none()
+       
+        if self._enable_a2a_moe:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -426,11 +427,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 self.gate.e_score_correction_bias.data
                 if self.gate.e_score_correction_bias is not None
                 else None
-            )
-
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-        )
+                )
 
     def get_moe_weights(self):
         return [

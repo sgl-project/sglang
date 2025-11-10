@@ -977,7 +977,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_auto():
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+                not get_moe_a2a_backend().is_none()
             ):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:

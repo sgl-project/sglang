@@ -607,14 +607,12 @@ def pre_permute_pplx_to_deep_gemm(
         hidden_states,
         hidden_states_scale,
         num_recv_tokens_per_expert,
-        num_input_tokens,
         topk_ids,
         topk_weights,
     ) = dispatch_output
     assert runner_config.activation == "silu"
 
     running_state["all_tokens"] = hidden_states.shape[0]
-    running_state["num_input_tokens"] = num_input_tokens
 
     hidden_states_shape = hidden_states.shape
     hidden_states_device = hidden_states.device
@@ -648,8 +646,6 @@ def post_permute_deep_gemm_to_pplx(
 
     return PplxCombineInput(
         hidden_states=runner_output.hidden_states,
-        num_input_tokens=running_state["num_input_tokens"],
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
-        hidden_states_scale=runner_output.hidden_states_scale,
     )

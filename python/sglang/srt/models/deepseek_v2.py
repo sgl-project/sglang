@@ -670,8 +670,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
+                    if not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -701,8 +700,9 @@ class DeepseekV2MoE(nn.Module):
                 )
 
         self.top_k = config.num_experts_per_tok
+        self._enable_a2a_moe = not get_moe_a2a_backend().is_none()
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if self._enable_a2a_moe:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -718,9 +718,6 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-        )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):

@@ -60,16 +60,20 @@ class TestEpDeepGEMM(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--dp",
+                "2",
                 "--tp",
                 "2",
                 "--ep-size",
                 "2",
+                "--enable-dp-attention",
                 "--quantization",
                 "fp8",
                 "--moe-runner-backend",
                 "deep_gemm",
                 "--moe-a2a-backend",
                 "pplx",
+                "--disable-cuda-graph",
             ],
         )
 
