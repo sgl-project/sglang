@@ -113,6 +113,8 @@ class SchedulerProfilerMixin:
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+        if hasattr(torch.profiler.ProfilerActivity, "XPU"):
+            activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]
