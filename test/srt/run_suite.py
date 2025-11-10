@@ -349,6 +349,7 @@ suite_ascend = {
     "per-commit-1-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_hicache_mha.py", 400),
     ],
     "per-commit-2-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
@@ -359,6 +360,7 @@ suite_ascend = {
     "per-commit-4-ascend-npu": [
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
+        TestFile("ascend/test_ascend_hicache_mla.py", 400),
     ],
     "per-commit-16-ascend-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
