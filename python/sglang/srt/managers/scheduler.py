@@ -413,6 +413,10 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
+        # Init metrics stats
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
+        self.init_kv_events(server_args.kv_events_config)
+
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
 
@@ -507,9 +511,6 @@ class Scheduler(
 
         # Init disaggregation
         self.init_disaggregation()
-
-        # Init metrics stats
-        self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         if self.enable_kv_cache_events:
             self.init_kv_events(server_args.kv_events_config)
@@ -725,6 +726,7 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
+                    enable_metrics=self.enable_metrics,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
             elif self.enable_hierarchical_cache:
@@ -761,6 +763,7 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    enable_metrics=self.enable_metrics,
                 )
             elif self.is_hybrid_gdn:
                 self.tree_cache = MambaRadixCache(
@@ -768,6 +771,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    enable_metrics=self.enable_metrics,
                 )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
@@ -779,6 +783,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    enable_metrics=self.enable_metrics,
                     model_config=self.model_config,
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
@@ -791,6 +796,7 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    enable_metrics=self.enable_metrics,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
                     is_eagle=self.spec_algorithm.is_eagle(),
@@ -1964,8 +1970,8 @@ class Scheduler(
                 req.time_stats.prefill_start_time = current_time
 
         # Place holder handling for pd-disagg decode event loop
-        if batch.forward_mode.is_prebuilt_extend():
-            return self._run_batch_prebuilt_extend(batch)
+        if batch.forward_mode.is_prebuilt():
+            return self._run_batch_prebuilt(batch)
 
         # Run forward
         if self.is_generation:
@@ -2099,8 +2105,8 @@ class Scheduler(
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_prebuilt_extend():
-            self.process_batch_result_prebuilt_extend(batch)
+        elif batch.forward_mode.is_prebuilt():
+            self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 if result.copy_done is not None:
@@ -2443,15 +2449,13 @@ class Scheduler(
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    if hasattr(decode_req.kv_receiver, "abort"):
-                        decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    if hasattr(decode_req.kv_receiver, "abort"):
-                        decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver.abort()
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:

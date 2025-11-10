@@ -310,6 +310,21 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def get_next_disagg_prefill_batch_to_run(
+        self: Scheduler,
+    ) -> Optional[ScheduleBatch]:
+        self.process_prefill_chunk()
+
+        batch = self.get_new_batch_prefill()
+        if self.require_mlp_sync:
+            batch = self.prepare_mlp_sync_batch(batch)
+
+        if batch:
+            attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
+            trace_event_batch("schedule", batch.reqs, attrs=attrs)
+
+        return batch
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -320,25 +335,16 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.process_prefill_chunk()
-            batch = self.get_new_batch_prefill()
-            if batch:
-                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
-                trace_event_batch("schedule", batch.reqs, attrs=attrs)
-
-            if self.require_mlp_sync:
-                batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
-
-            if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
-
-            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+            else:
                 self.self_check_during_idle()
+
+            self.process_disagg_prefill_inflight_queue()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -355,14 +361,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.process_prefill_chunk()
-            batch = self.get_new_batch_prefill()
-            if batch:
-                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
-                trace_event_batch("schedule", batch.reqs, attrs=attrs)
-
-            if self.require_mlp_sync:
-                batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
             batch_result = None
@@ -373,14 +372,12 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
+            elif batch is None:
+                self.self_check_during_idle()
 
-            if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
+            self.process_disagg_prefill_inflight_queue()
 
             self.launch_batch_sample_if_needed(batch_result)
-
-            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
-                self.self_check_during_idle()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
