@@ -113,7 +113,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_embedding_cache
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -128,6 +128,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -166,7 +167,6 @@ from sglang.srt.tracing.trace import (
     trace_slice_end,
     trace_slice_start,
 )
-from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -181,7 +181,6 @@ from sglang.srt.utils import (
     numa_bind_to_node,
     point_to_point_pyobj,
     require_mlp_sync,
-    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
@@ -218,6 +217,7 @@ class Scheduler(
     SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
+    SchedulerDPAttnMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -523,6 +523,9 @@ class Scheduler(
         # Init overlap
         self.init_overlap()
 
+        # Init mlp sync flag
+        self.require_mlp_sync = require_mlp_sync(server_args)
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -824,7 +827,7 @@ class Scheduler(
         )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
-        init_embedding_cache(embedding_cache_size * 1024 * 1024)
+        init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -1667,13 +1670,14 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
 
-        need_dp_attn_preparation = require_mlp_sync(self.server_args)
-
-        if need_dp_attn_preparation and not self.spec_algorithm.is_none():
-            # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
-            # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
+        need_mlp_sync = self.require_mlp_sync
+        if need_mlp_sync and not self.spec_algorithm.is_none():
+            # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
+            # Before merging the new batch into running batch:
+            # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
+            # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.prepare_mlp_sync_batch(new_batch)
-            need_dp_attn_preparation = new_batch is None
+            need_mlp_sync = new_batch is None
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -1687,7 +1691,7 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention
-        if need_dp_attn_preparation:
+        if need_mlp_sync:
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
@@ -1959,6 +1963,10 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
 
+        # Place holder handling for pd-disagg decode event loop
+        if batch.forward_mode.is_prebuilt_extend():
+            return self._run_batch_prebuilt_extend(batch)
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -2089,10 +2097,10 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
-
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-
+        elif batch.forward_mode.is_prebuilt_extend():
+            self.process_batch_result_prebuilt_extend(batch)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 if result.copy_done is not None:
@@ -2107,142 +2115,6 @@ class Scheduler(
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_output(HealthCheckOutput())
-
-    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
-        return self.prepare_mlp_sync_batch_raw(
-            local_batch,
-            dp_size=self.server_args.dp_size,
-            attn_tp_size=self.attn_tp_size,
-            tp_group=self.tp_group,
-            get_idle_batch=self.get_idle_batch,
-            disable_cuda_graph=self.server_args.disable_cuda_graph,
-            spec_algorithm=self.spec_algorithm,
-            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
-            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
-            offload_tags=self.offload_tags,
-        )
-
-    @staticmethod
-    def prepare_mlp_sync_batch_raw(
-        local_batch: ScheduleBatch,
-        dp_size,
-        attn_tp_size: int,
-        tp_group,
-        get_idle_batch,
-        disable_cuda_graph: bool,
-        spec_algorithm,
-        speculative_num_draft_tokens,
-        require_mlp_tp_gather: bool,
-        disable_overlap_schedule: bool,
-        offload_tags: set[str],
-    ):
-        # Check if other DP workers have running batches
-        if local_batch is None:
-            num_tokens = 0
-            num_tokens_for_logprob = 0
-        elif local_batch.forward_mode.is_decode():
-            num_tokens = local_batch.batch_size()
-            num_tokens_for_logprob = num_tokens
-        else:
-            num_tokens = local_batch.extend_num_tokens
-            if local_batch.return_logprob:
-                num_tokens_for_logprob = sum(
-                    # We should have at least 1 token for sample in every case.
-                    max(extend_len - logprob_start_len, 1)
-                    for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens,
-                        local_batch.extend_lens,
-                    )
-                )
-            else:
-                # When return_logprob = False, only need last token per request
-                num_tokens_for_logprob = local_batch.batch_size()
-
-        if local_batch is None or local_batch.forward_mode.is_decode_or_idle():
-            can_cuda_graph = 1
-        else:
-            can_cuda_graph = 0
-
-        is_extend_in_batch = (
-            local_batch.forward_mode.is_extend() if local_batch else False
-        )
-
-        tbo_preparer = TboDPAttentionPreparer()
-        if len(offload_tags) == 0 and disable_overlap_schedule:
-            group = tp_group.device_group
-            device = tp_group.device
-        else:
-            group = tp_group.cpu_group
-            device = "cpu"
-
-        local_info = torch.tensor(
-            [
-                num_tokens,
-                can_cuda_graph,
-                num_tokens_for_logprob,
-                is_extend_in_batch,
-                *tbo_preparer.prepare_all_gather(
-                    local_batch,
-                ),
-            ],
-            dtype=torch.int64,
-            device=device,
-        )
-        global_info = torch.empty(
-            (dp_size, attn_tp_size, 6),
-            dtype=torch.int64,
-            device=device,
-        )
-        torch.distributed.all_gather_into_tensor(
-            global_info.flatten(),
-            local_info,
-            group=group,
-        )
-        global_num_tokens = global_info[:, 0, 0].tolist()
-        can_cuda_graph = min(global_info[:, 0, 1].tolist())
-        global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
-        is_extend_in_batch = global_info[:, 0, 3].tolist()
-
-        tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
-            global_info[:, :, 4:6]
-        )
-
-        if local_batch is None and max(global_num_tokens) > 0:
-            local_batch = get_idle_batch()
-
-        if local_batch is not None:
-            # TODO: handle the case when moe_dense_tp_size != 1
-            if not require_mlp_tp_gather:
-                local_batch.global_num_tokens = [num_tokens]
-                local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
-            else:
-                local_batch.global_num_tokens = global_num_tokens
-                local_batch.global_num_tokens_for_logprob = (
-                    global_num_tokens_for_logprob
-                )
-            local_batch.is_extend_in_batch = any(is_extend_in_batch)
-            local_batch.tbo_split_seq_index = tbo_split_seq_index
-            local_batch.global_forward_mode = global_forward_mode
-
-            # Check forward mode for cuda graph
-            if not disable_cuda_graph:
-                local_batch.can_run_dp_cuda_graph = can_cuda_graph
-
-        return local_batch
-
-    def get_idle_batch(self):
-        idle_batch = ScheduleBatch.init_new(
-            [],
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-        )
-        idle_batch.prepare_for_idle()
-        return idle_batch
 
     def move_ready_grammar_requests(self):
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
@@ -2762,12 +2634,12 @@ def run_scheduler_process(
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
     if dp_rank is not None:
         prefix += f" DP{dp_rank}"
+    if server_args.pp_size > 1:
+        prefix += f" PP{pp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
     if server_args.ep_size > 1:
         prefix += f" EP{moe_ep_rank}"
-    if server_args.pp_size > 1:
-        prefix += f" PP{pp_rank}"
 
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")

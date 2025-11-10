@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use serde_json::json;
+use tracing::error;
 
 use super::super::HarmonyBuilder;
 use crate::{
@@ -56,6 +57,10 @@ impl PipelineStage for HarmonyPreparationStage {
             let request_arc = ctx.responses_request_arc();
             self.prepare_responses(ctx, &request_arc).await?;
         } else {
+            error!(
+                function = "HarmonyPreparationStage::execute",
+                "Unsupported request type for Harmony pipeline"
+            );
             return Err(error::bad_request(
                 "Only Chat and Responses requests supported in Harmony pipeline".to_string(),
             ));
@@ -78,6 +83,10 @@ impl HarmonyPreparationStage {
     ) -> Result<Option<Response>, Response> {
         // Validate - reject logprobs
         if request.logprobs {
+            error!(
+                function = "prepare_chat",
+                "logprobs requested but not supported for Harmony models"
+            );
             return Err(error::bad_request(
                 "logprobs are not supported for Harmony models".to_string(),
             ));
@@ -94,10 +103,14 @@ impl HarmonyPreparationStage {
         };
 
         // Step 3: Build via Harmony
-        let build_output = self
-            .builder
-            .build_from_chat(&body_ref)
-            .map_err(|e| error::bad_request(format!("Harmony build failed: {}", e)))?;
+        let build_output = self.builder.build_from_chat(&body_ref).map_err(|e| {
+            error!(
+                function = "prepare_chat",
+                error = %e,
+                "Harmony build failed for chat request"
+            );
+            error::bad_request(format!("Harmony build failed: {}", e))
+        })?;
 
         // Step 4: Store results
         ctx.state.preparation = Some(PreparationOutput {
@@ -154,6 +167,10 @@ impl HarmonyPreparationStage {
         };
 
         if tool_constraint.is_some() && text_constraint.is_some() {
+            error!(
+                function = "prepare_responses",
+                "Conflicting constraints: both tool_choice and text format specified"
+            );
             return Err(error::bad_request(
                 "Cannot use both tool_choice (required/function) and text format (json_object/json_schema) simultaneously".to_string(),
             ));
@@ -162,10 +179,14 @@ impl HarmonyPreparationStage {
         let constraint = tool_constraint.or(text_constraint);
 
         // Step 3: Build via Harmony from responses API request
-        let build_output = self
-            .builder
-            .build_from_responses(request)
-            .map_err(|e| error::bad_request(format!("Harmony build failed: {}", e)))?;
+        let build_output = self.builder.build_from_responses(request).map_err(|e| {
+            error!(
+                function = "prepare_responses",
+                error = %e,
+                "Harmony build failed for responses request"
+            );
+            error::bad_request(format!("Harmony build failed: {}", e))
+        })?;
 
         // Step 4: Store results with constraint
         ctx.state.preparation = Some(PreparationOutput {
@@ -200,12 +221,25 @@ impl HarmonyPreparationStage {
             TextFormat::Text => Ok(None),
             TextFormat::JsonObject => {
                 let tag = build_text_format_structural_tag(&serde_json::json!({"type": "object"}))
-                    .map_err(|e| Box::new(error::internal_error(e)))?;
+                    .map_err(|e| {
+                        error!(
+                            function = "generate_text_format_constraint",
+                            error = %e,
+                            "Failed to build text format structural tag for JsonObject"
+                        );
+                        Box::new(error::internal_error(e))
+                    })?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
             TextFormat::JsonSchema { schema, .. } => {
-                let tag = build_text_format_structural_tag(schema)
-                    .map_err(|e| Box::new(error::internal_error(e)))?;
+                let tag = build_text_format_structural_tag(schema).map_err(|e| {
+                    error!(
+                        function = "generate_text_format_constraint",
+                        error = %e,
+                        "Failed to build text format structural tag for JsonSchema"
+                    );
+                    Box::new(error::internal_error(e))
+                })?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
         }
@@ -266,11 +300,19 @@ impl HarmonyPreparationStage {
         };
 
         // Validate specific function exists
-        if specific_function.is_some() && tools_to_use.is_empty() {
-            return Err(Box::new(error::bad_request(format!(
-                "Tool '{}' not found in tools list",
-                specific_function.unwrap()
-            ))));
+        match specific_function {
+            Some(tool_name) if tools_to_use.is_empty() => {
+                error!(
+                    function = "generate_tool_call_constraint",
+                    tool_name = %tool_name,
+                    "Specified tool not found in tools list"
+                );
+                return Err(Box::new(error::bad_request(format!(
+                    "Tool '{}' not found in tools list",
+                    tool_name
+                ))));
+            }
+            _ => {}
         }
 
         // Build tags for each tool - need two patterns per tool for reasoning on/off
@@ -312,6 +354,11 @@ impl HarmonyPreparationStage {
         });
 
         serde_json::to_string(&structural_tag).map_err(|e| {
+            error!(
+                function = "generate_tool_call_constraint",
+                error = %e,
+                "Failed to serialize structural tag"
+            );
             Box::new(error::internal_error(format!(
                 "Failed to serialize structural tag: {}",
                 e

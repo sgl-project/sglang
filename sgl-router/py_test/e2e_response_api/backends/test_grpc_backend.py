@@ -136,14 +136,6 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
         self.assertIsInstance(output_json["answer"], str)
         self.assertTrue(output_json["answer"], "Answer is empty")
 
-    @unittest.skip("TODO: Temporary skip since deepwiki might hit rate limit")
-    def test_mcp_basic_tool_call(self):
-        return super().test_mcp_basic_tool_call()
-
-    @unittest.skip("Temporary skip since deepwiki might hit rate limit")
-    def test_mcp_basic_tool_call_streaming(self):
-        return super().test_mcp_basic_tool_call_streaming()
-
 
 class TestGrpcHarmonyBackend(
     StateManagementTests, MCPTests, FunctionCallingBaseTest, StructuredOutputBaseTest

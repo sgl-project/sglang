@@ -259,6 +259,17 @@ jobs:
           echo "ATP_PASSWORD=oracle" >> $GITHUB_ENV
           echo "ATP_DSN=localhost:1521/XEPDB1" >> $GITHUB_ENV
 
+      - name: Start Brave MCP Server
+        run: |
+          docker run -d --rm \
+            -p 8001:8080 \
+            -e BRAVE_API_KEY \
+            --name brave-search-server \
+            shoofio/brave-search-mcp-sse:1.0.10
+          echo "Starting Brave MCP Server..."
+          sleep 2
+          curl -f --max-time 1 http://localhost:8001/sse > /dev/null 2>&1 && echo "Brave MCP Server is healthy!" || echo "Brave MCP Server responded"
+
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
@@ -283,6 +294,12 @@ jobs:
           cd sgl-router
           source "$HOME/.cargo/env"
           SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Cleanup Brave MCP Server
+        if: always()
+        run: |
+          docker stop brave-search-server || true
+          docker rm brave-search-server || true
 
       - name: Cleanup Oracle Database
         if: always()
