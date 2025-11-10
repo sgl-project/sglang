@@ -232,18 +232,26 @@ class MultimodalDataItem:
 
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
-        
+
     def reconstruct(self):
         reconstruct_device = torch.cuda.current_device()
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
             self.feature = self.feature.reconstruct_on_target_device(reconstruct_device)
-        
+
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
-            self.precomputed_embeddings = self.precomputed_embeddings.reconstruct_on_target_device(reconstruct_device)
-        
+            self.precomputed_embeddings = (
+                self.precomputed_embeddings.reconstruct_on_target_device(
+                    reconstruct_device
+                )
+            )
+
         for extra_key in self.model_specific_data:
-            if isinstance(self.model_specific_data[extra_key], CudaIpcTensorTransportProxy):
-                extra_data = self.model_specific_data[extra_key].reconstruct_on_target_device(reconstruct_device)
+            if isinstance(
+                self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
+            ):
+                extra_data = self.model_specific_data[
+                    extra_key
+                ].reconstruct_on_target_device(reconstruct_device)
                 self.model_specific_data[extra_key] = extra_data
 
     @staticmethod
@@ -339,7 +347,7 @@ class MultimodalInputs:
             for item_idx in range(len(obj["mm_items"])):
                 if isinstance(obj["mm_items"][item_idx], MultimodalDataItem):
                     obj["mm_items"][item_idx].reconstruct()
-               
+
         ret = MultimodalInputs(
             mm_items=obj["mm_items"],
         )
