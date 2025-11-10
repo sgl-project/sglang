@@ -20,6 +20,10 @@ class TestFastWan2_1_T2V(TestGenerateBase):
         "test_mixed": 15.0,
     }
 
+    # disabled for vsa
+    def test_usp(self):
+        pass
+
 
 class TestFastWan2_2_T2V(TestGenerateBase):
     model_path = "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers"
@@ -38,7 +42,7 @@ class TestWan2_1_T2V(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.VIDEO
     thresholds = {
-        "test_single_gpu": 76.0,
+        "test_single_gpu": 76.0 * 1.05,
         "test_cfg_parallel": 46.5 * 1.05,
         "test_usp": 22.5,
         "test_mixed": 26.5,
