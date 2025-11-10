@@ -18,5 +18,9 @@ def set_kv_buffer_kernel(
         v_cache[loc] = v
 
 
-def weak_ref_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    return torch.ops.sgl_kernel.weak_ref_tensor(tensor)
+def weak_ref_tensor(tensor):
+    return (
+        torch.ops.sgl_kernel.weak_ref_tensor(tensor)
+        if isinstance(tensor, torch.Tensor)
+        else tensor
+    )
