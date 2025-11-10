@@ -31,6 +31,10 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+SUPPORT_PIN_MEMORY = not _is_npu
+if SUPPORT_PIN_MEMORY:
+    logger.warning("Current platform not support pin_memory")
+
 
 def synchronized(func):
     @wraps(func)
@@ -56,7 +60,7 @@ class HostKVCache(abc.ABC):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
-        self.pin_memory = pin_memory
+        self.pin_memory = pin_memory and SUPPORT_PIN_MEMORY
         self.device = device
 
         self.dtype = device_pool.store_dtype

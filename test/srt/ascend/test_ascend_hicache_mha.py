@@ -22,7 +22,7 @@ TEST_MODEL_MATRIX = {
 }
 
 
-class TestAscendMlaW8A8Int8(CustomTestCase):
+class TestAscendMhaHicache(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -37,7 +37,7 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             "ascend",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
-            2,
+            1.2,
         ]
 
     def test_a_gsm8k(self):
