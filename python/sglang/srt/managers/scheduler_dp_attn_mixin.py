@@ -161,15 +161,13 @@ def prepare_mlp_sync_batch_raw(
     )
 
     need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
-    batch_to_gather = local_batch
     if need_idle_batch:
+        batch_to_gather = local_batch
         if local_batch is None:
-            local_batch = get_idle_batch()
+            batch_to_gather = local_batch = get_idle_batch()
         elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
-            local_batch.inner_idle_batch = get_idle_batch()
-            batch_to_gather = local_batch.inner_idle_batch
-
+            batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
         _update_gather_batch(batch_to_gather, mlp_sync_info, require_mlp_tp_gather)
 
     return local_batch
