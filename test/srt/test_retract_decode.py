@@ -2,7 +2,6 @@ import time
 import unittest
 from types import SimpleNamespace
 
-import pytest
 import requests
 
 from sglang.srt.environ import envs
@@ -74,7 +73,7 @@ class TestRetractDecodeChunkCachePaged(TestRetractDecode):
     other_args = ["--disable-radix-cache", "--page-size", "16"]
 
 
-@pytest.mark.skipif(is_in_ci(), reason="Skipped in CI due to long runtime")
+@unittest.skipIf(is_in_ci(), "Skipped in CI due to long runtime")
 class TestRetractDecodeLongOutput(CustomTestCase):
     """python -m unittest test_retract_decode.TestRetractDecodeLongOutput"""
 
@@ -107,7 +106,7 @@ class TestRetractDecodeLongOutput(CustomTestCase):
         assert self.process.poll() is None, "Server crashed during test"
 
 
-@pytest.mark.skipif(is_in_ci(), reason="Skipped in CI due to long runtime")
+@unittest.skipIf(is_in_ci(), "Skipped in CI due to long runtime")
 class TestRetractDecodeLongOutputChunkCache(CustomTestCase):
     """python -m unittest test_retract_decode.TestRetractDecodeLongOutputChunkCache"""
 
