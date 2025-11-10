@@ -110,14 +110,9 @@ class AttentionInputs:
         self.qkv_latent_ = None
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
-        tp_group = get_tp_group()
-        sum_seq_len = forward_batch.input_ids.shape[0]
-        tp_size = tp_group.world_size
-
-        output = hidden_states.new_empty((sum_seq_len, hidden_states.shape[-1]))
-        tp_group.all_gather(
-            hidden_states, output_tensor_list=list(output.tensor_split(tp_size))
-        )
+        total_tokens = forward_batch.input_ids.shape[0]
+        output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
+        get_tp_group().all_gather_into_tensor(output, hidden_states)
         return output
 
     def fetch_qkv_latent(self):
@@ -467,16 +462,17 @@ class LayerCommunicator:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-
-        inputs = list(hidden_states.tensor_split(self._context.tp_size))
-        scattered_local_tokens = inputs[self._context.tp_rank]
-        hidden_states = get_tp_group().reduce_scatter(scattered_local_tokens, inputs)
-
+        assert (
+            hidden_states.shape[0] % self._context.tp_size == 0
+        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        local_tokens = hidden_states.shape[0] // self._context.tp_size
+        output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
+        get_tp_group().reduce_scatter_tensor(output, hidden_states)
         if residual is not None:
             residual = residual.tensor_split(self._context.tp_size)[
                 self._context.tp_rank
             ]
-        return hidden_states, residual
+        return output, residual
 
     def prepare_mlp(
         self,
