@@ -326,6 +326,7 @@ class MambaRadixCache(BasePrefixCache):
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
+        enable_metrics: bool = False,
     ):
         assert isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
@@ -339,6 +340,9 @@ class MambaRadixCache(BasePrefixCache):
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         self.key_match_fn = _key_match_page_size1
         self.get_child_key_fn = get_child_key
