@@ -352,10 +352,10 @@ impl RouterTrait for RouterManager {
         body: &GenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, None);
+        let router = self.select_router_for_request(headers, Some(&body.model));
 
         if let Some(router) = router {
-            router.route_generate(headers, body, None).await
+            router.route_generate(headers, body, Some(&body.model)).await
         } else {
             (
                 StatusCode::NOT_FOUND,
