@@ -456,8 +456,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     if IS_SPEC_DECODING:
         cache_idx = tl.load(h0_indices + i_n)
 
-    step_idx = 0
-    for _ in range(0, T):
+    for step_idx in range(0, T):
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx = 0 should use the b_h from USE_INITIAL_STATE
             if step_idx != 0 and cache_idx >= 0:
@@ -516,8 +515,6 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                     + o_v[None, :]
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
-
-        step_idx += 1
 
         p_q += H * K
         p_k += H * K
