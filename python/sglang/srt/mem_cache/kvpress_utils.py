@@ -95,8 +95,8 @@ class ScorerPress(BasePress):
         hidden_states: torch.Tensor,
         keys: torch.Tensor,
         values: torch.Tensor,
-        attentions: torch.Tensor,
-        kwargs,
+        attentions: Optional[torch.Tensor],
+        kwargs: Optional[dict],
     ) -> torch.Tensor:
         """
         Compute a tensor of scores with shape (bsz, num_key_value_heads, q_len)
