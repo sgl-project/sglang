@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
-_is_shuffle_moe = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
+_is_shuffle_moe_mxfp4 = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
 
 __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 
@@ -170,7 +170,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
         # Pre-shuffle weight
-        if _is_shuffle_moe:
+        if _is_shuffle_moe_mxfp4:
             layer.w13_weight.data = shuffle_weight(
                 layer.w13_weight.contiguous(), (16, 16)
             )

@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
-_is_shuffle_moe = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
+_is_shuffle_moe_mxfp4 = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
 
 if _is_hip:
     # import aiter
@@ -804,7 +804,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
 
         # Pre-shuffle weight
-        if _is_shuffle_moe:
+        if _is_shuffle_moe_mxfp4:
             w13 = shuffle_weight(w13.contiguous(), (16, 16))
             w2 = shuffle_weight(w2.contiguous(), (16, 16))
 
