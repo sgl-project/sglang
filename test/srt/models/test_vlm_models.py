@@ -51,21 +51,6 @@ class TestVLMModels(CustomTestCase):
         os.environ["OPENAI_API_KEY"] = cls.api_key
         os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
 
-    def _detect_eviction_in_logs(self, log_output):
-        """Detect if eviction events occurred in the log output."""
-        eviction_keywords = ["Cache eviction: evicted"]
-
-        eviction_detected = False
-        eviction_count = 0
-
-        for line in log_output.split("\n"):
-            if any(keyword in line for keyword in eviction_keywords):
-                eviction_detected = True
-                eviction_count += 1
-                print(f"Eviction detected: {line.strip()}")
-
-        return eviction_detected, eviction_count
-
     def run_mmmu_eval(
         self,
         model_version: str,
