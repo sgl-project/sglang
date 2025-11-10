@@ -2610,7 +2610,7 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER"],
+        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
     )
     parser.add_argument(
         "--lora-name",
