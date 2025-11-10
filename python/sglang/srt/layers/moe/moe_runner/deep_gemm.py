@@ -140,6 +140,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
+        disable_tma_align = True
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_dtype = running_state["hidden_states_dtype"]
@@ -161,7 +162,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not disable_tma_align:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (hidden_states, hidden_states_scale),
@@ -198,7 +199,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not disable_tma_align:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -624,7 +625,7 @@ def pre_permute_pplx_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    m_indices = torch.empty(hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32)
+    m_indices = torch.full((hidden_states.shape[0],), -1, device=hidden_states.device, dtype=torch.int32)
     compute_m_indices(num_recv_tokens_per_expert, m_indices)
 
     return DeepGemmRunnerInput(

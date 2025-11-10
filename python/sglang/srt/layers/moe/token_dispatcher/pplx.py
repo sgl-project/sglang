@@ -65,14 +65,12 @@ class PplxDispatcher(BaseDispatcher):
             local_rank = get_world_group().local_rank
             global_rank = get_world_group().rank
             ranks = get_world_group().ranks
-            node_rank = global_rank // get_world_group().world_size# To get node rank, we still need to collect hostnames
-
             hostname = os.environ.get("HOSTNAME", "unknown")
             host_list = [None] * get_world_size()
             torch.distributed.all_gather_object(host_list, hostname)
             unique_nodes = sorted(set(host_list))
             node_rank = unique_nodes.index(hostname)
-
+            
             NUM_NODES = len(unique_nodes)
             GLOBAL_GROUP = RoseParallelGroup(
                 device=device,
@@ -92,25 +90,7 @@ class PplxDispatcher(BaseDispatcher):
 
         self.max_num_tokens = get_global_server_args().chunked_prefill_size // self.attn_tp_size
         self.dtype, self.scale_dtype = torch.float8_e4m3fn, torch.float32  # TODO: support other dtypes
-        
-        if global_group.global_rank == 0:
-            print("============== PPLX Dispatcher Init Info ==============")
-            print(f"max_num_tokens: {self.max_num_tokens}")
-            print(f"num_experts: {moe_runner_config.num_experts}")
-            print(f"expert_padding: {128}")
-            print(f"hidden_dim: {moe_runner_config.hidden_size}")
-            print(f"hidden_dim_scale: {moe_runner_config.hidden_size // 128}")
-            print(f"max_private_tokens: {None}")
-            print(f"in_dtype: {self.dtype}")
-            print(f"out_dtype: {torch.bfloat16}")
-            print(f"scale_dtype: {self.scale_dtype}")
-            print(f"num_experts_per_token: {moe_runner_config.top_k}")
-            print(f"nets_per_gpu: {1}")
-            print(f"device: {get_attention_tp_group().device}")
-            print(f"dtype: {self.dtype}")
-            print(f"scale_dtype: {self.scale_dtype}")
-            print(f"num_local_experts: {self.num_local_experts}")
-            print("========================================================")
+        self.num_experts = moe_runner_config.num_experts
 
         with torch.device('cpu'):
             self.dispatcher = EfaAllToAll(
@@ -139,7 +119,7 @@ class PplxDispatcher(BaseDispatcher):
         
         max_recv_tokens = hidden_states.shape[0] * self.attn_dp_size * self.num_local_experts
 
-        expert_num_tokens = torch.empty(
+        out_expert_num_tokens = torch.empty(
             (self.num_local_experts,),
             dtype=torch.int32,
             device=hidden_states.device,
@@ -164,24 +144,32 @@ class PplxDispatcher(BaseDispatcher):
         else:
             raise NotImplementedError()
 
-        print(f"hidden_states_fp8.shape: {hidden_states_fp8.shape}, hidden_states_scale.shape: {hidden_states_scale.shape}, topk_output.topk_ids.shape: {topk_output.topk_ids.shape}, topk_output.topk_weights.shape: {topk_output.topk_weights.shape}, out_expert_x.shape: {out_expert_x.shape}, out_expert_x_scale.shape: {out_expert_x_scale.shape}, expert_num_tokens.shape: {expert_num_tokens.shape}, topk_output.topk_ids.min(): {topk_output.topk_ids.min()}, topk_output.topk_ids.max(): {topk_output.topk_ids.max()}")
+        if hidden_states_fp8.shape[0] > 0:
+            print(f"hidden_states_fp8.shape: {hidden_states_fp8.shape}, hidden_states_scale.shape: {hidden_states_scale.shape}, topk_output.topk_ids.shape: {topk_output.topk_ids.shape}, topk_output.topk_weights.shape: {topk_output.topk_weights.shape}, out_expert_x.shape: {out_expert_x.shape}, out_expert_x_scale.shape: {out_expert_x_scale.shape}, out_expert_num_tokens.shape: {out_expert_num_tokens.shape}, topk_output.topk_ids.min(): {topk_output.topk_ids.min()}, topk_output.topk_ids.max(): {topk_output.topk_ids.max()}")
+            topk_ids = torch.clamp(topk_output.topk_ids, min=0, max=self.num_experts - 1)
+        else:
+            topk_ids = topk_output.topk_ids
+        
+        topk_ids = topk_ids.to(torch.uint32)
 
         self.dispatcher.dispatch(
-            out_expert_num_tokens=expert_num_tokens,
+            out_expert_num_tokens=out_expert_num_tokens,
             out_expert_x=out_expert_x,
             out_expert_x_scale=out_expert_x_scale,
             dp_x=hidden_states_fp8,
             dp_x_scale=hidden_states_scale,
-            indices=topk_output.topk_ids.to(torch.uint32),
+            indices=topk_ids,
             weights=topk_output.topk_weights,
             bound_m=None,
         )
+        
+        # print(out_expert_x, out_expert_x_scale, flush=True)
 
         return PplxDispatchOutput(
             hidden_states=out_expert_x,
             hidden_states_scale=out_expert_x_scale,
-            num_recv_tokens_per_expert=expert_num_tokens,
-            topk_ids=topk_output.topk_ids,
+            num_recv_tokens_per_expert=out_expert_num_tokens,
+            topk_ids=topk_ids,
             topk_weights=topk_output.topk_weights,
         )
 
@@ -192,14 +180,16 @@ class PplxDispatcher(BaseDispatcher):
             device=combine_input.hidden_states.device,
         )
 
-        print(out_tokens.shape, combine_input.topk_ids.shape, combine_input.topk_weights.shape, combine_input.hidden_states.shape, combine_input.topk_ids.min(), combine_input.topk_ids.max())
+        # print(out_tokens.shape, combine_input.topk_ids.shape, combine_input.topk_weights.shape, combine_input.hidden_states.shape)
 
         self.dispatcher.combine(
             out_tokens=out_tokens,
-            indices=combine_input.topk_ids.to(torch.uint32),
+            indices=combine_input.topk_ids,
             weights=combine_input.topk_weights,
             expert_y=combine_input.hidden_states,
             bound_m=None,
         )
+        
+        # print(out_tokens)
         
         return out_tokens

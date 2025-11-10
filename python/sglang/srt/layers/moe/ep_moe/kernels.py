@@ -649,6 +649,8 @@ def compute_m_indices(
     num_recv_tokens_per_expert: torch.Tensor,
     m_indices: torch.Tensor,
 ):
+
+    
     BLOCK_E = 128  # token num of per expert is aligned to 128
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -662,6 +664,7 @@ def compute_m_indices(
         BLOCK_E=BLOCK_E,
         BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
     )
+    print(num_recv_tokens_per_expert, m_indices)
     return
 
 

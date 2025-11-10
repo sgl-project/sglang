@@ -384,15 +384,9 @@ class ForwardBatch:
             )
 
         if enable_num_token_non_padded(model_runner.server_args):
-            if get_moe_a2a_backend().is_pplx():
-                # The PPLX backend does not support num_token_non_padded
-                ret.num_token_non_padded = torch.tensor(
-                    2147483647, dtype=torch.int32
-                ).to(device, non_blocking=True)
-            else:
-                ret.num_token_non_padded = torch.tensor(
-                    len(batch.input_ids), dtype=torch.int32
-                ).to(device, non_blocking=True)
+            ret.num_token_non_padded = torch.tensor(
+                len(batch.input_ids), dtype=torch.int32
+            ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
@@ -996,7 +990,7 @@ class ForwardBatch:
 
 
 def enable_num_token_non_padded(server_args):
-    return get_moe_expert_parallel_world_size() > 1
+    return get_moe_expert_parallel_world_size() > 1 and not get_moe_a2a_backend().is_pplx()
 
 
 class PPProxyTensors:
