@@ -404,8 +404,6 @@ def handle_attention_nsa(attn, forward_batch):
     - Decode: MLA (avoids per-token decompression)
     - Prefill <= 2048: MHA (topk ineffective, MHA has lower FLOPs)
     - Prefill > 2048: MLA (topk filtering reduces computation significantly)
-
-    TODO: B200 (SM100) MHA path is temporarily disabled due to FA4 gpqa accuracy issues.
     """
     if forward_batch.forward_mode.is_decode_or_idle():
         return AttnForwardMethod.MLA
@@ -418,10 +416,17 @@ def handle_attention_nsa(attn, forward_batch):
         # B200 uses trtllm_ragged_attention_deepseek kernel instead of FA4
         supports_mha = _device_sm in [90, 100]
 
-        # Check if kvcache dtype is bfloat16
-        kv_dtype_is_bf16 = forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+        # MHA supports both BF16 and FP8 KV cache (FP8 will be dequantized on-demand)
+        kv_dtype_supported = forward_batch.token_to_kv_pool.dtype in [
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        ]
 
-        if max_kv_len <= attn.indexer.index_topk and supports_mha and kv_dtype_is_bf16:
+        if (
+            max_kv_len <= attn.indexer.index_topk
+            and supports_mha
+            and kv_dtype_supported
+        ):
             # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
             # Check if total sequence length fits in chunk capacity
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
@@ -1548,9 +1553,31 @@ class DeepseekV2AttentionMLA(nn.Module):
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
-            kv_a, k_pe = self._get_mla_kv_buffer(
-                forward_batch.fetch_mha_one_shot_kv_indices(), q.dtype, forward_batch
-            )
+            # If FP8, need to dequantize first
+            if self.kv_cache_dtype == "fp8_e4m3":
+                from sglang.srt.layers.attention.nsa.dequant_k_cache import (
+                    dequantize_k_cache_paged,
+                )
+
+                kv_indices = forward_batch.fetch_mha_one_shot_kv_indices()
+                kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
+                    self.attn_mha.layer_id
+                )
+                kv_latent_bf16 = dequantize_k_cache_paged(
+                    kv_cache_fp8, kv_indices
+                )  # [num_prefix_tokens, 1, 576]
+                kv_a = (
+                    kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
+                )  # [num_prefix_tokens, 512]
+                k_pe = kv_latent_bf16[
+                    :, :, self.kv_lora_rank :
+                ]  # [num_prefix_tokens, 1, 64]
+            else:
+                kv_a, k_pe = self._get_mla_kv_buffer(
+                    forward_batch.fetch_mha_one_shot_kv_indices(),
+                    q.dtype,
+                    forward_batch,
+                )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
