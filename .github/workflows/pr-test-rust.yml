@@ -166,7 +166,7 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-router
-          python3 -m pip install --upgrade pip maturin
+          python3 -m pip install maturin==1.9.6
           pip uninstall -y sglang-router
           maturin build --release --profile ci --features vendored-openssl
           pip install target/wheels/*.whl
@@ -275,8 +275,7 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-router
-          python3 -m venv .venv
-          python3 -m pip install --upgrade pip maturin
+          python3 -m pip install maturin==1.9.6
           pip uninstall -y sglang-router
           maturin build --release --profile ci --features vendored-openssl
           pip install target/wheels/*.whl
