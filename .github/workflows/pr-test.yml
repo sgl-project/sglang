@@ -52,6 +52,8 @@ jobs:
           filters: |
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+              - "python/sglang/launch_server/**"
+              - "python/sglang/cli/**"
             main_package:
               - "python/**"
               - "scripts/ci/**"
