@@ -32,9 +32,9 @@ except ImportError:
     SAFETENSORS_AVAILABLE = False
 
 
-# Mapping of runners to their required models
-# Add new runners and models here as needed
-RUNNER_MODEL_MAP: Dict[str, List[str]] = {
+# Mapping of runner labels to their required models
+# Add new runner labels and models here as needed
+RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "8-gpu-h200": ["deepseek-ai/DeepSeek-V3-0324", "moonshotai/Kimi-K2-Thinking"],
 }
 
@@ -287,37 +287,74 @@ def download_model(model_id: str) -> bool:
         return False
 
 
-def get_runner_name() -> Optional[str]:
-    """Get the runner name from environment variables."""
-    return os.environ.get("RUNNER_NAME")
-
-
-def should_validate_runner(runner_name: Optional[str]) -> bool:
-    """Check if the runner should have model validation."""
-    if not runner_name:
-        return False
-
-    # Check if runner is in the configured map (exact match only)
-    return runner_name in RUNNER_MODEL_MAP
-
-
-def get_required_models(runner_name: str) -> List[str]:
+def get_runner_labels() -> List[str]:
     """
-    Get list of models required for a specific runner.
+    Get the runner labels from environment variables.
 
-    Args:
-        runner_name: Name of the runner (e.g., "8-gpu-h200")
+    GitHub Actions doesn't expose runner labels directly as environment variables.
+    Workflows should set the RUNNER_LABELS environment variable with a comma-separated
+    list of labels (e.g., "self-hosted,8-gpu-h200,linux").
 
     Returns:
-        List of model identifiers to validate
+        List of runner labels, empty list if not set
     """
-    # Exact match only
-    if runner_name in RUNNER_MODEL_MAP:
-        print(f"  ✓ Matched runner configuration: '{runner_name}'")
-        return RUNNER_MODEL_MAP[runner_name]
+    labels_str = os.environ.get("RUNNER_LABELS", "")
+    if not labels_str:
+        return []
 
-    print(f"  ⚠ No configuration found for runner: '{runner_name}'")
-    return []
+    # Split by comma and strip whitespace
+    return [label.strip() for label in labels_str.split(",") if label.strip()]
+
+
+def should_validate_runner(runner_labels: List[str]) -> bool:
+    """
+    Check if the runner should have model validation based on its labels.
+
+    Args:
+        runner_labels: List of runner labels
+
+    Returns:
+        True if any label matches a configured label in RUNNER_LABEL_MODEL_MAP
+    """
+    if not runner_labels:
+        return False
+
+    # Check if any label is in the configured map
+    return any(label in RUNNER_LABEL_MODEL_MAP for label in runner_labels)
+
+
+def get_required_models(runner_labels: List[str]) -> List[str]:
+    """
+    Get list of models required based on runner labels.
+
+    Args:
+        runner_labels: List of runner labels (e.g., ["self-hosted", "8-gpu-h200", "linux"])
+
+    Returns:
+        List of model identifiers to validate (deduplicated)
+    """
+    all_models = []
+
+    for label in runner_labels:
+        if label in RUNNER_LABEL_MODEL_MAP:
+            models = RUNNER_LABEL_MODEL_MAP[label]
+            print(
+                f"  ✓ Matched label configuration: '{label}' -> {len(models)} model(s)"
+            )
+            all_models.extend(models)
+
+    if not all_models:
+        print(f"  ⚠ No configuration found for any label in: {runner_labels}")
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_models = []
+    for model in all_models:
+        if model not in seen:
+            seen.add(model)
+            unique_models.append(model)
+
+    return unique_models
 
 
 def main() -> int:
@@ -332,21 +369,23 @@ def main() -> int:
     print("Model Validation for CI Runners")
     print("=" * 70)
 
-    runner_name = get_runner_name()
-    print(f"Runner name: {runner_name or 'NOT SET'}")
+    runner_labels = get_runner_labels()
+    print(f"Runner labels: {', '.join(runner_labels) if runner_labels else 'NOT SET'}")
 
     # Check if this runner needs validation
-    if not should_validate_runner(runner_name):
-        print("Skipping validation: Runner not configured for model validation")
+    if not should_validate_runner(runner_labels):
+        print(
+            "Skipping validation: No runner labels match configured model requirements"
+        )
         return 0
 
     print(f"Proceeding with model validation for this runner")
 
-    # Get required models for this runner
-    required_models = get_required_models(runner_name)
+    # Get required models for these runner labels
+    required_models = get_required_models(runner_labels)
 
     if not required_models:
-        print(f"Warning: No models configured for runner '{runner_name}'")
+        print(f"Warning: No models configured for labels: {runner_labels}")
         return 0
 
     print(f"Models to validate: {required_models}")
