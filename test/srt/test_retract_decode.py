@@ -107,7 +107,7 @@ class TestRetractDecodeLongOutput(CustomTestCase):
 
 
 @unittest.skipIf(is_in_ci(), "Skipped in CI due to long runtime")
-class TestRetractDecodeLongOutputChunkCache(CustomTestCase):
+class TestRetractDecodeLongOutputChunkCache(TestRetractDecodeLongOutput):
     """python -m unittest test_retract_decode.TestRetractDecodeLongOutputChunkCache"""
 
     other_args = ["--disable-radix-cache"]
