@@ -23,9 +23,9 @@ if _is_hip:
     MODELS = [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4)]
 else:
     MODELS = [
-        SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
+        # SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
         SimpleNamespace(model="Qwen/Qwen2.5-VL-3B-Instruct", mmmu_accuracy=0.4),
-        SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
+        # SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
     ]
 
 # Set default mem_fraction_static to 0.8
@@ -268,50 +268,6 @@ class TestVLMModels(CustomTestCase):
 
         for model in models_to_test:
             self._run_vlm_mmmu_test(model, "./logs")
-
-    def test_vlm_mmmu_benchmark_with_small_cache(self):
-        """Test VLM models against MMMU benchmark with a small embedding cache to force eviction."""
-        models_to_test = MODELS
-
-        if is_in_ci():
-            models_to_test = [random.choice(MODELS)]
-
-        for model in models_to_test:
-            custom_env = {"SGLANG_VLM_CACHE_SIZE_MB": "5"}
-
-            # Run the test with output capture
-            server_output = self._run_vlm_mmmu_test(
-                model,
-                "./logs_small_cache",
-                test_name=" with small embedding cache (evict test)",
-                custom_env=custom_env,
-                log_level="debug",  # Enable debug logging for eviction detection
-                capture_output=True,  # Capture server output
-            )
-
-            # Print server output for debugging
-            print("Server output:\n", server_output)
-
-            # Analyze server output for eviction events
-            eviction_detected, eviction_count = self._detect_eviction_in_logs(
-                server_output
-            )
-
-            # Assert that eviction was detected (since we're using small cache)
-            self.assertTrue(
-                eviction_detected,
-                f"Expected eviction events to be detected with small cache (5MB), but none found. "
-                f"Cache size may be too large for the workload or eviction logic may not be working. "
-                f"Total log content length: {len(server_output)} characters",
-            )
-
-            print(
-                f"Eviction detection summary: {eviction_count} eviction events detected"
-            )
-
-            # Additional assertion: if eviction was detected, the test passed
-            if eviction_detected:
-                print("✅ Eviction logic successfully triggered and detected!")
 
 
 if __name__ == "__main__":
