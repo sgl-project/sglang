@@ -35,7 +35,7 @@ suites = {
         TestFile("models/test_encoder_embedding_models.py", 460),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 160),
-        TestFile("models/test_qwen_models.py", 82),
+        TestFile("models/test_qwen_models.py", 150),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("models/test_vlm_models.py", 741),
@@ -69,11 +69,11 @@ suites = {
         TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
-        TestFile("test_deterministic.py", 320),
-        TestFile("test_eagle_infer_a.py", 370),
-        TestFile("test_eagle_infer_b.py", 500),
+        TestFile("test_deterministic.py", 400),
+        TestFile("test_eagle_infer_a.py", 750),
+        TestFile("test_eagle_infer_b.py", 750),
         TestFile("test_eagle_infer_beta.py", 90),
-        TestFile("test_constrained_decoding.py", 120),
+        TestFile("test_constrained_decoding.py", 150),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
@@ -103,6 +103,7 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
+        TestFile("test_piecewise_cuda_graph.py", 300),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -115,7 +116,7 @@ suites = {
         TestFile("test_speculative_registry.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_srt_engine.py", 261),
+        TestFile("test_srt_engine.py", 450),
         TestFile("test_standalone_speculative_decoding.py", 150),
         TestFile("test_start_profile.py", 60),
         TestFile("test_profile_merger.py", 60),
@@ -157,7 +158,6 @@ suites = {
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 291),
-        TestFile("test_disaggregation_dp_attention.py", 155),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
@@ -167,11 +167,13 @@ suites = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
+        TestFile("models/test_kimi_k2_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
+        TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
@@ -206,6 +208,7 @@ suites = {
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
     "nightly-1-gpu": [
+        TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
@@ -217,7 +220,9 @@ suites = {
     ],
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
+        TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
     ],
+    "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [],
     "nightly-8-gpu": [],
     "nightly-8-gpu-h200": [],
@@ -240,6 +245,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_benchmark.py"),
         TestFile("hicache/test_hicache_storage_e2e.py"),
         TestFile("layers/attention/nsa/test_act_quant_triton.py"),
+        TestFile("layers/moe/test_moe_runners.py"),
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
         TestFile("models/lora/test_lora.py"),
@@ -330,11 +336,14 @@ suites = {
         TestFile("test_moe_ep.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_mscclpp.py"),
-        TestFile("test_nightly_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_perf.py"),
-        TestFile("test_nightly_vlms_mmmu_eval.py"),
-        TestFile("test_nightly_vlms_perf.py"),
+        TestFile("nightly/test_deepseek_v31_perf.py"),
+        TestFile("nightly/test_deepseek_v32_perf.py"),
+        TestFile("nightly/test_gpt_oss_4gpu_perf.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_text_models_gsm8k_eval.py"),
+        TestFile("nightly/test_text_models_perf.py"),
+        TestFile("nightly/test_vlms_mmmu_eval.py"),
+        TestFile("nightly/test_vlms_perf.py"),
         TestFile("test_openai_adapter.py"),
         TestFile("test_openai_function_calling.py"),
         TestFile("test_openai_server.py"),
@@ -474,7 +483,7 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "nightly-amd": [
-        TestFile("test_nightly_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
     ],
 }
 
@@ -641,6 +650,12 @@ if __name__ == "__main__":
         type=int,
         help="Use auto load balancing. The number of parts.",
     )
+    arg_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (useful for nightly tests)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -658,5 +673,5 @@ if __name__ == "__main__":
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
