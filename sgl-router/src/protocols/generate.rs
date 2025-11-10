@@ -21,7 +21,7 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 
-    pub model: String,
+    pub model: Option<String>,
 
     /// Input IDs for tokenized input
     #[serde(skip_serializing_if = "Option::is_none")]
