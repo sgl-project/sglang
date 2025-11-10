@@ -84,8 +84,8 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
-        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
+        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
