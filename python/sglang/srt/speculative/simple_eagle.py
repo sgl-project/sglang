@@ -414,7 +414,6 @@ class SimpleEagleWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
-        # logger.info(f"self.cuda_graph_runner:{self.cuda_graph_runner} and can run :{self.cuda_graph_runner.can_run(forward_batch)}")
         if can_cuda_graph:
             # logger.info("can_cuda_graph !!!")
             forward_batch.spec_info_topk_index = draft_input_spec_info.topk_index

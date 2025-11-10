@@ -33,5 +33,6 @@ _DEFAULT_WEIGHT = 1000
 _WEIGHT_OF_FORWARD_MODE = {
     ForwardMode.DECODE: 1,
     ForwardMode.TARGET_VERIFY: 1,
+    ForwardMode.SIMPLE_TARGET_VERIFY: 1,
     None: 1,
 }

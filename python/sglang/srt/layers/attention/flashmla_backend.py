@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 import torch
 import triton
 from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
@@ -120,39 +121,33 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         elif forward_batch.forward_mode.is_simple_draft():
             seq_lens = forward_batch.seq_lens + 1
-            if forward_batch.seq_lens_cpu is not None:
-                seq_lens_cpu = forward_batch.seq_lens_cpu + 1
-            else:
+            if forward_batch.seq_lens_cpu is None:
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + 1
+            else:
+                seq_lens_cpu = forward_batch.seq_lens_cpu + 1
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
 
             block_kv_indices = torch.full(
-                (bs, max_seqlen_pad), -1, dtype=torch.int32, device=seq_lens.device
-            )
+	            (bs, max_seqlen_pad), -1, dtype=torch.int32, device=seq_lens.device
+	        )
             create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                seq_lens,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                max_seqlen_pad,
+                self.req_to_token, forward_batch.req_pool_indices, seq_lens,
+                None, block_kv_indices, self.req_to_token.stride(0), max_seqlen_pad
             )
 
             mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32), self.num_q_heads, 1
+                seq_lens.to(torch.int32),
+                self.num_q_heads,
+                1
             )
 
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata, num_splits, block_kv_indices
             )
-        elif (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_simple_verify()
-        ):
-            seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
-            seq_lens = forward_batch.seq_lens + self.num_draft_tokens
 
+        elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_simple_verify():
+            seq_lens = forward_batch.seq_lens + self.num_draft_tokens
+            seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
             block_kv_indices = torch.full(
                 (bs, max_seqlen_pad),
@@ -267,7 +262,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                self.num_q_heads,
+                self.num_draft_tokens * self.num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -367,7 +362,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                self.num_q_heads,
+                self.num_q_heads * self.num_draft_tokens,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -441,19 +436,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-        if forward_batch.forward_mode.is_simple_verify():
-            cache_seqlens = (
-                forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens
-            )
-        else:
-            cache_seqlens = forward_batch.seq_lens.to(torch.int32)
-
+        offset = self.num_draft_tokens if forward_batch.forward_mode.is_simple_verify() else 0
+        cache_seqlens = forward_batch.seq_lens.to(torch.int32) + offset
+        # s
         if self.data_type == torch.float8_e4m3fn:
             reshape_q_fp8 = reshape_q.to(torch.float8_e4m3fn)
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
+                # cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 cache_seqlens=cache_seqlens,
                 head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
@@ -471,7 +463,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=cache_seqlens,
+                # cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                cache_seqlens = cache_seqlens,
                 head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
@@ -573,7 +566,7 @@ class FlashMLAMultiStepDraftBackend:
         )
 
         self.attn_backends = []
-        for i in range(self.speculative_num_steps - 1):
+        for i in range(self.speculative_num_steps):
             self.attn_backends.append(
                 FlashMLABackend(
                     model_runner,
@@ -601,7 +594,7 @@ class FlashMLAMultiStepDraftBackend:
         self.common_template(forward_batch, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        for i in range(self.speculative_num_steps - 1):
+        for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, block_kv_indices=None
             )
