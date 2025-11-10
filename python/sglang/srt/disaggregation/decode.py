@@ -588,7 +588,7 @@ class DecodePreallocQueue:
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
             self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt_extend()
+            and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
             allocatable_tokens -= self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
@@ -850,7 +850,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
-    def _run_batch_prebuilt_extend(
+    def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         if batch.inner_idle_batch is not None:
@@ -867,7 +867,7 @@ class SchedulerDisaggregationDecodeMixin:
         """Create fake completed prefill if possible and merge with running batch"""
         # Merge the prefill batch into the running batch
         last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_prebuilt_extend():
+        if last_batch and last_batch.forward_mode.is_prebuilt():
             # chunked prefill doesn't happen in decode instance.
             assert self.chunked_req is None
             # Filter finished batches.
@@ -950,8 +950,8 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         # construct fake completed prefill
-        new_batch.prepare_for_prebuilt_extend()
-        new_batch.process_prebuilt_extend(self.server_args, self.model_config)
+        new_batch.prepare_for_prebuilt()
+        new_batch.process_prebuilt(self.server_args, self.model_config)
 
         return new_batch
 

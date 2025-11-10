@@ -42,7 +42,7 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
-    def process_batch_result_prebuilt_extend(self: Scheduler, batch: ScheduleBatch):
+    def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
             req.check_finished()

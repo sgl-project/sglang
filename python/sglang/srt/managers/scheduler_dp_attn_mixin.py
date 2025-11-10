@@ -103,7 +103,7 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
 ):
     # Check if other DP workers have running batches
-    if local_batch is None or local_batch.forward_mode.is_prebuilt_extend():
+    if local_batch is None or local_batch.forward_mode.is_prebuilt():
         num_tokens = 0
         num_tokens_for_logprob = 0
     elif local_batch.forward_mode.is_decode():
@@ -127,7 +127,7 @@ def prepare_mlp_sync_batch_raw(
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
-        or local_batch.forward_mode.is_prebuilt_extend()
+        or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
@@ -165,7 +165,7 @@ def prepare_mlp_sync_batch_raw(
     if need_idle_batch:
         if local_batch is None:
             local_batch = get_idle_batch()
-        elif local_batch.forward_mode.is_prebuilt_extend():
+        elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             local_batch.inner_idle_batch = get_idle_batch()
             batch_to_gather = local_batch.inner_idle_batch
