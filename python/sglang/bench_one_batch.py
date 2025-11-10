@@ -77,8 +77,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
-    is_cuda_alike,
-    is_xpu,
     kill_process_tree,
     maybe_reindex_device_id,
     require_mlp_sync,
@@ -87,15 +85,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
-    profiler_activity
-    for available, profiler_activity in [
-        (is_cuda_alike(), torch.profiler.ProfilerActivity.CUDA),
-        (is_xpu(), torch.profiler.ProfilerActivity.XPU),
-    ]
-    if available
-]
 
 
 def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
@@ -116,6 +105,8 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
             activities.append(torch.profiler.ProfilerActivity.CPU)
         if "GPU" in profile_activities:
             activities.append(torch.profiler.ProfilerActivity.CUDA)
+        if "XPU" in profile_activities:
+            activities.append(torch.profiler.ProfilerActivity.XPU)
         if activities:
             profiler = torch.profiler.profile(
                 activities=activities,
@@ -215,7 +206,7 @@ class BenchArgs:
             type=str,
             nargs="+",
             default=["CPU", "GPU"],
-            choices=["CPU", "GPU", "CUDA_PROFILER"],
+            choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
             help="Profiler activities: CPU, GPU, CUDA_PROFILER. If CPU/GPU, use torch profiler. If CUDA_PROFILER, use CUDA profiler.",
         )
         parser.add_argument(
