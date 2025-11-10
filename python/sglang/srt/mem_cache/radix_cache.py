@@ -191,6 +191,7 @@ class RadixCache(BasePrefixCache):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
+        enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
         is_eagle: bool = False,
@@ -202,6 +203,9 @@ class RadixCache(BasePrefixCache):
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
         self.is_eagle = is_eagle
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -483,6 +487,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        start_time = time.perf_counter()
         leaves = self._collect_leaves()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -502,6 +507,12 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        if num_evicted > 0 and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
