@@ -107,7 +107,7 @@ class LMCRadixCache(RadixCache):
                 "v_buffer",
                 getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
             ),
-            tp_group=tp_group,
+            tp_group=tp_group.device_group,
         )
 
         self.load_stream = torch.cuda.Stream()
