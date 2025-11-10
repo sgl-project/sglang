@@ -262,36 +262,39 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+
         for name, param in params_dict.items():
-            print(f"DEBUG: Param: {name}")
+            print(f"DEBUG: Params_dict: {name}")
 
         for name, loaded_weight in weights:
             # Skip rotary embeddings
             if "rotary_emb.inv_freq" in name:
                 continue
+            if "lm_head" in name:
+                name = name.replace("language_model.lm_head.weight", "lm_head.weight")
 
             # Transform vision model parameter names
             if "vision_model" in name:
-                # SigLIP weights use 'out_proj' but model uses 'proj'
-                if "out_proj" in name:
+                # SigLIP weights use 'out_proj' but model uses 'proj', aside from for the head.
+                if "out_proj" in name and "head" not in name:
                     name = name.replace("out_proj", "proj")
 
                 # Transform head parameter names from checkpoint format to model format
-                if "head.attention.in_proj_weight" in name:
+                if "head.attention.in_proj.weight" in name:
                     name = name.replace(
-                        "head.attention.in_proj_weight", "head.attention.in_proj.weight"
+                        "head.attention.in_proj.weight", "head.attention.in_proj_weight"
                     )
                 if "head.attention.in_proj_bias" in name:
                     name = name.replace(
-                        "head.attention.in_proj_bias", "head.attention.in_proj.bias"
+                        "head.attention.in_proj.bias", "head.attention.in_proj_bias"
                     )
 
             # Transform language model parameter names
             if "language_model" in name:
                 name = name.replace(r"language_model.model.", r"language_model.")
 
-            # Handle LM head tie
-            if self.config.text_config.tie_word_embeddings and "lm_head.weight" in name:
+            # Handle LM head tie using value from Eagle2.5 general config
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
             # Handle stacked parameters
@@ -305,6 +308,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                # print(f"DEBUG: Loading weight {name}")
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -324,6 +328,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                     continue
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # print(f"DEBUG: Loading weight {name}")
                 weight_loader(param, loaded_weight)
 
 

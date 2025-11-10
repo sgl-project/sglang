@@ -106,6 +106,7 @@ class Eagle2_5_VLConfig(PretrainedConfig):
         max_dynamic_tiles=12,
         min_dynamic_tiles=1,
         pad2square=False,
+        tie_word_embeddings=True,
         select_layer=-4,
         template="qwen2-chat",
         torch_dtype="bfloat16",
@@ -147,4 +148,4 @@ class Eagle2_5_VLConfig(PretrainedConfig):
         self.use_thumbnail = use_thumbnail
         self.mlp_connector_layers = mlp_connector_layers
 
-        super().__init__(**kwargs)
+        super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
