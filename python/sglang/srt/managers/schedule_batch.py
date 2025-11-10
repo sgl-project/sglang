@@ -721,7 +721,7 @@ class Req:
         """Return the range of over-allocated KV cache and mark them as freed."""
 
         # NOTE: This function is called when there is over-allocation of KV cache.
-        # Over-allocation: we allocate more KV cache then the committed length.
+        # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
         assert (
             not self.kv_overallocated_freed
