@@ -22,8 +22,84 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  permission-and-rate-limit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce hourly limit for low-permission actors
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const actor = context.actor;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const eventName = context.eventName;
+
+            if (eventName === 'push') {
+              core.info(`Event '${eventName}' detected (push). Rate limit is disabled for push events.`);
+              return;
+            }
+            if (!(eventName === 'pull_request' || eventName === 'workflow_dispatch')) {
+              core.info(`Event '${eventName}' is not rate-limited. Skipping.`);
+              return;
+            }
+
+            core.info(`Triggering actor: ${actor}`);
+
+            async function hasHighPermission(username) {
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner, repo, username,
+                });
+                const perm = data.permission || 'none';
+                return perm === 'write' || perm === 'maintain' || perm === 'admin';
+              } catch (e) {
+                if (e.status === 404 || e.status === 403) return false;
+                throw e;
+              }
+            }
+
+            if (await hasHighPermission(actor)) {
+              core.info('Triggering user ${actor} has high permission. No rate limit applied.');
+              return;
+            }
+
+            const cutoff = new Date(Date.now() - 60 * 60 * 1000);
+            core.info(`Checking for workflow runs since ${cutoff.toISOString()} for event '${eventName}'.`);
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: context.workflow,
+              event: eventName,
+              per_page: 100,
+            });
+
+            const runs = data.workflow_runs || [];
+
+            const belongs = (run) => {
+              if (String(run.id) === String(context.runId)) return false;
+              if (new Date(run.created_at) < cutoff) return false;
+
+              return (
+                run.actor?.login === actor ||
+                run.triggering_actor?.login === actor
+              );
+            };
+
+            const recentFound = runs.find(belongs);
+
+            if (recentFound) {
+              core.setFailed(
+                `User '${actor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
+                `Please wait one hour before triggering again.`
+              );
+            } else {
+              core.info('No recent runs detected; proceeding.');
+            }
   # =============================================== check changes ====================================================
   check-changes:
+    needs: [permission-and-rate-limit]
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
