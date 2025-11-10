@@ -54,6 +54,32 @@ def topk_softmax(
     )
 
 
+def topk_sigmoid(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Compute top-k sigmoid for MoE routing.
+
+    Args:
+        topk_weights: Output tensor for top-k weights [num_tokens, topk]
+        topk_ids: Output tensor for top-k expert indices [num_tokens, topk]
+        gating_output: Gating logits [num_tokens, num_experts]
+        renormalize: Whether to renormalize the top-k weights
+        correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
+    """
+    torch.ops.sgl_kernel.topk_sigmoid.default(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        correction_bias,
+    )
+
+
 def moe_sum_reduce(
     input_tensor,
     output_tensor,
