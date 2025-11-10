@@ -141,6 +141,18 @@ class BaseKVReceiver(ABC):
         """
         ...
 
+    def clear(self):
+        """
+        Clear any internal states.
+        """
+        pass
+
+    def abort(self):
+        """
+        Abort the current transfer.
+        """
+        pass
+
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
