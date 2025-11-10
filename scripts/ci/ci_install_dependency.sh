@@ -22,8 +22,6 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
-rm -rf /root/.cache/flashinfer
-pip3 uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache || true
 
 # Install apt packages
 apt install -y git libnuma-dev libssl-dev pkg-config
@@ -80,6 +78,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 
     # Clean up existing installations
     $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
+    $PIP_CMD uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_INSTALL_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -91,6 +90,7 @@ else
 
     # Clean up existing installations
     $PIP_CMD uninstall sgl-kernel sglang || true
+    $PIP_CMD uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache || true
 fi
 
 # Install the main package
@@ -120,7 +120,7 @@ fi
 # Show current packages
 $PIP_CMD list
 
-$PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
@@ -134,3 +134,6 @@ fi
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
+
+# Prepare the CI runner (cleanup HuggingFace cache, etc.)
+bash "${SCRIPT_DIR}/prepare_runner.sh"

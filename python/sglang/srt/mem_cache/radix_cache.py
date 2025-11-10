@@ -493,16 +493,11 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            if x == self.root_node:
-                break
-            if x.lock_ref > 0:
-                continue
-
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
-            if len(x.parent.children) == 0:
+            if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
@@ -561,14 +556,15 @@ class RadixCache(BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
-        node.last_access_time = time.monotonic()
+        access_time = time.monotonic()
+        node.last_access_time = access_time
 
         child_key = self.get_child_key_fn(key)
 
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.monotonic()
+            child.last_access_time = access_time
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -605,7 +601,8 @@ class RadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: RadixKey, value):
-        node.last_access_time = time.monotonic()
+        access_time = time.monotonic()
+        node.last_access_time = access_time
         if len(key) == 0:
             return 0
 
@@ -614,7 +611,7 @@ class RadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.monotonic()
+            node.last_access_time = access_time
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -676,12 +673,13 @@ class RadixCache(BasePrefixCache):
 
     def _collect_leaves(self):
         ret_list = []
-        stack = [self.root_node]
+        stack = list(self.root_node.children.values())
 
         while stack:
             cur_node = stack.pop()
             if len(cur_node.children) == 0:
-                ret_list.append(cur_node)
+                if cur_node.lock_ref == 0:
+                    ret_list.append(cur_node)
             else:
                 stack.extend(cur_node.children.values())
 

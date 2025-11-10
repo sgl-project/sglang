@@ -1,4 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
+exclude: ^python/sglang/multimodal_gen/csrc
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -31,7 +32,15 @@ repos:
           - --select=F401,F821
           - --fix
         files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-router/py_*)
-        exclude: __init__\.py$|\.ipynb$|^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$
+        exclude: |
+          (?x)^(
+          .*/__init__\.py$|
+          .*\.ipynb$|
+          python/sglang/srt/grpc/.*_pb2\.py$|
+          python/sglang/srt/grpc/.*_pb2_grpc\.py$|
+          python/sglang/srt/grpc/.*_pb2\.pyi$|
+          python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
+          )$
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
