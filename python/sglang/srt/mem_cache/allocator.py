@@ -494,7 +494,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.page_size,
             self.seen_max_num_extend_tokens_next_power_of_2,
         )
- 
+
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
