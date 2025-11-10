@@ -183,7 +183,6 @@ class TestMamba(unittest.TestCase):
             dtype=dtype,
             device=device,
             kvcache=pool,
-            need_sort=False,
         )
         # setup radix cache
         tree = MambaRadixCache(

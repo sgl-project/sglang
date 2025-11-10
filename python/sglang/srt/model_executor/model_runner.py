@@ -1834,7 +1834,6 @@ class ModelRunner:
                 )
 
         # Initialize token_to_kv_pool_allocator
-        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
             if _is_npu and (
                 self.server_args.attention_backend == "ascend"
@@ -1846,7 +1845,6 @@ class ModelRunner:
                     dtype=self.kv_cache_dtype,
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
-                    need_sort=need_sort,
                 )
             else:
                 if self.page_size == 1:
@@ -1857,7 +1855,6 @@ class ModelRunner:
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
                         )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -1865,7 +1862,6 @@ class ModelRunner:
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
                         )
                 else:
                     assert not self.is_hybrid
@@ -1875,7 +1871,6 @@ class ModelRunner:
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
                     )
         else:
             assert self.is_draft_worker
