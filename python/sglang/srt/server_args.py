@@ -438,9 +438,9 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
-    # Ktransformers
-    kt_amx_weight_path: Optional[str] = None
-    kt_amx_method: Optional[str] = None
+    # Ktransformers/AMX expert parallelism
+    kt_weight_path: Optional[str] = None
+    kt_method: Optional[str] = None
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
@@ -603,9 +603,6 @@ class ServerArgs:
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
-
-        # Handle Ktransformers specific configs
-        self._handle_ktransformers_configs()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -1346,39 +1343,6 @@ class ServerArgs:
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
-
-    def _handle_ktransformers_configs(self):
-        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-            CompressedTensorsWNA16AMXEPMoEMethod,
-            override_config,
-        )
-
-        num_hidden_layers = None
-        if self.kt_max_deferred_experts_per_token is not None:
-            try:
-                model_config = self.get_model_config()
-                base_config = (
-                    getattr(model_config, "hf_text_config", None)
-                    or model_config.hf_config
-                )
-                num_hidden_layers = getattr(base_config, "num_hidden_layers", None)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to load model config for kt_max_deferred_experts_per_token: %s",
-                    exc,
-                )
-
-        override_config(
-            CompressedTensorsWNA16AMXEPMoEMethod,
-            self.kt_num_gpu_experts,
-            self.kt_cpuinfer,
-            self.kt_threadpool_count,
-            self.kt_amx_weight_path,
-            self.kt_amx_method,
-            self.chunked_prefill_size,
-            self.kt_max_deferred_experts_per_token,
-            num_hidden_layers,
-        )
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -3053,12 +3017,12 @@ class ServerArgs:
 
         # Ktransformer server args
         parser.add_argument(
-            "--kt-amx-weight-path",
+            "--kt-weight-path",
             type=str,
             help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
         )
         parser.add_argument(
-            "--kt-amx-method",
+            "--kt-method",
             type=str,
             default="AMXINT4",
             help="[ktransformers parameter] Quantization formats for CPU execution.",
@@ -3083,9 +3047,8 @@ class ServerArgs:
             "--kt-max-deferred-experts-per-token",
             type=int,
             default=ServerArgs.kt_max_deferred_experts_per_token,
-            help="Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+            help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
-
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
