@@ -53,10 +53,12 @@ jobs:
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
             main_package:
-              - "python/**"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/*.py"
+              - "python/*.py"
+              - "python/setup.py"
               - "scripts/ci/**"
               - "test/**"
-              - "!python/sglang/multimodal_gen/**"
             sgl_kernel:
               - "sgl-kernel/**"
 
