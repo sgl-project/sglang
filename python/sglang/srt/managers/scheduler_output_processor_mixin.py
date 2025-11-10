@@ -309,16 +309,15 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # NOTE: in any case, we should check finish here and cleanup the memory resources after confirming finish.
-        # Overlap + Finished before check: all resources should already be released.
-        # Non-overlap + Finished before check: We shall remove this case(?)
+        # NOTE: in any case, we should check finish here
+        # if finished, also clean up committed kv cache and over-allocated kv cache here
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
-                # NOTE: This can only happen when overlap scheduling is enabled.
+                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # (currently not, e.g. Eagle V1 still check finish during forward)
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
