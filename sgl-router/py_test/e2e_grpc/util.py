@@ -89,6 +89,9 @@ DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = _get_model_path(
     "mistralai/Mistral-7B-Instruct-v0.3"
 )
 
+# GPT-OSS models
+DEFAULT_GPT_OSS_MODEL_PATH = _get_model_path("openai/gpt-oss-20b")
+
 
 # ============================================================================
 # Process Management

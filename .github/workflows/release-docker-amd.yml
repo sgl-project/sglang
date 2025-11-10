@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         gpu_arch: ['gfx942', 'gfx942-rocm700', 'gfx950']
-        build_type: ['all', 'srt']
+        build_type: ['all']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -43,14 +43,5 @@ jobs:
 
           tag=v${version}-${rocm_tag}
 
-          if [ "${{ matrix.build_type }}" = "all" ]; then
-            tag_suffix=""
-          elif [ "${{ matrix.build_type }}" = "srt" ]; then
-            tag_suffix="-srt"
-          else
-            echo "Unsupported build type"
-            exit 1
-          fi
-
-          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
-          docker push lmsysorg/sglang:${tag}${tag_suffix}
+          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t lmsysorg/sglang:${tag} --no-cache
+          docker push lmsysorg/sglang:${tag}
