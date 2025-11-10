@@ -1,186 +1,82 @@
 #include "common.h"
 #include "gemm.h"
+#include "pack.h"
 #include "vec.h"
 
 namespace {
 
-#if defined(CPU_CAPABILITY_AVX512)
-// key: from [N, 32] to [32/2, N, 2]
 template <typename scalar_t>
-inline void
-pack_vnni_Nx32(scalar_t* __restrict__ dst, const scalar_t* __restrict__ src, int N, int ld_src, int ld_dst) {
-  __m512i vinputs[16];
-
-  int n = 0;
-  for (; n < N; ++n) {
-    vinputs[n] = _mm512_loadu_si512(src + n * ld_src);
+inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
+  using Vec = at::vec::Vectorized<scalar_t>;
+  constexpr int kVecSize = Vec::size();
+  const Vec data_vec = Vec(static_cast<scalar_t>(val));
+  int d = 0;
+#pragma GCC unroll 4
+  for (; d <= size - kVecSize; d += kVecSize) {
+    data_vec.store(out + d);
   }
-  // padding with zero to avoid uninitialized vectors
-  for (; n < 16; ++n) {
-    vinputs[n] = _mm512_set1_epi32(0);
-  }
-
-  // pack key
-  transpose_16x16_32bit(vinputs);
-
-  const __mmask16 vmask = (1 << N) - 1;
-  for (int k = 0; k < 16; ++k) {
-    _mm512_mask_storeu_epi32(dst + k * ld_dst * 2, vmask, vinputs[k]);
+  if (size - d > 0) {
+    data_vec.store(out + d, size - d);
   }
 }
 
-// value: from [K, 32] to [K/2, 32, 2]
-template <typename scalar_t>
-inline void
-pack_vnni_Kx32(scalar_t* __restrict__ dst, const scalar_t* __restrict__ src, int K, int ld_src, int ld_dst) {
-  __m512i vinputs[2];
-
-  int k = 0;
-  for (; k < K; ++k) {
-    vinputs[k] = _mm512_loadu_si512(src + k * ld_src);
-  }
-  // padding with zero to avoid uninitialized vectors
-  for (; k < 2; ++k) {
-    vinputs[k] = _mm512_set1_epi32(0);
-  }
-
-  // pack value
-  __m512i d0, d1;
-  std::tie(d0, d1) = transpose_2x32_16bit(vinputs[0], vinputs[1]);
-  _mm512_storeu_si512(dst + 0 * ld_dst * 2, d0);
-  _mm512_storeu_si512(dst + 0 * ld_dst * 2 + 32, d1);
-}
-#endif
-
-// convert to vnni format
-// from [N, K/2, 2] to [K/2, N, 2] for bfloat16 and float16
-template <typename scalar_t>
-void pack_vnni(scalar_t* __restrict__ dst, const scalar_t* __restrict__ src, int N, int K, int ld_src, int ld_dst) {
-#if defined(CPU_CAPABILITY_AVX512)
-  const int NB = div_up(N, 16);
-  const int KB = K / 32;  // no remainder
-
-  for (int nb = 0; nb < NB; ++nb) {
-    for (int kb = 0; kb < KB; ++kb) {
-      // handle 16x512bits each block
-      int nb_size = std::min(N - nb * 16, 16);
-      pack_vnni_Nx32<scalar_t>(
-          /*    dst */ dst + ((kb * 32) >> 1) * ld_dst * 2 + nb * 16 * 2,
-          /*    src */ src + kb * 32 + nb * 16 * ld_src,
-          /*      N */ nb_size,
-          /* ld_src */ ld_src,
-          /* ld_dst */ ld_dst);
-    }
-  }
-#else
-  for (int n = 0; n < N; ++n) {
-    for (int k = 0; k < K / 2; ++k) {
-      for (int d = 0; d < 2; ++d) {
-        dst[k * ld_dst * 2 + n * 2 + d] = src[n * ld_src + k * 2 + d];
-      }
-    }
-  }
-#endif
-}
-
-// convert to vnni format
-// from [K/2, 2, N] to [K/2, N, 2] for bfloat16 and float16
-template <typename scalar_t>
-void pack_vnni2(scalar_t* __restrict__ dst, const scalar_t* __restrict__ src, int K, int N, int ld_src, int ld_dst) {
-#if defined(CPU_CAPABILITY_AVX512)
-  const int KB = div_up(K, 2);
-  const int NB = N / 32;  // no remainder
-
-  for (int kb = 0; kb < KB; ++kb) {
-    for (int nb = 0; nb < NB; ++nb) {
-      // handle 2x512bits each block
-      int kb_size = std::min(K - kb * 2, 2);
-      pack_vnni_Kx32<scalar_t>(
-          /*    dst */ dst + ((kb * 2) >> 1) * ld_dst * 2 + nb * 32 * 2,
-          /*    src */ src + kb * 2 * ld_src + nb * 32,
-          /*      K */ kb_size,
-          /* ld_src */ ld_src,
-          /* ld_dst */ ld_dst);
-    }
-  }
-#else
-  int k = 0;
-  for (; k < (K >> 1) * 2; k += 2) {
-    for (int n = 0; n < N; ++n) {
-      dst[(k >> 1) * ld_dst * 2 + n * 2 + 0] = src[k * ld_src + n];
-      dst[(k >> 1) * ld_dst * 2 + n * 2 + 1] = src[(k + 1) * ld_src + n];
-    }
-  }
-  if (K % 2 != 0) {
-    for (int n = 0; n < N; ++n) {
-      dst[(K >> 1) * ld_dst * 2 + n * 2 + 0] = src[(K - 1) * ld_src + n];
-      dst[(K >> 1) * ld_dst * 2 + n * 2 + 1] = 0;
-    }
-    k += 2;
-  }
-#endif
-}
-
-template <typename scalar_t>
+template <typename scalar_t, int64_t chunk_size = 64>
 void chunk_gated_delta_rule_kernel_impl(
-    at::Tensor& output,       // [B, T, HV, EV]
-    at::Tensor& final_state,  // [N, HV, EK, EV]
-    at::Tensor& query,        // [B, T, HK, EK]
-    at::Tensor& key,          // [B, T, HK, EK]
-    at::Tensor& value,        // [B, T, HV, EV]
-    at::Tensor& g,            // [B, T, HV] FP32
-    at::Tensor& beta,         // [B, T, HV]
-    at::Tensor& cu_seqlens,   // [N + 1] INT32
+    scalar_t* __restrict__ out,            // [B, T, HV, EV]
+    float* __restrict__ final_state_data,  // [N, HV, EK, EV]
+    scalar_t* __restrict__ q_orig,         // [B, T, HK, EK]
+    scalar_t* __restrict__ k_orig,         // [B, T, HK, EK]
+    scalar_t* __restrict__ v_orig,         // [B, T, HV, EV]
+    float* __restrict__ g_orig,            // [B, T, HV] FP32
+    scalar_t* __restrict__ b_orig,         // [B, T, HV]
+    int32_t* __restrict__ cu_seqlens_ptr,  // [N + 1] INT32
+    float* __restrict__ buff,
+    scalar_t* __restrict__ reduced_buff,
+    scalar_t* __restrict__ thread_buff,
     bool use_qk_l2norm_in_kernel,
-    int64_t chunk_size = 64) {
-  // query: [B, T, HK, EK] -> [B, HK, T, EK]
-  // key: [B, T, HK, EK] -> [B, HK, T, EK]
-  // value: [B, T, HV, EV] -> [B, HV, T, EV]
-  // g: [B, T, HV] -> [B, HV, T]
-  // beta: [B, T, HV] -> [B, HV, T]
-  query = query.transpose(1, 2);
-  key = key.transpose(1, 2);
-  value = value.transpose(1, 2);
-  g = g.transpose(1, 2).contiguous();
-  beta = beta.transpose(1, 2).contiguous();
-
-  // Sizes
-  TORCH_CHECK(query.size(0) == 1);
-  int64_t batch_size = final_state.size(0);
-  int64_t global_seq_len = query.size(2);
-  int64_t qk_num_head = query.size(1);
-  int64_t v_num_head = value.size(1);
-  int64_t qk_head_size = query.size(3);
-  int64_t v_head_size = value.size(3);
+    const int64_t& batch_size,
+    const int64_t& global_seq_len,
+    const int64_t& qk_num_head,
+    const int64_t& v_num_head,
+    const int64_t& qk_head_size,
+    const int64_t& v_head_size,
+    const int64_t& qStrideH,
+    const int64_t& qStrideT,
+    const int64_t& kStrideH,
+    const int64_t& kStrideT,
+    const int64_t& vStrideH,
+    const int64_t& vStrideT,
+    std::vector<int64_t>& chunk_offsets,
+    std::vector<std::vector<int64_t>>& chunk_indices,
+    const int64_t& global_total_seq_length,
+    const int64_t& global_num_chunk,
+    const int64_t& buff_size_16bit_per_thread) {
+  int64_t oStrideT = vStrideT;
+  int64_t oStrideH = vStrideH;
+  int64_t gStrideH = 1;
+  int64_t gStrideT = v_num_head;
+  int64_t bStrideH = 1;
+  int64_t bStrideT = v_num_head;
+  int64_t final_state_StrideN = v_num_head * qk_head_size * v_head_size;
+  int64_t final_state_StrideH = qk_head_size * v_head_size;
+  int64_t final_state_StrideE = v_head_size;
   int64_t head_group = v_num_head / qk_num_head;
   float scale = 1.0 / std::sqrt(qk_head_size);
   const int32_t vec_size = at::vec::Vectorized<float>::size();
   const int32_t reduced_vec_size = at::vec::Vectorized<scalar_t>::size();
 
-  // Strides
-  int64_t oStrideT = output.stride(1);
-  int64_t oStrideH = output.stride(2);
-  int64_t qStrideH = query.stride(1);
-  int64_t qStrideT = query.stride(2);
-  int64_t kStrideH = key.stride(1);
-  int64_t kStrideT = key.stride(2);
-  int64_t vStrideH = value.stride(1);
-  int64_t vStrideT = value.stride(2);
-  int64_t gStrideH = g.stride(1);
-  int64_t bStrideH = beta.stride(1);
-  int64_t final_state_StrideN = final_state.stride(0);
-  int64_t final_state_StrideH = final_state.stride(1);
-  int64_t final_state_StrideE = final_state.stride(2);
-
   // Data pointers
-  scalar_t* q_orig = query.data_ptr<scalar_t>();
-  scalar_t* k_orig = key.data_ptr<scalar_t>();
-  scalar_t* v_orig = value.data_ptr<scalar_t>();
-  float* g_orig = g.data_ptr<float>();
-  scalar_t* b_orig = beta.data_ptr<scalar_t>();
-  int32_t* cu_seqlens_ptr = cu_seqlens.data_ptr<int32_t>();
-  scalar_t* out = output.data_ptr<scalar_t>();
-  float* final_state_data = final_state.data_ptr<float>();
+  float* g_pad = buff;
+  float* core_attn_out = g_pad + v_num_head * global_total_seq_length;
+  float* decay_mask = core_attn_out + batch_size * v_num_head * global_total_seq_length * v_head_size;
+  float* v_beta_attn = decay_mask + v_num_head * global_total_seq_length * chunk_size;
+
+  scalar_t* q_pad = reduced_buff;
+  scalar_t* k_pad = q_pad + qk_num_head * global_total_seq_length * qk_head_size;
+  scalar_t* v_pad = k_pad + qk_num_head * global_total_seq_length * qk_head_size;
+  scalar_t* k_beta = v_pad + v_num_head * global_total_seq_length * v_head_size;
+  scalar_t* v_beta = k_beta + v_num_head * global_total_seq_length * qk_head_size;
+  scalar_t* k_cumdecay_reduced = v_beta + v_num_head * global_total_seq_length * v_head_size;
 
   if (use_qk_l2norm_in_kernel) {
     using bVec = at::vec::Vectorized<scalar_t>;
@@ -254,85 +150,6 @@ void chunk_gated_delta_rule_kernel_impl(
     });
   }
 
-  // Deduce the global chunks
-  // e.g. cu_seqlens_ptr: [0, 5, 13, 16], chunk_size = 4
-  // chunk_offsets: [0, 2, 4, 5]
-  // chunk_indices (batch_id, local_chunk_id): [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]]
-  std::vector<int64_t> chunk_offsets(batch_size + 1, 0);
-  std::vector<std::vector<int64_t>> chunk_indices;
-  int64_t s = 0;
-  int64_t e = 0;
-  int64_t s_pad = 0;
-  int64_t e_pad = 0;
-  for (int64_t b = 0; b < batch_size; b++) {
-    e = cu_seqlens_ptr[b + 1];
-    int64_t seq_len = e - s;
-    int64_t pad_size = (chunk_size - seq_len % chunk_size) % chunk_size;
-    int64_t total_seq_length = seq_len + pad_size;
-    e_pad = s_pad + total_seq_length;
-    chunk_offsets[b + 1] = e_pad / chunk_size;
-    for (int64_t c = 0; c < total_seq_length / chunk_size; c++) {
-      chunk_indices.push_back({b, c});
-    }
-    s = e;
-    s_pad = e_pad;
-  }
-  int64_t global_total_seq_length = e_pad;
-  int64_t global_num_chunk = e_pad / chunk_size;
-
-  // Allocate buffer
-  int64_t buff_size = v_num_head * global_total_seq_length                               // g_pad_data
-                      + batch_size * v_num_head * global_total_seq_length * v_head_size  // core_attn
-                      + v_num_head * global_total_seq_length * chunk_size                // decay_mask
-                      + v_num_head * global_total_seq_length * v_head_size;              // v_beta_attn
-  at::Tensor buff_data = at::empty({buff_size}, query.options().dtype(at::kFloat));
-  float* buff = buff_data.data_ptr<float>();
-  float* g_pad = buff;
-  float* core_attn_out = g_pad + v_num_head * global_total_seq_length;
-  float* decay_mask = core_attn_out + batch_size * v_num_head * global_total_seq_length * v_head_size;
-  float* v_beta_attn = decay_mask + v_num_head * global_total_seq_length * chunk_size;
-
-  int64_t reduced_buff_size = qk_num_head * global_total_seq_length * qk_head_size    // q_pad_data
-                              + qk_num_head * global_total_seq_length * qk_head_size  // k_pad_data
-                              + v_num_head * global_total_seq_length * v_head_size    // v_pad_data
-                              + v_num_head * global_total_seq_length * qk_head_size   // k_beta_data
-                              + v_num_head * global_total_seq_length * v_head_size    // v_beta_data
-                              + v_num_head * global_total_seq_length * qk_head_size;  // k_cumdecay_reduced
-  at::Tensor reduced_buff_data = at::empty({reduced_buff_size}, query.options());
-  scalar_t* reduced_buff = reduced_buff_data.data_ptr<scalar_t>();
-  scalar_t* q_pad = reduced_buff;
-  scalar_t* k_pad = q_pad + qk_num_head * global_total_seq_length * qk_head_size;
-  scalar_t* v_pad = k_pad + qk_num_head * global_total_seq_length * qk_head_size;
-  scalar_t* k_beta = v_pad + v_num_head * global_total_seq_length * v_head_size;
-  scalar_t* v_beta = k_beta + v_num_head * global_total_seq_length * qk_head_size;
-  scalar_t* k_cumdecay_reduced = v_beta + v_num_head * global_total_seq_length * v_head_size;
-
-  int64_t num_thread = at::get_num_threads();
-  int64_t buff_size_16bit_per_thread =
-      /* k_transpose */ qk_head_size * chunk_size +
-      /* v_pack */ chunk_size * v_head_size +
-      /* k_beta_g  */ chunk_size * qk_head_size +
-      /* k_beta_g_pack  */ chunk_size * qk_head_size +
-      /* attn */ chunk_size * chunk_size * 2 +
-      /* attn_reduced */ chunk_size * chunk_size +
-      /* k_cumdecay */ chunk_size * qk_head_size * 2 +
-      /* curr_last_recurrent_state_reduced  */ qk_head_size * v_head_size +
-      /* curr_last_recurrent_state_pack_reduced   */ qk_head_size * v_head_size +
-      /* k_transpose_i  */ qk_head_size * chunk_size +
-      /* attn_i   */ chunk_size * chunk_size * 2 +
-      /* attn_i_reduced     */ chunk_size * chunk_size +
-      /* v_prime */ chunk_size * v_head_size * 2 +
-      /* v_prime_reduced */ chunk_size * v_head_size +
-      /* v_prime_pack_reduced */ chunk_size * v_head_size +
-      /* qg */ chunk_size * qk_head_size +
-      /* attn_inter */ chunk_size * v_head_size * 2 +
-      /* kg */ chunk_size * qk_head_size +
-      /* kg_transpose */ qk_head_size * chunk_size +
-      /* kgv */ qk_head_size * v_head_size * 2;
-
-  at::Tensor thread_buff_data = at::empty({num_thread, buff_size_16bit_per_thread}, query.options());
-  scalar_t* thread_buff = thread_buff_data.data_ptr<scalar_t>();
-
   // query = query * scale
   // k_beta = key * beta.unsqueeze(-1)
   // v_beta = value * beta.unsqueeze(-1)
@@ -352,7 +169,7 @@ void chunk_gated_delta_rule_kernel_impl(
       auto q_orig_ptr = q_orig + h_qk * qStrideH + l_orig * qStrideT;
       auto k_orig_ptr = k_orig + h_qk * kStrideH + l_orig * kStrideT;
       auto v_orig_ptr = v_orig + l_orig * vStrideT;
-      auto b_orig_ptr = b_orig + l_orig;
+      auto b_orig_ptr = b_orig + l_orig * bStrideT;
       auto q_pad_ptr = q_pad + h_qk * global_total_seq_length * qk_head_size + l * qk_head_size;
       auto k_pad_ptr = k_pad + h_qk * global_total_seq_length * qk_head_size + l * qk_head_size;
       auto v_pad_ptr = v_pad + l * v_head_size;
@@ -385,7 +202,7 @@ void chunk_gated_delta_rule_kernel_impl(
         for (auto hi = 0; hi < head_group; hi++) {
           int64_t h = h_qk * head_group + hi;
           auto curr_v_orig = v_orig_ptr + h * vStrideH + j * vStrideT;
-          auto curr_b_orig = b_orig_ptr + h * bStrideH + j;
+          auto curr_b_orig = b_orig_ptr + h * bStrideH + j * bStrideT;
           scalar_t b_orig_val_reduced = *(curr_b_orig);
           auto curr_v_pad = v_pad_ptr + h * global_total_seq_length * v_head_size + j * v_head_size;
           auto curr_k_beta = k_beta_ptr + h * global_total_seq_length * qk_head_size + j * qk_head_size;
@@ -482,13 +299,17 @@ void chunk_gated_delta_rule_kernel_impl(
     scalar_t* curr_attn_reduced = thread_buff_ptr + offset;
     offset += chunk_size * chunk_size;
     float* k_cumdecay = reinterpret_cast<float*>(thread_buff_ptr + offset);
+    offset += chunk_size * qk_head_size * 2;
+    float* row = reinterpret_cast<float*>(thread_buff_ptr + offset);
+    offset += chunk_size * 2;
+    float* updated = reinterpret_cast<float*>(thread_buff_ptr + offset);
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       int64_t ib = chunk_indices[c][0];  // idx_batch
       int64_t ic = chunk_indices[c][1];  // idx_chunk
       int64_t l_orig = cu_seqlens_ptr[ib] + ic * chunk_size;
       int64_t seq_len = cu_seqlens_ptr[ib + 1] - cu_seqlens_ptr[ib];
       int64_t h_qk = h / head_group;
-      auto curr_g_orig = g_orig + h * gStrideH + l_orig;
+      auto curr_g_orig = g_orig + h * gStrideH + l_orig * gStrideT;
       auto curr_g_pad = g_pad + h * global_total_seq_length + c * chunk_size;
       auto curr_decay_mask = decay_mask + h * global_total_seq_length * chunk_size + c * chunk_size * chunk_size;
       auto curr_k_pad = k_pad + h_qk * global_total_seq_length * qk_head_size + c * chunk_size * qk_head_size;
@@ -504,7 +325,7 @@ void chunk_gated_delta_rule_kernel_impl(
         // g = g.cumsum(dim=-1)
         // g: [B, HV, num_chunk, chunk_size]
         if (ic * chunk_size + i < seq_len) {
-          acc_val += curr_g_orig[i];
+          acc_val += curr_g_orig[i * gStrideT];
         }
         curr_g_pad[i] = acc_val;
         // decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
@@ -584,8 +405,6 @@ void chunk_gated_delta_rule_kernel_impl(
       }
       for (int i = 1; i < chunk_size; i++) {
         // row = attn[..., i, :i] [B, HK, num_chunk, i]
-        at::Tensor row_data = at::empty({i}, query.options().dtype(at::kFloat));
-        float* row = row_data.data_ptr<float>();
         int64_t j = 0;
         int64_t len = i;
         for (; j < vec_size * (len / vec_size); j += vec_size) {
@@ -597,8 +416,7 @@ void chunk_gated_delta_rule_kernel_impl(
           tmp0.store(row + j, len - j);
         }
         // (row.unsqueeze(-1) * sub).sum(-2)
-        at::Tensor updated_data = at::zeros({i}, query.options().dtype(at::kFloat));
-        float* updated = updated_data.data_ptr<float>();
+        fill_stub(updated, 0, i);
         for (int k = 0; k < i; k++) {
           float row_k = row[k];
           auto vec_row_k = at::vec::Vectorized<float>(row_k);
@@ -731,7 +549,9 @@ void chunk_gated_delta_rule_kernel_impl(
         /* k_beta_g_pack  */ chunk_size * qk_head_size +
         /* attn */ chunk_size * chunk_size * 2 +
         /* attn_reduced */ chunk_size * chunk_size +
-        /* k_cumdecay */ chunk_size * qk_head_size * 2;
+        /* k_cumdecay */ chunk_size * qk_head_size * 2 +
+        /* row */ chunk_size * 2 +
+        /* updated */ chunk_size * 2;
     scalar_t* thread_buff_ptr = thread_buff + ompIdx * buff_size_16bit_per_thread;
     scalar_t* curr_last_recurrent_state_reduced = thread_buff_ptr + offset;
     offset += qk_head_size * v_head_size;
@@ -1075,6 +895,22 @@ void chunk_gated_delta_rule_kernel_impl(
 }
 }  // anonymous namespace
 
+template <bool is_contiguous, bool is_last_dim_contiguous>
+static inline void
+CHECK_INPUT_SHAPE_DTYPE(at::Tensor& tensor, const int64_t& dim, const std::vector<int64_t>& sizes, at::ScalarType st) {
+  if (is_contiguous) {
+    CHECK_CONTIGUOUS(tensor);
+  }
+  if (is_last_dim_contiguous) {
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(tensor);
+  }
+  TORCH_CHECK(tensor.dtype() == st);
+  CHECK_DIM(dim, tensor);
+  for (int64_t i = 0; i < dim; i++) {
+    CHECK_EQ(tensor.size(i), sizes[i]);
+  }
+}
+
 // query: [B, T, HK, EK]
 // key: [B, T, HK, EK]
 // value: [B, T, HV, EV]
@@ -1100,54 +936,133 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
       "sgl-kernel::chunk_gated_delta_rule_cpu", std::vector<c10::IValue>({query, key, value, g, beta, initial_state}));
 
   TORCH_CHECK(head_first == false, "chunk_gated_delta_rule_cpu does not support head first");
-  TORCH_CHECK(
-      query.dtype() == at::kBFloat16 && query.dtype() == key.dtype() && query.dtype() == value.dtype() &&
-      query.dtype() == beta.dtype());
-  TORCH_CHECK(g.dtype() == at::kFloat && g.dtype() == initial_state.dtype());
-  TORCH_CHECK(cu_seqlens.dtype() == at::kInt);
-  CHECK_DIM(4, query);
-  CHECK_DIM(4, key);
-  CHECK_DIM(4, value);
-  CHECK_DIM(3, g);
-  CHECK_DIM(3, beta);
-  CHECK_DIM(1, cu_seqlens);
-  CHECK_DIM(4, initial_state);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(value);
-  CHECK_CONTIGUOUS(g);
-  CHECK_CONTIGUOUS(beta);
-  CHECK_CONTIGUOUS(initial_state);
   int64_t B = query.size(0);
-  int64_t T = query.size(1);
-  int64_t HK = query.size(2);
-  int64_t EK = query.size(3);
-  int64_t HV = value.size(2);
-  int64_t EV = value.size(3);
+  int64_t global_seq_len = query.size(1);
+  int64_t qk_num_head = query.size(2);
+  int64_t qk_head_size = query.size(3);
+  int64_t v_num_head = value.size(2);
+  int64_t v_head_size = value.size(3);
+  int64_t batch_size = initial_state.size(0);
   CHECK_EQ(B, 1);
-  CHECK_EQ(key.size(0), B);
-  CHECK_EQ(key.size(1), T);
-  CHECK_EQ(key.size(2), HK);
-  CHECK_EQ(key.size(3), EK);
-  CHECK_EQ(value.size(0), B);
-  CHECK_EQ(value.size(1), T);
-  CHECK_EQ(g.size(0), B);
-  CHECK_EQ(g.size(1), T);
-  CHECK_EQ(g.size(2), HV);
-  CHECK_EQ(beta.size(0), B);
-  CHECK_EQ(beta.size(1), T);
-  CHECK_EQ(beta.size(2), HV);
-  CHECK_EQ(initial_state.size(1), HV);
-  CHECK_EQ(initial_state.size(2), EK);
-  CHECK_EQ(initial_state.size(3), EV);
-  CHECK_EQ(HV % HK, 0);
+  CHECK_EQ(v_num_head % qk_num_head, 0);
+  CHECK_INPUT_SHAPE_DTYPE<false, true>(query, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<false, true>(key, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<false, true>(value, 4, {B, global_seq_len, v_num_head, v_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<true, true>(g, 3, {B, global_seq_len, v_num_head}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<true, true>(beta, 3, {B, global_seq_len, v_num_head}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<true, true>(cu_seqlens, 1, {batch_size + 1}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<true, true>(
+      initial_state, 4, {batch_size, v_num_head, qk_head_size, v_head_size}, at::kFloat);
 
   at::Tensor output = at::empty_like(value, value.options());  // [B, T, HV, EV]
   at::Tensor final_state = initial_state.to(at::kFloat);       // [N, HV, EK, EV]
 
+  // Strides
+  int64_t qStrideH = query.stride(2);
+  int64_t qStrideT = query.stride(1);
+  int64_t kStrideH = key.stride(2);
+  int64_t kStrideT = key.stride(1);
+  int64_t vStrideH = value.stride(2);
+  int64_t vStrideT = value.stride(1);
+
+  constexpr int64_t chunk_size = 64;
+  // Deduce the global chunks
+  // e.g. cu_seqlens: [0, 5, 13, 16], chunk_size = 4
+  // chunk_offsets: [0, 2, 4, 5]
+  // chunk_indices (batch_id, local_chunk_id): [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]]
+  std::vector<int64_t> chunk_offsets(batch_size + 1, 0);
+  std::vector<std::vector<int64_t>> chunk_indices;
+  int32_t* cu_seqlens_ptr = cu_seqlens.data_ptr<int32_t>();
+  int64_t s = 0;
+  int64_t e = 0;
+  int64_t s_pad = 0;
+  int64_t e_pad = 0;
+  for (int64_t b = 0; b < batch_size; b++) {
+    e = cu_seqlens_ptr[b + 1];
+    int64_t seq_len = e - s;
+    int64_t pad_size = (chunk_size - seq_len % chunk_size) % chunk_size;
+    int64_t total_seq_length = seq_len + pad_size;
+    e_pad = s_pad + total_seq_length;
+    chunk_offsets[b + 1] = e_pad / chunk_size;
+    for (int64_t c = 0; c < total_seq_length / chunk_size; c++) {
+      chunk_indices.push_back({b, c});
+    }
+    s = e;
+    s_pad = e_pad;
+  }
+  int64_t global_total_seq_length = e_pad;
+  int64_t global_num_chunk = e_pad / chunk_size;
+
+  // Allocate buffer
+  int64_t buff_size = v_num_head * global_total_seq_length                               // g_pad_data
+                      + batch_size * v_num_head * global_total_seq_length * v_head_size  // core_attn
+                      + v_num_head * global_total_seq_length * chunk_size                // decay_mask
+                      + v_num_head * global_total_seq_length * v_head_size;              // v_beta_attn
+  at::Tensor buff_data = at::empty({buff_size}, query.options().dtype(at::kFloat));
+  int64_t reduced_buff_size = qk_num_head * global_total_seq_length * qk_head_size    // q_pad_data
+                              + qk_num_head * global_total_seq_length * qk_head_size  // k_pad_data
+                              + v_num_head * global_total_seq_length * v_head_size    // v_pad_data
+                              + v_num_head * global_total_seq_length * qk_head_size   // k_beta_data
+                              + v_num_head * global_total_seq_length * v_head_size    // v_beta_data
+                              + v_num_head * global_total_seq_length * qk_head_size;  // k_cumdecay_reduced
+  at::Tensor reduced_buff_data = at::empty({reduced_buff_size}, query.options());
+  int64_t num_thread = at::get_num_threads();
+  int64_t buff_size_16bit_per_thread =
+      /* k_transpose */ qk_head_size * chunk_size +
+      /* v_pack */ chunk_size * v_head_size +
+      /* k_beta_g  */ chunk_size * qk_head_size +
+      /* k_beta_g_pack  */ chunk_size * qk_head_size +
+      /* attn */ chunk_size * chunk_size * 2 +
+      /* attn_reduced */ chunk_size * chunk_size +
+      /* k_cumdecay */ chunk_size * qk_head_size * 2 +
+      /* row */ chunk_size * 2 +
+      /* updated */ chunk_size * 2 +
+      /* curr_last_recurrent_state_reduced  */ qk_head_size * v_head_size +
+      /* curr_last_recurrent_state_pack_reduced   */ qk_head_size * v_head_size +
+      /* k_transpose_i  */ qk_head_size * chunk_size +
+      /* attn_i   */ chunk_size * chunk_size * 2 +
+      /* attn_i_reduced     */ chunk_size * chunk_size +
+      /* v_prime */ chunk_size * v_head_size * 2 +
+      /* v_prime_reduced */ chunk_size * v_head_size +
+      /* v_prime_pack_reduced */ chunk_size * v_head_size +
+      /* qg */ chunk_size * qk_head_size +
+      /* attn_inter */ chunk_size * v_head_size * 2 +
+      /* kg */ chunk_size * qk_head_size +
+      /* kg_transpose */ qk_head_size * chunk_size +
+      /* kgv */ qk_head_size * v_head_size * 2;
+  at::Tensor thread_buff_data = at::empty({num_thread, buff_size_16bit_per_thread}, query.options());
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "chunk_gated_delta_rule_kernel", [&] {
-    chunk_gated_delta_rule_kernel_impl<scalar_t>(
-        output, final_state, query, key, value, g, beta, cu_seqlens, use_qk_l2norm_in_kernel);
+    chunk_gated_delta_rule_kernel_impl<scalar_t, chunk_size>(
+        output.data_ptr<scalar_t>(),
+        final_state.data_ptr<float>(),
+        query.data_ptr<scalar_t>(),
+        key.data_ptr<scalar_t>(),
+        value.data_ptr<scalar_t>(),
+        g.data_ptr<float>(),
+        beta.data_ptr<scalar_t>(),
+        cu_seqlens_ptr,
+        buff_data.data_ptr<float>(),
+        reduced_buff_data.data_ptr<scalar_t>(),
+        thread_buff_data.data_ptr<scalar_t>(),
+        use_qk_l2norm_in_kernel,
+        batch_size,
+        global_seq_len,
+        qk_num_head,
+        v_num_head,
+        qk_head_size,
+        v_head_size,
+        qStrideH,
+        qStrideT,
+        kStrideH,
+        kStrideT,
+        vStrideH,
+        vStrideT,
+        chunk_offsets,
+        chunk_indices,
+        global_total_seq_length,
+        global_num_chunk,
+        buff_size_16bit_per_thread);
   });
   return std::make_tuple(std::move(output), std::move(final_state));
 }
