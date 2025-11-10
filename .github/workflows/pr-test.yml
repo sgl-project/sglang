@@ -53,11 +53,13 @@ jobs:
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
             main_package:
-              - "python/sglang/!(multimodal_gen)/**"
-              - "python/**"
-              - "scripts/ci/**"
-              - "test/**"
-              - ".github/workflows/pr-test.yml"
+              pattern:
+                - "python/**"
+                - "scripts/ci/**"
+                - "test/**"
+                - ".github/workflows/pr-test.yml"
+              ignore:
+                - "python/sglang/multimodal_gen/**"
             sgl_kernel:
               - "sgl-kernel/**"
 
