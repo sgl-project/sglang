@@ -1967,7 +1967,7 @@ class Scheduler(
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()
             for req in batch.reqs:
-                req.time_stats.prefill_start_time = current_time
+                req.time_stats.prefill_start_time_host = current_time
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
@@ -2076,7 +2076,7 @@ class Scheduler(
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()
             for req in batch.reqs:
-                req.time_stats.prefill_end_time = current_time
+                req.time_stats.prefill_end_time_host = current_time
 
         return ret
 
