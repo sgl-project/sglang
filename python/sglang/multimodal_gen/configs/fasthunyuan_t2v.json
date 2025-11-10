@@ -1,0 +1,48 @@
+{
+  "embedded_cfg_scale": 6,
+  "flow_shift": 17,
+  "dit_cpu_offload": false,
+  "disable_autocast": false,
+  "precision": "bf16",
+  "vae_precision": "fp32",
+  "vae_tiling": true,
+  "vae_sp": true,
+  "vae_config": {
+    "load_encoder": false,
+    "load_decoder": true,
+    "tile_sample_min_height": 256,
+    "tile_sample_min_width": 256,
+    "tile_sample_min_num_frames": 16,
+    "tile_sample_stride_height": 192,
+    "tile_sample_stride_width": 192,
+    "tile_sample_stride_num_frames": 12,
+    "blend_num_frames": 4,
+    "use_tiling": true,
+    "use_temporal_tiling": true,
+    "use_parallel_tiling": true
+  },
+  "dit_config": {
+    "prefix": "Hunyuan",
+    "quant_config": null
+  },
+  "text_encoder_precisions": [
+    "fp16",
+    "fp16"
+  ],
+  "text_encoder_configs": [
+    {
+      "prefix": "llama",
+      "quant_config": null,
+      "lora_config": null
+    },
+    {
+      "prefix": "clip",
+      "quant_config": null,
+      "lora_config": null,
+      "num_hidden_layers_override": null,
+      "require_post_norm": null
+    }
+  ],
+  "mask_strategy_file_path": null,
+  "enable_torch_compile": false
+}
