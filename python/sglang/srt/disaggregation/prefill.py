@@ -313,23 +313,7 @@ class SchedulerDisaggregationPrefillMixin:
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.chunked_req:
-                # Move the chunked request out of the batch so that we can merge
-                # only finished requests to running_batch.
-                self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-                if self.enable_overlap:
-                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                    self.chunked_req.tmp_end_idx = min(
-                        len(self.chunked_req.fill_ids),
-                        len(self.chunked_req.origin_input_ids),
-                    )
-                else:
-                    self.send_kv_chunk(self.chunked_req)
-                # chunked request keeps its rid but will get a new req_pool_idx
-                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
-                self.running_batch.batch_is_full = False
+        self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
         if self.require_mlp_sync:
@@ -611,6 +595,25 @@ class SchedulerDisaggregationPrefillMixin:
                 transferred_rids.append(req.rid)
 
         return transferred_rids
+
+    def process_prefill_chunk(self: Scheduler) -> None:
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.chunked_req:
+                # Move the chunked request out of the batch so that we can merge
+                # only finished requests to running_batch.
+                self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
+                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+                if self.enable_overlap:
+                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                    self.chunked_req.tmp_end_idx = min(
+                        len(self.chunked_req.fill_ids),
+                        len(self.chunked_req.origin_input_ids),
+                    )
+                else:
+                    self.send_kv_chunk(self.chunked_req)
+                # chunked request keeps its rid but will get a new req_pool_idx
+                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                self.running_batch.batch_is_full = False
 
     def send_kv_chunk(
         self: Scheduler,

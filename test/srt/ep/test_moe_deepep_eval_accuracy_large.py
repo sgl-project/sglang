@@ -10,7 +10,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST,
+    DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
