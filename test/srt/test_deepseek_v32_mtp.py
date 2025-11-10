@@ -15,13 +15,13 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
+FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 
 class TestDeepseekV32MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = FULL_DEEPSEEK_V3_MODEL_PATH
+        cls.model = FULL_DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
@@ -58,7 +58,7 @@ class TestDeepseekV32MTP(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=8,
+            num_shots=20,
             data_path=None,
             num_questions=1400,
             parallel=1400,
