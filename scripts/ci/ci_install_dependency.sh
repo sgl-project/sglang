@@ -137,5 +137,3 @@ python3 -c "import torch; print(torch.version.cuda)"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
-
-#dummy change for test

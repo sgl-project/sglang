@@ -23,11 +23,19 @@ except ImportError:
     )
     HF_HUB_AVAILABLE = False
 
+try:
+    from safetensors import safe_open
+
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    print("Warning: safetensors not available. Install with: pip install safetensors")
+    SAFETENSORS_AVAILABLE = False
+
 
 # Mapping of runners to their required models
 # Add new runners and models here as needed
 RUNNER_MODEL_MAP: Dict[str, List[str]] = {
-    "8-gpu-h200": ["deepseek-ai/DeepSeek-V3-0324"],
+    "8-gpu-h200": ["deepseek-ai/DeepSeek-V3-0324", "moonshotai/Kimi-K2-Thinking"],
 }
 
 
@@ -108,6 +116,34 @@ def check_incomplete_files(model_path: Path, cache_dir: str) -> List[str]:
     return incomplete_in_snapshot
 
 
+def validate_safetensors_file(file_path: Path) -> Tuple[bool, Optional[str]]:
+    """
+    Validate that a safetensors file is readable and not corrupted.
+
+    Args:
+        file_path: Path to the safetensors file
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not SAFETENSORS_AVAILABLE:
+        # Skip validation if safetensors library is not available
+        return True, None
+
+    try:
+        # Attempt to open and read the header
+        # This will fail if the file is corrupted or incomplete
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            # Just accessing the keys validates the header is readable
+            _ = f.keys()
+        return True, None
+    except Exception as e:
+        error_type = type(e).__name__
+        error_msg = str(e)
+        # Return detailed error for debugging
+        return False, f"{error_type}: {error_msg}"
+
+
 def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str]]:
     """
     Validate that all model shards are present and complete.
@@ -136,6 +172,11 @@ def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str]]:
             model_path.glob("pytorch_model.bin")
         )
         if single_files:
+            # Validate the single safetensors file if it exists
+            if single_files[0].suffix == ".safetensors":
+                is_valid, error_msg = validate_safetensors_file(single_files[0])
+                if not is_valid:
+                    return False, f"Corrupted file {single_files[0].name}: {error_msg}"
             return True, None
         return False, "No model files found (safetensors or bin)"
 
@@ -170,6 +211,14 @@ def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str]]:
     index_file = model_path / "model.safetensors.index.json"
     if not index_file.exists():
         return False, "Missing model.safetensors.index.json"
+
+    # Validate each safetensors shard file for corruption
+    print(f"  Validating {len(shard_files)} shard file(s) for corruption...")
+    for shard_file in shard_files:
+        if shard_file.suffix == ".safetensors":
+            is_valid, error_msg = validate_safetensors_file(shard_file)
+            if not is_valid:
+                return False, f"Corrupted shard {shard_file.name}: {error_msg}"
 
     return True, None
 
