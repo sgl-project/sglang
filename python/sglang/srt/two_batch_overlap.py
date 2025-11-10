@@ -79,7 +79,7 @@ def compute_split_seq_index(
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return (num_tokens // token_num_per_seq) // 2
-    elif forward_mode.is_idle() or forward_mode.is_prebuilt_extend():
+    elif forward_mode.is_idle() or forward_mode.is_prebuilt():
         assert num_tokens == 0
         return 0
     else:
@@ -381,7 +381,7 @@ class TboDPAttentionPreparer:
                 or local_batch.forward_mode.is_decode()
             ):
                 num_tokens = local_batch.batch_size() * token_num_per_seq
-            elif local_batch.forward_mode.is_prebuilt_extend():
+            elif local_batch.forward_mode.is_prebuilt():
                 num_tokens = 0
             else:
                 num_tokens = local_batch.extend_num_tokens
