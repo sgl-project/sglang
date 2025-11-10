@@ -146,11 +146,10 @@ class PplxDispatcher(BaseDispatcher):
 
         if hidden_states_fp8.shape[0] > 0:
             print(f"hidden_states_fp8.shape: {hidden_states_fp8.shape}, hidden_states_scale.shape: {hidden_states_scale.shape}, topk_output.topk_ids.shape: {topk_output.topk_ids.shape}, topk_output.topk_weights.shape: {topk_output.topk_weights.shape}, out_expert_x.shape: {out_expert_x.shape}, out_expert_x_scale.shape: {out_expert_x_scale.shape}, out_expert_num_tokens.shape: {out_expert_num_tokens.shape}, topk_output.topk_ids.min(): {topk_output.topk_ids.min()}, topk_output.topk_ids.max(): {topk_output.topk_ids.max()}")
-            topk_ids = torch.clamp(topk_output.topk_ids, min=0, max=self.num_experts - 1)
-        else:
-            topk_ids = topk_output.topk_ids
+            assert topk_output.topk_ids.min() >= 0 and topk_output.topk_ids.max() < self.num_experts
         
-        topk_ids = topk_ids.to(torch.uint32)
+        topk_ids = topk_output.topk_ids.to(torch.uint32)
+        topk_weights = topk_output.topk_weights
 
         self.dispatcher.dispatch(
             out_expert_num_tokens=out_expert_num_tokens,
@@ -159,7 +158,7 @@ class PplxDispatcher(BaseDispatcher):
             dp_x=hidden_states_fp8,
             dp_x_scale=hidden_states_scale,
             indices=topk_ids,
-            weights=topk_output.topk_weights,
+            weights=topk_weights,
             bound_m=None,
         )
         
@@ -170,7 +169,7 @@ class PplxDispatcher(BaseDispatcher):
             hidden_states_scale=out_expert_x_scale,
             num_recv_tokens_per_expert=out_expert_num_tokens,
             topk_ids=topk_ids,
-            topk_weights=topk_output.topk_weights,
+            topk_weights=topk_weights,
         )
 
     def combine(self, combine_input: PplxCombineInput) -> torch.Tensor:
