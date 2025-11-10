@@ -58,7 +58,7 @@ class TestQwenImageEdit(TestGenerateBase):
 
     def test_single_gpu(self):
         self._run_test(
-            name=f"{self.model_name()}, single gpu",
+            name=f"{self.model_name()}_single_gpu",
             args=None,
             model_path=self.model_path,
             test_key="test_single_gpu",

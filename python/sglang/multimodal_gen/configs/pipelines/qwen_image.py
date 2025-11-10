@@ -117,7 +117,7 @@ class QwenImagePipelineConfig(PipelineConfig):
         width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        _pack_latents(latents, batch_size, num_channels_latents, height, width)
+        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
 
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):

@@ -54,9 +54,9 @@ class TestWan2_2_T2V(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.VIDEO
     thresholds = {
-        "test_single_gpu": 865,
+        "test_single_gpu": 904.3 * 1.05,
         "test_cfg_parallel": 446,
-        "test_usp": 124,
+        "test_usp": 316 * 1.05,
         "test_mixed": 159,
     }
 

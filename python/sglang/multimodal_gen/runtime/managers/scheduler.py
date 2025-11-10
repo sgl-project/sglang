@@ -42,9 +42,11 @@ class Scheduler:
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
         endpoint = server_args.scheduler_endpoint()
-        logger.info(f"Scheduler listening at endpoint: {endpoint}")
         if gpu_id == 0:
-            self.receiver = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+            self.receiver, actual_endpoint = get_zmq_socket(
+                self.context, zmq.REP, endpoint, True
+            )
+            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
         else:
             self.receiver = None
 
