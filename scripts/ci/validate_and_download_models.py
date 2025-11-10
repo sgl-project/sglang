@@ -28,9 +28,6 @@ except ImportError:
 # Add new runners and models here as needed
 RUNNER_MODEL_MAP: Dict[str, List[str]] = {
     "8-gpu-h200": ["deepseek-ai/DeepSeek-V3-0324"],
-    "8-gpu-h20": ["Barrrrry/DeepSeek-R1-W4AFP8"],
-    "4-gpu-b200": ["nvidia/DeepSeek-V3-0324-FP4"],
-    "4-gpu-gb200": ["nvidia/DeepSeek-V3-0324-FP4"],
 }
 
 
