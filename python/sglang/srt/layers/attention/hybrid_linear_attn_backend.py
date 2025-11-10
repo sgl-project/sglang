@@ -36,24 +36,21 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
 
 if is_cuda():
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn as causal_conv1d_fn_cuda,
-    )
+    pass
 
-    causal_conv1d_fn = causal_conv1d_fn_cuda
+    # TODO: add this back. This is temporarily commented to wait for sgl-kernel new version release
+    # causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update_npu,
     )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
+    from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
+    # TODO: add this back. This is temporarily commented to wait for sgl-kernel new version release
+    # causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
 
 
