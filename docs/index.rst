@@ -27,9 +27,11 @@ Its core features include:
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
    basic_usage/deepseek.md
+   basic_usage/deepseek_v32.md
    basic_usage/gpt_oss.md
    basic_usage/llama4.md
    basic_usage/qwen3.md
+   basic_usage/qwen3_vl.md
 
 .. toctree::
    :maxdepth: 1
@@ -50,7 +52,9 @@ Its core features include:
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
    advanced_features/router.md
+   advanced_features/deterministic_inference.md
    advanced_features/observability.md
+   advanced_features/checkpoint_engine.md
 
 .. toctree::
    :maxdepth: 1
@@ -75,6 +79,7 @@ Its core features include:
    platforms/tpu.md
    platforms/nvidia_jetson.md
    platforms/ascend_npu.md
+   platforms/xpu.md
 
 .. toctree::
    :maxdepth: 1
@@ -92,7 +97,14 @@ Its core features include:
    references/faq.md
    references/environment_variables.md
    references/production_metrics.md
+   references/production_request_trace.md
    references/multi_node_deployment/multi_node_index.rst
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
    references/learn_more.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Security Acknowledgement
+
+   security/acknowledgements.md

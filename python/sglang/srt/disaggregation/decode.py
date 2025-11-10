@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 import torch
 from torch.distributed import ProcessGroup
@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -58,7 +59,8 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.utils import get_int_env_var, require_mlp_sync
+from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
+from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -151,6 +153,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
+        self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
         )
@@ -313,6 +316,7 @@ class DecodePreallocQueue:
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)
+            trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -521,13 +525,15 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
                 time.perf_counter()
             )
             decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
+            trace_slice_end(
+                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -578,11 +584,11 @@ class DecodePreallocQueue:
             need_space_for_single_req,
         )
 
-        # Note: if the last fake extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
+        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
             self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_extend()
+            and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
             allocatable_tokens -= self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
@@ -764,20 +770,13 @@ class DecodeTransferQueue:
 
                 indices_to_remove.add(i)
                 decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+                transferred_reqs.append(decode_req.req)
+                trace_slice_end(
+                    RequestStage.DECODE_TRANSFERRED,
+                    decode_req.req.rid,
+                    auto_next_anon=True,
+                )
 
-                # special handling for sampling_params.max_new_tokens == 1
-                if decode_req.req.sampling_params.max_new_tokens == 1:
-                    # finish immediately
-                    decode_req.req.time_stats.forward_entry_time = (
-                        decode_req.req.time_stats.completion_time
-                    ) = time.perf_counter()
-                    decode_req.req.check_finished()
-                    self.scheduler.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
-                    self.tree_cache.cache_finished_req(decode_req.req)
-                else:
-                    transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -814,34 +813,11 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
-
             if batch:
                 # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
-                    )
-                    if prepare_mlp_sync_flag:
-                        self._prepare_idle_batch_and_run(None)
-                else:
-                    if prepare_mlp_sync_flag:
-                        self.prepare_mlp_sync_batch(batch)
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
-            elif prepare_mlp_sync_flag:
-                batch, _ = self._prepare_idle_batch_and_run(None)
-
-            queue_size = (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-            )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                queue_size += len(self.decode_offload_manager.ongoing_offload)
-
-            if batch is None and queue_size == 0:
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+            else:
                 self.self_check_during_idle()
 
             self.last_batch = batch
@@ -850,7 +826,6 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
 
@@ -860,77 +835,39 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
-            last_batch_in_queue = False
-
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
             batch_result = None
             if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
-                    )
-                    if prepare_mlp_sync_flag:
-                        batch_, batch_result = self._prepare_idle_batch_and_run(
-                            None, delay_process=True
-                        )
-                        if batch_:
-                            self.result_queue.append((batch_.copy(), batch_result))
-                            last_batch_in_queue = True
-                else:
-                    if prepare_mlp_sync_flag:
-                        self.prepare_mlp_sync_batch(batch)
-                    batch_result = self.run_batch(batch)
-                    self.result_queue.append((batch.copy(), batch_result))
-                    last_batch_in_queue = True
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
-            elif prepare_mlp_sync_flag:
-                batch, batch_result = self._prepare_idle_batch_and_run(
-                    None, delay_process=True
-                )
-                if batch:
-                    self.result_queue.append((batch.copy(), batch_result))
-                    last_batch_in_queue = True
-
-            # Process the results of the previous batch but skip if the last batch is extend
-            if self.last_batch and self.last_batch_in_queue:
+            if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-
-            self.launch_batch_sample_if_needed(batch_result)
-
-            queue_size = (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-            )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                queue_size += len(self.decode_offload_manager.ongoing_offload)
-
-            if batch is None and queue_size == 0:
+            elif batch is None:
                 self.self_check_during_idle()
 
+            self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
-            self.last_batch_in_queue = last_batch_in_queue
 
-    def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
-        batch = self.prepare_mlp_sync_batch(batch)
-        result = None
-        if batch:
-            result = self.run_batch(batch)
-            if not delay_process:
-                self.process_batch_result(batch, result)
-        return batch, result
+    def _run_batch_prebuilt(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        if batch.inner_idle_batch is not None:
+            idle_batch = batch.inner_idle_batch
+            # Reset the inner idle batch to avoid reusing it.
+            batch.inner_idle_batch = None
+            return self.run_batch(idle_batch)
+
+        return GenerationBatchResult()
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
-    ) -> Optional[Tuple[ScheduleBatch, bool]]:
+    ) -> Optional[ScheduleBatch]:
         """Create fake completed prefill if possible and merge with running batch"""
         # Merge the prefill batch into the running batch
         last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_extend():
+        if last_batch and last_batch.forward_mode.is_prebuilt():
             # chunked prefill doesn't happen in decode instance.
             assert self.chunked_req is None
             # Filter finished batches.
@@ -954,6 +891,16 @@ class SchedulerDisaggregationDecodeMixin:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
 
+        # 1. decode + None -> decode + idle
+        # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
+        # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
+        # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
+        if self.require_mlp_sync:
+            ret = self.prepare_mlp_sync_batch(ret)
+
+        if ret:
+            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
+            trace_event_batch("schedule", ret.reqs, attrs=attrs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -1003,12 +950,15 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         # construct fake completed prefill
-        new_batch.prepare_for_prebuilt_extend()
-        new_batch.process_prebuilt_extend(self.server_args, self.model_config)
+        new_batch.prepare_for_prebuilt()
+        new_batch.process_prebuilt(self.server_args, self.model_config)
 
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            self.decode_offload_manager.check_offload_progress()
+
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
@@ -1031,6 +981,3 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
             self.waiting_queue.extend(alloc_reqs)
-
-        if self.server_args.disaggregation_decode_enable_offload_kvcache:
-            self.decode_offload_manager.check_offload_progress()
