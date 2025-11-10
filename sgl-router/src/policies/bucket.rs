@@ -1,13 +1,13 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
-    time::{Duration, SystemTime},
     thread,
+    time::{Duration, SystemTime},
 };
 
 use dashmap::DashMap;
 use rand::Rng;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::{get_healthy_worker_indices, BucketConfig, LoadBalancingPolicy};
@@ -40,27 +40,28 @@ impl BucketPolicy {
     }
 
     pub fn with_config(config: BucketConfig) -> Self {
-        let buckets = Arc::new(DashMap::<String,Arc<RwLock<Bucket>>>::new());
+        let buckets = Arc::new(DashMap::<String, Arc<RwLock<Bucket>>>::new());
 
         let adjustment_handle = {
             let buckets_clone = Arc::clone(&buckets);
 
             let interval_secs = config.bucket_adjust_interval_secs;
 
-            Some(thread::spawn(move || {
-                loop {
-                    thread::sleep(Duration::from_secs(interval_secs as u64));
+            Some(thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(interval_secs as u64));
 
-                    for bucket_ref in buckets_clone.iter() {
-                        let model_id = bucket_ref.key();
-                        let bucket = bucket_ref.value();
-                        match bucket.write() {
-                            Ok(mut bucket_guard) => {
-                                bucket_guard.adjust_boundary();
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to acquire write lock for bucket {}: {}", model_id, e);
-                            }
+                for bucket_ref in buckets_clone.iter() {
+                    let model_id = bucket_ref.key();
+                    let bucket = bucket_ref.value();
+                    match bucket.write() {
+                        Ok(mut bucket_guard) => {
+                            bucket_guard.adjust_boundary();
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to acquire write lock for bucket {}: {}",
+                                model_id, e
+                            );
                         }
                     }
                 }
@@ -76,8 +77,7 @@ impl BucketPolicy {
 
     pub fn init_prefill_worker_urls(&self, prefill_workers: &[Arc<dyn Worker>]) {
         // Group workers by model
-        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> =
-            HashMap::new();
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in prefill_workers {
             // Use "default" for unknown/empty model_ids for backward compatibility
             let model_id = worker.model_id();
@@ -104,9 +104,9 @@ impl BucketPolicy {
                 .clone();
 
             let worker_urls: Vec<String> = model_workers
-            .iter()
-            .map(|worker| worker.url().to_string())
-            .collect();
+                .iter()
+                .map(|worker| worker.url().to_string())
+                .collect();
 
             let lock_result = bucket.write();
             if let Ok(mut bucket_guard) = lock_result {
@@ -158,7 +158,10 @@ impl BucketPolicy {
                 worker_url, model_key
             );
         } else {
-            error!("Failed to acquire write lock for bucket of model {}", model_key);
+            error!(
+                "Failed to acquire write lock for bucket of model {}",
+                model_key
+            );
         }
     }
 
@@ -199,10 +202,16 @@ impl BucketPolicy {
                     worker_url, model_key, bucket_guard.bucket_cnt
                 );
             } else {
-                error!("Failed to acquire write lock for bucket of model {}", model_key);
+                error!(
+                    "Failed to acquire write lock for bucket of model {}",
+                    model_key
+                );
             }
         } else {
-            warn!("No bucket found for model {} when trying to remove worker", model_key);
+            warn!(
+                "No bucket found for model {} when trying to remove worker",
+                model_key
+            );
         }
     }
 }
@@ -233,7 +242,10 @@ impl LoadBalancingPolicy for BucketPolicy {
             first_model
         };
 
-        let bucket = self.buckets.get(model_key).map(|entry| entry.value().clone());
+        let bucket = self
+            .buckets
+            .get(model_key)
+            .map(|entry| entry.value().clone());
         let prefill_url = if let Some(bucket) = bucket {
             let (choiced_url, chars_per_url_snapshot) = {
                 let buc = bucket.read().unwrap();
@@ -245,9 +257,12 @@ impl LoadBalancingPolicy for BucketPolicy {
             let min_load = chars_per_url_snapshot.values().copied().min().unwrap_or(0);
             let abs_diff = max_load.saturating_sub(min_load);
             let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
-            let is_imbalanced = abs_diff > self.config.balance_abs_threshold
-                && max_load as f32 > rel_threshold;
-            info!("Current PD instance status | is_imbalanced={}", is_imbalanced);
+            let is_imbalanced =
+                abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
+            info!(
+                "Current PD instance status | is_imbalanced={}",
+                is_imbalanced
+            );
 
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
@@ -283,7 +298,10 @@ impl LoadBalancingPolicy for BucketPolicy {
 
             prefill_url
         } else {
-            warn!("No bucket found for model {}, randomly selecting healthy worker", model_key);
+            warn!(
+                "No bucket found for model {}, randomly selecting healthy worker",
+                model_key
+            );
             let mut rng = rand::rng();
             let idx = rng.random_range(0..healthy_indices.len());
             let selected_worker = &workers[healthy_indices[idx]];
@@ -657,8 +675,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(10)).await;
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -666,7 +687,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 33);
                     assert_eq!(bucket_guard.boundary[1].range[1], 67);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -779,8 +803,11 @@ mod tests {
         // Initial boundary
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -788,7 +815,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 1364);
                     assert_eq!(bucket_guard.boundary[1].range[1], 2729);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -818,8 +848,11 @@ mod tests {
         // Verify boundaries adjusted to: [0, 20], [21, 26], [27, MAX]
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -827,7 +860,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 20);
                     assert_eq!(bucket_guard.boundary[1].range[1], 26);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -857,8 +893,11 @@ mod tests {
         // Verify boundaries adjusted to: [0, 40], [41, 57], [58, MAX]
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -866,7 +905,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 40);
                     assert_eq!(bucket_guard.boundary[1].range[1], 57);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -907,8 +949,11 @@ mod tests {
         // Initial boundary
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -916,7 +961,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 1364);
                     assert_eq!(bucket_guard.boundary[1].range[1], 2729);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -929,8 +977,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -938,7 +989,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 20);
                     assert_eq!(bucket_guard.boundary[1].range[1], 27);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -950,8 +1004,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -959,7 +1016,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 7);
                     assert_eq!(bucket_guard.boundary[1].range[1], 10);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -1000,8 +1060,11 @@ mod tests {
         // Initial boundary
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -1009,7 +1072,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 1364);
                     assert_eq!(bucket_guard.boundary[1].range[1], 2729);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -1036,8 +1102,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -1045,7 +1114,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 20);
                     assert_eq!(bucket_guard.boundary[1].range[1], 26);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
@@ -1072,8 +1144,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         {
             let model_key = "default";
-    
-            let bucket = policy.buckets.get(model_key).map(|entry| entry.value().clone());
+
+            let bucket = policy
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
             if let Some(bucket) = bucket {
                 let lock_result = bucket.write();
                 if let Ok(bucket_guard) = lock_result {
@@ -1081,7 +1156,10 @@ mod tests {
                     assert_eq!(bucket_guard.boundary[0].range[1], 20);
                     assert_eq!(bucket_guard.boundary[1].range[1], 26);
                 } else {
-                    error!("Failed to acquire write lock for bucket of model {}", model_key);
+                    error!(
+                        "Failed to acquire write lock for bucket of model {}",
+                        model_key
+                    );
                 }
             }
         }
