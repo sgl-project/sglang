@@ -253,6 +253,12 @@ def _matmul_persistent_deepgemm(
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
+    M, K = a.shape
+    K2, N = b.shape
+
+    # DeepGEMM requires minimum dimensions, skip DeepGEMM for small dimensions to avoid CUDA_ERROR_INVALID_VALUE
+    MIN_DIM_FOR_DEEPGEMM = 64
+
     if (
         _ENABLE_MM_DEEPGEMM
         and ENABLE_JIT_DEEPGEMM
@@ -260,6 +266,8 @@ def matmul_persistent(
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
+        and M >= MIN_DIM_FOR_DEEPGEMM
+        and N >= MIN_DIM_FOR_DEEPGEMM
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
@@ -276,7 +284,12 @@ def matmul_persistent(
             # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
             return out_deepgemm
 
-        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        try:
+            return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        except RuntimeError:
+            # DeepGEMM failed, fallback to Triton kernel silently
+            # (dimension checks above should prevent most errors)
+            pass
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
