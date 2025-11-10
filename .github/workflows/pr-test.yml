@@ -60,7 +60,7 @@ jobs:
             }
 
             if (await hasHighPermission(actor)) {
-              core.info('Triggering user ${actor} has high permission. No rate limit applied.');
+              core.info(`Triggering user '${actor}' has high permission. No rate limit applied.`);
               return;
             }
 
