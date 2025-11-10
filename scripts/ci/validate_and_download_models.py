@@ -3,8 +3,9 @@
 Validate model integrity for CI runners and download if needed.
 
 This script checks HuggingFace cache for model completeness and downloads
-missing models. It exits with code 1 if download was required (indicating
-cache corruption), which causes the CI job to fail and surface cache issues.
+missing models. It exits with code 0 if models are present or successfully
+downloaded (emitting a warning annotation if repairs were needed), and exits
+with code 1 only if download attempts fail.
 """
 
 import os
@@ -362,8 +363,8 @@ def main() -> int:
     Main validation logic.
 
     Returns:
-        0 if all models are valid or runner doesn't need validation
-        1 if models needed to be downloaded or validation failed
+        0 if all models are valid, successfully downloaded, or runner doesn't need validation
+        1 only if download attempts fail
     """
     print("=" * 70)
     print("Model Validation for CI Runners")
@@ -436,11 +437,20 @@ def main() -> int:
         print("✗ FAILED: Some models could not be downloaded")
         return 1
 
-    # All downloads succeeded, but we still exit with error to flag cache issues
-    print("✗ FAILED: Models were downloaded due to cache corruption/missing files")
-    print("This indicates the cache was invalid and needed to be repaired.")
-    print("Failing the job to surface this issue for investigation.")
-    return 1
+    # All downloads succeeded - emit warning but exit successfully
+    print("✓ All required models downloaded successfully!")
+    print("⚠ WARNING: Models were missing/corrupted in cache and have been repaired.")
+    print(f"  Repaired models: {', '.join(models_needing_download)}")
+
+    # Emit GitHub Actions warning annotation for visibility
+    print(
+        f"::warning file=scripts/ci/validate_and_download_models.py::"
+        f"Cache validation failed for {len(models_needing_download)} model(s). "
+        f"Models were re-downloaded successfully. "
+        f"This may indicate cache corruption or infrastructure issues."
+    )
+
+    return 0
 
 
 if __name__ == "__main__":
