@@ -73,6 +73,7 @@ class LMCRadixCache(RadixCache):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
+        enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         model_config: Optional["ModelConfig"] = None,
         tp_size: int = 1,
@@ -85,6 +86,7 @@ class LMCRadixCache(RadixCache):
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             page_size=page_size,
             disable=disable,
+            enable_metrics=enable_metrics,
             enable_kv_cache_events=enable_kv_cache_events,
             eviction_policy=eviction_policy,
         )
@@ -107,7 +109,7 @@ class LMCRadixCache(RadixCache):
                 "v_buffer",
                 getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
             ),
-            tp_group=tp_group,
+            tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
         self.load_stream = torch.cuda.Stream()
