@@ -131,7 +131,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         fVec kv_mem_vec0 = fVec(float(0));
         fVec kv_mem_vec1 = fVec(float(0));
         for (int di = 0; di < head_dim; ++di) {
-          fVec k_val_vec = fVec(k_ptr[k_offset + di]) * fVec(k_scale);
+          fVec k_val_vec = fVec(k_ptr[k_offset + di] * k_scale);
           fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
           fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
           kv_mem_vec0 = kv_mem_vec0 + state_vec0 * g_val_exp_vec * k_val_vec;
@@ -145,8 +145,8 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         fVec o_vec0 = fVec(float(0));
         fVec o_vec1 = fVec(float(0));
         for (int di = 0; di < head_dim; ++di) {
-          fVec q_vec = fVec(q_ptr[q_offset + di]) * fVec(q_scale);
-          fVec k_vec = fVec(k_ptr[k_offset + di]) * fVec(k_scale);
+          fVec q_vec = fVec(q_ptr[q_offset + di] * q_scale);
+          fVec k_vec = fVec(k_ptr[k_offset + di] * k_scale);
           fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
           fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
           state_vec0 = state_vec0 * g_val_exp_vec + k_vec * dt_vec0;
