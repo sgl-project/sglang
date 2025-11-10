@@ -327,6 +327,11 @@ class ModelRunner:
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
+        if self.pp_size > 1:
+            assert (
+                self.support_pp
+            ), "Pipeline Parallel is not compatible with this model."
+
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
@@ -2057,7 +2062,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
-    ) -> LogitsProcessorOutput:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
@@ -2080,7 +2085,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
-    ) -> LogitsProcessorOutput:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2107,7 +2112,7 @@ class ModelRunner:
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
-    ) -> LogitsProcessorOutput:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
