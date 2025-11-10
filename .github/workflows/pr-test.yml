@@ -22,10 +22,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  permission-and-rate-limit:
+  # =============================================== check changes ====================================================
+  check-changes:
     runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Fail if the PR does not have the 'run-ci' label
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
+        run: |
+          echo "This pull request does not have the 'run-ci' label. Failing the workflow."
+          exit 1
+
+      - name: Fail if the PR is a draft
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "This pull request is a draft. Failing the workflow."
+          exit 1
+
       - name: Enforce hourly limit for low-permission actors
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -35,22 +56,9 @@ jobs:
             const repo = context.repo.repo;
             const eventName = context.eventName;
 
-            if (eventName === 'push') {
-              core.info(`Event '${eventName}' detected (push). Rate limit is disabled for push events.`);
-              return;
-            }
-            if (!(eventName === 'pull_request' || eventName === 'workflow_dispatch')) {
-              core.info(`Event '${eventName}' is not rate-limited. Skipping.`);
-              return;
-            }
-
-            core.info(`Triggering actor: ${actor}`);
-
             async function hasHighPermission(username) {
               try {
-                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
-                  owner, repo, username,
-                });
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
                 const perm = data.permission || 'none';
                 return perm === 'write' || perm === 'maintain' || perm === 'admin';
               } catch (e) {
@@ -76,18 +84,11 @@ jobs:
             });
 
             const runs = data.workflow_runs || [];
-
-            const belongs = (run) => {
+            const recentFound = runs.find((run) => {
               if (String(run.id) === String(context.runId)) return false;
               if (new Date(run.created_at) < cutoff) return false;
-
-              return (
-                run.actor?.login === actor ||
-                run.triggering_actor?.login === actor
-              );
-            };
-
-            const recentFound = runs.find(belongs);
+              return (run.actor?.login === actor) || (run.triggering_actor?.login === actor);
+            });
 
             if (recentFound) {
               core.setFailed(
@@ -97,29 +98,6 @@ jobs:
             } else {
               core.info('No recent runs detected; proceeding.');
             }
-  # =============================================== check changes ====================================================
-  check-changes:
-    needs: [permission-and-rate-limit]
-    runs-on: ubuntu-latest
-    outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
-      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Fail if the PR does not have the 'run-ci' label
-        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
-        run: |
-          echo "This pull request does not have the 'run-ci' label. Failing the workflow."
-          exit 1
-
-      - name: Fail if the PR is a draft
-        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
-        run: |
-          echo "This pull request is a draft. Failing the workflow."
-          exit 1
 
       - name: Detect file changes
         id: filter
