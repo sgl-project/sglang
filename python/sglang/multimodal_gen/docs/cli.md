@@ -143,7 +143,7 @@ SERVER_ARGS=(
   --ring-degree=2
 )
 
-sglang serve"${SERVER_ARGS[@]}"
+sglang serve "${SERVER_ARGS[@]}"
 ```
 
 - **--model-path**: Which model to load. The example uses `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.

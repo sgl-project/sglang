@@ -39,7 +39,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde_json::{from_str, from_value, json, to_string, to_value, Value};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -324,6 +324,12 @@ async fn execute_with_mcp_loop(
 
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
+            error!(
+                function = "execute_with_mcp_loop",
+                iteration_count = iteration_count,
+                max_iterations = MAX_TOOL_ITERATIONS,
+                "Maximum tool iterations exceeded"
+            );
             return Err(error::internal_error(format!(
                 "Maximum tool iterations ({}) exceeded",
                 MAX_TOOL_ITERATIONS
@@ -1040,7 +1046,6 @@ async fn execute_without_mcp_streaming(
 /// Build ResponsesResponse with tool calls (MCP and/or function tools)
 ///
 /// ResponsesResponse with tool calls
-/// TODO: Refactor to use builder pattern
 #[allow(clippy::too_many_arguments)]
 fn build_tool_response(
     mcp_tool_calls: Vec<ToolCall>,
@@ -1119,42 +1124,19 @@ fn build_tool_response(
         .unwrap()
         .as_secs() as i64;
 
-    ResponsesResponse {
-        id: request_id,
-        object: "response".to_string(),
-        created_at,
-        status: ResponseStatus::Completed,
-        error: None,
-        incomplete_details: None,
-        instructions: responses_request.instructions.clone(),
-        max_output_tokens: responses_request.max_output_tokens,
-        model: responses_request.model.clone(),
-        output,
-        parallel_tool_calls: responses_request.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: responses_request.previous_response_id.clone(),
-        reasoning: None,
-        store: responses_request.store.unwrap_or(true),
-        temperature: responses_request.temperature,
-        text: None,
-        tool_choice: responses_request
-            .tool_choice
-            .as_ref()
-            .map(|tc| to_string(tc).unwrap_or_else(|_| "auto".to_string()))
-            .unwrap_or_else(|| "auto".to_string()),
-        tools: responses_request.tools.clone().unwrap_or_default(),
-        top_p: responses_request.top_p,
-        truncation: None,
-        usage: Some(ResponsesUsage::Modern(ResponseUsage {
+    ResponsesResponse::builder(&request_id, &responses_request.model)
+        .copy_from_request(&responses_request)
+        .created_at(created_at)
+        .status(ResponseStatus::Completed)
+        .output(output)
+        .usage(ResponsesUsage::Modern(ResponseUsage {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
             input_tokens_details: None,
             output_tokens_details: None,
-        })),
-        user: None,
-        safety_identifier: responses_request.user.clone(),
-        metadata: responses_request.metadata.clone().unwrap_or_default(),
-    }
+        }))
+        .build()
 }
 
 /// Execute MCP tools and collect results
@@ -1181,6 +1163,13 @@ async fn execute_mcp_tools(
         // Parse tool arguments from JSON string
         let args_str = tool_call.function.arguments.as_deref().unwrap_or("{}");
         let args: Value = from_str(args_str).map_err(|e| {
+            error!(
+                function = "execute_mcp_tools",
+                tool_name = %tool_call.function.name,
+                call_id = %tool_call.id,
+                error = %e,
+                "Failed to parse tool arguments JSON"
+            );
             error::internal_error(format!(
                 "Invalid tool arguments JSON for tool '{}': {}",
                 tool_call.function.name, e
@@ -1543,6 +1532,12 @@ async fn load_previous_messages(
         .get_response_chain(&prev_id, None)
         .await
         .map_err(|e| {
+            error!(
+                function = "load_previous_messages",
+                prev_id = %prev_id_str,
+                error = %e,
+                "Failed to load previous response chain from storage"
+            );
             error::internal_error(format!(
                 "Failed to load previous response chain for {}: {}",
                 prev_id_str, e

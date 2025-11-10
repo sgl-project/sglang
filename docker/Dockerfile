@@ -11,13 +11,14 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.3.16.post5
-ARG SGL_VERSION=0.5.4.post3
+ARG SGL_VERSION=0.5.5
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
+ARG INSTALL_FLASHINFER_JIT_CACHE=0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -125,6 +126,9 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
    ; \
    fi \
  && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
+      python3 -m pip install flashinfer-jit-cache==0.5.0 --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+    fi \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
