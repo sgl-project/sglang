@@ -346,7 +346,7 @@ jobs:
           python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
   unit-test-backend-2-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-1-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
@@ -842,7 +842,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
   unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-gb200
