@@ -67,9 +67,9 @@ if _is_cuda or _is_xpu:
         rmsnorm,
     )
 
-    @torch.library.register_fake("sgl_kernel::fused_add_rmsnorm")
-    def _fused_add_rmsnorm_fake(input, residual, weight, eps, enable_pdl):
-        return
+    # @torch.library.register_fake("sgl_kernel::fused_add_rmsnorm")
+    # def _fused_add_rmsnorm_fake(input, residual, weight, eps, enable_pdl):
+    #     return
 
 
 if _use_aiter:
