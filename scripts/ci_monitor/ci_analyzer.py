@@ -108,6 +108,7 @@ class SGLangCIAnalyzer:
                 "nightly-test-8-gpu-h200",
                 "nightly-test-8-gpu-h20",
                 "nightly-test-4-gpu-b200",
+                "nightly-test-8-gpu-b200",
             ],
             "integration": [
                 "run-all-notebooks",
@@ -199,6 +200,7 @@ class SGLangCIAnalyzer:
                     "nightly-test-8-gpu-h200",
                     "nightly-test-8-gpu-h20",
                     "nightly-test-4-gpu-b200",
+                    "nightly-test-8-gpu-b200",
                 ]
 
                 if job_name in target_jobs:
