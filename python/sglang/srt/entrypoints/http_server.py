@@ -123,6 +123,9 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
@@ -152,6 +155,15 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
+    # Dict{
+    #   rank: Tuple(
+    #           session_id,
+    #           Dict{
+    #               name: Tuple (d_ptr, numel, element_size)
+    #           }
+    #         )
+    # }
+    remote_instance_transfer_engine_info: Optional[Dict] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -823,6 +835,30 @@ async def send_weights_to_remote_instance(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.get("/get_remote_instance_transfer_engine_info")
+async def get_remote_instance_transfer_engine_info(rank: int = None):
+    if rank is None or rank < 0:
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    if (
+        _global_state.remote_instance_transfer_engine_info is None
+        or len(_global_state.remote_instance_transfer_engine_info) == 0
+    ):
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    try:
+        result = {
+            "rank": rank,
+            "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
+                rank
+            ],
+        }
+        return result
+    except Exception as e:
+        logger.error(f"Exception: {e}")
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/init_weights_update_group")
@@ -1620,11 +1656,19 @@ def launch_server(
     )
 
     scheduler_info = scheduler_infos[0]
+    remote_instance_transfer_engine_info = None
+    if server_args.remote_instance_weight_loader_use_transfer_engine():
+        remote_instance_transfer_engine_info = (
+            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                scheduler_infos
+            )
+        )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_info,
+            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
 
