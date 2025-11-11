@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST,
+    DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -397,7 +397,7 @@ class Test09(CustomTestCase):
 class Test10(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -435,7 +435,7 @@ class Test10(CustomTestCase):
 class Test11(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -476,7 +476,7 @@ class Test11(CustomTestCase):
 class Test12(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -517,7 +517,7 @@ class Test12(CustomTestCase):
 class Test13(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -557,7 +557,7 @@ class Test13(CustomTestCase):
 class Test14(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -600,7 +600,7 @@ class Test14(CustomTestCase):
 class Test15(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -643,7 +643,7 @@ class Test15(CustomTestCase):
 class Test16(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -685,7 +685,7 @@ class Test16(CustomTestCase):
 class Test17(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -727,7 +727,7 @@ class Test17(CustomTestCase):
 class Test18(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -771,7 +771,7 @@ class Test18(CustomTestCase):
 class Test19(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1213,7 +1213,7 @@ class Test29(CustomTestCase):
 class Test30(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1257,7 +1257,7 @@ class Test30(CustomTestCase):
 class Test31(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1304,7 +1304,7 @@ class Test31(CustomTestCase):
 class Test32(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1351,7 +1351,7 @@ class Test32(CustomTestCase):
 class Test33(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1397,7 +1397,7 @@ class Test33(CustomTestCase):
 class Test34(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1446,7 +1446,7 @@ class Test34(CustomTestCase):
 class Test35(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1495,7 +1495,7 @@ class Test35(CustomTestCase):
 class Test36(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1543,7 +1543,7 @@ class Test36(CustomTestCase):
 class Test37(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1591,7 +1591,7 @@ class Test37(CustomTestCase):
 class Test38(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1641,7 +1641,7 @@ class Test38(CustomTestCase):
 class Test39(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1691,7 +1691,7 @@ class Test39(CustomTestCase):
 class Test40(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1741,7 +1741,7 @@ class Test40(CustomTestCase):
 class Test41(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1794,7 +1794,7 @@ class Test41(CustomTestCase):
 class Test42(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1847,7 +1847,7 @@ class Test42(CustomTestCase):
 class Test43(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1899,7 +1899,7 @@ class Test43(CustomTestCase):
 class Test44(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1954,7 +1954,7 @@ class Test44(CustomTestCase):
 class Test45(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2009,7 +2009,7 @@ class Test45(CustomTestCase):
 class Test46(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2063,7 +2063,7 @@ class Test46(CustomTestCase):
 class Test47(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2117,7 +2117,7 @@ class Test47(CustomTestCase):
 class Test48(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2173,7 +2173,7 @@ class Test48(CustomTestCase):
 class Test49(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2229,7 +2229,7 @@ class Test49(CustomTestCase):
 class Test50(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2275,7 +2275,7 @@ class Test50(CustomTestCase):
 class Test51(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2324,7 +2324,7 @@ class Test51(CustomTestCase):
 class Test52(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2373,7 +2373,7 @@ class Test52(CustomTestCase):
 class Test53(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2421,7 +2421,7 @@ class Test53(CustomTestCase):
 class Test54(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2472,7 +2472,7 @@ class Test54(CustomTestCase):
 class Test55(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2523,7 +2523,7 @@ class Test55(CustomTestCase):
 class Test56(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2573,7 +2573,7 @@ class Test56(CustomTestCase):
 class Test57(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2623,7 +2623,7 @@ class Test57(CustomTestCase):
 class Test58(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -2675,7 +2675,7 @@ class Test58(CustomTestCase):
 class Test59(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
