@@ -49,18 +49,23 @@ def maybe_wrap_ipv6_address(address: str) -> str:
 
 
 def clear_image_urls(data):
-    if 'messages' not in data:
+    if "messages" not in data:
         return data
     import copy
+
     data_copy = copy.deepcopy(data)
-    for message in data_copy['messages']:
-        if 'content' in message and isinstance(message['content'], list):
-            for content_item in message['content']:
+    for message in data_copy["messages"]:
+        if "content" in message and isinstance(message["content"], list):
+            for content_item in message["content"]:
                 if isinstance(content_item, dict):
-                    if content_item.get('type') == 'image_url' and 'image_url' in content_item:
-                        if 'url' in content_item['image_url']:
-                            content_item['image_url']['url'] = ''
+                    if (
+                        content_item.get("type") == "image_url"
+                        and "image_url" in content_item
+                    ):
+                        if "url" in content_item["image_url"]:
+                            content_item["image_url"]["url"] = ""
     return data_copy
+
 
 class MiniLoadBalancer:
     def __init__(
@@ -356,8 +361,12 @@ class MiniLoadBalancer:
 
                 tasks = [
                     session.post(
-                        f"{prefill_server}/{endpoint}", 
-                        json=clear_image_urls(modified_request) if self.encode_urls else modified_request
+                        f"{prefill_server}/{endpoint}",
+                        json=(
+                            clear_image_urls(modified_request)
+                            if self.encode_urls
+                            else modified_request
+                        ),
                     )
                 ]
                 if decode_server is not None:
