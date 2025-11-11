@@ -11,14 +11,16 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils.common import sample_video_frames
 
 if TYPE_CHECKING:
     from decord import VideoReader
 
 Image.MAX_IMAGE_PIXELS = None
 DEFAULT_NUM_TILES = 12
-NUM_VIDEO_FRAMES = 32  # TODO: allow num frames to be configurable
 NUM_VIDEO_TILES = 1
+DESIRED_FPS = 2  # TODO: allow desired fps/num frames to be configurable
+MAX_FRAMES = 128
 
 
 class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
@@ -82,7 +84,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
 
     @staticmethod
     def parse_video(video: "VideoReader") -> tuple[np.ndarray, list[float]]:
-        frames = np.linspace(0, len(video) - 1, NUM_VIDEO_FRAMES, dtype=int)
+        frames = sample_video_frames(
+            video, desired_fps=DESIRED_FPS, max_frames=MAX_FRAMES
+        )
         video_array = video.get_batch(frames).asnumpy()
         timestamps = video.get_frame_timestamp(frames)[:, 0]
         return video_array, timestamps
