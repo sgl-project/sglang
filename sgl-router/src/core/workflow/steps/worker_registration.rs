@@ -44,6 +44,7 @@ struct ServerInfo {
     #[serde(alias = "model")]
     model_id: Option<String>,
     model_path: Option<String>,
+    served_model_name: Option<String>,
     dp_size: Option<usize>,
     version: Option<String>,
     max_batch_size: Option<usize>,
@@ -104,11 +105,12 @@ async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, String>
         .ok_or_else(|| format!("No dp_size in response from {}", url))?;
 
     let model_id = info
-        .model_id
+        .served_model_name
+        .filter(|s| !s.is_empty())
         .or_else(|| {
-            info.model_path
-                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
+            info.model_path.and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
         })
+        .or(info.model_id)
         .unwrap_or_else(|| "unknown".to_string());
 
     Ok(DpInfo { dp_size, model_id })
@@ -318,20 +320,23 @@ impl StepExecutor for DiscoverMetadataStep {
         );
 
         let discovered_labels = match connection_mode.as_ref() {
-            ConnectionMode::Http => {
-                match get_server_info(&config.url, config.api_key.as_deref()).await {
-                    Ok(server_info) => {
-                        let mut labels = HashMap::new();
-                        if let Some(model_path) = server_info.model_path {
-                            if !model_path.is_empty() {
-                                labels.insert("model_path".to_string(), model_path);
-                            }
+            ConnectionMode::Http => match get_server_info(&config.url, config.api_key.as_deref()).await {
+                Ok(server_info) => {
+                    let mut labels = HashMap::new();
+                    if let Some(model_path) = server_info.model_path {
+                        if !model_path.is_empty() {
+                            labels.insert("model_path".to_string(), model_path);
                         }
-                        Ok(labels)
                     }
-                    Err(e) => Err(e),
+                    if let Some(served_model_name) = server_info.served_model_name {
+                        if !served_model_name.is_empty() {
+                            labels.insert("served_model_name".to_string(), served_model_name);
+                        }
+                    }
+                    Ok(labels)
                 }
-            }
+                Err(e) => Err(e),
+            },
             ConnectionMode::Grpc { .. } => fetch_grpc_metadata(&config.url).await,
         }
         .unwrap_or_else(|e| {
@@ -464,12 +469,15 @@ impl StepExecutor for CreateWorkerStep {
 
         // Derive model_id if not already set
         if !final_labels.contains_key("model_id") {
-            let derived_model_id = final_labels
-                .get("served_model_name")
-                .or_else(|| final_labels.get("model_path"))
-                .cloned();
+            let derived = if let Some(name) = final_labels.get("served_model_name") {
+                Some(name.clone())
+            } else if let Some(path) = final_labels.get("model_path") {
+                path.split('/').next_back().map(|s| s.to_string())
+            } else {
+                None
+            };
 
-            if let Some(model_id) = derived_model_id {
+            if let Some(model_id) = derived {
                 debug!("Derived model_id from metadata: {}", model_id);
                 final_labels.insert("model_id".to_string(), model_id);
             }
