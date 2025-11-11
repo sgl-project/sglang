@@ -63,6 +63,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.elementwise import fused_dual_input_rmsnorm
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -1617,8 +1618,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.variance_epsilon,
                     )
                 else:
-                    q = self.q_a_layernorm(q)
-                    k_nope = self.kv_a_layernorm(k_nope)
+                    q, k_nope = fused_dual_input_rmsnorm(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        k_nope,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.variance_epsilon,
+                    )
 
             # q_lora needed by indexer
             if self.use_nsa:
