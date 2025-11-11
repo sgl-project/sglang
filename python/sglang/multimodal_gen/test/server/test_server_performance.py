@@ -391,7 +391,7 @@ def test_server_perf_metrics_image(server):
     stage_times = _parse_stage_times(stdout_text)
     assert (
         stage_times
-    ), "No PipelineStage timing entries found�enable stage logging in the server run"
+    ), "No PipelineStage timing entries found; enable stage logging in the server run"
 
     for stage, expected in EXPECTED_STAGE_MS.items():
         actual = stage_times.get(stage)
@@ -413,13 +413,6 @@ def test_server_perf_metrics_image(server):
     per_step_report = ", ".join(
         f"step_{idx}:{ms:.2f}ms" for idx, ms in sorted(avg_per_step.items())
     )
-    print(
-        f"[Perf] E2E: {e2e_ms:.2f} ms; "
-        f"Avg denoise step: {avg_denoise_ms:.2f} ms; "
-        f"Stages: {stage_report}; "
-        f"Per-step denoise avg: {per_step_report}"
-    )
-
     print(
         f"[Perf] E2E: {e2e_ms:.2f} ms; "
         f"Avg denoise step: {avg_denoise_ms:.2f} ms; "
