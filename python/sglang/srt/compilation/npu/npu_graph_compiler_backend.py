@@ -25,12 +25,12 @@ from sglang.srt.compilation.npu.passes.w8a8_int8 import (
 )
 
 
-class NpuBackend:
+class NpuGraphCompilerBackend:
     def __call__(self, graph: torch.fx.GraphModule, example_inputs) -> Callable:
         DisableContext.compiled_function_args[DisableContext.batch_size] = (
             example_inputs
         )
-        NpuBackend.apply_passes(graph)
+        NpuGraphCompilerBackend.apply_passes(graph)
         return graph
 
     def apply_passes(graph_module: torch.fx.GraphModule):
