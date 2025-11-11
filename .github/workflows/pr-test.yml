@@ -79,7 +79,7 @@ jobs:
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
-              workflow_id: context.workflow,
+              workflow_id: 'pr-test.yml',
               event: eventName,
               per_page: 100,
             });
