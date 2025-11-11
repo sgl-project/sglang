@@ -74,6 +74,13 @@ try:
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
+    # Pre-build FlashInfer FP4 GEMM so torch.compile doesn't trace its JIT code paths
+    try:
+        from flashinfer.gemm import get_gemm_sm100_module_cutlass_fp4
+
+        _ = get_gemm_sm100_module_cutlass_fp4().build_and_load()
+    except Exception:
+        pass
 except ImportError:
     if is_cuda():
         from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
@@ -91,12 +98,6 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
-
-
-# Avoid tracing into flashinfer's JIT build path during torch.compile by forcing an eager call.
-@torch._dynamo.disable
-def _fp4_gemm_eager(*args, **kwargs):
-    return fp4_gemm(*args, **kwargs)
 
 
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
@@ -1086,7 +1087,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         backend = (
             FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
         )
-        out = _fp4_gemm_eager(
+        out = fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
