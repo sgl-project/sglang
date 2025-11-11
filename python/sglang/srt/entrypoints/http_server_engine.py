@@ -108,6 +108,13 @@ class HttpServerEngineAdapter(EngineBase):
         token_ids_logprob=None,
         lora_path=None,
         custom_logit_processor=None,
+        return_hidden_states=None,
+        stream=None,
+        bootstrap_host=None,
+        bootstrap_port=None,
+        bootstrap_room=None,
+        data_parallel_rank=None,
+        rid=None,
     ):
         payload = {
             "text": prompt,
@@ -120,6 +127,13 @@ class HttpServerEngineAdapter(EngineBase):
             "token_ids_logprob": token_ids_logprob,
             "lora_path": lora_path,
             "custom_logit_processor": custom_logit_processor,
+            "return_hidden_states": return_hidden_states,
+            "stream": stream,
+            "bootstrap_host": bootstrap_host,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": bootstrap_room,
+            "data_parallel_rank": data_parallel_rank,
+            "rid": rid,
         }
         # Filter out None values
         payload = {k: v for k, v in payload.items() if v is not None}
