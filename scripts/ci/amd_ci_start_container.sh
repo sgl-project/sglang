@@ -8,7 +8,7 @@ SGLANG_VERSION="v0.5.0rc0"   # Default version, will be overridden if version.py
 TMP_VERSION_FILE=$(mktemp)
 if git fetch origin main --quiet; then
   if git show origin/main:python/sglang/version.py >"$TMP_VERSION_FILE" 2>/dev/null; then
-    VERSION_FROM_FILE=$(cat $SGLANG_VERSION_FILE | cut -d'"' -f2)
+    VERSION_FROM_FILE="v$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)"
     if [ -n "$VERSION_FROM_FILE" ]; then
       SGLANG_VERSION="$VERSION_FROM_FILE"
       echo "Using SGLang version from origin/main: $SGLANG_VERSION"
