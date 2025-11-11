@@ -291,12 +291,12 @@ class PipelineConfig:
         )
 
         # Add VAE configuration arguments
-        from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+        from sglang.multimodal_gen.configs.models.vaes.vae_config import VAEConfig
 
         VAEConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}vae-config")
 
         # Add DiT configuration arguments
-        from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
+        from sglang.multimodal_gen.configs.models.dits.dit_config import DiTConfig
 
         DiTConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}dit-config")
 

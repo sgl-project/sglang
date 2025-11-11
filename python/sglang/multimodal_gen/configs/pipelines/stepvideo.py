@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits import StepVideoConfig
 from sglang.multimodal_gen.configs.models.vaes import StepVideoVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.pipeline_config import PipelineConfig
 
 
 @dataclass

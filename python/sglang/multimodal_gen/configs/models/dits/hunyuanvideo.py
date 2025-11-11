@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.dits.dit_base import DiTArchConfig, DiTConfig
 
 
 def is_double_block(n: str, m) -> bool:

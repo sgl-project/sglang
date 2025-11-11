@@ -29,7 +29,10 @@ from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 # TODO: support quantization
 # from vllm.model_executor.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
-from sglang.multimodal_gen.runtime.models.encoders.base import ImageEncoder, TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.encoder_base import (
+    ImageEncoder,
+    TextEncoder,
+)
 from sglang.multimodal_gen.runtime.models.encoders.vision import (
     resolve_visual_encoder_outputs,
 )

@@ -19,7 +19,7 @@ import torch.profiler
 from einops import rearrange
 from tqdm.auto import tqdm
 
-from sglang.multimodal_gen.configs.pipelines.base import STA_Mode
+from sglang.multimodal_gen.configs.pipelines.pipeline_config import STA_Mode
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -45,7 +45,7 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines.stages.base import (
+from sglang.multimodal_gen.runtime.pipelines.stages.pipeline_stage import (
     PipelineStage,
     StageParallelismType,
 )

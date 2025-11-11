@@ -1,9 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from sglang.multimodal_gen.configs.pipelines.base import (
-    PipelineConfig,
-    SlidingTileAttnConfig,
-)
 from sglang.multimodal_gen.configs.pipelines.flux import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipelines.hunyuan import (
     FastHunyuanConfig,
@@ -22,8 +18,6 @@ __all__ = [
     "HunyuanConfig",
     "FastHunyuanConfig",
     "FluxPipelineConfig",
-    "PipelineConfig",
-    "SlidingTileAttnConfig",
     "WanT2V480PConfig",
     "WanI2V480PConfig",
     "WanT2V720PConfig",

@@ -17,7 +17,10 @@ from typing import Any, Optional
 
 from sglang.multimodal_gen.configs.configs import PreprocessConfig
 from sglang.multimodal_gen.configs.pipelines import FluxPipelineConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.configs.pipelines.pipeline_config import (
+    PipelineConfig,
+    STA_Mode,
+)
 from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,

@@ -6,7 +6,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines.stages.pipeline_stage import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
     StageValidators as V,
 )

@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines.executors.pipeline_executor import 
     PipelineExecutor,
     Timer,
 )
-from sglang.multimodal_gen.runtime.pipelines.stages.base import (
+from sglang.multimodal_gen.runtime.pipelines.stages.pipeline_stage import (
     PipelineStage,
     StageParallelismType,
 )

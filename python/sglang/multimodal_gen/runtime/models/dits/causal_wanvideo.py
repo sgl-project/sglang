@@ -38,7 +38,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
-from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.dit_base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanT2VCrossAttention,
     WanTimeTextImageEmbedding,

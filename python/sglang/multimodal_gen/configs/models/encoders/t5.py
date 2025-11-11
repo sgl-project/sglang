@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.models.encoders.base import (
+from sglang.multimodal_gen.configs.models.encoders.encoder_config import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )

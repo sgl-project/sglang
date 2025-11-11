@@ -23,7 +23,7 @@ from sglang.multimodal_gen.configs.pipelines import (
     WanT2V480PConfig,
     WanT2V720PConfig,
 )
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.pipeline_config import PipelineConfig
 from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
