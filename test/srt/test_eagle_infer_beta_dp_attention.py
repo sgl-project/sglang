@@ -86,9 +86,7 @@ class TestEagleDPAttnServerBase(CustomTestCase, MatchedStopMixin):
         )
         metrics = run_eval(args)
         print(f"TestEagleLargeBS -- {metrics=}")
-        self.assertGreater(
-            metrics["accuracy"], 0.91
-        )
+        self.assertGreater(metrics["accuracy"], 0.91)
 
 
 if __name__ == "__main__":
