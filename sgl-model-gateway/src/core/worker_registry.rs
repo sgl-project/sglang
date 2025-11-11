@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     core::{CircuitState, ConnectionMode, RuntimeType, Worker, WorkerType},
+    ha::OptionalHASyncManager,
     observability::metrics::Metrics,
 };
 
@@ -187,6 +188,8 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
+    /// Optional HA sync manager for state synchronization
+    ha_sync: OptionalHASyncManager,
 }
 
 impl WorkerRegistry {
@@ -199,6 +202,7 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            ha_sync: None,
         }
     }
 
@@ -216,6 +220,11 @@ impl WorkerRegistry {
     /// Get the hash ring for a model (O(1) lookup)
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
+    }
+
+    /// Set HA sync manager
+    pub fn set_ha_sync(&mut self, ha_sync: OptionalHASyncManager) {
+        self.ha_sync = ha_sync;
     }
 
     /// Register a new worker
@@ -261,6 +270,17 @@ impl WorkerRegistry {
             .entry(worker.connection_mode().clone())
             .or_default()
             .push(worker_id.clone());
+
+        // Sync to HA if enabled
+        if let Some(ref ha_sync) = self.ha_sync {
+            ha_sync.sync_worker_state(
+                worker_id.as_str().to_string(),
+                worker.model_id().to_string(),
+                worker.url().to_string(),
+                worker.is_healthy(),
+                0.0, // TODO: Get actual load
+            );
+        }
 
         worker_id
     }
@@ -318,6 +338,11 @@ impl WorkerRegistry {
             worker.set_healthy(false);
             Metrics::remove_worker_metrics(worker.url());
 
+            // Sync removal to HA if enabled
+            if let Some(ref ha_sync) = self.ha_sync {
+                ha_sync.remove_worker_state(worker_id.as_str());
+            }
+
             Some(worker)
         } else {
             None
@@ -368,6 +393,25 @@ impl WorkerRegistry {
             .get(worker_type)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// Update worker health status and sync to HA
+    pub fn update_worker_health(&self, worker_id: &WorkerId, is_healthy: bool) {
+        if let Some(worker) = self.workers.get(worker_id) {
+            // Update worker health (if Worker trait has a method for this)
+            // For now, we'll just sync to HA
+            
+            // Sync to HA if enabled
+            if let Some(ref ha_sync) = self.ha_sync {
+                ha_sync.sync_worker_state(
+                    worker_id.as_str().to_string(),
+                    worker.model_id().to_string(),
+                    worker.url().to_string(),
+                    is_healthy,
+                    0.0, // TODO: Get actual load
+                );
+            }
+        }
     }
 
     /// Get all prefill workers (regardless of bootstrap_port)
