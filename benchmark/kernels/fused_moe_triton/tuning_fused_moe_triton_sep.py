@@ -50,6 +50,7 @@ def benchmark_config(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     topk_ids_dir: str,
+    per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
 ) -> float:
@@ -209,7 +210,7 @@ def benchmark_config(
                     use_int8_w8a8=False,
                     use_int8_w8a16=False,
                     use_int4_w4a16=False,
-                    per_channel_quant=False,
+                    per_channel_quant=per_channel_quant,
                     block_shape=block_shape,
                     b_use_tma=moe_use_tma,
                     c_sorted=moe_use_tma,
@@ -687,6 +688,10 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--per-channel-quant",
+        action="store_true",
+    )
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--configs", type=int, nargs="+", required=False)
     parser.add_argument("--topk-ids-dir", type=str, required=True)
