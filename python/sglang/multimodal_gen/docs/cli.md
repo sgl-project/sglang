@@ -1,4 +1,4 @@
-# sgl-diffusion CLI Inference
+# SGLang Diffusion CLI Inference
 
 The sgl-diffusion CLI provides a quick way to access the sgl-diffusion inference pipeline for image and video generation.
 
