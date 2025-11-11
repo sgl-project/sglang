@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 
 
 class WanImageToVideoDmdPipeline(LoRAPipeline, ComposedPipelineBase):
-    pipeline_name = "WanCausalDMDPipeline"
+    pipeline_name = "WanImageToVideoDmdPipeline"
 
     _required_config_modules = [
         "text_encoder",

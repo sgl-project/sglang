@@ -16,7 +16,7 @@ from enum import Enum, auto
 import torch
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
