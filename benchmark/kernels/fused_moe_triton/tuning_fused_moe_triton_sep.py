@@ -601,6 +601,7 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
+        False,
         block_shape,
     )
     print(
