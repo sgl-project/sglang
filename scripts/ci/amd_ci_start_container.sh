@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Get version from SGLang version.py file
 SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
-SGLANG_VERSION="v0.5.0rc0"   # Default version, will be overridden if version.py is found
+SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if version.py is found
 
 TMP_VERSION_FILE=$(mktemp)
 if git fetch origin main --quiet; then
@@ -119,9 +119,9 @@ find_latest_image() {
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
   echo "Using hard-coded fallback…" >&2
   if [[ "${gpu_arch}" == "mi35x" ]]; then
-    echo "rocm/sgl-dev:v0.5.0rc0-rocm700-mi35x-20250812"
+    echo "rocm/sgl-dev:v0.5.5-rocm630-mi30x-20251110"
   else
-    echo "rocm/sgl-dev:v0.5.0rc0-rocm630-mi30x-20250812"
+    echo "rocm/sgl-dev:v0.5.5-rocm630-mi30x-20251110"
   fi
 }
 
