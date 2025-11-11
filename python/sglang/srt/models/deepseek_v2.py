@@ -41,7 +41,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -79,11 +78,10 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.quantization import CompressedTensorsConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    CompressedTensorsWNA16AMXEPMoEMethod,
     CompressedTensorsWNA16MoEMethod,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -785,9 +783,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
             if (
                 not _is_cuda
-                or isinstance(
-                    self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
-                )
+                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
                 or isinstance(
                     self.experts.quant_method, CompressedTensorsWNA16MoEMethod
                 )
@@ -853,9 +849,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             not _is_cuda
             and not _use_aiter
-            or isinstance(
-                self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
-            )
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
             or isinstance(self.experts.quant_method, CompressedTensorsWNA16MoEMethod)
         ):
             # fused in biased_grouped_topk so we can skip here
@@ -1614,7 +1608,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, k_nope = fused_rms_mxfp4_quant(
+                    q, k_nope, *_ = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.variance_epsilon,
@@ -1943,7 +1937,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, k_nope = fused_rms_mxfp4_quant(
+                    q, k_nope, *_ = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.variance_epsilon,
@@ -3036,10 +3030,6 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
-            CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(
-                True, "dynamic", None, [128, 128]
-            )
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -3183,8 +3173,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
+                # For mixed quantization (experts int4, linear fp8), use linear_fp8_config
                 selected_quant_config = getattr(
-                    self.quant_config, "DeepSeekFP8Config", self.quant_config
+                    self.quant_config, "linear_fp8_config", self.quant_config
                 )
                 weight_block_size = getattr(
                     selected_quant_config, "weight_block_size", None

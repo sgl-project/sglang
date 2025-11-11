@@ -380,7 +380,7 @@ def _get_chunked_prefill_embedding(
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        item_hashes = [item.hash for item in embedding_items]
+        item_hashes = [item.hash for item in embedding_items_per_req]
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
         embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
