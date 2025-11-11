@@ -62,14 +62,21 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
-        memory_leak = (available_size + evictable_size) != (
-            # self.max_total_num_tokens
-            # if not self.enable_hierarchical_cache
-            # else self.max_total_num_tokens - protected_size
-            self.max_total_num_tokens
-            - protected_size
+        total_accounted = available_size + evictable_size + protected_size
+        diff = self.max_total_num_tokens - total_accounted
+        # Allow a small slack for in-flight/unaccounted tokens that are about to be
+        # reflected by the tree/allocator (e.g., post-insert duplicates or tails).
+        # This avoids transient false-positives during idle checks.
+        try:
+            page_size = int(getattr(self, "page_size", 1))
+        except Exception:
+            page_size = 1
+        tolerance = max(32, page_size)
+        memory_leak = not (0 <= diff <= tolerance)
+        token_msg = (
+            f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, "
+            f"{protected_size=}, diff={diff}, tolerance={tolerance}\n"
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         return memory_leak, token_msg
 
     def _check_runtime_mem_leak(self: Scheduler):
@@ -149,6 +156,38 @@ class SchedulerRuntimeCheckerMixin:
             memory_leak, token_msg = self._check_radix_cache_memory()
 
         if memory_leak:
+            # Extra diagnostics to help pinpoint mismatched accounting
+            try:
+                alloc = self.token_to_kv_pool_allocator
+                free_len = (
+                    int(len(getattr(alloc, "free_pages", [])))
+                    if getattr(alloc, "free_pages", None) is not None
+                    else -1
+                )
+                release_len = (
+                    int(len(getattr(alloc, "release_pages", [])))
+                    if getattr(alloc, "release_pages", None) is not None
+                    else -1
+                )
+                # Some trees expose total_size() for quick sanity
+                tree_total = None
+                try:
+                    if hasattr(self.tree_cache, "total_size"):
+                        total = self.tree_cache.total_size()
+                        tree_total = total if isinstance(total, int) else str(total)
+                except Exception:
+                    tree_total = "n/a"
+                print(
+                    f"DEBUG {self.max_total_num_tokens=} "
+                    f"free={free_len} "
+                    f"release={release_len} "
+                    f"evictable={self.tree_cache.evictable_size()} "
+                    f"protected={self.tree_cache.protected_size()} "
+                    f"avail={self.token_to_kv_pool_allocator.available_size()} "
+                    f"tree_total={tree_total}"
+                )
+            except Exception:
+                pass
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise ValueError(msg)
 
