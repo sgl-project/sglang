@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
+from sglang.multimodal_gen.configs.models.model_config import ArchConfig, ModelConfig
 from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.utils import StoreBoolean
 

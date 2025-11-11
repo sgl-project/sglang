@@ -4,7 +4,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
+from sglang.multimodal_gen.configs.models.model_config import ArchConfig, ModelConfig
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
