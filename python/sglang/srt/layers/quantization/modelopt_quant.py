@@ -99,46 +99,40 @@ except ImportError:
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 
+
 # Wrap FP4 GEMM as a custom op so Dynamo can use a fake kernel during compile
-try:
-
-    @torch.library.custom_op("sglang::fp4_gemm")
-    def _sglang_fp4_gemm(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        input_sf: torch.Tensor,
-        weight_sf: torch.Tensor,
-        alpha: torch.Tensor,
-        out_dtype: torch.dtype,
-        out_features: int,
-    ) -> torch.Tensor:
-        backend = (
-            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+@torch.library.custom_op("sglang::fp4_gemm")
+def _sglang_fp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+    if enable_flashinfer_fp4_gemm:
+        return fp4_gemm(
+            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
-        if enable_flashinfer_fp4_gemm:
-            return fp4_gemm(
-                input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
-            )
-        else:
-            return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+    else:
+        return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
-    @torch.library.register_fake("sglang::fp4_gemm")
-    def _sglang_fp4_gemm_fake(
-        input,
-        weight,
-        input_sf,
-        weight_sf,
-        alpha,
-        out_dtype,
-        out_features: int,
-    ):
-        M = input.shape[-2]
-        N = int(out_features)
-        return torch.empty((M, N), device="meta", dtype=out_dtype)
 
-except Exception:
-    # If registration fails (older torch), fallback to direct calls
-    pass
+@torch.library.register_fake("sglang::fp4_gemm")
+def _sglang_fp4_gemm_fake(
+    input,
+    weight,
+    input_sf,
+    weight_sf,
+    alpha,
+    out_dtype,
+    out_features: int,
+):
+    M = input.shape[-2]
+    N = int(out_features)
+    return torch.empty((M, N), device="meta", dtype=out_dtype)
 
 
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
