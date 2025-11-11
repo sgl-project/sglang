@@ -81,7 +81,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             - (prefix_lens + self.page_size - 1) // self.page_size
         ).sum()
         num_new_pages_item = num_new_pages.item()
-        if self.need_sort and num_new_pages_item > len(self.free_pages):
+        if num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()
 
         if num_new_pages_item > len(self.free_pages):
