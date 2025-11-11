@@ -226,7 +226,7 @@ def _preload_cuda_library():
                 logger.debug(f"Preloaded CUDA runtime under {cuda_runtime_lib}")
                 return
             except Exception as e:
-                logger.debug(f"Failed to load {cuda_runtime_lib}: {e}")
+                logger.debug(f"Failed to load {candidate}: {e}")
                 continue
 
     logger.debug("[sgl_kernel] Could not preload CUDA runtime library")
