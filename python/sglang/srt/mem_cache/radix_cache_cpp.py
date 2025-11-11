@@ -44,7 +44,7 @@ class RadixCacheCpp(BasePrefixCache):
         disable: bool,
         use_hicache: bool,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: BaseTokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         hicache_ratio: float,
@@ -61,7 +61,7 @@ class RadixCacheCpp(BasePrefixCache):
         assert (
             enable_kv_cache_events is False
         ), "HiRadixCache does not support kv cache events yet"
-        self.kv_cache = token_to_kv_pool.get_kvcache()
+        self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
 
         # record the nodes with ongoing write through
         self.ongoing_write_through: Set[IOHandle] = set()
@@ -71,8 +71,8 @@ class RadixCacheCpp(BasePrefixCache):
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
         )
-        self.device = token_to_kv_pool.device
-        self.token_to_kv_pool_allocator = token_to_kv_pool
+        self.device = token_to_kv_pool_allocator.device
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.req_to_token_pool = req_to_token_pool
         self.page_size = page_size
 
@@ -147,11 +147,9 @@ class RadixCacheCpp(BasePrefixCache):
         evicted_device_indices = self.tree.evict(num_tokens)
         for indice in evicted_device_indices:
             self.token_to_kv_pool_allocator.free(indice)
-        if evicted_device_indices and self.metrics_collector is not None:
-            self.metrics_collector.observe_eviction_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_eviction_num_tokens(num_tokens)
+
+        # FIXME: not sure about the real evict length here
+        self.update_eviction_metrics(num_tokens, start_time)
 
     def evictable_size(self):
         return self.tree.evictable_size()
