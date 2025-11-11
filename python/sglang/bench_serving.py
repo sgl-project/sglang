@@ -93,11 +93,17 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    priority: int = 0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        if (
+            request_func_input.extra_request_body
+            and "priority" in request_func_input.extra_request_body
+        ):
+            output.priority = request_func_input.extra_request_body["priority"]
         return output
 
 
@@ -1906,6 +1912,7 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    input_request_index = 0
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
@@ -1921,6 +1928,10 @@ async def benchmark(
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
             lora_name = None
+
+        if args.priorities:
+            extra_request_body = {"priority": args.priorities[input_request_index]}
+            input_request_index += 1
 
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1979,180 +1990,216 @@ async def benchmark(
     else:
         accept_length = None
 
+    def get_result(
+        input_requests: List[DatasetRow],
+        outputs: List[RequestFuncOutput],
+        benchmark_duration: float,
+        tokenizer: PreTrainedTokenizerBase,
+        backend: str,
+    ):
+        # Compute metrics and print results
+        metrics, output_lens = calculate_metrics(
+            input_requests=input_requests,
+            outputs=outputs,
+            dur_s=benchmark_duration,
+            tokenizer=tokenizer,
+            backend=backend,
+            accept_length=accept_length,
+        )
+
+        print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
+        print("{:<40} {:<10}".format("Backend:", backend))
+        print(
+            "{:<40} {:<10}".format(
+                "Traffic request rate:", "trace" if use_trace_timestamps else request_rate
+            )
+        )
+        print(
+            "{:<40} {:<10}".format(
+                "Max request concurrency:",
+                max_concurrency if max_concurrency else "not set",
+            )
+        )
+        print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+        print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+        print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+        print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
+        print(
+            "{:<40} {:<10}".format("Total input vision tokens:", metrics.total_input_vision)
+        )
+        print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+        print(
+            "{:<40} {:<10}".format(
+                "Total generated tokens (retokenized):", metrics.total_output_retokenized
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request throughput (req/s):", metrics.request_throughput
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Input token throughput (tok/s):", metrics.input_throughput
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Output token throughput (tok/s):", metrics.output_throughput
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Total token throughput (tok/s):", metrics.total_throughput
+            )
+        )
+        print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
+        if accept_length:
+            print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+        print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
+        print(
+            "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
+            )
+        )
+        print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
+        print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+        print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
+        print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+        print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
+        print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
+        print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+        print("=" * 50)
+
+        resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+        server_info = resp.json() if resp.status_code == 200 else None
+
+        if (
+            metrics.median_ttft_ms is not None
+            and metrics.mean_itl_ms is not None
+            and metrics.output_throughput is not None
+        ):
+            result = {
+                # Arguments
+                "tag": getattr(args, "tag", None),
+                "backend": args.backend,
+                "dataset_name": args.dataset_name,
+                "request_rate": "trace" if use_trace_timestamps else request_rate,
+                "max_concurrency": max_concurrency,
+                "sharegpt_output_len": args.sharegpt_output_len,
+                "random_input_len": args.random_input_len,
+                "random_output_len": args.random_output_len,
+                "random_range_ratio": args.random_range_ratio,
+                # Information
+                "server_info": server_info,
+                # Results
+                "duration": benchmark_duration,
+                "completed": metrics.completed,
+                "total_input_tokens": metrics.total_input,
+                "total_input_text_tokens": metrics.total_input_text,
+                "total_input_vision_tokens": metrics.total_input_vision,
+                "total_output_tokens": metrics.total_output,
+                "total_output_tokens_retokenized": metrics.total_output_retokenized,
+                "request_throughput": metrics.request_throughput,
+                "input_throughput": metrics.input_throughput,
+                "output_throughput": metrics.output_throughput,
+                "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
+                "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
+                "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
+                "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
+                "mean_ttft_ms": metrics.mean_ttft_ms,
+                "median_ttft_ms": metrics.median_ttft_ms,
+                "std_ttft_ms": metrics.std_ttft_ms,
+                "p99_ttft_ms": metrics.p99_ttft_ms,
+                "mean_tpot_ms": metrics.mean_tpot_ms,
+                "median_tpot_ms": metrics.median_tpot_ms,
+                "std_tpot_ms": metrics.std_tpot_ms,
+                "p99_tpot_ms": metrics.p99_tpot_ms,
+                "mean_itl_ms": metrics.mean_itl_ms,
+                "median_itl_ms": metrics.median_itl_ms,
+                "std_itl_ms": metrics.std_itl_ms,
+                "p95_itl_ms": metrics.p95_itl_ms,
+                "p99_itl_ms": metrics.p99_itl_ms,
+                "concurrency": metrics.concurrency,
+                "accept_length": accept_length,
+            }
+        else:
+            print(f"Error running benchmark for request rate: {request_rate}")
+            print("-" * 30)
+
+        # Determine output file name
+        if args.output_file:
+            output_file_name = args.output_file
+        else:
+            now = datetime.now().strftime("%m%d")
+            if args.dataset_name == "image":
+                output_file_name = (
+                    f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
+                    f"{args.random_output_len}_{args.image_count}imgs_"
+                    f"{args.image_resolution}.jsonl"
+                )
+            elif args.dataset_name.startswith("random"):
+                output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
+            else:
+                output_file_name = (
+                    f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
+                )
+
+        result_details = {
+            "input_lens": [output.prompt_len for output in outputs],
+            "output_lens": output_lens,
+            "ttfts": [output.ttft for output in outputs],
+            "itls": [output.itl for output in outputs],
+            "generated_texts": [output.generated_text for output in outputs],
+            "errors": [output.error for output in outputs],
+        }
+
+        # Append results to a JSONL file
+        with open(output_file_name, "a") as file:
+            if args.output_details:
+                result_for_dump = result | result_details
+            else:
+                result_for_dump = result
+            file.write(json.dumps(result_for_dump) + "\n")
+
+        return result | result_details
+
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
-    metrics, output_lens = calculate_metrics(
+    result = get_result(
         input_requests=input_requests,
         outputs=outputs,
-        dur_s=benchmark_duration,
+        benchmark_duration=benchmark_duration,
         tokenizer=tokenizer,
         backend=backend,
-        accept_length=accept_length,
     )
-
-    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
-    print("{:<40} {:<10}".format("Backend:", backend))
-    print(
-        "{:<40} {:<10}".format(
-            "Traffic request rate:", "trace" if use_trace_timestamps else request_rate
-        )
-    )
-    print(
-        "{:<40} {:<10}".format(
-            "Max request concurrency:",
-            max_concurrency if max_concurrency else "not set",
-        )
-    )
-    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
-    print(
-        "{:<40} {:<10}".format("Total input vision tokens:", metrics.total_input_vision)
-    )
-    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
-    print(
-        "{:<40} {:<10}".format(
-            "Total generated tokens (retokenized):", metrics.total_output_retokenized
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Request throughput (req/s):", metrics.request_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Input token throughput (tok/s):", metrics.input_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", metrics.output_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", metrics.total_throughput
-        )
-    )
-    print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
-    if accept_length:
-        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
-    print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
-    print(
-        "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
-        )
-    )
-    print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
-    print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
-    print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
-    print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
-    print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
-    print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
-    print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
-    print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
-    print("=" * 50)
-
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
-
-    if (
-        metrics.median_ttft_ms is not None
-        and metrics.mean_itl_ms is not None
-        and metrics.output_throughput is not None
-    ):
-        result = {
-            # Arguments
-            "tag": getattr(args, "tag", None),
-            "backend": args.backend,
-            "dataset_name": args.dataset_name,
-            "request_rate": "trace" if use_trace_timestamps else request_rate,
-            "max_concurrency": max_concurrency,
-            "sharegpt_output_len": args.sharegpt_output_len,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
-            # Information
-            "server_info": server_info,
-            # Results
-            "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "total_input_tokens": metrics.total_input,
-            "total_input_text_tokens": metrics.total_input_text,
-            "total_input_vision_tokens": metrics.total_input_vision,
-            "total_output_tokens": metrics.total_output,
-            "total_output_tokens_retokenized": metrics.total_output_retokenized,
-            "request_throughput": metrics.request_throughput,
-            "input_throughput": metrics.input_throughput,
-            "output_throughput": metrics.output_throughput,
-            "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
-            "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
-            "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
-            "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
-            "mean_ttft_ms": metrics.mean_ttft_ms,
-            "median_ttft_ms": metrics.median_ttft_ms,
-            "std_ttft_ms": metrics.std_ttft_ms,
-            "p99_ttft_ms": metrics.p99_ttft_ms,
-            "mean_tpot_ms": metrics.mean_tpot_ms,
-            "median_tpot_ms": metrics.median_tpot_ms,
-            "std_tpot_ms": metrics.std_tpot_ms,
-            "p99_tpot_ms": metrics.p99_tpot_ms,
-            "mean_itl_ms": metrics.mean_itl_ms,
-            "median_itl_ms": metrics.median_itl_ms,
-            "std_itl_ms": metrics.std_itl_ms,
-            "p95_itl_ms": metrics.p95_itl_ms,
-            "p99_itl_ms": metrics.p99_itl_ms,
-            "concurrency": metrics.concurrency,
-            "accept_length": accept_length,
-        }
-    else:
-        print(f"Error running benchmark for request rate: {request_rate}")
-        print("-" * 30)
-
-    # Determine output file name
-    if args.output_file:
-        output_file_name = args.output_file
-    else:
-        now = datetime.now().strftime("%m%d")
-        if args.dataset_name == "image":
-            output_file_name = (
-                f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
-                f"{args.random_output_len}_{args.image_count}imgs_"
-                f"{args.image_resolution}.jsonl"
+    # When input priority is given, we return metrics keyed by "all" and individual priority.
+    if args.priorities:
+        per_priority_result = dict()
+        per_priority_result["all"] = result
+        for p in sorted(set(args.priorities)):
+            target_priority_inputs = []
+            target_priority_outputs = []
+            for i in range(len(outputs)):
+                if outputs[i].priority == p:
+                    target_priority_inputs.append(input_requests[i])
+                    target_priority_outputs.append(outputs[i])
+            per_priority_result[p] = get_result(
+                input_requests=target_priority_inputs,
+                outputs=target_priority_outputs,
+                benchmark_duration=10
+                ** 12,  # Put a high number. Any metric driven from dur_s should be ignored.
+                tokenizer=tokenizer,
+                backend=backend,
             )
-        elif args.dataset_name.startswith("random"):
-            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
-        else:
-            output_file_name = (
-                f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
-            )
-
-    result_details = {
-        "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": output_lens,
-        "ttfts": [output.ttft for output in outputs],
-        "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
-    }
-
-    # Append results to a JSONL file
-    with open(output_file_name, "a") as file:
-        if args.output_details:
-            result_for_dump = result | result_details
-        else:
-            result_for_dump = result
-        file.write(json.dumps(result_for_dump) + "\n")
-
-    return result | result_details
-
+        return per_priority_result
+    return result
 
 def check_chat_template(model_path):
     try:
