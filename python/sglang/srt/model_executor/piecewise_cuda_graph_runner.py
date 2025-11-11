@@ -176,6 +176,9 @@ class PiecewiseCudaGraphRunner:
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
             self.positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_tokens), dtype=torch.int64
+            )
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         self.attention_layers = self.model_runner.attention_layers
@@ -246,7 +249,7 @@ class PiecewiseCudaGraphRunner:
                 global_num_tokens_for_logprob_gpu=None,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
-                mrope_positions=None,
+                mrope_positions=self.mrope_positions[:, :num_tokens],
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -330,6 +333,7 @@ class PiecewiseCudaGraphRunner:
         out_cache_loc = self.out_cache_loc[:num_tokens]
         out_cache_loc_swa = self.out_cache_loc_swa[:num_tokens]
         positions = self.positions[:num_tokens]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
 
         # pipeline parallelism
         if self.pp_size > 1:
@@ -376,7 +380,7 @@ class PiecewiseCudaGraphRunner:
                 global_num_tokens_for_logprob_gpu=None,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
-                mrope_positions=None,
+                mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -442,9 +446,17 @@ class PiecewiseCudaGraphRunner:
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         if forward_batch.out_cache_loc_swa is not None:
             self.out_cache_loc_swa[:num_tokens].copy_(forward_batch.out_cache_loc_swa)
+        if forward_batch.mrope_positions is not None:
+            self.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
+
         input_ids = self.input_ids[:static_num_tokens]
         positions = self.positions[:static_num_tokens]
         out_cache_loc = self.out_cache_loc[:static_num_tokens]
+        mrope_positions = (
+            self.mrope_positions[:, :static_num_tokens]
+            if forward_batch.mrope_positions is not None
+            else None
+        )
 
         out_cache_loc_swa = (
             self.out_cache_loc_swa[:static_num_tokens]
@@ -453,7 +465,6 @@ class PiecewiseCudaGraphRunner:
         )
 
         next_token_logits_buffer = None
-        mrope_positions = None
 
         static_forward_batch = ForwardBatch(
             forward_mode=forward_batch.forward_mode,
