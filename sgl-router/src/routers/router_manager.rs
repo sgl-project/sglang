@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
+use rmcp::model;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -352,10 +353,10 @@ impl RouterTrait for RouterManager {
         body: &GenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, body.model.as_ref().map(|s| s.as_str()));
+        let router = self.select_router_for_request(headers, _model_id);
 
         if let Some(router) = router {
-            router.route_generate(headers, body, body.model.as_ref().map(|s| s.as_str())).await
+            router.route_generate(headers, body, _model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -371,10 +372,10 @@ impl RouterTrait for RouterManager {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        let router = self.select_router_for_request(headers, _model_id);
 
         if let Some(router) = router {
-            router.route_chat(headers, body, Some(&body.model)).await
+            router.route_chat(headers, body, _model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -390,11 +391,11 @@ impl RouterTrait for RouterManager {
         body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        let router = self.select_router_for_request(headers, _model_id);
 
         if let Some(router) = router {
             router
-                .route_completion(headers, body, Some(&body.model))
+                .route_completion(headers, body, _model_id)
                 .await
         } else {
             (
@@ -489,11 +490,11 @@ impl RouterTrait for RouterManager {
         body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        let router = self.select_router_for_request(headers, _model_id);
 
         if let Some(router) = router {
             router
-                .route_embeddings(headers, body, Some(&body.model))
+                .route_embeddings(headers, body, _model_id)
                 .await
         } else {
             (
@@ -510,7 +511,7 @@ impl RouterTrait for RouterManager {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, None);
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
             router.route_rerank(headers, body, model_id).await
@@ -529,7 +530,7 @@ impl RouterTrait for RouterManager {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
             router.route_classify(headers, body, model_id).await
