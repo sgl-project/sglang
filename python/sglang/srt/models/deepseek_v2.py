@@ -3246,6 +3246,17 @@ class DeepseekV2ForCausalLM(nn.Module):
             ]:
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
+    @classmethod
+    def generate_weight_name_filter(cls, missing_logical_experts: List[Tuple[int, List[int]]]):
+        def missing_experts_name_filter(name: str) -> bool:
+            for layer, experts in missing_logical_experts:
+                for expert in experts:
+                    if f"layers.{layer}.mlp.experts.{expert}." in name:
+                        return True
+            return False
+
+        return missing_experts_name_filter
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
         if is_nextn:

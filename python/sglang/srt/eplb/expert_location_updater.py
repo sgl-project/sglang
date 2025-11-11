@@ -77,17 +77,17 @@ class ExpertLocationUpdater:
             )
 
             # Load the missing expert weights from disk
-            def missing_experts_name_filter(name: str) -> bool:
-                for layer, experts in all_missing_logical_experts:
-                    for expert in experts:
-                        if f"layers.{layer}.mlp.experts.{expert}." in name:
-                            return True
-                return False
+            if callable(getattr(model_runner.model, "generate_weight_name_filter", None)):
+                weight_name_filter = model_runner.model.generate_weight_name_filter(
+                    all_missing_logical_experts
+                )
+            else:
+                weight_name_filter = None
 
             model_runner.update_weights_from_disk(
                 model_runner.server_args.model_path,
                 model_runner.server_args.load_format,
-                missing_experts_name_filter,
+                weight_name_filter=weight_name_filter,
             )
 
 
