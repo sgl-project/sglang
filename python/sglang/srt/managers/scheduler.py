@@ -717,6 +717,7 @@ class Scheduler(
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
+                logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(
                     disable=False,
                     use_hicache=self.enable_hierarchical_cache,
