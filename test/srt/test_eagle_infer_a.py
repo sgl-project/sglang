@@ -4,11 +4,13 @@ import requests
 import torch
 
 import sglang as sgl
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
+    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -34,6 +36,11 @@ class TestEAGLEEngine(CustomTestCase):
         "cuda_graph_max_bs": 5,
     }
     NUM_CONFIGS = 2
+
+    THRESHOLDS = {
+        "batch_avg_accept_len": 1.9,
+        "accept_len": 3.6,
+    }
 
     def setUp(self):
         self.prompt = "Today is a sunny day and I like"
@@ -63,6 +70,7 @@ class TestEAGLEEngine(CustomTestCase):
                     self._test_eos_token(engine)
                     self._test_acc_length(engine)
                 finally:
+                    engine.flush_cache()  # check engine alive
                     engine.shutdown()
                 print("=" * 100)
 
@@ -92,7 +100,9 @@ class TestEAGLEEngine(CustomTestCase):
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 1.9)
+        self.assertGreater(
+            avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
+        )
 
     def _test_eos_token(self, engine):
         prompt = "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\nToday is a sunny day and I like [/INST]"
@@ -131,10 +141,7 @@ class TestEAGLEEngine(CustomTestCase):
         )
         print(f"{acc_length=:.4f}, {speed=}")
 
-        if engine.server_args.model_path == DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST:
-            self.assertGreater(acc_length, 3.6)
-        else:
-            self.assertGreater(acc_length, 2.5)
+        self.assertGreater(acc_length, self.THRESHOLDS["accept_len"])
 
 
 class TestEAGLEEngineTokenMap(TestEAGLEEngine):
@@ -151,12 +158,16 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
+    THRESHOLDS = {
+        "batch_avg_accept_len": 1.9,
+        "accept_len": 2.5,
+    }
 
 
 class TestEAGLE3Engine(TestEAGLEEngine):
     BASE_CONFIG = {
-        "model_path": "meta-llama/Llama-3.1-8B-Instruct",
-        "speculative_draft_model_path": "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
+        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
+        "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
         "speculative_algorithm": "EAGLE3",
         "speculative_num_steps": 5,
         "speculative_eagle_topk": 16,
@@ -166,6 +177,72 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
+    THRESHOLDS = {
+        "batch_avg_accept_len": 1.75,
+        "accept_len": 3.1,
+    }
+
+
+class TestEAGLERadixCache(CustomTestCase):
+    BASE_CONFIG = {
+        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
+        "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+        "speculative_algorithm": "EAGLE3",
+        "speculative_num_steps": 2,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 3,
+        "mem_fraction_static": 0.7,
+        "cuda_graph_max_bs": 5,
+        "dtype": "float16",
+    }
+
+    def test_correctness(self):
+        configs = [
+            # Basic config
+            self.BASE_CONFIG,
+            # Chunked prefill
+            {**self.BASE_CONFIG, "chunked_prefill_size": 64},
+            # Chunked prefill & Page Size > 1
+            {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
+        ]
+
+        for i, config in enumerate(configs):
+            with self.subTest(i=i):
+                print(f"{config=}")
+                engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
+                try:
+                    self._test_acc_length(engine)
+                finally:
+                    engine.shutdown()
+                print("=" * 100)
+
+    def _test_acc_length(self, engine):
+        warmup_prompt = [
+            "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:",
+        ]
+        sampling_params = {"temperature": 0, "max_new_tokens": 512}
+        output = engine.generate(warmup_prompt, sampling_params)
+        test_prompt = [
+            "<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGive me a fully functional FastAPI server. Show the python code.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        ]
+        output = engine.generate(test_prompt, sampling_params)
+        output = output[0]
+
+        if "spec_verify_ct" in output["meta_info"]:
+            acc_length = (
+                output["meta_info"]["completion_tokens"]
+                / output["meta_info"]["spec_verify_ct"]
+            )
+        else:
+            acc_length = 1.0
+
+        speed = (
+            output["meta_info"]["completion_tokens"]
+            / output["meta_info"]["e2e_latency"]
+        )
+        print(f"{acc_length=:.4f}, {speed=}")
+
+        self.assertGreater(acc_length, 2.5)
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")

@@ -1,12 +1,11 @@
 //! Integration tests for PolicyRegistry with RouterManager
 
-use sglang_router_rs::config::PolicyConfig;
-use sglang_router_rs::core::WorkerRegistry;
-use sglang_router_rs::policies::PolicyRegistry;
-use sglang_router_rs::protocols::worker_spec::WorkerConfigRequest;
-use sglang_router_rs::routers::router_manager::RouterManager;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+use sglang_router_rs::{
+    config::PolicyConfig, core::WorkerRegistry, policies::PolicyRegistry,
+    protocols::worker_spec::WorkerConfigRequest, routers::router_manager::RouterManager,
+};
 
 #[tokio::test]
 async fn test_policy_registry_with_router_manager() {
@@ -19,8 +18,6 @@ async fn test_policy_registry_with_router_manager() {
 
     // Create RouterManager with shared registries
     let _router_manager = RouterManager::new(worker_registry.clone());
-
-    // Test adding workers with different models and policies
 
     // Add first worker for llama-3 with cache_aware policy hint
     let mut labels1 = HashMap::new();
@@ -39,12 +36,17 @@ async fn test_policy_registry_with_router_manager() {
         reasoning_parser: None,
         tool_parser: None,
         chat_template: None,
+        health_check_timeout_secs: 30,
+        health_check_interval_secs: 60,
+        health_success_threshold: 2,
+        health_failure_threshold: 3,
+        max_connection_attempts: 20,
+        dp_aware: false,
     };
 
     // This would normally connect to a real worker, but for testing we'll just verify the structure
     // In a real test, we'd need to mock the worker or use a test server
 
-    // Verify PolicyRegistry has the correct policy for llama-3
     let _llama_policy = policy_registry.get_policy("llama-3");
     // After first worker is added, llama-3 should have a policy
 
@@ -65,6 +67,12 @@ async fn test_policy_registry_with_router_manager() {
         reasoning_parser: None,
         tool_parser: None,
         chat_template: None,
+        health_check_timeout_secs: 30,
+        health_check_interval_secs: 60,
+        health_success_threshold: 2,
+        health_failure_threshold: 3,
+        max_connection_attempts: 20,
+        dp_aware: false,
     };
 
     // The second worker should use the same policy as the first (cache_aware)
@@ -86,12 +94,16 @@ async fn test_policy_registry_with_router_manager() {
         reasoning_parser: None,
         tool_parser: None,
         chat_template: None,
+        health_check_timeout_secs: 30,
+        health_check_interval_secs: 60,
+        health_success_threshold: 2,
+        health_failure_threshold: 3,
+        max_connection_attempts: 20,
+        dp_aware: false,
     };
 
-    // Verify gpt-4 has random policy
     let _gpt_policy = policy_registry.get_policy("gpt-4");
 
-    // Test removing workers
     // When we remove both llama-3 workers, the policy should be cleaned up
 
     println!("PolicyRegistry integration test structure created");
@@ -100,8 +112,7 @@ async fn test_policy_registry_with_router_manager() {
 
 #[test]
 fn test_policy_registry_cleanup() {
-    use sglang_router_rs::config::PolicyConfig;
-    use sglang_router_rs::policies::PolicyRegistry;
+    use sglang_router_rs::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
@@ -113,7 +124,6 @@ fn test_policy_registry_cleanup() {
     let policy2 = registry.on_worker_added("model-1", Some("random"));
     assert_eq!(policy2.name(), "cache_aware"); // Should still be cache_aware
 
-    // Verify policy exists
     assert!(registry.get_policy("model-1").is_some());
 
     // Remove first worker - policy should remain
@@ -129,8 +139,7 @@ fn test_policy_registry_cleanup() {
 
 #[test]
 fn test_policy_registry_multiple_models() {
-    use sglang_router_rs::config::PolicyConfig;
-    use sglang_router_rs::policies::PolicyRegistry;
+    use sglang_router_rs::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
@@ -143,7 +152,6 @@ fn test_policy_registry_multiple_models() {
     assert_eq!(gpt_policy.name(), "random");
     assert_eq!(mistral_policy.name(), "round_robin"); // Default
 
-    // Verify all policies are stored
     assert!(registry.get_policy("llama-3").is_some());
     assert!(registry.get_policy("gpt-4").is_some());
     assert!(registry.get_policy("mistral").is_some());

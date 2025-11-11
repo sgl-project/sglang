@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -10,6 +9,7 @@ import torch
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -44,12 +44,9 @@ class SamplingBatchInfo:
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
-    # An event used for overlap schedule
-    sampling_info_done: Optional[threading.Event] = None
-
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
-    linear_penalty: torch.Tensor = None
+    acc_linear_penalties: torch.Tensor = None  # Used in the overlap mode
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -70,15 +67,9 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
 
     @classmethod
-    def _get_global_server_args_dict(cls):
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-        return global_server_args_dict
-
-    @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args_dict = cls._get_global_server_args_dict()
-        enable_deterministic = global_server_args_dict["enable_deterministic_inference"]
+        global_server_args = get_global_server_args()
+        enable_deterministic = global_server_args.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
@@ -115,10 +106,9 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = global_server_args_dict[
-            "enable_custom_logit_processor"
-        ] and any(  # check the flag first.
-            r.custom_logit_processor for r in reqs
+        has_custom_logit_processor = (
+            global_server_args.enable_custom_logit_processor
+            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
 
         if has_custom_logit_processor:
@@ -217,19 +207,19 @@ class SamplingBatchInfo:
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
-            self.linear_penalty = torch.zeros(
+            self.acc_linear_penalties = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
                 device=self.temperatures.device,
             )
-            self.penalizer_orchestrator.apply(self.linear_penalty)
+            self.penalizer_orchestrator.apply(self.acc_linear_penalties)
         else:
-            self.linear_penalty = None
+            self.acc_linear_penalties = None
 
     def apply_logits_bias(self, logits: torch.Tensor):
-        if self.linear_penalty is not None:
+        if self.acc_linear_penalties is not None:
             # Used in the overlap mode
-            logits.add_(self.linear_penalty)
+            logits.add_(self.acc_linear_penalties)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
@@ -369,6 +359,11 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+
+    def copy_for_forward(self):
+        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
+        self.update_penalties()
+        return dataclasses.replace(self, penalizer_orchestrator=None)
 
 
 def merge_bias_tensor(

@@ -1,6 +1,4 @@
-use axum::body::Body;
-use axum::extract::Request;
-use axum::http::HeaderMap;
+use axum::{body::Body, extract::Request, http::HeaderMap};
 
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers
@@ -83,6 +81,7 @@ pub fn apply_request_headers(
             key_str == "keep-alive" ||
             key_str == "te" ||
             key_str == "trailers" ||
+            key_str == "accept-encoding" ||
             key_str == "upgrade" ||
             (skip_content_headers && (key_str == "content-type" || key_str == "content-length"));
 

@@ -32,14 +32,6 @@ pub fn api_path(url: &str, api_path: &str) -> String {
     }
 }
 
-pub fn get_hostname(url: &str) -> String {
-    // Simple hostname extraction without external dependencies
-    let url = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    url.split(':').next().unwrap_or("localhost").to_string()
-}
-
 use serde::Serialize;
 
 // Optimized bootstrap wrapper for single requests
@@ -77,5 +69,10 @@ pub enum PDSelectionPolicy {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
+    },
+    Bucket {
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        bucket_adjust_interval_secs: usize,
     },
 }

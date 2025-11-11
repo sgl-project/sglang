@@ -19,6 +19,8 @@ pub enum WorkerError {
     WorkerAtCapacity { url: String },
     /// Invalid URL format
     InvalidUrl { url: String },
+    /// Connection failed
+    ConnectionFailed { url: String, reason: String },
 }
 
 impl fmt::Display for WorkerError {
@@ -42,6 +44,9 @@ impl fmt::Display for WorkerError {
             WorkerError::InvalidUrl { url } => {
                 write!(f, "Invalid URL format: {}", url)
             }
+            WorkerError::ConnectionFailed { url, reason } => {
+                write!(f, "Connection failed for worker {}: {}", url, reason)
+            }
         }
     }
 }
@@ -63,8 +68,9 @@ impl From<reqwest::Error> for WorkerError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::error::Error;
+
+    use super::*;
 
     #[test]
     fn test_health_check_failed_display() {

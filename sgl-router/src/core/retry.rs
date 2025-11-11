@@ -1,9 +1,10 @@
-use crate::config::types::RetryConfig;
-use axum::http::StatusCode;
-use axum::response::Response;
-use rand::Rng;
 use std::time::Duration;
+
+use axum::{http::StatusCode, response::Response};
+use rand::Rng;
 use tracing::debug;
+
+use crate::config::types::RetryConfig;
 
 /// Check if an HTTP status code indicates a retryable error
 pub fn is_retryable_status(status: StatusCode) -> bool {
@@ -162,11 +163,14 @@ impl RetryExecutor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    };
+
+    use axum::{http::StatusCode, response::IntoResponse};
+
     use super::*;
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
 
     fn base_retry_config() -> RetryConfig {
         RetryConfig {

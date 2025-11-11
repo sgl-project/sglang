@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import itertools
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -8,10 +8,12 @@ from torch import nn
 
 from sglang.srt.layers.pooler import CrossEncodingPooler, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sparse_pooler import SparsePooler
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bert import BertEncoder
+from sglang.srt.utils.hf_transformers_utils import download_from_hf
 
 RobertaConfig = None
 
@@ -206,12 +208,29 @@ class XLMRobertaModel(nn.Module):
         config: RobertaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        sparse_head: Optional[str] = None,
+        model_path: Optional[str] = None,
     ):
         super().__init__()
         self.roberta = XLMRobertaBaseModel(
             config=config, quant_config=quant_config, prefix=prefix
         )
-        self.pooler = Pooler(pooling_type=PoolingType.CLS, normalize=True)
+        if sparse_head is not None:
+            self._is_sparse = True
+            self._model_path = model_path
+            self._sparse_head = sparse_head
+            self.pooler = SparsePooler(config=config)
+            # Zero out special tokens
+            self._special_tokens = [
+                config.bos_token_id,
+                config.eos_token_id,
+                config.pad_token_id,
+                # self.config.unk_token_id # not available in the XLMRobertaConfig
+            ]
+            self._special_tokens = [t for t in self._special_tokens if t is not None]
+        else:
+            self._is_sparse = False
+            self.pooler = Pooler(pooling_type=PoolingType.CLS, normalize=True)
 
     def forward(
         self,
@@ -224,10 +243,43 @@ class XLMRobertaModel(nn.Module):
         hidden_states = self.roberta(
             input_ids, positions, forward_batch, input_embeds, get_embedding
         )
-        return self.pooler(hidden_states, forward_batch)
+        embeddings = self.pooler(hidden_states, forward_batch)
+
+        if self._is_sparse:
+            for token_id in self._special_tokens:
+                embeddings.embeddings[:, token_id] = 0.0
+            embeddings.embeddings = embeddings.embeddings.to_sparse()
+
+        return embeddings
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.roberta.load_weights(weights)
+
+        if self._is_sparse:
+            sparse_dict = XLMRobertaModel._load_sparse_linear(
+                self._model_path, self._sparse_head
+            )
+            self.pooler.load_weights(sparse_dict)
+
+    @staticmethod
+    def _load_sparse_linear(model_path_or_dir: str, sparse_head: str) -> dict:
+        """
+        Load sparse_head from local dir or HF Hub.
+        Returns a state_dict suitable for nn.Linear.load_state_dict().
+        """
+        if os.path.isdir(model_path_or_dir):
+            path = os.path.join(model_path_or_dir, sparse_head)
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"'{sparse_head}' not found in {model_path_or_dir}"
+                )
+        else:
+            # remote → use SGLang HF utility
+            local_dir = download_from_hf(model_path_or_dir, allow_patterns=sparse_head)
+            path = os.path.join(local_dir, sparse_head)
+
+        state_dict = torch.load(path)
+        return state_dict
 
 
 class XLMRobertaForSequenceClassification(nn.Module):

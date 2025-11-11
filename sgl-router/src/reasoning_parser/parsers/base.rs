@@ -2,7 +2,6 @@
 // for detecting and extracting reasoning blocks from text.
 
 use crate::reasoning_parser::traits::{ParseError, ParserConfig, ParserResult, ReasoningParser};
-use tracing as log;
 
 /// Base reasoning parser implementation.
 ///
@@ -46,18 +45,14 @@ impl BaseReasoningParser {
 
 impl ReasoningParser for BaseReasoningParser {
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
-        log::debug!("detect_and_parse_reasoning called with text: {:?}", text);
-
         // Check input size against buffer limit
         if text.len() > self.config.max_buffer_size {
             return Err(ParseError::BufferOverflow(text.len()));
         }
 
         let in_reasoning = self.in_reasoning || text.contains(&self.config.think_start_token);
-        log::debug!("in_reasoning: {}", in_reasoning);
 
         if !in_reasoning {
-            log::debug!("No reasoning detected, returning normal text.");
             return Ok(ParserResult::normal(text.to_string()));
         }
 
@@ -66,15 +61,8 @@ impl ReasoningParser for BaseReasoningParser {
             .replace(&self.config.think_start_token, "")
             .trim()
             .to_string();
-        log::debug!(
-            "Processed text after removing think_start_token: {:?}",
-            processed_text
-        );
 
         if !processed_text.contains(&self.config.think_end_token) {
-            log::debug!(
-                "Reasoning truncated, think_end_token not found. Returning reasoning text."
-            );
             // Assume reasoning was truncated before end token
             return Ok(ParserResult::reasoning(processed_text));
         }
@@ -88,9 +76,6 @@ impl ReasoningParser for BaseReasoningParser {
             .get(1)
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-
-        log::debug!("Extracted reasoning_text: {:?}", reasoning_text);
-        log::debug!("Extracted normal_text: {:?}", normal_text);
 
         Ok(ParserResult::new(normal_text, reasoning_text))
     }
@@ -107,19 +92,6 @@ impl ReasoningParser for BaseReasoningParser {
         // Incrementally parse the streaming text
         self.buffer.push_str(text);
         let mut current_text = self.buffer.clone();
-
-        log::debug!(
-            "parse_reasoning_streaming_incremental called with text: {:?}",
-            text
-        );
-        log::debug!("current buffer: {:?}", self.buffer);
-        log::debug!("current_text: {:?}", current_text);
-        log::debug!(
-            "in_reasoning: {}, stripped_think_start: {}, stream_reasoning: {}",
-            self.in_reasoning,
-            self.stripped_think_start,
-            self.config.stream_reasoning
-        );
 
         // If the current text is a prefix of a token, keep buffering
         if self.is_partial_token(&current_text) {
@@ -186,6 +158,10 @@ impl ReasoningParser for BaseReasoningParser {
 
     fn model_type(&self) -> &str {
         &self.model_type
+    }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.in_reasoning
     }
 }
 

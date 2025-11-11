@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import sglang as sgl
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -23,44 +24,43 @@ class _BaseTestDynamicEPLB(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "2",
-                "--dp",
-                "2",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
-                "--enable-eplb",
-                "--ep-num-redundant-experts",
-                "4",
-                "--eplb-rebalance-num-iterations",
-                "50",
-                "--expert-distribution-recorder-buffer-size",
-                "50",
-                # TODO pr-chain: enable later
-                # "--enable-expert-distribution-metrics",
-                # TODO auto determine these flags
-                "--expert-distribution-recorder-mode",
-                "stat",
-                "--ep-dispatch-algorithm",
-                "static",
-                *cls.extra_args,
-            ],
-            env={
-                "SGL_ENABLE_JIT_DEEPGEMM": "0",
-                "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
-                **os.environ,
-            },
-        )
+        with (
+            envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False),
+            envs.SGLANG_EXPERT_LOCATION_UPDATER_CANARY.override(True),
+        ):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--tp",
+                    "2",
+                    "--dp",
+                    "2",
+                    "--enable-dp-attention",
+                    "--moe-a2a-backend",
+                    "deepep",
+                    "--deepep-mode",
+                    "normal",
+                    "--disable-cuda-graph",
+                    "--enable-eplb",
+                    "--ep-num-redundant-experts",
+                    "4",
+                    "--eplb-rebalance-num-iterations",
+                    "50",
+                    "--expert-distribution-recorder-buffer-size",
+                    "50",
+                    # TODO pr-chain: enable later
+                    # "--enable-expert-distribution-metrics",
+                    # TODO auto determine these flags
+                    "--expert-distribution-recorder-mode",
+                    "stat",
+                    "--ep-dispatch-algorithm",
+                    "static",
+                    *cls.extra_args,
+                ],
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -89,7 +89,7 @@ class TestDynamicEPLBMultiChunk(_BaseTestDynamicEPLB):
 
 class TestStaticEPLB(CustomTestCase):
     def test_save_expert_distribution_and_init_expert_location(self):
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "0"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             engine_kwargs = dict(
@@ -108,7 +108,7 @@ class TestStaticEPLB(CustomTestCase):
             )
 
             print(f"Action: start engine")
-            os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = tmp_dir
+            envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.set(tmp_dir)
             engine = sgl.Engine(
                 **engine_kwargs,
                 disable_overlap_schedule=True,

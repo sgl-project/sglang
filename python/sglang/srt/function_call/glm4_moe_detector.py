@@ -6,11 +6,7 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    StructureInfo,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
 logger = logging.getLogger(__name__)
@@ -28,18 +24,28 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: list):
 
 def parse_arguments(json_value):
     try:
-        try:
-            parsed_value = json.loads(json_value)
-        except:
-            parsed_value = ast.literal_eval(json_value)
+        parsed_value = json.loads(json_value)
         return parsed_value, True
     except:
-        return json_value, False
+        # If that fails, try wrapping it to unescape JSON characters
+        try:
+            # Wrap the value as a JSON string field
+            wrapped = json.loads('{"tmp": "' + json_value + '"}')
+            # parse the unescaped value
+            parsed_value = json.loads(wrapped["tmp"])
+            return parsed_value, True
+        except:
+            # Final fallback to ast.literal_eval
+            try:
+                parsed_value = ast.literal_eval(json_value)
+                return parsed_value, True
+            except:
+                return json_value, False
 
 
 class Glm4MoeDetector(BaseFormatDetector):
     """
-    Detector for GLM-4.5 models.
+    Detector for GLM-4.5 and GLM-4.6 models.
     Assumes function call format:
       <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>北京</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>上海</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>
     """
@@ -49,11 +55,16 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
         self.func_call_regex = r"<tool_call>.*?</tool_call>"
-        self.func_detail_regex = r"<tool_call>([^\n]*)\n(.*)</tool_call>"
-        self.func_arg_regex = r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>"
+        self.func_detail_regex = re.compile(
+            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
+        )
+        self.func_arg_regex = re.compile(
+            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
+            re.DOTALL,
+        )
 
     def has_tool_call(self, text: str) -> bool:
-        """Check if the text contains a glm-4.5 format tool call."""
+        """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
         return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -73,14 +84,10 @@ class Glm4MoeDetector(BaseFormatDetector):
         try:
             for match_result in match_result_list:
                 # Get function name
-                func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
+                func_detail = self.func_detail_regex.search(match_result)
                 func_name = func_detail.group(1)
                 func_args = func_detail.group(2)
-                pairs = re.findall(
-                    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
-                    func_args,
-                    re.DOTALL,
-                )
+                pairs = self.func_arg_regex.findall(func_args)
                 arguments = {}
                 for arg_key, arg_value in pairs:
                     arg_key = arg_key.strip()
@@ -102,7 +109,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Streaming incremental parsing tool calls for GLM-4.5 format.
+        Streaming incremental parsing tool calls for GLM-4.5 and GLM-4.6 format.
         """
         self._buffer += new_text
         current_text = self._buffer

@@ -23,7 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from functools import lru_cache, partial
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
 import torch
@@ -40,7 +40,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -60,6 +59,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.utils import permute_inv
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -116,8 +116,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         rms_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
         self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
 
@@ -265,7 +263,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.fullatt_block_indexes = vision_config.fullatt_block_indexes
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
-        mlp_hidden_size: int = vision_config.intermediate_size
+        mlp_hidden_size: int = ((vision_config.intermediate_size + 7) // 8) * 8
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
@@ -405,6 +403,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         # Move window_index to the same device as x before using it to index x
         window_index = window_index.to(device=x.device)
+        reverse_indices = permute_inv(window_index)
 
         # Ensure rotary_pos_emb is on the same device/dtype as x
         rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
@@ -436,7 +435,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 .to(device=x.device, dtype=torch.int32),
             ]
         )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         # transformers
         x = x.unsqueeze(1)
@@ -451,14 +450,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         # adapter
         x = self.merger(x)
-
-        reverse_indices = torch.argsort(window_index)
         x = x[reverse_indices, :]
 
         return x
-
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):

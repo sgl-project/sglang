@@ -15,7 +15,7 @@ fi
 
 WORKDIR="/sglang-checkout/test/srt"
 declare -A ENV_MAP=(
-  [SGLANG_AMD_CI]=1
+  [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1
   [SGLANG_USE_AITER]=1
 )

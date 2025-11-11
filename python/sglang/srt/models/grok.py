@@ -28,7 +28,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -36,7 +35,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.elementwise import (
-    experts_combine_triton,
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
     gelu_and_mul_triton,
@@ -49,7 +47,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.router import fused_moe_router_shim
 from sglang.srt.layers.moe.topk import TopK
@@ -65,10 +62,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, dispose_tensor, dump_to_file
 
 logger = logging.getLogger(__name__)
@@ -76,9 +73,6 @@ logger = logging.getLogger(__name__)
 
 # Dump tensors for debugging
 debug_tensor_dump_output_folder = None
-debug_tensor_dump_prefill_only = False
-# Skip all the other tensor dumps, only dump the target logits
-debug_tensor_dump_only_target_logprobs = False
 debug_tensor_dump_inject = False
 debug_tensor_dump_layers = None
 debug_tensor_dump_test = False
@@ -176,17 +170,7 @@ class Grok1MoE(nn.Module):
             custom_routing_function=custom_routing_function,
         )
 
-        kwargs = {}
-        if get_moe_expert_parallel_world_size() > 1:
-            MoEImpl = EPMoE
-        else:
-            MoEImpl = FusedMoE
-            kwargs["reduce_results"] = reduce_results
-            kwargs["use_presharded_weights"] = use_presharded_weights
-            kwargs["inplace"] = inplace
-            kwargs["no_combine"] = no_combine
-
-        self.experts = MoEImpl(
+        self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
             layer_id=layer_id,
@@ -195,7 +179,10 @@ class Grok1MoE(nn.Module):
             params_dtype=params_dtype,
             quant_config=quant_config,
             activation="gelu",
-            **kwargs,
+            reduce_results=reduce_results,
+            use_presharded_weights=use_presharded_weights,
+            inplace=inplace,
+            no_combine=no_combine,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -877,10 +864,10 @@ class Grok1ForCausalLM(nn.Module):
 
         # Dump tensors for debugging
         global debug_tensor_dump_output_folder, debug_tensor_dump_inject
-        debug_tensor_dump_output_folder = global_server_args_dict[
-            "debug_tensor_dump_output_folder"
-        ]
-        debug_tensor_dump_inject = global_server_args_dict["debug_tensor_dump_inject"]
+        debug_tensor_dump_output_folder = (
+            get_global_server_args().debug_tensor_dump_output_folder
+        )
+        debug_tensor_dump_inject = get_global_server_args().debug_tensor_dump_inject
         warnings.filterwarnings("ignore", category=FutureWarning)
 
         if get_tensor_model_parallel_rank() == 0:

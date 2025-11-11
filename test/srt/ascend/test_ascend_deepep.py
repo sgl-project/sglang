@@ -38,13 +38,10 @@ class TestAscendDeepEP(CustomTestCase):
             "--quantization",
             "w8a8_int8",
             "--mem-fraction-static",
-            0.9,
-            "--max-running-requests",
-            32,
+            0.8,
             "--disable-radix-cache",
             "--chunked-prefill-size",
             32768,
-            "--disable-cuda-graph",
             "--tp-size",
             16,
             "--dp-size",
@@ -58,7 +55,7 @@ class TestAscendDeepEP(CustomTestCase):
         ]
 
         cls.extra_envs = {
-            "HCCL_BUFFSIZE": "500",
+            "HCCL_BUFFSIZE": "1000",
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
             "SGLANG_NPU_USE_MLAPO": "1",
         }

@@ -1,9 +1,9 @@
-import os
 import unittest
 from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.two_batch_overlap import (
     compute_split_seq_index,
@@ -25,26 +25,26 @@ class TestTwoBatchOverlap(unittest.TestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "2",
-                "--dp",
-                "2",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
-                "--enable-two-batch-overlap",
-            ],
-            env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
-        )
+        with envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--tp",
+                    "2",
+                    "--dp",
+                    "2",
+                    "--enable-dp-attention",
+                    "--moe-a2a-backend",
+                    "deepep",
+                    "--deepep-mode",
+                    "normal",
+                    "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
+                    "--enable-two-batch-overlap",
+                ],
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -126,26 +126,26 @@ class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
         cls.model = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "2",
-                "--dp",
-                "2",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
-                "--enable-two-batch-overlap",
-            ],
-            env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
-        )
+        with envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--tp",
+                    "2",
+                    "--dp",
+                    "2",
+                    "--enable-dp-attention",
+                    "--moe-a2a-backend",
+                    "deepep",
+                    "--deepep-mode",
+                    "normal",
+                    "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
+                    "--enable-two-batch-overlap",
+                ],
+            )
 
 
 if __name__ == "__main__":

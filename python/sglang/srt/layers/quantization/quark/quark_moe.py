@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
-from aiter import ActivationType, QuantType, biased_grouped_topk
+from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
+from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.fp4_utils import e8m0_shuffle
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import get_bool_env_var, mxfp_supported, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -22,6 +23,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+_is_shuffle_moe_mxfp4 = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
 
 __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 
@@ -165,6 +169,15 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         # layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
         layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
+        # Pre-shuffle weight
+        if _is_shuffle_moe_mxfp4:
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight.contiguous(), (16, 16)
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.contiguous(), (16, 16)
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -182,11 +195,22 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         topk_output = dispatch_output.topk_output
         moe_runner_config = self.moe_runner_config
         topk_weights, topk_ids, _ = topk_output
+        if _is_hip:
+            topk_weights = topk_weights.to(
+                torch.float32
+            )  # aiter's moe_sorting requires topk_weights to be FP32
+
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+            w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+        else:
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
 
         output = fused_moe(
             x,
-            layer.w13_weight,
-            layer.w2_weight,
+            w13_weight,
+            w2_weight,
             topk_weights,
             topk_ids,
             quant_type=QuantType.per_1x32,

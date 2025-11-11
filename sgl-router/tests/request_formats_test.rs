@@ -1,12 +1,14 @@
 mod common;
 
+use std::sync::Arc;
+
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{RouterConfig, RoutingMode};
-use sglang_router_rs::core::WorkerManager;
-use sglang_router_rs::routers::{RouterFactory, RouterTrait};
-use std::sync::Arc;
+use sglang_router_rs::{
+    config::{RouterConfig, RoutingMode},
+    routers::{RouterFactory, RouterTrait},
+};
 
 /// Test context that manages mock workers
 struct TestContext {
@@ -17,15 +19,12 @@ struct TestContext {
 
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
-        let mut config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            port: 3003,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            ..Default::default()
-        };
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .port(3003)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .build_unchecked();
 
         let mut workers = Vec::new();
         let mut worker_urls = Vec::new();
@@ -45,14 +44,7 @@ impl TestContext {
             worker_urls: worker_urls.clone(),
         };
 
-        let app_context = common::create_test_context(config.clone());
-
-        // Initialize workers in the registry before creating router
-        if !worker_urls.is_empty() {
-            WorkerManager::initialize_workers(&config, &app_context.worker_registry, None)
-                .await
-                .expect("Failed to initialize workers");
-        }
+        let app_context = common::create_test_context(config.clone()).await;
 
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
@@ -126,7 +118,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test 1: Basic text request
         let payload = json!({
             "text": "Hello, world!",
             "stream": false
@@ -135,7 +126,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test 2: Request with sampling parameters
         let payload = json!({
             "text": "Tell me a story",
             "sampling_params": {
@@ -149,7 +139,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test 3: Request with input_ids
         let payload = json!({
             "input_ids": [1, 2, 3, 4, 5],
             "sampling_params": {
@@ -176,7 +165,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test 1: Basic chat completion
         let payload = json!({
             "model": "test-model",
             "messages": [
@@ -197,7 +185,6 @@ mod request_format_tests {
             Some("chat.completion")
         );
 
-        // Test 2: Chat completion with parameters
         let payload = json!({
             "model": "test-model",
             "messages": [
@@ -226,7 +213,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test 1: Basic completion
         let payload = json!({
             "model": "test-model",
             "prompt": "Once upon a time",
@@ -244,7 +230,6 @@ mod request_format_tests {
             Some("text_completion")
         );
 
-        // Test 2: Completion with array prompt
         let payload = json!({
             "model": "test-model",
             "prompt": ["First prompt", "Second prompt"],
@@ -255,7 +240,6 @@ mod request_format_tests {
         let result = ctx.make_request("/v1/completions", payload).await;
         assert!(result.is_ok());
 
-        // Test 3: Completion with logprobs
         let payload = json!({
             "model": "test-model",
             "prompt": "The capital of France is",
@@ -281,7 +265,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test batch text generation
         let payload = json!({
             "text": ["First text", "Second text", "Third text"],
             "sampling_params": {
@@ -294,7 +277,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test batch with input_ids
         let payload = json!({
             "input_ids": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
             "stream": false
@@ -317,7 +299,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test with return_logprob
         let payload = json!({
             "text": "Test",
             "return_logprob": true,
@@ -327,7 +308,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test with json_schema
         let payload = json!({
             "text": "Generate JSON",
             "sampling_params": {
@@ -340,7 +320,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test with ignore_eos
         let payload = json!({
             "text": "Continue forever",
             "sampling_params": {
@@ -368,7 +347,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test with empty body - should still work with mock worker
         let payload = json!({});
 
         let result = ctx.make_request("/generate", payload).await;

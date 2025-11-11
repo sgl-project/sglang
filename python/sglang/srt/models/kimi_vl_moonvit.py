@@ -49,7 +49,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.activations import ACT2FN, PytorchGELUTanh
+from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
 try:
@@ -596,6 +596,8 @@ class MoonVitPretrainedModel(PreTrainedModel):
     _supports_sdpa = True
 
     def __init__(self, config: MoonViTConfig, *inputs, **kwargs):
+        from transformers.activations import GELUTanh
+
         super().__init__(config, *inputs, **kwargs)
         config = deepcopy(config)
         self.merge_kernel_size = config.merge_kernel_size
@@ -614,7 +616,7 @@ class MoonVitPretrainedModel(PreTrainedModel):
                 "num_heads": config.num_attention_heads,
                 "hidden_dim": config.hidden_size,
                 "mlp_dim": config.intermediate_size,
-                "activation": PytorchGELUTanh(),
+                "activation": GELUTanh(),
                 "attn_bias": True,
                 "attn_implementation": config._attn_implementation,
             },
