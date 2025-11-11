@@ -477,9 +477,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """
         if page_ids.numel() == 0:
             return
+        # Dedup to avoid double-free attempts on the same page within a batch
+        page_ids = torch.unique(page_ids.to(dtype=torch.long))
         # Hard range guard: in debug, fail fast; in prod, clamp to valid range
         if getattr(self, "debug_mode", False):
             assert (page_ids.min() >= 1) and (page_ids.max() <= self.num_pages)
+            # Drop pages that are not currently allocated to make free idempotent
+            if hasattr(self, "page_bitmap"):
+                alloc_mask = self.page_bitmap.index_select(0, page_ids) == 1
+                if not torch.all(alloc_mask):
+                    page_ids = page_ids[alloc_mask]
+                    if page_ids.numel() == 0:
+                        return
         else:
             if torch.any((page_ids < 1) | (page_ids > self.num_pages)):
                 page_ids = page_ids.clamp_(1, self.num_pages)
