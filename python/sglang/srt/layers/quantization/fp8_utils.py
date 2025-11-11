@@ -175,7 +175,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
     assert input_scale is None
 
     input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[1]]
+    output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=True
@@ -556,7 +556,14 @@ def channel_quant_to_tensor_quant(
 def _process_scaled_mm_output(output, input_2d_shape, output_shape):
     if type(output) is tuple and len(output) == 2:
         output = output[0]
-    return torch.narrow(output, 0, 0, input_2d_shape[0]).view(*output_shape)
+    narrowed = torch.narrow(output, 0, 0, input_2d_shape[0])
+    # Derive last dim from actual output to avoid mismatches due to weight layout.
+    # Preserve the original prefix shape (input dims excluding the last feature dim).
+    try:
+        prefix_shape = tuple(output_shape[:-1])
+    except Exception:
+        prefix_shape = ()
+    return narrowed.view(*prefix_shape, narrowed.shape[-1])
 
 
 def _apply_fallback_scaled_mm(
@@ -662,7 +669,8 @@ def apply_fp8_linear(
                         out_dtype=input.dtype,
                         bias=bias,
                     )
-            return output.view(*output_shape)
+                output = torch.narrow(output, 0, 0, input_2d.shape[0])
+                return output.view(*input.shape[:-1], output.shape[-1])
 
         # torch.scaled_mm supports per tensor weights + activations only
         # so fallback to naive if per channel or per token
@@ -697,7 +705,9 @@ def apply_fp8_linear(
                     scale_b=weight_scale,
                     bias=bias,
                 )
-                return _process_scaled_mm_output(output, input_2d.shape, output_shape)
+                return _process_scaled_mm_output(
+                    output, input_2d.shape, [*input.shape[:-1], 0]
+                )
 
             elif (
                 use_per_token_if_dynamic
@@ -725,7 +735,7 @@ def apply_fp8_linear(
                     if bias is not None:
                         output += bias
                     return _process_scaled_mm_output(
-                        output, input_2d.shape, [*input.shape[:-1], weight.shape[0]]
+                        output, input_2d.shape, [*input.shape[:-1], 0]
                     )
                 else:
                     # For now validated on ROCm platform
@@ -744,7 +754,7 @@ def apply_fp8_linear(
                         bias=bias,
                     )
                     return _process_scaled_mm_output(
-                        output, input_2d.shape, output_shape
+                        output, input_2d.shape, [*input.shape[:-1], 0]
                     )
             else:
                 # Fallback for channelwise case, where we use unfused DQ
@@ -833,7 +843,8 @@ def apply_fp8_linear(
                             out_dtype=input.dtype,
                             bias=bias,
                         )
-                return output.view(*output_shape)
+                output = torch.narrow(output, 0, 0, input_2d.shape[0])
+                return output.view(*input.shape[:-1], output.shape[-1])
             except (ImportError, NameError, AttributeError):
                 pass
 
