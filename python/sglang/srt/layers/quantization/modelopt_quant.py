@@ -99,6 +99,47 @@ except ImportError:
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 
+# Wrap FP4 GEMM as a custom op so Dynamo can use a fake kernel during compile
+try:
+
+    @torch.library.custom_op("sglang::fp4_gemm")
+    def _sglang_fp4_gemm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_sf: torch.Tensor,
+        weight_sf: torch.Tensor,
+        alpha: torch.Tensor,
+        out_dtype: torch.dtype,
+        out_features: int,
+    ) -> torch.Tensor:
+        backend = (
+            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+        )
+        if enable_flashinfer_fp4_gemm:
+            return fp4_gemm(
+                input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+            )
+        else:
+            return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+
+    @torch.library.register_fake("sglang::fp4_gemm")
+    def _sglang_fp4_gemm_fake(
+        input,
+        weight,
+        input_sf,
+        weight_sf,
+        alpha,
+        out_dtype,
+        out_features: int,
+    ):
+        M = input.shape[-2]
+        N = int(out_features)
+        return torch.empty((M, N), device="meta", dtype=out_dtype)
+
+except Exception:
+    # If registration fails (older torch), fallback to direct calls
+    pass
+
 
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
@@ -1087,14 +1128,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         backend = (
             FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
         )
-        out = fp4_gemm(
+        out = torch.ops.sglang.fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
-            **(dict(backend=backend)),
+            w_n,
         )
         if bias is not None:
             out = out + bias
