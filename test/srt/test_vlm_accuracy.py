@@ -14,7 +14,7 @@ from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.managers.mm_utils import embed_mm_inputs, init_embedding_cache
+from sglang.srt.managers.mm_utils import embed_mm_inputs, init_mm_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -182,7 +182,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
             .eval()
             .to(cls.device)
         )
-        init_embedding_cache()
+        init_mm_embedding_cache()
 
     async def test_vlm_embedding_output(self):
         """
@@ -288,7 +288,7 @@ class TestMiniCPMV4Logits(VisionLLMLogitsBase):
             .eval()
             .to(cls.device)
         )
-        init_embedding_cache()
+        init_mm_embedding_cache()
 
     async def test_vlm_embedding_output(self):
         """

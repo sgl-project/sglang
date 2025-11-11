@@ -34,6 +34,7 @@ class RouterArgs:
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
+    bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
@@ -112,6 +113,9 @@ class RouterArgs:
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
     ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
+    # Trace
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
 
     @staticmethod
     def add_cli_args(
@@ -164,7 +168,7 @@ class RouterArgs:
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "bucket"],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
@@ -230,6 +234,12 @@ class RouterArgs:
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
+        )
+        parser.add_argument(
+            f"--{prefix}bucket-adjust-interval-secs",
+            type=int,
+            default=RouterArgs.bucket_adjust_interval_secs,
+            help="Interval in seconds between bucket boundary adjustment operations",
         )
         parser.add_argument(
             f"--{prefix}eviction-interval-secs",
@@ -534,7 +544,7 @@ class RouterArgs:
             f"--{prefix}history-backend",
             type=str,
             default=RouterArgs.history_backend,
-            choices=["memory", "none", "oracle"],
+            choices=["memory", "none", "oracle", "postgres"],
             help="History storage backend for conversations and responses (default: memory)",
         )
         # Oracle configuration
@@ -607,6 +617,17 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            f"--{prefix}otlp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
     @classmethod

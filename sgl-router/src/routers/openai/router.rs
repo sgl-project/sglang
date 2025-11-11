@@ -2,6 +2,7 @@
 
 use std::{
     any::Any,
+    collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
@@ -15,6 +16,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -50,8 +52,8 @@ use crate::{
         generate::GenerateRequest,
         rerank::RerankRequest,
         responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
-            ResponsesRequest,
+            generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
+            ResponsesGetParams, ResponsesRequest,
         },
     },
     routers::header_utils::apply_request_headers,
@@ -60,6 +62,32 @@ use crate::{
 // ============================================================================
 // OpenAIRouter Struct
 // ============================================================================
+
+/// Fields specific to SGLang that should be stripped when forwarding to OpenAI-compatible endpoints
+static SGLANG_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    HashSet::from([
+        "request_id",
+        "priority",
+        "top_k",
+        "min_p",
+        "min_tokens",
+        "regex",
+        "ebnf",
+        "stop_token_ids",
+        "no_stop_trim",
+        "ignore_eos",
+        "continue_final_message",
+        "skip_special_tokens",
+        "lora_path",
+        "session_params",
+        "separate_reasoning",
+        "stream_reasoning",
+        "chat_template_kwargs",
+        "return_hidden_states",
+        "repetition_penalty",
+        "sampling_seed",
+    ])
+});
 
 /// Cached endpoint information
 #[derive(Clone, Debug)]
@@ -547,29 +575,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         };
         if let Some(obj) = payload.as_object_mut() {
             // Always remove SGLang-specific fields (unsupported by OpenAI)
-            for key in [
-                "top_k",
-                "min_p",
-                "min_tokens",
-                "regex",
-                "ebnf",
-                "stop_token_ids",
-                "no_stop_trim",
-                "ignore_eos",
-                "continue_final_message",
-                "skip_special_tokens",
-                "lora_path",
-                "session_params",
-                "separate_reasoning",
-                "stream_reasoning",
-                "chat_template_kwargs",
-                "return_hidden_states",
-                "repetition_penalty",
-                "sampling_seed",
-            ] {
-                obj.remove(key);
-            }
-
+            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
             // Remove logprobs if false (Gemini don't accept it)
             if obj.get("logprobs").and_then(|v| v.as_bool()) == Some(false) {
                 obj.remove("logprobs");
@@ -804,20 +810,76 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 Ok(stored_items) => {
                     let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                     for item in stored_items.into_iter() {
-                        // Only use message items for conversation context
-                        // Skip non-message items (reasoning, function calls, etc.)
-                        if item.item_type == "message" {
-                            if let Ok(content_parts) =
-                                serde_json::from_value::<Vec<ResponseContentPart>>(
+                        // Include messages, function calls, and function call outputs
+                        // Skip reasoning items as they're internal processing details
+                        match item.item_type.as_str() {
+                            "message" => {
+                                match serde_json::from_value::<Vec<ResponseContentPart>>(
                                     item.content.clone(),
-                                )
-                            {
-                                items.push(ResponseInputOutputItem::Message {
-                                    id: item.id.0.clone(),
-                                    role: item.role.clone().unwrap_or_else(|| "user".to_string()),
-                                    content: content_parts,
-                                    status: item.status.clone(),
-                                });
+                                ) {
+                                    Ok(content_parts) => {
+                                        items.push(ResponseInputOutputItem::Message {
+                                            id: item.id.0.clone(),
+                                            role: item
+                                                .role
+                                                .clone()
+                                                .unwrap_or_else(|| "user".to_string()),
+                                            content: content_parts,
+                                            status: item.status.clone(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to deserialize message content: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            "function_call" => {
+                                // The entire function_call item is stored in content field
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.content.clone(),
+                                ) {
+                                    Ok(func_call) => items.push(func_call),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to deserialize function_call: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            "function_call_output" => {
+                                // The entire function_call_output item is stored in content field
+                                tracing::debug!(
+                                    "Loading function_call_output from DB - content: {}",
+                                    serde_json::to_string_pretty(&item.content)
+                                        .unwrap_or_else(|_| "failed to serialize".to_string())
+                                );
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.content.clone(),
+                                ) {
+                                    Ok(func_output) => {
+                                        tracing::debug!(
+                                            "Successfully deserialized function_call_output"
+                                        );
+                                        items.push(func_output);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to deserialize function_call_output: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            "reasoning" => {
+                                // Skip reasoning items - they're internal processing details
+                            }
+                            _ => {
+                                // Skip unknown item types
+                                warn!("Unknown item type in conversation: {}", item.item_type);
                             }
                         }
                     }
@@ -883,6 +945,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         // Always set store=false for upstream (we store internally)
         request_body.store = Some(false);
+        // Filter out reasoning items from input - they're internal processing details
+        if let ResponseInput::Items(ref mut items) = request_body.input {
+            items.retain(|item| !matches!(item, ResponseInputOutputItem::Reasoning { .. }));
+        }
 
         // Convert to JSON and strip SGLang-specific fields
         let mut payload = match to_value(&request_body) {
@@ -899,30 +965,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         // Remove SGLang-specific fields only
         if let Some(obj) = payload.as_object_mut() {
             // Remove SGLang-specific fields (not part of OpenAI API)
-            for key in [
-                "request_id",
-                "priority",
-                "top_k",
-                "min_p",
-                "min_tokens",
-                "regex",
-                "ebnf",
-                "stop_token_ids",
-                "no_stop_trim",
-                "ignore_eos",
-                "continue_final_message",
-                "skip_special_tokens",
-                "lora_path",
-                "session_params",
-                "separate_reasoning",
-                "stream_reasoning",
-                "chat_template_kwargs",
-                "return_hidden_states",
-                "repetition_penalty",
-                "sampling_seed",
-            ] {
-                obj.remove(key);
-            }
+            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
             // XAI (Grok models) requires special handling of input items
             // Check if model is a Grok model
             let is_grok_model = obj
@@ -1051,10 +1094,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         if item.get("id").is_none() {
                             // Generate ID if not present using centralized utility
                             if let Some(obj) = item.as_object_mut() {
-                                obj.insert(
-                                    "id".to_string(),
-                                    json!(super::utils::generate_id("msg")),
-                                );
+                                obj.insert("id".to_string(), json!(generate_id("msg")));
                             }
                         }
                         item
