@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'sgl-project/sglang'
+    if: always() && github.repository == 'sgl-project/sglang'
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
