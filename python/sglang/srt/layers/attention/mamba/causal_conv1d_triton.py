@@ -672,49 +672,6 @@ def _causal_conv1d_update_kernel(
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    if not IS_SPEC_DECODING:
-        # STEP 2: assume state_len > seqlen
-        idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
-
-        # The conv_state updates works in a sliding window manner,
-        # at each forward pass, the tokens are shift by 1, so we
-        # load since idx_tokens + 1.
-        conv_state_ptrs_source = (
-            conv_state_ptr
-            + (conv_state_batch_coord * stride_conv_state_seq)
-            + (idx_feats * stride_conv_state_dim)[None, :]
-            + ((idx_tokens + seqlen) * stride_conv_state_tok)[:, None]
-        )  # [BLOCK_M, BLOCK_N]
-        mask = (
-            (conv_state_batch_coord < num_cache_lines)
-            & ((idx_tokens + seqlen) < state_len)[:, None]
-            & (idx_feats < dim)[None, :]
-        )
-        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
-        x_ptrs = (
-            x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-        )  # [BLOCK_M, BLOCK_N]
-        mask_x = (
-            (idx_tokens - VAL >= 0)[:, None]
-            & (idx_tokens - VAL < seqlen)[:, None]
-            & (idx_feats < dim)[None, :]
-        )  # token-index  # token-index  # feature-index
-        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-        # tl.debug_barrier()
-
-        new_conv_state = tl.where(mask, conv_state, loaded_x)
-
-        conv_state_base = (
-            conv_state_ptr
-            + (conv_state_batch_coord * stride_conv_state_seq)
-            + (idx_feats * stride_conv_state_dim)
-        )  # [BLOCK_N,]
-        conv_state_ptrs_target = (
-            conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
-        )  # [BLOCK_M, BLOCK_N]
-        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-        tl.store(conv_state_ptrs_target, new_conv_state, mask)
-
     # STEP 3: init accumulator
     if HAS_BIAS:
         bias = bias_ptr + idx_feats
@@ -908,21 +865,20 @@ def _causal_conv1d_update_kernel(
                 col1 = col2
                 col2 = matrix_x
 
-            if IS_SPEC_DECODING:
-                # Save the window state after consuming this token
-                # Layout: [seq(cache line), step, dim, win(K-1)]
-                base_ptr = (
-                    conv_state_ptr
-                    + conv_state_batch_coord * stride_conv_state_seq
-                    + idx_token * stride_conv_state_step
-                    + idx_feats * stride_conv_state_dim
-                )
-                if KERNEL_WIDTH >= 2:
-                    tl.store(base_ptr + 0 * stride_conv_state_tok, col0, mask=mask_w)
-                if KERNEL_WIDTH >= 3:
-                    tl.store(base_ptr + 1 * stride_conv_state_tok, col1, mask=mask_w)
-                if KERNEL_WIDTH >= 4:
-                    tl.store(base_ptr + 2 * stride_conv_state_tok, col2, mask=mask_w)
+            # Save the window state after consuming this token
+            # Layout: [seq(cache line), step, dim, win(K-1)]
+            base_ptr = (
+                conv_state_ptr
+                + conv_state_batch_coord * stride_conv_state_seq
+                + idx_token * stride_conv_state_step
+                + idx_feats * stride_conv_state_dim
+            )
+            if KERNEL_WIDTH >= 2:
+                tl.store(base_ptr + 0 * stride_conv_state_tok, col0, mask=mask_w)
+            if KERNEL_WIDTH >= 3:
+                tl.store(base_ptr + 1 * stride_conv_state_tok, col1, mask=mask_w)
+            if KERNEL_WIDTH >= 4:
+                tl.store(base_ptr + 2 * stride_conv_state_tok, col2, mask=mask_w)
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
