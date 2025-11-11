@@ -21,13 +21,7 @@ import torch
 
 from sglang.srt.compilation.npu.compilation_context import CompilationContext
 from sglang.srt.compilation.npu.config import CompilationConfig
-from sglang.srt.compilation.npu.pass_manager import PassManager
 from sglang.srt.compilation.npu.npu_compiler_backend import NpuBackend
-from sglang.srt.compilation.npu.passes.w8a8_int8 import (
-    DivFuse,
-    EraseCopy,
-    NpuAddRmsNormQuantFuse,
-)
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
 logger = logging.getLogger(__name__)
@@ -182,10 +176,12 @@ class PiecewiseNpuGraphCompilerBackend(NpuBackend):
             return callable
 
         super().__call__(graph, example_inputs)
-        
+
         self.graph = graph
-        self.split_gm, self.piecewise_graphs = PiecewiseNpuGraphCompilerBackend.split_graph(
-            self.graph, self.compilation_config.splitting_ops
+        self.split_gm, self.piecewise_graphs = (
+            PiecewiseNpuGraphCompilerBackend.split_graph(
+                self.graph, self.compilation_config.splitting_ops
+            )
         )
 
         npu_graph_backend = resolve_obj_by_qualname(
@@ -218,14 +214,6 @@ class PiecewiseNpuGraphCompilerBackend(NpuBackend):
         self.split_gm(*example_inputs)
         self.callables[example_inputs_len] = self.split_gm.forward
         return self.split_gm.forward
-
-    # def apply_passes(graph_module: torch.fx.GraphModule):
-    #     passManager = PassManager(graph_module)
-    #     passManager.add(NpuAddRmsNormQuantFuse)
-    #     passManager.add(DivFuse)
-    #     passManager.add(EraseCopy)
-    #     passManager.apply()
-    #     graph_module.recompile()
 
     def split_graph(
         graph: torch.fx.GraphModule, ops: list[str]

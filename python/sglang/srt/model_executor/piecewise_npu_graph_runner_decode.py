@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import bisect
 import gc
-import os
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
@@ -32,9 +30,8 @@ from sglang.srt.compilation.npu.patch_dynamo import (
     patch_dynamo_context_call,
     restore_dynamo_context_call,
 )
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.compilation.piecewise_npu_graph_compiler import (
@@ -89,74 +86,8 @@ class CompiledGraph:
     ):
         self.bs = bs
         self.forward_batch = forward_batch
-        # TODO: debug only
         self.attn_backend = attn_backend
         self.callable = callable
-
-
-def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
-    for sub in model._modules.values():
-        if isinstance(sub, CustomOp):
-            if reverse:
-                sub.leave_torch_compile()
-            else:
-                sub.enter_torch_compile(num_tokens=num_tokens)
-        if isinstance(sub, torch.nn.Module):
-            _to_torch(sub, reverse, num_tokens)
-
-
-@contextmanager
-def patch_model(
-    model: torch.nn.Module,
-    enable_compile: bool,
-    num_tokens: int,
-    tp_group: GroupCoordinator,
-):
-    """Patch the model to make it compatible with with torch.compile"""
-    backup_ca_comm = None
-
-    try:
-        if enable_compile:
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
-            backup_ca_comm = tp_group.ca_comm
-            # Use custom-allreduce here.
-            # We found the custom allreduce is much faster than the built-in allreduce in torch,
-            # even with ENABLE_INTRA_NODE_COMM=1.
-            # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                mode=os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-npugraphs"
-                ),
-                dynamic=False,
-            )
-        else:
-            yield model.forward
-    finally:
-        if enable_compile:
-            _to_torch(model, reverse=True, num_tokens=num_tokens)
-            tp_group.ca_comm = backup_ca_comm
-
-
-def set_torch_compile_config():
-    import torch._dynamo.config
-    import torch._inductor.config
-
-    torch._inductor.config.fx_graph_cache = False
-
-    from packaging import version
-
-    if version.parse(torch.__version__) < version.parse("2.8.0"):
-        # These things are cacheable by torch.compile. torch.compile just doesn't know it.
-        # This was fixed in PyTorch 2.8, but until then, we monkey patch.
-        import torch._higher_order_ops.auto_functionalize as af
-
-        af.auto_functionalized_v2._cacheable = False
-        af.auto_functionalized._cacheable = False
-
-    torch._dynamo.config.accumulated_cache_size_limit = 1024
-    if hasattr(torch._dynamo.config, "cache_size_limit"):
-        torch._dynamo.config.cache_size_limit = 1024
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
@@ -274,11 +205,6 @@ class PiecewiseNPUGraphRunnerDecode:
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
-
-        set_torch_compile_config()
-
-        # if self.model_runner.server_args.lora_paths is not None:
-        #     self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
         # Graph inputs
         with torch.device(self.model_runner.device):
@@ -440,11 +366,8 @@ class PiecewiseNPUGraphRunnerDecode:
         encoder_lens = None
         num_token_non_padded = None
 
-        # pipeline parallelism
         assert self.pp_size <= 1
-
         assert self.enable_dp_attention == False
-        # assert self.enable_sp_layernorm == False
         global_num_tokens = None
         gathered_buffer = None
 
@@ -453,9 +376,6 @@ class PiecewiseNPUGraphRunnerDecode:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
-
-        # assert self.model_runner.server_args.lora_paths is None
-        # lora_paths = None
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -472,14 +392,12 @@ class PiecewiseNPUGraphRunnerDecode:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
-            # gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
-            # lora_paths=lora_paths,
         )
 
         seq_lens_cpu_int = torch.zeros((bs,), dtype=torch.int32, device="cpu")
@@ -488,7 +406,6 @@ class PiecewiseNPUGraphRunnerDecode:
         seq_lens_cpu = torch.full((bs,), 1, dtype=torch.int32, device="cpu")
         forward_batch.seq_lens_cpu = seq_lens_cpu
 
-        # TODO: don't use loop here
         for i in range(bs):
             forward_batch.global_forward_mode = None
             forward_batch.input_ids[i] = 323
@@ -505,7 +422,6 @@ class PiecewiseNPUGraphRunnerDecode:
             assert False
         assert self.pp_size <= 1
         assert self.enable_dp_attention == False
-        # assert self.enable_sp_layernorm == False
         assert enable_num_token_non_padded(self.model_runner.server_args) == False
         assert self.enable_two_batch_overlap == False
 
@@ -525,7 +441,6 @@ class PiecewiseNPUGraphRunnerDecode:
         compile: bool = True,
     ):
         attn_backend = self.model_runner.attn_backend
-        # TODO: absent in CUDAGraphRunner
         attn_backend.init_cuda_graph_state(bs, self.max_num_token)
 
         self.model_runner.attn_backend = attn_backend
@@ -581,26 +496,6 @@ class PiecewiseNPUGraphRunnerDecode:
 
         return (compiled_graph, logits_output_or_pp_proxy_tensors)
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch):
-        assert False
-
-        # If the capture_hidden_mode changes, we need to recapture the graph
-        hidden_mode_from_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-        )
-        if (
-            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
-            and self.capture_hidden_mode != CaptureHiddenMode.FULL
-        ):
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
-            self.capture()
-        elif (
-            forward_batch.capture_hidden_mode != CaptureHiddenMode.FULL
-            and self.capture_hidden_mode != hidden_mode_from_spec_info
-        ):
-            self.capture_hidden_mode = hidden_mode_from_spec_info
-            self.capture()
-
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
@@ -610,7 +505,7 @@ class PiecewiseNPUGraphRunnerDecode:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.enable_dp_attention:  # or self.enable_sp_layernorm:
+        if self.enable_dp_attention:
             index = bisect.bisect_left(
                 self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
             )
@@ -664,7 +559,7 @@ class PiecewiseNPUGraphRunnerDecode:
                 forward_batch.mrope_positions
             )
 
-        if self.enable_dp_attention:  # or self.enable_sp_layernorm:
+        if self.enable_dp_attention:
             assert False
 
         if enable_num_token_non_padded(self.model_runner.server_args):
