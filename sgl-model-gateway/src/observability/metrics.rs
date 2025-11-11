@@ -323,6 +323,9 @@ pub fn init_metrics() {
         "Active database connections by storage_type"
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
+
+    // Initialize HA metrics
+    crate::ha::metrics::init_ha_metrics();
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
