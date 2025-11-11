@@ -345,6 +345,7 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        per_channel_quant: bool,
         block_shape: List[int],
         cfg: Dict[str, int],
         topk_ids_dir: str,
@@ -370,6 +371,7 @@ class BenchmarkWorker:
                 use_int8_w8a8,
                 use_int8_w8a16,
                 topk_ids_dir,
+                per_channel_quant,
                 block_shape,
             )
         return cfg, kernel_time
@@ -385,6 +387,7 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
+        per_channel_quant: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
         topk_ids_dir: str,
@@ -407,6 +410,7 @@ class BenchmarkWorker:
                         use_fp8_w8a8,
                         use_int8_w8a8,
                         use_int8_w8a16,
+                        per_channel_quant,
                         topk_ids_dir,
                         block_shape,
                         num_iters=10,
