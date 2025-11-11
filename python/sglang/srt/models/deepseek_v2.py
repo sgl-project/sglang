@@ -3443,9 +3443,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
     @classmethod
-    def generate_weight_name_filter(
-        cls, logical_experts: List[Tuple[int, List[int]]]
-    ):
+    def generate_weight_name_filter(cls, logical_experts: List[Tuple[int, List[int]]]):
         """
         Generates a filter function that tests whether the (layer_id, expert_id)
         indicated by a param name lies in the `logical_experts` list
@@ -3456,6 +3454,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         Returns:
             A function (name: str) -> bool
         """
+
         def weight_name_filter(name: str) -> bool:
             for layer, experts in logical_experts:
                 for expert in experts:
