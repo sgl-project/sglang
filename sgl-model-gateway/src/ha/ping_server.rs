@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use tonic::{transport::Server, Response, Status};
@@ -16,11 +16,12 @@ use super::{
     try_ping, ClusterState,
     stores::{StateStores, MembershipStore, AppStore, WorkerStore, PolicyStore},
     crdt::SKey,
+    sync::HASyncManager,
 };
 use futures::Stream;
 use std::pin::Pin;
 use tokio_stream::StreamExt;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug)]
 pub struct GossipService {
@@ -28,6 +29,7 @@ pub struct GossipService {
     self_addr: SocketAddr,
     self_name: String,
     stores: Option<StateStores>, // Optional state stores for CRDT-based sync
+    sync_manager: Option<Arc<HASyncManager>>, // Optional sync manager for applying remote updates
 }
 
 impl GossipService {
@@ -50,11 +52,17 @@ impl GossipService {
             self_addr,
             self_name: self_name.to_string(),
             stores: None,
+            sync_manager: None,
         }
     }
 
     pub fn with_stores(mut self, stores: StateStores) -> Self {
         self.stores = Some(stores);
+        self
+    }
+
+    pub fn with_sync_manager(mut self, sync_manager: Arc<HASyncManager>) -> Self {
+        self.sync_manager = Some(sync_manager);
         self
     }
 
@@ -144,6 +152,7 @@ impl Gossip for GossipService {
         let self_name = self.self_name.clone();
         let state = self.state.clone();
         let stores = self.stores.clone();
+        let sync_manager = self.sync_manager.clone();
 
         // Create output stream
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamMessage, Status>>(128);
@@ -161,12 +170,34 @@ impl Gossip for GossipService {
                         match msg.message_type() {
                             StreamMessageType::IncrementalUpdate => {
                                 if let Some(gossip::stream_message::Payload::Incremental(update)) = &msg.payload {
+                                    let store_type = StoreType::try_from(update.store).unwrap_or(StoreType::Membership);
                                     log::info!("Received incremental update from {}: store={:?}, {} updates", 
-                                        peer_id, 
-                                        StoreType::try_from(update.store).unwrap_or(StoreType::Membership),
-                                        update.updates.len());
-                                    // TODO: Apply incremental updates to state stores
-                                    // For now, just acknowledge
+                                        peer_id, store_type, update.updates.len());
+                                    
+                                    // Apply incremental updates to state stores
+                                    // This will be handled by the sync manager if available
+                                    // For now, we acknowledge and the sync manager will handle it
+                                    if let Some(ref sync_manager) = sync_manager {
+                                        for state_update in &update.updates {
+                                            match store_type {
+                                                StoreType::Worker => {
+                                                    // Deserialize and apply worker state
+                                                    if let Ok(worker_state) = serde_json::from_slice::<super::stores::WorkerState>(&state_update.value) {
+                                                        sync_manager.apply_remote_worker_state(worker_state);
+                                                    }
+                                                }
+                                                StoreType::Policy => {
+                                                    // Deserialize and apply policy state
+                                                    if let Ok(policy_state) = serde_json::from_slice::<super::stores::PolicyState>(&state_update.value) {
+                                                        sync_manager.apply_remote_policy_state(policy_state);
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Other store types handled elsewhere
+                                                }
+                                            }
+                                        }
+                                    }
                                     let ack = StreamMessage {
                                         message_type: StreamMessageType::Ack as i32,
                                         payload: Some(super::gossip::stream_message::Payload::Ack(StreamAck {
