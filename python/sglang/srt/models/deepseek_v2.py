@@ -3723,12 +3723,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                                     param, "weight_loader", default_weight_loader
                                 )
                                 maybe_executor_submit(
-                                    executor,
-                                    futures,
-                                    use_async_loading,
-                                    weight_loader,
-                                    param,
-                                    fused_weight,
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(param, fused_weight),
                                 )
                                 cached_wk_and_weights_proj.pop(wk_name)
                                 cached_wk_and_weights_proj.pop(weights_proj_name)
