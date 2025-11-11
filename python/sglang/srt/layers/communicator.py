@@ -154,6 +154,7 @@ class AttnTpContext:
             and not is_dp_attention_enabled()
             and not get_moe_a2a_backend().is_deepep()
             and not enable_moe_dense_fully_dp()
+            and not get_global_server_args().enable_piecewise_cuda_graph
         )
 
     def use_input_scattered(self, forward_batch: ForwardBatch):
