@@ -32,16 +32,18 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-from sglang.srt.layers.moe import (
-    get_moe_runner_backend,
-    should_use_flashinfer_trtllm_moe,
-)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -261,7 +263,7 @@ class TopK(CustomOp):
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif (
-            should_use_flashinfer_trtllm_moe()
+            get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_mxfp4()
         ):
             output_format = TopKOutputFormat.BYPASSED
@@ -286,14 +288,18 @@ class TopK(CustomOp):
             )
         else:
             self.topk_config.torch_native = False
-            return select_experts(
-                hidden_states=hidden_states,
-                layer_id=self.layer_id,
-                router_logits=router_logits,
-                topk_config=self.topk_config,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-            )
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                topk_output = select_experts(
+                    hidden_states=hidden_states,
+                    layer_id=self.layer_id,
+                    router_logits=router_logits,
+                    topk_config=self.topk_config,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                )
+            return topk_output
 
     def forward_cpu(
         self,
@@ -396,8 +402,11 @@ class TopK(CustomOp):
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
-        topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
-        topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
+            topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         # FIXME: router_logits should be of size (0, num_experts)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
@@ -924,3 +933,27 @@ def select_experts(
         topk_ids=topk_ids,
     )
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @torch.library.register_fake("sgl_kernel::moe_fused_gate")
+    def _(
+        input_tensor,
+        bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=0,
+        apply_routed_scaling_factor_on_output=False,
+    ):
+        num_rows = input_tensor.shape[0]
+        topk_weights = torch.empty(
+            (num_rows, topk), dtype=torch.float32, device=input_tensor.device
+        )
+        topk_ids = torch.empty(
+            (num_rows, topk), dtype=torch.int32, device=input_tensor.device
+        )
+        return topk_weights, topk_ids

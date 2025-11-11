@@ -145,6 +145,7 @@ async fn try_http_health_check(
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
+        .and_then(reqwest::Response::error_for_status)
         .map_err(|e| format!("Health check failed: {}", e))?;
 
     Ok(())
@@ -754,6 +755,13 @@ impl StepExecutor for UpdatePoliciesStep {
                         .policy_registry
                         .init_cache_aware_policy(&model_id, &all_workers);
                 }
+            }
+            let prefill_workers = app_context.worker_registry.get_prefill_workers();
+            let policy = app_context.policy_registry.get_prefill_policy();
+            if policy.name() == "bucket" {
+                app_context
+                    .policy_registry
+                    .init_pd_bucket_policies(&prefill_workers);
             }
 
             debug!(
