@@ -119,6 +119,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # For non-paged allocators, page IDs are effectively token indices
         self.free(page_ids)
 
+    # Back-compat alias for older call sites
+    def free_page_ids(self, page_ids: torch.Tensor):
+        self.free_pages(page_ids)
+
 
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """An allocator managing the indices to kv cache data."""
@@ -471,6 +475,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """
         if page_ids.numel() == 0:
             return
+        if self.debug_mode:
+            # Cheap range guard in debug
+            assert (page_ids.min() >= 1) and (page_ids.max() <= self.num_pages)
         # Debug guard
         self._mark_pages_freed(page_ids)
         # Append directly without sort/dedup

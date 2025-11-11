@@ -485,7 +485,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
         start_p:end_p
     ]
-    tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+    if page_size > 1:
+        page_ids = torch.unique(indices_to_free // page_size)
+        tree_cache.token_to_kv_pool_allocator.free_pages(page_ids)
+    else:
+        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 
 
 def available_and_evictable_str(tree_cache) -> str:
