@@ -43,8 +43,14 @@ pub async fn get_grpc_client_from_worker(
     let client_arc = worker
         .get_grpc_client()
         .await
-        .map_err(|e| error::internal_error(format!("Failed to get gRPC client: {}", e)))?
-        .ok_or_else(|| error::internal_error("Selected worker is not configured for gRPC"))?;
+        .map_err(|e| {
+            error!(function = "get_grpc_client_from_worker", error = %e, "Failed to get gRPC client");
+            error::internal_error(format!("Failed to get gRPC client: {}", e))
+        })?
+        .ok_or_else(|| {
+            error!(function = "get_grpc_client_from_worker", "Selected worker not configured for gRPC");
+            error::internal_error("Selected worker is not configured for gRPC")
+        })?;
 
     Ok((*client_arc).clone())
 }
@@ -596,7 +602,7 @@ pub async fn collect_stream_responses(
                         all_responses.push(complete);
                     }
                     Some(Error(err)) => {
-                        error!("{} error: {}", worker_name, err.message);
+                        error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message, "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
                         return Err(error::internal_error(format!(
                             "{} generation failed: {}",
@@ -612,7 +618,7 @@ pub async fn collect_stream_responses(
                 }
             }
             Err(e) => {
-                error!("{} stream error: {:?}", worker_name, e);
+                error!(function = "collect_stream_responses", worker = %worker_name, error = ?e, "Worker stream error");
                 // Don't mark as completed - let Drop send abort for error cases
                 return Err(error::internal_error(format!(
                     "{} stream failed: {}",
