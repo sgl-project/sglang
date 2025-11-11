@@ -92,6 +92,13 @@ except ImportError:
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 
+
+# Avoid tracing into flashinfer's JIT build path during torch.compile by forcing an eager call.
+@torch._dynamo.disable
+def _fp4_gemm_eager(*args, **kwargs):
+    return fp4_gemm(*args, **kwargs)
+
+
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
@@ -1079,7 +1086,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         backend = (
             FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
         )
-        out = fp4_gemm(
+        out = _fp4_gemm_eager(
             x_fp4,
             w,
             x_scale_interleaved,
