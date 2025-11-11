@@ -223,5 +223,4 @@ pub async fn probe_endpoint_for_model(
 // ============================================================================
 // Re-export FunctionCallInProgress from mcp module
 // ============================================================================
-
 pub(crate) use super::mcp::FunctionCallInProgress;

@@ -1,8 +1,14 @@
 from typing import Optional
 
 from sglang_router.router_args import RouterArgs
-from sglang_router_rs import BackendType, HistoryBackendType, PolicyType, PyOracleConfig
-from sglang_router_rs import Router as _Router
+from sglang_router.sglang_router_rs import (
+    BackendType,
+    HistoryBackendType,
+    PolicyType,
+    PyOracleConfig,
+    PyPostgresConfig,
+)
+from sglang_router.sglang_router_rs import Router as _Router
 
 
 def policy_from_str(policy_str: Optional[str]) -> PolicyType:
@@ -14,6 +20,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
         "power_of_two": PolicyType.PowerOfTwo,
+        "bucket": PolicyType.Bucket,
     }
     return policy_map[policy_str]
 
@@ -47,6 +54,8 @@ def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
         return getattr(HistoryBackendType, "None")
     elif backend_lower == "oracle":
         return HistoryBackendType.Oracle
+    elif backend_lower == "postgres":
+        return HistoryBackendType.Postgres
     else:
         raise ValueError(f"Unknown history backend: {backend_str}")
 
@@ -180,6 +189,15 @@ class Router:
             )
         args_dict["oracle_config"] = oracle_config
         args_dict["history_backend"] = history_backend
+
+        # Convert Postgres config if needed
+        postgres_config = None
+        if history_backend == HistoryBackendType.Postgres:
+            postgres_config = PyPostgresConfig(
+                db_url=args_dict.get("postgres_db_url"),
+                pool_max=args_dict.get("postgres_pool_max", 16),
+            )
+        args_dict["postgres_config"] = postgres_config
 
         # Remove fields that shouldn't be passed to Rust Router constructor
         fields_to_remove = [

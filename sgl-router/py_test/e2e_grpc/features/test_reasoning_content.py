@@ -9,15 +9,11 @@ python3 -m unittest openai_server.features.test_reasoning_content.TestReasoningC
 python3 -m unittest openai_server.features.test_reasoning_content.TestReasoningContentStartup.test_streaming
 """
 
-import json
-
-# CHANGE: Import router launcher instead of server launcher
 import sys
 import unittest
 from pathlib import Path
 
 import openai
-import requests
 
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))

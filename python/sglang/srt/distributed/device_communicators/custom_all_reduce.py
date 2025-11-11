@@ -18,25 +18,21 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0
 
-logger = logging.getLogger(__name__)
+try:
+    # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
+    import sgl_kernel  # noqa: F401
+
+    custom_ar = True
+except ImportError:
+    # For CPUs
+    custom_ar = False
+
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-
-try:
-    if ops.use_vllm_custom_allreduce and not _is_hip:
-        # Use vLLM custom allreduce
-        ops.meta_size()
-    else:
-        # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-        import sgl_kernel  # noqa: F401
-    custom_ar = True
-except Exception:
-    # For CPUs
-    custom_ar = False
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +206,7 @@ class CustomAllreduce:
             self.register_buffer(self.buffer)
 
         self.disabled = False
+        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
     @staticmethod
     def create_shared_buffer(
@@ -394,7 +391,7 @@ class CustomAllreduce:
                 if _is_hip:
                     return self.all_reduce_reg(input)
                 else:
-                    return self.all_reduce(input, registered=True)
+                    return self.all_reduce(input, registered=not self.tms_cudagraph)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
