@@ -713,15 +713,16 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
-            if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
+            if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
+                logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(
                     disable=False,
                     use_hicache=self.enable_hierarchical_cache,
                     req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool=self.token_to_kv_pool_allocator,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     tp_cache_group=self.tp_cpu_group,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
@@ -1702,8 +1703,7 @@ class Scheduler(
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
-            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
-            trace_event_batch("schedule", ret.reqs, attrs=attrs)
+            trace_event_batch("schedule", ret.reqs)
 
         return ret
 
@@ -1968,7 +1968,7 @@ class Scheduler(
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()
             for req in batch.reqs:
-                req.time_stats.prefill_start_time = current_time
+                req.time_stats.prefill_start_time_host = current_time
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
@@ -2077,7 +2077,7 @@ class Scheduler(
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()
             for req in batch.reqs:
-                req.time_stats.prefill_end_time = current_time
+                req.time_stats.prefill_end_time_host = current_time
 
         return ret
 
