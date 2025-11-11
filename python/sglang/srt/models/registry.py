@@ -9,7 +9,12 @@ from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
 
 import torch.nn as nn
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
+
+
+DISABLED_MODEL_ARCHS: tuple[str, ...] = envs.SGLANG_DISABLED_MODEL_ARCHS.get()
 
 
 @dataclass
@@ -91,6 +96,10 @@ def import_model_classes(package_name: str):
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
+            if name.split(".")[-1] in DISABLED_MODEL_ARCHS:
+                logger.debug(f"Skip loading {name} due to SGLANG_DISABLED_MODEL_ARCHS")
+                continue
+
             try:
                 module = importlib.import_module(name)
             except Exception as e:
