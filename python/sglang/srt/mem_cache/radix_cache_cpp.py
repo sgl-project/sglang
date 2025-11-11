@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Set
 
 import torch
@@ -49,6 +50,7 @@ class RadixCacheCpp(BasePrefixCache):
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
+        enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         hicache_oracle: bool = False,
         enable_write_cancel: bool = False,
@@ -75,6 +77,9 @@ class RadixCacheCpp(BasePrefixCache):
         self.page_size = page_size
 
         self.tp_group = tp_cache_group
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         if not use_hicache:
             self.tree = RadixTreeCpp(
@@ -138,9 +143,15 @@ class RadixCacheCpp(BasePrefixCache):
         self.tree.lock_ref(node, True)
 
     def evict(self, num_tokens: int):
+        start_time = time.perf_counter()
         evicted_device_indices = self.tree.evict(num_tokens)
         for indice in evicted_device_indices:
             self.token_to_kv_pool.free(indice)
+        if evicted_device_indices and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(num_tokens)
 
     def evictable_size(self):
         return self.tree.evictable_size()
@@ -154,15 +165,16 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
-        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
-        overall_len = len(token_ids)  # prefill + decode
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :overall_len]
+        kv_committed_len = req.pop_committed_kv_cache()
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        page_aligned_overall_len = overall_len // self.page_size * self.page_size
+        page_aligned_overall_len = kv_committed_len // self.page_size * self.page_size
 
         if is_insert:
             new_prefix_len = self._insert(
@@ -179,7 +191,7 @@ class RadixCacheCpp(BasePrefixCache):
             )
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if page_aligned_overall_len < overall_len:
+        if page_aligned_overall_len < kv_committed_len:
             # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
             self.token_to_kv_pool.free(kv_indices[page_aligned_overall_len:])
 
