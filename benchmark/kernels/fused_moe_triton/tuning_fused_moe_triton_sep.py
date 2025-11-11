@@ -50,7 +50,6 @@ def benchmark_config(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     topk_ids_dir: str,
-    per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
 ) -> float:
@@ -210,7 +209,7 @@ def benchmark_config(
                     use_int8_w8a8=False,
                     use_int8_w8a16=False,
                     use_int4_w4a16=False,
-                    per_channel_quant=per_channel_quant,
+                    per_channel_quant=False,
                     block_shape=block_shape,
                     b_use_tma=moe_use_tma,
                     c_sorted=moe_use_tma,
@@ -248,7 +247,7 @@ def benchmark_config(
                     use_int8_w8a8=False,
                     use_int8_w8a16=False,
                     use_int4_w4a16=False,
-                    per_channel_quant=per_channel_quant,
+                    per_channel_quant=False,
                     block_shape=block_shape,
                     a_use_tma=moe_use_tma,
                     b_use_tma=moe_use_tma,
@@ -345,7 +344,6 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
-        per_channel_quant: bool,
         block_shape: List[int],
         cfg: Dict[str, int],
         topk_ids_dir: str,
@@ -371,7 +369,6 @@ class BenchmarkWorker:
                 use_int8_w8a8,
                 use_int8_w8a16,
                 topk_ids_dir,
-                per_channel_quant,
                 block_shape,
             )
         return cfg, kernel_time
@@ -387,7 +384,6 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
-        per_channel_quant: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
         topk_ids_dir: str,
@@ -410,7 +406,6 @@ class BenchmarkWorker:
                         use_fp8_w8a8,
                         use_int8_w8a8,
                         use_int8_w8a16,
-                        per_channel_quant,
                         topk_ids_dir,
                         block_shape,
                         num_iters=10,
@@ -519,7 +514,6 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
-    per_channel_quant = args.per_channel_quant
 
     topk_ids_dir = args.topk_ids_dir
     if args.batch_size is None:
@@ -607,7 +601,6 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
-        per_channel_quant,
         block_shape,
     )
     print(
@@ -692,10 +685,6 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
-    parser.add_argument(
-        "--per-channel-quant",
-        action="store_true",
-    )
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--configs", type=int, nargs="+", required=False)
     parser.add_argument("--topk-ids-dir", type=str, required=True)
