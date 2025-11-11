@@ -24,10 +24,10 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -46,11 +46,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_deepep_mode,
-    get_moe_a2a_backend,
-    get_moe_runner_backend,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -248,19 +244,6 @@ class HybridSWACompressedMoE(nn.Module):
                 else None
             )
 
-            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
-                router_topk=config.num_experts_per_tok,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.n_routed_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=get_deepep_mode(),
-                async_finish=True,
-                return_recv_hook=True,
-            )
-
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
@@ -284,9 +267,7 @@ class HybridSWACompressedMoE(nn.Module):
                 should_allreduce_fusion,
             )
         else:
-            # todo: implement deepep forward
-            # return self.forward_deepep(hidden_states, forward_batch)
-            raise Exception("forward_deepep branch not implemented yet")
+            return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal(
         self,
@@ -311,7 +292,6 @@ class HybridSWACompressedMoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -326,28 +306,9 @@ class HybridSWACompressedMoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        # final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo(
-        #     hidden_states=hidden_states,
-        #     topk_output=topk_output,
-        #     forward_batch=forward_batch,
-        #     # SBO args
-        #     forward_shared_experts=lambda: None,
-        #     experts=self.experts,
-        # )
-
-        # TODO: check forward_batch
-        final_hidden_states = self.experts(hidden_states, topk_output=topk_output)
-
-        if shared_output is not None:
-            x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
-                x.add_(final_hidden_states)
-            else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-                final_hidden_states *= self.routed_scaling_factor
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
 
         return final_hidden_states
 
@@ -414,6 +375,7 @@ class HybridSWACompressedAttention(nn.Module):
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
             hidden_size,
@@ -528,8 +490,10 @@ class HybridSWACompressedDecoderLayer(nn.Module):
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=add_prefix("self_attn", prefix),
             )
+
         self.is_layer_sparse = self.is_moe_layer(layer_id)
         is_previous_layer_sparse = self.is_moe_layer(layer_id - 1)
+
         if self.is_layer_sparse:
             self.mlp = HybridSWACompressedMoE(
                 config=config,
@@ -551,6 +515,7 @@ class HybridSWACompressedDecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
@@ -591,7 +556,8 @@ class HybridSWACompressedDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
