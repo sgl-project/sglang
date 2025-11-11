@@ -70,10 +70,10 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
 
 3.  **Implement Model Components**:
     - Adapt or implement specific model components in the appropriate directories:
-        - **DiT/Transformer**: Implement in [`runtime/models/dits/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/) - e.g., [`qwen_image.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/qwen_image.py) for Qwen's DiT architecture
-        - **Encoders**: Implement in [`runtime/models/encoders/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/) - e.g., text encoders like [`qwen2_5vl.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/qwen2_5vl.py)
-        - **VAEs**: Implement in [`runtime/models/vaes/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/) - e.g., [`autoencoder_kl_qwenimage.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py)
-        - **Schedulers**: Implement in [`runtime/models/schedulers/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/schedulers/) if needed
+      - **DiT/Transformer**: Implement in [`runtime/models/dits/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/) - e.g., [`qwen_image.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/qwen_image.py) for Qwen's DiT architecture
+      - **Encoders**: Implement in [`runtime/models/encoders/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/) - e.g., text encoders like [`qwen2_5vl.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/qwen2_5vl.py)
+      - **VAEs**: Implement in [`runtime/models/vaes/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/) - e.g., [`autoencoder_kl_qwenimage.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py)
+      - **Schedulers**: Implement in [`runtime/models/schedulers/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/schedulers/) if needed
     - These components handle the core model logic, attention mechanisms, and data transformations specific to the target diffusion model.
 
 4.  **Define Pipeline Class**:
