@@ -21,7 +21,7 @@ from openai import InternalServerError, OpenAI
 
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.test_utils import is_png, is_jpeg, wait_for_port
+from sglang.multimodal_gen.test.test_utils import is_jpeg, is_png, wait_for_port
 
 logger = init_logger(__name__)
 
@@ -167,7 +167,9 @@ def _extract_e2e_ms(records: List[dict]) -> float | None:
     return None
 
 
-def _collect_denoise_step_stats(records: List[dict]) -> tuple[List[float], Dict[int, float]]:
+def _collect_denoise_step_stats(
+    records: List[dict],
+) -> tuple[List[float], Dict[int, float]]:
     """
     Returns:
         durations: flat list of every denoising step duration (ms).
@@ -270,7 +272,9 @@ def server():
             tail = ""
             try:
                 tail = "\n".join(
-                    stdout_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-200:]
+                    stdout_path.read_text(
+                        encoding="utf-8", errors="ignore"
+                    ).splitlines()[-200:]
                 )
             except Exception:
                 pass
@@ -298,7 +302,9 @@ def server():
         tail = ""
         try:
             tail = "\n".join(
-                stdout_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-200:]
+                stdout_path.read_text(encoding="utf-8", errors="ignore").splitlines()[
+                    -200:
+                ]
             )
         except Exception:
             pass
@@ -374,30 +380,34 @@ def test_server_perf_metrics_image(server):
     denoise_durations, avg_per_step = _collect_denoise_step_stats(perf_records)
     assert denoise_durations, "Denoising step timings not found in performance.log"
     avg_denoise_ms = sum(denoise_durations) / len(denoise_durations)
-    assert avg_per_step, "Per-step denoising timings missing; enable step index logging."
+    assert (
+        avg_per_step
+    ), "Per-step denoising timings missing; enable step index logging."
 
     try:
         stdout_text = server["stdout_file"].read_text(encoding="utf-8", errors="ignore")
     except Exception:
         stdout_text = ""
     stage_times = _parse_stage_times(stdout_text)
-    assert stage_times, "No PipelineStage timing entries found�enable stage logging in the server run"
+    assert (
+        stage_times
+    ), "No PipelineStage timing entries found�enable stage logging in the server run"
 
     for stage, expected in EXPECTED_STAGE_MS.items():
         actual = stage_times.get(stage)
         assert actual is not None, f"Stage {stage} timing missing from logs"
         upper_bound = expected * (1 + STAGE_TOLERANCE_RATIO)
-        assert actual <= upper_bound, (
-            f"Stage {stage} took {actual:.2f}ms > allowed {upper_bound:.2f}ms"
-        )
+        assert (
+            actual <= upper_bound
+        ), f"Stage {stage} took {actual:.2f}ms > allowed {upper_bound:.2f}ms"
 
     for idx, expected in EXPECTED_DENOISE_STEP_MS.items():
         actual = avg_per_step.get(idx)
         assert actual is not None, f"Denoise step {idx} timing missing"
         upper_bound = expected * (1 + DENOISE_STEP_TOLERANCE_RATIO)
-        assert actual <= upper_bound, (
-            f"Denoise step {idx} took {actual:.2f}ms > allowed {upper_bound:.2f}ms"
-        )
+        assert (
+            actual <= upper_bound
+        ), f"Denoise step {idx} took {actual:.2f}ms > allowed {upper_bound:.2f}ms"
 
     stage_report = ", ".join(f"{name}:{ms:.2f}ms" for name, ms in stage_times.items())
     per_step_report = ", ".join(

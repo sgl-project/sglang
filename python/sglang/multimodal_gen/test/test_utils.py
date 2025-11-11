@@ -56,13 +56,16 @@ def is_mp4(data):
     idx = data.find(b"ftyp")
     return 0 <= idx <= 32
 
+
 def is_jpeg(data: bytes) -> bool:
     # JPEG files start with: FF D8 FF
     return data.startswith(b"\xff\xd8\xff")
 
+
 def is_png(data):
     # PNG files start with: 89 50 4E 47 0D 0A 1A 0A
     return data.startswith(b"\x89PNG\r\n\x1a\n")
+
 
 def wait_for_port(host="127.0.0.1", port=30010, deadline=300.0, interval=0.5):
     end = time.time() + deadline
