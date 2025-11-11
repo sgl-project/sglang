@@ -38,6 +38,8 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -55,6 +57,7 @@ _is_npu = is_npu()
 
 import triton
 import triton.language as tl
+from contextlib import nullcontext
 
 
 @triton.jit
@@ -349,7 +352,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024 if not _is_npu else 0
+        DUAL_STREAM_TOKEN_THRESHOLD =  0
         seq_len, _ = hidden_states.shape
         if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
             current_stream = torch.cuda.current_stream()
@@ -364,6 +367,23 @@ class Qwen3GatedDeltaNet(nn.Module):
         return projected_states_qkvz, projected_states_ba
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        output = torch.empty_like(hidden_states)
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+            torch.ops.sglang.gdn_with_output(
+                hidden_states,
+                self.layer_id.
+                output,
+            )
+            return output
+        else:
+            return self._forward(hidden_states, forward_batch)
+        
+
+    def _forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -814,7 +834,12 @@ class Qwen3NextModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
                 hidden_states, residual = layer(
                     layer_id=i,
                     positions=positions,
@@ -1024,3 +1049,41 @@ class Qwen3NextForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3NextForCausalLM
+
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils import direct_register_custom_op
+
+def gdn_with_output(
+    hidden_states: torch.Tensor,
+    layer_id: int,
+    output: torch.Tensor,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+
+    ret = attention_layer._forward(hidden_states, forward_batch)
+
+    assert (
+        output.numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
+
+    output.view(ret.shape).copy_(ret)
+    return 
+
+
+def gdn_with_output_fake(
+    hidden_states: torch.Tensor,
+    layer_id: int,
+    output: torch.Tensor,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="gdn_with_output",
+    op_func=gdn_with_output,
+    mutates_args=["output"],
+    fake_impl=gdn_with_output_fake,
+)

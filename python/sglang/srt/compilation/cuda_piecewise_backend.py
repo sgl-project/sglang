@@ -136,7 +136,6 @@ class CUDAPiecewiseBackend:
         if entry.need_to_compile and not entry.compiled:
             entry.compiled = True
             self.to_be_compiled_sizes.remove(runtime_shape)
-            # args are real arguments
             entry.runnable = self.sglang_backend.compiler_manager.compile(
                 self.graph,
                 args,

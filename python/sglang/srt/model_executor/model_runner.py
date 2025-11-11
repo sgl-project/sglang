@@ -349,14 +349,12 @@ class ModelRunner:
                     elif hasattr(layer.self_attn, "attn_mqa"):
                         # For DeepSeek model
                         self.attention_layers.append(layer.self_attn.attn_mqa)
-
+                if hasattr(layer, "attn"):
+                    self.attention_layers.append(layer.attn)
+                if hasattr(layer,"linear_attn"):
+                    self.attention_layers.append(layer.linear_attn)
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
-                # TODO(yuwei): support Non-Standard GQA
-                log_info_on_rank0(
-                    logger,
-                    "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
-                )
-                self.piecewise_cuda_graph_runner = None
+                self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
             else:
                 self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
         else:
