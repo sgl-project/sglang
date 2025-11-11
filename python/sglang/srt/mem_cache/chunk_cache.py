@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -38,7 +38,7 @@ class ChunkCache(BasePrefixCache):
             last_host_node=None,
         )
 
-    def cache_finished_req(self, req: Req):
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx,
             # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
@@ -47,7 +47,7 @@ class ChunkCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         if self.page_size != 1:
             page_ids = torch.unique(kv_indices // self.page_size)
-            self.token_to_kv_pool_allocator.free_page_ids(page_ids)
+            self.token_to_kv_pool_allocator.free_pages(page_ids)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices)
 

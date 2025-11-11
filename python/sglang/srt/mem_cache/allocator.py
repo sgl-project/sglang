@@ -20,7 +20,6 @@ Page-aligned memory pool.
 """
 
 import abc
-import weakref
 from typing import TYPE_CHECKING
 
 import torch
@@ -77,17 +76,17 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.cat(self.free_group))
+            self.free_pages(torch.cat(self.free_group))
 
     def merge_and_sort_free(self):
-          if len(self.release_pages) > 0:
-              # Always merge; only sort in debug mode to save overhead in prod.
-              self.free_pages = torch.cat((self.free_pages, self.release_pages))
-              if getattr(self, "debug_mode", False):
-                  self.free_pages, _ = torch.sort(self.free_pages)
-              self.release_pages = torch.empty(
-                  (0,), dtype=self.release_pages.dtype, device=self.device
-              )
+        if len(self.release_pages) > 0:
+            # Always merge; only sort in debug mode to save overhead in prod.
+            self.free_pages = torch.cat((self.free_pages, self.release_pages))
+            if getattr(self, "debug_mode", False):
+                self.free_pages, _ = torch.sort(self.free_pages)
+            self.release_pages = torch.empty(
+                (0,), dtype=self.release_pages.dtype, device=self.device
+            )
 
     def get_cpu_copy(self, *args, **kwargs):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
@@ -114,6 +113,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
+
+    # New API: free page IDs (default behavior falls back to token-free)
+    def free_pages(self, page_ids: torch.Tensor):
+        # For non-paged allocators, page IDs are effectively token indices
+        self.free(page_ids)
 
 
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -455,11 +459,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         prev = self.page_bitmap.index_select(0, page_ids)
         # Ensure previously allocated
         if not torch.all(prev == 1).item():
-            raise AssertionError("Paged allocator: double-free or free of unallocated page")
+            raise AssertionError(
+                "Paged allocator: double-free or free of unallocated page"
+            )
         self.page_bitmap.index_fill_(0, page_ids, 0)
 
     # ----- New page-granular free API -----
-    def free_page_ids(self, page_ids: torch.Tensor) -> None:
+    def free_pages(self, page_ids: torch.Tensor) -> None:
         """
         Free unique page IDs (1-based). Caller must ensure one entry per freed page.
         """
@@ -469,13 +475,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._mark_pages_freed(page_ids)
         # Append directly without sort/dedup
         if self.is_not_in_free_group:
-            self.release_pages = torch.cat((page_ids.to(self.free_pages.dtype), self.release_pages))
+            self.release_pages = torch.cat(
+                (page_ids.to(self.free_pages.dtype), self.release_pages)
+            )
         else:
-            # In grouped mode, keep collecting token indices; callers should avoid grouping pages.
-            # As a safe fallback, convert page IDs back to token indices for grouping by pushing
-            # one representative token per page (page*page_size). This path is rare.
-            repr_tokens = (page_ids.to(dtype=torch.long) * self.page_size).to(self.device)
-            self.free_group.append(repr_tokens)
+            # Grouping mode: aggregate page IDs directly
+            self.free_group.append(page_ids.to(self.free_pages.dtype))
 
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
@@ -607,7 +612,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Compatibility shim: convert tokens to unique page IDs, then delegate
         page_ids = torch.unique(free_index // self.page_size)
-        self.free_page_ids(page_ids)
+        self.free_pages(page_ids)
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
