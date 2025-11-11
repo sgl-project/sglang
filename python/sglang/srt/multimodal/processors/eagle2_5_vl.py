@@ -1,13 +1,13 @@
 import math
 import os
-from typing import List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoProcessor
 
 from sglang.srt.environ import envs
+from sglang.srt.models.eagle2_5_vl import Eagle2_5_VLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -105,13 +105,14 @@ def resize_image(
 class Eagle2_5_VLProcessor(SGLangBaseProcessor):
     """Multimodal processor for Eagle2.5 Vision-Language Model."""
 
-    def __init__(self, model_path: str, **kwargs):
-        super().__init__(model_path, **kwargs)
+    models = [Eagle2_5_VLForConditionalGeneration]
 
-        # Load the original HF processor
-        self.hf_processor = AutoProcessor.from_pretrained(
-            model_path, trust_remote_code=True, **kwargs
-        )
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        self.model_type = hf_config.model_type
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+
+        # Use the passed processor instead of loading our own
+        self.hf_processor = _processor
 
         # Eagle2.5 specific attributes (NVIDIA's default is 151667)
         self.image_token_index = 151667  # From config
@@ -322,15 +323,15 @@ class Eagle2_5_VLProcessor(SGLangBaseProcessor):
 
         return result
 
-
-# Register the processor
-from sglang.srt.multimodal.customized_mm_processor_utils import (
-    register_customized_processor,
-)
-
-
-@register_customized_processor(Eagle2_5_VLProcessor)
-class Eagle2_5_VLConfig:
-    """Dummy class for processor registration."""
-
-    model_type = "eagle_2_5_vl"
+    async def process_mm_data_async(
+        self,
+        image_data,
+        audio_data,
+        input_text,
+        request_obj,
+        **kwargs,
+    ) -> Optional[Dict[str, Any]]:
+        """Process multimodal data for Eagle2_5_VL."""
+        # For now, return None to indicate no special processing needed
+        # The actual processing happens during tokenization
+        return None
