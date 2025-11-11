@@ -1,6 +1,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Only regenerate if the proto file changes
+    // Only regenerate if proto files change
     println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
+    println!("cargo:rerun-if-changed=src/proto/vllm_engine.proto");
 
     // Configure tonic-prost-build for gRPC code generation
     tonic_prost_build::configure()
@@ -9,10 +10,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         // Allow proto3 optional fields
         .protoc_arg("--experimental_allow_proto3_optional")
-        // Compile the proto file
-        .compile_protos(&["src/proto/sglang_scheduler.proto"], &["src/proto"])?;
+        // Compile both proto files
+        .compile_protos(
+            &[
+                "src/proto/sglang_scheduler.proto",
+                "src/proto/vllm_engine.proto",
+            ],
+            &["src/proto"],
+        )?;
 
-    println!("cargo:warning=Protobuf compilation completed successfully");
+    println!("cargo:warning=Protobuf compilation completed successfully (sglang + vllm)");
 
     Ok(())
 }
