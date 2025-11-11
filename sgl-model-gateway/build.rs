@@ -12,6 +12,7 @@ macro_rules! set_env {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rebuild triggers
+    println!("cargo:rerun-if-changed=src/ha/proto/gossip.proto");
     println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
     println!("cargo:rerun-if-changed=src/proto/vllm_engine.proto");
     println!("cargo:rerun-if-changed=Cargo.toml");
