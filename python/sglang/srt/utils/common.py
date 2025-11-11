@@ -1831,7 +1831,8 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
             "."
         )
-        major, minor = int(major), int(minor)
+        # Currently XPU version does not contain capability information.
+        major, minor = None, None
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         try:
@@ -2980,7 +2981,7 @@ def configure_gc_logger():
 
 
 # COPIED FROM DeepGEMM
-def align(x: int, y: int) -> int:
+def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
