@@ -43,7 +43,6 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
 ## Installation
-
 ### Prerequisites
 - **Rust and Cargo**
   ```bash
@@ -87,7 +86,6 @@ pip install --force-reinstall dist/*.whl
 > **Note:** Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
 ## Quick Start
-
 ### Regular HTTP Routing
 - **Rust binary**
   ```bash
