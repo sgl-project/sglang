@@ -148,7 +148,8 @@ class RadixCacheCpp(BasePrefixCache):
         for indice in evicted_device_indices:
             self.token_to_kv_pool_allocator.free(indice)
 
-        self.update_eviction_metrics(len(evicted_device_indices), start_time)
+        # FIXME: not sure about the real evict length here
+        self.update_eviction_metrics(num_tokens, start_time)
 
     def evictable_size(self):
         return self.tree.evictable_size()
