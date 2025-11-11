@@ -48,7 +48,6 @@ class TestSWA(unittest.TestCase):
             dtype=dtype,
             device=device,
             kvcache=pool,
-            need_sort=False,
         )
         self.assertEqual(
             alloc.full_available_size() + alloc.swa_available_size(), size + size_swa
@@ -106,7 +105,6 @@ class TestSWA(unittest.TestCase):
             dtype=dtype,
             device=device,
             kvcache=kv_pool,
-            need_sort=False,
         )
         # setup radix cache
         tree = SWARadixCache(
@@ -237,7 +235,6 @@ class TestSWA(unittest.TestCase):
             dtype=dtype,
             device=device,
             kvcache=kv_pool,
-            need_sort=False,
         )
         # setup radix cache
         tree = SWARadixCache(

@@ -1578,6 +1578,9 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def _get_token_info(self):
+        # Make staged frees visible before measuring
+        if hasattr(self.token_to_kv_pool_allocator, "merge_and_sort_free"):
+            self.token_to_kv_pool_allocator.merge_and_sort_free()
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
@@ -1586,6 +1589,9 @@ class Scheduler(
 
     def _get_mamba_token_info(self):
         is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
+        # Make staged frees visible before measuring
+        if hasattr(self.token_to_kv_pool_allocator, "merge_and_sort_free"):
+            self.token_to_kv_pool_allocator.merge_and_sort_free()
         full_available_size = self.token_to_kv_pool_allocator.available_size()
         full_evictable_size = (
             self.tree_cache.full_evictable_size() if is_radix_tree else 0

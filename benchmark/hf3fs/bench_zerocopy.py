@@ -67,7 +67,6 @@ token_to_kv_pool_allocator = TokenToKVPoolAllocator(
     dtype=kv_cache_dtype,
     device=device,
     kvcache=token_to_kv_pool,
-    need_sort=False,
 )
 
 kv_cache = token_to_kv_pool_allocator.get_kvcache()
