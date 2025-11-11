@@ -419,6 +419,7 @@ class NgramVerifyInput(SpecInput):
             self._greedy_verify(batch, logits_output)
         else:
             # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
+            logger.warning("Currently Ngram speculative sampling forces to use greedy verification.")
             self._greedy_verify(batch, logits_output)
             # self._sampling_verify(batch, logits_output, sampling_info)
 
