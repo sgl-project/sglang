@@ -318,7 +318,7 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req):
+    def cache_unfinished_req(self, req: Req, chunked: bool = False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
