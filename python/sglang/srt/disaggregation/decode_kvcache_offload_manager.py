@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    pass
+    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
