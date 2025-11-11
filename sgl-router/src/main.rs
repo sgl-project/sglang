@@ -4,15 +4,14 @@ use clap::{ArgAction, Parser, ValueEnum};
 use sglang_router_rs::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig, RouterConfig,
-        RoutingMode, TokenizerCacheConfig,
+        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
+        RouterConfig, RoutingMode, TokenizerCacheConfig,
     },
     core::ConnectionMode,
     metrics::PrometheusConfig,
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
 };
-
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
     let mut prefill_entries = Vec::new();
@@ -283,7 +282,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 52428800)]
     tokenizer_cache_l1_max_memory: usize,
 
-    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle"])]
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres"])]
     history_backend: String,
 
     #[arg(long, env = "ATP_WALLET_PATH")]
@@ -309,6 +308,12 @@ struct CliArgs {
 
     #[arg(long, env = "ATP_POOL_TIMEOUT_SECS")]
     oracle_pool_timeout_secs: Option<u64>,
+
+    #[arg(long)]
+    postgres_db_url: Option<String>,
+
+    #[arg(long)]
+    postgres_pool_max_size: Option<usize>,
 
     #[arg(long)]
     reasoning_parser: Option<String>,
@@ -446,6 +451,18 @@ impl CliArgs {
         })
     }
 
+    fn build_postgres_config(&self) -> ConfigResult<PostgresConfig> {
+        let db_url = self.postgres_db_url.clone().unwrap_or_default();
+        let pool_max = self
+            .postgres_pool_max_size
+            .unwrap_or_else(PostgresConfig::default_pool_max);
+        let pcf = PostgresConfig { db_url, pool_max };
+        pcf.validate().map_err(|e| ConfigError::ValidationFailed {
+            reason: e.to_string(),
+        })?;
+        Ok(pcf)
+    }
+
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -532,11 +549,17 @@ impl CliArgs {
         let history_backend = match self.history_backend.as_str() {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
+            "postgres" => HistoryBackend::Postgres,
             _ => HistoryBackend::Memory,
         };
 
         let oracle = if history_backend == HistoryBackend::Oracle {
             Some(self.build_oracle_config()?)
+        } else {
+            None
+        };
+        let postgres = if history_backend == HistoryBackend::Postgres {
+            Some(self.build_postgres_config()?)
         } else {
             None
         };
@@ -595,6 +618,7 @@ impl CliArgs {
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
+            .maybe_postgres(postgres)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())

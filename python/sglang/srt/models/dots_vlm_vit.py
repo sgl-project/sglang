@@ -310,6 +310,7 @@ class DotsVisionTransformer(PreTrainedModel):
     def forward(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, bf16=True
     ) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.device)
         if bf16:
             hidden_states = hidden_states.bfloat16()
         hidden_states = self.patch_embed(hidden_states, grid_thw)

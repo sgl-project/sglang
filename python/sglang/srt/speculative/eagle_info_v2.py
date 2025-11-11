@@ -129,6 +129,10 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
+        for i, req in enumerate(batch.reqs):
+            req.kv_committed_len = batch.seq_lens_cpu[i].item()
+            req.kv_allocated_len = req.kv_committed_len + self.ALLOC_LEN_PER_DECODE
+
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
