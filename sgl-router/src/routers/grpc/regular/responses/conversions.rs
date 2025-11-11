@@ -38,7 +38,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     // 1. Add system message if instructions provided
     if let Some(instructions) = &req.instructions {
         messages.push(ChatMessage::System {
-            content: instructions.clone(),
+            content: MessageContent::Text(instructions.clone()),
             name: None,
         });
     }
@@ -223,7 +223,7 @@ fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
             reasoning_content: None,
         },
         "system" => ChatMessage::System {
-            content: text,
+            content: MessageContent::Text(text),
             name: None,
         },
         _ => {

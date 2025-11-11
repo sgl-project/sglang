@@ -1038,7 +1038,7 @@ mod tests {
     fn test_transform_messages_multiple_messages() {
         let messages = vec![
             ChatMessage::System {
-                content: "System prompt".to_string(),
+                content: MessageContent::Text("System prompt".to_string()),
                 name: None,
             },
             ChatMessage::User {

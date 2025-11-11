@@ -11,7 +11,10 @@ fn test_chat_message_tagged_by_role_system() {
     let msg: ChatMessage = serde_json::from_value(json).unwrap();
     match msg {
         ChatMessage::System { content, .. } => {
-            assert_eq!(content, "You are a helpful assistant");
+            assert_eq!(
+                content,
+                MessageContent::Text("You are a helpful assistant".to_string())
+            )
         }
         _ => panic!("Expected System variant"),
     }

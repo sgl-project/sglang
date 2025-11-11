@@ -118,7 +118,7 @@ fn test_llama_style_template() {
 
     let messages = [
         ChatMessage::System {
-            content: "You are a helpful assistant".to_string(),
+            content: MessageContent::Text("You are a helpful assistant".to_string()),
             name: None,
         },
         ChatMessage::User {

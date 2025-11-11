@@ -704,7 +704,7 @@ impl HarmonyBuilder {
                         },
                         recipient: None,
                         content: vec![Content::Text(TextContent {
-                            text: content.clone(),
+                            text: content.to_simple_string(),
                         })],
                         channel: None,
                         content_type: None,

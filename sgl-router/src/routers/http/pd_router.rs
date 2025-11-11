@@ -1102,7 +1102,7 @@ impl RouterTrait for PDRouter {
                     MessageContent::Text(text) => Some(text.clone()),
                     MessageContent::Parts(_) => None,
                 },
-                ChatMessage::System { content, .. } => Some(content.clone()),
+                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
                 _ => None,
             })
         } else {

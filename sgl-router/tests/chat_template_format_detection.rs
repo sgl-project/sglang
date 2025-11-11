@@ -176,7 +176,7 @@ assistant:
 
     let messages = [
         ChatMessage::System {
-            content: "You are helpful".to_string(),
+            content: MessageContent::Text("You are helpful".to_string()),
             name: None,
         },
         ChatMessage::User {

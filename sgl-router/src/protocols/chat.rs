@@ -19,7 +19,7 @@ use crate::protocols::validated::Normalizable;
 pub enum ChatMessage {
     #[serde(rename = "system")]
     System {
-        content: String,
+        content: MessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -604,7 +604,7 @@ impl GenerationRequest for ChatCompletionRequest {
         self.messages
             .iter()
             .filter_map(|msg| match msg {
-                ChatMessage::System { content, .. } => Some(content.clone()),
+                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
                 ChatMessage::User { content, .. } => Some(content.to_simple_string()),
                 ChatMessage::Assistant {
                     content,
