@@ -1122,7 +1122,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         backend = (
             FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
         )
-        out = torch.ops.sglang.fp4_gemm(
+        out = _sglang_fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
