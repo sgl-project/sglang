@@ -486,7 +486,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         topk_ids,
         topk_weights,
         num_recv_tokens_per_expert,
-    ) = dispatch_output
+    ) = dispatch_output.hidden_states, dispatch_output.hidden_states_scale, dispatch_output.topk_ids, dispatch_output.topk_weights, dispatch_output.num_recv_tokens_per_expert
     assert runner_config.activation == "silu"
 
     all_tokens = sum(num_recv_tokens_per_expert)
@@ -503,6 +503,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
+    
+    print(f"pre_permute_deepep_normal_to_deep_gemm: (num_recv_tokens_per_expert, all_tokens): {num_recv_tokens_per_expert, all_tokens}")
 
     input_tensor = torch.empty(
         (all_tokens, K),
@@ -601,6 +603,21 @@ def pre_permute_pplx_to_deep_gemm(
     running_state: dict,
 ) -> DeepGemmRunnerInput:
     
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalDispatchOutput
+    
+    print(f"[2] dispatch_output.num_recv_tokens_per_expert: {dispatch_output.num_recv_tokens_per_expert}")
+    
+    dispatch_output: DeepEPNormalDispatchOutput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=dispatch_output.hidden_states_scale,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+        num_recv_tokens_per_expert=dispatch_output.num_recv_tokens_per_expert,
+    )
+    
+    return pre_permute_deepep_normal_to_deep_gemm(dispatch_output, quant_info, runner_config, running_state)
+    
+    """
     from sglang.srt.layers.moe.ep_moe.kernels import compute_m_indices
 
     (
@@ -625,6 +642,9 @@ def pre_permute_pplx_to_deep_gemm(
     running_state["topk_weights"] = topk_weights
 
     m_indices = torch.full((hidden_states.shape[0],), -1, device=hidden_states.device, dtype=torch.int32)
+    
+    print("num_recv_tokens_per_expert:", num_recv_tokens_per_expert)
+    print("m_indices:", m_indices.shape)
     compute_m_indices(num_recv_tokens_per_expert, m_indices)
 
     return DeepGemmRunnerInput(
@@ -633,6 +653,7 @@ def pre_permute_pplx_to_deep_gemm(
         use_masked_gemm=False,
         m_indices=m_indices,
     )
+    """
 
 
 @register_post_permute("deep_gemm", "pplx")
@@ -643,9 +664,19 @@ def post_permute_deep_gemm_to_pplx(
     running_state: dict,
 ) -> PplxCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.pplx import PplxCombineInput
+    
+    combine_input = post_permute_deep_gemm_to_deepep_normal(runner_output, quant_info, runner_config, running_state)
 
+    """
     return PplxCombineInput(
         hidden_states=runner_output.hidden_states,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+    )
+    """
+    
+    return PplxCombineInput(
+        hidden_states=combine_input.hidden_states,
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
     )

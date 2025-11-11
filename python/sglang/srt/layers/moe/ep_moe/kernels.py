@@ -664,7 +664,7 @@ def compute_m_indices(
         BLOCK_E=BLOCK_E,
         BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
     )
-    print(num_recv_tokens_per_expert, m_indices)
+    # print(num_recv_tokens_per_expert, m_indices)
     return
 
 
