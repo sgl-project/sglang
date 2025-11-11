@@ -6,7 +6,7 @@ use proto::DisaggregatedParams;
 use rand::Rng;
 use tracing::debug;
 
-use crate::{core::Worker, grpc_client::proto};
+use crate::{core::Worker, grpc_client::sglang_proto as proto};
 
 /// Inject PD bootstrap metadata into a gRPC request
 ///

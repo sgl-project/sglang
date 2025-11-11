@@ -10,7 +10,7 @@ use serde_json::Value;
 use tracing::error;
 
 use crate::{
-    grpc_client::proto,
+    grpc_client::sglang_proto as proto,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},

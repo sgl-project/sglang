@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::{chat::ChatRequestBuildingStage, generate::GenerateRequestBuildingStage};
 use crate::{
-    grpc_client::proto,
+    grpc_client::sglang_proto as proto,
     routers::grpc::{
         common::stages::PipelineStage,
         context::{RequestContext, RequestType},

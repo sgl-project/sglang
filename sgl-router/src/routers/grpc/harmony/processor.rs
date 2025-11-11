@@ -8,7 +8,7 @@ use tracing::error;
 
 use super::HarmonyParserAdapter;
 use crate::{
-    grpc_client::proto,
+    grpc_client::sglang_proto as proto,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{ToolCall, Usage},

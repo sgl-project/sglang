@@ -22,7 +22,7 @@ use super::{
     processor::ResponsesIterationResult, types::HarmonyChannelDelta, HarmonyParserAdapter,
 };
 use crate::{
-    grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
+    grpc_client::{sglang_proto as proto, sglang_scheduler::AbortOnDropStream},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,

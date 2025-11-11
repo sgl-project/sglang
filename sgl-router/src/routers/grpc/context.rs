@@ -11,7 +11,9 @@ use serde_json::Value;
 
 use crate::{
     core::Worker,
-    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
+    grpc_client::{
+        sglang_proto as proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient,
+    },
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::{GenerateRequest, GenerateResponse},

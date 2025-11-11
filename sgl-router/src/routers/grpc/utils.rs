@@ -11,7 +11,9 @@ use uuid::Uuid;
 use super::{error, ProcessedMessages};
 use crate::{
     core::Worker,
-    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
+    grpc_client::{
+        sglang_proto as proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient,
+    },
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{

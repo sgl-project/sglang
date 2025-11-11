@@ -6,7 +6,7 @@ use tracing::error;
 
 use super::PipelineStage;
 use crate::{
-    grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
+    grpc_client::{sglang_proto as proto, sglang_scheduler::AbortOnDropStream},
     routers::grpc::{
         context::{ClientSelection, ExecutionResult, RequestContext},
         error,

@@ -1,6 +1,6 @@
 //! gRPC router implementations
 
-use crate::{grpc_client::proto, protocols::common::StringOrArray};
+use crate::{grpc_client::sglang_proto as proto, protocols::common::StringOrArray};
 
 pub mod common;
 pub mod context;

@@ -6,7 +6,7 @@
 use axum::response::Response;
 
 use crate::{
-    grpc_client::proto,
+    grpc_client::sglang_proto as proto,
     routers::grpc::{context::ExecutionResult, error, utils},
 };
 
