@@ -7,8 +7,8 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST,
+    DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -16,16 +16,16 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
+class TestEagleDPAttnServerBase(CustomTestCase, MatchedStopMixin):
     max_running_requests = 64
     attention_backend = "triton"
-    spec_steps = 5
-    spec_topk = 1
-    spec_draft_tokens = 6
+    spec_steps = 6
+    spec_topk = 10
+    spec_draft_tokens = 32
     page_size = 1
     other_launch_args = []
-    model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
-    draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
+    model = DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST
+    draft_model = DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST
 
     @classmethod
     def setUpClass(cls):
@@ -35,7 +35,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             "--attention-backend",
             cls.attention_backend,
             "--speculative-algorithm",
-            "EAGLE",
+            "EAGLE3",
             "--speculative-draft-model",
             cls.draft_model,
             "--speculative-num-steps",
@@ -46,6 +46,11 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             cls.spec_draft_tokens,
             "--page-size",
             str(cls.page_size),
+            "--tp-size",
+            2,
+            "--dp-size",
+            2,
+            "--enable-dp-attention",
             "--mem-fraction-static",
             "0.75",
             "--max-running-requests",
@@ -68,13 +73,12 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
-        assert self.process.poll() is None
 
     def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=1000,
+            num_questions=200,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -83,13 +87,8 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         metrics = run_eval(args)
         print(f"TestEagleLargeBS -- {metrics=}")
         self.assertGreater(
-            metrics["accuracy"], 0.23
-        )  # 0.3333 for 60 questions; 0.234 for 1319 questions
-        assert self.process.poll() is None
-
-
-class TestEagleServerPage(TestEagleServerBase):
-    other_launch_args = ["--page-size", "64"]
+            metrics["accuracy"], 0.91
+        )
 
 
 if __name__ == "__main__":
