@@ -163,6 +163,7 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
         )
+        self.quant_config = getattr(self.model_runner.model, "quant_config", None)
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
@@ -263,7 +264,9 @@ class PiecewiseCudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        with set_forward_context(forward_batch, self.attention_layers):
+        with set_forward_context(
+            forward_batch, self.attention_layers, self.quant_config
+        ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -405,7 +408,9 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
-            with set_forward_context(forward_batch, self.attention_layers):
+            with set_forward_context(
+                forward_batch, self.attention_layers, self.quant_config
+            ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
@@ -503,7 +508,9 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
-            with set_forward_context(static_forward_batch, self.attention_layers):
+            with set_forward_context(
+                static_forward_batch, self.attention_layers, self.quant_config
+            ):
                 with set_compiled(True):
                     output = self.model_runner.model.forward(
                         static_forward_batch.input_ids,

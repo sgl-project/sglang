@@ -73,6 +73,7 @@ class LMCRadixCache(RadixCache):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
+        enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         model_config: Optional["ModelConfig"] = None,
         tp_size: int = 1,
@@ -85,6 +86,7 @@ class LMCRadixCache(RadixCache):
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             page_size=page_size,
             disable=disable,
+            enable_metrics=enable_metrics,
             enable_kv_cache_events=enable_kv_cache_events,
             eviction_policy=eviction_policy,
         )
@@ -217,16 +219,17 @@ class LMCRadixCache(RadixCache):
 
         return base_res
 
-    def cache_finished_req(self, req: "Req", is_insert: bool = True) -> None:  # type: ignore[override]
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
         """On request completion, insert device KV into radix and store to LMCache."""
 
         super().cache_finished_req(req, is_insert=is_insert)
         if not is_insert:
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        kv_committed_len = req.pop_committed_kv_cache()
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_committed_len
         ]
 
         _, new_last_node, _, _ = self.match_prefix(RadixKey(token_ids, req.extra_key))
