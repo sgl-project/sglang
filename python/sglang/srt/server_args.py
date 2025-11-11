@@ -1064,7 +1064,7 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["Qwen3NextForCausalLM"]:
-            if self.disable_radix_cache == False:
+            if not self.disable_radix_cache:
                 logger.warning(
                     "Disabling overlap schedule since MambaRadixCache is not compatible with "
                     "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
