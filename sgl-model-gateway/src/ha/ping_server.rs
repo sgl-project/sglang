@@ -10,16 +10,21 @@ use super::{
         self,
         gossip_server::{Gossip, GossipServer},
         GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq,
-        StreamMessage, StreamMessageType, IncrementalUpdate, SnapshotRequest, SnapshotChunk, StreamAck, StoreType,
+        StreamMessage, StreamMessageType, IncrementalUpdate, SnapshotRequest, SnapshotChunk, StreamAck,
         StateUpdate,
     },
     try_ping, ClusterState,
-    stores::{StateStores, MembershipStore, AppStore, WorkerStore, PolicyStore},
+    stores::{StateStores, MembershipStore, AppStore, WorkerStore, PolicyStore, StoreType as LocalStoreType},
     crdt::SKey,
     sync::HASyncManager,
+    metrics::{
+        record_batch_received, record_batch_sent, record_ack, record_nack,
+        record_snapshot_trigger, record_snapshot_duration, record_snapshot_bytes,
+        update_peer_connections, record_peer_reconnect, ConvergenceTracker,
+    },
 };
 use futures::Stream;
-use std::pin::Pin;
+use std::{pin::Pin, time::Instant};
 use tokio_stream::StreamExt;
 use serde::{Serialize, Deserialize};
 
@@ -36,7 +41,7 @@ impl GossipService {
     /// Create snapshot chunks for a store
     async fn create_snapshot_chunks(
         &self,
-        store_type: StoreType,
+        store_type: LocalStoreType,
         chunk_size: usize,
     ) -> Vec<SnapshotChunk> {
         // TODO: Implement actual snapshot generation from state stores
@@ -170,7 +175,7 @@ impl Gossip for GossipService {
                         match msg.message_type() {
                             StreamMessageType::IncrementalUpdate => {
                                 if let Some(gossip::stream_message::Payload::Incremental(update)) = &msg.payload {
-                                    let store_type = StoreType::try_from(update.store).unwrap_or(StoreType::Membership);
+                                    let store_type = LocalStoreType::from_proto(update.store);
                                     log::info!("Received incremental update from {}: store={:?}, {} updates", 
                                         peer_id, store_type, update.updates.len());
                                     
@@ -180,13 +185,13 @@ impl Gossip for GossipService {
                                     if let Some(ref sync_manager) = sync_manager {
                                         for state_update in &update.updates {
                                             match store_type {
-                                                StoreType::Worker => {
+                                                LocalStoreType::Worker => {
                                                     // Deserialize and apply worker state
                                                     if let Ok(worker_state) = serde_json::from_slice::<super::stores::WorkerState>(&state_update.value) {
                                                         sync_manager.apply_remote_worker_state(worker_state);
                                                     }
                                                 }
-                                                StoreType::Policy => {
+                                                LocalStoreType::Policy => {
                                                     // Deserialize and apply policy state
                                                     if let Ok(policy_state) = serde_json::from_slice::<super::stores::PolicyState>(&state_update.value) {
                                                         sync_manager.apply_remote_policy_state(policy_state);
@@ -215,17 +220,25 @@ impl Gossip for GossipService {
                             }
                             StreamMessageType::SnapshotRequest => {
                                 if let Some(gossip::stream_message::Payload::SnapshotRequest(req)) = &msg.payload {
-                                    let store_type = StoreType::try_from(req.store).unwrap_or(StoreType::Membership);
+                                    let store_type = LocalStoreType::from_proto(req.store);
+                                    let store_name = store_type.as_str();
                                     log::info!("Received snapshot request from {}: store={:?}, from_version={}", 
                                         peer_id, store_type, req.from_version);
+                                    
+                                    record_snapshot_trigger(store_name, "request");
+                                    let snapshot_start = Instant::now();
                                     
                                     // Generate and send snapshot chunks
                                     // TODO: Implement actual snapshot generation
                                     // For now, send empty chunks
-                                    let chunks = vec![];
+                                    let chunks: Vec<SnapshotChunk> = vec![];
                                     let total_chunks = chunks.len() as u64;
+                                    let mut total_bytes = 0;
                                     
                                     for (idx, chunk) in chunks.into_iter().enumerate() {
+                                        let chunk_bytes = chunk.entries.iter().map(|e| e.value.len()).sum::<usize>();
+                                        total_bytes += chunk_bytes;
+                                        
                                         let mut chunk_msg = StreamMessage {
                                             message_type: StreamMessageType::SnapshotChunk as i32,
                                             payload: Some(gossip::stream_message::Payload::SnapshotChunk(chunk)),
@@ -242,6 +255,9 @@ impl Gossip for GossipService {
                                             break;
                                         }
                                     }
+                                    
+                                    record_snapshot_duration(store_name, snapshot_start.elapsed());
+                                    record_snapshot_bytes(store_name, "sent", total_bytes);
                                     
                                     // Send snapshot complete message
                                     let complete = StreamMessage {
@@ -265,6 +281,7 @@ impl Gossip for GossipService {
                                         sequence,
                                         peer_id: self_name.clone(),
                                     };
+                                    record_ack(&peer_id, true);
                                     if tx.send(Ok(ack)).await.is_err() {
                                         break;
                                     }
@@ -272,10 +289,15 @@ impl Gossip for GossipService {
                             }
                             StreamMessageType::SnapshotChunk => {
                                 if let Some(gossip::stream_message::Payload::SnapshotChunk(chunk)) = &msg.payload {
+                                    let store_type = LocalStoreType::from_proto(chunk.store);
+                                    let store_name = store_type.as_str();
                                     log::info!("Received snapshot chunk from {}: store={:?}, chunk={}/{}", 
-                                        peer_id,
-                                        StoreType::try_from(chunk.store).unwrap_or(StoreType::Membership),
-                                        chunk.chunk_index, chunk.total_chunks);
+                                        peer_id, store_type, chunk.chunk_index, chunk.total_chunks);
+                                    
+                                    // Record metrics
+                                    let chunk_bytes: usize = chunk.entries.iter().map(|e| e.value.len()).sum();
+                                    record_snapshot_bytes(store_name, "received", chunk_bytes);
+                                    
                                     // TODO: Apply snapshot chunks
                                     let ack = StreamMessage {
                                         message_type: StreamMessageType::Ack as i32,
@@ -287,6 +309,7 @@ impl Gossip for GossipService {
                                         sequence,
                                         peer_id: self_name.clone(),
                                     };
+                                    record_ack(&peer_id, true);
                                     if tx.send(Ok(ack)).await.is_err() {
                                         break;
                                     }
@@ -294,6 +317,9 @@ impl Gossip for GossipService {
                             }
                             StreamMessageType::Ack => {
                                 log::debug!("Received ACK from {}: sequence={}", peer_id, msg.sequence);
+                                if let Some(gossip::stream_message::Payload::Ack(ack)) = &msg.payload {
+                                    record_ack(&peer_id, ack.success);
+                                }
                             }
                             StreamMessageType::Heartbeat => {
                                 // Send heartbeat back
@@ -314,11 +340,15 @@ impl Gossip for GossipService {
                     }
                     Err(e) => {
                         log::error!("Error receiving stream message: {}", e);
+                        record_nack(&peer_id);
+                        update_peer_connections(&peer_id, false);
+                        record_peer_reconnect(&peer_id);
                         break;
                     }
                 }
             }
             log::info!("Stream from {} closed", peer_id);
+            update_peer_connections(&peer_id, false);
         });
 
         // Convert receiver to stream

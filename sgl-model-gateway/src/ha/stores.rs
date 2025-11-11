@@ -30,6 +30,17 @@ impl StoreType {
             StoreType::Policy => "policy",
         }
     }
+
+    /// Convert from proto StoreType (i32) to local StoreType
+    pub fn from_proto(proto_value: i32) -> Self {
+        match proto_value {
+            0 => StoreType::Membership,
+            1 => StoreType::App,
+            2 => StoreType::Worker,
+            3 => StoreType::Policy,
+            _ => StoreType::Membership, // Default fallback
+        }
+    }
 }
 
 /// Membership state entry

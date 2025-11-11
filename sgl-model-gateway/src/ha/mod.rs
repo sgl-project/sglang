@@ -1,10 +1,13 @@
 pub mod controller;
 pub mod crdt;
 pub mod endpoints;
+pub mod metrics;
+pub mod mtls;
 mod ping_server;
 pub mod service;
 pub mod stores;
 pub mod sync;
+pub mod topology;
 
 pub use crdt::{CRDTMap, CRDTPNCounter, SKey, SyncCRDTMap, SyncPNCounter};
 pub use service::{broadcast_node_states, gossip, try_ping, ClusterState};
