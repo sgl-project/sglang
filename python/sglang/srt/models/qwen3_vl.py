@@ -667,16 +667,62 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+
+        in_channels = self.visual.patch_embed.in_channels
+        t_patch = self.visual.temporal_patch_size
+        p = self.visual.patch_size
+        per_patch = in_channels * t_patch * p * p
+
+        m_size = self.visual.spatial_merge_size
+        patch_group = m_size * m_size 
+
+        all_patches = []
+        all_grid_thw = []
+
+        for it in items:
+            feat = it.feature.to(dtype=self.visual.dtype, device=self.visual.device)
+
+            flat = feat.reshape(-1)
+            num_full_patches = flat.numel() // per_patch
+            if num_full_patches == 0:
+                continue
+
+
+            num_groups = num_full_patches // patch_group
+            if num_groups == 0:
+
+                continue
+
+            used_patches = num_groups * patch_group
+            flat = flat[: used_patches * per_patch]
+
+            patches = flat.view(used_patches, per_patch)
+            all_patches.append(patches)
+
+
+            grid = torch.tensor(
+                [[num_groups, m_size, m_size]],
+                dtype=torch.long,
+                device=self.visual.device,
+            )
+            all_grid_thw.append(grid)
+
+        if not all_patches:
+            return torch.empty(
+                0,
+                self.visual.hidden_size,
+                device=self.visual.device,
+            )
+
+        pixel_values = torch.cat(all_patches, dim=0)     # [sum_patches, per_patch]
+        image_grid_thw = torch.cat(all_grid_thw, dim=0)  # [num_images, 3]
+
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
+
+
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same

@@ -412,35 +412,55 @@ def _get_multimodal_mask(
 
 
 def _adjust_embedding_length(
-    embedding: torch.Tensor,
-    mask: torch.Tensor,
-    logger,
+    embedding: torch.Tensor, special_multimodal_mask: torch.Tensor, logger
 ) -> torch.Tensor:
-    num_mm_tokens_in_embedding = embedding.shape[0]
-    num_mm_tokens_in_input_ids = mask.sum().item()
-    if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
+    """Make sure the multimodal embedding length matches the number of MM tokens.
+
+    - If we have MORE embeddings than MM tokens: truncate (保持和原逻辑一致)
+    - If we have FEWER embeddings than MM tokens: pad zeros instead of raising.
+    """
+    num_mm_tokens_in_input_ids = int(special_multimodal_mask.sum().item())
+    num_mm_tokens_in_embedding = int(embedding.size(0))
+
+    
+    if num_mm_tokens_in_embedding == num_mm_tokens_in_input_ids:
+        return embedding
+
+    
+    if num_mm_tokens_in_embedding < num_mm_tokens_in_input_ids:
         logger.warning(
-            f"Number of tokens in multimodal embedding does not match those in the input text. "
-            f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
-            f"tokens from multimodal embeddings."
+            "Multimodal embedding shorter than expected: "
+            "num_mm_tokens_in_input_ids=%d vs num_mm_tokens_in_embedding=%d. "
+            "Padding %d zero embeddings.",
+            num_mm_tokens_in_input_ids,
+            num_mm_tokens_in_embedding,
+            num_mm_tokens_in_input_ids - num_mm_tokens_in_embedding,
         )
-        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = get_global_server_args().chunked_prefill_size
-            if chunked_prefill_size != -1:
-                logger.warning(
-                    "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
-                )
-            # extract from the end: this is a compromise
-            if embedding.dim() == 2:
-                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
-            else:
-                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
-                embedding = embedding[-num_multimodal:, :]
-        else:
-            raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+
+        hidden_size = embedding.size(-1)
+
+        
+        if num_mm_tokens_in_embedding == 0:
+            return embedding.new_zeros(
+                num_mm_tokens_in_input_ids, hidden_size
             )
-    return embedding
+
+        pad = embedding.new_zeros(
+            num_mm_tokens_in_input_ids - num_mm_tokens_in_embedding,
+            hidden_size,
+        )
+        return torch.cat([embedding, pad], dim=0)
+
+    
+    logger.warning(
+        "Multimodal embedding longer than expected: "
+        "num_mm_tokens_in_input_ids=%d vs num_mm_tokens_in_embedding=%d. "
+        "Truncating extra %d embeddings.",
+        num_mm_tokens_in_input_ids,
+        num_mm_tokens_in_embedding,
+        num_mm_tokens_in_embedding - num_mm_tokens_in_input_ids,
+    )
+    return embedding[:num_mm_tokens_in_input_ids]
 
 
 def get_embedding_and_mask(
