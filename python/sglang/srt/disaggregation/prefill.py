@@ -321,8 +321,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.prepare_mlp_sync_batch(batch)
 
         if batch:
-            attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
-            trace_event_batch("schedule", batch.reqs, attrs=attrs)
+            trace_event_batch("schedule", batch.reqs)
 
         return batch
 
