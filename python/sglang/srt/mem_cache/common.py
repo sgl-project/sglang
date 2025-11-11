@@ -485,7 +485,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     ]
     if page_size > 1:
         page_ids = torch.unique(indices_to_free // page_size + 1)
-        tree_cache.token_to_kv_pool_allocator.free_pages(page_ids)
+        tree_cache.token_to_kv_pool_allocator.free_page_ids(page_ids)
     else:
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 

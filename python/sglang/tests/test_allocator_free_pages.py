@@ -32,7 +32,7 @@ def test_free_pages_append_only_no_debug():
     # Start with empty release list
     alloc.release_pages = torch.empty((0,), dtype=torch.int64, device=alloc.device)
     pages = torch.tensor([2, 5, 7], dtype=torch.int64, device=alloc.device)
-    alloc.free_pages(pages)
+    alloc.free_page_ids(pages)
     assert torch.equal(alloc.release_pages, pages)
 
 

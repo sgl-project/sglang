@@ -275,7 +275,7 @@ class RadixCache(BasePrefixCache):
                 ]
                 if self.page_size != 1:
                     page_ids = torch.unique(kv_indices // self.page_size + 1)
-                    self.token_to_kv_pool_allocator.free_pages(page_ids)
+                    self.token_to_kv_pool_allocator.free_page_ids(page_ids)
                 else:
                     self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
@@ -295,7 +295,7 @@ class RadixCache(BasePrefixCache):
             tail = kv_indices[page_aligned_len:]
             if len(tail) > 0:
                 tail_pages = torch.unique(tail // self.page_size + 1)
-                self.token_to_kv_pool_allocator.free_pages(tail_pages)
+                self.token_to_kv_pool_allocator.free_page_ids(tail_pages)
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
@@ -308,7 +308,7 @@ class RadixCache(BasePrefixCache):
             segment = kv_indices[len(req.prefix_indices) : new_prefix_len]
             if len(segment) > 0:
                 seg_pages = torch.unique(segment // self.page_size + 1)
-                self.token_to_kv_pool_allocator.free_pages(seg_pages)
+                self.token_to_kv_pool_allocator.free_page_ids(seg_pages)
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[len(req.prefix_indices) : new_prefix_len]
@@ -344,7 +344,7 @@ class RadixCache(BasePrefixCache):
             segment = kv_indices[len(req.prefix_indices) : new_prefix_len]
             if len(segment) > 0:
                 seg_pages = torch.unique(segment // self.page_size + 1)
-                self.token_to_kv_pool_allocator.free_pages(seg_pages)
+                self.token_to_kv_pool_allocator.free_page_ids(seg_pages)
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[len(req.prefix_indices) : new_prefix_len]
@@ -394,7 +394,7 @@ class RadixCache(BasePrefixCache):
 
             if self.page_size != 1:
                 freed_pages = torch.unique(x.value // self.page_size + 1)
-                self.token_to_kv_pool_allocator.free_pages(freed_pages)
+                self.token_to_kv_pool_allocator.free_page_ids(freed_pages)
             else:
                 self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
