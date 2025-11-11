@@ -306,7 +306,7 @@ def get_context_length(config):
 
     for key in CONTEXT_LENGTH_KEYS:
         val = getattr(text_config, key, None)
-        if val is not None:
+        if val is not None and val < 2 ** 64 - 1:
             return int(rope_scaling_factor * val)
     return 2048
 

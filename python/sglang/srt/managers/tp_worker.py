@@ -317,7 +317,14 @@ class TpModelWorker:
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output, _ = self.model_runner.forward(forward_batch)
+        # Debug information
+        logger.debug(f"forward_batch.batch_size: {forward_batch.batch_size}")
+        logger.debug(f"forward_batch.extend_seq_lens: {forward_batch.extend_seq_lens}")
+        logger.debug(f"forward_batch.input_ids.shape: {forward_batch.input_ids.shape}")
+        logger.debug(f"type(logits_output): {type(logits_output)}")
         embeddings = logits_output.embeddings
+        logger.debug(f"embeddings.shape: {embeddings.shape}")
+        logger.debug(f"embeddings: {embeddings}")
         return embeddings
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

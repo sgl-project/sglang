@@ -822,6 +822,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "GigarEmbedModel" in model_architectures
     ):
         return False
     else:

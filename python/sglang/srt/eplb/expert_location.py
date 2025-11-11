@@ -449,14 +449,24 @@ class ModelConfigForExpertLocation:
 
     @staticmethod
     def from_model_config(model_config: ModelConfig):
-        model_class, _ = get_model_architecture(model_config)
-        if hasattr(model_class, "get_model_config_for_expert_location"):
-            return model_class.get_model_config_for_expert_location(
-                model_config.hf_config
-            )
-        else:
+        try:
+            model_class, _ = get_model_architecture(model_config)
+            if hasattr(model_class, "get_model_config_for_expert_location"):
+                return model_class.get_model_config_for_expert_location(
+                    model_config.hf_config
+                )
+            else:
+                return None
+        except ValueError:
+            # Если модель не поддерживается, возвращаем None для моделей эмбеддингов
+            if getattr(model_config.hf_config, "architectures", []):
+                arch = model_config.hf_config.architectures[0]
+                if "Embed" in arch or "embed" in arch.lower():
+                    return None
             return None
-
+        except Exception:
+            # Для любых других ошибок также возвращаем None
+             return None
 
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs, model_config: ModelConfig

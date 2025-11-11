@@ -35,8 +35,8 @@ class OpenAIServingTokenize(OpenAIServingBase):
     ) -> Union[TokenizeResponse, ErrorResponse]:
         try:
             tokenizer = self.tokenizer_manager.tokenizer
-            max_model_len = getattr(tokenizer, "model_max_length", -1)
-
+            # max_model_len = getattr(tokenizer, "model_max_length", -1)
+            max_model_len = 4096
             if isinstance(request.prompt, str):
                 token_ids = tokenizer.encode(
                     request.prompt,
@@ -57,7 +57,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 return self.create_error_response(
                     f"Invalid prompt type: {type(request.prompt)}. Expected str or List[str]."
                 )
-
+            logger.info(f"{tokens=}, {count=}, {max_model_len=}")
             return TokenizeResponse(
                 tokens=tokens, count=count, max_model_len=max_model_len
             )

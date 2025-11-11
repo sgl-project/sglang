@@ -357,7 +357,7 @@ class ModelRunner:
             enable=self.server_args.enable_memory_saver
         )
 
-        if not self.is_draft_worker:
+        if not self.is_draft_worker and self.model_config.is_generation:
             set_global_expert_location_metadata(
                 compute_initial_expert_location_metadata(server_args, self.model_config)
             )
