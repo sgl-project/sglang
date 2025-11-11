@@ -18,6 +18,7 @@ import gc
 import inspect
 import json
 import logging
+import math
 import os
 import socket
 import threading
@@ -1275,6 +1276,7 @@ class ModelRunner:
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
+            # TODO: need do test for int4 and int8 for MLA
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
@@ -1307,13 +1309,44 @@ class ModelRunner:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
-                * num_layers
-                * 2
-                * torch._utils._element_size(self.kv_cache_dtype)
-            )
+            if self.kv_cache_dtype in ("int4", "int8"):
+                if self.kv_cache_dtype == "int4":
+                    cell_size = (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * math.ceil(self.model_config.head_dim / 2) # two neightbour dims are packed into one byte
+                        * num_layers
+                        * 2 # key and value
+                        * 2 # scale and zero
+                        * 1 # two int4 pack to one byte
+                    )
+                else:
+                    cell_size = (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * self.model_config.head_dim
+                        * num_layers
+                        * 2 # key and value
+                        * 2 # scale and zero
+                        * 1 # int8 is one byte
+                    )
+                # quantize on head dimension, so need add scale buffer
+                cell_size = cell_size + (
+                    (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * num_layers
+                        * 2 # key and value
+                        * 1 # int8 is one byte
+                    )
+                    * num_layers
+                    * torch._utils._element_size(torch.float32)
+                )
+            else:
+                cell_size = (
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * self.model_config.head_dim
+                    * num_layers
+                    * 2
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -1531,6 +1564,10 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
+        elif self.server_args.kv_cache_dtype == "int4":
+            self.kv_cache_dtype = "int4"
+        elif self.server_args.kv_cache_dtype == "int8":
+            self.kv_cache_dtype = "int8"
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
@@ -1820,6 +1857,7 @@ class ModelRunner:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
+                    model_dtype=self.dtype,
                 )
 
         # Initialize token_to_kv_pool_allocator

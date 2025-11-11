@@ -691,15 +691,18 @@ class FlashAttentionBackend(AttentionBackend):
         )
         window_size = (layer.sliding_window_size, 0) if is_swa else (-1, -1)
         k_descale, v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
-        if (
+        if self.kv_cache_dtype_str in ("int4", "int8"):
+            pass
+
+        elif (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
             and self.fa_impl_ver != 4
         ):
+            # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+            # has corresponding quantization method so that layer.k_scale is not None,
+            # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
+            # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
@@ -1031,10 +1034,12 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         k_descale, v_descale = None, None
+        if self.kv_cache_dtype_str in ("int4", "int8"):
+            pass
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+        elif self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
