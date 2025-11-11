@@ -379,9 +379,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return is_channel_group and input_quant_none and is_symmetric and is_static
 
-    def _is_fp4a16_nvfp4(
-        self, weight_quant: BaseModel, input_quant: BaseModel
-    ):
+    def _is_fp4a16_nvfp4(self, weight_quant: BaseModel, input_quant: BaseModel):
         is_weight_only = weight_quant is not None and input_quant is None
         is_tensor_group_quant = (
             weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
