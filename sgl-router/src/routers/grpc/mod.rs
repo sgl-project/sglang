@@ -2,15 +2,14 @@
 
 use crate::{grpc_client::proto, protocols::common::StringOrArray};
 
+pub mod common;
 pub mod context;
+pub mod error;
 pub mod harmony;
 pub mod pd_router;
 pub mod pipeline;
-pub mod processing;
-pub mod responses;
+pub mod regular;
 pub mod router;
-pub mod stages;
-pub mod streaming;
 pub mod utils;
 
 /// Processed chat messages ready for gRPC generation
