@@ -172,12 +172,18 @@ class RadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         enable_kv_cache_events: bool = False,
+        enable_metrics: bool = False,
+        eviction_policy: Optional[str] = None,
+        is_eagle: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
+        self.enable_metrics = enable_metrics
+        self.eviction_policy = eviction_policy
+        self.is_eagle = is_eagle
         self.kv_event_queue = []
 
         if self.token_to_kv_pool_allocator:

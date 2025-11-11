@@ -344,12 +344,16 @@ class SWARadixCache(BasePrefixCache):
         sliding_window_size: int,
         page_size: int,
         disable: bool = False,
+        is_eagle: bool = False,
+        enable_metrics: bool = False,
     ):
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
+        self.is_eagle = is_eagle
+        self.enable_metrics = enable_metrics
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -891,7 +895,9 @@ class SWARadixCache(BasePrefixCache):
                             seg_pages = torch.unique(seg // self.page_size)
                             self.token_to_kv_pool_allocator.free_page_ids(seg_pages)
                     else:
-                        self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
+                        self.token_to_kv_pool_allocator.free(
+                            node.value[first_diff_idx:]
+                        )
                     node.value = value[:prefix_len]
                     node.swa_tombstone = False
 
