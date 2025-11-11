@@ -5,18 +5,23 @@ set -euo pipefail
 SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
 SGLANG_VERSION="v0.5.0rc0"   # Default version, will be overridden if version.py is found
 
-if [ -f "$SGLANG_VERSION_FILE" ]; then
-  VERSION_FROM_FILE=$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)
-
-  if [ -n "$VERSION_FROM_FILE" ]; then
+TMP_VERSION_FILE=$(mktemp)
+if git fetch origin main --quiet; then
+  if git show origin/main:python/sglang/version.py >"$TMP_VERSION_FILE" 2>/dev/null; then
+    VERSION_FROM_FILE=$(cat $SGLANG_VERSION_FILE | cut -d'"' -f2)
+    if [ -n "$VERSION_FROM_FILE" ]; then
       SGLANG_VERSION="$VERSION_FROM_FILE"
-      echo "Using SGLang version from version.py: $SGLANG_VERSION"
+      echo "Using SGLang version from origin/main: $SGLANG_VERSION"
+    else
+      echo "Warning: Could not parse version from origin/main; using default $SGLANG_VERSION" >&2
+    fi
   else
-      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using default: $SGLANG_VERSION" >&2
+    echo "Warning: version.py not found on origin/main; using default $SGLANG_VERSION" >&2
   fi
 else
-  echo "Warning: version.py not found, using default version: $SGLANG_VERSION" >&2
+  echo "Warning: failed to fetch origin/main; using default $SGLANG_VERSION" >&2
 fi
+rm -f "$TMP_VERSION_FILE"
 
 
 # Default base tags (can be overridden by command line arguments)
