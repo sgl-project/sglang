@@ -31,7 +31,15 @@ use crate::{
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
-    ha::service::HAServerConfig,
+    ha::{
+        service::{HAServerConfig, HAServerHandler},
+        sync::HASyncManager,
+        endpoints::{
+            get_cluster_status, get_ha_health, get_worker_states, get_policy_states,
+            get_worker_state, get_policy_state, update_app_config, get_app_config,
+            trigger_graceful_shutdown,
+        },
+    },
     ha_run,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -63,6 +71,8 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+    pub ha_handler: Option<Arc<HAServerHandler>>,
+    pub ha_sync_manager: Option<Arc<HASyncManager>>,
 }
 
 async fn parse_function_call(
@@ -647,11 +657,28 @@ pub fn build_app(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
+    // HA management routes
+    let ha_routes = Router::new()
+        .route("/ha/status", get(get_cluster_status))
+        .route("/ha/health", get(get_ha_health))
+        .route("/ha/workers", get(get_worker_states))
+        .route("/ha/workers/{worker_id}", get(get_worker_state))
+        .route("/ha/policies", get(get_policy_states))
+        .route("/ha/policies/{model_id}", get(get_policy_state))
+        .route("/ha/config/{key}", get(get_app_config))
+        .route("/ha/config", post(update_app_config))
+        .route("/ha/shutdown", post(trigger_graceful_shutdown))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
+
     Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
+        .merge(ha_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -704,13 +731,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         metrics::start_prometheus(prometheus_config.clone());
     }
 
-    let ha_handler = config.ha_server_config.as_ref().map(|ha_server_config| {
-        ha_run!(
-            ha_server_config.self_name,
+    let (ha_handler, ha_sync_manager) = if let Some(ha_server_config) = &config.ha_server_config {
+        let handler = ha_run!(
+            ha_server_config.self_name.clone(),
             ha_server_config.self_addr,
             ha_server_config.init_peer
-        )
-    });
+        );
+        
+        // Create HA sync manager if stores are available
+        // TODO: Get stores from HA server if available
+        let sync_manager = None; // Will be set up when stores are integrated
+        
+        (Some(Arc::new(handler)), sync_manager)
+    } else {
+        (None, None)
+    };
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
@@ -867,6 +902,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager: Some(router_manager),
+        ha_handler,
+        ha_sync_manager,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
@@ -962,10 +999,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     }
 
-    if let Some(ha_handler) = ha_handler {
-        info!("Shutting down HA server");
-        ha_handler.shutdown();
-    }
+    // HA handler shutdown is handled by the signal in ha_run! macro
+    // No need to manually shutdown here
 
     Ok(())
 }

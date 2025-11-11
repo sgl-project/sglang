@@ -36,7 +36,7 @@ pub struct HAServerConfig {
 /// node discovery(TODO), node status update(TODO), etc.
 pub struct HAServerHandler {
     pub state: ClusterState,
-    self_name: String,
+    pub self_name: String,
     _self_addr: SocketAddr,
     signal_tx: tokio::sync::watch::Sender<()>,
 }
