@@ -185,4 +185,4 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly-8-gpu-h20
+          python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
