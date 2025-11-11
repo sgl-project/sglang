@@ -76,7 +76,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free_pages(torch.cat(self.free_group))
+            # Avoid instance attribute shadowing the method name
+            type(self).free_pages(self, torch.cat(self.free_group))
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
@@ -121,7 +122,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     # Back-compat alias for older call sites
     def free_page_ids(self, page_ids: torch.Tensor):
-        self.free_pages(page_ids)
+        # Avoid instance attribute shadowing the method name
+        type(self).free_pages(self, page_ids)
 
 
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -622,7 +624,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Compatibility shim: convert tokens to unique page IDs, then delegate
         page_ids = torch.unique(free_index // self.page_size + 1)
-        self.free_pages(page_ids)
+        # Avoid instance attribute shadowing the method name
+        type(self).free_pages(self, page_ids)
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
