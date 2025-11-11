@@ -188,6 +188,94 @@ class SchedulerRuntimeCheckerMixin:
                 )
             except Exception:
                 pass
+            # Extra detailed breakdown including staged frees inside allocator free_group
+            try:
+                alloc = self.token_to_kv_pool_allocator
+                page_size_dbg = int(getattr(alloc, "page_size", 1))
+                is_open_free_group = bool(
+                    hasattr(alloc, "is_not_in_free_group")
+                    and (not alloc.is_not_in_free_group)
+                )
+                fg_list = getattr(alloc, "free_group", None)
+                staged_groups = int(len(fg_list)) if fg_list is not None else 0
+                staged_pages = 0
+                if isinstance(fg_list, list) and staged_groups > 0:
+                    # Sum lengths of page-id tensors staged for grouped frees
+                    staged_pages = int(
+                        sum(int(len(t)) for t in fg_list if t is not None)
+                    )
+                staged_tokens = staged_pages * page_size_dbg
+
+                avail_now = int(self.token_to_kv_pool_allocator.available_size())
+                evictable_now = int(self.tree_cache.evictable_size())
+                protected_now = int(self.tree_cache.protected_size())
+                total_accounted = avail_now + evictable_now + protected_now
+                diff_now = int(self.max_total_num_tokens - total_accounted)
+                diff_with_staged = int(
+                    self.max_total_num_tokens - (total_accounted + staged_tokens)
+                )
+                reserved_decode = int(
+                    getattr(self.server_args, "num_reserved_decode_tokens", 0)
+                )
+                running_nonempty = bool(
+                    self.running_batch is not None and not self.running_batch.is_empty()
+                )
+                print(
+                    "DEBUG+ breakdown: "
+                    f"page_size={page_size_dbg} "
+                    f"staged_groups={staged_groups} "
+                    f"staged_pages={staged_pages} "
+                    f"staged_tokens={staged_tokens} "
+                    f"avail_now={avail_now} "
+                    f"evictable_now={evictable_now} "
+                    f"protected_now={protected_now} "
+                    f"total_accounted={total_accounted} "
+                    f"diff_now={diff_now} "
+                    f"diff_with_staged={diff_with_staged} "
+                    f"reserved_decode={reserved_decode} "
+                    f"running_nonempty={running_nonempty}"
+                )
+            except Exception:
+                pass
+            # Decode-boundary slack estimate (pages that will be allocated next decode step)
+            try:
+                last_slack_pages = -1
+                run_slack_pages = -1
+                if getattr(self, "last_batch", None) is not None:
+                    last_slack_pages = int(self.last_batch.new_page_count_next_decode())
+                if (
+                    getattr(self, "running_batch", None) is not None
+                    and not self.running_batch.is_empty()
+                ):
+                    run_slack_pages = int(
+                        self.running_batch.new_page_count_next_decode()
+                    )
+                slack_pages_total = max(
+                    0, (0 if last_slack_pages < 0 else last_slack_pages)
+                ) + max(0, (0 if run_slack_pages < 0 else run_slack_pages))
+                slack_tokens = slack_pages_total * page_size_dbg
+                diff_minus_slack = diff_now - slack_tokens
+                last_bs = (
+                    self.last_batch.batch_size() if self.last_batch is not None else 0
+                )
+                run_bs = (
+                    self.running_batch.batch_size()
+                    if self.running_batch is not None
+                    and not self.running_batch.is_empty()
+                    else 0
+                )
+                print(
+                    "DEBUG+ decode_slack: "
+                    f"last_slack_pages={last_slack_pages} "
+                    f"run_slack_pages={run_slack_pages} "
+                    f"slack_pages_total={slack_pages_total} "
+                    f"slack_tokens={slack_tokens} "
+                    f"diff_minus_slack={diff_minus_slack} "
+                    f"last_batch_size={last_bs} "
+                    f"running_batch_size={run_bs}"
+                )
+            except Exception:
+                pass
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise ValueError(msg)
 

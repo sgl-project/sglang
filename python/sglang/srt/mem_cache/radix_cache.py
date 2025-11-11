@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -288,14 +289,38 @@ class RadixCache(BasePrefixCache):
         ]
 
         if self.page_size != 1:
+            # Debug flags for validator
+            _dbg_validate = get_bool_env_var("SGLANG_DEBUG_RADIX_VALIDATE")
+            _dbg_override = get_bool_env_var("SGLANG_DEBUG_RADIX_VALIDATE_OVERRIDE")
+
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
             tail = kv_indices[page_aligned_len:]
-            if len(tail) > 0:
+            # Compute validator sets
+            if _dbg_validate or _dbg_override:
+                pages_all = torch.unique(kv_indices // self.page_size + 1)
+                if page_aligned_len > 0:
+                    pages_aligned = torch.unique(
+                        page_aligned_kv_indices // self.page_size + 1
+                    )
+                else:
+                    pages_aligned = torch.empty(
+                        (0,), dtype=torch.int64, device=self.device
+                    )
+                # expected_free = pages_all - pages_aligned
+                expected_free = pages_all[~torch.isin(pages_all, pages_aligned)]
+                _actual_free_parts = []
+
+            if len(tail) > 0 and not _dbg_override:
                 tail_pages = torch.unique(tail // self.page_size + 1)
                 self.token_to_kv_pool_allocator.free_page_ids(tail_pages)
+                if _dbg_validate:
+                    _actual_free_parts.append(tail_pages)
+            elif _dbg_override and (_dbg_validate or True):
+                # Under override, defer frees until after insertion (we will free expected_free)
+                pass
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
@@ -306,9 +331,42 @@ class RadixCache(BasePrefixCache):
         )
         if self.page_size != 1:
             segment = kv_indices[len(req.prefix_indices) : new_prefix_len]
-            if len(segment) > 0:
+            if len(segment) > 0 and not _dbg_override:
                 seg_pages = torch.unique(segment // self.page_size + 1)
                 self.token_to_kv_pool_allocator.free_page_ids(seg_pages)
+                if _dbg_validate:
+                    _actual_free_parts.append(seg_pages)
+
+            # Validator reporting and optional override free
+            if _dbg_validate or _dbg_override:
+                if _dbg_override:
+                    # Free exactly what should not be kept by the tree
+                    if expected_free.numel() > 0:
+                        self.token_to_kv_pool_allocator.free_page_ids(expected_free)
+                    # For observability, treat expected as actual
+                    _actual = expected_free
+                else:
+                    if len(_actual_free_parts) > 0:
+                        _actual = torch.unique(
+                            torch.cat(_actual_free_parts).to(dtype=torch.int64)
+                        )
+                    else:
+                        _actual = torch.empty(
+                            (0,), dtype=torch.int64, device=self.device
+                        )
+                if expected_free.numel() > 0:
+                    # missing = expected_free - actual
+                    missing = expected_free[~torch.isin(expected_free, _actual)]
+                else:
+                    missing = expected_free
+                # Print a concise one-line debug (sizes only) to avoid spam
+                try:
+                    print(
+                        f"RADIX_VALIDATE finish: expected_free_pages={expected_free.numel()}, "
+                        f"actual_free_pages={_actual.numel()}, missing={missing.numel()}"
+                    )
+                except Exception:
+                    pass
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[len(req.prefix_indices) : new_prefix_len]
