@@ -140,8 +140,7 @@ class Wan2_2_TI2V_5B_Config(WanT2V480PConfig):
         vae_stride = self.vae_stride
         oh = batch.height
         ow = batch.width
-        shape = (z_dim, F, oh // vae_stride[1], ow // vae_stride[2])
-
+        shape = (batch_size, z_dim, F, oh // vae_stride[1], ow // vae_stride[2])
         return shape
 
     def __post_init__(self) -> None:
