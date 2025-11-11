@@ -46,7 +46,6 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -688,6 +687,8 @@ class DecodeTransferQueue:
         self.queue.extend(decode_reqs)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+        from sglang.srt.managers.schedule_batch import RequestStage
+
         idx = decode_req.metadata_buffer_index
         (
             output_id,
