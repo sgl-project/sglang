@@ -77,7 +77,7 @@ def check_model_scores(results):
 
     if is_in_ci():
         write_github_step_summary(
-            f"### TestNightlyGsm8KEval for vLLM awq, gptq, gguf\n{summary}"
+            f"### TestNightlyGsm8KEval for awq, gptq, gguf\n{summary}"
         )
 
     if failed_models:
