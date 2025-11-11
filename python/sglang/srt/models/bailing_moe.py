@@ -538,6 +538,7 @@ class BailingMoEAttention(nn.Module):
                     forward_batch=forward_batch,
                 )
                 if enable_fused_set_kv_buffer(forward_batch)
+                and not get_is_capture_mode()
                 else None
             ),
         )
@@ -546,7 +547,10 @@ class BailingMoEAttention(nn.Module):
             k,
             v,
             forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not (
+                enable_fused_set_kv_buffer(forward_batch)
+                and not get_is_capture_mode()
+            ),
         )
         attn_output, _ = self.dense(context_layer)
         return attn_output

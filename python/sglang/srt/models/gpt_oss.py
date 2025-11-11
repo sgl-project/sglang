@@ -311,6 +311,7 @@ class GptOssAttention(nn.Module):
                     forward_batch=forward_batch,
                 )
                 if enable_fused_set_kv_buffer(forward_batch)
+                and not get_is_capture_mode()
                 else None
             ),
         )
@@ -324,7 +325,10 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not (
+                enable_fused_set_kv_buffer(forward_batch)
+                and not get_is_capture_mode()
+            ),
         )
         output, _ = self.o_proj(attn_output)
         return output

@@ -413,6 +413,7 @@ class Qwen3MoeAttention(nn.Module):
                 )
                 if enable_fused_set_kv_buffer(forward_batch)
                 and self.compatible_with_fused_kv_buffer
+                and not get_is_capture_mode()
                 else None
             ),
         )
@@ -428,6 +429,7 @@ class Qwen3MoeAttention(nn.Module):
             save_kv_cache=not (
                 enable_fused_set_kv_buffer(forward_batch)
                 and self.compatible_with_fused_kv_buffer
+                and not get_is_capture_mode()
             ),
         )
         output, _ = self.o_proj(attn_output)
