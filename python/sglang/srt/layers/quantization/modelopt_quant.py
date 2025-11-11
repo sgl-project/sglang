@@ -132,7 +132,7 @@ def _sglang_fp4_gemm_fake(
 ):
     M = input.shape[-2]
     N = int(out_features)
-    return torch.empty((M, N), device="meta", dtype=out_dtype)
+    return input.new_empty((M, N), dtype=out_dtype)
 
 
 # Register fake for sgl-kernel FP4 quant op (void op with out tensors)
