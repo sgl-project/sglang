@@ -188,7 +188,9 @@ class NightlyTestMonitor:
                 # Track duration
                 if started_at and completed_at:
                     try:
-                        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                        start = datetime.fromisoformat(
+                            started_at.replace("Z", "+00:00")
+                        )
                         end = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
                         duration_minutes = (end - start).total_seconds() / 60
                         job_stat["durations"].append(duration_minutes)
@@ -200,7 +202,9 @@ class NightlyTestMonitor:
         # Calculate average durations
         for job_name, job_stat in stats["job_stats"].items():
             if job_stat["durations"]:
-                job_stat["avg_duration_minutes"] = sum(job_stat["durations"]) / len(job_stat["durations"])
+                job_stat["avg_duration_minutes"] = sum(job_stat["durations"]) / len(
+                    job_stat["durations"]
+                )
                 del job_stat["durations"]  # Remove raw data to reduce size
 
         return stats
@@ -212,8 +216,14 @@ class NightlyTestMonitor:
         print("=" * 80)
         print(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Total Runs Analyzed: {stats['total_runs']}")
-        print(f"Successful: {stats['successful_runs']} ({stats['successful_runs']/max(1, stats['total_runs'])*100:.1f}%)")
-        print(f"Failed: {stats['failed_runs']} ({stats['failed_runs']/max(1, stats['total_runs'])*100:.1f}%)")
+        print(
+            f"Successful: {stats['successful_runs']} "
+            f"({stats['successful_runs']/max(1, stats['total_runs'])*100:.1f}%)"
+        )
+        print(
+            f"Failed: {stats['failed_runs']} "
+            f"({stats['failed_runs']/max(1, stats['total_runs'])*100:.1f}%)"
+        )
         print(f"Cancelled: {stats['cancelled_runs']}")
         print("=" * 80)
 
@@ -223,18 +233,22 @@ class NightlyTestMonitor:
         daily_stats = sorted(stats["daily_stats"].items(), reverse=True)[:7]
         for date, day_stats in daily_stats:
             success_rate = (day_stats["success"] / max(1, day_stats["total"])) * 100
-            print(f"{date}: {day_stats['total']} runs, {day_stats['success']} success ({success_rate:.1f}%), {day_stats['failure']} failed")
+            print(
+                f"{date}: {day_stats['total']} runs, {day_stats['success']} success "
+                f"({success_rate:.1f}%), {day_stats['failure']} failed"
+            )
 
         # Job statistics
         print("\nJOB STATISTICS:")
         print("-" * 80)
-        print(f"{'Job Name':<40} {'Total':<8} {'Success':<8} {'Failed':<8} {'Rate':<8} {'Avg Duration'}")
+        print(
+            f"{'Job Name':<40} {'Total':<8} {'Success':<8} {'Failed':<8} "
+            f"{'Rate':<8} {'Avg Duration'}"
+        )
         print("-" * 80)
 
         job_stats_sorted = sorted(
-            stats["job_stats"].items(),
-            key=lambda x: x[1]["failure"],
-            reverse=True
+            stats["job_stats"].items(), key=lambda x: x[1]["failure"], reverse=True
         )
 
         for job_name, job_stat in job_stats_sorted:
@@ -244,7 +258,10 @@ class NightlyTestMonitor:
             success_rate = (success / max(1, total)) * 100
             avg_duration = job_stat["avg_duration_minutes"]
 
-            print(f"{job_name:<40} {total:<8} {success:<8} {failure:<8} {success_rate:>6.1f}% {avg_duration:>7.1f}m")
+            print(
+                f"{job_name:<40} {total:<8} {success:<8} {failure:<8} "
+                f"{success_rate:>6.1f}% {avg_duration:>7.1f}m"
+            )
 
             # Show recent failures
             if job_stat["recent_failures"]:
