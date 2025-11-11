@@ -34,7 +34,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     post_process_sample,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -69,8 +69,8 @@ def _build_sampling_params_from_request(
         save_output=True,
     )
     sampling_params = sampling_params.from_user_sampling_params(user_params)
+    sampling_params.set_output_file_name()
     sampling_params.log(server_args)
-    sampling_params.set_output_file_ext()
     return sampling_params
 
 

@@ -107,15 +107,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
   m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
 
-  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths) -> ()");
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
   m.def(
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
-      "cu_seqlens_q) -> ()");
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
   m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
   m.def(
       "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
-      "topk_indices_offset) -> ()");
+      "topk_indices_offset, Tensor ? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
   /*
