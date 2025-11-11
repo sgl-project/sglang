@@ -206,7 +206,8 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly-4-gpu-b200
+          rm -rf performance_profiles_gpt_oss_4gpu/
+          python3 nightly/test_gpt_oss_4gpu_perf.py
 
       - name: Publish traces to storage repo
         env:
@@ -214,4 +215,4 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --profile-dir test/srt/performance_profiles_gpt_oss_4gpu
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_gpt_oss_4gpu
