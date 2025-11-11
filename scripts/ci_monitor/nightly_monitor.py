@@ -273,22 +273,26 @@ class NightlyTestMonitor:
 
                 # Flag jobs with high failure rates
                 if failure_rate > 30:
-                    regressions.append({
-                        "job_name": job_name,
-                        "type": "high_failure_rate",
-                        "failure_rate": failure_rate,
-                        "total_runs": total,
-                        "failures": failure,
-                    })
+                    regressions.append(
+                        {
+                            "job_name": job_name,
+                            "type": "high_failure_rate",
+                            "failure_rate": failure_rate,
+                            "total_runs": total,
+                            "failures": failure,
+                        }
+                    )
 
                 # Flag jobs with recent consecutive failures
                 recent_failures = len(job_stat["recent_failures"])
                 if recent_failures >= 3:
-                    regressions.append({
-                        "job_name": job_name,
-                        "type": "consecutive_failures",
-                        "recent_failure_count": recent_failures,
-                    })
+                    regressions.append(
+                        {
+                            "job_name": job_name,
+                            "type": "consecutive_failures",
+                            "recent_failure_count": recent_failures,
+                        }
+                    )
 
         if regressions:
             print("\n" + "⚠" * 40)
@@ -297,9 +301,14 @@ class NightlyTestMonitor:
             for regression in regressions:
                 print(f"\nJob: {regression['job_name']}")
                 if regression["type"] == "high_failure_rate":
-                    print(f"  High failure rate: {regression['failure_rate']:.1f}% ({regression['failures']}/{regression['total_runs']})")
+                    print(
+                        f"  High failure rate: {regression['failure_rate']:.1f}% "
+                        f"({regression['failures']}/{regression['total_runs']})"
+                    )
                 elif regression["type"] == "consecutive_failures":
-                    print(f"  {regression['recent_failure_count']} recent consecutive failures")
+                    print(
+                        f"  {regression['recent_failure_count']} recent consecutive failures"
+                    )
             print("⚠" * 40)
 
         return regressions
@@ -309,21 +318,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Monitor nightly test runs for regressions"
     )
+    parser.add_argument("--token", required=True, help="GitHub personal access token")
     parser.add_argument(
-        "--token",
-        required=True,
-        help="GitHub personal access token"
+        "--days", type=int, default=7, help="Number of days to analyze (default: 7)"
     )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=7,
-        help="Number of days to analyze (default: 7)"
-    )
-    parser.add_argument(
-        "--output",
-        help="Output file for detailed stats (JSON)"
-    )
+    parser.add_argument("--output", help="Output file for detailed stats (JSON)")
 
     args = parser.parse_args()
 
