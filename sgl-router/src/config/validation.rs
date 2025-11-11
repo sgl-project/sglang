@@ -209,6 +209,34 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::Bucket {
+                balance_abs_threshold: _,
+                balance_rel_threshold,
+                bucket_adjust_interval_secs,
+            } => {
+                if *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_rel_threshold".to_string(),
+                        value: balance_rel_threshold.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
+                    });
+                }
+
+                if *bucket_adjust_interval_secs < 1 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "bucket_adjust_interval_secs".to_string(),
+                        value: bucket_adjust_interval_secs.to_string(),
+                        reason: "Must be >= 1s".to_string(),
+                    });
+                }
+                if *bucket_adjust_interval_secs >= 4294967296 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "bucket_adjust_interval_secs".to_string(),
+                        value: bucket_adjust_interval_secs.to_string(),
+                        reason: "Must be < 4294967296s".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -505,6 +533,13 @@ impl ConfigValidator {
                         });
                     }
                 }
+
+                // Check bucket for decode
+                if let Some(PolicyConfig::Bucket { .. }) = decode_policy {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "Decode policy should not be allowed to be bucket".to_string(),
+                    });
+                }
             }
         }
 
@@ -790,6 +825,67 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+    }
+
+    #[test]
+    fn test_validate_pd_mode_bucket_policy_restrictions() {
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), None),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+                decode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 60,
+                }),
+            },
+            PolicyConfig::Random, // Main policy as fallback
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(
+            result.is_ok(),
+            "Prefill policy should be allowed to be bucket"
+        );
+
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), None),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+                decode_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+            },
+            PolicyConfig::Random, // Main policy as fallback
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(
+            result.is_err(),
+            "Decode policy should not be allowed to be bucket"
+        );
     }
 
     #[test]
