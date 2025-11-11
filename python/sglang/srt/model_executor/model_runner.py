@@ -159,6 +159,7 @@ from sglang.srt.utils.offloader import (
     set_offloader,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -2196,6 +2197,10 @@ class ModelRunner:
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
+            )
+            # Copy cached routing experts' buffers back to CPU cache
+            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
+                forward_batch.out_cache_loc
             )
 
         if self.eplb_manager is not None:
