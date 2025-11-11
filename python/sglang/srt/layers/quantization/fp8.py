@@ -64,10 +64,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
+    deepgemm_scale_ue8m0_supported,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
-    deepgemm_scale_ue8m0_supported,
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -370,7 +370,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 return
             else:
                 if deepgemm_scale_ue8m0_supported():
-                    requant_weight_ue8m0_inplace(layer.weight, layer.weight_scale_inv, self.quant_config.weight_block_size)
+                    requant_weight_ue8m0_inplace(
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        self.quant_config.weight_block_size,
+                    )
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
             layer.weight.data = weight.data
