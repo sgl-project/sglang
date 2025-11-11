@@ -470,15 +470,12 @@ impl StepExecutor for CreateWorkerStep {
 
         // Derive model_id if not already set
         if !final_labels.contains_key("model_id") {
-            let derived = if let Some(name) = final_labels.get("served_model_name") {
-                Some(name.clone())
-            } else if let Some(path) = final_labels.get("model_path") {
-                path.split('/').next_back().map(|s| s.to_string())
-            } else {
-                None
-            };
+            let derived_model_id = final_labels
+                .get("served_model_name")
+                .or_else(|| final_labels.get("model_path"))
+                .cloned();
 
-            if let Some(model_id) = derived {
+            if let Some(model_id) = derived_model_id {
                 debug!("Derived model_id from metadata: {}", model_id);
                 final_labels.insert("model_id".to_string(), model_id);
             }
