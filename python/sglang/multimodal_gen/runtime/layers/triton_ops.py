@@ -985,15 +985,11 @@ def _timestep_embedding_triton_kernel(
     is_second_half = (d_offsets >= half) & (d_offsets < 2 * half)
 
     # Prepare fetch index
-    freq_indices = tl.where(
-        is_first_half,
-        d_offsets,
-        tl.where(is_second_half, d_offsets - half, 0)
-    )
+    freq_indices = d_offsets % half
 
     # Calculate freqs and angles
     dtype = output_ptr.dtype.element_ty
-    log_max_period = tl.log(tl.full((BLOCK_SIZE_DIM,), max_period, dtype))
+    log_max_period = tl.log(max_period.to(dtype))
     freqs = tl.exp(-log_max_period * freq_indices / half)
     angles = t_val.to(tl.float32) * freqs
 
