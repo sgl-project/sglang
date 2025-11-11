@@ -10,6 +10,12 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -482,6 +488,16 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            if isinstance(x, tuple):
+                return self.w8a8_block_fp8_linear(
+                    input=x[0],
+                    weight=layer.weight,
+                    block_size=self.quant_config.weight_block_size,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=x[1],
+                    bias=bias,
+                )
+
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
@@ -528,7 +544,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
+        if get_moe_runner_backend().is_cutlass():
+            assert (
+                cutlass_fp8_supported()
+            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
+            assert is_sm100_supported() or is_sm90_supported()
 
     def create_weights(
         self,
@@ -636,7 +657,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if self._should_use_cutlass_fused_experts():
+            if get_moe_runner_backend().is_cutlass():
                 self._ensure_cutlass_buffers_initialized(layer)
 
         else:
@@ -1025,12 +1046,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if self._should_use_cutlass_fused_experts():
+        if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
-            with use_symmetric_memory(get_tp_group()) as sm:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
                 symm_output = torch.empty_like(x)
-                sm.tag(symm_output)
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
             output = cutlass_fused_experts_fp8(
@@ -1122,22 +1144,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         return self.runner.run(dispatch_output, quant_info)
 
-    def _should_use_cutlass_fused_experts(self) -> bool:
-        """Decide whether to use Cutlass FP8 fused-experts path based on moe runner backend,
-        with env var override via `SGLANG_CUTLASS_MOE`.
-        """
-        backend = get_moe_runner_backend()
-        env_force = get_bool_env_var("SGLANG_CUTLASS_MOE")
-        # TODO: remove env var in the future, it should be handled by moe runner backend
-        if env_force:
-            return True
-        return (
-            backend.is_flashinfer_cutlass()
-            and self.cutlass_fp8_supported
-            and self.block_quant
-            and (is_sm100_supported() or is_sm90_supported())
-        )
-
     def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
         if getattr(self, "_cutlass_buffers_ready", False):
             return
@@ -1219,12 +1225,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else topk_config.correction_bias.to(x.dtype)
         )
 
-        with use_symmetric_memory(get_tp_group()) as sm:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
             # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
             # so we put the whole function under the ``use_symmetric_memory`` context manager.
             # If the bug is fixed, we can only put the output tensor allocation under the context manager.
-            output = trtllm_fp8_block_scale_moe(
+            return trtllm_fp8_block_scale_moe(
                 routing_logits=router_logits.to(torch.float32),
                 routing_bias=correction_bias,
                 hidden_states=a_q,
@@ -1249,8 +1257,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 routing_method_type=2,  # DeepSeek-styled routing method
                 use_shuffled_weight=False,
             )
-            sm.tag(output)
-        return output
 
     def maybe_apply_hip_fused_experts(
         self,
