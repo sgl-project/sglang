@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
         GenerationBatchResult,
+        RequestRetractStatus,
         ScheduleBatch,
         Scheduler,
     )
@@ -102,7 +103,10 @@ class SchedulerOutputProcessorMixin:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.finished() or req.is_retracted:
+                if (
+                    req.finished()
+                    or req.is_retracted == RequestRetractStatus.RETRACTING
+                ):
                     # decode req in mixed batch or retracted req
                     continue
 
@@ -231,7 +235,7 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
-                if req.is_retracted:
+                if req.is_retracted == RequestRetractStatus.RETRACTING:
                     continue
 
                 req.embedding = embeddings[i]
@@ -316,8 +320,11 @@ class SchedulerOutputProcessorMixin:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
-            if self.enable_overlap and (req.finished() or req.is_retracted):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
+            if self.enable_overlap and (
+                req.finished() or req.is_retracted == RequestRetractStatus.RETRACTING
+            ):
+                # NOTE: This (req.finished() or req.is_retracted == RequestRetractStatus.RETRACTING) should
+                # only happen when overlap scheduling is enabled.
                 # (currently not, e.g. Eagle V1 still check finish during forward)
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue

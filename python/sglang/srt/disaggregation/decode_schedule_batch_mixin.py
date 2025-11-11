@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import RequestRetractStatus, ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
 
@@ -61,9 +61,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     seq_len - pre_len == req.extend_input_len
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
-            req.is_retracted = False
+            if req.is_retracted == RequestRetractStatus.NOT_RETRACTED:
+                req.cached_tokens += pre_len - req.already_computed
+                req.already_computed = seq_len
+            if req.is_retracted == RequestRetractStatus.RETRACTING:
+                req.is_retracted = RequestRetractStatus.RETRACTED
             pre_lens.append(pre_len)
             req.extend_logprob_start_len = 0
 
