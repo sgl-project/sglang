@@ -448,7 +448,8 @@ class HybridSWACompressedDecoderLayer(nn.Module):
 
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        max_position_embeddings = getattr(config, "context_len", getattr(config, "max_position_embeddings", 32768))
+        logger.info(f"max_position_embeddings in config: {max_position_embeddings}")
 
         if self.is_compressed_softmax_layer():
             self.self_attn = HybridSWACompressedAttention(
