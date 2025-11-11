@@ -113,6 +113,7 @@ class RetriveQuery:
         self.updated = False
         self.layer_id = layer_id
         self.bs = 0
+        self.max_num_pages = None
 
 
 class RetriveResult:
@@ -184,6 +185,7 @@ class RetriveCudaGraphRunner:
     def _capture_one_layer(self, layer_id: int):
         graph = torch.cuda.CUDAGraph()
         memory_pool = get_global_graph_memory_pool()
+        self.queries[layer_id].max_seq_len_k = self.config.top_k * self.config.page_size + self.config.stream_budget[0] + self.config.stream_budget[1]
         with self.device_module.graph(graph, pool=memory_pool, stream=self.stream):
             self.retrive_function(self.queries[layer_id], self.results[layer_id])
         return graph
@@ -220,6 +222,7 @@ class CacheManager:
 
         self.accumlation_step = self.config.page_size
         self._retrive_cache_indices = None
+        self.graph_runner = None
 
     def init_cuda_graph(self):
         self.graph_runner = RetriveCudaGraphRunner(
@@ -283,6 +286,7 @@ class CacheManager:
                 req_to_token=self.config.req_to_token,
                 req_pool_indices=query.req_pool_indices,
                 seq_lens=query.seq_lens,
+                max_num_pages=query.max_num_pages,
                 top_k=self.config.top_k,
                 score=query.score,
                 selected_page_indices=query.selected_page_indices,
@@ -296,13 +300,15 @@ class CacheManager:
 
     def _retrive_loop(self):
         while True:
+            max_seq_len_k = self.retrived_query[0].seq_lens.max().item()
+            max_num_pages = max(self.config.top_k, (max_seq_len_k + self.config.page_size - 1) // self.config.page_size)
             for layer_id in range(self.config.skip_first_n_layers, self.config.num_layers):
-                if self.retrived_query[layer_id].updated:
-                    if self.config.is_cuda_graph:
-                        self.graph_runner.replay(layer_id)
-                    else:
-                        self._retrive_one_layer(
-                            self.retrived_query[layer_id],
-                            self.retrived_result[layer_id],
-                        )
+                self.retrived_query[layer_id].max_num_pages = max_num_pages
+                if self.graph_runner:
+                    self.graph_runner.replay(layer_id)
+                else:
+                    self._retrive_one_layer(
+                        self.retrived_query[layer_id],
+                        self.retrived_result[layer_id],
+                    )
                 time.sleep(0.001)

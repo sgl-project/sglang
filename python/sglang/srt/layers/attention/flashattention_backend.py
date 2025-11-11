@@ -448,6 +448,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 if self.sparse_attn:
                     self.sparse_cache_updater.update_decode(forward_batch, metadata)
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 else:
                     # Normal Decode
                     metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)

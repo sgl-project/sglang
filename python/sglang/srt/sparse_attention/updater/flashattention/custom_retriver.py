@@ -165,6 +165,7 @@ class NaiveDecodeSparseRetriver:
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,  # [bs]
+        max_num_pages: int,
         top_k: int,
         selected_page_indices: torch.Tensor,
         score: torch.Tensor,
@@ -184,19 +185,19 @@ class NaiveDecodeSparseRetriver:
         kv_pages_num_per_seq = (
             seq_lens + self.cache_manager.config.page_size - 1
         ) // self.cache_manager.config.page_size
+        bs = query.shape[0]
 
         compute_score(
             q=query,
             k=proxy_k_tensor,
-            out=score,
+            out=score[:bs, :, :max_num_pages],
             kv_pages_per_seq=kv_pages_per_seq,
             kv_pages_num_per_seq=kv_pages_num_per_seq,
             num_sink_pages=self.stream_budget[0] // self.cache_manager.config.page_size,
             num_local_pages=self.stream_budget[1]
             // self.cache_manager.config.page_size,
         )
-        bs = query.shape[0]
-        _, topk_indices = torch.topk(score[:bs, :, :], k=top_k, dim=2, sorted=False)
+        _, topk_indices = torch.topk(score[:bs, :, :max_num_pages], k=top_k, dim=2, sorted=False)
         score_copy(topk_indices, kv_pages_per_seq, bs)
         selected_page_indices[:bs, :, :] = topk_indices
 
@@ -292,54 +293,26 @@ class NaiveDecodeSparseRetriver:
 
         if self.cache_manager.config.async_retrive:
             retrive_result = self.cache_manager.get_result(layer.layer_id)
-            new_seq_lens = self._combine_indices_async(
-                retrive_result,
-                forward_batch.req_pool_indices,
-                forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.seq_lens,
-                diff,
-            )
-
-            num_heads = self.cache_manager.config.keys[0].shape[1]
-
-            # set metadata info
-            metadata.page_table = retrive_result.page_table[
-                forward_batch.req_pool_indices, :, :
-            ].reshape(forward_batch.batch_size * num_heads, -1)
-            metadata.cache_seqlens_int32 = new_seq_lens
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(new_seq_lens, dim=0, dtype=torch.int32), (1, 0)
-            )
         else:
-            query = self.cache_manager.retrived_query[layer.layer_id]
-            self._retrive_cache_indices(
-                query=query.query,
-                proxy_k_tensor=query.proxy_k_tensor,
-                req_to_token=forward_batch.req_to_token_pool.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=query.seq_lens,
-                top_k=self.cache_manager.config.top_k,
-                selected_page_indices=query.selected_page_indices,
-                score=query.score,
-            )
+            self.cache_manager._retrive_one_layer(self.cache_manager.retrived_query[layer.layer_id], 
+                                                  self.cache_manager.retrived_result[layer.layer_id])
+            retrive_result = self.cache_manager.get_result(layer.layer_id)
 
-            combined_page_indices = self._combine_indices(
-                retrived_cache_indices=query.selected_page_indices,
-                seq_lens=query.seq_lens,
-            )
+        new_seq_lens = self._combine_indices_async(
+            retrive_result,
+            forward_batch.req_pool_indices,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.seq_lens,
+            diff,
+        )
 
-            # set metadata info
-            seq_lens = (
-                torch.full(
-                    (forward_batch.batch_size,),
-                    self.budget_per_seq,
-                    device=device,
-                    dtype=torch.int32,
-                )
-                - diff
-            )
-            metadata.page_table = combined_page_indices
-            metadata.cache_seqlens_int32 = seq_lens
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-            )
+        num_heads = self.cache_manager.config.keys[0].shape[1]
+
+        # set metadata info
+        metadata.page_table = retrive_result.page_table[
+            forward_batch.req_pool_indices, :, :
+        ].reshape(forward_batch.batch_size * num_heads, -1)
+        metadata.cache_seqlens_int32 = new_seq_lens
+        metadata.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(new_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+        )
