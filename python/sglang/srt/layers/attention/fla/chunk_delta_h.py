@@ -308,12 +308,12 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, K, V)
+    h = k.new_zeros(B, NT, H, K, V)
     final_state = (
-        k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+        k.new_zeros(N, H, K, V, dtype=torch.float32) if output_final_state else None
     )
 
-    v_new = torch.empty_like(u) if save_new_value else None
+    v_new = torch.zeros_like(u) if save_new_value else None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)

@@ -5,6 +5,7 @@ from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
@@ -630,6 +631,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = mamba_cache_params.conv
         ssm_states = mamba_cache_params.temporal
+        
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -716,7 +718,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
+            # Zero-initialize cache slots for sequences without prefix cache
+            # This ensures deterministic behavior for fresh sequences while still supporting
+            if get_global_server_args().enable_deterministic_inference:
+                # Check which sequences have no prefix (fresh sequences)
+                no_prefix_mask = forward_batch.extend_prefix_lens == 0
+                
+                if no_prefix_mask.any():
+                    # Zero out cache slots for sequences without prefix directly in the cache
+                    ssm_states[cache_indices[no_prefix_mask]] = 0
+            
             recurrent_state = ssm_states[cache_indices]
+            
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -729,6 +742,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
+            
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 
