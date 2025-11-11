@@ -514,6 +514,29 @@ class ForwardBatch:
 
         return ret
 
+    def record_stream(self, stream) -> None:
+        """
+        Record the given CUDA stream on all CUDA tensors contained in this ForwardBatch.
+        This informs the caching allocator about cross-stream usage to avoid premature reuse.
+        """
+
+        def _record(obj):
+            match obj:
+                case torch.Tensor():
+                    if obj.is_cuda:
+                        obj.record_stream(stream)
+                case list() | tuple():
+                    for x in obj:
+                        _record(x)
+                case dict():
+                    for x in obj.values():
+                        _record(x)
+                case _:
+                    pass
+
+        for value in self.__dict__.values():
+            _record(value)
+
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
         Merge all multimodal inputs in the batch into a single MultiModalInputs object.

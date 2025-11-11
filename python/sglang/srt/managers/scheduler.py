@@ -151,7 +151,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -1932,11 +1932,17 @@ class Scheduler(
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
+            self.model_worker.set_hicache_consumer(batch.hicache_consumer_index)
+            forward_batch = ForwardBatch.init_new(
+                batch_or_worker_batch, self.model_worker.model_runner
+            )
+
             if self.enable_overlap:
                 # FIXME: remove this assert
                 assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
                 model_worker_batch = batch_or_worker_batch
                 self.record_batch_in_overlap(model_worker_batch)
+                forward_batch.record_stream(self.forward_stream)
 
                 # Sampling info will be modified during forward
                 model_worker_batch.sampling_info = (
@@ -1948,9 +1954,9 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
-                    self.future_map.resolve_future(model_worker_batch)
+                    self.future_map.resolve_future(forward_batch)
                     batch_result = self.model_worker.forward_batch_generation(
-                        model_worker_batch
+                        forward_batch
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
@@ -1984,9 +1990,7 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
-                )
+                batch_result = self.model_worker.forward_batch_generation(forward_batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 

@@ -10,6 +10,7 @@ from sglang.srt.utils import get_compiler_backend
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -110,10 +111,10 @@ class FutureMap:
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices=indices, interval=slice(start, end))
 
-    def resolve_future(self, model_worker_batch: ModelWorkerBatch):
+    def resolve_future(self, batch: ForwardBatch | ModelWorkerBatch):
         if self.spec_algo.is_eagle():
             # TODO(lsyin): write future indices into spec_info.future_indices
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
+            draft_input: EagleDraftInput = batch.spec_info
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
@@ -124,7 +125,7 @@ class FutureMap:
             draft_input.verified_id = self.verified_id_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
         else:
-            _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
+            _resolve_future_token_ids(batch.input_ids, self.token_ids_buf)
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
