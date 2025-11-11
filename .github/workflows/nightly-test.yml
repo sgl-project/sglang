@@ -31,7 +31,7 @@ jobs:
         timeout-minutes: 120
         run: |
           cd test/srt
-          python3 test_nightly_text_models_gsm8k_eval.py
+          python3 nightly/test_text_models_gsm8k_eval.py
 
   nightly-test-perf-text-models:
     if: github.repository == 'sgl-project/sglang'
@@ -51,8 +51,9 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
-          rm -rf test/srt/performance_profiles_text_models/
-          python3 test/srt/test_nightly_text_models_perf.py
+          cd test/srt
+          rm -rf performance_profiles_text_models/
+          python3 nightly/test_text_models_perf.py
 
       - name: Publish traces to storage repo
         env:
@@ -60,7 +61,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models
 
   nightly-test-eval-vlms:
     if: github.repository == 'sgl-project/sglang'
@@ -78,7 +79,7 @@ jobs:
         timeout-minutes: 240
         run: |
           cd test/srt
-          python3 test_nightly_vlms_mmmu_eval.py
+          python3 nightly/test_vlms_mmmu_eval.py
 
   nightly-test-perf-vlms:
     if: github.repository == 'sgl-project/sglang'
@@ -98,8 +99,9 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
         run: |
-          rm -rf test/srt/performance_profiles_vlms/
-          python3 test/srt/test_nightly_vlms_perf.py
+          cd test/srt
+          rm -rf performance_profiles_vlms/
+          python3 nightly/test_vlms_perf.py
 
       - name: Publish traces to storage repo
         env:
@@ -107,7 +109,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --vlm
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_vlms
 
   nightly-test-1-gpu:
     if: github.repository == 'sgl-project/sglang'
@@ -125,7 +127,7 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly-1-gpu
+          python3 run_suite.py --suite nightly-1-gpu --continue-on-error
 
   nightly-test-4-gpu:
     if: github.repository == 'sgl-project/sglang'
@@ -143,7 +145,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly-4-gpu
+          python3 run_suite.py --suite nightly-4-gpu --continue-on-error
 
   nightly-test-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang'
@@ -161,7 +163,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly-8-gpu-h200
+          python3 run_suite.py --suite nightly-8-gpu-h200 --continue-on-error
 
   nightly-test-8-gpu-h20:
     if: github.repository == 'sgl-project/sglang'
@@ -181,22 +183,4 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly-8-gpu-h20
-
-  nightly-test-4-gpu-b200:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 4-gpu-b200
-    continue-on-error: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 60
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-4-gpu-b200
+          python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error

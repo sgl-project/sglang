@@ -19,12 +19,10 @@ use tracing::{debug, error, warn};
 use crate::{
     grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
     protocols::{
-        chat::{
-            ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
-        },
+        chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
         common::{
-            ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
-            ToolChoiceValue, Usage,
+            FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue,
+            Usage,
         },
         generate::GenerateRequest,
     },
@@ -292,26 +290,11 @@ impl StreamingProcessor {
 
                     // Send first chunk with role
                     if is_firsts.get(&index).copied().unwrap_or(true) {
-                        let first_chunk = ChatCompletionStreamResponse {
-                            id: request_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model.clone(),
-                            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                            choices: vec![ChatStreamChoice {
-                                index,
-                                delta: ChatMessageDelta {
-                                    role: Some("assistant".to_string()),
-                                    content: None,
-                                    tool_calls: None,
-                                    reasoning_content: None,
-                                },
-                                logprobs: None,
-                                finish_reason: None,
-                                matched_stop: None,
-                            }],
-                            usage: None,
-                        };
+                        let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                            .created(created)
+                            .add_choice_role(index, "assistant")
+                            .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                            .build();
                         Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .map_err(|_| "Failed to send first chunk".to_string())?;
@@ -399,15 +382,17 @@ impl StreamingProcessor {
 
                     // Regular content emission
                     if !delta.is_empty() {
-                        let content_chunk = Self::create_content_chunk(
-                            delta,
-                            index,
-                            request_id,
-                            model,
-                            created,
-                            system_fingerprint,
-                            choice_logprobs,
-                        );
+                        let content_chunk =
+                            ChatCompletionStreamResponse::builder(request_id, model)
+                                .created(created)
+                                .add_choice_content_with_logprobs(
+                                    index,
+                                    "assistant",
+                                    delta,
+                                    choice_logprobs,
+                                )
+                                .maybe_system_fingerprint(system_fingerprint)
+                                .build();
                         Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .map_err(|_| "Failed to send content chunk".to_string())?;
@@ -423,26 +408,14 @@ impl StreamingProcessor {
                                 let stream_buffer = stream_buffers.entry(index).or_default();
                                 stream_buffer.push_str(&text);
 
-                                let content_chunk = ChatCompletionStreamResponse {
-                                    id: request_id.clone(),
-                                    object: "chat.completion.chunk".to_string(),
-                                    created,
-                                    model: model.clone(),
-                                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                                    choices: vec![ChatStreamChoice {
-                                        index,
-                                        delta: ChatMessageDelta {
-                                            role: Some("assistant".to_string()),
-                                            content: Some(text),
-                                            tool_calls: None,
-                                            reasoning_content: None,
-                                        },
-                                        logprobs: None,
-                                        finish_reason: None,
-                                        matched_stop: None,
-                                    }],
-                                    usage: None,
-                                };
+                                let content_chunk =
+                                    ChatCompletionStreamResponse::builder(request_id, model)
+                                        .created(created)
+                                        .add_choice_content(index, "assistant", text)
+                                        .maybe_system_fingerprint(
+                                            system_fingerprint.map(|s| s.to_string()),
+                                        )
+                                        .build();
 
                                 let sse_chunk =
                                     serde_json::to_string(&content_chunk).map_err(|e| {
@@ -498,26 +471,11 @@ impl StreamingProcessor {
                         }),
                     };
 
-                    let tool_chunk = ChatCompletionStreamResponse {
-                        id: request_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created,
-                        model: model.clone(),
-                        system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                        choices: vec![ChatStreamChoice {
-                            index: *index,
-                            delta: ChatMessageDelta {
-                                role: Some("assistant".to_string()),
-                                content: None,
-                                tool_calls: Some(vec![tool_call_delta]),
-                                reasoning_content: None,
-                            },
-                            logprobs: None,
-                            finish_reason: None,
-                            matched_stop: None,
-                        }],
-                        usage: None,
-                    };
+                    let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_tool_call_delta(*index, tool_call_delta)
+                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .build();
 
                     let sse_chunk = serde_json::to_string(&tool_chunk)
                         .map_err(|e| format!("Failed to serialize tool chunk: {}", e))?;
@@ -538,26 +496,11 @@ impl StreamingProcessor {
 
             let matched_stop_value = matched_stops.get(index).and_then(|v| v.clone());
 
-            let finish_chunk = ChatCompletionStreamResponse {
-                id: request_id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                choices: vec![ChatStreamChoice {
-                    index: *index,
-                    delta: ChatMessageDelta {
-                        role: Some("assistant".to_string()),
-                        content: None,
-                        tool_calls: None,
-                        reasoning_content: None,
-                    },
-                    logprobs: None,
-                    finish_reason: Some(final_finish_reason),
-                    matched_stop: matched_stop_value,
-                }],
-                usage: None,
-            };
+            let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
+                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                .build();
 
             let sse_chunk = serde_json::to_string(&finish_chunk)
                 .map_err(|e| format!("Failed to serialize finish chunk: {}", e))?;
@@ -571,20 +514,16 @@ impl StreamingProcessor {
                 let total_prompt: u32 = prompt_tokens.values().sum();
                 let total_completion: u32 = completion_tokens.values().sum();
 
-                let usage_chunk = ChatCompletionStreamResponse {
-                    id: request_id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model.clone(),
-                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                    choices: vec![],
-                    usage: Some(Usage {
+                let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                    .created(created)
+                    .usage(Usage {
                         prompt_tokens: total_prompt,
                         completion_tokens: total_completion,
                         total_tokens: total_prompt + total_completion,
                         completion_tokens_details: None,
-                    }),
-                };
+                    })
+                    .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                    .build();
 
                 let sse_chunk = serde_json::to_string(&usage_chunk)
                     .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
@@ -971,7 +910,7 @@ impl StreamingProcessor {
                     );
 
                     // Send final chunk with finish_reason
-                    let finish_response = serde_json::json!({
+                    let finish_response = json!({
                         "text": accumulated_text,
                         "output_ids": complete.output_ids[complete.output_ids.len().saturating_sub(1)..].to_vec(),
                         "meta_info": {
@@ -1082,26 +1021,13 @@ impl StreamingProcessor {
                     normal_text,
                 }) => {
                     let chunk = if !reasoning_text.is_empty() {
-                        Some(ChatCompletionStreamResponse {
-                            id: request_id.to_string(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model.to_string(),
-                            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                            choices: vec![ChatStreamChoice {
-                                index,
-                                delta: ChatMessageDelta {
-                                    role: Some("assistant".to_string()),
-                                    content: None,
-                                    tool_calls: None,
-                                    reasoning_content: Some(reasoning_text),
-                                },
-                                logprobs: None,
-                                finish_reason: None,
-                                matched_stop: None,
-                            }],
-                            usage: None,
-                        })
+                        Some(
+                            ChatCompletionStreamResponse::builder(request_id, model)
+                                .created(created)
+                                .add_choice_reasoning(index, reasoning_text)
+                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .build(),
+                        )
                     } else {
                         None
                     };
@@ -1145,66 +1071,24 @@ impl StreamingProcessor {
                     history_tool_calls_count,
                 );
 
-                chunks.push(ChatCompletionStreamResponse {
-                    id: request_id.to_string(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model.to_string(),
-                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                    choices: vec![ChatStreamChoice {
-                        index,
-                        delta: ChatMessageDelta {
-                            role: Some("assistant".to_string()),
-                            content: None,
-                            tool_calls: Some(vec![ToolCallDelta {
-                                index: 0,
-                                id: Some(tool_call_id),
-                                tool_type: Some("function".to_string()),
-                                function: Some(FunctionCallDelta {
-                                    name: Some(function.name.clone()),
-                                    arguments: None,
-                                }),
-                            }]),
-                            reasoning_content: None,
-                        },
-                        logprobs: None,
-                        finish_reason: None,
-                        matched_stop: None,
-                    }],
-                    usage: None,
-                });
+                chunks.push(
+                    ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_tool_name(index, tool_call_id, function.name.clone())
+                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .build(),
+                );
             }
 
             // Emit arguments delta
             if !delta.is_empty() {
-                chunks.push(ChatCompletionStreamResponse {
-                    id: request_id.to_string(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model.to_string(),
-                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                    choices: vec![ChatStreamChoice {
-                        index,
-                        delta: ChatMessageDelta {
-                            role: Some("assistant".to_string()),
-                            content: None,
-                            tool_calls: Some(vec![ToolCallDelta {
-                                index: 0,
-                                id: None,
-                                tool_type: None,
-                                function: Some(FunctionCallDelta {
-                                    name: None,
-                                    arguments: Some(delta.to_string()),
-                                }),
-                            }]),
-                            reasoning_content: None,
-                        },
-                        logprobs: None,
-                        finish_reason: None,
-                        matched_stop: None,
-                    }],
-                    usage: None,
-                });
+                chunks.push(
+                    ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_tool_args(index, delta.to_string())
+                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .build(),
+                );
             }
         }
 
@@ -1256,26 +1140,13 @@ impl StreamingProcessor {
                 Ok(StreamingParseResult { normal_text, calls }) => {
                     // Emit normal text if present
                     if !normal_text.is_empty() {
-                        chunks.push(ChatCompletionStreamResponse {
-                            id: request_id.to_string(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model.to_string(),
-                            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                            choices: vec![ChatStreamChoice {
-                                index,
-                                delta: ChatMessageDelta {
-                                    role: Some("assistant".to_string()),
-                                    content: Some(normal_text),
-                                    tool_calls: None,
-                                    reasoning_content: None,
-                                },
-                                logprobs: None,
-                                finish_reason: None,
-                                matched_stop: None,
-                            }],
-                            usage: None,
-                        });
+                        chunks.push(
+                            ChatCompletionStreamResponse::builder(request_id, model)
+                                .created(created)
+                                .add_choice_content(index, "assistant", normal_text)
+                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .build(),
+                        );
                     }
 
                     // Emit tool call chunks
@@ -1311,26 +1182,13 @@ impl StreamingProcessor {
                             }),
                         };
 
-                        chunks.push(ChatCompletionStreamResponse {
-                            id: request_id.to_string(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model.to_string(),
-                            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                            choices: vec![ChatStreamChoice {
-                                index,
-                                delta: ChatMessageDelta {
-                                    role: Some("assistant".to_string()),
-                                    content: None,
-                                    tool_calls: Some(vec![tool_call_delta]),
-                                    reasoning_content: None,
-                                },
-                                logprobs: None,
-                                finish_reason: None,
-                                matched_stop: None,
-                            }],
-                            usage: None,
-                        });
+                        chunks.push(
+                            ChatCompletionStreamResponse::builder(request_id, model)
+                                .created(created)
+                                .add_choice_tool_call_delta(index, tool_call_delta)
+                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .build(),
+                        );
                     }
 
                     return chunks;
@@ -1358,38 +1216,6 @@ impl StreamingProcessor {
             buffer.extend_from_slice(error_msg.as_bytes());
         }
         buffer.extend_from_slice(b"\n\n");
-    }
-
-    /// Create a content chunk response
-    fn create_content_chunk(
-        content: String,
-        index: u32,
-        request_id: &str,
-        model: &str,
-        created: u64,
-        system_fingerprint: Option<&str>,
-        logprobs: Option<ChatLogProbs>,
-    ) -> ChatCompletionStreamResponse {
-        ChatCompletionStreamResponse {
-            id: request_id.to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created,
-            model: model.to_string(),
-            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-            choices: vec![ChatStreamChoice {
-                index,
-                delta: ChatMessageDelta {
-                    role: Some("assistant".to_string()),
-                    content: Some(content),
-                    tool_calls: None,
-                    reasoning_content: None,
-                },
-                logprobs,
-                finish_reason: None,
-                matched_stop: None,
-            }],
-            usage: None,
-        }
     }
 }
 

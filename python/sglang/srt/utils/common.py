@@ -2981,7 +2981,7 @@ def configure_gc_logger():
 
 
 # COPIED FROM DeepGEMM
-def align(x: int, y: int) -> int:
+def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 

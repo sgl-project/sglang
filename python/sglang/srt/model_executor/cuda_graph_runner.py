@@ -69,7 +69,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
-    from kt_kernel import AMXMoEWrapper
+    from kt_kernel import KTMoEWrapper
 
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
@@ -259,7 +259,7 @@ class CudaGraphRunner:
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
-            AMXMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1

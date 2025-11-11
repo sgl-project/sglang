@@ -11,7 +11,10 @@ using the modular pipeline architecture.
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

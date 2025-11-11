@@ -152,6 +152,8 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
@@ -202,6 +204,10 @@ def add_radix_supported_deterministic_attention_backend_choices(choices):
 
 def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
+
+
+def add_rl_on_policy_target_choices(choices):
+    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
 def add_mamba_ssm_dtype_choices(choices):
@@ -432,9 +438,9 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
-    # Ktransformers
-    kt_amx_weight_path: Optional[str] = None
-    kt_amx_method: Optional[str] = None
+    # Ktransformers/AMX expert parallelism
+    kt_weight_path: Optional[str] = None
+    kt_method: Optional[str] = None
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
@@ -597,9 +603,6 @@ class ServerArgs:
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
-
-        # Handle Ktransformers specific configs
-        self._handle_ktransformers_configs()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -816,6 +819,10 @@ class ServerArgs:
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
+            # For piecewise cuda graphs
+            if self.enable_piecewise_cuda_graph:
+                reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
+
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
                 if gpu_mem is not None
@@ -897,6 +904,9 @@ class ServerArgs:
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
         if model_arch in ["DeepseekV3ForCausalLM"] and not is_deepseek_nsa(hf_config):
+            if self.enable_piecewise_cuda_graph:
+                logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
+
             if is_cuda() and is_sm100_supported():
                 if (
                     self.attention_backend is None
@@ -1263,9 +1273,9 @@ class ServerArgs:
             raise ValueError(
                 "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
             )
-        if self.prefill_attention_backend == "fa4":
+        if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
             logger.warning(
-                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 128."
+                f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
             )
             self.page_size = 128
 
@@ -1341,39 +1351,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-    def _handle_ktransformers_configs(self):
-        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-            CompressedTensorsWNA16AMXEPMoEMethod,
-            override_config,
-        )
-
-        num_hidden_layers = None
-        if self.kt_max_deferred_experts_per_token is not None:
-            try:
-                model_config = self.get_model_config()
-                base_config = (
-                    getattr(model_config, "hf_text_config", None)
-                    or model_config.hf_config
-                )
-                num_hidden_layers = getattr(base_config, "num_hidden_layers", None)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to load model config for kt_max_deferred_experts_per_token: %s",
-                    exc,
-                )
-
-        override_config(
-            CompressedTensorsWNA16AMXEPMoEMethod,
-            self.kt_num_gpu_experts,
-            self.kt_cpuinfer,
-            self.kt_threadpool_count,
-            self.kt_amx_weight_path,
-            self.kt_amx_method,
-            self.chunked_prefill_size,
-            self.kt_max_deferred_experts_per_token,
-            num_hidden_layers,
-        )
-
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
@@ -1396,7 +1373,7 @@ class ServerArgs:
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
                 self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            ), "modelopt_fp4 quantization is required for Flashinfer Cutlass MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -3047,12 +3024,12 @@ class ServerArgs:
 
         # Ktransformer server args
         parser.add_argument(
-            "--kt-amx-weight-path",
+            "--kt-weight-path",
             type=str,
             help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
         )
         parser.add_argument(
-            "--kt-amx-method",
+            "--kt-method",
             type=str,
             default="AMXINT4",
             help="[ktransformers parameter] Quantization formats for CPU execution.",
@@ -3077,9 +3054,8 @@ class ServerArgs:
             "--kt-max-deferred-experts-per-token",
             type=int,
             default=ServerArgs.kt_max_deferred_experts_per_token,
-            help="Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+            help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
-
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
@@ -3429,7 +3405,7 @@ class ServerArgs:
             "--rl-on-policy-target",
             type=str,
             default=ServerArgs.rl_on_policy_target,
-            choices=["fsdp"],
+            choices=RL_ON_POLICY_TARGET_CHOICES,
             help="The training system that SGLang needs to match for true on-policy.",
         )
 
@@ -3708,6 +3684,13 @@ class ServerArgs:
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
+
+        # Check served model name to not have colon as it is reserved for LoRA adapter syntax
+        assert ":" not in self.served_model_name, (
+            "served_model_name cannot contain a colon (':') character. "
+            "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
+            f"Invalid value: '{self.served_model_name}'"
+        )
 
         # Check LoRA
         self.check_lora_server_args()
@@ -4026,7 +4009,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
-DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
 
 
 @dataclasses.dataclass

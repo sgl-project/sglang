@@ -127,7 +127,7 @@ class RotaryEmbedding(CustomOp):
 
         self._apply_rotary_emb_wrapped = _apply_rotary_emb
 
-        if get_global_server_args().rl_on_policy_target == "fsdp":
+        if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
                 self._apply_rotary_emb_wrapped
@@ -140,7 +140,7 @@ class RotaryEmbedding(CustomOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         init_device = (
-            "cpu" if get_global_server_args().rl_on_policy_target == "fsdp" else None
+            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
         )
         inv_freq = 1.0 / (
             base
@@ -151,7 +151,7 @@ class RotaryEmbedding(CustomOp):
                 / self.rotary_dim
             )
         )
-        if get_global_server_args().rl_on_policy_target == "fsdp":
+        if get_global_server_args().rl_on_policy_target is not None:
             inv_freq = inv_freq.cuda()
         return inv_freq
 
@@ -823,7 +823,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
         cos_sin = self.cos_sin_cache[
             torch.add(positions, offsets) if offsets is not None else positions
         ]

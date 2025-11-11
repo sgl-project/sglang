@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -20,13 +21,13 @@ if TYPE_CHECKING:
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
-    def prepare_for_prebuilt_extend(self: ScheduleBatch):
+    def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
         Adapted from .prepare_for_extend().
         """
 
-        self.forward_mode = ForwardMode.EXTEND
+        self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
@@ -100,7 +101,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
-    def process_prebuilt_extend(
+    def process_prebuilt(
         self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
     ):
         """Assign the buffered last input id to schedule batch"""
@@ -119,7 +120,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
-                    self.tree_cache.cache_finished_req(req)
+                    release_kv_cache(req, self.tree_cache)
                     prepare_abort(
                         req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                     )

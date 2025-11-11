@@ -18,7 +18,7 @@ from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages.base import (
     PipelineStage,
     StageParallelismType,

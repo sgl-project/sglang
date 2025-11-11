@@ -8,7 +8,10 @@ use super::{
     common::*,
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
-use crate::protocols::validated::Normalizable;
+use crate::protocols::{
+    builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
+    validated::Normalizable,
+};
 
 // ============================================================================
 // Chat Messages
@@ -639,6 +642,16 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
+impl ChatCompletionResponse {
+    /// Create a new builder for ChatCompletionResponse
+    pub fn builder(
+        id: impl Into<String>,
+        model: impl Into<String>,
+    ) -> ChatCompletionResponseBuilder {
+        ChatCompletionResponseBuilder::new(id, model)
+    }
+}
+
 /// Response message structure for ChatCompletionResponse (different from request ChatMessage)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionMessage {
@@ -678,6 +691,16 @@ pub struct ChatCompletionStreamResponse {
     pub choices: Vec<ChatStreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+}
+
+impl ChatCompletionStreamResponse {
+    /// Create a new builder for ChatCompletionStreamResponse
+    pub fn builder(
+        id: impl Into<String>,
+        model: impl Into<String>,
+    ) -> ChatCompletionStreamResponseBuilder {
+        ChatCompletionStreamResponseBuilder::new(id, model)
+    }
 }
 
 /// Delta structure for streaming chat completion responses

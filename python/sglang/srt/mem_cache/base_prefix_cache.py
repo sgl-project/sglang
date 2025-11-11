@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.metrics.collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -49,6 +50,15 @@ class MatchResult(NamedTuple):
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
+
+    metrics_collector: Optional[RadixCacheMetricsCollector] = (
+        None  # metrics collector for the cache
+    )
+
+    def init_metrics_collector(self):
+        self.metrics_collector = RadixCacheMetricsCollector(
+            labels={"cache_type": self.__class__.__name__}
+        )
 
     @abstractmethod
     def reset(self):

@@ -253,6 +253,12 @@ def _matmul_persistent_deepgemm(
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
+    M, K = a.shape
+    K2, N = b.shape
+
+    # DeepGEMM requires minimum dimensions, skip DeepGEMM for small dimensions to avoid CUDA_ERROR_INVALID_VALUE
+    MIN_DIM_FOR_DEEPGEMM = 64
+
     if (
         _ENABLE_MM_DEEPGEMM
         and ENABLE_JIT_DEEPGEMM
@@ -260,6 +266,8 @@ def matmul_persistent(
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
+        and M >= MIN_DIM_FOR_DEEPGEMM
+        and N >= MIN_DIM_FOR_DEEPGEMM
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
@@ -276,7 +284,12 @@ def matmul_persistent(
             # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
             return out_deepgemm
 
-        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        try:
+            return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        except RuntimeError:
+            # DeepGEMM failed, fallback to Triton kernel silently
+            # (dimension checks above should prevent most errors)
+            pass
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
@@ -302,8 +315,16 @@ def _log_softmax_kernel(
     output_row_start_ptr = output_ptr + row_idx * output_row_stride
 
     # Step 1: Find maximum value in the row for numerical stability
-    max_val = -float("inf")
-    for col_offset in range(0, n_cols, BLOCK_SIZE):
+    # Load first block to infer dtype and initialize max_val with correct type
+    col_idx_init = tl.arange(0, BLOCK_SIZE)
+    mask_init = col_idx_init < n_cols
+    vals_init = tl.load(
+        row_start_ptr + col_idx_init, mask=mask_init, other=-float("inf")
+    )
+    max_val = tl.max(vals_init)
+
+    # Continue with remaining blocks
+    for col_offset in range(BLOCK_SIZE, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
 
@@ -314,7 +335,9 @@ def _log_softmax_kernel(
         max_val = tl.max(tl.maximum(vals, max_val))
 
     # Step 2: Compute sum of exp(x - max_val)
-    sum_exp = 0.0
+    # Initialize sum_exp with correct dtype by using tl.sum on a zero vector
+    sum_exp = tl.sum(tl.zeros([1], dtype=max_val.dtype))
+
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols

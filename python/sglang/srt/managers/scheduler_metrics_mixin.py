@@ -132,6 +132,7 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
+        self.stats.new_token_ratio = adder.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
 
         f = (

@@ -922,3 +922,27 @@ def select_experts(
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @torch.library.register_fake("sgl_kernel::moe_fused_gate")
+    def _(
+        input_tensor,
+        bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=0,
+        apply_routed_scaling_factor_on_output=False,
+    ):
+        num_rows = input_tensor.shape[0]
+        topk_weights = torch.empty(
+            (num_rows, topk), dtype=torch.float32, device=input_tensor.device
+        )
+        topk_ids = torch.empty(
+            (num_rows, topk), dtype=torch.int32, device=input_tensor.device
+        )
+        return topk_weights, topk_ids

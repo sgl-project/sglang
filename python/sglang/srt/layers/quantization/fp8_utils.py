@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.utils import (
-    align,
+    ceil_align,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
@@ -495,7 +495,7 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros(
-        (align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device
+        (ceil_align(m, 128), ceil_align(n, 128)), dtype=x.dtype, device=x.device
     )
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
