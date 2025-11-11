@@ -1370,7 +1370,7 @@ class ModelRunner:
                 // (1 + speculativa_ratio)
             )
 
-        if self.hybrid_gdn_config is not None or self.jet_nemotron_config is not None:
+        if self.hybrid_gdn_config is not None:
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
@@ -1412,12 +1412,7 @@ class ModelRunner:
 
     @property
     def mambaish_config(self):
-        return (
-            self.mamba2_config
-            or self.hybrid_gdn_config
-            or self.jet_nemotron_config
-            or self.kimi_linear_config
-        )
+        return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
     def set_num_token_hybrid(self):
         if (

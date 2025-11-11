@@ -1,23 +1,3 @@
-# Copyright 2025 NVIDIA CORPORATION & AFFILIATES
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# SPDX-License-Identifier: Apache-2.0
-
-# This file is modified from https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/configuration_qwen2.py
-
-"""Jet-Nemotron model configuration"""
-
 from dataclasses import dataclass
 
 from transformers.configuration_utils import PretrainedConfig
@@ -30,7 +10,6 @@ from sglang.srt.configs.mamba_utils import (
     extra_groups_for_head_shards,
 )
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 logger = logging.get_logger(__name__)
 
@@ -211,6 +190,8 @@ class JetNemotronConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         num_heads = self.efficient_attention_config["jet"]["num_heads"]
         value_head_dim = int(
             self.efficient_attention_config["jet"]["head_dim"]
