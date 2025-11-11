@@ -99,6 +99,6 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
     The pipeline is constructed by adding stages in order. `Qwen-Image-Edit` uses `ImageEncodingStage` (for prompt and image processing) and `ImageVAEEncodingStage` (for latent extraction) before standard denoising and decoding.
 
 5.  **Register Configs**:
-    - Map the configs in the central registry ([`registry.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)) to enable automatic loading and instantiation for the model. Modules are automatically loaded and injected based on the config and repository structure.
+    - Register the configs in the central registry ([`registry.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)) via `_register_configs` to enable automatic loading and instantiation for the model. Modules are automatically loaded and injected based on the config and repository structure.
 
 By following this modular pattern of defining configurations and composing pipelines, you can integrate new diffusion models into SGLang with clarity and ease.
