@@ -12,7 +12,7 @@ class GlobalConfig:
         # Verbosity level
         # 0: do not output anything
         # 2: output final text after every run
-        self.verbosity = 0
+        self.verbosity=0
 
         # Default backend of the language
         self.default_backend = None
