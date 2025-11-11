@@ -8,7 +8,7 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 if is_cuda():
     try:
@@ -114,7 +114,7 @@ class Indexer(CustomOp):
         self.fuse_wk_and_weights_proj = fuse_wk_and_weights_proj
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
-            self.half_device_sm_count = align(self.sm_count // 2, 8)
+            self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -410,13 +410,15 @@ class Indexer(CustomOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
             index_k=k_fp8,
@@ -509,7 +511,7 @@ class Indexer(CustomOp):
             end_pos = seq_len
             topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
 
-            pad_len = align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
+            pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
             topk_indices = torch.nn.functional.pad(
                 topk_indices, (0, pad_len), "constant", -1
             )
@@ -555,14 +557,15 @@ class Indexer(CustomOp):
             return None
 
         # Determine if should skip topk based on sequence length
-        should_skip = False
-        if not forward_batch.forward_mode.is_decode_or_idle():
+        # We can only skip the logits computation if cuda graph is not involved
+        skip_logits_computation = False
+        if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                should_skip = max_kv_len <= self.index_topk
+                skip_logits_computation = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation
-        if should_skip:
+        if skip_logits_computation:
             return self._forward_cuda_k_only(
                 x,
                 positions,
@@ -596,7 +599,7 @@ class Indexer(CustomOp):
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
             index_k=k_fp8,

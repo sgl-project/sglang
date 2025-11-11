@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import logging
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -17,6 +20,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
