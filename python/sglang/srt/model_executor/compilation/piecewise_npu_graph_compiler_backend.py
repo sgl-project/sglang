@@ -21,7 +21,9 @@ import torch
 
 from sglang.srt.compilation.npu.compilation_context import CompilationContext
 from sglang.srt.compilation.npu.config import CompilationConfig
-from sglang.srt.compilation.npu.npu_compiler_backend import NpuBackend
+from sglang.srt.compilation.npu.npu_graph_compiler_backend import (
+    NpuGraphCompilerBackend,
+)
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
 logger = logging.getLogger(__name__)
@@ -146,7 +148,7 @@ class NpuAddRmsNormFuse:
         return quantized_output, out2
 
 
-class PiecewiseNpuGraphCompilerBackend(NpuBackend):
+class PiecewiseNpuGraphCompilerBackend(NpuGraphCompilerBackend):
     graph: torch.fx.GraphModule
 
     def __init__(
