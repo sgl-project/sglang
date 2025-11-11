@@ -44,7 +44,7 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages.base import (
     PipelineStage,
     StageParallelismType,
