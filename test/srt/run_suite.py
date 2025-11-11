@@ -103,7 +103,7 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
-        TestFile("test_piecewise_cuda_graph.py", 300),
+        TestFile("test_piecewise_cuda_graph.py", 450),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -199,11 +199,11 @@ suites = {
         TestFile("test_deepseek_v32_mtp.py", 275),
         TestFile("test_deepseek_v32_nsabackend.py", 600),
     ],
-    "vllm_dependency_test": [
+    "quantization_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),
         TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_vllm_dependency.py", 185),
+        TestFile("test_quantization.py", 185),
         TestFile("test_gguf.py", 96),
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
@@ -221,6 +221,7 @@ suites = {
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
+        TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
     ],
     "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [],
@@ -420,6 +421,7 @@ suite_amd = {
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
+        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("test_abort.py", 51),
         TestFile("test_chunked_prefill.py", 410),
@@ -481,6 +483,7 @@ suite_amd = {
     "per-commit-8-gpu-amd": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
+        TestFile("test_disaggregation_pp.py", 200),
     ],
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
