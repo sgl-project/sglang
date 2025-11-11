@@ -715,17 +715,30 @@ def is_port_available(port):
             return False
 
 
-def get_free_port():
+def get_free_port(return_socket=False):
     # try ipv4
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("", 0))
+        port = s.getsockname()[1]
+
+        if return_socket:
+            return port, s
+        else:
+            s.close()
+            return port
+
     except OSError:
         # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.bind(("", 0))
+        port = s.getsockname()[1]
+
+        if return_socket:
+            return port, s
+        else:
+            s.close()
+            return port
 
 
 def decode_video_base64(video_base64):

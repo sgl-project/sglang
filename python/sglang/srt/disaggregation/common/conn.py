@@ -68,7 +68,7 @@ class CommonKVManager(BaseKVManager):
         )
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
-        self.rank_port = get_free_port()
+        self.rank_port, self.temp_socket = get_free_port(return_socket=True)
         self.local_ip = get_local_ip_auto()
         self.server_socket = zmq.Context().socket(zmq.PULL)
         if is_valid_ipv6_address(self.local_ip):
@@ -93,6 +93,7 @@ class CommonKVManager(BaseKVManager):
             )
 
     def _bind_server_socket(self):
+        self.temp_socket.close()
         self.server_socket.bind(format_tcp_address(self.local_ip, self.rank_port))
 
     def _register_to_bootstrap(self):
