@@ -248,7 +248,7 @@ def benchmark_config(
                     use_int8_w8a8=False,
                     use_int8_w8a16=False,
                     use_int4_w4a16=False,
-                    per_channel_quant=False,
+                    per_channel_quant=per_channel_quant,
                     block_shape=block_shape,
                     a_use_tma=moe_use_tma,
                     b_use_tma=moe_use_tma,
