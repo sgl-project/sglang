@@ -45,6 +45,61 @@ jobs:
           echo "This pull request is a draft. Failing the workflow."
           exit 1
 
+      - name: Enforce rate limit for low-permission actors
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const HOURS = 2;
+            const actor = context.actor;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const eventName = context.eventName;
+
+            async function hasHighPermission(username) {
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
+                const perm = data.permission || 'none';
+                return perm === 'write' || perm === 'maintain' || perm === 'admin';
+              } catch (e) {
+                if (e.status === 404 || e.status === 403) return false;
+                throw e;
+              }
+            }
+
+            if (await hasHighPermission(actor)) {
+              core.info(`Triggering user '${actor}' has high permission. No rate limit applied.`);
+              return;
+            }
+
+            const cutoff = new Date(Date.now() - HOURS * 60 * 60 * 1000);
+            core.info(`Checking for workflow runs since ${cutoff.toISOString()} (last ${HOURS} hours) for event '${eventName}'.`);
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: context.workflow,
+              event: eventName,
+              per_page: 100,
+            });
+
+            const runs = data.workflow_runs || [];
+            const recentFound = runs.find((run) => {
+              if (String(run.id) === String(context.runId)) return false;
+              if (new Date(run.created_at) < cutoff) return false;
+              return (run.actor?.login === actor) || (run.triggering_actor?.login === actor);
+            });
+
+            if (recentFound) {
+              core.setFailed(
+                `User '${actor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
+                `Please wait ${HOURS} hours before triggering again.`
+              );
+            } else {
+              core.info(`No recent runs detected within the last ${HOURS} hours; proceeding.`);
+            }
+
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
