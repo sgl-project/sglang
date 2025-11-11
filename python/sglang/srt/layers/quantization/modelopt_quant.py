@@ -135,6 +135,12 @@ def _sglang_fp4_gemm_fake(
     return torch.empty((M, N), device="meta", dtype=out_dtype)
 
 
+# Register fake for sgl-kernel FP4 quant op (void op with out tensors)
+@torch.library.register_fake("sgl_kernel::scaled_fp4_quant")
+def _sgl_kernel_scaled_fp4_quant_fake(output, input, output_scale, input_global_scale):
+    return
+
+
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
