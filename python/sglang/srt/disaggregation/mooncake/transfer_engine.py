@@ -60,7 +60,7 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
 
     except json.JSONDecodeError:
         # Not JSON format, treat as old format - return same devices for all GPUs
-        return ib_device_str if ib_device_str else None
+        return ib_device_str
 
 
 class MooncakeTransferEngine:
