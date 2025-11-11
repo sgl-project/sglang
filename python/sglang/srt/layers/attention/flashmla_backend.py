@@ -134,7 +134,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
 
             block_kv_indices = torch.full(
-                (bs, max_seqlen_pad), -1, dtype=torch.int32, device=seq_lens.device
+                (bs, max_seqlen_pad), -1, dtype=torch.int32, device=forward_batch.seq_lens.device
             )
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,
@@ -157,6 +157,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_simple_verify()
         ):
+            seq_lens = forward_batch.seq_lens + self.num_draft_tokens
             seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
             block_kv_indices = torch.full(
@@ -576,7 +577,7 @@ class FlashMLAMultiStepDraftBackend:
         )
 
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps-1):
             self.attn_backends.append(
                 FlashMLABackend(
                     model_runner,
@@ -604,7 +605,7 @@ class FlashMLAMultiStepDraftBackend:
         self.common_template(forward_batch, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps-1):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, block_kv_indices=None
             )

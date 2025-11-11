@@ -29,9 +29,12 @@ import triton.language as tl
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
+import logging
+logger = logging.getLogger(__name__)
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
@@ -465,6 +468,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
+        # logger.info(f"Allocating {extend_num_tokens} tokens with paged allocator")
+        # logger.info(f"Prefix lens: {prefix_lens}")
+        # logger.info(f"Seq lens: {seq_lens}")
+        # logger.info(f"Last loc: {last_loc}")
+        
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
@@ -484,6 +492,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
+        # logger.info(f"Free pages before allocation: {self.free_pages}")
+        # logger.info(f"Free pages len before allocation: {len(self.free_pages)}")
         alloc_extend_kernel[(bs,)](
             prefix_lens,
             seq_lens,
@@ -494,15 +504,24 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.page_size,
             self.seen_max_num_extend_tokens_next_power_of_2,
         )
+        # logger.info(f"Free pages after allocation: {self.free_pages}")
+        # logger.info(f"Free pages len after allocation: {len(self.free_pages)}")
+        # logger.info(f"Allocated indices: {out_indices}")
+        # logger.info(f"len unique: {len(torch.unique(out_indices))}")
+        # logger.info((f"len out_indices: {len(out_indices)}"))
+        
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
+        # logger.info(f"Prefix lens CPU: {prefix_lens_cpu}")
+        # logger.info(f"Seq lens CPU: {seq_lens_cpu}")
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
             page_size=self.page_size,
             prefix_lens=prefix_lens_cpu,
         )
+        # logger.info(f"Number of new pages needed: {num_new_pages}")
         if num_new_pages > len(self.free_pages):
             return None
 
