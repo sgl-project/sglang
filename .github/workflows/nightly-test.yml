@@ -211,3 +211,24 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_traces.py --profile-dir test/srt/performance_profiles_gpt_oss_4gpu
+
+  nightly-test-8-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-b200
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 90
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-b200
