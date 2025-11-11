@@ -21,7 +21,7 @@ import concurrent.futures
 import logging
 import os
 from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -3247,15 +3247,27 @@ class DeepseekV2ForCausalLM(nn.Module):
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
     @classmethod
-    def generate_weight_name_filter(cls, missing_logical_experts: List[Tuple[int, List[int]]]):
-        def missing_experts_name_filter(name: str) -> bool:
-            for layer, experts in missing_logical_experts:
+    def generate_weight_name_filter(
+        cls, logical_experts: List[Tuple[int, List[int]]]
+    ):
+        """
+        Generates a filter function that tests whether the (layer_id, expert_id)
+        indicated by a param name lies in the `logical_experts` list
+        Args:
+            logical_experts: a list of (layer_id, expert_ids) tuples. Each tuple
+            specifies a list of expert_ids of a specific layer_id.
+
+        Returns:
+            A function (name: str) -> bool
+        """
+        def weight_name_filter(name: str) -> bool:
+            for layer, experts in logical_experts:
                 for expert in experts:
                     if f"layers.{layer}.mlp.experts.{expert}." in name:
                         return True
             return False
 
-        return missing_experts_name_filter
+        return weight_name_filter
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
