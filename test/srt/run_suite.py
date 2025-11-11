@@ -482,6 +482,7 @@ suite_amd = {
     "per-commit-8-gpu-amd": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
+        TestFile("test_disaggregation_pp.py", 200),
     ],
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
