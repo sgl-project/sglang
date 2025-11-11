@@ -6,6 +6,7 @@ from typing import List, Optional
 import setproctitle
 from sglang_router.mini_lb import MiniLoadBalancer
 from sglang_router.router_args import RouterArgs
+from sglang_router.version import get_version_string, get_short_version_string
 
 logger = logging.getLogger("router")
 
@@ -98,6 +99,20 @@ Examples:
 
     """,
         formatter_class=CustomHelpFormatter,
+    )
+
+    # Add version arguments
+    parser.add_argument(
+        "--version", "-V",
+        action="version",
+        version=get_version_string(),
+        help="Show full version information and exit",
+    )
+    parser.add_argument(
+        "-v",
+        action="version",
+        version=get_short_version_string(),
+        help="Show short version information and exit",
     )
 
     RouterArgs.add_cli_args(parser, use_router_prefix=False)

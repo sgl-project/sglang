@@ -85,6 +85,26 @@ pip install --force-reinstall dist/*.whl
 ```
 > **Note:** Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
+## Checking Version
+
+After installation, verify the installation and check version information:
+
+```bash
+# Short version info (Rust binary)
+./target/release/sglang-router -v
+
+# Full version info with build details (Rust binary)
+./target/release/sglang-router --version
+
+# Short version info (Python launcher)
+python3 -m sglang_router.launch_router -v
+
+# Full version info with build details (Python launcher)
+python3 -m sglang_router.launch_router --version
+```
+
+The `-v` flag displays a concise version string, while `--version` (or `-V`) shows comprehensive build information including Git commit, build time, compiler versions, and platform details.
+
 ## Quick Start
 ### Regular HTTP Routing
 - **Rust binary**

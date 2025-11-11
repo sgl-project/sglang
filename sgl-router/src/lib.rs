@@ -20,6 +20,7 @@ pub mod service_discovery;
 pub mod tokenizer;
 pub mod tool_parser;
 pub mod tree;
+pub mod version;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
