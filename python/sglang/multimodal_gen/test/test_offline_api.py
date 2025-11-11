@@ -19,7 +19,7 @@ class TestGeneratorAPIBase(unittest.TestCase):
     server_kwargs = {}
 
     # sampling
-    output_path: str = "outputs"
+    output_path: str = "test_outputs"
 
     results = []
 
