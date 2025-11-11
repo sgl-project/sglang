@@ -298,16 +298,33 @@ jobs:
 
   # =============================================== multimodal_gen ====================================================
   multimodal-gen-test:
-    needs: [check-changes]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: ubuntu-latest
+    runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Run placeholder test
+
+      - name: Download CUDA 12.9 kernel artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
         run: |
-          echo "Running multimodal_gen tests..."
-          echo "This is a placeholder for future tests."
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run diffusion server tests
+        env:
+          SGLANG_TEST_IMAGE_MODEL: Qwen/Qwen-Image
+          SGLANG_TEST_SERVER_PORT: 30100
+        timeout-minutes: 60
+        run: |
+          cd python
+          pytest -s sglang/multimodal_gen/test/server/test_server_performance.py
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
