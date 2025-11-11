@@ -105,12 +105,13 @@ async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, String>
         .ok_or_else(|| format!("No dp_size in response from {}", url))?;
 
     let model_id = info
-        .served_model_name
+        .model_id
         .filter(|s| !s.is_empty())
+        .or(info.served_model_name.filter(|s| !s.is_empty()))
         .or_else(|| {
-            info.model_path.and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
+            info.model_path
+                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
         })
-        .or(info.model_id)
         .unwrap_or_else(|| "unknown".to_string());
 
     Ok(DpInfo { dp_size, model_id })
