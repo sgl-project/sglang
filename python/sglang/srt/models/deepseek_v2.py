@@ -1554,29 +1554,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
-            # If FP8 with NSA, need to dequantize first (NSA uses DeepSeek-specific FP8 format)
             if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
-                # Reuse pre-computed page_table_1_flattened from nsa_backend metadata
-                kv_indices = (
-                    forward_batch.attn_backend.forward_metadata.page_table_1_flattened
-                )
-                assert (
-                    kv_indices is not None
-                ), "page_table_1_flattened should have been generated for FP8 MHA path"
-
-                kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
-                    self.attn_mha.layer_id
-                )
-                kv_latent_bf16 = dequantize_k_cache_paged(
-                    kv_cache_fp8, kv_indices
-                )  # [num_prefix_tokens, 1, 576]
-                kv_a = (
-                    kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
-                )  # [num_prefix_tokens, 512]
-                k_pe = kv_latent_bf16[
-                    :, :, self.kv_lora_rank :
-                ]  # [num_prefix_tokens, 1, 64]
+                # FP8 path: dequantize NSA-specific FP8 format to BF16
+                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8(forward_batch)
             else:
+                # BF16/FP16 path: directly fetch from cache
                 kv_a, k_pe = self._get_mla_kv_buffer(
                     forward_batch.fetch_mha_one_shot_kv_indices(),
                     q.dtype,
@@ -2557,6 +2539,31 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
             kv_a = kv_a.squeeze(1).contiguous()
+        return kv_a, k_pe
+
+    def _get_mla_kv_buffer_from_fp8(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        """
+        Dequantize FP8 KV cache to BF16 for MLA attention (NSA-specific format).
+
+        Returns: (kv_a, k_pe) both in BF16
+        """
+        kv_indices = forward_batch.attn_backend.forward_metadata.page_table_1_flattened
+        assert (
+            kv_indices is not None
+        ), "page_table_1_flattened should have been generated for FP8 MHA path"
+
+        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
+            self.attn_mha.layer_id
+        )
+
+        kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
+
+        kv_a = kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
+        k_pe = kv_latent_bf16[:, :, self.kv_lora_rank :]
+
         return kv_a, k_pe
 
     def _concat_and_cast_mha_k(self, k_nope, k_pe, forward_batch):
