@@ -84,6 +84,7 @@ class SimpleEAGLECudaGraphRunner:
         self.speculative_num_steps = 1
         self.tp_size = self.model_runner.server_args.tp_size
         self.dp_size = self.model_runner.server_args.dp_size
+        self.speculative_num_steps = 1
         self.enable_profile_cuda_graph = (
             self.model_runner.server_args.enable_profile_cuda_graph
         )
@@ -174,8 +175,6 @@ class SimpleEAGLECudaGraphRunner:
             )
         else:
             cuda_graph_bs = forward_batch.batch_size
-        # batch_size = forward_batch.seq_lens.numel()
-
         is_bs_supported = (
             cuda_graph_bs in self.graphs
             if self.disable_padding
@@ -183,12 +182,6 @@ class SimpleEAGLECudaGraphRunner:
         )
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
-
-        # is_bs_supported = (
-        #     batch_size in self.graphs
-        #     if self.disable_padding
-        #     else batch_size <= self.max_bs
-        # )
 
         return is_bs_supported
 
@@ -493,7 +486,6 @@ class SimpleEAGLECudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(1)
             self.out_cache_loc.zero_()
-            # self.positions.zero_() # add
 
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)

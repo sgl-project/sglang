@@ -403,9 +403,11 @@ class SimpleEagleWorker(TpModelWorker):
                 batch.req_to_token_pool.req_to_token.shape[1],
                 next_power_of_2(num_seqs),
             )
-            batch.input_ids = torch.column_stack(
-                (batch.output_ids, draft_input_spec_info.topk_index.squeeze(1))
-            ).flatten()
+            topk_idx_norm = self._normalize_spec_tensor(
+                draft_input_spec_info.topk_index, num_seqs,
+            )
+
+            batch.input_ids = torch.column_stack((batch.output_ids, topk_idx_norm)).flatten()
             positions = torch.column_stack((batch.seq_lens, batch.seq_lens + 1)).flatten()
 
             batch.spec_info = EagleVerifyInput(
@@ -441,8 +443,15 @@ class SimpleEagleWorker(TpModelWorker):
             forward_batch
         )
         if can_cuda_graph:
-            forward_batch.spec_info_topk_index = draft_input_spec_info.topk_index
-            forward_batch.spec_info_topk_p = draft_input_spec_info.topk_p
+            if num_seqs == 0:
+                forward_batch.spec_info_topk_index = draft_input_spec_info.topk_index
+                forward_batch.spec_info_topk_p = draft_input_spec_info.topk_p
+            else:
+                forward_batch.spec_info_topk_index = topk_idx_norm.unsqueeze(-1)
+                p_norm = self._normalize_spec_tensor(
+                    draft_input_spec_info.topk_p, num_seqs,
+                )
+                forward_batch.spec_info_topk_p = p_norm.unsqueeze(-1)
             (
                 logits_output,
                 next_token_ids,
@@ -808,6 +817,27 @@ class SimpleEagleWorker(TpModelWorker):
             # prepare next_token_ids
             next_token_ids = torch.multinomial(target_probs, num_samples=1).squeeze(-1)
         return logits_output, next_token_ids, accept_index
+    
+    def _normalize_spec_tensor(
+        self,
+        tensor: Optional[torch.Tensor],
+        num_seqs: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Normalizes a tensor (like topk_p or topk_index) to match the number of sequences.
+        It handles cases where the tensor length is 1 or a divisor of num_seqs.
+        """
+        if tensor.dim() > 1 and tensor.shape[-1] == 1:
+            tensor = tensor.squeeze(-1)
+
+        s0 = tensor.shape[0]
+        if s0 == num_seqs:
+            return tensor
+        if s0 == 1:
+            return tensor.expand(num_seqs)
+        repeats = (num_seqs + s0 - 1) // s0
+
+        return tensor.repeat(repeats)[:num_seqs]
 
 
 def load_token_map(token_map_path: str) -> List[int]:
