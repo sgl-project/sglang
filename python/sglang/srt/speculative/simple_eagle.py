@@ -95,7 +95,7 @@ def align_evict_mask_to_page_size_simple_eagle(
 def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
-    with disable_dp_size(), patch_tensor_parallel_group(tp_group):
+    with patch_tensor_parallel_group(tp_group):
         yield
 
 
@@ -124,6 +124,7 @@ class SimpleEagleWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.num_draft_tokens = 2
 
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -241,8 +242,21 @@ class SimpleEagleWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
-        if batch.forward_mode.is_decode():
-            # return self.draft(batch)
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(batch)
+            with self.draft_tp_context(self.draft_model_runner.tp_group):
+                self.forward_draft_extend(
+                    batch, logits_output.hidden_states, next_token_ids,seq_lens_cpu
+                )
+                
+            # return logits_output, next_token_ids, bid, 0, False
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=False,
+            )
+        else:
             (
 	            logits_output,
 	            output_ids,
@@ -257,31 +271,6 @@ class SimpleEagleWorker(TpModelWorker):
 	            num_accepted_tokens=num_accepted_tokens,
 	            can_run_cuda_graph=can_run_cuda_graph,
 	        )
-        elif batch.forward_mode.is_idle():
-            model_worker_batch = batch.get_model_worker_batch()
-            # logits_output, next_token_ids, _ = (
-            #     self.target_worker.forward_batch_generation(model_worker_batch)
-            # )
-
-            # return logits_output, next_token_ids, model_worker_batch.bid, 0, False
-            generation_result = self.target_worker.forward_batch_generation(model_worker_batch)
-
-            return generation_result
-            
-        else:
-            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(batch)
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
-                self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids,seq_lens_cpu
-                )
-                
-            # return logits_output, next_token_ids, bid, 0, False
-            return GenerationBatchResult(
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
-                can_run_cuda_graph=False,
-            )
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -314,93 +303,126 @@ class SimpleEagleWorker(TpModelWorker):
         return logits_output, next_token_ids, model_worker_batch.seq_lens_cpu
 
     def forward_draft_extend_after_decode(
-        self, forward_batch: ForwardBatch, accept_index
+        self, forward_batch: ForwardBatch
     ):
-        # Prepare metadata
-        forward_batch.spec_info.prepare_extend_after_decode(
-            forward_batch,
-            1,
+        input_is_idle = forward_batch.forward_mode.is_idle()
+        if not input_is_idle:
+            # Prepare metadata
+            if forward_batch.spec_info.verified_id is not None:
+                forward_batch.spec_info.prepare_extend_after_decode(
+                    forward_batch,
+                    self.speculative_num_steps,
+                )
+
+            else:
+                forward_batch = forward_batch.copy()
+                forward_batch.prepare_for_idle()
+                forward_batch.spec_info = EagleDraftInput.create_idle_input(
+                    device=self.device,
+                    hidden_size=self.model_config.hidden_size,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
+                forward_batch.positions = torch.empty((0,), dtype=torch.long, device=self.device)
+                
+        forward_batch.forward_mode = (
+            ForwardMode.SIMPLE_DRAFT_EXTEND if not input_is_idle else ForwardMode.IDLE
         )
-        forward_batch.forward_mode = ForwardMode.SIMPLE_DRAFT_EXTEND
         forward_batch.seq_lens_sum = sum(forward_batch.seq_lens)
         forward_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         forward_batch.return_logprob = False
         forward_batch.req_to_token_pool = self.draft_model_runner.req_to_token_pool
         forward_batch.token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         forward_batch.attn_backend = self.draft_model_runner.attn_backend
-        forward_batch.positions = forward_batch.spec_info.positions
+        # forward_batch.positions = forward_batch.spec_info.positions
         # Run
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
 
-        last = accept_index[:, 1]
-        first = accept_index[:, 0]
-        save_index = torch.where(last != -1, last, first)
-        logits_output.hidden_states = logits_output.hidden_states[save_index]
-        logits_output.next_token_logits = logits_output.next_token_logits[save_index]
+        # last = accept_index[:, 1]
+        # first = accept_index[:, 0]
+        # save_index = torch.where(last != -1, last, first)
+        # logits_output.hidden_states = logits_output.hidden_states[save_index]
+        # logits_output.next_token_logits = logits_output.next_token_logits[save_index]
 
         return logits_output
 
     def draft(self, batch: ScheduleBatch):
-        num_seqs = batch.batch_size()
-        draft_input_spec_info = batch.spec_info
-        num_draft_tokens = 2
-        if self.page_size == 1:
-            batch.out_cache_loc = alloc_token_slots(
-                batch.tree_cache,
-                num_seqs * 2,
-                backup_state=False,
+        if batch.forward_mode.is_idle():
+            num_seqs = 0
+            draft_input_spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=self.model_config.hidden_size,
+                topk=1,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                dtype=self.model_config.dtype,
             )
-            end_offset = batch.seq_lens + 2
-        else:  # support page_size > 1
-            prefix_lens = batch.seq_lens
-            prefix_lens_cpu = batch.seq_lens_cpu
-            end_offset = prefix_lens + 2
-            end_offset_cpu = prefix_lens_cpu + 2
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                prefix_lens,
+            batch.input_ids = torch.empty((0,), dtype=torch.long, device=self.device)
+            # positions = torch.empty((0,), dtype=torch.long, device=self.device)
+            batch.spec_info = EagleVerifyInput.create_idle_input(
+                1,
+                1,
+                2,
             )
+        else:
+            num_seqs = batch.batch_size()
+            draft_input_spec_info = batch.spec_info
+            if self.page_size == 1:
+                batch.out_cache_loc = alloc_token_slots(
+                    batch.tree_cache,
+                    num_seqs * 2,
+                    backup_state=False,
+                )
+                end_offset = batch.seq_lens + 2
+            else:  # support page_size > 1
+                prefix_lens = batch.seq_lens
+                prefix_lens_cpu = batch.seq_lens_cpu
+                end_offset = prefix_lens + 2
+                end_offset_cpu = prefix_lens_cpu + 2
+                last_loc = get_last_loc(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    prefix_lens,
+                )
             
-            batch.out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                prefix_lens,
-                prefix_lens_cpu,
+                batch.out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    num_seqs * 2,
+                )
+
+            assign_req_to_token_pool[(num_seqs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
                 end_offset,
-                end_offset_cpu,
-                last_loc,
-                num_seqs * 2,
+                batch.out_cache_loc,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                next_power_of_2(num_seqs),
             )
+            batch.input_ids = torch.column_stack(
+                (batch.output_ids, draft_input_spec_info.topk_index.squeeze(1))
+            ).flatten()
+            positions = torch.column_stack((batch.seq_lens, batch.seq_lens + 1)).flatten()
 
-        assign_req_to_token_pool[(num_seqs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(num_seqs),
-        )
-        batch.input_ids = torch.column_stack(
-            (batch.output_ids, draft_input_spec_info.topk_index.squeeze(1))
-        ).flatten()
-        positions = torch.column_stack((batch.seq_lens, batch.seq_lens + 1)).flatten()
-
-        batch.spec_info = EagleVerifyInput(
-            draft_token=batch.input_ids,
-            custom_mask=None,
-            positions=positions,
-            retrive_index=None,
-            retrive_next_token=None,
-            retrive_next_sibling=None,
-            retrive_cum_len=None,
-            draft_token_num=2,
-            spec_steps=1,
-            topk=1,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            seq_lens_cpu=None,
-            seq_lens_sum=None,
-        )
+            batch.spec_info = EagleVerifyInput(
+                draft_token=batch.input_ids,
+                custom_mask=None,
+                positions=positions,
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                retrive_cum_len=None,
+                draft_token_num=2,
+                spec_steps=1,
+                topk=1,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_cpu=None,
+                seq_lens_sum=None,
+            )
 
         model_worker_batch = batch.get_model_worker_batch()
 
@@ -430,14 +452,13 @@ class SimpleEagleWorker(TpModelWorker):
             ) = self.cuda_graph_runner.replay(forward_batch)
             forward_batch.input_ids = next_token_ids
         else:
-            draft_token_num = 2
             kv_indptr = torch.empty(
-                size=[1 + draft_token_num * num_seqs], dtype=torch.int32, device="cuda"
+                size=[1 + self.num_draft_tokens * num_seqs], dtype=torch.int32, device="cuda"
             )
             kv_indices = torch.empty(
                 size=[
-                    forward_batch.seq_lens_sum * draft_token_num
-                    + (draft_token_num + 1) * num_seqs
+                    forward_batch.seq_lens_sum * self.num_draft_tokens
+                    + (self.num_draft_tokens + 1) * num_seqs
                 ],
                 dtype=torch.int32,
                 device="cuda",
@@ -449,8 +470,8 @@ class SimpleEagleWorker(TpModelWorker):
                 kv_indices,
                 forward_batch.req_pool_indices,
                 req_to_token,
-                forward_batch.seq_lens + num_draft_tokens,
-                num_draft_tokens,
+                forward_batch.seq_lens + self.num_draft_tokens,
+                self.num_draft_tokens,
                 req_to_token.shape[-1],
                 next_power_of_2(num_seqs),
             )
@@ -472,11 +493,16 @@ class SimpleEagleWorker(TpModelWorker):
             accept_length_cpu_for_draft_extend = accept_length_for_draft_extend.tolist()
 
             # here, we extend draft tokens anyway cause we want to adopt to cuda graph.
+            last = accept_index[:, 1]
+            first = accept_index[:, 0]
+            save_index = torch.where(last != -1, last, first)
+            selected_hidden_states = logits_output.hidden_states[save_index]
+            
             draft_input = EagleDraftInput()
-            draft_input.hidden_states = logits_output.hidden_states
+            draft_input.hidden_states = selected_hidden_states
             draft_input.accept_length = accept_length_for_draft_extend
             draft_input.accept_length_cpu = accept_length_cpu_for_draft_extend
-            draft_input.verified_id = next_token_ids
+            draft_input.verified_id = next_token_ids[save_index]
             draft_input.seq_lens_for_draft_extend = forward_batch.seq_lens + (
                 accept_length_for_draft_extend + 1
             )
@@ -485,7 +511,7 @@ class SimpleEagleWorker(TpModelWorker):
             )
             forward_batch.spec_info = draft_input
             draft_logits_output = self.forward_draft_extend_after_decode(
-                forward_batch, accept_index
+                forward_batch
             )
 
         accept_length = torch.zeros((num_seqs,), dtype=torch.int32, device="cuda")
@@ -502,13 +528,15 @@ class SimpleEagleWorker(TpModelWorker):
 
         batch.seq_lens_sum = forward_batch.seq_lens_sum
         batch.input_ids = forward_batch.input_ids
-        batch.forward_mode = ForwardMode.DECODE
+        batch.forward_mode = (
+            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        )
 
         accept_length_cpu = accept_length.tolist()
         batch.spec_info.accept_length = accept_length
         batch.spec_info.accept_length_cpu = accept_length_cpu
         batch.seq_lens.add_(accept_length + 1)
-        batch.seq_lens_cpu.add_(torch.tensor(accept_length_cpu) + 1)
+        batch.seq_lens_cpu.add_(torch.tensor(accept_length_cpu,dtype=torch.int32) + 1)
         batch.seq_lens_sum = batch.seq_lens.sum().item()
 
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
@@ -569,8 +597,8 @@ class SimpleEagleWorker(TpModelWorker):
                 # batch.seq_lens,
                 evict_mask,
                 self.page_size,
-                num_draft_tokens,
-                next_power_of_2(num_draft_tokens),
+                2,
+                next_power_of_2(self.num_draft_tokens),
             )
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             
@@ -751,15 +779,15 @@ class SimpleEagleWorker(TpModelWorker):
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
                 forward_batch.sampling_info.temperatures, 2, dim=0
-            )  # (bs * draft_token_num, 1)
+            )  # (bs * self.num_draft_tokens, 1)
 
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * draft_token_num, vocab_size)
+            )  # (bs * self.num_draft_tokens, vocab_size)
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(forward_batch.sampling_info.top_ks, 2, dim=0),
-            )  # (bs * draft_token_num, vocab_size)
+            )  # (bs * self.num_draft_tokens, vocab_size)
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(forward_batch.sampling_info.top_ps, 2, dim=0),
