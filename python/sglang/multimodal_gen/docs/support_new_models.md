@@ -20,16 +20,16 @@ To add support for a new diffusion model, you will primarily need to define or c
 2.  **`SamplingParams`**: This dataclass defines the parameters that control the generation process at runtime. These are the user-provided inputs for a generation request, such as the `prompt`, `negative_prompt`, `guidance_scale`, `num_inference_steps`, `seed`, output dimensions (`height`, `width`), etc.
 
 3.  **`ComposedPipeline` (not a config)**: This is the central class where you define the structure of your model's generation pipeline. You will create a new class that inherits from `ComposedPipelineBase` and, within it, instantiate and chain together the necessary `PipelineStage`s in the correct order. See `ComposedPipelineBase` and `PipelineStage` base definitions:
-    - `ComposedPipelineBase`: https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/composed_pipeline_base.py
-    - `PipelineStage` base: https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/stages/base.py
-    - Central registry (models/config mapping): https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py
+    - [`ComposedPipelineBase`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/composed_pipeline_base.py)
+    - [`PipelineStage`]( https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/stages/base.py)
+    - [Central registry (models/config mapping)](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)
 
 4.  **Modules (components referenced by the pipeline)**: Each pipeline references a set of modules that are loaded from the model repository (e.g., Diffusers `model_index.json`) and assembled via the registry/loader. Common modules include:
-    - `text_encoder`: Encodes text prompts into embeddings (may support multiple encoders for complex conditioning).
+    - `text_encoder`: Encodes text prompts into embeddings
     - `tokenizer`: Tokenizes raw text input for the text encoder(s).
     - `processor`: Preprocesses images and extracts features; often used in image-to-image tasks.
     - `image_encoder`: Specialized image feature extractor (may be distinct from or combined with `processor`).
-    - `transformer`: The core denoiser network (DiT/UNet architecture) operating in latent space.
+    - `dit/transformer`: The core denoising network (DiT/UNet architecture) operating in latent space.
     - `scheduler`: Controls the timestep schedule and denoising dynamics throughout inference.
     - `vae`: Variational Autoencoder for encoding/decoding between pixel space and latent space.
 
