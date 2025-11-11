@@ -63,6 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
@@ -326,8 +327,7 @@ class GptOssAttention(nn.Module):
             *inner_state,
             sinks=self.sinks,
             save_kv_cache=not (
-                enable_fused_set_kv_buffer(forward_batch)
-                and not get_is_capture_mode()
+                enable_fused_set_kv_buffer(forward_batch) and not get_is_capture_mode()
             ),
         )
         output, _ = self.o_proj(attn_output)
