@@ -191,6 +191,7 @@ class RadixCache(BasePrefixCache):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
+        enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
         is_eagle: bool = False,
@@ -202,6 +203,9 @@ class RadixCache(BasePrefixCache):
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
         self.is_eagle = is_eagle
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -337,21 +341,21 @@ class RadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
-        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        committed_kv_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :all_token_len
+                req.req_pool_idx, :committed_kv_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
-        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
+        actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :all_token_len
+            req.req_pool_idx, :committed_kv_len
         ]
 
         if self.page_size != 1:
@@ -483,6 +487,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        start_time = time.perf_counter()
         leaves = self._collect_leaves()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -493,20 +498,21 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            if x == self.root_node:
-                break
-            if x.lock_ref > 0:
-                continue
-
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
-            if len(x.parent.children) == 0:
+            if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        if num_evicted > 0 and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
@@ -561,14 +567,15 @@ class RadixCache(BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
-        node.last_access_time = time.monotonic()
+        access_time = time.monotonic()
+        node.last_access_time = access_time
 
         child_key = self.get_child_key_fn(key)
 
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = time.monotonic()
+            child.last_access_time = access_time
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -605,7 +612,8 @@ class RadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: RadixKey, value):
-        node.last_access_time = time.monotonic()
+        access_time = time.monotonic()
+        node.last_access_time = access_time
         if len(key) == 0:
             return 0
 
@@ -614,7 +622,7 @@ class RadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.monotonic()
+            node.last_access_time = access_time
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -676,12 +684,13 @@ class RadixCache(BasePrefixCache):
 
     def _collect_leaves(self):
         ret_list = []
-        stack = [self.root_node]
+        stack = list(self.root_node.children.values())
 
         while stack:
             cur_node = stack.pop()
             if len(cur_node.children) == 0:
-                ret_list.append(cur_node)
+                if cur_node.lock_ref == 0:
+                    ret_list.append(cur_node)
             else:
                 stack.extend(cur_node.children.values())
 
