@@ -724,8 +724,8 @@ class SchedulerOutputProcessorMixin:
 
         queue_times = []
         forward_entry_times = []
-        prefill_delays = []
-        prefill_latencies = []
+        prefill_launch_delays = []
+        prefill_launch_latencies = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -830,24 +830,10 @@ class SchedulerOutputProcessorMixin:
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
 
-                if req.time_stats.prefill_start_time > 0.0:
-                    prefill_delays.append(
-                        req.time_stats.prefill_start_time
-                        - req.time_stats.forward_entry_time
-                    )
-                else:
-                    prefill_delays.append(None)
-
-                if (
-                    req.time_stats.prefill_start_time > 0.0
-                    and req.time_stats.prefill_end_time > 0.0
-                ):
-                    prefill_latencies.append(
-                        req.time_stats.prefill_end_time
-                        - req.time_stats.prefill_start_time
-                    )
-                else:
-                    prefill_latencies.append(None)
+                prefill_launch_delays.append(req.time_stats.get_prefill_launch_delay())
+                prefill_launch_latencies.append(
+                    req.time_stats.get_prefill_launch_latency()
+                )
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -940,12 +926,14 @@ class SchedulerOutputProcessorMixin:
 
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
+                    rids=rids,
+                    http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
                     queue_time=queue_times,
                     forward_entry_time=forward_entry_times,
-                    prefill_delay=prefill_delays,
-                    prefill_latency=prefill_latencies,
+                    prefill_launch_delay=prefill_launch_delays,
+                    prefill_launch_latency=prefill_launch_latencies,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
                     decode_ids=decode_ids_list,
@@ -971,8 +959,6 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
-                    rids=rids,
-                    http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
@@ -989,8 +975,8 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         queue_times = []
         forward_entry_times = []
-        prefill_delays = []
-        prefill_latencies = []
+        prefill_launch_delays = []
+        prefill_launch_latencies = []
         retraction_counts = []
         for req in reqs:
             if req.finished():
@@ -1004,39 +990,25 @@ class SchedulerOutputProcessorMixin:
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
 
-                if req.time_stats.prefill_start_time > 0.0:
-                    prefill_delays.append(
-                        req.time_stats.prefill_start_time
-                        - req.time_stats.forward_entry_time
-                    )
-                else:
-                    prefill_delays.append(None)
-
-                if (
-                    req.time_stats.prefill_start_time > 0.0
-                    and req.time_stats.prefill_end_time > 0.0
-                ):
-                    prefill_latencies.append(
-                        req.time_stats.prefill_end_time
-                        - req.time_stats.prefill_start_time
-                    )
-                else:
-                    prefill_latencies.append(None)
+                prefill_launch_delays.append(req.time_stats.get_prefill_launch_delay())
+                prefill_launch_latencies.append(
+                    req.time_stats.get_prefill_launch_latency()
+                )
                 retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
+                rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
                 queue_time=queue_times,
                 forward_entry_time=forward_entry_times,
-                prefill_delay=prefill_delays,
-                prefill_latency=prefill_latencies,
+                prefill_launch_delay=prefill_launch_delays,
+                prefill_launch_latency=prefill_launch_latencies,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
-                http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
-                rids=rids,
             )
         )
