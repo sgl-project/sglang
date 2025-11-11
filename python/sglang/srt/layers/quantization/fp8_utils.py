@@ -655,7 +655,7 @@ def apply_fp8_linear(
                         out_dtype=input.dtype,
                         bias=bias,
                     )
-                return output.view(*output_shape)
+            return output.view(*output_shape)
 
         # torch.scaled_mm supports per tensor weights + activations only
         # so fallback to naive if per channel or per token
