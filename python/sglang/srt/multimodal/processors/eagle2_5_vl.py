@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -102,6 +103,16 @@ def resize_image(
     return image
 
 
+async def resize_image_async(
+    image,
+    min_pixels: int = MIN_PIXELS,
+    max_pixels: int = MAX_PIXELS,
+    size_factor: int = IMAGE_FACTOR,
+):
+    """Async wrapper for resize_image."""
+    return resize_image(image, min_pixels, max_pixels, size_factor)
+
+
 class Eagle2_5_VLProcessor(SGLangBaseProcessor):
     """Multimodal processor for Eagle2.5 Vision-Language Model."""
 
@@ -114,29 +125,126 @@ class Eagle2_5_VLProcessor(SGLangBaseProcessor):
         # Use the passed processor instead of loading our own
         self.hf_processor = _processor
 
-        # Eagle2.5 specific attributes (NVIDIA's default is 151667)
-        self.image_token_index = 151667  # From config
-        self.downsample_ratio = 0.5
-        self.dynamic_image_size = True
-        self.force_image_size = 224
-        self.max_dynamic_tiles = 12
-        self.min_dynamic_tiles = 1
-        self.use_thumbnail = True
+        # Eagle2.5 specific attributes (from config)
+        self.image_token_index = getattr(hf_config, "image_token_index", 151667)
+        self.image_token_id = self.image_token_index  # Alias for consistency
+        self.video_token_id = getattr(hf_config, "video_token_id", 151670)
+        self.audio_token_id = None  # Eagle2.5 doesn't support audio yet
 
-        # Special tokens
-        self.image_token = "<image>"
-        self.video_token = "<video>"
+        self.downsample_ratio = getattr(hf_config, "downsample_ratio", 0.5)
+        self.dynamic_image_size = getattr(hf_config, "dynamic_image_size", True)
+        self.force_image_size = getattr(hf_config, "force_image_size", 224)
+        self.max_dynamic_tiles = getattr(hf_config, "max_dynamic_tiles", 12)
+        self.min_dynamic_tiles = getattr(hf_config, "min_dynamic_tiles", 1)
+        self.use_thumbnail = getattr(hf_config, "use_thumbnail", True)
+
+        # Special tokens - Eagle2.5 uses numbered image placeholders in prompts like <image-1>, <image-2>, etc.
+        # The actual token in the tokenizer is <IMG_CONTEXT>, but the text contains <image-N> placeholders
+        # We use regex to match all numbered placeholders since there can be multiple images per prompt
+
+        # Initialize multimodal tokens with regex to match numbered placeholders
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<image>",  # Generic representation (not used due to custom regex)
+            image_token_id=self.image_token_id,
+            image_token_regex=re.compile(
+                r"<image-\d+>"
+            ),  # Match <image-1>, <image-2>, etc.
+            video_token="<video>",  # Generic representation (not used due to custom regex)
+            video_token_id=self.video_token_id,
+            video_token_regex=re.compile(
+                r"<video-\d+>"
+            ),  # Match <video-1>, <video-2>, etc.
+            audio_token_id=self.audio_token_id,
+        ).build(_processor)
 
     def _get_mm_special_tokens(self) -> MultimodalSpecialTokens:
         """Get multimodal special tokens."""
+        # Note: This method appears unused, but kept for compatibility
         return MultimodalSpecialTokens(
-            image_start_token=self.image_token,
-            image_end_token=self.image_token,  # Same token for start/end
-            image_token=self.image_token,
-            video_start_token=self.video_token,
-            video_end_token=self.video_token,
-            video_token=self.video_token,
+            image_start_token="<image>",
+            image_end_token="<image>",  # Same token for start/end
+            image_token="<image>",
+            video_start_token="<video>",
+            video_end_token="<video>",
+            video_token="<video>",
         )
+
+    def __call__(
+        self,
+        images: Optional[Union[Image.Image, List[Image.Image]]] = None,
+        text: Optional[Union[str, List[str]]] = None,
+        videos: Optional[List[torch.Tensor]] = None,
+        return_tensors: Optional[str] = "pt",
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Main method to prepare inputs for Eagle2.5-VL model.
+
+        Args:
+            images: PIL Image(s) to process
+            text: Text string(s) to tokenize
+            videos: Video tensor(s) to process (not fully supported yet)
+            return_tensors: Format of returned tensors ('pt' for PyTorch)
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            Dictionary containing:
+            - input_ids: Tokenized text input
+            - attention_mask: Attention mask for input
+            - pixel_values: Processed image tensors (if images provided)
+            - image_grid_thw: Image grid dimensions (if images provided)
+            - pixel_values_videos: Processed video tensors (if videos provided)
+            - video_grid_thw: Video grid dimensions (if videos provided)
+        """
+        # Initialize output dictionary
+        output = {}
+
+        # Process images if provided
+        if images is not None:
+            if isinstance(images, Image.Image):
+                images = [images]
+
+            # Resize images according to Eagle2.5's requirements
+            processed_images = []
+            for img in images:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img = resize_image(
+                    img,
+                    min_pixels=MIN_PIXELS,
+                    max_pixels=MAX_PIXELS,
+                    size_factor=IMAGE_FACTOR,
+                )
+                processed_images.append(img)
+
+            # Use HF processor's image processor
+            if hasattr(self.hf_processor, "image_processor"):
+                image_outputs = self.hf_processor.image_processor(
+                    images=processed_images,
+                    return_tensors=return_tensors,
+                )
+                output.update(image_outputs)
+
+        # Process videos if provided
+        if videos is not None:
+            video_data = self._process_videos(videos)
+            output.update(video_data)
+
+        # Process text if provided
+        if text is not None:
+            if not isinstance(text, list):
+                text = [text]
+
+            # Tokenize text
+            text_outputs = self.hf_processor.tokenizer(
+                text,
+                return_tensors=return_tensors,
+                padding=kwargs.get("padding", False),
+                truncation=kwargs.get("truncation", False),
+            )
+            output.update(text_outputs)
+
+        return output
 
     def _process_images(self, images: List[Image.Image]) -> dict:
         """Process images for Eagle2.5."""
@@ -325,13 +433,53 @@ class Eagle2_5_VLProcessor(SGLangBaseProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data,
+        image_data: List[Union[str, bytes]],
         audio_data,
         input_text,
         request_obj,
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
         """Process multimodal data for Eagle2_5_VL."""
-        # For now, return None to indicate no special processing needed
-        # The actual processing happens during tokenization
+        # Use base class to load multimodal data (handles various input formats)
+        base_output = self.load_mm_data(
+            prompt=input_text,
+            image_data=image_data,
+            video_data=getattr(request_obj, "video_data", None),
+            audio_data=audio_data,
+            multimodal_tokens=self.mm_tokens,
+        )
+
+        # Eagle2.5-specific: resize images if they are raw Image objects
+        if base_output.images and isinstance(base_output.images[0], Image.Image):
+            import asyncio
+
+            resize_tasks = [
+                resize_image_async(
+                    image,
+                    min_pixels=MIN_PIXELS,
+                    max_pixels=MAX_PIXELS,
+                    size_factor=IMAGE_FACTOR,
+                )
+                for image in base_output.images
+            ]
+            base_output.images = await asyncio.gather(*resize_tasks)
+
+        # Use base class to process and combine multimodal data with tokens
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
+
+        # Return processed multimodal data
+        if mm_items:
+            input_ids = input_ids.flatten()
+            return {
+                "input_ids": input_ids.tolist(),
+                "mm_items": mm_items,
+                "im_start_id": self.image_token_id,
+                "im_end_id": self.image_token_id,
+                "im_token_id": self.image_token_id,
+                "video_token_id": self.video_token_id,
+                "audio_token_id": self.audio_token_id,
+            }
+
         return None
