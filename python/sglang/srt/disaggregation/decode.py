@@ -809,7 +809,6 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
