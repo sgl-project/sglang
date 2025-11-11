@@ -56,7 +56,7 @@ if _is_cuda:
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
-        return torch.empty((M, N), dtype=out_dtype)
+        return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
