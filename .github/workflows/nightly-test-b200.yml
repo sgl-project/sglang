@@ -82,3 +82,22 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v32
+
+  check-all-jobs:
+    if: github.repository == 'sgl-project/sglang' && always()
+    needs:
+      - nightly-test-4-gpu-b200
+      - nightly-test-8-gpu-b200
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"
