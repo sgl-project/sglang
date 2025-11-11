@@ -251,7 +251,6 @@ class SimpleEagleWorker(TpModelWorker):
 	            can_run_cuda_graph,
 	        ) = self.draft(batch)
             
-            logger.info(f"[decode] output_ids: {output_ids}")
             return GenerationBatchResult(
 	            logits_output=logits_output,
 	            next_token_ids=output_ids,
@@ -275,8 +274,6 @@ class SimpleEagleWorker(TpModelWorker):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids,seq_lens_cpu
                 )
-                
-            logger.info(f"[prefill] next_token_ids: {next_token_ids}")
                 
             # return logits_output, next_token_ids, bid, 0, False
             return GenerationBatchResult(

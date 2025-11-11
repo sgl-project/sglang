@@ -693,8 +693,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.positions,
             self.verified_id,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
-        )
-        
+        )        
+
     def prepare_extend_after_decode_for_simple_eagle(
         self,
         batch: ScheduleBatch,

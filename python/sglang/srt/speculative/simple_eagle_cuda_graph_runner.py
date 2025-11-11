@@ -419,12 +419,6 @@ class SimpleEAGLECudaGraphRunner:
                 accept_length, dtype=torch.int32, device="cuda"
             )
 
-            # draft_input.hidden_states = logits_output.hidden_states
-            # last = accept_index[:, 1]
-            # first = accept_index[:, 0]
-            # save_index = torch.where(last != -1, last, first)
-            # selected_hidden_states = logits_output.hidden_states[save_index]
-
             draft_spec_info.hidden_states = logits_output.hidden_states
             # draft_spec_info.hidden_states = selected_hidden_states
             draft_spec_info.accept_length = accept_length_for_draft_extend
@@ -710,7 +704,7 @@ class SimpleEAGLECudaGraphRunner:
         forward_batch.req_to_token_pool = self.draft_model_runner.req_to_token_pool
         forward_batch.token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         forward_batch.attn_backend = self.draft_model_runner.attn_backend
-        forward_batch.positions = forward_batch.spec_info.positions
+        # forward_batch.positions = forward_batch.spec_info.positions
         # Run
         logits_output, _ = self.draft_model_runner.forward(
             forward_batch, skip_attn_backend_init=True
