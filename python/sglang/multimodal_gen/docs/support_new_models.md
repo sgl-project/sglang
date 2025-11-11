@@ -55,8 +55,8 @@ You can build your custom `ComposedPipeline` by combining the following availabl
 
 To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. The typical implementation order is:
 
-1.  **Define Modules**:
-    - Identify and declare required modules via `_required_config_modules` (corresponding to keys in the model's `model_index.json`):
+1.  **Analyze Required Modules**:
+    - Study the target model's components by examining its `model_index.json` or Diffusers implementation to identify required modules:
       - `processor`: Image preprocessing and feature extraction
       - `scheduler`: Diffusion timestep scheduling
       - `text_encoder`: Text-to-embedding conversion
@@ -68,9 +68,17 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
     - **PipelineConfig**: [`QwenImageEditPipelineConfig`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/pipelines/qwen_image.py) defines model-specific parameters, precision settings, preprocessing functions, and latent shape calculations.
     - **SamplingParams**: [`QwenImageSamplingParams`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/sample/qwenimage.py) sets runtime defaults like `num_frames=1`, `guidance_scale=4.0`, `num_inference_steps=50`.
 
-3.  **Define Pipeline Class**:
+3.  **Implement Model Components**:
+    - Adapt or implement specific model components in the appropriate directories:
+      - **DiT/Transformer**: Implement in [`runtime/models/dits/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/) - e.g., [`qwen_image.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/qwen_image.py) for Qwen's DiT architecture
+      - **Encoders**: Implement in [`runtime/models/encoders/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/) - e.g., text encoders like [`qwen2_5vl.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/qwen2_5vl.py)
+      - **VAEs**: Implement in [`runtime/models/vaes/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/) - e.g., [`autoencoder_kl_qwenimage.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py)
+      - **Schedulers**: Implement in [`runtime/models/schedulers/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/schedulers/) if needed
+    - These components handle the core model logic, attention mechanisms, and data transformations specific to the target diffusion model.
+
+4.  **Define Pipeline Class**:
     - The [`QwenImageEditPipeline`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/architectures/basic/qwen_image/qwen_image.py) class inherits from `ComposedPipelineBase` and orchestrates stages sequentially.
-    - Implementation:
+    - Declare required modules via `_required_config_modules` and implement the pipeline stages:
 
     ```python
     class QwenImageEditPipeline(ComposedPipelineBase):
@@ -90,7 +98,7 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
     ```
     The pipeline is constructed by adding stages in order. `Qwen-Image-Edit` uses `ImageEncodingStage` (for prompt and image processing) and `ImageVAEEncodingStage` (for latent extraction) before standard denoising and decoding.
 
-4.  **Register Configs**:
+5.  **Register Configs**:
     - Map the configs in the central registry ([`registry.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)) to enable automatic loading and instantiation for the model. Modules are automatically loaded and injected based on the config and repository structure.
 
 By following this modular pattern of defining configurations and composing pipelines, you can integrate new diffusion models into SGLang with clarity and ease.
