@@ -948,7 +948,6 @@ def rms_norm_fn(
     )
 
 
-
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE_DIM": 32}, num_warps=2),
@@ -994,19 +993,14 @@ def _timestep_embedding_triton_kernel(
     angles = t_val.to(tl.float32) * freqs
 
     embedding = tl.where(
-        is_first_half,
-        tl.cos(angles),
-        tl.where(
-            is_second_half,
-            tl.sin(angles),
-            0.0
-        )
+        is_first_half, tl.cos(angles), tl.where(is_second_half, tl.sin(angles), 0.0)
     )
 
     # Store results
     out_ptrs = output_ptr + pid_b * stride_out_b + d_offsets * stride_out_d
     mask = d_offsets < dim
     tl.store(out_ptrs, embedding, mask=mask)
+
 
 def timestep_embedding_triton(
     t: torch.Tensor,
@@ -1028,7 +1022,7 @@ def timestep_embedding_triton(
     B = t.shape[0]
     assert t.is_cuda, "t should be a CUDA tensor"
 
-    output = torch.empty((B, dim), dtype=dtype, device='cuda')
+    output = torch.empty((B, dim), dtype=dtype, device="cuda")
 
     grid = lambda META: (B, triton.cdiv(dim, META["BLOCK_SIZE_DIM"]))
 
@@ -1043,4 +1037,3 @@ def timestep_embedding_triton(
     )
 
     return output
-
