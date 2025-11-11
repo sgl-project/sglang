@@ -2574,6 +2574,9 @@ class Scheduler(
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
+    def get_remote_instance_transfer_engine_info(self):
+        return self.tp_worker.get_remote_instance_transfer_engine_info()
+
 
 class IdleSleeper:
     """
@@ -2685,11 +2688,18 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
+        (
+            remote_instance_transfer_engine_session_id,
+            remote_instance_transfer_engine_weights_info_dict,
+        ) = scheduler.get_remote_instance_transfer_engine_info()
         pipe_writer.send(
             {
                 "status": "ready",
                 "max_total_num_tokens": scheduler.max_total_num_tokens,
                 "max_req_input_len": scheduler.max_req_input_len,
+                "tp_rank": tp_rank,
+                "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
+                "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
             }
         )
 
