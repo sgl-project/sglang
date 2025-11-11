@@ -205,7 +205,7 @@ impl GenerationRequest for GenerateRequest {
     fn get_model(&self) -> Option<&str> {
         // Generate requests have an optional model field
         if let Some(s) = &self.model {
-            Some(&s.as_str())
+            Some(s.as_str())
         } else {
             None
         }
