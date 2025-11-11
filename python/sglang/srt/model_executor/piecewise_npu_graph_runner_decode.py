@@ -37,7 +37,9 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.compilation.npu_graph_compiler import NpuGraphCompiler
+from sglang.srt.model_executor.compilation.piecewise_npu_graph_compiler import (
+    PiecewiseNpuGraphCompiler,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -544,7 +546,7 @@ class PiecewiseNPUGraphRunnerDecode:
         self.compilation_context.stream = self.stream
         self.model_runner.attn_backend.graph_mode = True
 
-        compiler = NpuGraphCompiler(
+        compiler = PiecewiseNpuGraphCompiler(
             self.model_runner,
             self.model_runner.model,
             self.compilation_config,

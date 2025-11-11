@@ -18,11 +18,11 @@ import logging
 from typing import Any, Callable
 
 import torch
-from torch._dynamo.eval_frame import DisableContext
 
 from sglang.srt.compilation.npu.compilation_context import CompilationContext
 from sglang.srt.compilation.npu.config import CompilationConfig
 from sglang.srt.compilation.npu.pass_manager import PassManager
+from sglang.srt.compilation.npu.npu_compiler_backend import NpuBackend
 from sglang.srt.compilation.npu.passes.w8a8_int8 import (
     DivFuse,
     EraseCopy,
@@ -152,7 +152,7 @@ class NpuAddRmsNormFuse:
         return quantized_output, out2
 
 
-class NpuBackend:
+class PiecewiseNpuGraphCompilerBackend(NpuBackend):
     graph: torch.fx.GraphModule
 
     def __init__(
@@ -170,9 +170,7 @@ class NpuBackend:
         self.compilation_context = compilation_context
 
         self.split_gm = None
-
         self.piecewise_graphs = None
-        self.submod_names_to_compile = None
 
         self.callables = {}
         self.callables_by_branch = {}
@@ -183,13 +181,10 @@ class NpuBackend:
             callable = self.callables[example_inputs_len]
             return callable
 
-        DisableContext.compiled_function_args[DisableContext.batch_size] = (
-            example_inputs
-        )
-
+        super().__call__(graph, example_inputs)
+        
         self.graph = graph
-        NpuBackend.apply_passes(self.graph)
-        self.split_gm, self.piecewise_graphs = NpuBackend.split_graph(
+        self.split_gm, self.piecewise_graphs = PiecewiseNpuGraphCompilerBackend.split_graph(
             self.graph, self.compilation_config.splitting_ops
         )
 
@@ -224,13 +219,13 @@ class NpuBackend:
         self.callables[example_inputs_len] = self.split_gm.forward
         return self.split_gm.forward
 
-    def apply_passes(graph_module: torch.fx.GraphModule):
-        passManager = PassManager(graph_module)
-        passManager.add(NpuAddRmsNormQuantFuse)
-        passManager.add(DivFuse)
-        passManager.add(EraseCopy)
-        passManager.apply()
-        graph_module.recompile()
+    # def apply_passes(graph_module: torch.fx.GraphModule):
+    #     passManager = PassManager(graph_module)
+    #     passManager.add(NpuAddRmsNormQuantFuse)
+    #     passManager.add(DivFuse)
+    #     passManager.add(EraseCopy)
+    #     passManager.apply()
+    #     graph_module.recompile()
 
     def split_graph(
         graph: torch.fx.GraphModule, ops: list[str]

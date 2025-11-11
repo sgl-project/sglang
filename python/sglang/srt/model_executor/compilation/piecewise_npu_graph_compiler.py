@@ -19,10 +19,10 @@ import torch
 
 from sglang.srt.compilation.npu.compilation_context import CompilationContext
 from sglang.srt.compilation.npu.config import CompilationConfig
-from sglang.srt.model_executor.compilation.npu_compiler_backend import NpuBackend
+from sglang.srt.model_executor.compilation.piecewise_npu_graph_compiler_backend import PiecewiseNpuGraphCompilerBackend
 
 
-class NpuGraphCompiler:
+class PiecewiseNpuGraphCompiler:
     def __init__(
         self,
         model_runner,
@@ -31,7 +31,7 @@ class NpuGraphCompiler:
         compilation_context: CompilationContext,
         page_size: int,
     ):
-        self.backend = NpuBackend(
+        self.backend = PiecewiseNpuGraphCompilerBackend(
             model_runner, compilation_config, compilation_context, page_size
         )
         self.model = model
