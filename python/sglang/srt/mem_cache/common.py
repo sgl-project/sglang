@@ -269,11 +269,9 @@ def alloc_paged_token_slots_extend(
         state = allocator.backup_state()
 
     out_cache_loc = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
+        prefix_lens,  # device tensor
+        seq_lens,  # device tensor
+        last_loc,  # device tensor
         extend_num_tokens,
     )
 
@@ -402,7 +400,7 @@ def alloc_paged_token_slots_decode(
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+    out_cache_loc = allocator.alloc_decode(seq_lens, last_loc)
 
     if out_cache_loc is None:
         error_msg = (
