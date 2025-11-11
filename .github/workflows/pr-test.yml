@@ -79,6 +79,7 @@ jobs:
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
+              # TODO: Use context.workflow_id when it is supported by the GitHub API
               workflow_id: 'pr-test.yml',
               event: eventName,
               per_page: 100,
