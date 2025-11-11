@@ -1,9 +1,4 @@
-"""
-Lightweight request types and enums.
-
-These were originally in schedule_batch.py, but it has been moved here
-to avoid expensive imports.
-"""
+"""Lightweight request types and enums from schedule_batch.py."""
 
 from __future__ import annotations
 

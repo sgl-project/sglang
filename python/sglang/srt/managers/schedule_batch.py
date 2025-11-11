@@ -35,6 +35,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing it in the future.
 """
 
+from __future__ import annotations
+
 import copy
 import dataclasses
 import logging
