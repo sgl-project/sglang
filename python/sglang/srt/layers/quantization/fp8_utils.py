@@ -175,7 +175,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
     assert input_scale is None
 
     input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[0]]
+    output_shape = [*input.shape[:-1], weight.shape[1]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=True
