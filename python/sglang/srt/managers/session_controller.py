@@ -15,7 +15,8 @@ import uuid
 from typing import Dict, Optional
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.request_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 
 
 class SessionReqNode:

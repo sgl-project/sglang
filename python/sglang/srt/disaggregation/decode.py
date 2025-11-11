@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.managers.request_types import FINISH_ABORT, RequestStage
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -298,8 +299,6 @@ class DecodePreallocQueue:
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
-        from sglang.srt.managers.schedule_batch import RequestStage
-
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -414,8 +413,6 @@ class DecodePreallocQueue:
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage
-
         self._update_handshake_waiters()
 
         preallocated_reqs = []
@@ -687,8 +684,6 @@ class DecodeTransferQueue:
         self.queue.extend(decode_reqs)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
-        from sglang.srt.managers.schedule_batch import RequestStage
-
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -733,8 +728,6 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
     def pop_transferred(self) -> List[Req]:
-        from sglang.srt.managers.schedule_batch import RequestStage
-
         if not self.queue:
             return []
         polls = poll_and_all_reduce(
@@ -897,7 +890,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
-        from sglang.srt.managers.schedule_batch import RequestStage, ScheduleBatch
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
 
         if self.grammar_queue:
             self.move_ready_grammar_requests()

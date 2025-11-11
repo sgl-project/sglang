@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import enum
 
-from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Copyright 2023-2024 SGLang Team
@@ -57,6 +56,15 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
+from sglang.srt.managers.request_types import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    FINISH_MATCHED_STR,
+    FINISH_MATCHED_TOKEN,
+    FINISHED_MATCHED_REGEX,
+    BaseFinishReason,
+    RequestStage,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -92,83 +100,12 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+    from sglang.srt.dllm.config import DllmConfig
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
 logger = logging.getLogger(__name__)
-
-
-class BaseFinishReason:
-    def __init__(self, is_error: bool = False):
-        self.is_error = is_error
-
-    def to_json(self):
-        raise NotImplementedError()
-
-
-class FINISH_MATCHED_TOKEN(BaseFinishReason):
-    def __init__(self, matched: Union[int, List[int]]):
-        super().__init__()
-        self.matched = matched
-
-    def to_json(self):
-        return {
-            "type": "stop",  # to match OpenAI API's return value
-            "matched": self.matched,
-        }
-
-
-class FINISH_MATCHED_STR(BaseFinishReason):
-    def __init__(self, matched: str):
-        super().__init__()
-        self.matched = matched
-
-    def to_json(self):
-        return {
-            "type": "stop",  # to match OpenAI API's return value
-            "matched": self.matched,
-        }
-
-
-class FINISHED_MATCHED_REGEX(BaseFinishReason):
-    def __init__(self, matched: str):
-        super().__init__()
-        self.matched = matched
-
-    def to_json(self):
-        return {
-            "type": "stop",  # to match OpenAI API's return value
-            "matched": self.matched,
-        }
-
-
-class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
-        super().__init__()
-        self.length = length
-
-    def to_json(self):
-        return {
-            "type": "length",  # to match OpenAI API's return value
-            "length": self.length,
-        }
-
-
-class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message=None, status_code=None, err_type=None):
-        super().__init__(is_error=True)
-        self.message = message or "Aborted"
-        self.status_code = status_code
-        self.err_type = err_type
-
-    def to_json(self):
-        return {
-            "type": "abort",
-            "message": self.message,
-            "status_code": self.status_code,
-            "err_type": self.err_type,
-        }
 
 
 class Modality(Enum):
@@ -401,35 +338,6 @@ class MultimodalInputs:
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
-
-
-class RequestStage(str, enum.Enum):
-    # Tokenizer
-    TOKENIZE = "tokenize"
-    TOKENIZER_DISPATCH = "dispatch"
-
-    # DP controller
-    DC_DISPATCH = "dc_dispatch"
-
-    # common/non-disaggregation
-    PREFILL_WAITING = "prefill_waiting"
-    REQUEST_PROCESS = "request_process"
-    DECODE_LOOP = "decode_loop"
-    PREFILL_FORWARD = "prefill_forward"
-    PREFILL_CHUNKED_FORWARD = "chunked_prefill"
-
-    # disaggregation prefill
-    PREFILL_PREPARE = "prefill_prepare"
-    PREFILL_BOOTSTRAP = "prefill_bootstrap"
-    PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
-
-    # disaggregation decode
-    DECODE_PREPARE = "decode_prepare"
-    DECODE_BOOTSTRAP = "decode_bootstrap"
-    DECODE_WAITING = "decode_waiting"
-    DECODE_TRANSFERRED = "decode_transferred"
-    DECODE_FAKE_OUTPUT = "fake_output"
-    DECODE_QUICK_FINISH = "quick_finish"
 
 
 class Req:

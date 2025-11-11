@@ -34,7 +34,7 @@ from sglang.srt.utils import ImageData
 if TYPE_CHECKING:
     from PIL.Image import Image
 
-    from sglang.srt.managers.schedule_batch import BaseFinishReason
+    from sglang.srt.managers.request_types import BaseFinishReason
 else:
     Image = Any
 

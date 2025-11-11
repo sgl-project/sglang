@@ -13,6 +13,8 @@
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
+from __future__ import annotations
+
 import faulthandler
 import logging
 import multiprocessing as mp
@@ -21,7 +23,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import psutil
 import setproctitle
@@ -34,7 +36,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req, RequestStage
+from sglang.srt.managers.request_types import RequestStage
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
@@ -59,6 +62,9 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
