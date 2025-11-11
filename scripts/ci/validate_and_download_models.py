@@ -10,6 +10,7 @@ with code 1 only if download attempts fail.
 
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -288,14 +289,12 @@ def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -
     """
     Download a model from HuggingFace.
 
-    Removes specific corrupted files before downloading to ensure a clean download.
-    If no corrupted files are specified, the model is simply missing and will be
-    downloaded in full.
+    Completely removes the model cache directory before downloading to ensure a clean download.
 
     Args:
         model_id: Model identifier
         cache_dir: HuggingFace cache directory
-        corrupted_files: List of specific file paths that are corrupted and should be removed
+        corrupted_files: List of specific file paths that are corrupted (unused, kept for compatibility)
 
     Returns:
         True if download succeeded, False otherwise
@@ -306,21 +305,20 @@ def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -
 
     print(f"Downloading model: {model_id}")
 
-    # Remove only the specific corrupted files
-    if corrupted_files:
-        print(f"  Removing {len(corrupted_files)} corrupted file(s)...")
-        for file_path in corrupted_files:
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-                    print(f"    ✓ Removed: {file_path.name}")
-                else:
-                    print(f"    ⚠ File not found (already removed?): {file_path.name}")
-            except Exception as e:
-                print(f"    ✗ Failed to remove {file_path.name}: {e}")
-                print(f"    Attempting download anyway...")
+    # Completely remove the model directory from cache
+    cache_model_name = "models--" + model_id.replace("/", "--")
+    model_cache_path = Path(cache_dir) / cache_model_name
+
+    if model_cache_path.exists():
+        print(f"  Removing entire model directory: {model_cache_path}")
+        try:
+            shutil.rmtree(model_cache_path)
+            print(f"    ✓ Successfully removed model directory")
+        except Exception as e:
+            print(f"    ✗ Failed to remove model directory: {e}")
+            print(f"    Attempting download anyway...")
     else:
-        print(f"  No corrupted files to remove (missing shards will be downloaded)")
+        print(f"  Model directory not found in cache (will download fresh)")
 
     print(f"  Downloading from HuggingFace (this may take a while for large models)...")
 
@@ -485,8 +483,27 @@ def main() -> int:
         print("✗ FAILED: Some models could not be downloaded")
         return 1
 
-    # All downloads succeeded - emit warning but exit successfully
-    print("✓ All required models downloaded successfully!")
+    # All downloads succeeded - now validate them again
+    print("✓ All models downloaded successfully!")
+    print("-" * 70)
+    print("Validating downloaded models...")
+    print("-" * 70)
+
+    validation_failed = False
+    for model_id in models_needing_download.keys():
+        is_valid, error_msg, _ = validate_model(model_id, cache_dir)
+        if not is_valid:
+            print(f"  ✗ Post-download validation failed for {model_id}: {error_msg}")
+            validation_failed = True
+
+    print("-" * 70)
+
+    if validation_failed:
+        print("✗ FAILED: Some models failed validation after download")
+        return 1
+
+    # All validations passed - emit warning but exit successfully
+    print("✓ All downloaded models validated successfully!")
     print("⚠ WARNING: Models were missing/corrupted in cache and have been repaired.")
     print(f"  Repaired models: {', '.join(models_needing_download.keys())}")
 
@@ -494,7 +511,7 @@ def main() -> int:
     print(
         f"::warning file=scripts/ci/validate_and_download_models.py::"
         f"Cache validation failed for {len(models_needing_download)} model(s). "
-        f"Models were re-downloaded successfully. "
+        f"Models were re-downloaded and validated successfully. "
         f"This may indicate cache corruption or infrastructure issues."
     )
 
