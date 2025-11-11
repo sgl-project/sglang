@@ -53,16 +53,16 @@ if _is_cuda:
 
     @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
     def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-        # mat_a: [M, K], mat_b: [N, K] (row-major weights), output: [M, N]
+        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
-        N = mat_b.shape[-2]
+        N = mat_b.shape[-1]
         return torch.empty((M, N), device="meta", dtype=out_dtype)
 
     @torch.library.register_fake("sgl_kernel::fp8_blockwise_scaled_mm")
     def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
-        # mat_a: [M, K], mat_b: [N, K] (row-major weights), output: [M, N]
+        # mat_a: [M, K], mat_b: [K, N] (blockwise path passes weight.T), output: [M, N]
         M = mat_a.shape[-2]
-        N = mat_b.shape[-2]
+        N = mat_b.shape[-1]
         return torch.empty((M, N), device="meta", dtype=out_dtype)
 
 
@@ -616,7 +616,7 @@ def apply_fp8_linear(
 
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[1]]
+    output_shape = [*input.shape[:-1], weight.shape[0]]
 
     if compressed_tensor_quant:
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
