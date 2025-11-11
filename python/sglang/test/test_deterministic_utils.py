@@ -24,8 +24,12 @@ class TestDeterministicBase(CustomTestCase):
         return COMMON_SERVER_ARGS
 
     @classmethod
+    def get_model(cls):
+        return DEFAULT_MODEL
+
+    @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL
+        cls.model = cls.get_model()
         cls.base_url = DEFAULT_URL_FOR_TEST
         if "--attention-backend" not in cls.get_server_args():
             raise unittest.SkipTest("Skip the base test class")
@@ -56,7 +60,7 @@ class TestDeterministicBase(CustomTestCase):
         for result in results:
             assert result == 1
 
-    def test_prefix(self):
+    def test_prefix_with_logprobs(self):
         args = BenchArgs()
         url = DEFAULT_URL_FOR_TEST
         args.host, args.port = self._extract_host_and_port(url)
@@ -64,6 +68,7 @@ class TestDeterministicBase(CustomTestCase):
         args.n_start = 10
         args.n_trials = 10
         args.temperature = 0.5  # test for deterministic sampling
+        args.return_logprob = True  # Enable logprobs comparison
         results = test_deterministic(args)
         for result in results:
             assert result == 1
