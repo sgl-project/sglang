@@ -118,19 +118,23 @@ class NightlyTestMonitor:
             "successful_runs": 0,
             "failed_runs": 0,
             "cancelled_runs": 0,
-            "job_stats": defaultdict(lambda: {
-                "total": 0,
-                "success": 0,
-                "failure": 0,
-                "recent_failures": [],
-                "avg_duration_minutes": 0,
-                "durations": [],
-            }),
-            "daily_stats": defaultdict(lambda: {
-                "total": 0,
-                "success": 0,
-                "failure": 0,
-            }),
+            "job_stats": defaultdict(
+                lambda: {
+                    "total": 0,
+                    "success": 0,
+                    "failure": 0,
+                    "recent_failures": [],
+                    "avg_duration_minutes": 0,
+                    "durations": [],
+                }
+            ),
+            "daily_stats": defaultdict(
+                lambda: {
+                    "total": 0,
+                    "success": 0,
+                    "failure": 0,
+                }
+            ),
         }
 
         for i, run in enumerate(runs, 1):
@@ -178,12 +182,14 @@ class NightlyTestMonitor:
 
                     # Store recent failures (up to 5)
                     if len(job_stat["recent_failures"]) < 5:
-                        job_stat["recent_failures"].append({
-                            "run_url": run_url,
-                            "run_number": run_number,
-                            "created_at": created_at,
-                            "job_url": job.get("html_url"),
-                        })
+                        job_stat["recent_failures"].append(
+                            {
+                                "run_url": run_url,
+                                "run_number": run_number,
+                                "created_at": created_at,
+                                "job_url": job.get("html_url"),
+                            }
+                        )
 
                 # Track duration
                 if started_at and completed_at:
@@ -191,7 +197,9 @@ class NightlyTestMonitor:
                         start = datetime.fromisoformat(
                             started_at.replace("Z", "+00:00")
                         )
-                        end = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+                        end = datetime.fromisoformat(
+                            completed_at.replace("Z", "+00:00")
+                        )
                         duration_minutes = (end - start).total_seconds() / 60
                         job_stat["durations"].append(duration_minutes)
                     except:
