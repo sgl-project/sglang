@@ -392,7 +392,7 @@ class SGLangBackend:
         self.configure_post_pass()
 
         self.split_gm, self.piecewise_graphs = split_graph(
-            graph, ["sglang.unified_attention_with_output"]
+            graph, ["sglang.unified_attention_with_output", "sglang.inplace_all_reduce"]
         )
 
         from torch._dynamo.utils import lazy_format_graph_code

@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+pub mod app_context;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
@@ -28,6 +29,7 @@ pub enum PolicyType {
     RoundRobin,
     CacheAware,
     PowerOfTwo,
+    Bucket,
 }
 
 #[pyclass(eq)]
@@ -43,6 +45,7 @@ pub enum HistoryBackendType {
     Memory,
     None,
     Oracle,
+    Postgres,
 }
 
 #[pyclass]
@@ -139,6 +142,34 @@ impl PyOracleConfig {
 
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
+pub struct PyPostgresConfig {
+    #[pyo3(get, set)]
+    pub db_url: Option<String>,
+
+    #[pyo3(get, set)]
+    pub pool_max: usize,
+}
+
+#[pymethods]
+impl PyPostgresConfig {
+    #[new]
+    #[pyo3(signature = (db_url = None,pool_max = 16,))]
+    fn new(db_url: Option<String>, pool_max: usize) -> PyResult<Self> {
+        Ok(PyPostgresConfig { db_url, pool_max })
+    }
+}
+
+impl PyPostgresConfig {
+    fn to_config_postgres(&self) -> config::PostgresConfig {
+        config::PostgresConfig {
+            db_url: self.db_url.clone().unwrap_or_default(),
+            pool_max: self.pool_max,
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Debug, Clone, PartialEq)]
 struct Router {
     host: String,
     port: u16,
@@ -168,6 +199,8 @@ struct Router {
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
+    // Takes effect in PD mode and when policy = bucket
+    bucket_adjust_interval_secs: usize,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
@@ -204,9 +237,14 @@ struct Router {
     tokenizer_cache_l1_max_memory: usize,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
+    mcp_config_path: Option<String>,
     backend: BackendType,
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
+    postgres_config: Option<PyPostgresConfig>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    ca_cert_paths: Vec<String>,
 }
 
 impl Router {
@@ -238,6 +276,11 @@ impl Router {
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
+                },
+                PolicyType::Bucket => ConfigPolicyConfig::Bucket {
+                    balance_abs_threshold: self.balance_abs_threshold,
+                    balance_rel_threshold: self.balance_rel_threshold,
+                    bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 },
             }
         };
@@ -292,6 +335,7 @@ impl Router {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
             HistoryBackendType::Oracle => config::HistoryBackend::Oracle,
+            HistoryBackendType::Postgres => config::HistoryBackend::Postgres,
         };
 
         let oracle = if matches!(self.history_backend, HistoryBackendType::Oracle) {
@@ -302,7 +346,15 @@ impl Router {
             None
         };
 
-        let builder = config::RouterConfig::builder()
+        let postgres_config = if matches!(self.history_backend, HistoryBackendType::Postgres) {
+            self.postgres_config
+                .as_ref()
+                .map(|cfg| cfg.to_config_postgres())
+        } else {
+            None
+        };
+
+        config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
             .host(&self.host)
@@ -354,14 +406,20 @@ impl Router {
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
+            .maybe_postgres(postgres_config)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
-            .igw(self.enable_igw);
-
-        builder.build()
+            .igw(self.enable_igw)
+            .maybe_client_cert_and_key(
+                self.client_cert_path.as_ref(),
+                self.client_key_path.as_ref(),
+            )
+            .add_ca_certificates(self.ca_cert_paths.clone())
+            .build()
     }
 }
 
@@ -397,6 +455,7 @@ impl Router {
         request_timeout_secs = 1800,
         request_id_headers = None,
         pd_disaggregation = false,
+        bucket_adjust_interval_secs = 5,
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
@@ -432,9 +491,14 @@ impl Router {
         tokenizer_cache_l1_max_memory = 52428800,
         reasoning_parser = None,
         tool_call_parser = None,
+        mcp_config_path = None,
         backend = BackendType::Sglang,
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
+        postgres_config = None,
+        client_cert_path = None,
+        client_key_path = None,
+        ca_cert_paths = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -466,6 +530,7 @@ impl Router {
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
+        bucket_adjust_interval_secs: usize,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
@@ -501,9 +566,14 @@ impl Router {
         tokenizer_cache_l1_max_memory: usize,
         reasoning_parser: Option<String>,
         tool_call_parser: Option<String>,
+        mcp_config_path: Option<String>,
         backend: BackendType,
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
+        postgres_config: Option<PyPostgresConfig>,
+        client_cert_path: Option<String>,
+        client_key_path: Option<String>,
+        ca_cert_paths: Vec<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -548,6 +618,7 @@ impl Router {
             request_timeout_secs,
             request_id_headers,
             pd_disaggregation,
+            bucket_adjust_interval_secs,
             prefill_urls,
             decode_urls,
             prefill_policy,
@@ -584,9 +655,14 @@ impl Router {
             tokenizer_cache_l1_max_memory,
             reasoning_parser,
             tool_call_parser,
+            mcp_config_path,
             backend,
             history_backend,
             oracle_config,
+            postgres_config,
+            client_cert_path,
+            client_key_path,
+            ca_cert_paths,
         })
     }
 
@@ -654,6 +730,7 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BackendType>()?;
     m.add_class::<HistoryBackendType>()?;
     m.add_class::<PyOracleConfig>()?;
+    m.add_class::<PyPostgresConfig>()?;
     m.add_class::<Router>()?;
     Ok(())
 }

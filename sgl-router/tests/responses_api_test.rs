@@ -55,8 +55,9 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    // Create router and context
-    let ctx = common::create_test_context(router_cfg);
+    // Create router and context with MCP config from file
+    let ctx =
+        common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
@@ -79,6 +80,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         tool_choice: Some(ToolChoice::default()),
         tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
+            function: None,
             server_url: Some(mcp.url()),
             authorization: None,
             server_label: Some("mock".to_string()),
@@ -89,6 +91,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         top_logprobs: Some(0),
         top_p: None,
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_test_mcp_e2e".to_string()),
         priority: 0,
@@ -230,7 +233,7 @@ async fn test_conversations_crud_basic() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
@@ -310,6 +313,7 @@ fn test_responses_request_creation() {
         top_logprobs: Some(5),
         top_p: Some(0.9),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: Some("test-user".to_string()),
         request_id: Some("resp_test123".to_string()),
         priority: 0,
@@ -352,6 +356,7 @@ fn test_responses_request_sglang_extensions() {
         top_logprobs: Some(0),
         top_p: Some(0.95),
         truncation: Some(Truncation::Auto),
+        text: None,
         user: None,
         request_id: Some("resp_test456".to_string()),
         priority: 0,
@@ -467,6 +472,7 @@ fn test_json_serialization() {
         top_logprobs: Some(10),
         top_p: Some(0.8),
         truncation: Some(Truncation::Auto),
+        text: None,
         user: Some("test_user".to_string()),
         request_id: Some("resp_comprehensive_test".to_string()),
         priority: 1,
@@ -540,7 +546,7 @@ async fn test_multi_turn_loop_with_mcp() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
@@ -572,6 +578,7 @@ async fn test_multi_turn_loop_with_mcp() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_multi_turn_test".to_string()),
         priority: 0,
@@ -691,7 +698,7 @@ async fn test_max_tool_calls_limit() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -720,6 +727,7 @@ async fn test_max_tool_calls_limit() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_max_calls_test".to_string()),
         priority: 0,
@@ -808,7 +816,8 @@ async fn setup_streaming_mcp_test() -> (
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx =
+        common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
@@ -890,6 +899,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_streaming_mcp_test".to_string()),
         priority: 0,
@@ -1169,6 +1179,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_streaming_multiturn_test".to_string()),
         priority: 0,
@@ -1224,7 +1235,7 @@ async fn test_conversation_items_create_and_get() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1300,7 +1311,7 @@ async fn test_conversation_items_delete() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1382,7 +1393,7 @@ async fn test_conversation_items_max_limit() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1434,7 +1445,7 @@ async fn test_conversation_items_unsupported_type() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1485,7 +1496,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
         .queue_timeout_secs(5)
         .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations

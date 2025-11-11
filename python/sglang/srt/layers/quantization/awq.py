@@ -840,12 +840,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
-        # The input must currently be float16
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-
         orig_dtype = x.dtype
-        x = x.half()
 
         topk_weights, topk_ids, router_logits = topk_output
 
@@ -957,3 +954,25 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             use_wna16=True,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @torch.library.register_fake("sgl_kernel::awq_dequantize")
+    def _(
+        qweight,
+        scales,
+        qzeros,
+        ch_axis,
+        group_size,
+        num_bits,
+    ):
+        out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 32 // num_bits,)
+        return qweight.new_empty(out_shape, dtype=scales.dtype)
+
+    @torch.library.register_fake("sgl_kernel::awq_marlin_repack")
+    def _(b_q_weight, size_k, size_n, num_bits):
+        return b_q_weight.new_empty(
+            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
+        )

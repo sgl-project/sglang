@@ -18,7 +18,7 @@ use rustls;
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{core::Job, protocols::worker_spec::WorkerConfigRequest, server::AppContext};
+use crate::{app_context::AppContext, core::Job, protocols::worker_spec::WorkerConfigRequest};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -593,6 +593,7 @@ mod tests {
             configured_tool_parser: None,
             worker_job_queue: Arc::new(std::sync::OnceLock::new()),
             workflow_engine: Arc::new(std::sync::OnceLock::new()),
+            mcp_manager: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
