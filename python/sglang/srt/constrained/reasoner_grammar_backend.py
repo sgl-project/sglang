@@ -29,6 +29,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
+        self.is_in_reasoning: bool = False
 
     def maybe_init_reasoning(self, reasoning: bool):
         self.is_in_reasoning = reasoning
