@@ -157,6 +157,7 @@ def _timestep_embedding_triton_kernel(
     freqs = tl.exp(-log_max_period * freq_indices / half)
     angles = t_val.to(tl.float32) * freqs
 
+    # TODO: review
     embedding = tl.where(
         is_first_half, tl.cos(angles), tl.where(is_second_half, tl.sin(angles), 0.0)
     )
@@ -190,6 +191,9 @@ def timestep_embedding_triton(
     output = torch.empty((B, dim), dtype=dtype, device="cuda")
 
     grid = lambda META: (B, triton.cdiv(dim, META["BLOCK_SIZE_DIM"]))
+
+    # TODO: review
+    # a badcase if dim < 2. like dim = 1
 
     _timestep_embedding_triton_kernel[grid](
         t,
