@@ -217,6 +217,11 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        # Skip idle checks if there is an in-flight running batch to avoid counting
+        # tokens that are not yet reflected in the radix tree or allocator lists.
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            return
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return

@@ -475,9 +475,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """
         if page_ids.numel() == 0:
             return
-        if self.debug_mode:
-            # Cheap range guard in debug
+        # Hard range guard: in debug, fail fast; in prod, clamp to valid range
+        if getattr(self, "debug_mode", False):
             assert (page_ids.min() >= 1) and (page_ids.max() <= self.num_pages)
+        else:
+            if torch.any((page_ids < 1) | (page_ids > self.num_pages)):
+                page_ids = page_ids.clamp_(1, self.num_pages)
         # Debug guard
         self._mark_pages_freed(page_ids)
         # Append directly without sort/dedup
@@ -618,7 +621,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # Compatibility shim: convert tokens to unique page IDs, then delegate
-        page_ids = torch.unique(free_index // self.page_size)
+        page_ids = torch.unique(free_index // self.page_size + 1)
         self.free_pages(page_ids)
 
         if self.debug_mode:

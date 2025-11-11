@@ -439,7 +439,7 @@ class SWARadixCache(BasePrefixCache):
                 : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
             ]
             if self.page_size != 1:
-                page_ids = torch.unique(kv_indices // self.page_size)
+                page_ids = torch.unique(kv_indices // self.page_size + 1)
                 self.token_to_kv_pool_allocator.free_pages(page_ids)
             else:
                 self.token_to_kv_pool_allocator.free(kv_indices)
@@ -469,7 +469,7 @@ class SWARadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
             tail = kv_indices[page_aligned_len:]
             if len(tail) > 0:
-                tail_pages = torch.unique(tail // self.page_size)
+                tail_pages = torch.unique(tail // self.page_size + 1)
                 self.token_to_kv_pool_allocator.free_pages(tail_pages)
         else:
             page_aligned_len = len(kv_indices)
@@ -568,7 +568,7 @@ class SWARadixCache(BasePrefixCache):
 
                 # 1. free node kv indices, evict full and swa tokens
                 if self.page_size != 1:
-                    freed_pages = torch.unique(x.value // self.page_size)
+                    freed_pages = torch.unique(x.value // self.page_size + 1)
                     self.token_to_kv_pool_allocator.free_pages(freed_pages)
                 else:
                     self.token_to_kv_pool_allocator.free(x.value)
@@ -621,7 +621,7 @@ class SWARadixCache(BasePrefixCache):
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
                     if self.page_size != 1:
-                        freed_pages = torch.unique(x.value // self.page_size)
+                        freed_pages = torch.unique(x.value // self.page_size + 1)
                         self.token_to_kv_pool_allocator.free_pages(freed_pages)
                     else:
                         self.token_to_kv_pool_allocator.free(x.value)
@@ -905,7 +905,7 @@ class SWARadixCache(BasePrefixCache):
                     if self.page_size != 1:
                         seg = node.value[first_diff_idx:]
                         if len(seg) > 0:
-                            seg_pages = torch.unique(seg // self.page_size)
+                            seg_pages = torch.unique(seg // self.page_size + 1)
                             self.token_to_kv_pool_allocator.free_pages(seg_pages)
                     else:
                         self.token_to_kv_pool_allocator.free(
@@ -922,7 +922,7 @@ class SWARadixCache(BasePrefixCache):
                     if self.page_size != 1:
                         seg = value[first_diff_idx:prefix_len]
                         if len(seg) > 0:
-                            seg_pages = torch.unique(seg // self.page_size)
+                            seg_pages = torch.unique(seg // self.page_size + 1)
                             self.token_to_kv_pool_allocator.free_pages(seg_pages)
                     else:
                         self.token_to_kv_pool_allocator.free(
@@ -964,7 +964,7 @@ class SWARadixCache(BasePrefixCache):
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
             if self.page_size != 1:
-                freed_pages = torch.unique(node.parent.value // self.page_size)
+                freed_pages = torch.unique(node.parent.value // self.page_size + 1)
                 self.token_to_kv_pool_allocator.free_pages(freed_pages)
             else:
                 self.token_to_kv_pool_allocator.free(node.parent.value)
