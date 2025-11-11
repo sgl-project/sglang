@@ -268,24 +268,19 @@ class DynamicShortConvolution(nn.Module):
         cache: torch.Tensor,
         generator_input: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # --- Triton Implementation ---
         assert x.shape[1] == 1, "x must be of shape [B, 1, D]"
         shape = x.shape  # Keep original shape [B, 1, D] for return
         generator_input = x if generator_input is None else generator_input
 
-        # 1. Generate kernels
         kernels_triton = self.get_kernel(generator_input.squeeze(1))  # [B, D, W]
 
-        # 2. Call Triton kernel without activation
         x_out_triton = causal_conv_step_triton(
             x,
             cache,
             kernels_triton,
         )
 
-        # Apply activation (if any) after kernel execution
         if self.activation is not None:
             x_out_triton = ACT2FN[self.activation](x_out_triton)
 
-        # 3. Return reshaped output and the *same cache tensor* (it was updated in-place)
         return x_out_triton.view(shape), cache
