@@ -67,11 +67,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.memory_pool import (
-    HybridReqToTokenPool,
-    LingHybridLinearReqToTokenPool,
-    ReqToTokenPool,
-)
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
@@ -1053,8 +1049,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ):
                     mamba_num = max(0, num_reqs - mamba_available_size)
                     self.tree_cache.evict_mamba(mamba_num)
-            req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
-        elif isinstance(self.req_to_token_pool, LingHybridLinearReqToTokenPool):
             req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
         else:
             req_pool_indices = self.req_to_token_pool.alloc(num_reqs)

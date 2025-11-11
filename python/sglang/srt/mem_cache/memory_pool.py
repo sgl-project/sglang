@@ -111,81 +111,6 @@ class ReqToTokenPool:
         self.free_slots = list(range(self.size))
 
 
-class LingHybridLinearReqToTokenPool(ReqToTokenPool):
-    """A memory pool that maps a request to its token locations."""
-
-    def __init__(
-        self,
-        size: int,
-        max_context_len: int,
-        device: str,
-        enable_memory_saver: bool,
-    ):
-
-        super().__init__(
-            size=size,
-            max_context_len=max_context_len,
-            device=device,
-            enable_memory_saver=enable_memory_saver,
-        )
-
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-        )
-
-        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self.req_to_constant = torch.full(
-                (size + 1,), -1, dtype=torch.int32, device=device
-            )
-        self.rid_to_req = {}
-        self.req_to_rid = {}
-
-        self.linear_free_slots = list(range(size))
-
-    def alloc(self, need_size: int, reqs) -> List[int]:
-        select_index = super().alloc(need_size)
-        if select_index == None:
-            return None
-
-        req_to_constant = []
-        for req in reqs:
-            rid = req.rid
-            if rid in self.rid_to_req:
-                pre_index = self.rid_to_req[rid]
-            else:
-                pre_index = self.linear_free_slots.pop()
-                self.rid_to_req[rid] = pre_index
-                self.req_to_rid[pre_index] = rid
-
-            req_to_constant.append(pre_index)
-        self.req_to_constant[select_index] = torch.tensor(
-            req_to_constant, dtype=torch.int32, device=self.device
-        )
-
-        return select_index
-
-    def free(self, free_index: Union[int, List[int]], free_constant_cache=True):
-        super().free(free_index)
-        if not free_constant_cache:
-            return
-        if isinstance(free_index, (int,)):
-            linear_free_index = [self.req_to_constant[free_index].item()]
-
-        else:
-            linear_free_index = self.req_to_constant[free_index].tolist()
-        self.linear_free_slots.extend(linear_free_index)
-        for index in linear_free_index:
-            rid = self.req_to_rid[index]
-            self.rid_to_req.pop(rid)
-            self.req_to_rid.pop(index)
-
-    def clear(self):
-        self.free_slots = list(range(self.size))
-        self.linear_free_slots = list(range(self.size))
-        self.rid_to_req = {}
-        self.req_to_constant.fill_(-1)
-
-
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -218,7 +143,9 @@ class MambaPool:
         num_mamba_layers = len(cache_params.layers)
 
         # assume conv_state = (dim, state_len)
-        assert conv_state_shape[0] > conv_state_shape[1]
+        assert conv_state_shape[0] > conv_state_shape[1] or (
+            conv_state_shape[0] == 0 and conv_state_shape[1] == 0
+        )
         conv_state = torch.zeros(
             size=(num_mamba_layers, size + 1) + conv_state_shape,
             dtype=conv_dtype,
@@ -831,75 +758,30 @@ class HybridLinearKVPool(KVCache):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
-        layer_num: int,
-        enable_memory_saver: bool = False,
-        TokenToKVPoolClass: Optional[KVCache] = None,
-        kwargs_for_token_to_kv_pool: Optional[Dict] = None,
-        LinearTokenToKVPoolClass: Optional[KVCache] = None,
-        kwargs_for_linear_token_to_kv_pool: Optional[Dict] = None,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
         self.device = device
-        self.start_layer = start_layer or 0
-        self.end_layer = end_layer or layer_num
-        full_attention_layer_ids = [
-            i
-            for i in full_attention_layer_ids
-            if (i >= self.start_layer and i < self.end_layer)
-        ]
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
-        if TokenToKVPoolClass is None:
-            if _is_npu:
-                TokenToKVPoolClass = AscendTokenToKVPool
-            else:
-                TokenToKVPoolClass = MHATokenToKVPool
-        # TokenToKVPoolClass: MHATokenToKVPool
-        if kwargs_for_token_to_kv_pool is None:
-            kwargs_for_token_to_kv_pool = {
-                "size": size,
-                "page_size": self.page_size,
-                "dtype": dtype,
-                "head_num": head_num,
-                "head_dim": head_dim,
-                "layer_num": self.full_layer_nums,
-                "device": device,
-                "enable_memory_saver": enable_memory_saver,
-            }
-        kwargs_for_token_to_kv_pool.update(
-            {"start_layer": None, "end_layer": None, "layer_num": self.full_layer_nums}
-        )
-        self.full_kv_pool = TokenToKVPoolClass(**kwargs_for_token_to_kv_pool)
-
-        if LinearTokenToKVPoolClass is not None:
-            kwargs_for_linear_token_to_kv_pool.update(
-                {
-                    "start_layer": None,
-                    "end_layer": None,
-                    "layer_num": end_layer - start_layer - self.full_layer_nums,
-                }
-            )
-            self.linear_kv_pool = LinearTokenToKVPoolClass(
-                **kwargs_for_linear_token_to_kv_pool
-            )
+        if _is_npu:
+            TokenToKVPoolClass = AscendTokenToKVPool
         else:
-            self.linear_kv_pool = None
-
+            TokenToKVPoolClass = MHATokenToKVPool
+        self.full_kv_pool = TokenToKVPoolClass(
+            size=size,
+            page_size=self.page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=self.full_layer_nums,
+            device=device,
+            enable_memory_saver=False,
+        )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
-        }
-        linear_attention_layer_ids = [
-            i
-            for i in range(start_layer, end_layer)
-            if i not in full_attention_layer_ids
-        ]
-        self.linear_attention_layer_id_mapping = {
-            id: i for i, id in enumerate(linear_attention_layer_ids)
         }
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -917,13 +799,6 @@ class HybridLinearKVPool(KVCache):
             )
         return self.full_attention_layer_id_mapping[layer_id]
 
-    def _transfer_linear_attention_id(self, layer_id: int):
-        if layer_id not in self.linear_attention_layer_id_mapping:
-            raise ValueError(
-                f"{layer_id=} not in linear attention layers: {self.full_attention_layer_id_mapping.keys()}"
-            )
-        return self.linear_attention_layer_id_mapping[layer_id]
-
     def get_key_buffer(self, layer_id: int):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_key_buffer(layer_id)
@@ -933,12 +808,8 @@ class HybridLinearKVPool(KVCache):
         return self.full_kv_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
-        if layer_id in self.full_attention_layer_id_mapping:
-            layer_id = self._transfer_full_attention_id(layer_id)
-            return self.full_kv_pool.get_kv_buffer(layer_id)
-        else:
-            layer_id = self._transfer_linear_attention_id(layer_id)
-            return self.linear_kv_pool.get_kv_buffer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_kv_buffer(layer_id)
 
     def set_kv_buffer(
         self,
@@ -949,144 +820,19 @@ class HybridLinearKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ):
-        layer_id = layer.layer_id
-        if layer_id in self.full_attention_layer_id_mapping:
-            layer_id = self._transfer_full_attention_id(layer_id)
-            self.full_kv_pool.set_kv_buffer(
-                None,
-                loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id,
-            )
-        else:
-            layer_id = self._transfer_linear_attention_id(layer_id)
-            self.linear_kv_pool.set_kv_buffer(
-                None,
-                loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id,
-            )
+        layer_id = self._transfer_full_attention_id(layer.layer_id)
+        self.full_kv_pool.set_kv_buffer(
+            None,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id,
+        )
 
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
-
-
-class LinearTokenToKVPool(KVCache):
-    def __init__(
-        self,
-        size: int,
-        linear_size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-    ):
-        super().__init__(
-            size,
-            page_size,
-            dtype,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
-        )
-        self.head_dim = head_dim
-        self.head_num = head_num
-        self.layer_num = layer_num
-        self.linear_size = linear_size
-        self._create_buffers()
-        self.layer_transfer_counter = None
-        self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = self.device_module.Stream() if is_cuda else None
-        linear_kv_size = self.get_linear_kv_size_bytes()
-        logger.info(
-            f"Linear KV Cache is allocated. #max_req_nums: {linear_size}, kv size: {linear_kv_size / GB:.2f} GB"
-        )
-
-    def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self.linear_kv_buffer = [
-                torch.zeros(
-                    (
-                        self.linear_size,
-                        self.head_num,
-                        self.head_dim,
-                        self.head_dim,
-                    ),
-                    # dtype=self.store_dtype,
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-
-    def _clear_buffers(self):
-        del self.linear_kv_buffer
-
-    def get_kv_size_bytes(self):
-        return self.get_linear_kv_size_bytes(), 0
-
-    def get_linear_kv_size_bytes(self):
-        assert hasattr(self, "linear_kv_buffer")
-        kv_size_bytes = 0
-        for kv_cache in self.linear_kv_buffer:
-            kv_size_bytes += np.prod(kv_cache.shape) * 4  # fp32
-        return kv_size_bytes
-
-    def get_key_buffer(self, layer_id: int):
-        raise ValueError(
-            "Linear attention does not have separate key and value buffers"
-        )
-
-    def get_value_buffer(self, layer_id: int):
-        raise ValueError(
-            "Linear attention does not have separate key and value buffers"
-        )
-
-    def get_linear_kv_buffer(self, layer_id: int):
-        if self.store_dtype != self.dtype:
-            return self.linear_kv_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.linear_kv_buffer[layer_id - self.start_layer]
-
-    def get_kv_buffer(self, layer_id: int):
-        return self.get_linear_kv_buffer(layer_id), None
-
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
-    ):
-        if layer_id_override is not None:
-            layer_id = layer_id_override
-        else:
-            layer_id = layer.layer_id
-        self.linear_kv_buffer[layer_id - self.start_layer][loc] = cache_k
-
-    def get_flat_data(self, indices):
-        raise NotImplementedError()
-
-    def transfer(self, indices, flat_data):
-        raise NotImplementedError()
-
-    def transfer_per_layer(self, indices, flat_data, layer_id):
-        raise NotImplementedError()
 
 
 class SWAKVPool(KVCache):

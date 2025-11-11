@@ -187,6 +187,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             GDNAttnBackend,
             HybridLinearAttnBackend,
+            LightningAttentionBackend,
             Mamba2AttnBackend,
         )
         from sglang.srt.utils import is_blackwell, is_npu
@@ -205,6 +206,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
+        elif runner.hybrid_lightning_attn_config is not None:
+            linear_attn_backend = LightningAttentionBackend(runner)
         else:
             raise ValueError(
                 "Expected hybrid GDN or NemotronH models, but got unknown model."
@@ -215,40 +218,3 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     return full_attn_backend
-
-
-@register_attention_backend("hybrid_lightning_attn")
-def create_hybrid_lightning_attn_backend(runner):
-    from sglang.srt.layers.attention.hybrid_lightning_attn_backend import (
-        LightningAttentionBackend,
-    )
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-        HybridLinearAttnBackend,
-    )
-    from sglang.srt.utils import is_blackwell, is_npu
-
-    if is_npu():
-        from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
-
-        full_attn_backend = AscendAttnBackend(runner)
-    elif is_blackwell():
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-        full_attn_backend = TritonAttnBackend(runner)
-    else:
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
-        )
-
-        full_attn_backend = FlashAttentionBackend(runner)
-
-    linear_attn_backend = LightningAttentionBackend(runner)
-    decoder_attention_types = runner.model.get_decoder_attention_types()
-    full_attn_layers = [
-        i
-        for i in range(len(decoder_attention_types))
-        if decoder_attention_types[i] == 1
-    ]
-    return HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, full_attn_layers
-    )

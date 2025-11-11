@@ -419,16 +419,26 @@ def seg_la_sum_kernel(T, O, DIM: tl.constexpr, NUM_BLOCK: tl.constexpr):
     tl.store(O + pid * DIM + tl.arange(0, DIM), x)
 
 
-def seg_la_fwd(q, k, v, s, decay_scales, meta, softmax_scale=None, decouple=False):
+def seg_la_fwd(
+    q,
+    k,
+    v,
+    s,
+    decay_scales,
+    batch_size,
+    q_offsets,
+    s_offsets,
+    q_lengths,
+    s_scales,
+    softmax_scale=None,
+):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
-    bs = meta.batch_size
+    bs = batch_size
     if softmax_scale is None:
         softmax_scale = HEAD_DIM ** (-0.5)  # 1.0 / math.sqrt(d)
 
     MAX_LENGTH = triton.cdiv(length, bs)  # meta.max_q_length
-
-    # print(f'{batch=} {length=} {meta.max_q_length=}')
 
     # NOT support GQA currently
     # NOT support customized MASK currently
@@ -469,10 +479,10 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, softmax_scale=None, decouple=Fals
             v.stride(0),
             s.stride(0),
             tmp.stride(0),
-            meta.s_offsets,
-            meta.q_offsets,
-            meta.q_lengths,
-            meta.s_scales,
+            s_offsets,
+            q_offsets,
+            q_lengths,
+            s_scales,
             decay_scales,
             HEAD_DIM=HEAD_DIM,
             K_SPLIT_DIM=K_SPLIT_DIM,
@@ -532,7 +542,7 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, softmax_scale=None, decouple=Fals
             v.stride(0),
             s.stride(0),
             tmp.stride(0),
-            meta.s_offsets,
+            s_offsets,
             decay_scales,
             HEAD_DIM=HEAD_DIM,
             K_SPLIT_DIM=K_SPLIT_DIM,

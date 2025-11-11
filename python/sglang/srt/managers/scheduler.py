@@ -468,7 +468,10 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid = self.tp_worker.is_hybrid
-        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
+        self.is_hybrid_gdn = (
+            self.tp_worker.model_runner.hybrid_gdn_config is not None
+            or (self.tp_worker.model_runner.hybrid_lightning_attn_config is not None)
+        )
 
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -1886,13 +1889,6 @@ class Scheduler(
             if self.tp_worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
-                )
-            elif (
-                self.tp_worker.model_runner.server_args.attention_backend
-                == "hybrid_lightning_attn"
-            ):
-                self.req_to_token_pool.free(
-                    self.chunked_req.req_pool_idx, free_constant_cache=False
                 )
             else:
                 self.req_to_token_pool.free(self.chunked_req.req_pool_idx)

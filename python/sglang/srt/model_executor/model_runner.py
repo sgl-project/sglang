@@ -29,7 +29,12 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
+from sglang.srt.configs import (
+    BailingMoeLinearConfig,
+    FalconH1Config,
+    NemotronHConfig,
+    Qwen3NextConfig,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
@@ -96,8 +101,6 @@ from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
-    LinearTokenToKVPool,
-    LingHybridLinearReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
@@ -562,12 +565,6 @@ class ModelRunner:
                     server_args.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
                     )
-                if (
-                    self.is_hybrid_lightning
-                    and getattr(self.model_config.hf_config, "layer_group_size", 0) > 1
-                ):
-                    server_args.attention_backend = "hybrid_lightning_attn"
-                    logger.info("Use Hybrid Linear backend!")
             else:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
@@ -1346,14 +1343,6 @@ class ModelRunner:
             )
         elif config := self.mambaish_config:
             num_layers = len(config.full_attention_layer_ids)
-        elif (
-            self.is_hybrid_lightning
-            and getattr(self.model_config.hf_config, "layer_group_size", 0) > 1
-        ):
-            num_layers = (
-                self.num_effective_layers
-                // self.model_config.hf_config.layer_group_size
-            )
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
@@ -1386,12 +1375,6 @@ class ModelRunner:
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
-        elif (
-            self.is_hybrid_lightning
-            and getattr(self.model_config.hf_config, "layer_group_size", 0) > 1
-        ):
-            rest_memory = self.handle_max_lightning_attn_cache(rest_memory)
-
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
@@ -1432,7 +1415,10 @@ class ModelRunner:
                 // (1 + speculativa_ratio)
             )
 
-        if self.hybrid_gdn_config is not None:
+        if (
+            self.hybrid_gdn_config is not None
+            or self.hybrid_lightning_attn_config is not None
+        ):
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
@@ -1444,42 +1430,20 @@ class ModelRunner:
         )
         return total_rest_memory - mamba_state_memory
 
-    def handle_max_lightning_attn_cache(self, total_rest_memory):
-        softmax_layer_nums = (
-            self.num_effective_layers // self.model_config.hf_config.layer_group_size
-        )
-        lightning_attn_layer_nums = self.num_effective_layers - softmax_layer_nums
-
-        lightning_attn_state_cell_size = (
-            self.model_config.get_num_attention_heads(get_attention_tp_size())
-            * self.model_config.head_dim
-            * self.model_config.head_dim
-            * lightning_attn_layer_nums
-            * 4  # fp32
-        )
-        if self.server_args.max_mamba_cache_size is None:
-            if self.server_args.max_running_requests is not None:
-                self.server_args.max_mamba_cache_size = (
-                    self.server_args.max_running_requests
-                )
-            else:
-                self.server_args.max_mamba_cache_size = 512
-
-        lightning_attn_state_memory = (
-            1.0
-            * lightning_attn_state_cell_size
-            * self.server_args.max_mamba_cache_size
-            / (1 << 30)
-        )
-        logger.info(
-            f"Lightning attention cache gpu memory:{lightning_attn_state_memory}GB, max_num_reqs={self.server_args.max_mamba_cache_size} ."
-        )
-        return total_rest_memory - lightning_attn_state_memory
-
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
+        if (
+            isinstance(config, Qwen3NextConfig)
+            and not self.hybrid_lightning_attn_config
+        ):
+            return config
+        return None
+
+    @property
+    def hybrid_lightning_attn_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, BailingMoeLinearConfig):
             return config
         return None
 
@@ -1492,15 +1456,11 @@ class ModelRunner:
 
     @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config
-
-    @property
-    def is_hybrid_lightning(self):
-        return self.model_config.hf_config.architectures[0] in [
-            "BailingMoELinearForCausalLM",
-            "BailingMoeLinearForCausalLM",
-            "BailingMoeLinearV2ForCausalLM",
-        ]
+        return (
+            self.mamba2_config
+            or self.hybrid_gdn_config
+            or self.hybrid_lightning_attn_config
+        )
 
     def set_num_token_hybrid(self):
         if (
@@ -1657,10 +1617,7 @@ class ModelRunner:
                 4096,
             )
 
-        if (
-            self.mambaish_config is not None
-            or self.server_args.attention_backend == "hybrid_lightning_attn"
-        ):
+        if self.mambaish_config is not None:
             ratio = (
                 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
                 if not self.server_args.disable_radix_cache
@@ -1758,17 +1715,6 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-                )
-            elif (
-                self.is_hybrid_lightning
-                and getattr(self.model_config.hf_config, "layer_group_size", 0) > 1
-            ):
-                self.req_to_token_pool = LingHybridLinearReqToTokenPool(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
@@ -1884,48 +1830,6 @@ class ModelRunner:
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    layer_num=self.num_effective_layers,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                )
-            elif self.server_args.attention_backend == "hybrid_lightning_attn":
-                decoder_attention_types = self.model.get_decoder_attention_types()
-                full_attn_layers = [
-                    i
-                    for i in range(len(decoder_attention_types))
-                    if decoder_attention_types[i] == 1
-                ]
-
-                kwargs_for_linear_token_to_kv_pool = {
-                    "size": self.max_total_num_tokens,
-                    "linear_size": max_num_reqs,
-                    "page_size": self.page_size,
-                    "dtype": self.kv_cache_dtype,
-                    "head_num": self.model_config.num_attention_heads
-                    // get_attention_tp_size(),  # MHA
-                    "head_dim": self.model_config.head_dim,
-                    "layer_num": self.num_effective_layers - len(full_attn_layers),
-                    "device": self.device,
-                    "enable_memory_saver": self.server_args.enable_memory_saver,
-                }
-                self.token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.page_size if _is_npu else 1,
-                    size=self.max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
-                    full_attention_layer_ids=full_attn_layers,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    layer_num=self.num_effective_layers,
-                    LinearTokenToKVPoolClass=LinearTokenToKVPool,
-                    kwargs_for_linear_token_to_kv_pool=kwargs_for_linear_token_to_kv_pool,
-                    enable_kvcache_transpose=False,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
                 )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
