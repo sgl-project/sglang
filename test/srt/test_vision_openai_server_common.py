@@ -215,7 +215,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
         # `driver` is for gemma-3-it
         assert (
-            "man" in text or "person" or "driver" in text
+            "man" in text or "person" in text or "driver" in text
         ), f"text: {text}, should contain man, person or driver"
         assert (
             "cab" in text

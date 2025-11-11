@@ -34,6 +34,52 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
         "--grammar-backend=none",
     ]
 
+    def verify_single_image_response(self, response):
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+
+        
+        text_lower = text.lower()
+
+        # 结构上要有 1. 和 2. 两点
+        assert "1." in text and "2." in text, f"text: {text}, should contain '1.' and '2.'"
+
+       
+        assert (
+            "image" in text_lower
+            or "picture" in text_lower
+            or "photo" in text_lower
+        ), f"text: {text}, should describe the image"
+
+        
+        assert (
+            "audio" in text_lower
+            or "sound" in text_lower
+            or "speech" in text_lower
+        ), f"text: {text}, should describe the audio"
+
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+    
+    def verify_speech_recognition_response(self, text):
+        
+
+        text_lower = text.lower()
+
+        
+        assert "2." in text, f"audio_response: |{text}| should contain '2.' for the audio part"
+
+        
+        assert (
+            "audio" in text_lower
+            or "sound" in text_lower
+            or "speech" in text_lower
+        ), f"audio_response: |{text}| should mention audio/sound/speech"
+
 
 class TestQwen2VLContextLengthServer(CustomTestCase):
     @classmethod
