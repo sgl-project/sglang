@@ -416,7 +416,7 @@ def _adjust_embedding_length(
 ) -> torch.Tensor:
     """Make sure the multimodal embedding length matches the number of MM tokens.
 
-    - If we have MORE embeddings than MM tokens: truncate (保持和原逻辑一致)
+    - If we have MORE embeddings than MM tokens: truncate
     - If we have FEWER embeddings than MM tokens: pad zeros instead of raising.
     """
     num_mm_tokens_in_input_ids = int(special_multimodal_mask.sum().item())
