@@ -208,6 +208,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
     return capture_bs, compile_bs
 
+
 class PiecewiseNPUGraphRunnerDecode:
     """A PiecewiseNPUGraphRunnerDecode runs the forward pass of a model with npu graph and torch.compile."""
 
