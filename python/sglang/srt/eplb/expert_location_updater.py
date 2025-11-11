@@ -80,10 +80,16 @@ class ExpertLocationUpdater:
             if callable(
                 getattr(model_runner.model, "generate_weight_name_filter", None)
             ):
+                # Filter and load only missing expert weights
                 weight_name_filter = model_runner.model.generate_weight_name_filter(
                     all_missing_logical_experts
                 )
             else:
+                # Do a full reload from disk
+                logger.info(
+                    "[ExpertLocationUpdater] Model does not implement generate_weight_name_filter. "
+                    "Performing full weight reload."
+                )
                 weight_name_filter = None
 
             model_runner.update_weights_from_disk(
