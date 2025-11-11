@@ -123,6 +123,8 @@ tokio-postgres = { version = "0.7.15", features = ["runtime","with-chrono-0_4","
 deadpool-postgres = "0.14.1"
 # CRDT for HA state synchronization
 crdts = "7.3"
+# mTLS support
+rustls-pemfile = "2.1"
 
 
 # wasm dependencies
