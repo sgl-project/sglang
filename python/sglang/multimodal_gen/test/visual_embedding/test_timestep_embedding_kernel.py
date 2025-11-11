@@ -7,8 +7,10 @@ import unittest
 import tabulate
 import torch
 
-from sglang.multimodal_gen.runtime.layers.triton_ops import timestep_embedding_triton
-from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
+from sglang.multimodal_gen.runtime.layers.visual_embedding import (
+    timestep_embedding,
+    timestep_embedding_triton,
+)
 
 
 class TestTimestepEmbed(unittest.TestCase):
