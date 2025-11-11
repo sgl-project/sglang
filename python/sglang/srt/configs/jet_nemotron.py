@@ -255,7 +255,7 @@ class JetNemotronStateShape(Mamba2StateShape):
 @dataclass
 class JetBlockConfig:
     mode: str = "chunk"
-    expand_v: int = 2.0
+    expand_v: float = 2.0
     num_heads: int = 6
     head_dim: int = 256
     norm_eps: float = 1e-5
