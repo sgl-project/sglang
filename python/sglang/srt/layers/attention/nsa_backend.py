@@ -456,8 +456,9 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
 
             # Generate page_table_1_flattened when needed:
-            mha_dequantize_needed = (
-                self.nsa_kv_cache_store_fp8 and max_seqlen_k <= self.nsa_index_topk
+            # Use flag set by deepseek_v2.py to avoid duplicating dispatch logic
+            mha_dequantize_needed = getattr(
+                forward_batch, "using_mha_one_shot_fp8_dequant", False
             )
             if (
                 topk_transform_method == TopkTransformMethod.RAGGED
