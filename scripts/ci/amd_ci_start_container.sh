@@ -6,14 +6,7 @@ SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
 SGLANG_VERSION="v0.5.0rc0"   # Default version, will be overridden if version.py is found
 
 if [ -f "$SGLANG_VERSION_FILE" ]; then
-  VERSION_FROM_FILE=$(python3 -c '
-import re, sys
-with open(sys.argv[1], "r") as f:
-    content = f.read()
-    match = re.search(r"__version__\s*=\s*[\"'"'"'](.*?)[\"'"'"']", content)
-    if match:
-        print("v" + match.group(1))
-' "$SGLANG_VERSION_FILE" 2>/dev/null || echo "")
+  VERSION_FROM_FILE=$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)
 
   if [ -n "$VERSION_FROM_FILE" ]; then
       SGLANG_VERSION="$VERSION_FROM_FILE"
