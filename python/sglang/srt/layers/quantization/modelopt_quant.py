@@ -101,7 +101,7 @@ logger = logging.getLogger(__name__)
 
 
 # Wrap FP4 GEMM as a custom op so Dynamo can use a fake kernel during compile
-@torch.library.custom_op("sglang::fp4_gemm")
+@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
 def _sglang_fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
