@@ -8,18 +8,19 @@ import torch
 from sglang.srt.sparse_attention.cache_manager.cache_manager import (
     CacheManager,
     RetriveResult,
+    RetriveQuery,
 )
 
-# from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_average import compute_average_score as compute_score
-# from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_average import proxy_k_tensor_decode, proxy_k_tensor_extend
+from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_average import compute_average_score as compute_score
+from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_average import proxy_k_tensor_decode, proxy_k_tensor_extend
 from sglang.srt.sparse_attention.kernels.combine_indices_paged import combine_indices
-from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_quest import (
-    compute_quest_score as compute_score,
-)
-from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_quest import (
-    proxy_k_tensor_decode,
-    proxy_k_tensor_extend,
-)
+# from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_quest import (
+#     compute_quest_score as compute_score,
+# )
+# from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_quest import (
+#     proxy_k_tensor_decode,
+#     proxy_k_tensor_extend,
+# )
 from sglang.srt.sparse_attention.kernels.score_copy import score_copy
 
 if TYPE_CHECKING:
@@ -160,46 +161,46 @@ class NaiveDecodeSparseRetriver:
 
     def _retrive_cache_indices(
         self,
-        query: torch.Tensor,  # [bs, hidden_state_dim]
-        proxy_k_tensor: torch.Tensor,
+        query: RetriveQuery,
         req_to_token: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,  # [bs]
-        max_num_pages: int,
         top_k: int,
-        selected_page_indices: torch.Tensor,
-        score: torch.Tensor,
-        layer_id: int,
     ):
 
-        token_indices = req_to_token[req_pool_indices, :]
-        strided_indices = torch.arange(
-            0,
-            token_indices.shape[1],
-            self.cache_manager.config.page_size,
-            device=token_indices.device,
-        )
-        kv_pages_per_seq = (
-            token_indices[:, strided_indices] // self.cache_manager.config.page_size
-        )
+        # token_indices = req_to_token[query.req_pool_indices, :]
+        # strided_indices = torch.arange(
+        #     0,
+        #     token_indices.shape[1],
+        #     self.cache_manager.config.page_size,
+        #     device=token_indices.device,
+        # )
+        # kv_pages_per_seq = (
+        #     token_indices[:, strided_indices] // self.cache_manager.config.page_size
+        # )
         kv_pages_num_per_seq = (
-            seq_lens + self.cache_manager.config.page_size - 1
+            query.seq_lens + self.cache_manager.config.page_size - 1
         ) // self.cache_manager.config.page_size
-        bs = query.shape[0]
+        bs = query.query.shape[0]
 
         compute_score(
-            q=query,
-            k=proxy_k_tensor,
-            out=score[:bs, :, :max_num_pages],
-            kv_pages_per_seq=kv_pages_per_seq,
+            q=query.query,
+            k=query.proxy_k_tensor,
+            out=query.score[:bs, :, :query.max_num_pages],
+            #kv_pages_per_seq=kv_pages_per_seq,
+            req_to_token=req_to_token,
+            req_pool_indices=query.req_pool_indices,
             kv_pages_num_per_seq=kv_pages_num_per_seq,
             num_sink_pages=self.stream_budget[0] // self.cache_manager.config.page_size,
             num_local_pages=self.stream_budget[1]
             // self.cache_manager.config.page_size,
+            page_size=self.cache_manager.config.page_size
         )
-        _, topk_indices = torch.topk(score[:bs, :, :max_num_pages], k=top_k, dim=2, sorted=False)
-        score_copy(topk_indices, kv_pages_per_seq, bs)
-        selected_page_indices[:bs, :, :] = topk_indices
+        #print(query.score[0, 0, 10: 50])
+        _, topk_indices = torch.topk(query.score[:bs, :, :query.max_num_pages], k=top_k, dim=2, sorted=False)
+        #print(topk_indices[0, 0, :])
+        score_copy(topk_indices, req_to_token, query.req_pool_indices, bs, self.cache_manager.config.page_size)
+        # print(topk_indices[0, 0, :])
+        # print('=====')
+        query.selected_page_indices[:bs, :, :] = topk_indices
 
     def _call_after_update_query(
         self,

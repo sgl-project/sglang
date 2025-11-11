@@ -8,10 +8,12 @@ def _compute_average_score_kernel(
     Q,
     K,
     Out,
-    kv_pages_per_seq,
+    #kv_pages_per_seq,
+    req_to_token,
+    req_pool_indices,
     kv_pages_num_per_seq,
     # Strides
-    kv_pages_per_seq_stride_b,
+    req_to_token_stride_b,
     q_stride_b,
     q_stride_h,
     k_stride_p,
@@ -30,6 +32,7 @@ def _compute_average_score_kernel(
     BLOCK_SIZE_P: tl.constexpr,
     PADDED_GROUP_SIZE: tl.constexpr,
     PADDED_HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     bid = tl.program_id(0)
     kv_hid = tl.program_id(1)
@@ -59,9 +62,16 @@ def _compute_average_score_kernel(
     q_matrix = tl.load(
         q_ptrs, mask=q_load_mask, other=0.0
     )  # [PADDED_GROUP_SIZE, HEAD_DIM]
+    
+    b_offset = tl.load(req_pool_indices + bid)
+    if b_offset < 0:
+        return
+    page_ptr = req_to_token + b_offset * req_to_token_stride_b
+    page_indices = tl.load(page_ptr + page_offsets * PAGE_SIZE, 
+                           mask=page_offsets < num_pages*PAGE_SIZE, other=0) // PAGE_SIZE
 
-    page_ptr = kv_pages_per_seq + bid * kv_pages_per_seq_stride_b + page_offsets
-    page_indices = tl.load(page_ptr, mask=store_mask, other=0)
+    # page_ptr = kv_pages_per_seq + bid * kv_pages_per_seq_stride_b + page_offsets
+    # page_indices = tl.load(page_ptr, mask=store_mask, other=0)
     k_ptrs = (
         K
         + page_indices[:, None] * k_stride_p
@@ -91,10 +101,13 @@ def compute_average_score(
     q: torch.Tensor,
     k: torch.Tensor,
     out: torch.Tensor,
-    kv_pages_per_seq: torch.Tensor = None,
-    kv_pages_num_per_seq: torch.Tensor = None,
+    #kv_pages_per_seq: torch.Tensor = None,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    kv_pages_num_per_seq: torch.Tensor,
     num_sink_pages: int = 0,
     num_local_pages: int = 0,
+    page_size: int = 16,
 ):
 
     bs = q.shape[0]
@@ -116,10 +129,12 @@ def compute_average_score(
         q,
         k,
         out,
-        kv_pages_per_seq,
+        #kv_pages_per_seq,
+        req_to_token,
+        req_pool_indices,
         kv_pages_num_per_seq,
         # Strides
-        kv_pages_per_seq.stride(0),
+        req_to_token.stride(0),
         q.stride(0),
         q.stride(1),
         k.stride(0),
@@ -138,6 +153,7 @@ def compute_average_score(
         PADDED_GROUP_SIZE=PADDED_GROUP_SIZE,
         PADDED_HEAD_DIM=PADDED_HEAD_DIM,
         BLOCK_SIZE_P=32,
+        PAGE_SIZE=page_size,
         num_warps=2,
         num_stages=4,
     )

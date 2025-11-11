@@ -8,7 +8,9 @@ def _compute_quest_score_kernel(
     Q,
     K,
     Out,
-    kv_pages_per_seq,
+    #kv_pages_per_seq,
+    req_to_token,
+    req_pool_indices,
     kv_pages_num_per_seq,
     # Strides
     kv_pages_per_seq_stride_b,
@@ -30,6 +32,7 @@ def _compute_quest_score_kernel(
     # Block sizes and padding
     BLOCK_SIZE_P: tl.constexpr,
     PADDED_HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     bid = tl.program_id(0)
     kv_hid = tl.program_id(1)
@@ -53,7 +56,11 @@ def _compute_quest_score_kernel(
         q_ptrs, mask=q_load_mask, other=0.0
     )  # [PADDED_GROUP_SIZE, HEAD_DIM]
 
-    page_ptr = kv_pages_per_seq + bid * kv_pages_per_seq_stride_b
+    #page_ptr = kv_pages_per_seq + bid * kv_pages_per_seq_stride_b
+    b_offset = tl.load(req_pool_indices + bid)
+    if b_offset < 0:
+        return
+    page_ptr = req_to_token + b_offset * kv_pages_per_seq_stride_b
 
     out_ptr = Out + bid * scores_stride_b + kv_hid * scores_stride_h + tl.arange(0, 1)
     for i in tl.static_range(0, BLOCK_SIZE_P):
@@ -66,7 +73,7 @@ def _compute_quest_score_kernel(
             neg_inf_scores = tl.full([1], -float("inf"), dtype=tl.float32)
             tl.store(out_ptrs, neg_inf_scores)
         else:
-            page_indices = tl.load(page_ptr + page_offset)
+            page_indices = tl.load(page_ptr + page_offset * PAGE_SIZE) // PAGE_SIZE
 
             k_ptrs = K + page_indices * k_stride_p + kv_hid * k_stride_h + dim_offsets
             k_load_mask = dim_offsets < HEAD_DIM
@@ -87,10 +94,13 @@ def compute_quest_score(
     q: torch.Tensor,
     k: torch.Tensor,
     out: torch.Tensor,
-    kv_pages_per_seq: torch.Tensor = None,
-    kv_pages_num_per_seq: torch.Tensor = None,
+    #kv_pages_per_seq: torch.Tensor = None,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    kv_pages_num_per_seq: torch.Tensor,
     num_sink_pages: int = 0,
     num_local_pages: int = 0,
+    page_size: int = 16,
 ):
 
     bs = q.shape[0]
@@ -113,10 +123,13 @@ def compute_quest_score(
         q,
         k,
         out,
-        kv_pages_per_seq,
+        #kv_pages_per_seq,
+        req_to_token,
+        req_pool_indices,
         kv_pages_num_per_seq,
         # Strides
-        kv_pages_per_seq.stride(0),
+        #kv_pages_per_seq.stride(0),
+        req_to_token.stride(0),
         q.stride(0),
         q.stride(1),
         k.stride(0),
@@ -135,6 +148,7 @@ def compute_quest_score(
         # Padding info
         PADDED_HEAD_DIM=PADDED_HEAD_DIM,
         BLOCK_SIZE_P=BLOCK_SIZE,
+        PAGE_SIZE=page_size,
         num_warps=2,
         num_stages=4,
     )

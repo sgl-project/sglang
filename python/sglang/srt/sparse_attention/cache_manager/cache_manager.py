@@ -72,23 +72,23 @@ class RetriveQuery:
             config.max_bs, device=config.device, dtype=torch.int32
         )
         # for quest
-        self.proxy_k_tensor = torch.zeros(
-            size=(
-                config.keys[0].shape[0] // config.page_size,
-                2,
-                config.head_num,
-                config.head_dim,
-            ),
-            device=config.device,
-            dtype=config.q_dtype,
-        )
+        # self.proxy_k_tensor = torch.zeros(
+        #     size=(
+        #         config.keys[0].shape[0] // config.page_size,
+        #         2,
+        #         config.head_num,
+        #         config.head_dim,
+        #     ),
+        #     device=config.device,
+        #     dtype=config.q_dtype,
+        # )
 
         # for average
-        # self.proxy_k_tensor = torch.zeros(
-        #     size=(config.keys[0].shape[0]//config.page_size, 1, config.head_num, config.head_dim),
-        #     device=config.device,
-        #     dtype=config.q_dtype
-        # )
+        self.proxy_k_tensor = torch.zeros(
+            size=(config.keys[0].shape[0]//config.page_size, 1, config.head_num, config.head_dim),
+            device=config.device,
+            dtype=config.q_dtype
+        )
 
         self.count_steps = torch.zeros(
             config.max_bs,
@@ -110,7 +110,6 @@ class RetriveQuery:
             dtype=torch.int32,
             device=config.device,
         )
-        self.updated = False
         self.layer_id = layer_id
         self.bs = 0
         self.max_num_pages = None
@@ -148,7 +147,6 @@ class RetriveResult:
             dtype=torch.int32,
             device=config.device,
         )
-        self.updated = False
         self.layer_id = layer_id
 
     def copy_from(
@@ -160,7 +158,6 @@ class RetriveResult:
         self.req_pool_indices.copy_(req_pool_indices)
         self.seq_lens.copy_(seq_lens)
         self.retrived_cache_indices_page.copy_(retrived_cache_indices_page)
-        self.updated = True
 
 
 class RetriveCudaGraphRunner:
@@ -185,7 +182,6 @@ class RetriveCudaGraphRunner:
     def _capture_one_layer(self, layer_id: int):
         graph = torch.cuda.CUDAGraph()
         memory_pool = get_global_graph_memory_pool()
-        self.queries[layer_id].max_seq_len_k = self.config.top_k * self.config.page_size + self.config.stream_budget[0] + self.config.stream_budget[1]
         with self.device_module.graph(graph, pool=memory_pool, stream=self.stream):
             self.retrive_function(self.queries[layer_id], self.results[layer_id])
         return graph
@@ -219,6 +215,12 @@ class CacheManager:
             RetriveQuery(self.config, layer_id)
             for layer_id in range(self.config.num_layers)
         ]
+        self.strided_indices = torch.arange(
+            0,
+            self.config.req_to_token.shape[1],
+            self.config.page_size,
+            device=self.config.device,
+        )
 
         self.accumlation_step = self.config.page_size
         self._retrive_cache_indices = None
@@ -249,7 +251,6 @@ class CacheManager:
                               self.config.moving_average_factor)
         self.retrived_query[layer_id].req_pool_indices[:bs] = req_pool_indices
         self.retrived_query[layer_id].seq_lens[:bs] = seq_lens
-        self.retrived_query[layer_id].updated = True
         self.retrived_query[layer_id].bs = bs
 
         self._call_after_update_query(
@@ -281,16 +282,9 @@ class CacheManager:
     def _retrive_one_layer(self, query: RetriveQuery, result: RetriveResult):
         with self.stream:
             self._retrive_cache_indices(
-                query=query.query,
-                proxy_k_tensor=query.proxy_k_tensor,
+                query=query,
                 req_to_token=self.config.req_to_token,
-                req_pool_indices=query.req_pool_indices,
-                seq_lens=query.seq_lens,
-                max_num_pages=query.max_num_pages,
                 top_k=self.config.top_k,
-                score=query.score,
-                selected_page_indices=query.selected_page_indices,
-                layer_id=query.layer_id,
             )
             result.copy_from(
                 req_pool_indices=query.req_pool_indices,
