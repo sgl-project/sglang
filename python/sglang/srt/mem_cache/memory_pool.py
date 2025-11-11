@@ -14,7 +14,7 @@ limitations under the License.
 """
 
 from __future__ import annotations
-
+import dataclasses
 from dataclasses import dataclass
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, Mamba2CacheParams
@@ -133,10 +133,15 @@ class MambaPool:
                     conv=[v[layer] for v in self.conv],
                     temporal=self.temporal[layer],
                 )
-            return type(self)(**{k: v[layer] for k, v in vars(self).items()})
+            return type(self)(
+                **{f.name: getattr(self, f.name)[layer] for f in dataclasses.fields(self)}
+            )
 
         def mem_usage_bytes(self):
-            return sum(get_tensor_size_bytes(t) for t in vars(self).values())
+            return sum(
+                get_tensor_size_bytes(getattr(self, f.name))
+                for f in dataclasses.fields(self)
+            )
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
