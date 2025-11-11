@@ -37,6 +37,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-b200
     continue-on-error: true
+    env:
+      RUNNER_LABELS: 8-gpu-b200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
