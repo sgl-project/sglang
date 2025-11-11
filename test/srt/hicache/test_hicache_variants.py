@@ -70,7 +70,7 @@ class HiCacheBaseServer(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         # Setup tokenizer if needed by subclass
-        if hasattr(cls, 'needs_tokenizer') and cls.needs_tokenizer:
+        if hasattr(cls, "needs_tokenizer") and cls.needs_tokenizer:
             cls.tokenizer = get_tokenizer(cls.model)
 
         cls.process = popen_launch_server(
