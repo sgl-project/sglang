@@ -421,6 +421,7 @@ suite_amd = {
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
+        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("test_abort.py", 51),
         TestFile("test_chunked_prefill.py", 410),
@@ -482,6 +483,7 @@ suite_amd = {
     "per-commit-8-gpu-amd": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
+        TestFile("test_disaggregation_pp.py", 200),
     ],
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
