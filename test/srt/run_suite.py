@@ -217,6 +217,7 @@ suites = {
         TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("test_deepseek_v3_deterministic.py", 240),
+        TestFile("test_cpp_radix_cache.py", 60),
     ],
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
