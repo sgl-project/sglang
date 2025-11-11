@@ -221,6 +221,7 @@ suites = {
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
+        TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
     ],
     "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [],
