@@ -99,6 +99,12 @@ tokio-postgres = { version = "0.7.15", features = ["runtime","with-chrono-0_4","
 deadpool-postgres = "0.14.1"
 
 
+# wasm dependencies
+sha2 = "0.10"
+wasmtime = { version = "38.0", features = ["component-model", "async"] }
+wasmtime-wasi = "38.0"
+async-channel = "2.5"
+
 [build-dependencies]
 tonic-prost-build = "0.14.2"
 prost-build = "0.14.1"

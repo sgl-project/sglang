@@ -20,6 +20,7 @@ pub mod service_discovery;
 pub mod tokenizer;
 pub mod tool_parser;
 pub mod tree;
+pub mod wasm;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
@@ -245,6 +246,7 @@ struct Router {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    enable_wasm: bool,
 }
 
 impl Router {
@@ -419,6 +421,7 @@ impl Router {
                 self.client_key_path.as_ref(),
             )
             .add_ca_certificates(self.ca_cert_paths.clone())
+            .enable_wasm(true)
             .build()
     }
 }
@@ -499,6 +502,7 @@ impl Router {
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        enable_wasm = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -574,6 +578,7 @@ impl Router {
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        enable_wasm: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -663,6 +668,7 @@ impl Router {
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            enable_wasm,
         })
     }
 
