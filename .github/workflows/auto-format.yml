@@ -64,8 +64,30 @@ jobs:
           name: auto_format-${{ github.sha }}.patch
           path: auto_format.patch
 
-      - name: Add comment
+      - name: Add patch info to summary
         if: ${{ failure() && steps.git_push.outcome == 'failure' }}
+        run: |
+          echo "## 🤖 Auto-format Patch Available" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The code has been formatted but couldn't be pushed (likely from a forked repo)." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📦 **Download the patch file from the artifacts above and apply it locally:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo 'git apply auto_format-${{ github.sha }}.patch' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Add comment with patch info
+        if: ${{ failure() && steps.git_push.outcome == 'failure' }}
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -d '{"body":"🤖 **Auto-format completed!**\n\nThe code has been formatted but couldn'\''t be pushed automatically (this PR is from a forked repo).\n\n📦 Please download the patch file from [GitHub Actions Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) and apply it locally:\n\n```bash\ngit apply auto_format-${{ github.sha }}.patch\n```"}'
+        continue-on-error: true
+
+      - name: Add success comment
+        if: ${{ success() }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -74,8 +96,9 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: '🤖 Code got formatted by CI. If the PR is from a forked repo, please download the patch files from the GitHub Actions web page and apply them locally.'
+              body: '🤖 Code has been auto-formatted and pushed successfully!'
             })
+        continue-on-error: true
 
       - name: Remove format label
         if: always()
