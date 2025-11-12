@@ -191,7 +191,7 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ResponsesRequest>,
+    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
     state
         .router
