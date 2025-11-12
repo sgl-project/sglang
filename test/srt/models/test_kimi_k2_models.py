@@ -46,16 +46,17 @@ class TestKimiK2Thinking(CustomTestCase):
             "--reasoning-parser",
             "kimi_k2",
         ]
+        os.environ["SGLANG_TOOL_STRICT_LEVEL"] = "0"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=5000,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={"SGLANG_TOOL_STRICT_LEVEL": "0"},
         )
 
     @classmethod
     def tearDownClass(cls):
+        del os.environ["SGLANG_TOOL_STRICT_LEVEL"]
         kill_process_tree(cls.process.pid)
 
     def test_a_gsm8k(
@@ -91,8 +92,8 @@ class TestKimiK2Thinking(CustomTestCase):
         """
         requests.get(self.base_url + "/flush_cache")
         args = SimpleNamespace(
-            num_questions=100,
-            concurrency=5,
+            num_questions=200,
+            concurrency=128,
             data_path=None,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -131,7 +132,6 @@ class TestKimiK2Thinking(CustomTestCase):
         schema_accuracy = (
             summary["successful_tool_call_count"] / summary["finish_tool_calls"]
         )
-        # Expected tool call rate is ~30%.
         tool_call_rate = summary["finish_tool_calls"] / summary["success_count"]
         print(f"Schema Accuracy: {schema_accuracy:.3f}")
         print(f"Tool Call Rate: {tool_call_rate:.3f}")
@@ -141,8 +141,9 @@ class TestKimiK2Thinking(CustomTestCase):
                 f"{schema_accuracy=:.3f}\n"
                 f"{tool_call_rate=:.3f}\n"
             )
+            # TODO: update after new test result published by Moonshot
             self.assertGreater(schema_accuracy, 0.7)
-            self.assertGreater(tool_call_rate, 0.3)
+            self.assertGreater(tool_call_rate, 0.32)
 
 
 ######### Code Below References MoonshotAI/K2-Vendor-Verifier ########
