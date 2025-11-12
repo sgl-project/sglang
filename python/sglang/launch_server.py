@@ -1,5 +1,7 @@
 """Launch the inference server."""
 
+import argparse
+from importlib.metadata import version as pkg_version
 import asyncio
 import os
 import sys
@@ -21,6 +23,13 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
+    if "--version" in sys.argv:
+        try:
+            v = pkg_version("sglang")
+        except Exception:
+            v = "unknown"
+        print(f"SGLang {v}")
+        sys.exit(0)
     server_args = prepare_server_args(sys.argv[1:])
 
     try:
