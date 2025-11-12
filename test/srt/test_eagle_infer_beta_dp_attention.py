@@ -1,80 +1,70 @@
+import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.environ import envs
+import requests
+
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.kits.matched_stop_kit import MatchedStopMixin
-from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
+FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 
-class TestEagleDPAttnServerBase(CustomTestCase, MatchedStopMixin):
-    max_running_requests = 64
-    attention_backend = "triton"
-    spec_steps = 6
-    spec_topk = 10
-    spec_draft_tokens = 32
-    page_size = 1
-    other_launch_args = []
-    model = DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST
-    draft_model = DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST
 
+class TestEagleDPAttnServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
+        cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        launch_args = [
-            "--trust-remote-code",
-            "--attention-backend",
-            cls.attention_backend,
-            "--speculative-algorithm",
-            "EAGLE3",
-            "--speculative-draft-model",
-            cls.draft_model,
-            "--speculative-num-steps",
-            cls.spec_steps,
-            "--speculative-eagle-topk",
-            cls.spec_topk,
-            "--speculative-num-draft-tokens",
-            cls.spec_draft_tokens,
-            "--page-size",
-            str(cls.page_size),
+        other_args = [
             "--tp-size",
-            2,
+            "4",
             "--dp-size",
-            2,
+            "4",
             "--enable-dp-attention",
-            "--mem-fraction-static",
-            "0.75",
-            "--max-running-requests",
-            str(cls.max_running_requests),
-            "--cuda-graph-bs",
-            *[str(i) for i in range(1, cls.max_running_requests + 1)],
+            "--attention-backend",
+            "trtllm_mla",
+            "--moe-runner-backend",
+            "flashinfer_trtllm",
+            "--quantization",
+            "modelopt_fp4",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
         ]
-        launch_args.extend(cls.other_launch_args)
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=launch_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
+            del os.environ["SGLANG_ENABLE_SPEC_V2"]
 
-    def test_radix_attention(self):
-        run_radix_attention_test(self.base_url)
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        requests.get(self.base_url + "/flush_cache")
 
-    def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -84,9 +74,23 @@ class TestEagleDPAttnServerBase(CustomTestCase, MatchedStopMixin):
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
-        print(f"TestEagleLargeBS -- {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.91)
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (deepseek-v3-fp4 mtp)\n"
+                f'{metrics["accuracy"]=:.3f}\n'
+                f"{avg_spec_accept_length=:.2f}\n"
+            )
+            self.assertGreater(metrics["accuracy"], 0.94)
+            self.assertGreater(avg_spec_accept_length, 2.04)
 
 
 if __name__ == "__main__":

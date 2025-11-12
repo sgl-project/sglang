@@ -155,7 +155,6 @@ suites = {
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 200),
         TestFile("test_eagle_dp_attention.py", 200),
-        TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 291),
@@ -183,6 +182,7 @@ suites = {
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
+        TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
