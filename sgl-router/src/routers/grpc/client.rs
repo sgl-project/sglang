@@ -55,6 +55,48 @@ impl GrpcClient {
         matches!(self, Self::Vllm(_))
     }
 
+    /// Connect to gRPC server (runtime-aware)
+    pub async fn connect(
+        url: &str,
+        runtime_type: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        match runtime_type {
+            "sglang" => Ok(Self::Sglang(SglangSchedulerClient::connect(url).await?)),
+            "vllm" => Ok(Self::Vllm(VllmEngineClient::connect(url).await?)),
+            _ => Err(format!("Unknown runtime type: {}", runtime_type).into()),
+        }
+    }
+
+    /// Perform health check (dispatches to appropriate backend)
+    pub async fn health_check(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::Sglang(client) => {
+                client.health_check().await?;
+                Ok(())
+            }
+            Self::Vllm(client) => {
+                client.health_check().await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Get model info (returns enum wrapping backend-specific response)
+    pub async fn get_model_info(
+        &self,
+    ) -> Result<ModelInfo, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::Sglang(client) => {
+                let info = client.get_model_info().await?;
+                Ok(ModelInfo::Sglang(info))
+            }
+            Self::Vllm(client) => {
+                let info = client.get_model_info().await?;
+                Ok(ModelInfo::Vllm(info))
+            }
+        }
+    }
+
     /// Generate streaming response from request
     ///
     /// Dispatches to the appropriate backend client and wraps the result in ProtoStream
@@ -73,5 +115,48 @@ impl GrpcClient {
             }
             _ => panic!("Mismatched client and request types"),
         }
+    }
+}
+
+/// Unified ModelInfo wrapper
+pub enum ModelInfo {
+    Sglang(crate::grpc_client::sglang_proto::GetModelInfoResponse),
+    Vllm(crate::grpc_client::vllm_proto::GetModelInfoResponse),
+}
+
+impl ModelInfo {
+    /// Convert model info to label map for worker metadata
+    pub fn to_labels(&self) -> std::collections::HashMap<String, String> {
+        let mut labels = std::collections::HashMap::new();
+
+        // Serialize to JSON Value (like pydantic's model_dump)
+        let value = match self {
+            ModelInfo::Sglang(info) => serde_json::to_value(info).ok(),
+            ModelInfo::Vllm(info) => serde_json::to_value(info).ok(),
+        };
+
+        // Convert JSON object to HashMap, filtering out empty/zero/false values
+        if let Some(serde_json::Value::Object(obj)) = value {
+            for (key, val) in obj {
+                match val {
+                    // Insert non-empty strings
+                    serde_json::Value::String(s) if !s.is_empty() => {
+                        labels.insert(key, s);
+                    }
+                    // Insert positive numbers
+                    serde_json::Value::Number(n) if n.as_i64().unwrap_or(0) > 0 => {
+                        labels.insert(key, n.to_string());
+                    }
+                    // Insert true booleans
+                    serde_json::Value::Bool(true) => {
+                        labels.insert(key, "true".to_string());
+                    }
+                    // Skip empty strings, zeros, false, nulls, arrays, objects
+                    _ => {}
+                }
+            }
+        }
+
+        labels
     }
 }

@@ -8,6 +8,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate both client and server code
         .build_server(true)
         .build_client(true)
+        // Add serde Serialize for model info messages (we only need to serialize to labels)
+        .type_attribute("GetModelInfoResponse", "#[derive(serde::Serialize)]")
         // Allow proto3 optional fields
         .protoc_arg("--experimental_allow_proto3_optional")
         // Compile both proto files

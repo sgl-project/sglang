@@ -26,8 +26,8 @@ use crate::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
         DPAwareWorkerBuilder, HealthConfig, Worker, WorkerType,
     },
-    grpc_client::SglangSchedulerClient,
     protocols::worker_spec::WorkerConfigRequest,
+    routers::grpc::client::GrpcClient,
 };
 
 // HTTP client for metadata fetching
@@ -151,15 +151,13 @@ async fn try_http_health_check(
     Ok(())
 }
 
-/// Helper: Try gRPC health check
-async fn try_grpc_health_check(url: &str, timeout_secs: u64) -> Result<(), String> {
-    let grpc_url = if url.starts_with("grpc://") {
-        url.to_string()
-    } else {
-        format!("grpc://{}", strip_protocol(url))
-    };
-
-    let connect_future = SglangSchedulerClient::connect(&grpc_url);
+/// Helper: Perform gRPC health check with runtime type
+async fn do_grpc_health_check(
+    grpc_url: &str,
+    timeout_secs: u64,
+    runtime_type: &str,
+) -> Result<(), String> {
+    let connect_future = GrpcClient::connect(grpc_url, runtime_type);
     let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
         .await
         .map_err(|_| "gRPC connection timeout".to_string())?
@@ -174,15 +172,48 @@ async fn try_grpc_health_check(url: &str, timeout_secs: u64) -> Result<(), Strin
     Ok(())
 }
 
-/// Helper: Fetch gRPC metadata
-async fn fetch_grpc_metadata(url: &str) -> Result<HashMap<String, String>, String> {
+/// Helper: Try gRPC health check
+///
+/// If runtime_type is specified, uses the appropriate client (SGLang or vLLM).
+/// If not specified, tries SGLang first, then falls back to vLLM.
+async fn try_grpc_health_check(
+    url: &str,
+    timeout_secs: u64,
+    runtime_type: Option<&str>,
+) -> Result<(), String> {
     let grpc_url = if url.starts_with("grpc://") {
         url.to_string()
     } else {
         format!("grpc://{}", strip_protocol(url))
     };
 
-    let client = SglangSchedulerClient::connect(&grpc_url)
+    match runtime_type {
+        Some(runtime) => do_grpc_health_check(&grpc_url, timeout_secs, runtime).await,
+        None => {
+            // Runtime not specified: Try SGLang first, then vLLM as fallback
+            if let Ok(()) = do_grpc_health_check(&grpc_url, timeout_secs, "sglang").await {
+                return Ok(());
+            }
+
+            // Try vLLM as fallback
+            do_grpc_health_check(&grpc_url, timeout_secs, "vllm")
+                .await
+                .map_err(|e| {
+                    format!(
+                        "gRPC health check failed (tried both SGLang and vLLM): {}",
+                        e
+                    )
+                })
+        }
+    }
+}
+
+/// Fetch metadata from gRPC server with runtime type
+async fn do_fetch_grpc_metadata(
+    grpc_url: &str,
+    runtime_type: &str,
+) -> Result<HashMap<String, String>, String> {
+    let client = GrpcClient::connect(grpc_url, runtime_type)
         .await
         .map_err(|e| format!("Failed to connect to gRPC: {}", e))?;
 
@@ -191,53 +222,42 @@ async fn fetch_grpc_metadata(url: &str) -> Result<HashMap<String, String>, Strin
         .await
         .map_err(|e| format!("Failed to fetch gRPC metadata: {}", e))?;
 
-    let mut labels = HashMap::new();
+    Ok(model_info.to_labels())
+}
 
-    // Extract all available fields
-    if !model_info.model_path.is_empty() {
-        labels.insert("model_path".to_string(), model_info.model_path.clone());
-    }
-    if !model_info.tokenizer_path.is_empty() {
-        labels.insert(
-            "tokenizer_path".to_string(),
-            model_info.tokenizer_path.clone(),
-        );
-    }
-    if !model_info.served_model_name.is_empty() {
-        labels.insert(
-            "served_model_name".to_string(),
-            model_info.served_model_name.clone(),
-        );
-    }
-    if !model_info.weight_version.is_empty() {
-        labels.insert(
-            "weight_version".to_string(),
-            model_info.weight_version.clone(),
-        );
-    }
-    if !model_info.model_type.is_empty() {
-        labels.insert("model_type".to_string(), model_info.model_type.clone());
-    }
-    if model_info.max_context_length > 0 {
-        labels.insert(
-            "max_context_length".to_string(),
-            model_info.max_context_length.to_string(),
-        );
-    }
-    if model_info.max_req_input_len > 0 {
-        labels.insert(
-            "max_req_input_len".to_string(),
-            model_info.max_req_input_len.to_string(),
-        );
-    }
-    if model_info.vocab_size > 0 {
-        labels.insert("vocab_size".to_string(), model_info.vocab_size.to_string());
-    }
-    if model_info.is_generation {
-        labels.insert("is_generation".to_string(), "true".to_string());
-    }
+/// Helper: Fetch gRPC metadata
+///
+/// If runtime_type is specified, uses the appropriate client (SGLang or vLLM).
+/// If not specified, tries SGLang first, then falls back to vLLM.
+async fn fetch_grpc_metadata(
+    url: &str,
+    runtime_type: Option<&str>,
+) -> Result<HashMap<String, String>, String> {
+    let grpc_url = if url.starts_with("grpc://") {
+        url.to_string()
+    } else {
+        format!("grpc://{}", strip_protocol(url))
+    };
 
-    Ok(labels)
+    match runtime_type {
+        Some(runtime) => do_fetch_grpc_metadata(&grpc_url, runtime).await,
+        None => {
+            // Runtime not specified: Try SGLang first, then vLLM as fallback
+            if let Ok(labels) = do_fetch_grpc_metadata(&grpc_url, "sglang").await {
+                return Ok(labels);
+            }
+
+            // Try vLLM as fallback
+            do_fetch_grpc_metadata(&grpc_url, "vllm")
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to fetch gRPC metadata (tried both SGLang and vLLM): {}",
+                        e
+                    )
+                })
+        }
+    }
 }
 
 /// Step 1: Detect connection mode by probing both HTTP and gRPC
@@ -263,9 +283,10 @@ impl StepExecutor for DetectConnectionModeStep {
         let url = config.url.clone();
         let timeout = config.health_check_timeout_secs;
         let client = &app_context.client;
+        let runtime_type = config.runtime.as_deref();
         let (http_result, grpc_result) = tokio::join!(
             try_http_health_check(&url, timeout, client),
-            try_grpc_health_check(&url, timeout)
+            try_grpc_health_check(&url, timeout, runtime_type)
         );
 
         let connection_mode = match (http_result, grpc_result) {
@@ -332,7 +353,10 @@ impl StepExecutor for DiscoverMetadataStep {
                     Err(e) => Err(e),
                 }
             }
-            ConnectionMode::Grpc { .. } => fetch_grpc_metadata(&config.url).await,
+            ConnectionMode::Grpc { .. } => {
+                let runtime_type = config.runtime.as_deref();
+                fetch_grpc_metadata(&config.url, runtime_type).await
+            }
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);
