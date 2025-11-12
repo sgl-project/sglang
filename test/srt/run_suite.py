@@ -196,11 +196,6 @@ suites = {
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
     ],
-    "per-commit-8-gpu-h200-deepseek-v32": [
-        TestFile("test_deepseek_v32_basic.py", 275),
-        TestFile("test_deepseek_v32_mtp.py", 275),
-        TestFile("test_deepseek_v32_nsabackend.py", 600),
-    ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),
