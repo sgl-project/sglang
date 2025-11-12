@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.utils import device_context, is_npu
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
