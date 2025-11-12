@@ -98,7 +98,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             config.vision_config,
             quant_config,
             prefix=add_prefix("vision_model", prefix),
-            use_eagle_head=True,  # Enable Eagle2.5 vision head
         )
 
         # Language model
@@ -163,7 +162,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
     def pixel_shuffle(self, x, scale_factor=0.5):
         """Pixel shuffle operation for downsampling vision features."""
         # Reshape to spatial grid
-        print(f"DEBUG pixel_shuffle input shape: {x.shape}")
         h = w = int(x.shape[1] ** 0.5)
         x = x.reshape(x.shape[0], h, w, -1)
 
