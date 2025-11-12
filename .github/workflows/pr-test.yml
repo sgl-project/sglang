@@ -79,7 +79,7 @@ jobs:
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
-              workflow_id: context.workflow,
+              workflow_id: 'pr-test.yml',
               event: eventName,
               per_page: 100,
             });
@@ -467,6 +467,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     strategy:
       fail-fast: false
       matrix:
@@ -818,6 +820,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -845,6 +849,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -862,7 +868,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepseek-v32

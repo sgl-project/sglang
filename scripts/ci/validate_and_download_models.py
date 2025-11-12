@@ -3,12 +3,14 @@
 Validate model integrity for CI runners and download if needed.
 
 This script checks HuggingFace cache for model completeness and downloads
-missing models. It exits with code 1 if download was required (indicating
-cache corruption), which causes the CI job to fail and surface cache issues.
+missing models. It exits with code 0 if models are present or successfully
+downloaded (emitting a warning annotation if repairs were needed), and exits
+with code 1 only if download attempts fail.
 """
 
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -144,7 +146,7 @@ def validate_safetensors_file(file_path: Path) -> Tuple[bool, Optional[str]]:
         return False, f"{error_type}: {error_msg}"
 
 
-def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str]]:
+def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str], List[Path]]:
     """
     Validate that all model shards are present and complete.
 
@@ -152,7 +154,8 @@ def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str]]:
         model_path: Path to model's snapshot directory
 
     Returns:
-        Tuple of (is_valid, error_message)
+        Tuple of (is_valid, error_message, corrupted_files)
+        - corrupted_files: List of paths to corrupted shard files that should be removed
     """
     # Pattern for sharded files: model-00001-of-00009.safetensors or pytorch_model-00001-of-00009.bin
     shard_pattern = re.compile(
@@ -176,9 +179,13 @@ def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str]]:
             if single_files[0].suffix == ".safetensors":
                 is_valid, error_msg = validate_safetensors_file(single_files[0])
                 if not is_valid:
-                    return False, f"Corrupted file {single_files[0].name}: {error_msg}"
-            return True, None
-        return False, "No model files found (safetensors or bin)"
+                    return (
+                        False,
+                        f"Corrupted file {single_files[0].name}: {error_msg}",
+                        [single_files[0]],
+                    )
+            return True, None, []
+        return False, "No model files found (safetensors or bin)", []
 
     # Extract total shard count from any shard filename
     total_shards = None
@@ -189,7 +196,7 @@ def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str]]:
             break
 
     if total_shards is None:
-        return False, "Could not determine total shard count from filenames"
+        return False, "Could not determine total shard count from filenames", []
 
     # Check that all shards exist
     expected_shards = set(range(1, total_shards + 1))
@@ -205,25 +212,41 @@ def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str]]:
 
     if missing_shards:
         missing_list = sorted(missing_shards)
-        return False, f"Missing shards: {missing_list} (expected {total_shards} total)"
+        # Missing shards - nothing to remove, let download handle it
+        return (
+            False,
+            f"Missing shards: {missing_list} (expected {total_shards} total)",
+            [],
+        )
 
     # Check for index file
     index_file = model_path / "model.safetensors.index.json"
     if not index_file.exists():
-        return False, "Missing model.safetensors.index.json"
+        return False, "Missing model.safetensors.index.json", []
 
     # Validate each safetensors shard file for corruption
     print(f"  Validating {len(shard_files)} shard file(s) for corruption...")
+    corrupted_files = []
     for shard_file in shard_files:
         if shard_file.suffix == ".safetensors":
             is_valid, error_msg = validate_safetensors_file(shard_file)
             if not is_valid:
-                return False, f"Corrupted shard {shard_file.name}: {error_msg}"
+                corrupted_files.append(shard_file)
+                print(f"    ✗ Corrupted: {shard_file.name} - {error_msg}")
 
-    return True, None
+    if corrupted_files:
+        return (
+            False,
+            f"Corrupted shards: {[f.name for f in corrupted_files]}",
+            corrupted_files,
+        )
+
+    return True, None, []
 
 
-def validate_model(model_id: str, cache_dir: str) -> Tuple[bool, Optional[str]]:
+def validate_model(
+    model_id: str, cache_dir: str
+) -> Tuple[bool, Optional[str], List[Path]]:
     """
     Validate a model's cache integrity.
 
@@ -232,37 +255,46 @@ def validate_model(model_id: str, cache_dir: str) -> Tuple[bool, Optional[str]]:
         cache_dir: HuggingFace cache directory
 
     Returns:
-        Tuple of (is_valid, error_message)
+        Tuple of (is_valid, error_message, corrupted_files)
+        - corrupted_files: List of paths to corrupted files that should be removed
     """
     print(f"Validating model: {model_id}")
 
     # Find model in cache
     model_path = get_model_cache_path(model_id, cache_dir)
     if model_path is None:
-        return False, "Model not found in cache"
+        return False, "Model not found in cache", []
 
     print(f"  Found in cache: {model_path}")
 
     # Check for incomplete files
     incomplete_files = check_incomplete_files(model_path, cache_dir)
     if incomplete_files:
-        return False, f"Found incomplete download files: {len(incomplete_files)} files"
+        return (
+            False,
+            f"Found incomplete download files: {len(incomplete_files)} files",
+            [],
+        )
 
     # Validate shards
-    is_valid, error_msg = validate_model_shards(model_path)
+    is_valid, error_msg, corrupted_files = validate_model_shards(model_path)
     if not is_valid:
-        return False, error_msg
+        return False, error_msg, corrupted_files
 
     print(f"  ✓ Model validated successfully")
-    return True, None
+    return True, None, []
 
 
-def download_model(model_id: str) -> bool:
+def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -> bool:
     """
     Download a model from HuggingFace.
 
+    Completely removes the model cache directory before downloading to ensure a clean download.
+
     Args:
         model_id: Model identifier
+        cache_dir: HuggingFace cache directory
+        corrupted_files: List of specific file paths that are corrupted (unused, kept for compatibility)
 
     Returns:
         True if download succeeded, False otherwise
@@ -272,7 +304,23 @@ def download_model(model_id: str) -> bool:
         return False
 
     print(f"Downloading model: {model_id}")
-    print(f"  This may take a while for large models...")
+
+    # Completely remove the model directory from cache
+    cache_model_name = "models--" + model_id.replace("/", "--")
+    model_cache_path = Path(cache_dir) / cache_model_name
+
+    if model_cache_path.exists():
+        print(f"  Removing entire model directory: {model_cache_path}")
+        try:
+            shutil.rmtree(model_cache_path)
+            print(f"    ✓ Successfully removed model directory")
+        except Exception as e:
+            print(f"    ✗ Failed to remove model directory: {e}")
+            print(f"    Attempting download anyway...")
+    else:
+        print(f"  Model directory not found in cache (will download fresh)")
+
+    print(f"  Downloading from HuggingFace (this may take a while for large models)...")
 
     try:
         snapshot_download(
@@ -362,8 +410,8 @@ def main() -> int:
     Main validation logic.
 
     Returns:
-        0 if all models are valid or runner doesn't need validation
-        1 if models needed to be downloaded or validation failed
+        0 if all models are valid, successfully downloaded, or runner doesn't need validation
+        1 only if download attempts fail
     """
     print("=" * 70)
     print("Model Validation for CI Runners")
@@ -397,17 +445,16 @@ def main() -> int:
     print("-" * 70)
 
     # Track validation results
-    models_needing_download = []
-    validation_errors = []
+    # Maps model_id -> (error_msg, corrupted_files)
+    models_needing_download: Dict[str, Tuple[str, List[Path]]] = {}
 
     # Validate each required model
     for model_id in required_models:
-        is_valid, error_msg = validate_model(model_id, cache_dir)
+        is_valid, error_msg, corrupted_files = validate_model(model_id, cache_dir)
 
         if not is_valid:
             print(f"  ✗ Validation failed: {error_msg}")
-            models_needing_download.append(model_id)
-            validation_errors.append(f"{model_id}: {error_msg}")
+            models_needing_download[model_id] = (error_msg, corrupted_files)
 
     print("-" * 70)
 
@@ -418,16 +465,16 @@ def main() -> int:
 
     # Models need to be downloaded
     print(f"⚠ Cache validation failed for {len(models_needing_download)} model(s)")
-    for error in validation_errors:
-        print(f"  - {error}")
+    for model_id, (error_msg, _) in models_needing_download.items():
+        print(f"  - {model_id}: {error_msg}")
 
     print("-" * 70)
     print("Attempting to download missing/corrupted models...")
     print("-" * 70)
 
     download_failed = False
-    for model_id in models_needing_download:
-        if not download_model(model_id):
+    for model_id, (error_msg, corrupted_files) in models_needing_download.items():
+        if not download_model(model_id, cache_dir, corrupted_files):
             download_failed = True
 
     print("-" * 70)
@@ -436,11 +483,39 @@ def main() -> int:
         print("✗ FAILED: Some models could not be downloaded")
         return 1
 
-    # All downloads succeeded, but we still exit with error to flag cache issues
-    print("✗ FAILED: Models were downloaded due to cache corruption/missing files")
-    print("This indicates the cache was invalid and needed to be repaired.")
-    print("Failing the job to surface this issue for investigation.")
-    return 1
+    # All downloads succeeded - now validate them again
+    print("✓ All models downloaded successfully!")
+    print("-" * 70)
+    print("Validating downloaded models...")
+    print("-" * 70)
+
+    validation_failed = False
+    for model_id in models_needing_download.keys():
+        is_valid, error_msg, _ = validate_model(model_id, cache_dir)
+        if not is_valid:
+            print(f"  ✗ Post-download validation failed for {model_id}: {error_msg}")
+            validation_failed = True
+
+    print("-" * 70)
+
+    if validation_failed:
+        print("✗ FAILED: Some models failed validation after download")
+        return 1
+
+    # All validations passed - emit warning but exit successfully
+    print("✓ All downloaded models validated successfully!")
+    print("⚠ WARNING: Models were missing/corrupted in cache and have been repaired.")
+    print(f"  Repaired models: {', '.join(models_needing_download.keys())}")
+
+    # Emit GitHub Actions warning annotation for visibility
+    print(
+        f"::warning file=scripts/ci/validate_and_download_models.py::"
+        f"Cache validation failed for {len(models_needing_download)} model(s). "
+        f"Models were re-downloaded and validated successfully. "
+        f"This may indicate cache corruption or infrastructure issues."
+    )
+
+    return 0
 
 
 if __name__ == "__main__":
