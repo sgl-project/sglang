@@ -23,8 +23,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import general_mm_embed_routine
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -160,6 +163,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
     def pixel_shuffle(self, x, scale_factor=0.5):
         """Pixel shuffle operation for downsampling vision features."""
         # Reshape to spatial grid
+        print(f"DEBUG pixel_shuffle input shape: {x.shape}")
         h = w = int(x.shape[1] ** 0.5)
         x = x.reshape(x.shape[0], h, w, -1)
 
@@ -194,16 +198,37 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
 
     def extract_feature(self, pixel_values):
         """Extract and compress vision features."""
-        if self.config.select_layer == -1:
-            vit_embeds = self.vision_model(pixel_values=pixel_values)
-        else:
-            # For select_layer != -1, we need to get hidden states
-            # This requires the vision model to output hidden states
-            vit_embeds = self.vision_model(pixel_values=pixel_values)
-            # Note: In NVIDIA's implementation, they access hidden_states[select_layer]
-            # For now, we use the last hidden state as the base implementation
+        # Handle batched input: process each image individually since flatten_batch=True
+        if pixel_values.dim() == 4 and pixel_values.shape[0] > 1:
+            # Batched images: [batch_size, channels, height, width]
+            batch_size = pixel_values.shape[0]
+            vit_embeds_list = []
+            for i in range(batch_size):
+                single_image = pixel_values[i : i + 1]  # [1, channels, height, width]
+                if self.config.select_layer == -1:
+                    single_vit_embeds = self.vision_model(pixel_values=single_image)
+                else:
+                    # For select_layer != -1, we need to get hidden states
+                    # This requires the vision model to output hidden states
+                    single_vit_embeds = self.vision_model(pixel_values=single_image)
+                    # Note: In NVIDIA's implementation, they access hidden_states[select_layer]
+                    # For now, we use the last hidden state as the base implementation
 
-        vit_embeds = self.feature_compression(vit_embeds)
+                single_vit_embeds = self.feature_compression(single_vit_embeds)
+                vit_embeds_list.append(single_vit_embeds)
+            vit_embeds = torch.cat(vit_embeds_list, dim=0)
+        else:
+            # Single image or already properly shaped
+            if self.config.select_layer == -1:
+                vit_embeds = self.vision_model(pixel_values=pixel_values)
+            else:
+                # For select_layer != -1, we need to get hidden states
+                # This requires the vision model to output hidden states
+                vit_embeds = self.vision_model(pixel_values=pixel_values)
+                # Note: In NVIDIA's implementation, they access hidden_states[select_layer]
+                # For now, we use the last hidden state as the base implementation
+
+            vit_embeds = self.feature_compression(vit_embeds)
         return vit_embeds
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -330,6 +355,12 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 # print(f"DEBUG: Loading weight {name}")
                 weight_loader(param, loaded_weight)
+
+    def pad_input_ids(
+        self, input_ids: list[int], mm_inputs: MultimodalInputs
+    ) -> list[int]:
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
 
 # Register the model for automatic discovery
