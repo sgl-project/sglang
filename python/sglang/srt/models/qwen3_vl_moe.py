@@ -22,10 +22,6 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_rank,
-)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
