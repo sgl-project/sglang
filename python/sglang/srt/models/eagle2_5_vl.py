@@ -15,10 +15,8 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.activations import ACT2FN
 
 from sglang.srt.configs.eagle2_5_vl import Eagle2_5_VLConfig
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -35,43 +33,6 @@ from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
-
-
-class Eagle2_5_VLVisionMLP(nn.Module):
-    """MLP for projecting vision features to language space."""
-
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features: int = None,
-        out_features: int = None,
-        hidden_act: str = "gelu_pytorch_tanh",
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-
-        self.fc1 = ColumnParallelLinear(
-            in_features,
-            hidden_features,
-            quant_config=quant_config,
-            prefix=add_prefix("fc1", prefix),
-        )
-        self.act = ACT2FN[hidden_act]
-        self.fc2 = RowParallelLinear(
-            hidden_features,
-            out_features,
-            quant_config=quant_config,
-            prefix=add_prefix("fc2", prefix),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_parallel, _ = self.fc1(x)
-        x_parallel = self.act(x_parallel)
-        x, _ = self.fc2(x_parallel)
-        return x
 
 
 class Eagle2_5_VLForConditionalGeneration(nn.Module):
