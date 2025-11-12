@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     apply_module_patch,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_npu,
@@ -118,9 +119,9 @@ def npu_fused_experts(
     row_idx_len = num_tokens * top_k
     row_idx = (
         torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-        .view(top_k, -1)
-        .permute(1, 0)
-        .contiguous()
+            .view(top_k, -1)
+            .permute(1, 0)
+            .contiguous()
     )
     hidden_states, expanded_row_idx, expanded_expert_idx = (
         torch_npu.npu_moe_init_routing(
@@ -1001,16 +1002,69 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
-    def release_weight_cache(self, weight):
+    def release_weight_cache(self, weight: torch.Tensor):
         # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
         origin_weight = weight.data.transpose(1, 2)
         new_weight = origin_weight.contiguous()
         origin_weight.untyped_storage().resize_(0)
-        return Parameter(new_weight, requires_grad=False)
+        return new_weight
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = self.release_weight_cache(layer.w13_weight.data)
-        layer.w2_weight = self.release_weight_cache(layer.w2_weight.data)
+    def permute_weight(self, w: torch.Tensor, tile_n: int):
+        *dims, n = w.shape
+        order = list(range(len(dims))) + [-2, -3, -1]
+        return (
+            w.reshape(*dims, 2, n // tile_n, tile_n // 2).permute(order).reshape(*dims, n).contiguous()
+        )
+
+    def reshape_w13_weight(self, weight: torch.Tensor, dim: int):
+        # Achieving greater computing power through reshape on Ascend.
+        original_shape = weight.shape
+        if dim < 0:
+            dim += len(original_shape)
+
+        weight = weight.view(
+            *original_shape[:dim], 2, -1, 64, *original_shape[dim + 1:]
+        )
+        weight = weight.transpose(dim, dim + 1).contiguous()
+        weight = weight.view(*original_shape[:dim], -1, *original_shape[dim + 1:])
+
+        return weight.contiguous()
+
+    def process_weight_with_fused_deepep(self, layer: torch.nn.Module) -> None:
+        w13 = self.release_weight_cache(layer.w13_weight)
+        torch_npu.npu_format_cast_(w13, 2)
+        cpu_w13 = w13.cpu()
+        w13 = self.reshape_w13_weight(cpu_w13, -1).npu()
+        torch_npu.npu_format_cast_(w13, 29)
+        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+
+        w2 = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
+        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+
+        w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
+        w13_scale = self.permute_weight(w13_scale, 128)
+        layer.w13_weight_scale = torch.nn.Parameter(w13_scale.to(torch.float32), requires_grad=False)
+
+        w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
+        layer.w2_weight_scale = torch.nn.Parameter(w2_scale.to(torch.float32), requires_grad=False)
+
+        if hasattr(layer, "w13_weight_offset"):
+            layer.w13_weight_offset = torch.nn.Parameter(
+                layer.w13_weight_offset.data.squeeze(-1).contiguous(),
+                requires_grad=False,
+            )
+        if hasattr(layer, "w2_weight_offset"):
+            layer.w2_weight_offset = torch.nn.Parameter(
+                layer.w2_weight_offset.data.squeeze(-1).contiguous(),
+                requires_grad=False,
+            )
+
+    def process_weight_common(self, layer: torch.nn.Module) -> None:
+        weight_data = self.release_weight_cache(layer.w13_weight.data)
+        layer.w13_weight = Parameter(weight_data, requires_grad=False)
+
+        weight_data = self.release_weight_cache(layer.w2_weight.data)
+        layer.w2_weight = Parameter(weight_data, requires_grad=False)
 
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32), requires_grad=False
@@ -1024,6 +1078,20 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_offset = Parameter(
             layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
         )
+
+        if get_bool_env_var("ENABLE_ASCEND_MOE_NZ"):
+            layer.w13_weight.data = torch_npu.npu_format_cast(
+                layer.w13_weight.data, 29
+            )
+            layer.w2_weight.data = torch_npu.npu_format_cast(
+                layer.w2_weight.data, 29
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if get_bool_env_var("ENABLE_ASCEND_FUSED_DEEPEP"):
+            self.process_weight_with_fused_deepep(layer)
+        else:
+            self.process_weight_common(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
