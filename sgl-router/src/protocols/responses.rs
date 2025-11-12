@@ -12,6 +12,7 @@ use super::common::{
     default_model, default_true, ChatLogProbs, Function, GenerationRequest, PromptTokenUsageInfo,
     StringOrArray, ToolChoice, UsageInfo,
 };
+use super::sampling_params::{validate_top_k_value, validate_top_p_value};
 use crate::protocols::builders::ResponsesResponseBuilder;
 
 // ============================================================================
@@ -483,6 +484,7 @@ pub struct ResponsesRequest {
     pub include: Option<Vec<IncludeField>>,
 
     /// Input content - can be string or structured items
+    #[validate(custom(function = "validate_response_input"))]
     pub input: ResponseInput,
 
     /// System instructions for the model
@@ -491,10 +493,12 @@ pub struct ResponsesRequest {
 
     /// Maximum number of output tokens
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
     pub max_output_tokens: Option<u32>,
 
     /// Maximum number of tool calls
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
     pub max_tool_calls: Option<u32>,
 
     /// Additional metadata
@@ -539,6 +543,7 @@ pub struct ResponsesRequest {
         default = "default_temperature",
         skip_serializing_if = "Option::is_none"
     )]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
 
     /// Tool choice behavior
@@ -547,14 +552,17 @@ pub struct ResponsesRequest {
 
     /// Available tools
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_response_tools"))]
     pub tools: Option<Vec<ResponseTool>>,
 
     /// Number of top logprobs to return
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0, max = 20))]
     pub top_logprobs: Option<u32>,
 
     /// Top-p sampling parameter
     #[serde(default = "default_top_p", skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
     /// Truncation behavior
@@ -563,6 +571,7 @@ pub struct ResponsesRequest {
 
     /// Text format for structured outputs (text, json_object, json_schema)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_text_format"))]
     pub text: Option<TextConfig>,
 
     /// User identifier
@@ -579,26 +588,32 @@ pub struct ResponsesRequest {
 
     /// Frequency penalty
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
 
     /// Presence penalty
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
 
     /// Stop sequences
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_stop"))]
     pub stop: Option<StringOrArray>,
 
     /// Top-k sampling parameter (SGLang extension)
     #[serde(default = "default_top_k")]
+    #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: i32,
 
     /// Min-p sampling parameter (SGLang extension)
     #[serde(default)]
+    #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: f32,
 
     /// Repetition penalty (SGLang extension)
     #[serde(default = "default_repetition_penalty")]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: f32,
 }
 
@@ -826,6 +841,143 @@ fn validate_responses_cross_parameters(
         }
     }
 
+    Ok(())
+}
+
+// ============================================================================
+// Field-Level Validation Functions
+// ============================================================================
+
+/// Validates stop sequences (max 4, non-empty strings)
+fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
+    match stop {
+        StringOrArray::String(s) => {
+            if s.is_empty() {
+                return Err(validator::ValidationError::new(
+                    "stop sequences cannot be empty",
+                ));
+            }
+        }
+        StringOrArray::Array(arr) => {
+            if arr.len() > 4 {
+                return Err(validator::ValidationError::new(
+                    "maximum 4 stop sequences allowed",
+                ));
+            }
+            for s in arr {
+                if s.is_empty() {
+                    return Err(validator::ValidationError::new(
+                        "stop sequences cannot be empty",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates response input is not empty and has valid content
+fn validate_response_input(input: &ResponseInput) -> Result<(), validator::ValidationError> {
+    match input {
+        ResponseInput::Text(text) => {
+            if text.is_empty() {
+                let mut e = validator::ValidationError::new("input_text_empty");
+                e.message = Some("Input text cannot be empty".into());
+                return Err(e);
+            }
+        }
+        ResponseInput::Items(items) => {
+            if items.is_empty() {
+                let mut e = validator::ValidationError::new("input_items_empty");
+                e.message = Some("Input items cannot be empty".into());
+                return Err(e);
+            }
+            // Validate each item has valid content
+            for item in items {
+                validate_input_item(item)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates individual input items have valid content
+fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), validator::ValidationError> {
+    match item {
+        ResponseInputOutputItem::Message { content, .. } => {
+            if content.is_empty() {
+                let mut e = validator::ValidationError::new("message_content_empty");
+                e.message = Some("Message content cannot be empty".into());
+                return Err(e);
+            }
+        }
+        ResponseInputOutputItem::SimpleInputMessage { content, .. } => {
+            match content {
+                StringOrContentParts::String(s) if s.is_empty() => {
+                    let mut e = validator::ValidationError::new("message_content_empty");
+                    e.message = Some("Message content cannot be empty".into());
+                    return Err(e);
+                }
+                StringOrContentParts::Array(parts) if parts.is_empty() => {
+                    let mut e = validator::ValidationError::new("message_content_empty");
+                    e.message = Some("Message content parts cannot be empty".into());
+                    return Err(e);
+                }
+                _ => {}
+            }
+        }
+        ResponseInputOutputItem::Reasoning { content, .. } => {
+            if content.is_empty() {
+                let mut e = validator::ValidationError::new("reasoning_content_empty");
+                e.message = Some("Reasoning content cannot be empty".into());
+                return Err(e);
+            }
+        }
+        ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
+            if output.is_empty() {
+                let mut e = validator::ValidationError::new("function_output_empty");
+                e.message = Some("Function call output cannot be empty".into());
+                return Err(e);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validates ResponseTool structure based on tool type
+fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), validator::ValidationError> {
+    for tool in tools {
+        match tool.r#type {
+            ResponseToolType::Function => {
+                if tool.function.is_none() {
+                    let mut e = validator::ValidationError::new("function_tool_missing_function");
+                    e.message = Some("Function tool must have a function definition".into());
+                    return Err(e);
+                }
+            }
+            ResponseToolType::Mcp => {
+                if tool.server_url.is_none() {
+                    let mut e = validator::ValidationError::new("mcp_tool_missing_server_url");
+                    e.message = Some("MCP tool must have a server_url".into());
+                    return Err(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Validates text format configuration (JSON schema name cannot be empty)
+fn validate_text_format(text: &TextConfig) -> Result<(), validator::ValidationError> {
+    if let Some(TextFormat::JsonSchema { name, .. }) = &text.format {
+        if name.is_empty() {
+            let mut e = validator::ValidationError::new("json_schema_name_empty");
+            e.message = Some("JSON schema name cannot be empty".into());
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
