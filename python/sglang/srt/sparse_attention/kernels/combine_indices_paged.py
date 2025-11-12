@@ -176,6 +176,7 @@ def combine_indices(
     req_to_token: torch.Tensor,  # [max_bs, max_seq_len]
     page_table: torch.Tensor,  # [max_bs, max_seq_len] or [max_bs, num_kv_heads, max_pages]
     seq_lens: torch.Tensor,  # [cur_bs]
+    new_seq_lens: torch.Tensor,  # [cur_bs]
     diff: torch.Tensor,  # [cur_bs]
     num_sink_pages: int,
     num_local_pages: int,
@@ -187,7 +188,6 @@ def combine_indices(
     _, num_kv_heads, cache_len = retrived_cache_indices.shape
     _, _, max_pages = page_table.shape
     max_bs, max_seq_len = req_to_token.shape
-    new_seq_lens = torch.empty(cur_bs, dtype=torch.int32, device=seq_lens.device)
     
     grid = (cur_bs * num_kv_heads,)
     
@@ -215,5 +215,5 @@ def combine_indices(
         budget_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-    return new_seq_lens
+    return new_seq_lens[:cur_bs]
 

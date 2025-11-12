@@ -347,7 +347,7 @@ class FlashAttentionBackend(AttentionBackend):
                 page_size=self.page_size,
                 retrive_budget_per_seq=model_runner.server_args.sparse_token_budget,
                 device=model_runner.device,
-                async_retrive=True,
+                async_retrive=False,
                 req_to_token=model_runner.req_to_token_pool.req_to_token,
                 max_seq_len=self.max_context_len,
                 stream_budget=(128, 256),

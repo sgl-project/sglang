@@ -72,23 +72,23 @@ class RetriveQuery:
             config.max_bs, device=config.device, dtype=torch.int32
         )
         # for quest
-        # self.proxy_k_tensor = torch.zeros(
-        #     size=(
-        #         config.keys[0].shape[0] // config.page_size,
-        #         2,
-        #         config.head_num,
-        #         config.head_dim,
-        #     ),
-        #     device=config.device,
-        #     dtype=config.q_dtype,
-        # )
+        self.proxy_k_tensor = torch.zeros(
+            size=(
+                config.keys[0].shape[0] // config.page_size,
+                2,
+                config.head_num,
+                config.head_dim,
+            ),
+            device=config.device,
+            dtype=config.q_dtype,
+        )
 
         # for average
-        self.proxy_k_tensor = torch.zeros(
-            size=(config.keys[0].shape[0]//config.page_size, 1, config.head_num, config.head_dim),
-            device=config.device,
-            dtype=config.q_dtype
-        )
+        # self.proxy_k_tensor = torch.zeros(
+        #     size=(config.keys[0].shape[0]//config.page_size, 1, config.head_num, config.head_dim),
+        #     device=config.device,
+        #     dtype=config.q_dtype
+        # )
 
         self.count_steps = torch.zeros(
             config.max_bs,
@@ -140,7 +140,11 @@ class RetriveResult:
             dtype=torch.int32,
             device=config.device,
         )
-
+        self.sparse_seq_lens = torch.zeros(
+            config.max_bs,
+            dtype=torch.int32,
+            device=config.device,
+        )
         self.retrived_cache_indices_page = torch.full(
             (config.max_bs, config.head_num, config.top_k),
             -1,
@@ -199,7 +203,7 @@ class CacheManager:
     def __init__(self, config: ManagerConfig):
         self.config = config
 
-        self.stream = torch.cuda.Stream()
+        self.stream = torch.cuda.Stream(priority=-5)
         self.start_retrive_event = [
             torch.cuda.Event(external=True) for _ in range(self.config.num_layers)
         ]
@@ -243,7 +247,6 @@ class CacheManager:
         seq_lens: torch.Tensor,
         layer_id: int,
     ):
-
         bs = req_pool_indices.shape[0]
         pre_bs = self.retrived_query[layer_id].bs
         moving_average_update(self.retrived_query[layer_id].query[:bs], query[:bs], 
@@ -280,7 +283,19 @@ class CacheManager:
         self.loop.start()
 
     def _retrive_one_layer(self, query: RetriveQuery, result: RetriveResult):
-        with self.stream:
+        if self.config.async_retrive:
+            with self.stream:
+                self._retrive_cache_indices(
+                    query=query,
+                    req_to_token=self.config.req_to_token,
+                    top_k=self.config.top_k,
+                )
+                result.copy_from(
+                    req_pool_indices=query.req_pool_indices,
+                    seq_lens=query.seq_lens,
+                    retrived_cache_indices_page=query.selected_page_indices,
+                )
+        else:
             self._retrive_cache_indices(
                 query=query,
                 req_to_token=self.config.req_to_token,
@@ -305,4 +320,4 @@ class CacheManager:
                         self.retrived_query[layer_id],
                         self.retrived_result[layer_id],
                     )
-                time.sleep(0.001)
+            time.sleep(0.00001)

@@ -11,16 +11,16 @@ from sglang.srt.sparse_attention.cache_manager.cache_manager import (
     RetriveQuery,
 )
 
-from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_average import compute_average_score as compute_score
-from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_average import proxy_k_tensor_decode, proxy_k_tensor_extend
+# from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_average import compute_average_score as compute_score
+# from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_average import proxy_k_tensor_decode, proxy_k_tensor_extend
 from sglang.srt.sparse_attention.kernels.combine_indices_paged import combine_indices
-# from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_quest import (
-#     compute_quest_score as compute_score,
-# )
-# from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_quest import (
-#     proxy_k_tensor_decode,
-#     proxy_k_tensor_extend,
-# )
+from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_quest import (
+    compute_quest_score as compute_score,
+)
+from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_quest import (
+    proxy_k_tensor_decode,
+    proxy_k_tensor_extend,
+)
 from sglang.srt.sparse_attention.kernels.score_copy import score_copy
 
 if TYPE_CHECKING:
@@ -165,41 +165,25 @@ class NaiveDecodeSparseRetriver:
         req_to_token: torch.Tensor,
         top_k: int,
     ):
-
-        # token_indices = req_to_token[query.req_pool_indices, :]
-        # strided_indices = torch.arange(
-        #     0,
-        #     token_indices.shape[1],
-        #     self.cache_manager.config.page_size,
-        #     device=token_indices.device,
-        # )
-        # kv_pages_per_seq = (
-        #     token_indices[:, strided_indices] // self.cache_manager.config.page_size
-        # )
         kv_pages_num_per_seq = (
             query.seq_lens + self.cache_manager.config.page_size - 1
         ) // self.cache_manager.config.page_size
-        bs = query.query.shape[0]
+        bs = query.bs
 
         compute_score(
-            q=query.query,
+            q=query.query[:bs],
             k=query.proxy_k_tensor,
             out=query.score[:bs, :, :query.max_num_pages],
-            #kv_pages_per_seq=kv_pages_per_seq,
             req_to_token=req_to_token,
-            req_pool_indices=query.req_pool_indices,
-            kv_pages_num_per_seq=kv_pages_num_per_seq,
+            req_pool_indices=query.req_pool_indices[:bs],
+            kv_pages_num_per_seq=kv_pages_num_per_seq[:bs],
             num_sink_pages=self.stream_budget[0] // self.cache_manager.config.page_size,
             num_local_pages=self.stream_budget[1]
             // self.cache_manager.config.page_size,
             page_size=self.cache_manager.config.page_size
         )
-        #print(query.score[0, 0, 10: 50])
         _, topk_indices = torch.topk(query.score[:bs, :, :query.max_num_pages], k=top_k, dim=2, sorted=False)
-        #print(topk_indices[0, 0, :])
-        score_copy(topk_indices, req_to_token, query.req_pool_indices, bs, self.cache_manager.config.page_size)
-        # print(topk_indices[0, 0, :])
-        # print('=====')
+        score_copy(topk_indices, req_to_token, query.req_pool_indices[:bs], bs, self.cache_manager.config.page_size)
         query.selected_page_indices[:bs, :, :] = topk_indices
 
     def _call_after_update_query(
@@ -224,22 +208,6 @@ class NaiveDecodeSparseRetriver:
             proxy_k_tensor=proxy_k_tensor,
         )
 
-    def _combine_indices(
-        self,
-        retrived_cache_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        bs = seq_lens.shape[0]
-        num_heads = retrived_cache_indices.shape[1]
-        stream_len = self.stream_indices_page.shape[1]
-        stream_indices_expanded = self.stream_indices_page.unsqueeze(1).expand(
-            bs, num_heads, stream_len
-        )
-        combined_page_indices = torch.cat(
-            [retrived_cache_indices[:bs], stream_indices_expanded], dim=2
-        ).reshape(bs * num_heads, self.cache_manager.config.top_k + stream_len)
-        return combined_page_indices
-
     def _combine_indices_async(
         self,
         retrive_result: RetriveResult,
@@ -258,6 +226,7 @@ class NaiveDecodeSparseRetriver:
             req_to_token=req_to_token,
             page_table=retrive_result.page_table,
             seq_lens=seq_lens,
+            new_seq_lens=retrive_result.sparse_seq_lens,
             diff=diff,
             num_sink_pages=num_sink_pages,
             num_local_pages=num_local_pages,
