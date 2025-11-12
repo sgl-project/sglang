@@ -689,6 +689,48 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
+    def post_process(self,
+        inputs_embeds, 
+        modalities: List[Modality], 
+        embeddings: List[torch.Tensor], 
+        masks: List[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        deepstack_embeddings = []
+        new_embeddings = []
+        for i, modality, embedding, mask in zip(
+            range(len(embeddings)), modalities, embeddings, masks
+        ):
+            if self.use_deepstack.get(modality, False):
+                embedding, deepstack_embedding = self.separate_deepstack_embeds(embedding)
+                new_embeddings += [embedding]
+                deepstack_embeddings += [deepstack_embedding]
+            else:
+                new_embeddings += [embedding]
+
+        num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+        deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
+            inputs_embeds.shape[-1] * num_deepstack_embeddings,
+        )
+        input_deepstack_embeds = torch.zeros(
+            deepstack_embedding_shape,
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+        for i, modality, embedding, mask in zip(
+            range(len(embeddings)), modalities, embeddings, masks
+        ):  
+            if mask is None:
+                continue
+            indices = torch.where(mask.squeeze(dim=-1))[0]
+            if self.use_deepstack.get(modality, None):
+                input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                
+        forward_batch.input_deepstack_embeds = input_deepstack_embeds
+        return new_embeddings
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -731,13 +773,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        hidden_states = general_mm_embed_routine(
+        inputs_embeds = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.model,
             multimodal_model=self,
             positions=positions,
-            use_deepstack=self.use_deepstack,
+            skip_llm_forward=True,
+        )
+
+        hidden_states = self.model(
+            input_ids=None,
+            forward_batch=forward_batch,
+            input_embeds=inputs_embeds,
+            positions=positions,
+            input_deepstack_embeds=forward_batch.input_deepstack_embeds,
         )
 
         if not get_embedding:
