@@ -12,17 +12,20 @@
 # limitations under the License.
 # ==============================================================================
 
+import itertools
+import math
+from typing import Literal
+
 import torch
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
-from typing import Literal
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
-import math
-import itertools
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
-
 
 _is_cuda = is_cuda()
 
@@ -249,7 +252,9 @@ def run_dp_sharded_mrope_vision_model(
     else:
         if pixel_values_local.shape[0] > 0:
             # print(f"{local_grid_thw_list = }", flush=True)
-            image_embeds_local = vision_model(pixel_values_local, torch.tensor(local_grid_thw_list))
+            image_embeds_local = vision_model(
+                pixel_values_local, torch.tensor(local_grid_thw_list)
+            )
         else:
             # Handle empty case
             image_embeds_local = torch.empty(
@@ -322,4 +327,3 @@ def run_dp_sharded_mrope_vision_model(
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings
-

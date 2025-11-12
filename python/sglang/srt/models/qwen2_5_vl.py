@@ -40,6 +40,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -59,15 +63,9 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import permute_inv
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.models.utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.models.utils import permute_inv, run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +82,9 @@ class Qwen2_5_VLMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size() if not use_data_parallel else 1
+        self.tp_size = (
+            get_tensor_model_parallel_world_size() if not use_data_parallel else 1
+        )
         self.tp_rank = get_tensor_model_parallel_rank() if not use_data_parallel else 0
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
@@ -560,7 +560,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d")
+                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+            )
         else:
             image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
