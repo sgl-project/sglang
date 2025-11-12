@@ -276,7 +276,7 @@ class RotaryEmbedding(CustomOp):
         if (
             _is_cuda
             and (self.head_size in [64, 128, 256, 512])
-            #and self.dtype != torch.float32
+            # and self.dtype != torch.float32
         ):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
