@@ -345,7 +345,10 @@ class Indexer(CustomOp):
         k_scale_list = []
         ks_list = []
         ke_list = []
-        offset = 0
+
+        q_offset = 0
+        k_offset = 0
+
         seq_lens_expanded = metadata.get_seqlens_expanded()
         block_tables = metadata.get_page_table_64()
 
@@ -368,13 +371,17 @@ class Indexer(CustomOp):
                 block_tables[i],
             )
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
-            ks = torch.full((extend_seq_len,), offset, dtype=torch.int32, device="cuda")
-            ke = ks + seq_lens_expanded[offset : offset + extend_seq_len]
+            ks = torch.full(
+                (extend_seq_len,), k_offset, dtype=torch.int32, device="cuda"
+            )
+            ke = ks + seq_lens_expanded[q_offset : q_offset + extend_seq_len]
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
             ks_list.append(ks)
             ke_list.append(ke)
-            offset += extend_seq_len
+
+            q_offset += extend_seq_len
+            k_offset += seq_len
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
@@ -382,21 +389,38 @@ class Indexer(CustomOp):
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
 
+        # Suppose there are two requests, with extend_seq_len = [3, 2]
+        # and seq_lens = [10, 4]
+        # The logits matrix looks like this, with * representing the valid logits
+        # and - representing the invalid logits:
+        #
+        #  ********--|----
+        #  *********-|----
+        #  **********|----
+        #  ----------|***-
+        #  ----------|****
+        #
+        # ks = [0, 0, 0, 10, 10]
+        # ke = [8, 9, 10, 13, 14]
+
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8[:offset],
+            q_fp8[:q_offset],
             kv_fp8,
-            weights[:offset],
+            weights[:q_offset],
             ks,
             ke,
             clean_logits=False,
         )
+
         token_nums, _, _ = q_fp8.shape
         assert logits.shape[0] == len(seq_lens_expanded)
-        raw_topk_result = metadata.topk_transform(logits, self.index_topk)
+        assert logits.shape[1] == k_offset
+
+        raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
         )
-        topk_result[:offset] = raw_topk_result
+        topk_result[:q_offset] = raw_topk_result
         return topk_result
 
     def _forward_cuda_k_only(

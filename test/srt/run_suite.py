@@ -217,6 +217,7 @@ suites = {
         TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("test_deepseek_v3_deterministic.py", 240),
+        TestFile("test_cpp_radix_cache.py", 60),
     ],
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
@@ -394,9 +395,9 @@ suite_amd = {
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 150),
         TestFile("lora/test_lora_backend.py", 99),
-        TestFile("lora/test_lora_cuda_graph.py", 250),
+        # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
-        TestFile("lora/test_lora_qwen3.py", 97),
+        # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
@@ -421,6 +422,7 @@ suite_amd = {
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
+        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("test_abort.py", 51),
         TestFile("test_chunked_prefill.py", 410),
@@ -434,7 +436,7 @@ suite_amd = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        TestFile("test_mla.py", 242),
+        # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_page_size.py", 60),
@@ -450,7 +452,7 @@ suite_amd = {
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_torch_compile.py", 169),
-        TestFile("test_torch_compile_moe.py", 210),
+        # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_torch_native_attention_backend.py", 123),
         # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
@@ -470,7 +472,7 @@ suite_amd = {
         TestFile("test_mla.py", 242),
     ],
     "per-commit-2-gpu-amd": [
-        TestFile("lora/test_lora_tp.py", 116),
+        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),

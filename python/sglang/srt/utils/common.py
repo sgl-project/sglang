@@ -69,6 +69,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from urllib.parse import urlparse
 
 import numpy as np
 import orjson
@@ -945,7 +946,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif os.path.isfile(video_file):
+            # `urlparse` supports file:// paths, and so does VideoReader
+            elif os.path.isfile(urlparse(video_file).path):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
