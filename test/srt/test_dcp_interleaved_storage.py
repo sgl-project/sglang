@@ -401,7 +401,7 @@ class TestDCPInterleavedStorage(unittest.TestCase):
                            f"Rank {rank} should allocate {expected_count} tokens")
 
             # Verify: All allocated indices are unique
-            allocated_indices = indices[indices > 0]
+            allocated_indices = indices[indices >= 0]
             self.assertEqual(len(allocated_indices), expected_count)
             self.assertEqual(len(torch.unique(allocated_indices)), expected_count,
                            f"Rank {rank} allocated indices should be unique")
@@ -470,7 +470,7 @@ class TestDCPInterleavedStorage(unittest.TestCase):
                                    f"Rank {rank}, position {pos} should be placeholder")
 
             # Verify: All allocated indices are unique
-            allocated_indices = indices[indices > 0]
+            allocated_indices = indices[indices >= 0]
             self.assertEqual(len(allocated_indices), expected_count)
             self.assertEqual(len(torch.unique(allocated_indices)), expected_count,
                            f"Rank {rank} allocated indices should be unique")
@@ -532,7 +532,7 @@ class TestDCPInterleavedStorage(unittest.TestCase):
                                    f"Rank {rank}, request {i}, position {token_pos} should be placeholder")
 
             # Verify: All allocated indices are unique
-            allocated_indices = indices[indices > 0]
+            allocated_indices = indices[indices >= 0]
             self.assertEqual(len(allocated_indices), expected_count)
             if expected_count > 0:
                 self.assertEqual(len(torch.unique(allocated_indices)), expected_count,
@@ -586,7 +586,7 @@ class TestDCPInterleavedStorage(unittest.TestCase):
 
         # Count tokens allocated for rank 0 in extend
         extend_rank_0_count = sum(1 for pos in range(prefix_len, seq_len) if pos % 4 == 0)
-        extend_allocated = indices_extend[indices_extend > 0]
+        extend_allocated = indices_extend[indices_extend >= 0]
         self.assertEqual(len(extend_allocated), extend_rank_0_count)
 
         # Second: decode with batch
@@ -610,7 +610,7 @@ class TestDCPInterleavedStorage(unittest.TestCase):
 
         # Count tokens allocated for rank 0 in decode
         decode_rank_0_count = sum(1 for s in seq_lens_decode if (s - 1) % 4 == 0)
-        decode_allocated = indices_decode[indices_decode > 0]
+        decode_allocated = indices_decode[indices_decode >= 0]
         self.assertEqual(len(decode_allocated), decode_rank_0_count)
 
         # Verify: All indices are unique across extend and decode
