@@ -99,13 +99,15 @@ def resolve_seqlens(
     device: torch.device,
 ) -> torch.Tensor:
     if cu_seqlens is None:
-        cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=device)
+        resolved_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=device)
     elif isinstance(cu_seqlens, SingletonCache):
         if cu_seqlens.empty():
             cu_seqlens.set_data(_get_cu_seqlens_for_shape(bsz, seq_len, device=device))
-        cu_seqlens = cu_seqlens.get_data()
-    assert isinstance(cu_seqlens, torch.Tensor), "cu_seqlens must be a torch.Tensor"
-    return cu_seqlens
+        resolved_seqlens = cu_seqlens.get_data()
+    else:
+        resolved_seqlens = cu_seqlens
+    assert isinstance(resolved_seqlens, torch.Tensor), "cu_seqlens must be a torch.Tensor"
+    return resolved_seqlens
 
 
 class VisionSdpaAttention(nn.Module):
