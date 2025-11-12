@@ -6,10 +6,8 @@ from typing import List, Union
 from PIL import Image
 
 from sglang.srt.models.points_v15_chat import POINTSV15ChatModel
-from sglang.srt.multimodal.processors.qwen_vl import (
-    QwenVLImageProcessor,
-    resize_image_async,
-)
+from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+from sglang.srt.multimodal.processors.qwen_vl_video_worker import resize_image_async
 
 
 class POINTSV15ChatProcessor(QwenVLImageProcessor):
