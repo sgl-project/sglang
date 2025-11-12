@@ -67,6 +67,7 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
 )
+from sglang.srt.managers.mm_utils import multimodal_preprocess_routine
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     compute_initial_expert_location_metadata,
@@ -2106,11 +2107,19 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self.is_multimodal:
+            forward_batch = multimodal_preprocess_routine(
+                forward_batch=forward_batch,
+                multimodal_model=self.model,
+            )
+            assert forward_batch.input_embeds is not None, "input_embeds is required"
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
-            kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+            kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16() 
+            # should we convert to bfloat16?
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
@@ -2209,7 +2218,7 @@ class ModelRunner:
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
-
+        
         if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,

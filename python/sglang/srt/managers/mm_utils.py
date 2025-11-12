@@ -792,3 +792,65 @@ def hash_feature(f):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
         return tensor_hash([reconstruct_t])
     return data_hash(f)
+
+def multimodal_preprocess_routine(
+    forward_batch: ForwardBatch,
+    multimodal_model: Optional[nn.Module] = None,
+    data_embedding_funcs: Dict[
+        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
+    ] = None,
+) -> torch.Tensor:
+    """
+    Process multimodal inputs and forward through language model.
+
+    Args:
+        input_ids: Input token IDs tensor
+        forward_batch: Batch information for model forward pass
+        language_model: Base language model to use
+        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
+        **kwargs: Additional arguments passed to language model
+
+    Returns:
+        Hidden states from language model forward pass
+    """
+    language_model = multimodal_model.model
+
+    assert hasattr(language_model, "get_input_embeddings")
+    embed_tokens = language_model.get_input_embeddings()
+    input_ids = forward_batch.input_ids
+    if (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
+        and forward_batch.contains_mm_inputs()
+    ):
+        mm_inputs_list = [
+            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+        ]
+        extend_prefix_lens = [
+            prefix_len
+            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        extend_seq_lens = [
+            seq_len
+            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        inputs_embeds = embed_mm_inputs(
+            forward_batch=forward_batch,
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=forward_batch.input_ids,
+            multimodal_model=multimodal_model,
+            input_embedding=embed_tokens,
+            data_embedding_func_mapping=data_embedding_funcs,
+        )
+        # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+        # just being defensive here
+        forward_batch.mm_inputs = None
+    else:
+        inputs_embeds = embed_tokens(input_ids)
+
+    forward_batch.input_embeds = inputs_embeds
+    return forward_batch

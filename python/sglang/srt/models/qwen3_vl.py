@@ -746,6 +746,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds = None,
         get_embedding: bool = False,
     ):
         """Run forward pass for Qwen3-VL.
@@ -773,19 +774,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        inputs_embeds = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            skip_llm_forward=True,
-        )
+        if input_embeds is None:
+            input_embeds = self.get_input_embeddings()(input_ids)
 
         hidden_states = self.model(
             input_ids=None,
             forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             positions=positions,
             input_deepstack_embeds=forward_batch.input_deepstack_embeds,
         )
