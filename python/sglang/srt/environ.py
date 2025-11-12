@@ -262,6 +262,9 @@ class Envs:
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
+    # Enforce using Greedy Verification in NGram speculative decoding
+    SGLANG_ENFORCE_NGRAM_GREEDY_VERIFY = EnvBool(False)
+
     # VLM
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")

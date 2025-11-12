@@ -8,6 +8,8 @@ import torch
 import triton
 
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.environ import envs
+
 
 logger = logging.getLogger(__name__)
 
@@ -418,12 +420,11 @@ class NgramVerifyInput(SpecInput):
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             self._greedy_verify(batch, logits_output)
         else:
-            # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
-            logger.warning(
-                "Currently Ngram speculative sampling forces to use greedy verification."
-            )
-            self._greedy_verify(batch, logits_output)
-            # self._sampling_verify(batch, logits_output, sampling_info)
+            if envs.SGLANG_ENFORCE_NGRAM_GREEDY_VERIFY.get():
+                # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
+                self._greedy_verify(batch, logits_output)
+            else:
+                self._sampling_verify(batch, logits_output, sampling_info)
 
         self._fill_requests(batch, logits_output)
 
