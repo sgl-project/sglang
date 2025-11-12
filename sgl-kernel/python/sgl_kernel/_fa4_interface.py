@@ -1,7 +1,7 @@
 # Adapted from https://github.com/sgl-project/sgl-flash-attn/blob/98861d54940726354df9cd91943b0ed986e0d37b/flash_attn/cute/interface.py
 
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.3.0.dev0
+# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0
 
 # Supported features:
 # - BF16 & FP16 dtype
@@ -11,7 +11,6 @@
 # - (hdim_qk, hdim_v) = (192, 128) for Blackwell (i.e. DeepSeek shape)
 # - varlen
 # - sliding window
-# - bwd pass for Ampere (will also run on Hopper/Blackwell, but will be slow)
 
 # Features not supported yet:
 # - split (i.e. FlashDecoding)
@@ -19,7 +18,6 @@
 # - paged KV
 # - append KV to existing KV cache
 # - FP8
-# - bwd pass optimized for Hopper/Blackwell
 
 
 import copy
@@ -211,7 +209,6 @@ def _flash_attn_fwd(
         if cu_seqlens_q is None
         else (num_head, total_q)
     )
-    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
 
     if out is None:
         out = torch.empty(
@@ -237,7 +234,7 @@ def _flash_attn_fwd(
     if lse is None:
         lse = (
             torch.empty(lse_shape, dtype=torch.float32, device=device)
-            if requires_grad or return_lse
+            if return_lse
             else None
         )
     elif lse is not None:
@@ -584,30 +581,11 @@ def _flash_attn_fwd(
         cute_aux_tensors,
     )
     if is_split_kv:
-        # lse_partial shape: (num_splits, batch, nheads, seqlen) or (num_splits, nheads, total_q)
-        # lse shape: (batch, nheads, seqlen) or (nheads, total_q)
-        # Combine expects: (num_splits, batch, seqlen, nheads) or (num_splits, total_q, nheads)
-        if cu_seqlens_q is None:
-            # Regular batched: transpose nheads and seqlen dimensions
-            lse_partial_combined = lse_partial.transpose(
-                2, 3
-            )  # (num_splits, batch, seqlen, nheads)
-            lse_combined = (
-                lse.transpose(1, 2) if lse is not None else None
-            )  # (batch, seqlen, nheads)
-        else:
-            # Varlen: transpose nheads and total_q dimensions
-            lse_partial_combined = lse_partial.transpose(
-                1, 2
-            )  # (num_splits, total_q, nheads)
-            lse_combined = (
-                lse.transpose(0, 1) if lse is not None else None
-            )  # (total_q, nheads)
         _flash_attn_fwd_combine(
             out_partial,
-            lse_partial_combined,
+            lse_partial.transpose(-1, -2),
             out,
-            lse_combined,
+            lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
         )
