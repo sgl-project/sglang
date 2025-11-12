@@ -59,7 +59,8 @@ impl ReasoningParser for MiniMaxParser {
             text.to_string()
         };
 
-        self.base.parse_reasoning_streaming_incremental(&modified_text)
+        self.base
+            .parse_reasoning_streaming_incremental(&modified_text)
     }
 
     fn reset(&mut self) {
