@@ -82,7 +82,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_norm_rope import split_qkv_norm_rope
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -404,8 +404,8 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
-        self.rotary_emb.get_cos_sin_with_position(positions, layer_id=self.layer_id)
-        q, k, v = split_qkv_norm_rope(
+        self.rotary_emb.get_cos_sin_with_position(positions, layer_id=self.attn.layer_id)
+        q, k, v = split_qkv_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,

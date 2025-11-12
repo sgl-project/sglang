@@ -150,6 +150,16 @@ class DeepEPMoE(FusedMoE):
                 hidden_states,
                 topk_output,
             )
+        if self.deepep_mode.is_low_latency() and get_bool_env_var("ENABLE_ASCEND_FUSED_DEEPEP"):
+            return self.forward_npu_fused_deepep(
+                hidden_states,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                self.w13_weight,
+                self.w13_weight_scale,
+                self.w2_weight,
+                self.w2_weight_scale,
+            )
 
         # TODO: can we call super().forward here?
         dispatch_output = self.dispatcher.dispatch(
@@ -305,6 +315,26 @@ class DeepEPMoE(FusedMoE):
         return self.quant_method.apply_deepep_ll(
             layer=self,
             dispatch_output=dispatch_output,
+        )
+
+    def forward_npu_fused_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        gmm1_permuted_weight: torch.Tensor,
+        gmm1_permuted_weight_scale: torch.Tensor,
+        gmm2_weight: torch.Tensor,
+        gmm2_weight_scale: torch.Tensor,
+    ):
+        return self.dispatcher.fused_moe(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            gmm1_permuted_weight=gmm1_permuted_weight,
+            gmm1_permuted_weight_scale=gmm1_permuted_weight_scale,
+            gmm2_weight=gmm2_weight,
+            gmm2_weight_scale=gmm2_weight_scale,
         )
 
     def forward_npu(
