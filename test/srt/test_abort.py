@@ -185,7 +185,7 @@ class TestAbortAllWithRetraction(CustomTestCase):
                     if len(future.result()["output_ids"]) > 0:
                         abort_in_queue_with_none_empty_text += 1
             assert abort_in_queue_count > 0
-            assert abort_in_queue_with_none_empty_text > 0
+            assert abort_in_queue_with_none_empty_text>0
             print("Finished test_abort_all_with_retraction")
 
 
