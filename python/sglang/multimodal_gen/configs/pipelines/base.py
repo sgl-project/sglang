@@ -28,6 +28,8 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 
+# NOTE: possible duplication with DataType, WorkloadType
+# this may focus on the model's original ability
 class ModelTaskType(Enum):
     I2V = auto()  # Image to Video
     T2V = auto()  # Text to Video

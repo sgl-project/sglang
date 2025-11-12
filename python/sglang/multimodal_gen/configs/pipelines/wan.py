@@ -37,6 +37,7 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 class WanT2V480PConfig(PipelineConfig):
     """Base configuration for Wan T2V 1.3B pipeline architecture."""
 
+    task_type: ModelTaskType = ModelTaskType.T2V
     # WanConfig-specific parameters with defaults
     # DiT
     dit_config: DiTConfig = field(default_factory=WanVideoConfig)
