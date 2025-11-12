@@ -24,7 +24,7 @@ use crate::{
     app_context::AppContext,
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        DPAwareWorkerBuilder, HealthConfig, Worker, WorkerType,
+        DPAwareWorkerBuilder, HealthConfig, RuntimeType, Worker, WorkerType,
     },
     protocols::worker_spec::WorkerConfigRequest,
     routers::grpc::client::GrpcClient,
@@ -229,10 +229,11 @@ async fn do_fetch_grpc_metadata(
 ///
 /// If runtime_type is specified, uses the appropriate client (SGLang or vLLM).
 /// If not specified, tries SGLang first, then falls back to vLLM.
+/// Returns (labels, detected_runtime_type)
 async fn fetch_grpc_metadata(
     url: &str,
     runtime_type: Option<&str>,
-) -> Result<HashMap<String, String>, String> {
+) -> Result<(HashMap<String, String>, String), String> {
     let grpc_url = if url.starts_with("grpc://") {
         url.to_string()
     } else {
@@ -240,22 +241,26 @@ async fn fetch_grpc_metadata(
     };
 
     match runtime_type {
-        Some(runtime) => do_fetch_grpc_metadata(&grpc_url, runtime).await,
+        Some(runtime) => {
+            let labels = do_fetch_grpc_metadata(&grpc_url, runtime).await?;
+            Ok((labels, runtime.to_string()))
+        }
         None => {
             // Runtime not specified: Try SGLang first, then vLLM as fallback
             if let Ok(labels) = do_fetch_grpc_metadata(&grpc_url, "sglang").await {
-                return Ok(labels);
+                return Ok((labels, "sglang".to_string()));
             }
 
             // Try vLLM as fallback
-            do_fetch_grpc_metadata(&grpc_url, "vllm")
+            let labels = do_fetch_grpc_metadata(&grpc_url, "vllm")
                 .await
                 .map_err(|e| {
                     format!(
                         "Failed to fetch gRPC metadata (tried both SGLang and vLLM): {}",
                         e
                     )
-                })
+                })?;
+            Ok((labels, "vllm".to_string()))
         }
     }
 }
@@ -338,7 +343,7 @@ impl StepExecutor for DiscoverMetadataStep {
             config.url, *connection_mode
         );
 
-        let discovered_labels = match connection_mode.as_ref() {
+        let (discovered_labels, detected_runtime) = match connection_mode.as_ref() {
             ConnectionMode::Http => {
                 match get_server_info(&config.url, config.api_key.as_deref()).await {
                     Ok(server_info) => {
@@ -348,19 +353,21 @@ impl StepExecutor for DiscoverMetadataStep {
                                 labels.insert("model_path".to_string(), model_path);
                             }
                         }
-                        Ok(labels)
+                        Ok((labels, None))
                     }
                     Err(e) => Err(e),
                 }
             }
             ConnectionMode::Grpc { .. } => {
                 let runtime_type = config.runtime.as_deref();
-                fetch_grpc_metadata(&config.url, runtime_type).await
+                fetch_grpc_metadata(&config.url, runtime_type)
+                    .await
+                    .map(|(labels, runtime)| (labels, Some(runtime)))
             }
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);
-            HashMap::new()
+            (HashMap::new(), None)
         });
 
         debug!(
@@ -369,8 +376,12 @@ impl StepExecutor for DiscoverMetadataStep {
             config.url
         );
 
-        // Store discovered labels in context
+        // Store discovered labels and detected runtime in context
         context.set("discovered_labels", discovered_labels);
+        if let Some(runtime) = detected_runtime {
+            debug!("Detected runtime type: {}", runtime);
+            context.set("detected_runtime_type", runtime);
+        }
 
         Ok(StepResult::Success)
     }
@@ -520,6 +531,26 @@ impl StepExecutor for CreateWorkerStep {
             })
             .unwrap_or(WorkerType::Regular);
 
+        // Get detected runtime type (for gRPC workers)
+        let runtime_type = if matches!(connection_mode.as_ref(), ConnectionMode::Grpc { .. }) {
+            // Try to get detected runtime from context, fall back to config, or default to sglang
+            if let Some(detected_runtime) = context.get::<String>("detected_runtime_type") {
+                match detected_runtime.as_str() {
+                    "vllm" => RuntimeType::Vllm,
+                    _ => RuntimeType::Sglang,
+                }
+            } else if let Some(ref runtime) = config.runtime {
+                match runtime.as_str() {
+                    "vllm" => RuntimeType::Vllm,
+                    _ => RuntimeType::Sglang,
+                }
+            } else {
+                RuntimeType::Sglang
+            }
+        } else {
+            RuntimeType::Sglang // Default for HTTP workers
+        };
+
         // Build circuit breaker config
         let circuit_breaker_config = {
             let cfg = app_context.router_config.effective_circuit_breaker_config();
@@ -585,6 +616,7 @@ impl StepExecutor for CreateWorkerStep {
                     DPAwareWorkerBuilder::new(normalized_url.clone(), rank, dp_info.dp_size)
                         .worker_type(worker_type.clone())
                         .connection_mode(connection_mode.as_ref().clone())
+                        .runtime_type(runtime_type.clone())
                         .circuit_breaker_config(circuit_breaker_config.clone())
                         .health_config(health_config.clone());
 
@@ -619,6 +651,7 @@ impl StepExecutor for CreateWorkerStep {
             let mut builder = BasicWorkerBuilder::new(normalized_url.clone())
                 .worker_type(worker_type)
                 .connection_mode(connection_mode.as_ref().clone())
+                .runtime_type(runtime_type)
                 .circuit_breaker_config(circuit_breaker_config)
                 .health_config(health_config);
 
