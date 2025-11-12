@@ -2117,7 +2117,7 @@ class ModelRunner:
             print(f"{forward_batch.input_embeds.shape=}")
             print(f"{forward_batch.input_deepstack_embeds.shape=}")
             print(f"right!!!!!!")
-            
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2256,6 +2256,7 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            forward_batch.input_deepstack_embeds = None
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:

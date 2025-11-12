@@ -259,7 +259,7 @@ class PiecewiseCudaGraphRunner:
                 global_num_tokens_for_logprob_gpu=None,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
-                mrope_positions=torch.zeros((3, num_tokens), dtype=torch.int64) if self.use_mrope else None,
+                mrope_positions=torch.zeros((3, num_tokens), dtype=torch.int64),
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
