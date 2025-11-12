@@ -65,6 +65,7 @@ if _is_cuda or _is_xpu:
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
         rmsnorm,
+        turbomind_rms_norm,
     )
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
@@ -126,6 +127,9 @@ class RMSNorm(CustomOp):
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
+        if x.dim() == 2 and x.stride(0) <= 128:
+            turbomind_rms_norm(x, self.weight.data, self.variance_epsilon)
+            return x
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
 
@@ -262,6 +266,9 @@ class RMSNorm(CustomOp):
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
+        if x.dim() == 2 and x.stride(0) <= 128:
+            turbomind_rms_norm(x, self.weight.data, self.variance_epsilon)
+            return x
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
 
