@@ -18,7 +18,6 @@ jobs:
   nightly-test-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 4-gpu-b200
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -36,7 +35,6 @@ jobs:
   nightly-test-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-b200
-    continue-on-error: true
     env:
       RUNNER_LABELS: 8-gpu-b200
     steps:
@@ -84,7 +82,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v32
 
   check-all-jobs:
-    if: always()
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
     needs:
       - nightly-test-4-gpu-b200
       - nightly-test-8-gpu-b200
