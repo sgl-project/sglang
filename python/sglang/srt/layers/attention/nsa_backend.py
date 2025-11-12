@@ -339,7 +339,17 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         page_table_1_flattened = None
         topk_indices_offset = None
-        self.set_nsa_prefill_impl(forward_batch)
+
+        # First decide MHA vs MLA, then MLA implementation
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            will_use_mha = self.should_use_mha(forward_batch)
+        else:
+            will_use_mha = False  # Decode/verify use MLA
+
+        # Set MLA implementation only if needed
+        if not will_use_mha:
+            self.set_nsa_prefill_impl(forward_batch)
+
         topk_transform_method = self.get_topk_transform_method()
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -455,11 +465,13 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ]
             )
 
-            # Generate page_table_1_flattened when needed:
-            # Use flag set by deepseek_v2.py to avoid duplicating dispatch logic
-            mha_dequantize_needed = getattr(
-                forward_batch, "using_mha_one_shot_fp8_dequant", False
+            # Check if MHA with FP8 needs page_table_1_flattened for dequantization
+            mha_dequantize_needed = (
+                will_use_mha
+                and forward_batch.token_to_kv_pool.dtype == torch.float8_e4m3fn
             )
+            forward_batch.using_mha_one_shot_fp8_dequant = mha_dequantize_needed
+
             if (
                 topk_transform_method == TopkTransformMethod.RAGGED
                 or mha_dequantize_needed
@@ -1381,6 +1393,51 @@ class NativeSparseAttnBackend(AttentionBackend):
             else:
                 # bf16 kv cache
                 NSA_PREFILL_IMPL = "flashmla_sparse"
+
+    def should_use_mha(self, forward_batch: ForwardBatch, attn_layer=None) -> bool:
+        """
+        Decide whether to use MHA_ONE_SHOT or MLA for this batch.
+
+        Returns True if MHA_ONE_SHOT should be used (short sequences on H200/B200).
+        Called in init_forward_metadata and cached for reuse.
+        """
+        # Use cached result if available
+        if hasattr(forward_batch, "_should_use_mha_cached"):
+            return forward_batch._should_use_mha
+
+        # Compute and cache decision
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            decision = self._should_use_mha_impl(forward_batch, attn_layer)
+        else:
+            decision = False  # Decode/verify always use MLA
+
+        forward_batch._should_use_mha = decision
+        forward_batch._should_use_mha_cached = True
+        return decision
+
+    def _should_use_mha_impl(
+        self, forward_batch: ForwardBatch, attn_layer=None
+    ) -> bool:
+        """Check if sequence meets criteria for MHA_ONE_SHOT."""
+        from sglang.srt.utils import get_device_sm
+
+        assert forward_batch.seq_lens_cpu is not None
+        max_kv_len = forward_batch.seq_lens_cpu.max().item()
+        sum_seq_lens = sum(forward_batch.seq_lens_cpu)
+
+        # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+        device_sm = get_device_sm()
+        index_topk = (
+            self.nsa_index_topk if attn_layer is None else attn_layer.indexer.index_topk
+        )
+
+        return (
+            device_sm in [90, 100]  # H200/B200 only
+            and max_kv_len <= index_topk  # Short enough for MHA
+            and forward_batch.token_to_kv_pool.dtype
+            in [torch.bfloat16, torch.float8_e4m3fn]
+            and sum_seq_lens <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
+        )
 
     def get_topk_transform_method(self) -> TopkTransformMethod:
         """
