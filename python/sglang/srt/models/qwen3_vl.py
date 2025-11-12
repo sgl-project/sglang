@@ -699,17 +699,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         deepstack_embeddings = []
         new_embeddings = []
-        for i, modality, embedding, mask in zip(
-            range(len(embeddings)), modalities, embeddings, masks
-        ):
-            if self.use_deepstack.get(modality, False):
-                embedding, deepstack_embedding = self.separate_deepstack_embeds(
-                    embedding
-                )
-                new_embeddings += [embedding]
-                deepstack_embeddings += [deepstack_embedding]
-            else:
-                new_embeddings += [embedding]
 
         num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
@@ -720,16 +709,23 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             device=inputs_embeds.device,
             dtype=inputs_embeds.dtype,
         )
-        for i, modality, embedding, mask in zip(
-            range(len(embeddings)), modalities, embeddings, masks
+
+        for i, (modality, embedding, mask) in enumerate(
+            zip(modalities, embeddings, masks)
         ):
-            if mask is None:
+            if embedding is None or mask is None:
                 continue
-            indices = torch.where(mask.squeeze(dim=-1))[0]
-            if self.use_deepstack.get(modality, None):
-                input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                    inputs_embeds.device, inputs_embeds.dtype
+            if self.use_deepstack.get(modality, False):
+                embedding, deepstack_embedding = self.separate_deepstack_embeds(
+                    embedding
                 )
+                if mask is not None:
+                    indices = torch.where(mask.squeeze(dim=-1))[0]
+                    input_deepstack_embeds[indices] = deepstack_embedding.to(
+                        inputs_embeds.device, inputs_embeds.dtype
+                    )
+
+            new_embeddings.append(embedding)
 
         forward_batch.input_deepstack_embeds = input_deepstack_embeds
         return new_embeddings
