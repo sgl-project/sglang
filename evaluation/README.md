@@ -64,8 +64,7 @@
         2>&1 | tee log.server.log &
     ```
 
-Or if you want to use the PTPC FP8 model, you can change the `model` argument. Due to w8a8fp8 kernel scale limitations, the `chunked-prefill-size` and `max-prefill-tokens` argument must be restricted to 32k in the command like this:
-
+    Or if you want to use the PTPC FP8 model, you can change the `model` argument. Due to w8a8fp8 kernel scale limitations, the `chunked-prefill-size` and `max-prefill-tokens` argument must be restricted to 32k in the command like this:
     ```
     bash launch_deepseekr1_fp8.sh
     ```
