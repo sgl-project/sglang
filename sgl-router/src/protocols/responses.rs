@@ -914,22 +914,7 @@ fn validate_responses_cross_parameters(
         return Err(e);
     }
 
-    // 4. Validate previous_response_id format
-    if let Some(ref prev_id) = request.previous_response_id {
-        if !prev_id.starts_with("resp_") {
-            let mut e = validator::ValidationError::new("invalid_previous_response_id");
-            e.message = Some(
-                format!(
-                "Invalid 'previous_response_id': '{}'. Expected an ID that begins with 'resp_'.",
-                prev_id
-            )
-                .into(),
-            );
-            return Err(e);
-        }
-    }
-
-    // 5. Validate conversation and previous_response_id are mutually exclusive
+    // 4. Validate conversation and previous_response_id are mutually exclusive
     // NOTE: This validation is moved from router.rs (lines 699-713)
     if request.conversation.is_some() && request.previous_response_id.is_some() {
         let mut e = validator::ValidationError::new("mutually_exclusive_parameters");
@@ -937,7 +922,7 @@ fn validate_responses_cross_parameters(
         return Err(e);
     }
 
-    // 6. Validate input items structure
+    // 5. Validate input items structure
     if let ResponseInput::Items(items) = &request.input {
         // Check for at least one valid input message
         let has_valid_input = items.iter().any(|item| {
@@ -955,7 +940,7 @@ fn validate_responses_cross_parameters(
         }
     }
 
-    // 7. Validate text format conflicts (for future structured output constraints)
+    // 6. Validate text format conflicts (for future structured output constraints)
     // Currently, Responses API doesn't have regex/ebnf like Chat API,
     // but this is here for completeness and future-proofing
 
