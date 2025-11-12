@@ -217,6 +217,7 @@ suites = {
         TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("test_deepseek_v3_deterministic.py", 240),
+        TestFile("test_cpp_radix_cache.py", 60),
     ],
     "nightly-4-gpu-b200": [
         TestFile("test_fp4_moe.py", 300),
@@ -421,6 +422,7 @@ suite_amd = {
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
+        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("test_abort.py", 51),
         TestFile("test_chunked_prefill.py", 410),
