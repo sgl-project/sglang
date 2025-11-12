@@ -66,6 +66,7 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+
 # Define constants
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -383,7 +384,6 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
-    requests_all_greedy: Optional[bool] = True
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
     requests_all_greedy: Optional[bool] = True
@@ -556,7 +556,6 @@ class ServerArgs:
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
-    
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
 

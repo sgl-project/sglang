@@ -29,12 +29,9 @@ import triton.language as tl
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
-
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
-import logging
-logger = logging.getLogger(__name__)
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
@@ -468,11 +465,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
-        # logger.info(f"Allocating {extend_num_tokens} tokens with paged allocator")
-        # logger.info(f"Prefix lens: {prefix_lens}")
-        # logger.info(f"Seq lens: {seq_lens}")
-        # logger.info(f"Last loc: {last_loc}")
-        
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size

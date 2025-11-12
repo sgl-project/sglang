@@ -34,7 +34,6 @@ from sglang.srt.speculative.spec_utils import (
     create_accept_length_filter,
     create_extend_spec_info,
     create_extend_after_decode_spec_info,
-    create_extend_spec_info,
     filter_finished_cache_loc_kernel,
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
