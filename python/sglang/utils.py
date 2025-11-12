@@ -5,8 +5,8 @@ import json
 import logging
 import os
 import random
-import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -14,6 +14,7 @@ import traceback
 import urllib.request
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
@@ -25,7 +26,27 @@ from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
+
+
+def execute_once(func):
+    has_run = None
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        nonlocal has_run
+        if not has_run:
+            func(*args, **kwargs)
+            has_run = True
+
+    return wrapper
+
+
+@execute_once
+def info_once(message: str):
+    logger.info(message)
 
 
 def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
@@ -137,7 +158,15 @@ def http_request(
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            if sys.version_info >= (3, 13):
+                # Python 3.13+: Use SSL context (cafile removed)
+                if verify and isinstance(verify, str):
+                    context = ssl.create_default_context(cafile=verify)
+                else:
+                    context = ssl.create_default_context()
+                resp = urllib.request.urlopen(req, data=data, context=context)
+            else:
+                resp = urllib.request.urlopen(req, data=data, cafile=verify)
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)
@@ -272,17 +301,6 @@ def find_printable_text(text: str):
         return text[: text.rfind(" ") + 1]
 
 
-def graceful_registry(sub_module_name: str):
-    def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
-        if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} receive sigterm")
-
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-
-
 class LazyImport:
     """Lazy import to make `import sglang` run faster."""
 
@@ -340,10 +358,8 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def is_in_ci():
-    from sglang.test.test_utils import is_in_ci
-
-    return is_in_ci()
+def is_in_ci() -> bool:
+    return envs.SGLANG_IS_IN_CI.get()
 
 
 def print_highlight(html_content: str):
@@ -450,7 +466,8 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
+                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
+                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
@@ -464,11 +481,22 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
+        self._fallback_fn = None
+
+    def add_fallback_fn(self, fallback_fn: Callable):
+        self._fallback_fn = fallback_fn
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        self._mapping.extend(other._mapping)
+        return self
 
     def __call__(self, obj: Any):
         for ty, fn in self._mapping:
             if isinstance(obj, ty):
                 return fn(obj)
+
+        if self._fallback_fn is not None:
+            return self._fallback_fn(obj)
         raise ValueError(f"Invalid object: {obj}")
 
 

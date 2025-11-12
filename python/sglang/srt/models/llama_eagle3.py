@@ -19,6 +19,7 @@ from sglang.srt.utils import add_prefix
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
+import copy
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -27,7 +28,7 @@ from transformers import LlamaConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -109,6 +110,16 @@ class LlamaModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+
+        self.is_mrope_enabled = (
+            hasattr(config, "rope_scaling")
+            and config.rope_scaling is not None
+            and "mrope_section" in config.rope_scaling
+        )
+        # fix rope_scaling for qwen2.5-vl
+        if self.is_mrope_enabled:
+            config.rope_scaling["rope_type"] = "default"
+
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -144,9 +155,16 @@ class LlamaModel(nn.Module):
         else:
             embeds = input_embeds
 
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
+
+        # idle batch
+        if hidden_states.shape[0] == 0:
+            return hidden_states, [hidden_states]
 
         residual = None
         hidden_states, residual = self.midlayer(
@@ -185,9 +203,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
+            if config.draft_vocab_size is None:
+                self.load_lm_head_from_target = True
+                config.draft_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
                 config.draft_vocab_size,
                 config.hidden_size,
@@ -195,7 +217,12 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
 
-        self.logits_processor = LogitsProcessor(config)
+        config_ = copy.deepcopy(config)
+        config_.vocab_size = (
+            config_.draft_vocab_size
+        )  # draft logits processor has it's own vocab size
+        self.logits_processor = LogitsProcessor(config_)
+
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 

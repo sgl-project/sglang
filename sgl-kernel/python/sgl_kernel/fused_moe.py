@@ -2,10 +2,13 @@ import functools
 from typing import Optional
 
 import torch
-from sgl_kernel.scalar_type import scalar_types
+from sgl_kernel.elementwise import silu_and_mul
+from sgl_kernel.moe import moe_sum_reduce
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
+    from sgl_kernel.scalar_type import scalar_types
+
     if has_zp:
         assert num_bits == 4
         return scalar_types.uint4
@@ -34,6 +37,7 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -78,6 +82,12 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+    assert (
+        hidden_states.dtype == w1_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
+    assert (
+        hidden_states.dtype == w2_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape
@@ -158,13 +168,13 @@ def fused_marlin_moe(
         size_m=M,
         size_n=2 * N,
         size_k=K,
-        is_full_k=is_k_full,
+        is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
 
-    torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, 2 * N))
+    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -190,16 +200,22 @@ def fused_marlin_moe(
         size_m=M * topk,
         size_n=K,
         size_k=N,
-        is_full_k=is_k_full,
+        is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     ).view(-1, topk, K)
 
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
     output = hidden_states if inplace else torch.empty_like(hidden_states)
-    return torch.sum(
-        intermediate_cache3.view(*intermediate_cache3.shape), dim=1, out=output
+    moe_sum_reduce(
+        intermediate_cache3,
+        output,
+        routed_scaling_factor,
     )
+    return output
 
 
 def fused_marlin_moe_fake(
@@ -219,5 +235,7 @@ def fused_marlin_moe_fake(
     w2_zeros: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
+    inplace: bool = False,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)

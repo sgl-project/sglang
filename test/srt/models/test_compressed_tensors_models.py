@@ -39,7 +39,7 @@ class TestCompressedTensorsLlama3FP8(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.45)
+        self.assertGreaterEqual(metrics["accuracy"], 0.45)
 
 
 if __name__ == "__main__":

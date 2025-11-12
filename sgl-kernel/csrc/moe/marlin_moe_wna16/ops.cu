@@ -23,8 +23,8 @@
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
-#include "core/registration.h"
 #include "kernel.h"
+#include "kernel_marlin.cuh"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \
   static_assert(                                                                         \
@@ -50,8 +50,7 @@ __global__ void permute_cols_kernel(
     int size_m,
     int size_k,
     int top_k) {};
-
-}  // namespace marlin
+}
 
 torch::Tensor moe_wna16_marlin_gemm(
     torch::Tensor& a,

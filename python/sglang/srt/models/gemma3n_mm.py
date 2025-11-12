@@ -1,7 +1,7 @@
 import logging
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
@@ -14,9 +14,7 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -25,6 +23,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
+    Modality,
     MultimodalDataItem,
     MultimodalInputs,
     flatten_nested_list,
@@ -37,6 +36,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +264,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
-        all_pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        all_pixel_values = flatten_nested_list([item.feature for item in items])
         vision_outputs_list = []
 
         for pixel_values_batch in all_pixel_values:
@@ -315,9 +315,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             audio_features (`torch.Tensor`): Audio feature tensor of shape `(num_audios, audio_length, embed_dim)`).
         """
         # Extract audio features and masks from items
-        all_input_features = flatten_nested_list(
-            [item.input_features for item in items]
-        )
+        all_input_features = flatten_nested_list([item.feature for item in items])
         all_input_features_mask = flatten_nested_list(
             [~item.input_features_mask for item in items]
         )  # Note(Xinyuan): reverse the mask according to the HF implementation
@@ -434,8 +432,10 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
-            audio_data_embedding_func=self.get_audio_feature,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+                Modality.AUDIO: self.get_audio_feature,
+            },
             positions=positions,
             per_layer_inputs=per_layer_inputs,
         )
@@ -490,6 +490,44 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+
+    lora_pattern = re.compile(
+        r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self.lora_pattern.match(module_name))
+
+    def get_hidden_dim(self, module_name, layer_idx):
+        # return input_dim, output_dim
+        if module_name == "qkv_proj":
+            return (
+                self.config.hidden_size,
+                self.config.head_dim
+                * (
+                    self.config.num_attention_heads
+                    + self.config.num_key_value_heads * 2
+                ),
+            )
+        elif module_name == "o_proj":
+            return (
+                self.config.head_dim * self.config.num_attention_heads,
+                self.config.hidden_size,
+            )
+        elif module_name == "gate_up_proj":
+            assert len(set(self.config.intermediate_size)) == 1, (
+                "Currently SGLang requires uniform intermediate size for all layers. "
+                "Please file an issue if you need support for non-uniform intermediate sizes."
+            )
+            return self.config.hidden_size, self.config.intermediate_size[0] * 2
+        elif module_name == "down_proj":
+            assert len(set(self.config.intermediate_size)) == 1, (
+                "Currently SGLang requires uniform intermediate size for all layers. "
+                "Please file an issue if you need support for non-uniform intermediate sizes."
+            )
+            return self.config.intermediate_size[0], self.config.hidden_size
+        else:
+            raise NotImplementedError()
 
 
 EntryClass = Gemma3nForConditionalGeneration
