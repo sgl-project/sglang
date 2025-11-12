@@ -7,7 +7,7 @@ use super::{
         WorkerType,
     },
 };
-use crate::grpc_client::SglangSchedulerClient;
+use crate::routers::grpc::client::GrpcClient;
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -19,7 +19,7 @@ pub struct BasicWorkerBuilder {
     labels: HashMap<String, String>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<SglangSchedulerClient>,
+    grpc_client: Option<GrpcClient>,
 }
 
 impl BasicWorkerBuilder {
@@ -102,7 +102,7 @@ impl BasicWorkerBuilder {
     }
 
     /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: SglangSchedulerClient) -> Self {
+    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
         self.grpc_client = Some(client);
         self
     }
@@ -183,7 +183,7 @@ pub struct DPAwareWorkerBuilder {
     labels: HashMap<String, String>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<SglangSchedulerClient>,
+    grpc_client: Option<GrpcClient>,
 }
 
 impl DPAwareWorkerBuilder {
@@ -275,7 +275,7 @@ impl DPAwareWorkerBuilder {
     }
 
     /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: SglangSchedulerClient) -> Self {
+    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
         self.grpc_client = Some(client);
         self
     }

@@ -123,9 +123,9 @@ pub struct VllmEngineClient {
 }
 
 impl VllmEngineClient {
-    /// Create a new client and connect to the scheduler
+    /// Create a new client and connect to the vLLM server
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        debug!("Connecting to vLLM scheduler at {}", endpoint);
+        debug!("Connecting to vLLM gRPC server at {}", endpoint);
 
         // Convert grpc:// to http:// for tonic
         let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpc://") {

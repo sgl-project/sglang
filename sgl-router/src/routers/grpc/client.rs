@@ -5,6 +5,13 @@ use crate::{
     routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoStream},
 };
 
+/// Health check response (common across backends)
+#[derive(Debug, Clone)]
+pub struct HealthCheckResponse {
+    pub healthy: bool,
+    pub message: String,
+}
+
 /// Polymorphic gRPC client that wraps either SGLang or vLLM
 #[derive(Clone)]
 pub enum GrpcClient {
@@ -68,15 +75,23 @@ impl GrpcClient {
     }
 
     /// Perform health check (dispatches to appropriate backend)
-    pub async fn health_check(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn health_check(
+        &self,
+    ) -> Result<HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             Self::Sglang(client) => {
-                client.health_check().await?;
-                Ok(())
+                let resp = client.health_check().await?;
+                Ok(HealthCheckResponse {
+                    healthy: resp.healthy,
+                    message: resp.message,
+                })
             }
             Self::Vllm(client) => {
-                client.health_check().await?;
-                Ok(())
+                let resp = client.health_check().await?;
+                Ok(HealthCheckResponse {
+                    healthy: resp.healthy,
+                    message: resp.message,
+                })
             }
         }
     }
