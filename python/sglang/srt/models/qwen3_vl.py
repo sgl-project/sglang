@@ -694,7 +694,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         inputs_embeds,
         modalities: List[Modality],
         embeddings: List[torch.Tensor],
-        masks: List[torch.Tensor],
+        indices: List[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         deepstack_embeddings = []
@@ -710,18 +710,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             dtype=inputs_embeds.dtype,
         )
 
-        for i, (modality, embedding, mask) in enumerate(
-            zip(modalities, embeddings, masks)
+        for i, (modality, embedding, index) in enumerate(
+            zip(modalities, embeddings, indices)
         ):
-            if embedding is None or mask is None:
+            if embedding is None or index is None:
                 continue
             if self.use_deepstack.get(modality, False):
                 embedding, deepstack_embedding = self.separate_deepstack_embeds(
                     embedding
                 )
-                if mask is not None:
-                    indices = torch.where(mask.squeeze(dim=-1))[0]
-                    input_deepstack_embeds[indices] = deepstack_embedding.to(
+                if index is not None:
+                    input_deepstack_embeds[index] = deepstack_embedding.to(
                         inputs_embeds.device, inputs_embeds.dtype
                     )
 
