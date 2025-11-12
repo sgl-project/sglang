@@ -477,25 +477,22 @@ class CudaGraphRunner:
             )
             torch.cuda.memory._record_memory_history()
 
-        # Trigger CUDA graph capture for specific shapes.
-        # Capture the large shapes first so that the smaller shapes
-        # can reuse the memory pool allocated for the large shapes.
-        decode_stream_groups = []
-        if self.enable_pdmux:
-            set_pdmux_status(False)
-            for stream_group in self.stream_groups:
-                decode_stream_groups.append(stream_group[1])
-        else:
-            decode_stream_groups.append(None)
-        num_stream = len(decode_stream_groups)
-        for stream_idx in range(num_stream):
-            with freeze_gc(
-                self.model_runner.server_args.enable_cudagraph_gc
-            ), graph_capture(
-                stream=decode_stream_groups[stream_idx]
-            ) as graph_capture_context, profile_context as prof:
-                self.stream = graph_capture_context.stream
-                self._capture_one_stream(stream_idx)
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            if not self.enable_pdmux:
+                with graph_capture() as graph_capture_context, profile_context as prof:
+                    self.stream = graph_capture_context.stream
+                    self._capture_one_stream()
+            else:
+                # Trigger CUDA graph capture for specific shapes.
+                # Capture the large shapes first so that the smaller shapes
+                # can reuse the memory pool allocated for the large shapes.
+                set_pdmux_status(False)
+                for i, sg in enumerate(self.stream_groups):
+                    with graph_capture(
+                        stream=sg[1]
+                    ) as graph_capture_context, profile_context as prof:
+                        self.stream = graph_capture_context.stream
+                        self._capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
             torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
@@ -513,7 +510,7 @@ class CudaGraphRunner:
             )
             logger.info(log_message)
 
-    def _capture_one_stream(self, stream_idx: int):
+    def _capture_one_stream(self, stream_idx: Optional[int] = None):
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
             self.model_runner.gpu_id,
@@ -546,13 +543,10 @@ class CudaGraphRunner:
                     graph,
                     output_buffers,
                 ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                if not self.enable_pdmux:
-                    self.graphs[bs] = graph
-                    self.output_buffers[bs] = output_buffers
-                else:
-                    # For pd_multiplexing, we need to save the graph and output buffers
-                    self.graphs[f"{stream_idx}_{bs}"] = graph
-                    self.output_buffers[f"{stream_idx}_{bs}"] = output_buffers
+                # For pd_multiplexing, we need to save the graph and output buffers
+                key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+                self.graphs[key] = graph
+                self.output_buffers[key] = output_buffers
 
                 # Save gemlite cache after each capture
                 save_gemlite_cache()
@@ -574,7 +568,9 @@ class CudaGraphRunner:
     def _create_device_graph(self):
         return torch.cuda.CUDAGraph()
 
-    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int):
+    def capture_one_batch_size(
+        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+    ):
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -648,11 +644,11 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
-        attn_backend = (
-            self.model_runner.decode_attn_backend_group[stream_idx]
-            if self.enable_pdmux
-            else self.model_runner.attn_backend
-        )
+        if stream_idx is None:
+            attn_backend = self.model_runner.attn_backend
+        else:
+            assert self.enable_pdmux
+            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
