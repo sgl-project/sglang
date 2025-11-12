@@ -148,7 +148,10 @@ async fn v1_chat_completions(
     headers: http::HeaderMap,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
-    state.router.route_chat(Some(&headers), &body, Some(&body.model)).await
+    state
+        .router
+        .route_chat(Some(&headers), &body, Some(&body.model))
+        .await
 }
 
 async fn v1_completions(
@@ -167,7 +170,10 @@ async fn rerank(
     headers: http::HeaderMap,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
-    state.router.route_rerank(Some(&headers), &body, Some(&body.model)).await
+    state
+        .router
+        .route_rerank(Some(&headers), &body, Some(&body.model))
+        .await
 }
 
 async fn v1_rerank(

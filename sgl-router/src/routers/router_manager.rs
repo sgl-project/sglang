@@ -393,9 +393,7 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router
-                .route_completion(headers, body, model_id)
-                .await
+            router.route_completion(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -492,9 +490,7 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router
-                .route_embeddings(headers, body, model_id)
-                .await
+            router.route_embeddings(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
