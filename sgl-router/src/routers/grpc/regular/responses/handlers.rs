@@ -108,23 +108,7 @@ pub async fn route_responses(
             .into_response();
     }
 
-    // 2. Validate mutually exclusive parameters
-    if request.previous_response_id.is_some() && request.conversation.is_some() {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "error": {
-                    "message": "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
-                    "type": "invalid_request_error",
-                    "param": serde_json::Value::Null,
-                    "code": "mutually_exclusive_parameters"
-                }
-            })),
-        )
-            .into_response();
-    }
-
-    // 3. Reject background mode (no longer supported)
+    // 2. Reject background mode (no longer supported)
     let is_background = request.background.unwrap_or(false);
     if is_background {
         return (
@@ -141,7 +125,7 @@ pub async fn route_responses(
             .into_response();
     }
 
-    // 4. Route based on execution mode
+    // 3. Route based on execution mode
     let is_streaming = request.stream.unwrap_or(false);
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
