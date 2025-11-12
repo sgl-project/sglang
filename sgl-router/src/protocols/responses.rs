@@ -9,8 +9,8 @@ use validator::Validate;
 
 // Import shared types from common module
 use super::common::{
-    default_model, default_true, ChatLogProbs, Function, GenerationRequest, PromptTokenUsageInfo,
-    StringOrArray, ToolChoice, UsageInfo,
+    default_model, default_true, validate_stop, ChatLogProbs, Function, GenerationRequest,
+    PromptTokenUsageInfo, StringOrArray, ToolChoice, UsageInfo,
 };
 use super::sampling_params::{validate_top_k_value, validate_top_p_value};
 use crate::protocols::builders::ResponsesResponseBuilder;
@@ -924,34 +924,6 @@ fn validate_responses_cross_parameters(
 // ============================================================================
 // Field-Level Validation Functions
 // ============================================================================
-
-/// Validates stop sequences (max 4, non-empty strings)
-fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
-    match stop {
-        StringOrArray::String(s) => {
-            if s.is_empty() {
-                return Err(validator::ValidationError::new(
-                    "stop sequences cannot be empty",
-                ));
-            }
-        }
-        StringOrArray::Array(arr) => {
-            if arr.len() > 4 {
-                return Err(validator::ValidationError::new(
-                    "maximum 4 stop sequences allowed",
-                ));
-            }
-            for s in arr {
-                if s.is_empty() {
-                    return Err(validator::ValidationError::new(
-                        "stop sequences cannot be empty",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
 
 /// Validates response input is not empty and has valid content
 fn validate_response_input(input: &ResponseInput) -> Result<(), validator::ValidationError> {
