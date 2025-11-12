@@ -346,12 +346,12 @@ def _get_precomputed_embedding(
     If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
     """
-    precomputed_embeddings = [item.precomputed_embeddings for item in items]
+    precomputed_embeddings = [
+        item.feature for item in items if item.is_precomputed_embedding()
+    ]
     if any(feature is not None for feature in precomputed_embeddings):
-        if not all(feature is not None for feature in precomputed_embeddings):
-            raise NotImplementedError(
-                "MM inputs where only some items are precomputed."
-            )
+        if len(precomputed_embeddings) != len(items):
+            raise NotImplementedError("Expect none or all mm items to be precomputed.")
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
@@ -678,20 +678,24 @@ def general_mm_embed_routine(
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
-        inputs_embeds, other_info = embed_mm_inputs(
-            mm_inputs_list=mm_inputs_list,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            input_ids=input_ids,
-            multimodal_model=multimodal_model,
-            input_embedding=embed_tokens,
-            data_embedding_func_mapping=data_embedding_funcs,
-            placeholder_tokens=placeholder_tokens,
-            use_deepstack=use_deepstack,
-        )
-        # add for qwen3_vl deepstack
-        if use_deepstack:
-            kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+        try:
+            inputs_embeds, other_info = embed_mm_inputs(
+                mm_inputs_list=mm_inputs_list,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                input_ids=input_ids,
+                multimodal_model=multimodal_model,
+                input_embedding=embed_tokens,
+                data_embedding_func_mapping=data_embedding_funcs,
+                placeholder_tokens=placeholder_tokens,
+                use_deepstack=use_deepstack,
+            )
+            # add for qwen3_vl deepstack
+            if use_deepstack:
+                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+        except Exception as e:
+            inputs_embeds = None
+            logger.error("Error when embedding multimodal inputs", exc_info=True)
         # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
         # just being defensive here
         forward_batch.mm_inputs = None
