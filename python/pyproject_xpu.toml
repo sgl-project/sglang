@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.4"
+version = "0.5.5.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,8 +15,8 @@ classifiers = [
 ]
 
 dependencies = [
-  "torch==2.8.0",
-  "torchaudio==2.8.0",
+  "torch==2.9.0",
+  "torchaudio==2.9.0",
   "torchvision",
   "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
   "IPython",
@@ -63,7 +63,7 @@ dependencies = [
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop",
+  "uvloop==0.21.0",
   # "xgrammar==0.1.24", , xgrammar depends on CUDA PyTorch and Triton only
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py

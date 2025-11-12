@@ -33,7 +33,7 @@ Add [performance optimization options](#performance-optimization-options) as nee
 
 ```bash
 # Installation
-pip install "sglang[all]>=0.5.4"
+pip install "sglang[all]>=0.5.5.post1"
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
@@ -367,6 +367,21 @@ edit your `config.json` and remove the `quantization_config` block. For example:
 ```
 
 Removing this block typically resolves the error. For more details, see the discussion in [sgl-project/sglang#3491](https://github.com/sgl-project/sglang/issues/3491#issuecomment-2650779851).
+
+# Example: Serving with 4 H200 with w4fp8 Quantization
+There are mixed-precision quantization methods where MoE layers are computed using W4(int)A(FP)8 quantization while the dense layers remain in FP8 precision. Users can run these models efficiently on 4xH200 GPUs (or potentially 8xH100 GPUs), as the pre-quantized weights are already available on Hugging Face. Here's an example:
+
+```bash
+python -m sglang.launch_server --model novita/Deepseek-V3-0324-W4AFP8 --mem-fraction-static 0.85 --disable-shared-experts-fusion --tp-size 4
+```
+
+Other variants of pre-quantized DeepSeek models are also available:
+
+- [novita/Deepseek-V3.1-W4AFP8](https://huggingface.co/novita/Deepseek-V3.1-W4AFP8)
+- [novita/Deepseek-R1-0528-W4AFP8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8)
+- [novita/Deepseek-R1-W4AFP8](https://huggingface.co/novita/Deepseek-R1-W4AFP8)
+- [novita/Deepseek-V3-0324-W4AFP8](https://huggingface.co/novita/Deepseek-V3-0324-W4AFP8)
+
 
 ## DeepSeek V3 Optimization Plan
 

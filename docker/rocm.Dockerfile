@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.4 --build-arg GPU_ARCH=gfx942 -t v0.5.4-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.4 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.4-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.4 --build-arg GPU_ARCH=gfx950 -t v0.5.4-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.5.post1-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5.post1 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.5.post1-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.5.post1-rocm700-mi35x -f rocm.Dockerfile .
 
 
 # Default base images
@@ -31,7 +31,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.6.post1"
+ENV AITER_COMMIT="v0.1.6.post3"
 ENV NO_DEPS_FLAG=""
 
 # ===============================
@@ -42,8 +42,8 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.6.post1"
-ENV NO_DEPS_FLAG="--no-deps"
+ENV AITER_COMMIT="v0.1.6.post3"
+ENV NO_DEPS_FLAG=""
 
 # ===============================
 # Chosen arch and args
@@ -67,7 +67,7 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="dcdf1c784b40aa6975a8ed89fe26321b028e40e8"
+ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 
 ARG TILELANG_REPO="https://github.com/HaiShaw/tilelang.git"
 ARG TILELANG_BRANCH="dsv32-mi35x"
@@ -105,12 +105,13 @@ RUN git clone ${AITER_REPO} \
  && git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive
 RUN cd aiter \
+     && if [ "$GPU_ARCH" = "gfx950" ]; then export AITER_MXFP4_MOE_SF=1; fi \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-          HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-          PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         else \
-          GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+          sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         fi
 
 # -----------------------
@@ -156,7 +157,7 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      rm go1.22.2.linux-amd64.tar.gz && \
      mkdir -p build && \
      cd build && \
-     cmake .. -DUSE_ETCD=ON && \
+     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON && \
      make -j "$(nproc)" && make install; \
     fi
 
@@ -295,14 +296,25 @@ RUN python3 -m pip install --no-cache-dir \
 
 # -----------------------
 # Performance environment variable.
+# Set AITER_MXFP4_MOE_SF only for gfx950 architecture
+RUN if [ "$GPU_ARCH" = "gfx950" ]; then \
+        echo "AITER_MXFP4_MOE_SF=1"; \
+    else \
+        echo "AITER_MXFP4_MOE_SF=0"; \
+    fi >> /etc/environment
+
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
-ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-ENV NCCL_MIN_NCHANNELS=112
-
-ENV SGLANG_USE_AITER=1
+ENV SGLANG_INT4_WEIGHT=0
 ENV SGLANG_MOE_PADDING=1
+ENV SGLANG_ROCM_DISABLE_LINEARQUANT=0
+ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
+ENV SGLANG_SET_CPU_AFFINITY=1
+ENV SGLANG_USE_AITER=1
+ENV SGLANG_USE_ROCM700A=1
+
+ENV NCCL_MIN_NCHANNELS=112
 ENV VLLM_FP8_PADDING=1
 ENV VLLM_FP8_ACT_PADDING=1
 ENV VLLM_FP8_WEIGHT_PADDING=1

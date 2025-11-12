@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.4"
+version = "0.5.5.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -61,7 +61,7 @@ dependencies = [
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop",
+  "uvloop==0.21.0",
   "xgrammar==0.1.25",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py

@@ -180,6 +180,14 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
+        # TODO: requires further polishing
+        self.is_image_understandable_model = enable_multimodal and hasattr(
+            self.hf_config, "vision_config"
+        )
+        self.is_audio_understandable_model = enable_multimodal and hasattr(
+            self.hf_config, "audio_config"
+        )
+
         self.is_multimodal_chunked_prefill_supported = (
             enable_multimodal
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
@@ -205,6 +213,14 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
+        # matryoshka embeddings
+        self.matryoshka_dimensions = getattr(
+            self.hf_config, "matryoshka_dimensions", None
+        )
+        self.is_matryoshka = self.matryoshka_dimensions or getattr(
+            self.hf_config, "is_matryoshka", False
+        )
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -226,6 +242,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
+            override_config_file=server_args.decrypted_config_file,
             **kwargs,
         )
 
@@ -358,6 +375,13 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 72
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -582,14 +606,20 @@ class ModelConfig:
             return
 
         # Check if ModelOpt quantization is specified
-        modelopt_quantization_specified = self.quantization in [
+        _MODELOPT_QUANTIZATION_METHODS = [
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
         ]
+        modelopt_quantization_specified = (
+            self.quantization in _MODELOPT_QUANTIZATION_METHODS
+        )
 
         if not modelopt_quantization_specified:
-            raise ValueError("quantize_and_serve requires ModelOpt quantization")
+            raise ValueError(
+                "quantize_and_serve requires ModelOpt quantization (set with --quantization "
+                f"{{{', '.join(sorted(_MODELOPT_QUANTIZATION_METHODS))}}})"
+            )
 
         # quantize_and_serve is disabled due to compatibility issues
         raise NotImplementedError(
@@ -613,6 +643,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "mxfp4",
+            "auto-round",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -634,6 +665,7 @@ class ModelConfig:
             "petit_nvfp4",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
@@ -914,12 +946,13 @@ multimodal_model_archs = [
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
-    "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
+    "NVILAForConditionalGeneration",
+    "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
 ]
 

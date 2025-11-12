@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.4"
+version = "0.5.5.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,7 +26,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.4.1",
+  "flashinfer_python==0.5.0",
+  "flashinfer_cubin==0.5.0",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -38,7 +39,7 @@ dependencies = [
   "numpy",
   "nvidia-cutlass-dsl==4.2.1",
   "openai-harmony==0.0.4",
-  "openai==1.99.1",
+  "openai==2.6.1",
   "orjson",
   "outlines==0.1.11",
   "packaging",
@@ -56,19 +57,19 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.16.post4",
+  "sgl-kernel==0.3.17",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
-  "torch==2.8.0",
   "torch_memory_saver==0.0.9",
-  "torchao==0.9.0",
+  "torch==2.8.0",
   "torchaudio==2.8.0",
   "torchvision",
+  "torchao==0.9.0",
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop",
+  "uvloop==0.21.0",
   "xgrammar==0.1.25",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
@@ -77,7 +78,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-modelopt = ["nvidia-modelopt"]
+checkpoint-engine = ["checkpoint-engine==0.1.2"]
+diffusion = [
+    "diffusers==0.35.2",
+    "yunchang==0.6.3.post1",
+    "opencv-python==4.10.0.84",
+    "imageio==2.36.0",
+    "imageio-ffmpeg==0.5.1",
+    "PyYAML==6.0.1",
+    "moviepy>=2.0.0",
+    "cloudpickle",
+    "remote-pdb",
+    "torchcodec==0.5.0",
+    "st_attn ==0.0.7",
+    "vsa==0.0.4",
+]
+
+[tool.uv.extra-build-dependencies]
+st-attn = ["torch", "setuptools"]
+vsa = ["torch", "setuptools"]
+
 test = [
   "accelerate",
   "expecttest",
@@ -89,21 +109,7 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-checkpoint-engine = ["checkpoint-engine==0.1.2"]
-all = []
 dev = ["sglang[test]"]
-
-# Temporary tags
-cu130 = [
-  "torch==2.9.0",
-  "torchaudio==2.9.0",
-  "torchvision==0.24.0",
-]
-cu130_all = [
-  "sglang[test]",
-  "sglang[decord]",
-  "sglang[cu130]"
-]
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
@@ -111,13 +117,12 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
-# To be deprecated in 2 weeks
-blackwell = ["sglang[dev]"]
-blackwell_aarch64 = ["sglang[dev]"]
-
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
