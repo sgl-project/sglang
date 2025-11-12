@@ -653,6 +653,11 @@ def wait_cmo_stream():
     cur_stream.wait_stream(get_cmo_stream())
 
 
+@lru_cache(maxsize=1)
+def get_device_module():
+    return torch.get_device_module()
+
+
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)
@@ -1357,6 +1362,29 @@ def get_zmq_socket(
             socket.connect(endpoint)
 
         return socket
+
+
+def get_zmq_socket_on_host(
+    context: zmq.Context,
+    socket_type: zmq.SocketType,
+    host: Optional[str] = None,
+) -> Tuple[int, zmq.Socket]:
+    """Create and configure a ZeroMQ socket.
+
+    Args:
+        context: ZeroMQ context to create the socket from.
+        socket_type: Type of ZeroMQ socket to create.
+        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
+
+    Returns:
+        Tuple of (port, socket) where port is the randomly assigned TCP port.
+    """
+    socket = context.socket(socket_type)
+    # Bind to random TCP port
+    config_socket(socket, socket_type)
+    bind_host = f"tcp://{host}" if host else "tcp://*"
+    port = socket.bind_to_random_port(bind_host)
+    return port, socket
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
