@@ -259,15 +259,15 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   int64_t head_dim = q.size(3);
   int64_t v_num_heads = v.size(2);
   int64_t v_head_dim = v.size(3);
-  CHECK_INPUT_SHAPE_DTYPE<true, false>(k, {seq_len, batch_size, num_heads, head_dim}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<true, false>(v, {seq_len, batch_size, v_num_heads, v_head_dim}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(A_log, {v_num_heads}, at::kFloat);
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(a, {batch_size, v_num_heads}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(dt_bias, {v_num_heads}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(b, {batch_size, v_num_heads}, q.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(initial_state_indices, {batch_size}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(cu_seqlens, {batch_size + 1}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(
+  CHECK_INPUT_SHAPE_DTYPE<true>(k, {seq_len, batch_size, num_heads, head_dim}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(v, {seq_len, batch_size, v_num_heads, v_head_dim}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(A_log, {v_num_heads}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<true>(a, {batch_size, v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(dt_bias, {v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(b, {batch_size, v_num_heads}, q.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(initial_state_indices, {batch_size}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<true>(cu_seqlens, {batch_size + 1}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<true>(
       initial_state_source, {initial_state_source.size(0), v_num_heads, head_dim, v_head_dim}, at::kFloat);
   CHECK(initial_state_source.size(0) >= batch_size);
   CHECK_EQ(v_num_heads % num_heads, 0);
