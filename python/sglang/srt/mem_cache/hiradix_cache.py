@@ -727,6 +727,9 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
+        # EAGLE uses bigram keys in the radix tree
+        new_input_tokens = self.key_convert_fn(new_input_tokens)
+        
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
