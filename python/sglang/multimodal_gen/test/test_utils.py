@@ -247,8 +247,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_cfg_parallel(self):
         """cfg parallel"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_cfg_parallel",
             args="--num-gpus 2 --enable-cfg-parallel",
@@ -258,8 +256,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_usp(self):
         """usp"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_usp",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=2",
@@ -269,8 +265,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_mixed(self):
         """mixed"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_mixed",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=1 --enable-cfg-parallel",

@@ -5,12 +5,22 @@ from typing import Callable
 
 import torch
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_dimensions
+from einops import rearrange
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.base import (
+    ModelTaskType,
+    PipelineConfig,
+    shard_rotary_emb_for_sp,
+)
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
+)
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -102,15 +112,14 @@ class QwenImagePipelineConfig(PipelineConfig):
         return self.vae_config.arch_config.vae_scale_factor
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
-        height = 2 * (
-            batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)
-        )
-        width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        height = 2 * (batch.height // (vae_scale_factor * 2))
+        width = 2 * (batch.width // (vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
-        shape = (batch_size, num_channels_latents, height, width)
+        shape = (batch_size, 1, num_channels_latents, height, width)
         return shape
 
-    def pack_latents(self, latents, batch_size, batch):
+    def maybe_pack_latents(self, latents, batch_size, batch):
         height = 2 * (
             batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)
         )
@@ -119,8 +128,36 @@ class QwenImagePipelineConfig(PipelineConfig):
         # pack latents
         return _pack_latents(latents, batch_size, num_channels_latents, height, width)
 
+    def shard_latents_for_sp(self, batch, latents):
+        # Image latents packed as [B, S, D] -> shard S across SP
+        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+
+        seq_len = latents.shape[1]
+        # Pad to next multiple of SP degree if needed
+        if seq_len % sp_world_size != 0:
+            pad_len = sp_world_size - (seq_len % sp_world_size)
+            pad = torch.zeros(
+                (latents.shape[0], pad_len, latents.shape[2]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=1)
+            # Record padding length for later unpad
+            batch.sp_seq_pad = int(getattr(batch, "sp_seq_pad", 0)) + pad_len
+        sharded_tensor = rearrange(
+            latents, "b (n s) d -> b n s d", n=sp_world_size
+        ).contiguous()
+        sharded_tensor = sharded_tensor[:, rank_in_sp_group, :, :]
+        return sharded_tensor, True
+
+    def gather_latents_for_sp(self, latents):
+        # For image latents [B, S_local, D], gather along sequence dim=1
+        latents = sequence_model_parallel_all_gather(latents, dim=1)
+        return latents
+
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
+        # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
 
         img_cos, img_sin = (
@@ -131,6 +168,7 @@ class QwenImagePipelineConfig(PipelineConfig):
             txt_freqs.real.to(dtype=dtype),
             txt_freqs.imag.to(dtype=dtype),
         )
+
         return (img_cos, img_sin), (txt_cos, txt_sin)
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -147,12 +185,34 @@ class QwenImagePipelineConfig(PipelineConfig):
             ]
         ] * batch_size
         txt_seq_lens = [batch.prompt_embeds[0].shape[1]]
+
+        (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
+            img_shapes, txt_seq_lens, rotary_emb, device, dtype
+        )
+        # Pad image RoPE to make total tokens divisible by SP degree (if enabled)
+        try:
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_sp_world_size,
+            )
+
+            sp_world_size = get_sp_world_size()
+        except Exception:
+            sp_world_size = 1
+        if sp_world_size and sp_world_size > 1:
+            total_tokens = img_cos.shape[0]
+            pad_len = (sp_world_size - (total_tokens % sp_world_size)) % sp_world_size
+            if pad_len > 0:
+                pad_cos = img_cos[-1:, :].repeat(pad_len, 1)
+                pad_sin = img_sin[-1:, :].repeat(pad_len, 1)
+                img_cos = torch.cat([img_cos, pad_cos], dim=0)
+                img_sin = torch.cat([img_sin, pad_sin], dim=0)
+
+        # FIXME: video models handle SP internally in `_forward_cached_from_grid`, while for image models we do this manually
+        img_cos = shard_rotary_emb_for_sp(img_cos)
+        img_sin = shard_rotary_emb_for_sp(img_sin)
         return {
-            "img_shapes": img_shapes,
             "txt_seq_lens": txt_seq_lens,
-            "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device, dtype
-            ),
+            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -170,12 +230,15 @@ class QwenImagePipelineConfig(PipelineConfig):
         ] * batch_size
 
         txt_seq_lens = [batch.negative_prompt_embeds[0].shape[1]]
+
+        (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
+            img_shapes, txt_seq_lens, rotary_emb, device, dtype
+        )
+        img_cos = shard_rotary_emb_for_sp(img_cos)
+        img_sin = shard_rotary_emb_for_sp(img_sin)
         return {
-            "img_shapes": img_shapes,
             "txt_seq_lens": txt_seq_lens,
-            "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device, dtype
-            ),
+            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
         }
 
     def post_denoising_loop(self, latents, batch):
@@ -186,6 +249,11 @@ class QwenImagePipelineConfig(PipelineConfig):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
         height = 2 * (int(batch.height) // (vae_scale_factor * 2))
         width = 2 * (int(batch.width) // (vae_scale_factor * 2))
+
+        # If SP padding was applied, remove extra tokens before reshaping
+        target_tokens = (height // 2) * (width // 2)
+        if latents.shape[1] != target_tokens:
+            latents = latents[:, :target_tokens, :]
 
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
@@ -199,6 +267,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         # TODO: lots of duplications here
         batch_size = batch.latents.shape[0]
+        assert batch_size == 1
         height = batch.height
         width = batch.width
         image = batch.pil_image
@@ -218,12 +287,29 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             ]
         ] * batch_size
         txt_seq_lens = [batch.prompt_embeds[0].shape[1]]
+        (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
+            img_shapes, txt_seq_lens, rotary_emb, device, dtype
+        )
+
+        # perform sp shard on noisy image tokens
+        noisy_img_seq_len = (
+            1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
+        )
+
+        noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
+        noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
+
+        # concat back the img_cos for input image (since it is not sp-shared later)
+        img_cos = torch.cat([noisy_img_cos, img_cos[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+        img_sin = torch.cat([noisy_img_sin, img_sin[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+
         return {
-            "img_shapes": img_shapes,
             "txt_seq_lens": txt_seq_lens,
-            "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device, dtype
-            ),
+            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -248,22 +334,27 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         ] * batch_size
 
         txt_seq_lens = [batch.negative_prompt_embeds[0].shape[1]]
+
+        (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
+            img_shapes, txt_seq_lens, rotary_emb, device, dtype
+        )
+        noisy_img_seq_len = (
+            1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
+        )
+        noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
+        noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
+
+        img_cos = torch.cat([noisy_img_cos, img_cos[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+        img_sin = torch.cat([noisy_img_sin, img_sin[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+
         return {
-            "img_shapes": img_shapes,
             "txt_seq_lens": txt_seq_lens,
-            "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
-                img_shapes, txt_seq_lens, rotary_emb, device, dtype
-            ),
+            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
         }
-
-    def prepare_latent_shape(self, batch, batch_size, num_frames):
-        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
-        height = 2 * (batch.height // (vae_scale_factor * 2))
-
-        width = 2 * (batch.width // (vae_scale_factor * 2))
-        num_channels_latents = self.dit_config.arch_config.in_channels // 4
-        shape = (batch_size, 1, num_channels_latents, height, width)
-        return shape
 
     def preprocess_image(self, image, image_processor):
         image_size = image[0].size if isinstance(image, list) else image.size
@@ -287,5 +378,6 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         return width, height
 
     def slice_noise_pred(self, noise, latents):
+        # remove noise over input image
         noise = noise[:, : latents.size(1)]
         return noise

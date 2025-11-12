@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
+from einops import rearrange
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
@@ -17,10 +18,17 @@ from sglang.multimodal_gen.configs.pipelines.base import (
     ModelTaskType,
     PipelineConfig,
     preprocess_text,
+    shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipelines.hunyuan import (
     clip_postprocess_text,
     clip_preprocess_text,
+)
+from sglang.multimodal_gen.configs.pipelines.qwen_image import _pack_latents
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
 )
 
 
@@ -82,20 +90,38 @@ class FluxPipelineConfig(PipelineConfig):
         shape = (batch_size, num_channels_latents, height, width)
         return shape
 
-    def pack_latents(self, latents, batch_size, batch):
+    def maybe_pack_latents(self, latents, batch_size, batch):
         height = 2 * (
             batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)
         )
         width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        latents = latents.view(
-            batch_size, num_channels_latents, height // 2, 2, width // 2, 2
-        )
-        latents = latents.permute(0, 2, 4, 1, 3, 5)
-        latents = latents.reshape(
-            batch_size, (height // 2) * (width // 2), num_channels_latents * 4
-        )
+        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
+
+    def shard_latents_for_sp(self, batch, latents):
+        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        seq_len = latents.shape[1]
+        # Pad to next multiple of SP degree if needed
+        if seq_len % sp_world_size != 0:
+            pad_len = sp_world_size - (seq_len % sp_world_size)
+            pad = torch.zeros(
+                (latents.shape[0], pad_len, latents.shape[2]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=1)
+            # Record padding length for later unpad
+            batch.sp_seq_pad = int(getattr(batch, "sp_seq_pad", 0)) + pad_len
+        sharded_tensor = rearrange(
+            latents, "b (n s) d -> b n s d", n=sp_world_size
+        ).contiguous()
+        sharded_tensor = sharded_tensor[:, rank_in_sp_group, :, :]
+        return sharded_tensor, True
+
+    def gather_latents_for_sp(self, latents):
+        # For image latents [B, S_local, D], gather along sequence dim=1
+        latents = sequence_model_parallel_all_gather(latents, dim=1)
         return latents
 
     def get_pos_prompt_embeds(self, batch):
@@ -133,10 +159,34 @@ class FluxPipelineConfig(PipelineConfig):
             original_width=width,
             device=device,
         )
-        ids = torch.cat([txt_ids, img_ids], dim=0).to(device=device)
+
         # NOTE(mick): prepare it here, to avoid unnecessary computations
-        freqs_cis = rotary_emb.forward(ids)
-        return freqs_cis
+        img_cos, img_sin = rotary_emb.forward(img_ids)
+        img_cos = shard_rotary_emb_for_sp(img_cos)
+        img_sin = shard_rotary_emb_for_sp(img_sin)
+
+        txt_cos, txt_sin = rotary_emb.forward(txt_ids)
+        # Pad image RoPE to make total tokens divisible by SP degree (if enabled)
+        try:
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_sp_world_size,
+            )
+
+            sp_world_size = get_sp_world_size()
+        except Exception:
+            sp_world_size = 1
+        if sp_world_size and sp_world_size > 1:
+            total_tokens = img_cos.shape[0]
+            pad_len = (sp_world_size - (total_tokens % sp_world_size)) % sp_world_size
+            if pad_len > 0:
+                pad_cos = img_cos[-1:, :].repeat(pad_len, 1)
+                pad_sin = img_sin[-1:, :].repeat(pad_len, 1)
+                img_cos = torch.cat([img_cos, pad_cos], dim=0)
+                img_sin = torch.cat([img_sin, pad_sin], dim=0)
+
+        cos = torch.cat([txt_cos, img_cos], dim=0).to(device=device)
+        sin = torch.cat([txt_sin, img_sin], dim=0).to(device=device)
+        return cos, sin
 
     def post_denoising_loop(self, latents, batch):
         # unpack latents for flux
@@ -147,6 +197,11 @@ class FluxPipelineConfig(PipelineConfig):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
         height = 2 * (int(batch.height) // (vae_scale_factor * 2))
         width = 2 * (int(batch.width) // (vae_scale_factor * 2))
+
+        # If SP padding was applied, remove extra tokens before reshaping
+        target_tokens = (height // 2) * (width // 2)
+        if latents.shape[1] != target_tokens:
+            latents = latents[:, :target_tokens, :]
 
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)

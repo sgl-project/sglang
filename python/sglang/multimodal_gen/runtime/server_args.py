@@ -799,18 +799,6 @@ class ServerArgs:
         return provided_args
 
     def check_server_sp_args(self):
-
-        if self.pipeline_config.task_type.is_image_task():
-            if (
-                (self.sp_degree and self.sp_degree > 1)
-                or (self.ulysses_degree and self.ulysses_degree > 1)
-                or (self.ring_degree and self.ring_degree > 1)
-            ):
-                raise ValueError(
-                    "SP is not supported for image generation models for now"
-                )
-            self.sp_degree = self.ulysses_degree = self.ring_degree = 1
-
         if self.sp_degree == -1:
             # assume we leave all remaining gpus to sp
             num_gpus_per_group = self.dp_size * self.tp_size
