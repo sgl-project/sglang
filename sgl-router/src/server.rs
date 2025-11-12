@@ -136,9 +136,10 @@ async fn generate(
     headers: http::HeaderMap,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
+    let model_id = body.model.as_deref();
     state
         .router
-        .route_generate(Some(&headers), &body, None)
+        .route_generate(Some(&headers), &body, model_id)
         .await
 }
 
@@ -147,7 +148,10 @@ async fn v1_chat_completions(
     headers: http::HeaderMap,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
-    state.router.route_chat(Some(&headers), &body, None).await
+    state
+        .router
+        .route_chat(Some(&headers), &body, Some(&body.model))
+        .await
 }
 
 async fn v1_completions(
@@ -157,7 +161,7 @@ async fn v1_completions(
 ) -> Response {
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion(Some(&headers), &body, Some(&body.model))
         .await
 }
 
@@ -166,7 +170,10 @@ async fn rerank(
     headers: http::HeaderMap,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
-    state.router.route_rerank(Some(&headers), &body, None).await
+    state
+        .router
+        .route_rerank(Some(&headers), &body, Some(&body.model))
+        .await
 }
 
 async fn v1_rerank(
@@ -174,9 +181,10 @@ async fn v1_rerank(
     headers: http::HeaderMap,
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
+    let rerank_body = &body.into();
     state
         .router
-        .route_rerank(Some(&headers), &body.into(), None)
+        .route_rerank(Some(&headers), rerank_body, Some(&rerank_body.model))
         .await
 }
 
@@ -187,7 +195,7 @@ async fn v1_responses(
 ) -> Response {
     state
         .router
-        .route_responses(Some(&headers), &body, None)
+        .route_responses(Some(&headers), &body, Some(&body.model))
         .await
 }
 
@@ -198,7 +206,7 @@ async fn v1_embeddings(
 ) -> Response {
     state
         .router
-        .route_embeddings(Some(&headers), &body, None)
+        .route_embeddings(Some(&headers), &body, Some(&body.model))
         .await
 }
 
@@ -209,7 +217,7 @@ async fn v1_classify(
 ) -> Response {
     state
         .router
-        .route_classify(Some(&headers), &body, None)
+        .route_classify(Some(&headers), &body, Some(&body.model))
         .await
 }
 
