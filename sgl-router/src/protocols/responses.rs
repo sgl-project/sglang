@@ -7,15 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use validator::Validate;
 
-// Import shared types from common module
 use super::{
     common::{
         default_model, default_true, validate_stop, ChatLogProbs, Function, GenerationRequest,
-        PromptTokenUsageInfo, StringOrArray, ToolChoice, ToolChoiceValue, UsageInfo,
+        PromptTokenUsageInfo, StringOrArray, ToolChoice, ToolChoiceValue,ToolReference, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
-use crate::protocols::builders::ResponsesResponseBuilder;
+use crate::protocols::{builders::ResponsesResponseBuilder, validated::Normalizable};
 
 // ============================================================================
 // Response Tools (MCP and others)
@@ -664,7 +663,7 @@ impl Default for ResponsesRequest {
     }
 }
 
-impl crate::protocols::validated::Normalizable for ResponsesRequest {
+impl Normalizable for ResponsesRequest {
     /// Normalize the request by applying defaults:
     /// 1. Apply tool_choice defaults based on tools presence
     /// 2. Apply parallel_tool_calls defaults
@@ -804,8 +803,6 @@ pub fn validate_conversation_id(conv_id: &str) -> Result<(), validator::Validati
 fn validate_responses_cross_parameters(
     request: &ResponsesRequest,
 ) -> Result<(), validator::ValidationError> {
-    use super::common::{ToolChoice, ToolChoiceValue, ToolReference};
-
     // 1. Validate tool_choice requires tools (enhanced)
     if let Some(ref tool_choice) = request.tool_choice {
         let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
@@ -915,7 +912,6 @@ fn validate_responses_cross_parameters(
     }
 
     // 4. Validate conversation and previous_response_id are mutually exclusive
-    // NOTE: This validation is moved from router.rs (lines 699-713)
     if request.conversation.is_some() && request.previous_response_id.is_some() {
         let mut e = validator::ValidationError::new("mutually_exclusive_parameters");
         e.message = Some("Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.".into());
