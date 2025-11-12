@@ -263,19 +263,32 @@ def aiter_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
+    # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
+    # if input_scale not None, input is quanted
+    if input_scale is not None:
+        q_input = input_2d
+        x_scale = input_scale
+
+    else:
+        q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
+
     output = gemm_a8w8_blockscale(
-        q_input, weight, x_scale, weight_scale, dtype=input.dtype
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
 
     if bias is not None:
         output += bias
 
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(
+        dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
+    ).view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(

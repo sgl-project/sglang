@@ -948,7 +948,7 @@ mod tests {
     use super::*;
     use crate::{
         protocols::{
-            chat::{ChatMessage, UserMessageContent},
+            chat::{ChatMessage, MessageContent},
             common::{ContentPart, ImageUrl},
         },
         tokenizer::chat_template::ChatTemplateContentFormat,
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format() {
         let messages = vec![ChatMessage::User {
-            content: UserMessageContent::Parts(vec![
+            content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Hello".to_string(),
                 },
@@ -990,7 +990,7 @@ mod tests {
     #[test]
     fn test_transform_messages_openai_format() {
         let messages = vec![ChatMessage::User {
-            content: UserMessageContent::Parts(vec![
+            content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe this image:".to_string(),
                 },
@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn test_transform_messages_simple_string_content() {
         let messages = vec![ChatMessage::User {
-            content: UserMessageContent::Text("Simple text message".to_string()),
+            content: MessageContent::Text("Simple text message".to_string()),
             name: None,
         }];
 
@@ -1044,11 +1044,11 @@ mod tests {
     fn test_transform_messages_multiple_messages() {
         let messages = vec![
             ChatMessage::System {
-                content: "System prompt".to_string(),
+                content: MessageContent::Text("System prompt".to_string()),
                 name: None,
             },
             ChatMessage::User {
-                content: UserMessageContent::Parts(vec![
+                content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "User message".to_string(),
                     },
@@ -1079,7 +1079,7 @@ mod tests {
     #[test]
     fn test_transform_messages_empty_text_parts() {
         let messages = vec![ChatMessage::User {
-            content: UserMessageContent::Parts(vec![ContentPart::ImageUrl {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
@@ -1101,11 +1101,11 @@ mod tests {
     fn test_transform_messages_mixed_content_types() {
         let messages = vec![
             ChatMessage::User {
-                content: UserMessageContent::Text("Plain text".to_string()),
+                content: MessageContent::Text("Plain text".to_string()),
                 name: None,
             },
             ChatMessage::User {
-                content: UserMessageContent::Parts(vec![
+                content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "With image".to_string(),
                     },
