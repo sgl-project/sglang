@@ -6,7 +6,7 @@ Please refer to [https://github.com/sgl-project/sglang/issues/8833](https://gith
 
 ### Responses API
 
-GPT‑OSS is compatible with the OpenAI Responses API. Use `client.responses.create(...)` with `model`, `instructions`, `input`, and optional `tools` to enable built‑in tool use.
+GPT‑OSS is compatible with the OpenAI Responses API. Use `client.responses.create(...)` with `model`, `instructions`, `input`, and optional `tools` to enable built‑in tool use. You can set reasoning level via `instructions`, e.g., "Reasoning: high" (also supports "medium" and "low") — levels: low (fast), medium (balanced), high (deep).
 
 ### Built-in Tools
 
@@ -23,6 +23,11 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 - Uses the Exa backend for web search.
 - Requires an Exa API key; set `EXA_API_KEY` in your environment. Create a key at `https://exa.ai`.
 
+### Tool & Reasoning Parser
+
+- We support OpenAI Reasoning and Tool Call parser, as well as our SGLang native api for tool call and reasoning. Refer to [reasoning parser](../advanced_features/separate_reasoning.ipynb) and [tool call parser](../advanced_features/function_calling.ipynb) for more details.
+
+
 ## Notes
 
 - Use **Python 3.12** for the demo tools. And install the required `gpt-oss` packages.
@@ -38,7 +43,12 @@ export PYTHON_EXECUTION_BACKEND=UV
 
 Launch the server with the demo tool server:
 
-`python3 -m sglang.launch_server --model-path openai/gpt-oss-120b --tool-server demo --tp 2`
+```bash
+python3 -m sglang.launch_server \
+  --model-path openai/gpt-oss-120b \
+  --tool-server demo \
+  --tp 2
+```
 
 For production usage, sglang can act as an MCP client for multiple services. An [example tool server](https://github.com/openai/gpt-oss/tree/main/gpt-oss-mcp-server) is provided. Start the servers and point sglang to them:
 ```bash
@@ -55,7 +65,7 @@ The URLs should be MCP SSE servers that expose server information and well-docum
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:30323/v1",
+    base_url="http://localhost:30000/v1",
     api_key="sk-123456"
 )
 
@@ -63,6 +73,16 @@ tools = [
     {"type": "code_interpreter"},
     {"type": "web_search_preview"},
 ]
+
+# Reasoning level example
+response = client.responses.create(
+    model="openai/gpt-oss-120b",
+    instructions="You are a helpful assistant."
+    reasoning_effort="high" # Supports high, medium, or low
+    input="In one sentence, explain the transformer architecture.",
+)
+print("====== reasoning: high ======")
+print(response.output_text)
 
 # Test python tool
 response = client.responses.create(

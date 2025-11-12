@@ -1,9 +1,16 @@
 import itertools
+import os
 
 import sgl_kernel
 import torch
 import triton
 import triton.testing
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 def torch_top_k_top_p_joint_sampling_from_probs(
@@ -67,10 +74,16 @@ def calculate_diff(batch_size, vocab_size, p):
     )
 
 
-# parameter space
-batch_size_range = [16, 64, 128]
-vocab_size_range = [111, 32000]
-p_range = [0.1, 0.5]
+# parameter space - simplified for CI
+if IS_CI:
+    batch_size_range = [16]  # Single batch size for CI
+    vocab_size_range = [111]  # Single vocab size for CI
+    p_range = [0.1]  # Single p value for CI
+else:
+    batch_size_range = [16, 64, 128]
+    vocab_size_range = [111, 32000]
+    p_range = [0.1, 0.5]
+
 configs = list(itertools.product(batch_size_range, vocab_size_range, p_range))
 
 
@@ -119,8 +132,14 @@ def benchmark_sampling(batch_size, vocab_size, p, provider):
 
 
 if __name__ == "__main__":
-    # Correctness check
-    for cfg in configs:
+    # Correctness check - simplified for CI
+    if IS_CI:
+        # Only test one configuration in CI
+        test_configs = [configs[0]] if configs else [(16, 111, 0.1)]
+    else:
+        test_configs = configs
+
+    for cfg in test_configs:
         calculate_diff(*cfg)
 
     print("\n" + "=" * 60)
