@@ -589,21 +589,27 @@ def embed_mm_inputs(
     input_ids.clamp_(min=0, max=vocab_size - 1)
     inputs_embeds = input_embedding(input_ids)
 
+    indices = []
+    for mask in masks:
+        if mask is not None:
+            indices.append(torch.where(mask.squeeze(dim=-1))[0])
+        else:
+            indices.append(None)
+
     # only for qwen3vl right now,  replace the original use_deepstack with this method.
     if hasattr(multimodal_model, "post_process"):
         embeddings = multimodal_model.post_process(
-            inputs_embeds, modalities, embeddings, masks, forward_batch
+            inputs_embeds, modalities, embeddings, indices, forward_batch
         )
 
     # 4. scatter embeddings into input embedding
-    for i, modality, embedding, mask in zip(
-        range(len(embeddings)), modalities, embeddings, masks
+    for i, modality, embedding, index in zip(
+        range(len(embeddings)), modalities, embeddings, indices
     ):
-        if embedding is None or mask is None:
+        if embedding is None or index is None:
             continue
         # in-place update
-        indices = torch.where(mask.squeeze(dim=-1))[0]
-        inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds[index] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
 
     return inputs_embeds
 
