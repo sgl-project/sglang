@@ -408,10 +408,9 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        graph_key = cuda_graph_bs
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
-        else:
-            graph_key = cuda_graph_bs
 
         is_bs_supported = (
             graph_key in self.graphs
