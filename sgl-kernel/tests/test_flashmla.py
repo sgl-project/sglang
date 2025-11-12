@@ -488,7 +488,7 @@ def test_flash_mla_decode(
     # Get schedule metadata
     torch.cuda.synchronize()
     tile_scheduler_metadata, num_splits = get_mla_metadata(
-        cache_seqlens, s_q * h_q // h_kv, h_kv, h_q
+        cache_seqlens, s_q * h_q // h_kv, h_kv, h_q, is_fp8, topk
     )
     torch.cuda.synchronize()
 
