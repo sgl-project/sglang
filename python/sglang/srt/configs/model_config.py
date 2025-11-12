@@ -180,6 +180,14 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
+        # TODO: requires further polishing
+        self.is_image_understandable_model = enable_multimodal and hasattr(
+            self.hf_config, "vision_config"
+        )
+        self.is_audio_understandable_model = enable_multimodal and hasattr(
+            self.hf_config, "audio_config"
+        )
+
         self.is_multimodal_chunked_prefill_supported = (
             enable_multimodal
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
@@ -234,6 +242,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
+            override_config_file=server_args.decrypted_config_file,
             **kwargs,
         )
 
@@ -366,6 +375,13 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 72
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
         else:
             if (
                 "MistralModel" in self.hf_config.architectures

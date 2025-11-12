@@ -2,7 +2,6 @@ import json
 import os
 import pickle
 import random
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -424,26 +423,6 @@ def sample_random_requests(
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
-
-
-def gen_prompt(tokenizer, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
-
-
-def get_gen_prefix_cache_path(args, tokenizer):
-    """Create cache directory under ~/.cache/sglang/benchmark"""
-    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
-
-    # Create a unique cache filename based on the generation parameters
-    cache_key = (
-        f"gsp_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
-        f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
-        f"{tokenizer.__class__.__name__}.pkl"
-    )
-    return cache_dir / cache_key
 
 
 def sample_generated_shared_prefix_requests(
