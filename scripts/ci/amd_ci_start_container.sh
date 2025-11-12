@@ -25,7 +25,7 @@ rm -f "$TMP_VERSION_FILE"
 
 
 # Default base tags (can be overridden by command line arguments)
-DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm630-mi30x"
+DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi35x"
 
 # Parse command line arguments
@@ -121,7 +121,7 @@ find_latest_image() {
   if [[ "${gpu_arch}" == "mi35x" ]]; then
     echo "rocm/sgl-dev:v0.5.5-rocm700-mi35x-20251110"
   else
-    echo "rocm/sgl-dev:v0.5.5-rocm630-mi30x-20251110"
+    echo "rocm/sgl-dev:v0.5.5-rocm700-mi30x-20251110"
   fi
 }
 
