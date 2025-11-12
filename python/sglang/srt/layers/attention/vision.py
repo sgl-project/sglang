@@ -350,10 +350,10 @@ class VisionAiterAttention(nn.Module):
             raise Exception("aiter_attn is only available for AMD")
         try:
             from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
-        except ImportError:
-            print(
+        except ImportError as e:
+            raise ImportError(
                 "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-            )
+            ) from e
 
         self.flash_attn_varlen_func = aiter_flash_attn_varlen_func
         super().__init__()
