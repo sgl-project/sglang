@@ -7,9 +7,8 @@ from typing import Optional, Tuple
 import torch
 import triton
 
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.environ import envs
-
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
