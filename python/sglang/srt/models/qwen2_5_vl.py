@@ -84,9 +84,9 @@ class Qwen2_5_VLMLP(nn.Module):
     ):
         super().__init__()
         self.tp_size = (
-            get_tensor_model_parallel_world_size() if not use_data_parallel else 1
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
-        self.tp_rank = get_tensor_model_parallel_rank() if not use_data_parallel else 0
+        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
@@ -226,8 +226,8 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = RMSNorm(context_dim, eps=1e-6)
-        tp_size = get_tensor_model_parallel_world_size() if not use_data_parallel else 1
-        tp_rank = get_tensor_model_parallel_rank() if not use_data_parallel else 0
+        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
