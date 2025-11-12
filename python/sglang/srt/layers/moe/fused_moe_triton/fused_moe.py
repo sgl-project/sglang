@@ -83,6 +83,7 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    down_moe: bool = True,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -112,6 +113,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        down_moe,
     )
 
 
@@ -141,6 +143,7 @@ def inplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    down_moe: bool = True,
 ) -> None:
     pass
 
@@ -180,6 +183,7 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    down_moe: bool = True,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -209,6 +213,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        down_moe=down_moe,
     )
 
 
@@ -239,6 +244,7 @@ def outplace_fused_experts_fake(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    down_moe: bool = True,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -271,6 +277,7 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    down_moe: Optional[bool] = True,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -305,6 +312,7 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            down_moe,
         )
         return hidden_states
     else:
@@ -335,6 +343,7 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            down_moe=down_moe,
         )
 
 
@@ -385,6 +394,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    down_moe: bool = True,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -424,15 +434,21 @@ def fused_experts_impl(
         topk_ids.shape[1],
         config_dtype,
         block_shape=block_shape,
-        return_down_config=True,
+        return_down_config=down_moe,
     )
 
-    config, (down_config, max_block_m) = get_config_func(M)
-    down_moe_use_tma = (
-        _down_moe_use_tma()
-        and down_config is not None
-        and down_config.pop("USE_TMA", False)
-    )
+    if down_moe:
+        config, (down_config, max_block_m) = get_config_func(M)
+        down_moe_use_tma = (
+            _down_moe_use_tma()
+            and down_config is not None
+            and down_config.pop("USE_TMA", False)
+        )
+    else:
+        down_moe_use_tma = None
+        down_config = None
+        max_block_m = None
+        config = get_config_func(M)
     topk = topk_ids.shape[1]
     max_padded_tokens = (
         min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
@@ -477,12 +493,17 @@ def fused_experts_impl(
             # chunk. Note that in most cases we only have one chunk
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
-            config, (down_config, _) = get_config_func(tokens_in_chunk)
-            down_moe_use_tma = (
-                _down_moe_use_tma()
-                and down_config is not None
-                and down_config.pop("USE_TMA", False)
-            )
+            if down_moe:
+                config, (down_config, _) = get_config_func(tokens_in_chunk)
+                down_moe_use_tma = (
+                    _down_moe_use_tma()
+                    and down_config is not None
+                    and down_config.pop("USE_TMA", False)
+                )
+            else:
+                down_moe_use_tma = None
+                down_config = None
+                config = get_config_func(tokens_in_chunk)
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
 
         padded_tokens = (
@@ -669,6 +690,7 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    down_moe: Optional[bool] = True,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -730,4 +752,5 @@ def fused_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        down_moe=down_moe,
     )

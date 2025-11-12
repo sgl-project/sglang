@@ -22,7 +22,7 @@ def get_config_file_name(
     dtype: Optional[str],
     block_shape: Optional[int] = None,
     per_channel_quant: bool = False,
-    down_moe: bool = False,
+    down_moe: bool = True,
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
@@ -42,7 +42,7 @@ def get_moe_configs(
     block_n: Optional[int] = 0,
     block_k: Optional[int] = 0,
     per_channel_quant: bool = False,
-    down_moe: bool = False,
+    down_moe: bool = True,
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.

@@ -47,6 +47,7 @@ def benchmark_config(
     per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
+    down_moe: bool = True,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
@@ -152,6 +153,7 @@ def benchmark_config(
                 a2_scale=a2_scale,
                 per_channel_quant=per_channel_quant,
                 block_shape=block_shape,
+                down_moe=down_moe,
             )
 
     # JIT compilation & warmup
@@ -216,6 +218,7 @@ class BenchmarkWorker:
         use_int8_w8a16: bool,
         per_channel_quant: bool,
         block_shape: List[int],
+        down_moe: bool,
     ) -> Tuple[Dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
         dtype_str = get_config_dtype_str(
@@ -260,6 +263,7 @@ class BenchmarkWorker:
                 use_int8_w8a16,
                 per_channel_quant,
                 block_shape,
+                down_moe=down_moe,
             )
         return config, kernel_time
 
@@ -277,6 +281,7 @@ class BenchmarkWorker:
         per_channel_quant: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
+        down_moe: bool,
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
@@ -297,6 +302,7 @@ class BenchmarkWorker:
                         per_channel_quant,
                         block_shape,
                         num_iters=10,
+                        down_moe=down_moe,
                     )
                 except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     # Some configurations may be invalid and fail to compile.
@@ -324,11 +330,17 @@ def main(args: argparse.Namespace):
     shard_intermediate_size = model_config["shard_intermediate_size"]
     dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
+    # TODO(yingchun): it's tricky, should read from model config directly, but now the info is missing
+    if model_config["architecture"] in [
+        "HybridSWACompressedForCausalLM",
+    ]:
+        block_shape = [128, 128]
 
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     per_channel_quant = args.per_channel_quant
+    down_moe = args.down_moe
 
     if args.batch_size is None:
         batch_sizes = get_default_batch_sizes()
@@ -371,6 +383,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a16,
             per_channel_quant,
             block_shape,
+            down_moe,
         )
         print(
             f"Start tuning over {len(search_space)} configurations to create {filename}..."
@@ -393,6 +406,7 @@ def main(args: argparse.Namespace):
                     per_channel_quant,
                     block_shape,
                     search_space,
+                    down_moe,
                 )
                 for batch_size in batch_sizes
             ],
@@ -422,6 +436,7 @@ def main(args: argparse.Namespace):
                     use_int8_w8a16,
                     per_channel_quant,
                     block_shape,
+                    down_moe,
                 )
                 for batch_size in batch_sizes
             ],
@@ -452,6 +467,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--down_moe", action="store_true")
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     args = parser.parse_args()
 

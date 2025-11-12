@@ -468,7 +468,7 @@ def save_configs_sep(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     block_shape: List[int],
-    down_moe: bool = False,
+    down_moe: bool = True,
 ) -> None:
     dtype_str = get_config_dtype_str(
         dtype,

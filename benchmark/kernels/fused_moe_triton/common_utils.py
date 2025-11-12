@@ -104,7 +104,10 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-    elif architecture in ["Glm4MoeForCausalLM"]:
+    elif architecture in [
+        "Glm4MoeForCausalLM",
+        "HybridSWACompressedForCausalLM",
+    ]:
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
@@ -212,6 +215,7 @@ def get_config_filename(
     use_int8_w8a16: bool,
     per_channel_quant: bool,
     block_shape: List[int],
+    down_moe: bool = True,
 ) -> str:
     dtype_str = get_config_dtype_str(
         dtype,
@@ -228,6 +232,7 @@ def get_config_filename(
         dtype_str,
         block_shape,
         per_channel_quant,
+        down_moe,
     )
 
     return filename
