@@ -8,11 +8,13 @@ use serde_json::Value;
 use validator::Validate;
 
 // Import shared types from common module
-use super::common::{
-    default_model, default_true, validate_stop, ChatLogProbs, Function, GenerationRequest,
-    PromptTokenUsageInfo, StringOrArray, ToolChoice, UsageInfo,
+use super::{
+    common::{
+        default_model, default_true, validate_stop, ChatLogProbs, Function, GenerationRequest,
+        PromptTokenUsageInfo, StringOrArray, ToolChoice, UsageInfo,
+    },
+    sampling_params::{validate_top_k_value, validate_top_p_value},
 };
-use super::sampling_params::{validate_top_k_value, validate_top_p_value};
 use crate::protocols::builders::ResponsesResponseBuilder;
 
 // ============================================================================
