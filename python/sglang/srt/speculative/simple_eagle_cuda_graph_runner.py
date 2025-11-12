@@ -204,49 +204,6 @@ class SimpleEAGLECudaGraphRunner:
         spec_info_topk_p = self.spec_info_topk_p[:bs]
         spec_info_topk_index = self.spec_info_topk_index[:bs]
 
-        if self.require_mlp_tp_gather:
-            self.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=self.input_ids.device,
-                )
-            )
-            self.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=self.input_ids.device,
-                )
-            )
-            global_num_tokens = self.global_num_tokens_gpu
-            global_dp_buffer_len = num_tokens * self.dp_size
-            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
-
-        elif self.require_attn_tp_gather:
-            self.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=self.input_ids.device,
-                )
-            )
-            self.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=self.input_ids.device,
-                )
-            )
-            global_num_tokens = self.global_num_tokens_gpu
-            global_dp_buffer_len = num_tokens
-            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
-
-        else:
-            global_num_tokens = None
-            global_dp_buffer_len = None
-            global_num_tokens_for_logprob = None
-
         verify_spec_info, draft_spec_info = self.get_spec_info()
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (

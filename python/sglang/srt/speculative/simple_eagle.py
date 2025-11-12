@@ -518,7 +518,6 @@ class SimpleEagleWorker(TpModelWorker):
                 forward_batch.req_pool_indices
             )
             forward_batch.spec_info = draft_input
-            # forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
             draft_logits_output = self.forward_draft_extend_after_decode(
                 forward_batch
             )
