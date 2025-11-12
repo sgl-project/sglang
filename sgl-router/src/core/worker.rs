@@ -282,6 +282,38 @@ impl fmt::Display for ConnectionMode {
     }
 }
 
+/// Runtime implementation type for gRPC workers
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeType {
+    /// SGLang runtime (default)
+    #[default]
+    Sglang,
+    /// vLLM runtime
+    Vllm,
+}
+
+impl fmt::Display for RuntimeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuntimeType::Sglang => write!(f, "sglang"),
+            RuntimeType::Vllm => write!(f, "vllm"),
+        }
+    }
+}
+
+impl std::str::FromStr for RuntimeType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sglang" => Ok(RuntimeType::Sglang),
+            "vllm" => Ok(RuntimeType::Vllm),
+            _ => Err(format!("Unknown runtime type: {}", s)),
+        }
+    }
+}
+
 /// Worker type classification
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkerType {
@@ -345,6 +377,8 @@ pub struct WorkerMetadata {
     pub worker_type: WorkerType,
     /// Connection mode
     pub connection_mode: ConnectionMode,
+    /// Runtime type (for gRPC workers)
+    pub runtime_type: RuntimeType,
     /// Additional labels/tags
     pub labels: std::collections::HashMap<String, String>,
     /// Health check configuration
@@ -927,6 +961,11 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         _ => None,
     };
 
+    let runtime_type = match worker.connection_mode() {
+        ConnectionMode::Grpc { .. } => Some(worker.metadata().runtime_type.to_string()),
+        ConnectionMode::Http => None,
+    };
+
     WorkerInfo {
         id: worker.url().to_string(),
         url: worker.url().to_string(),
@@ -937,6 +976,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         is_healthy: worker.is_healthy(),
         load: worker.load(),
         connection_mode: format!("{:?}", worker.connection_mode()),
+        runtime_type,
         tokenizer_path: worker.tokenizer_path().map(String::from),
         reasoning_parser: worker.reasoning_parser().map(String::from),
         tool_parser: worker.tool_parser().map(String::from),
