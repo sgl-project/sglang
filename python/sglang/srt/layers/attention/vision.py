@@ -106,7 +106,9 @@ def resolve_seqlens(
         resolved_seqlens = cu_seqlens.get_data()
     else:
         resolved_seqlens = cu_seqlens
-    assert isinstance(resolved_seqlens, torch.Tensor), "cu_seqlens must be a torch.Tensor"
+    assert isinstance(
+        resolved_seqlens, torch.Tensor
+    ), "cu_seqlens must be a torch.Tensor"
     return resolved_seqlens
 
 
