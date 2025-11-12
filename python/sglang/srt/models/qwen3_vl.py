@@ -775,13 +775,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 )
 
         input_embeds = forward_batch.input_embeds
-        # 可能会觉得很奇怪，为什么传入了input_embeds还要赋值一次？
-        # 这是 出于兼容性考虑
-        # 在extend中，两个地方会调用这个forward：1. model_runner 直接调用forward，2. piece_wise_cuda_graph_runner 调用 forward & replay
+        # It may seem strange to assign input_embeds again even after passing it as an argument.
+        # This is for compatibility considerations.
+        # In the 'extend' scenario, this forward function is called from two places: 
+        # 1. model_runner calls forward directly,
+        # 2. piece_wise_cuda_graph_runner calls forward and replay.
 
-        # 另外现在
-        # 在 extend 中，会传入 input_embeds
-        # 在 decode 中，会传入 input_ids
+        # Currently,
+        # In 'extend', input_embeds is passed in.
+        # In 'decode', input_ids is passed in.
 
         hidden_states = self.model(
             input_ids=input_ids,
