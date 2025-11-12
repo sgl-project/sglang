@@ -678,10 +678,14 @@ def trace_event_batch(
     name: str,
     reqs: List[Req],
     ts: Optional[int] = None,
-    attrs: Dict[str, Any] = None,
+    attrs: Dict[str, Any] = {},
 ):
     if not tracing_enabled:
         return
 
+    bid = uuid.uuid4().hex[:8]
+    _attrs = {"bid": bid, "batch_size": len(reqs)}
+    _attrs.update(attrs)
+
     for req in reqs:
-        trace_event(name, req.rid, ts=ts, attrs=attrs)
+        trace_event(name, req.rid, ts=ts, attrs=_attrs)
