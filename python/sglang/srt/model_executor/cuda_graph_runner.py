@@ -255,8 +255,6 @@ class CudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
-        if self.enable_pdmux:
-            self.stream_groups = get_stream_groups()
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -294,9 +292,9 @@ class CudaGraphRunner:
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
-        if self.enable_pdmux:
-            for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+
+        # Init PDMux if needed
+        self.maybe_init_pdmux()
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -395,6 +393,12 @@ class CudaGraphRunner:
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def maybe_init_pdmux(self):
+        if self.enable_pdmux:
+            self.stream_groups = get_stream_groups()
+            for attn_backend in self.model_runner.decode_attn_backend_group:
+                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+
     def _cache_loc_dtype(self):
         return torch.int64
 
@@ -489,53 +493,9 @@ class CudaGraphRunner:
                 self.model_runner.server_args.enable_cudagraph_gc
             ), graph_capture(
                 stream=decode_stream_groups[stream_idx]
-            ) as graph_capture_context:
-                with profile_context as prof:
-                    self.stream = graph_capture_context.stream
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    # Reverse the order to enable better memory sharing across cuda graphs.
-                    capture_range = (
-                        tqdm.tqdm(list(reversed(self.capture_bs)))
-                        if get_tensor_model_parallel_rank() == 0
-                        else reversed(self.capture_bs)
-                    )
-                    for i, bs in enumerate(capture_range):
-                        if get_tensor_model_parallel_rank() == 0:
-                            avail_mem = get_available_gpu_memory(
-                                self.model_runner.device,
-                                self.model_runner.gpu_id,
-                                empty_cache=False,
-                            )
-                            capture_range.set_description(
-                                f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
-                            )
-
-                        with patch_model(
-                            self.model_runner.model,
-                            bs in self.compile_bs,
-                            num_tokens=bs * self.num_tokens_per_bs,
-                            tp_group=self.model_runner.tp_group,
-                        ) as forward:
-                            (
-                                graph,
-                                output_buffers,
-                            ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                            if self.enable_pdmux:
-                                # For pd_multiplexing, we need to save the graph and output buffers
-                                self.graphs[f"{stream_idx}_{bs}"] = graph
-                                self.output_buffers[f"{stream_idx}_{bs}"] = (
-                                    output_buffers
-                                )
-                            else:
-                                self.graphs[bs] = graph
-                                self.output_buffers[bs] = output_buffers
-
-                        # Save gemlite cache after each capture
-                        save_gemlite_cache()
+            ) as graph_capture_context, profile_context as prof:
+                self.stream = graph_capture_context.stream
+                self._capture_one_stream(stream_idx)
 
         if self.enable_profile_cuda_graph:
             torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
@@ -552,6 +512,50 @@ class CudaGraphRunner:
                 + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
             )
             logger.info(log_message)
+
+    def _capture_one_stream(self, stream_idx: int):
+        avail_mem = get_available_gpu_memory(
+            self.model_runner.device,
+            self.model_runner.gpu_id,
+            empty_cache=False,
+        )
+        # Reverse the order to enable better memory sharing across cuda graphs.
+        capture_range = (
+            tqdm.tqdm(list(reversed(self.capture_bs)))
+            if get_tensor_model_parallel_rank() == 0
+            else reversed(self.capture_bs)
+        )
+        for i, bs in enumerate(capture_range):
+            if get_tensor_model_parallel_rank() == 0:
+                avail_mem = get_available_gpu_memory(
+                    self.model_runner.device,
+                    self.model_runner.gpu_id,
+                    empty_cache=False,
+                )
+                capture_range.set_description(
+                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                )
+
+            with patch_model(
+                self.model_runner.model,
+                bs in self.compile_bs,
+                num_tokens=bs * self.num_tokens_per_bs,
+                tp_group=self.model_runner.tp_group,
+            ) as forward:
+                (
+                    graph,
+                    output_buffers,
+                ) = self.capture_one_batch_size(bs, forward, stream_idx)
+                if not self.enable_pdmux:
+                    self.graphs[bs] = graph
+                    self.output_buffers[bs] = output_buffers
+                else:
+                    # For pd_multiplexing, we need to save the graph and output buffers
+                    self.graphs[f"{stream_idx}_{bs}"] = graph
+                    self.output_buffers[f"{stream_idx}_{bs}"] = output_buffers
+
+                # Save gemlite cache after each capture
+                save_gemlite_cache()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
