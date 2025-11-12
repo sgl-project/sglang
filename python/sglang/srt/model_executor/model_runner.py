@@ -88,6 +88,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    get_global_experts_capturer,
     set_global_experts_capturer,
 )
 from sglang.srt.layers.sampler import Sampler
@@ -159,7 +160,6 @@ from sglang.srt.utils.offloader import (
     set_offloader,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
