@@ -62,7 +62,6 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
 
-
     def test_structured_output_json_schema(self):
         """Override with simpler schema for Llama model (complex schemas not well supported)."""
         data = {

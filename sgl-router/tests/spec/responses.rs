@@ -1176,11 +1176,7 @@ fn test_normalize_store_default() {
         request.store.is_some(),
         "store should be set after normalization"
     );
-    assert_eq!(
-        request.store,
-        Some(true),
-        "store should default to true"
-    );
+    assert_eq!(request.store, Some(true), "store should default to true");
 }
 
 /// Test store is not overridden if already set

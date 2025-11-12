@@ -172,8 +172,9 @@ class FunctionCallingBaseTest(ResponseAPIBaseTest):
             },
         )
         import logging
+
         logger = logging.getLogger(__name__)
-        logger.info(f"Response: {resp2.text}")  
+        logger.info(f"Response: {resp2.text}")
         logger.info(f"Response status code: {resp2.status_code}")
         self.assertEqual(resp2.status_code, 200)
 
