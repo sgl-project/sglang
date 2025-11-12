@@ -458,6 +458,7 @@ class PiecewiseCudaGraphRunner:
         bs = forward_batch.batch_size
 
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
+        # self.input_embeds[:num_tokens].copy_(forward_batch.input_embeds)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         if forward_batch.out_cache_loc_swa is not None:
@@ -465,7 +466,13 @@ class PiecewiseCudaGraphRunner:
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
 
-        input_ids = self.input_ids[:static_num_tokens]
+        if self.use_input_embeds:
+            input_ids = None
+            input_embeds = self.input_embeds[:static_num_tokens]
+        else:
+            input_ids = self.input_ids[:static_num_tokens]
+            input_embeds = None
+
         positions = self.positions[:static_num_tokens]
         out_cache_loc = self.out_cache_loc[:static_num_tokens]
         mrope_positions = (
@@ -486,6 +493,7 @@ class PiecewiseCudaGraphRunner:
             forward_mode=forward_batch.forward_mode,
             batch_size=bs,
             input_ids=input_ids,
+            input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             next_token_logits_buffer=next_token_logits_buffer,
