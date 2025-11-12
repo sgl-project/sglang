@@ -168,6 +168,8 @@ suites = {
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
         TestFile("models/test_kimi_k2_models.py", 200),
+        TestFile("test_deepseek_v32_basic.py", 275),
+        TestFile("test_deepseek_v32_mtp.py", 275),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
@@ -193,11 +195,6 @@ suites = {
     ],
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
-    ],
-    "per-commit-8-gpu-h200-deepseek-v32": [
-        TestFile("test_deepseek_v32_basic.py", 275),
-        TestFile("test_deepseek_v32_mtp.py", 275),
-        TestFile("test_deepseek_v32_nsabackend.py", 600),
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
@@ -227,7 +224,9 @@ suites = {
     "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [],
     "nightly-8-gpu": [],
-    "nightly-8-gpu-h200": [],
+    "nightly-8-gpu-h200": [
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
+    ],
     "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
@@ -250,14 +249,10 @@ suites = {
         TestFile("layers/moe/test_moe_runners.py"),
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
-        TestFile("models/lora/test_lora.py"),
-        TestFile("models/lora/test_lora_backend.py"),
-        TestFile("models/lora/test_lora_cuda_graph.py"),
-        TestFile("models/lora/test_lora_eviction.py"),
-        TestFile("models/lora/test_lora_qwen3.py"),
-        TestFile("models/lora/test_lora_tp.py"),
-        TestFile("models/lora/test_lora_update.py"),
-        TestFile("models/lora/test_multi_lora_backend.py"),
+        TestFile("lora/test_lora_cuda_graph.py"),
+        TestFile("lora/test_lora_qwen3.py"),
+        TestFile("lora/test_lora_tp.py"),
+        TestFile("lora/test_lora_update.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
