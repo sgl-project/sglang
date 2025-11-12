@@ -311,7 +311,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
-                    use_data_parallel = use_data_parallel,
+                    use_data_parallel=use_data_parallel,
                 )
                 for i in range(depth)
             ]
