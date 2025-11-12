@@ -852,6 +852,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-b200
+    env:
+      RUNNER_LABELS: 4-gpu-b200
     strategy:
       fail-fast: false
     steps:
@@ -881,6 +883,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-gb200
+    env:
+      RUNNER_LABELS: 4-gpu-gb200
     strategy:
       fail-fast: false
     steps:

@@ -38,6 +38,10 @@ except ImportError:
 # Add new runner labels and models here as needed
 RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "8-gpu-h200": ["deepseek-ai/DeepSeek-V3-0324", "moonshotai/Kimi-K2-Thinking"],
+    "8-gpu-b200": ["deepseek-ai/DeepSeek-V3.1", "deepseek-ai/DeepSeek-V3.2-Exp"],
+    "4-gpu-b200": ["nvidia/DeepSeek-V3-0324-FP4"],
+    "4-gpu-gb200": ["nvidia/DeepSeek-V3-0324-FP4"],
+    "linux-mi300-gpu-8": ["deepseek-ai/DeepSeek-V3-0324"],
 }
 
 
