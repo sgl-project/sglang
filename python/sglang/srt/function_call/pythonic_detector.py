@@ -2,7 +2,7 @@ import ast
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
