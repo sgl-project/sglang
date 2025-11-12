@@ -58,9 +58,9 @@ pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<Grp
         .ok_or_else(|| {
             error!(
                 function = "get_grpc_client_from_worker",
-                "Worker returned None for gRPC client (HTTP worker in gRPC pipeline?)"
+                "Selected worker not configured for gRPC"
             );
-            error::internal_error("gRPC worker did not provide client")
+            error::internal_error("Selected worker is not configured for gRPC")
         })?;
 
     Ok((*client_arc).clone())
