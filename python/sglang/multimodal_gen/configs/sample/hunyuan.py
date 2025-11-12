@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.sample.base import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 

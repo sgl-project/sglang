@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_dimensions
 
-from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.vae_config import (
+    VAEArchConfig,
+    VAEConfig,
+)
 
 
 @dataclass

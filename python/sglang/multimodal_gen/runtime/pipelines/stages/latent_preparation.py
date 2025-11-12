@@ -8,7 +8,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines.stages.pipeline_stage import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
     StageValidators as V,
 )

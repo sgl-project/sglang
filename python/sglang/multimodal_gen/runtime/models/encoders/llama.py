@@ -53,7 +53,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.encoder_base import TextEncoder
 
 
 class LlamaMLP(nn.Module):

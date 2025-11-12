@@ -10,7 +10,7 @@ from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAECo
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.pipeline_config import PipelineConfig
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):

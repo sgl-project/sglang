@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.performance_logger import PerformanceLogger
 

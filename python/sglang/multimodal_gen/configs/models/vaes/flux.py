@@ -3,7 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.vae_config import (
+    VAEArchConfig,
+    VAEConfig,
+)
 
 
 @dataclass

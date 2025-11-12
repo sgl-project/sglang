@@ -15,7 +15,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     LlamaConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.pipeline_config import PipelineConfig
 
 PROMPT_TEMPLATE_ENCODE_VIDEO = (
     "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "

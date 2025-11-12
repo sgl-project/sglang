@@ -14,7 +14,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     T5Config,
 )
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.pipeline_config import PipelineConfig
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:

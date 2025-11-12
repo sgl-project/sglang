@@ -15,7 +15,7 @@ from sglang.multimodal_gen.configs.pipelines.qwen_image import (
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines.stages.pipeline_stage import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
     StageValidators,
     VerificationResult,

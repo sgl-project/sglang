@@ -3,7 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.dits.dit_config import (
+    DiTArchConfig,
+    DiTConfig,
+)
 
 
 def is_blocks(n: str, m) -> bool:

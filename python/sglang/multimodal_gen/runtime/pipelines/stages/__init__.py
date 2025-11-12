@@ -8,7 +8,6 @@ This package contains the various stages that can be composed to create
 complete diffusion pipelines.
 """
 
-from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines.stages.causal_denoising import (
     CausalDMDDenoisingStage,
 )
@@ -31,6 +30,7 @@ from sglang.multimodal_gen.runtime.pipelines.stages.input_validation import (
 from sglang.multimodal_gen.runtime.pipelines.stages.latent_preparation import (
     LatentPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines.stages.pipeline_stage import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines.stages.stepvideo_encoding import (
     StepvideoPromptEncodingStage,
 )

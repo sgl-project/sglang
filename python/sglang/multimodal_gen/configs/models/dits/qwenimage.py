@@ -4,7 +4,10 @@
 from dataclasses import dataclass, field
 from typing import Tuple
 
-from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.dits.dit_config import (
+    DiTArchConfig,
+    DiTConfig,
+)
 
 
 @dataclass

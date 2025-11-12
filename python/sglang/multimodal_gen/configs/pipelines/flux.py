@@ -13,10 +13,13 @@ from sglang.multimodal_gen.configs.models.encoders import (
     T5Config,
 )
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, preprocess_text
 from sglang.multimodal_gen.configs.pipelines.hunyuan import (
     clip_postprocess_text,
     clip_preprocess_text,
+)
+from sglang.multimodal_gen.configs.pipelines.pipeline_config import (
+    PipelineConfig,
+    preprocess_text,
 )
 
 
