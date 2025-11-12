@@ -312,8 +312,8 @@ class SiglipVisionTransformer(nn.Module):
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
         # Apply Eagle2.5 head if enabled
-        if self.use_eagle_head:
-            last_hidden_state = self.head(last_hidden_state)
+        # if self.use_eagle_head:
+        #     last_hidden_state = self.head(last_hidden_state)
 
         return last_hidden_state
 

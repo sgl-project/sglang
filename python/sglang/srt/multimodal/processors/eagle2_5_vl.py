@@ -22,6 +22,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.image_processing_eagle2_5_vl_fast import (
+    Eagle2_5_VLImageProcessorFast,
+)
 from sglang.srt.server_args import ServerArgs
 
 
@@ -46,6 +49,13 @@ class Eagle2_5_VLProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self._processor: ProcessorMixin
+
+        # Replace HF image processor with our local modified version to avoid bug in HF fast processor
+        if hasattr(self._processor, "image_processor"):
+            original_config = getattr(self._processor.image_processor, "__dict__", {})
+            self._processor.image_processor = Eagle2_5_VLImageProcessorFast(
+                **original_config
+            )
 
         tokenizer: PreTrainedTokenizerBase = getattr(self._processor, "tokenizer")
 
