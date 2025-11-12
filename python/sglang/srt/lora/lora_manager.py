@@ -467,9 +467,7 @@ class LoRAManager:
                 if lora_target is None:
                     continue
 
-                norm_lora_target = next(
-                    iter(get_normalized_target_modules([lora_target]))
-                )
+                (norm_lora_target,) = get_normalized_target_modules([lora_target])
                 if norm_lora_target not in self.target_modules:
                     raise RuntimeError(
                         f"LoRA target of {lora_target} for {module_name} is not a target module"
