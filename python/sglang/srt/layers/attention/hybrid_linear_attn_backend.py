@@ -719,7 +719,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             # Zero-initialize cache slots for sequences without prefix cache
-            # This ensures deterministic behavior for fresh sequences while still supporting
+            # This ensures deterministic behavior for fresh sequences
             if get_global_server_args().enable_deterministic_inference:
                 # Check which sequences have no prefix (fresh sequences)
                 no_prefix_mask = forward_batch.extend_prefix_lens == 0
