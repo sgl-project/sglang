@@ -1,13 +1,12 @@
 // Adapted from: https://github.com/vllm-project/vllm/blob/main/csrc/ops.h
 
 #include <torch/extension.h>
-
 #include <vector>
 
-static at::Tensor weak_ref_tensor(at::Tensor& tensor) {
+static at::Tensor weak_ref_tensor(at::Tensor &tensor) {
   TORCH_CHECK(tensor.is_cuda(), "weak_ref_tensor expects a CUDA tensor");
 
-  void* data_ptr = tensor.data_ptr();
+  void *data_ptr = tensor.data_ptr();
   std::vector<int64_t> sizes = tensor.sizes().vec();
   std::vector<int64_t> strides = tensor.strides().vec();
 
