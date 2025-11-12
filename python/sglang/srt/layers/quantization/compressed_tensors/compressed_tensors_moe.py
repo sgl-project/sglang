@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
+from sglang.srt.layers.quantization.w8a8_int8 import NPU_W8A8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
