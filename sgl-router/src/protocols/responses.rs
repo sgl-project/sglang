@@ -325,7 +325,7 @@ pub enum TextFormat {
     },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum IncludeField {
     #[serde(rename = "code_interpreter_call.outputs")]
@@ -771,76 +771,153 @@ pub fn validate_conversation_id(conv_id: &str) -> Result<(), validator::Validati
 fn validate_responses_cross_parameters(
     request: &ResponsesRequest,
 ) -> Result<(), validator::ValidationError> {
-    use super::common::{ToolChoice, ToolReference};
+    use super::common::{ToolChoice, ToolChoiceValue, ToolReference};
 
-    // Only validate if both tools and tool_choice are present
-    if let (Some(tools), Some(tool_choice)) = (&request.tools, &request.tool_choice) {
-        // Extract function tool names from ResponseTools
-        let function_tool_names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| match t.r#type {
-                ResponseToolType::Function => t.function.as_ref().map(|f| f.name.as_str()),
-                _ => None,
-            })
-            .collect();
+    // 1. Validate tool_choice requires tools (enhanced)
+    if let Some(ref tool_choice) = request.tool_choice {
+        let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
+        
+        // Check if tool_choice is anything other than "none"
+        let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
+        
+        if is_some_choice && !has_tools {
+            let mut e = validator::ValidationError::new("tool_choice_requires_tools");
+            e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
+            return Err(e);
+        }
+        
+        // Validate tool references exist when tools are present
+        if has_tools {
+            let tools = request.tools.as_ref().unwrap();
+            
+            // Extract function tool names from ResponseTools
+            let function_tool_names: Vec<&str> = tools
+                .iter()
+                .filter_map(|t| match t.r#type {
+                    ResponseToolType::Function => t.function.as_ref().map(|f| f.name.as_str()),
+                    _ => None,
+                })
+                .collect();
 
-        match tool_choice {
-            ToolChoice::Function { function, .. } => {
-                // Validate the specific function exists
-                if !function_tool_names.contains(&function.name.as_str()) {
-                    let mut e = validator::ValidationError::new("tool_choice_function_not_found");
-                    e.message = Some(
-                        format!(
-                            "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
-                            function.name
-                        )
-                        .into(),
-                    );
-                    return Err(e);
-                }
-            }
-            ToolChoice::AllowedTools {
-                mode,
-                tools: allowed_tools,
-                ..
-            } => {
-                // Validate mode is "auto" or "required"
-                if mode != "auto" && mode != "required" {
-                    let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
-                    e.message = Some(
-                        format!(
-                            "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{}'.",
-                            mode
-                        )
-                        .into(),
-                    );
-                    return Err(e);
-                }
-
-                // Validate that all function tool references exist
-                for tool_ref in allowed_tools {
-                    if let ToolReference::Function { name } = tool_ref {
-                        if !function_tool_names.contains(&name.as_str()) {
-                            let mut e =
-                                validator::ValidationError::new("tool_choice_tool_not_found");
-                            e.message = Some(
-                                format!(
-                                    "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
-                                    name
-                                )
-                                .into(),
-                            );
-                            return Err(e);
-                        }
+            match tool_choice {
+                ToolChoice::Function { function, .. } => {
+                    // Validate the specific function exists
+                    if !function_tool_names.contains(&function.name.as_str()) {
+                        let mut e = validator::ValidationError::new("tool_choice_function_not_found");
+                        e.message = Some(
+                            format!(
+                                "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+                                function.name
+                            )
+                            .into(),
+                        );
+                        return Err(e);
                     }
-                    // Note: MCP and hosted tools don't need existence validation here
-                    // as they are resolved dynamically at runtime
                 }
+                ToolChoice::AllowedTools {
+                    mode,
+                    tools: allowed_tools,
+                    ..
+                } => {
+                    // Validate mode is "auto" or "required"
+                    if mode != "auto" && mode != "required" {
+                        let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
+                        e.message = Some(
+                            format!(
+                                "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{}'.",
+                                mode
+                            )
+                            .into(),
+                        );
+                        return Err(e);
+                    }
+
+                    // Validate that all function tool references exist
+                    for tool_ref in allowed_tools {
+                        if let ToolReference::Function { name } = tool_ref {
+                            if !function_tool_names.contains(&name.as_str()) {
+                                let mut e =
+                                    validator::ValidationError::new("tool_choice_tool_not_found");
+                                e.message = Some(
+                                    format!(
+                                        "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
+                                        name
+                                    )
+                                    .into(),
+                                );
+                                return Err(e);
+                            }
+                        }
+                        // Note: MCP and hosted tools don't need existence validation here
+                        // as they are resolved dynamically at runtime
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
+    // 2. Validate top_logprobs requires include field
+    if request.top_logprobs.is_some() {
+        let has_logprobs_include = request.include.as_ref().is_some_and(|inc| {
+            inc.contains(&IncludeField::MessageOutputTextLogprobs)
+        });
+        
+        if !has_logprobs_include {
+            let mut e = validator::ValidationError::new("top_logprobs_requires_include");
+            e.message = Some("top_logprobs requires include field with 'message.output_text.logprobs'".into());
+            return Err(e);
+        }
+    }
+
+    // 3. Validate background/stream conflict
+    if request.background == Some(true) && request.stream == Some(true) {
+        let mut e = validator::ValidationError::new("background_conflicts_with_stream");
+        e.message = Some("Cannot use background mode with streaming".into());
+        return Err(e);
+    }
+
+    // 4. Validate previous_response_id format
+    if let Some(ref prev_id) = request.previous_response_id {
+        if !prev_id.starts_with("resp_") {
+            let mut e = validator::ValidationError::new("invalid_previous_response_id");
+            e.message = Some(format!(
+                "Invalid 'previous_response_id': '{}'. Expected an ID that begins with 'resp_'.",
+                prev_id
+            ).into());
+            return Err(e);
+        }
+    }
+
+    // 5. Validate conversation and previous_response_id are mutually exclusive
+    // NOTE: This validation is moved from router.rs (lines 699-713)
+    if request.conversation.is_some() && request.previous_response_id.is_some() {
+        let mut e = validator::ValidationError::new("mutually_exclusive_parameters");
+        e.message = Some("Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.".into());
+        return Err(e);
+    }
+
+    // 6. Validate input items structure
+    if let ResponseInput::Items(items) = &request.input {
+        // Check for at least one valid input message
+        let has_valid_input = items.iter().any(|item| {
+            matches!(item, 
+                ResponseInputOutputItem::Message { .. } |
+                ResponseInputOutputItem::SimpleInputMessage { .. }
+            )
+        });
+        
+        if !has_valid_input {
+            let mut e = validator::ValidationError::new("input_missing_user_message");
+            e.message = Some("Input items must contain at least one message".into());
+            return Err(e);
+        }
+    }
+
+    // 7. Validate text format conflicts (for future structured output constraints)
+    // Currently, Responses API doesn't have regex/ebnf like Chat API,
+    // but this is here for completeness and future-proofing
+    
     Ok(())
 }
 
