@@ -227,7 +227,7 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-        if self.debug and self.perf_logger is None:
+        if self.perf_logger is None:
             self.perf_logger = PerformanceLogger(self.request_id)
 
     def set_width_and_height(self, server_args: ServerArgs):
