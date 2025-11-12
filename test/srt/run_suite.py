@@ -222,7 +222,7 @@ suites = {
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
     ],
     "nightly-8-gpu-b200": [],
-    "nightly-4-gpu": [TestFile("nightly/test_encoder_dp.py", 900)],
+    "nightly-4-gpu": [TestFile("nightly/test_encoder_dp.py", 500)],
     "nightly-8-gpu": [],
     "nightly-8-gpu-h200": [
         TestFile("test_deepseek_v32_nsabackend.py", 600),
