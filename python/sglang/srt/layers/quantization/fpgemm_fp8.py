@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.utils.utils import is_layer_skipped
 from sglang.srt.utils import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()

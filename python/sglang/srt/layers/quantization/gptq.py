@@ -36,7 +36,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_zero_points,
     verify_marlin_supported,
 )
-from sglang.srt.layers.quantization.utils import (
+from sglang.srt.layers.quantization.utils.utils import (
     get_linear_quant_method,
     get_scalar_types,
     replace_parameter,

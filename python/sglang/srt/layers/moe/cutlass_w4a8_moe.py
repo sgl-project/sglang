@@ -121,6 +121,9 @@ def cutlass_w4a8_moe(
         dtype=torch.float8_e4m3fn,
     )
 
+    # TODO: Fuse quantization with pre-reorder
+    if a1_scale is None:
+        a1_scale = torch.max(torch.abs(a)).to(torch.float32).div_(torch.finfo(torch.float8_e4m3fn).max).view(1) 
     pre_reorder_triton_kernel_for_cutlass_moe[(m,)](
         a,
         gateup_input,
@@ -175,7 +178,11 @@ def cutlass_w4a8_moe(
     intermediate_q = torch.empty(
         intermediate.shape, dtype=torch.float8_e4m3fn, device=device
     )
-    sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
+    if a2_scale is None:
+        a2_scale = torch.zeros(1, device=device, dtype=torch.float32)
+        sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale, False)
+    else:
+        sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
 
     cutlass_w4a8_moe_mm(
         c2,
@@ -317,9 +324,15 @@ def cutlass_w4a8_moe_deepep_normal(
     gateup_input = torch.empty(
         gateup_input_pre_reorder.shape, dtype=torch.float8_e4m3fn, device=device
     )
-    sgl_per_tensor_quant_fp8(
-        gateup_input_pre_reorder, gateup_input, a1_scale.float(), True
-    )
+    if a1_scale is None:
+        a1_scale = torch.zeros(1, device=device, dtype=torch.float32)
+        sgl_per_tensor_quant_fp8(
+            gateup_input_pre_reorder, gateup_input, a1_scale, False
+        )
+    else:
+        sgl_per_tensor_quant_fp8(
+            gateup_input_pre_reorder, gateup_input, a1_scale.float(), True
+        )
     del gateup_input_pre_reorder
     local_topk_ids = topk_ids_
     local_topk_ids = (
@@ -363,8 +376,11 @@ def cutlass_w4a8_moe_deepep_normal(
     intermediate_q = torch.empty(
         intermediate.shape, dtype=torch.float8_e4m3fn, device=device
     )
-    sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
-
+    if a2_scale is None:
+        a2_scale = torch.zeros(1, device=device, dtype=torch.float32)
+        sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale, False)
+    else:
+        sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
     cutlass_w4a8_moe_mm(
         c2,
         intermediate_q,
@@ -491,7 +507,11 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
-    sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+    if a1_scale is None:
+        a1_scale = torch.zeros(1, device=device, dtype=torch.float32)
+        sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale, False)
+    else:
+        sgl_per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 
@@ -514,6 +534,11 @@ def cutlass_w4a8_moe_deepep_ll(
     intermediate_q = torch.empty(
         (num_experts, m, n), device=a.device, dtype=torch.float8_e4m3fn
     )
+
+     # TODO: Fuse quantization with silu_and_mul_masked_post_per_tensor_quant_fwd
+    if a2_scale is None:
+        a2_scale = torch.max(torch.abs(c1)).to(torch.float32).div_(torch.finfo(torch.float8_e4m3fn).max).view(1) 
+
     silu_and_mul_masked_post_per_tensor_quant_fwd(
         c1, intermediate_q, masked_m, a2_scale
     )
