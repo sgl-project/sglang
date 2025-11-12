@@ -10,6 +10,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     "per-commit-1-gpu": [
         TestFile("test_evs.py", 20),
+        TestFile("test_dcp_interleaved_storage.py", 5),
         TestFile("test_external_models.py", 30),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_utils_update_weights.py", 29),

@@ -465,6 +465,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs]
+            if get_dcp_world_size() > 1:
+                dcp_world_size = get_dcp_world_size()
+                dcp_rank = get_dcp_rank()
+                # Compute local lengths following the same formula as filter_seq_indices.
+                kv_len_arr_cpu = ((kv_len_arr_cpu - dcp_rank - 1) // dcp_world_size) + 1
+
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
@@ -735,35 +741,45 @@ class FlashInferMLAIndicesUpdaterDecode:
 
             # TODO(augusto.yjh) 更新kv_indices
             def filter_seq_indices(
-                paged_kernel_lens,
-                paged_kernel_lens_cumsum,
+                paged_kernel_lens: torch.Tensor,
+                paged_kernel_lens_cumsum: torch.Tensor,
                 dcp_rank: int,
-                dpc_world_size: int,
+                dcp_world_size: int,
             ):
-                paged_kernel_lens_split = (
-                    (paged_kernel_lens - dcp_rank - 1) // dpc_world_size
-                ) + 1
-                all_filered_indice = []
-                for i in range(len(paged_kernel_lens_split)):
-                    indice = (
-                        torch.arange(
-                            paged_kernel_lens_split[i], device=paged_kernel_lens.device
-                        )
-                        * dpc_world_size
-                        + dcp_rank
-                        + paged_kernel_lens_cumsum[i]
+                device = paged_kernel_lens.device
+                lens = paged_kernel_lens.to(torch.int64)
+                starts = paged_kernel_lens_cumsum[:-1].to(torch.int64)
+                paged_kernel_lens_split = ((lens - dcp_rank - 1) // dcp_world_size) + 1
+                paged_kernel_lens_split.clamp_(min=0)
+                total_local = int(paged_kernel_lens_split.sum().item())
+                if total_local == 0:
+                    return paged_kernel_lens_split, torch.empty(
+                        0, dtype=torch.int64, device="cuda"
                     )
-                    all_filered_indice.append(indice)
-                filterd_kv_indices = torch.cat(all_filered_indice, dim=0).to(
-                    device="cuda"
-                )
-                return paged_kernel_lens_split, filterd_kv_indices
+                max_split = int(paged_kernel_lens_split.max().item())
+                j = torch.arange(max_split, device=device, dtype=torch.int64)
+                starts_ = starts.view(-1, 1)
+                j_ = j.view(1, -1)
+                ids = starts_ + dcp_rank + j_ * dcp_world_size
+                mask = j_ < paged_kernel_lens_split.view(-1, 1)
+                filter_kv_indices = ids[mask].to(device="cuda")
+                return paged_kernel_lens_split, filter_kv_indices
 
             if get_dcp_world_size() > 1:
                 filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(
                     paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size()
                 )
-                kv_indices = kv_indices[filterd_kv_indices]
+                if init_metadata_replay:
+                    # For cuda graph replay, we must pack the DCP-filtered indices
+                    # back into the shared kv_indices buffer so that the FlashInfer
+                    # kernel reads a contiguous prefix of valid entries.
+                    local_kv_indices = (
+                        kv_indices[filterd_kv_indices] // get_dcp_world_size()
+                    )
+                    kv_indices[: local_kv_indices.numel()] = local_kv_indices
+                else:
+                    # Non-replay path can keep using a shrunk tensor.
+                    kv_indices = kv_indices[filterd_kv_indices] // get_dcp_world_size()
                 kv_lens = filtered_paged_kernel_lens.to(torch.int32)
                 kv_indptr[1 : bs + 1] = torch.cumsum(filtered_paged_kernel_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]

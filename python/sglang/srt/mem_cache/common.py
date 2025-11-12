@@ -373,6 +373,7 @@ def alloc_for_extend(
     if batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
+        # Since tree_cache.page_size is (page_size * get_dcp_world_size), for dcp, always use alloc_paged_token_slots_extend
         # Paged allocation - build last_loc
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))

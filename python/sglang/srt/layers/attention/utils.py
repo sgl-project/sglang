@@ -279,6 +279,7 @@ def pad_sequence_with_mask(
 
     return B, output, attn_mask
 
+@triton.jit
 def _correct_attn_cp_out_kernel(
     outputs_ptr,
     new_output_ptr,
@@ -298,13 +299,16 @@ def _correct_attn_cp_out_kernel(
     Apply the all-gathered lses to correct each local rank's attention
     output. we still need perform a cross-rank reduction to obtain the
     final attention output.
+
     Args:
-        output: [ B, H, D ]
-        lses   : [ N, B, H ]
-        cp, batch, q_heads, v_head_dim
-    Return:
-        output: [ B, H, D ]
-        lse   : [ B, H ]
+        outputs_ptr (triton.PointerType):
+            Pointer to input tensor of shape [ B, H, D ]
+        lses_ptr (triton.PointerType):
+            Pointer to input tensor of shape [ N, B, H ]
+        new_output_ptr (triton.PointerType):
+            Pointer to output tensor of shape [ B, H, D ]
+        vlse_ptr (triton.PointerType):
+            Pointer to output tensor of shape [ B, H ]
     """
     batch_idx = tl.program_id(axis=0).to(tl.int64)
     head_idx = tl.program_id(axis=1).to(tl.int64)
@@ -322,10 +326,11 @@ def _correct_attn_cp_out_kernel(
     lse = tl.load(lses_ptr + lse_offsets)
     lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
     lse_max = tl.max(lse, axis=0)
+    lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
     lse -= lse_max
-    lse_exp = tl.exp(lse)
+    lse_exp = tl.exp2(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    lse = tl.log(lse_acc)
+    lse = tl.log2(lse_acc)
     lse += lse_max
 
     lse_offsets = batch_idx * lses_stride_B + head_idx * lses_stride_H
@@ -349,7 +354,7 @@ def _correct_attn_cp_out_kernel(
         -float("inf"),
         lse_finally,
     )
-    factor = tl.exp(lse_finally)
+    factor = tl.exp2(lse_finally)
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
 
@@ -371,29 +376,67 @@ class CPTritonContext:
 
 def correct_attn_out(
     out: torch.Tensor, lses: torch.Tensor, cp_rank: int, ctx: CPTritonContext
-):
-    """
-    Apply the all-gathered lses to correct each local rank's attention
-    output. we still need perform a cross-rank reduction to obtain the
-    final attention output.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Correct the attention output using the all-gathered lses.
+
     Args:
-        output: [ B, H, D ]
-        lses   : [ N, B, H ]
-    Return:
-        output: [ B, H, D ]
-        lse   : [ B, H ]
+        out: Tensor of shape [ B, H, D ]
+        lses: Tensor of shape [ N, B, H ]
+        cp_rank: Current rank in the context-parallel group
+        ctx: Triton context to avoid recompilation
+
+    Returns:
+        Tuple of (out, lse) with corrected attention and final log-sum-exp.
     """
     if ctx is None:
         ctx = CPTritonContext()
 
-    lse = torch.empty_like(lses[0])
+    # --- Normalize to 3D views ---
+    if out.ndim == 4 and out.shape[1] == 1:
+        out = out.squeeze(1)
+    assert out.ndim == 3, f"expected out [B,H,D] or [B,1,H,D], got {tuple(out.shape)}"
 
-    grid = (out.shape[0], out.shape[1], 1)
-    regular_args = (out, out, lses, lse, *out.stride(), *lses.stride(), cp_rank)
-    const_args = {
-        "HEAD_DIM": out.shape[-1],
-        "N_ROUNDED": lses.shape[0],
-    }
+    if lses.ndim == 4 and lses.shape[-1] == 1:
+        lses = lses.squeeze(-1)
+    if lses.ndim == 4 and lses.shape[1] == 1:
+        lses = lses.squeeze(1)
+    assert lses.ndim == 3, (
+        f"expected lses [N,B,H] (optionally with a 1-sized extra dim), "
+        f"got {tuple(lses.shape)}"
+    )
+
+    B, H, D = out.shape
+    N = lses.shape[0]
+
+    # Strides after we normalized shapes to 3-D views.  The kernel computes
+    # offsets for `vlse_ptr` using lses_stride_B/H, so the output buffer must
+    # have the same B/H stride layout as a slice of `lses`.
+    o_sB, o_sH, o_sD = out.stride()
+    l_sN, l_sB, l_sH = lses.stride()
+
+    # Allocate LSE with the same B/H strides as `lses` so writes land correctly
+    # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
+    lse = torch.empty_strided(
+        (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
+    )
+
+    # Kernel launch config
+    grid = (B, H, 1)
+
+    regular_args = (
+        out,
+        out,
+        lses,
+        lse,
+        o_sB,
+        o_sH,
+        o_sD,
+        l_sN,
+        l_sB,
+        l_sH,
+        cp_rank,
+    )
+    const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return out, lse

@@ -1658,6 +1658,16 @@ def initialize_model_parallel(
 
     # build decode context parallel groups
     decode_context_model_parallel_size = get_dcp_size_from_env()
+    if decode_context_model_parallel_size > 1:
+        if get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                f"DCP enabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
+    else:
+        if get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                f"DCP disabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
     assert (
         tensor_model_parallel_size % decode_context_model_parallel_size == 0
     ), f"{tensor_model_parallel_size} must be divisible by decode_context_model_parallel_size"
