@@ -271,7 +271,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name,
                 shard_id,
                 expert_id,
-                )
+            )
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
