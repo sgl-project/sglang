@@ -14,11 +14,8 @@ use super::{
     ProcessedMessages,
 };
 use crate::{
-    core::{RuntimeType, Worker},
-    grpc_client::{
-        sglang_proto::{InputLogProbs, OutputLogProbs},
-        SglangSchedulerClient, VllmEngineClient,
-    },
+    core::Worker,
+    grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{
@@ -46,41 +43,27 @@ use crate::{
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {
-    // Check runtime type to determine which client to use
-    let runtime_type = &worker.metadata().runtime_type;
+    // Get cached client from worker (or create one if not cached yet)
+    let client_arc = worker
+        .get_grpc_client()
+        .await
+        .map_err(|e| {
+            error!(
+                function = "get_grpc_client_from_worker",
+                error = %e,
+                "Failed to get gRPC client from worker"
+            );
+            error::internal_error(format!("Failed to get gRPC client: {}", e))
+        })?
+        .ok_or_else(|| {
+            error!(
+                function = "get_grpc_client_from_worker",
+                "Worker returned None for gRPC client (HTTP worker in gRPC pipeline?)"
+            );
+            error::internal_error("gRPC worker did not provide client")
+        })?;
 
-    match runtime_type {
-        RuntimeType::Sglang => {
-            // Connect to SGLang gRPC server
-            let client = SglangSchedulerClient::connect(worker.url())
-                .await
-                .map_err(|e| {
-                    error!(
-                        function = "get_grpc_client_from_worker",
-                        runtime = "sglang",
-                        error = %e,
-                        "Failed to connect to SGLang gRPC server"
-                    );
-                    error::internal_error(format!("Failed to connect to SGLang: {}", e))
-                })?;
-
-            Ok(GrpcClient::Sglang(client))
-        }
-        RuntimeType::Vllm => {
-            // Connect to vLLM gRPC server
-            let client = VllmEngineClient::connect(worker.url()).await.map_err(|e| {
-                error!(
-                    function = "get_grpc_client_from_worker",
-                    runtime = "vllm",
-                    error = %e,
-                    "Failed to connect to vLLM gRPC server"
-                );
-                error::internal_error(format!("Failed to connect to vLLM: {}", e))
-            })?;
-
-            Ok(GrpcClient::Vllm(client))
-        }
-    }
+    Ok((*client_arc).clone())
 }
 
 /// Process tool call arguments in messages
