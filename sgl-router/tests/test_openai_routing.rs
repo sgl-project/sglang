@@ -23,7 +23,7 @@ use sglang_router_rs::{
     },
     data_connector::{ResponseId, StoredResponse},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::StringOrArray,
         completion::CompletionRequest,
         generate::GenerateRequest,
@@ -555,7 +555,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
     assert_eq!(stored.metadata.get("topic"), Some(&json!("unicorns")));
     assert_eq!(stored.instructions.as_deref(), Some("Be kind"));
     assert_eq!(stored.model.as_deref(), Some("gpt-5-nano"));
-    assert_eq!(stored.user, None);
+    assert_eq!(stored.safety_identifier, None);
     assert_eq!(stored.raw_response["store"], json!(true));
     assert_eq!(
         stored.raw_response["previous_response_id"].as_str(),
@@ -661,7 +661,7 @@ async fn test_openai_router_chat_completion_with_mock() {
     // Create a minimal chat completion request
     let mut chat_request = create_minimal_chat_request();
     chat_request.messages = vec![ChatMessage::User {
-        content: UserMessageContent::Text("Hello, how are you?".to_string()),
+        content: MessageContent::Text("Hello, how are you?".to_string()),
         name: None,
     }];
     chat_request.temperature = Some(0.7);
