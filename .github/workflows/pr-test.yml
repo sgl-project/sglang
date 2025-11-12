@@ -410,6 +410,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
+    env:
+      RUNNER_LABELS: 2-gpu-runner
     strategy:
       fail-fast: false
       matrix:

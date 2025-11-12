@@ -41,6 +41,9 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "moonshotai/Kimi-VL-A3B-Instruct",
         "deepseek-ai/DeepSeek-OCR",
     ],
+    "2-gpu-runner": [
+        "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+    ],
     "8-gpu-h200": [
         "deepseek-ai/DeepSeek-V3-0324",
         "deepseek-ai/DeepSeek-V3.2-Exp",
