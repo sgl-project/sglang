@@ -1,0 +1,22 @@
+name: Nightly-test-general-1-gpu-h100
+
+on:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: 1-gpu-runner
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-1-gpu --continue-on-error

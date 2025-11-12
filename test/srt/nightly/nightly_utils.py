@@ -29,6 +29,7 @@ class NightlyBenchmarkRunner:
         profile_dir: str,
         test_name: str,
         base_url: str,
+        gpu_config: str = None,
     ):
         """Initialize the benchmark runner.
 
@@ -36,11 +37,19 @@ class NightlyBenchmarkRunner:
             profile_dir: Directory to store performance profiles
             test_name: Name of the test (used for reporting)
             base_url: Base URL for the server
+            gpu_config: Optional GPU configuration string (e.g., "2-gpu-h100", "8-gpu-b200")
         """
         self.profile_dir = profile_dir
         self.test_name = test_name
         self.base_url = base_url
-        self.full_report = f"## {test_name}\n" + BenchmarkResult.help_str()
+        self.gpu_config = gpu_config or os.environ.get("GPU_CONFIG", "")
+
+        # Include GPU config in report header if available
+        header = f"## {test_name}"
+        if self.gpu_config:
+            header += f" ({self.gpu_config})"
+        header += "\n"
+        self.full_report = header + BenchmarkResult.help_str()
 
     def setup_profile_directory(self) -> None:
         """Create the profile directory if it doesn't exist."""

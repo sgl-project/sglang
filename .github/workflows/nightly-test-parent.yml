@@ -1,0 +1,116 @@
+name: Nightly Test Parent
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-test-parent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Text model accuracy tests
+  nightly-test-text-accuracy-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-text-accuracy-2-gpu-h100.yml
+    secrets: inherit
+
+  # Text model performance tests
+  nightly-test-text-perf-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-text-perf-2-gpu-h100.yml
+    secrets: inherit
+
+  # VLM accuracy tests
+  nightly-test-vlm-accuracy-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-vlm-accuracy-2-gpu-h100.yml
+    secrets: inherit
+
+  # VLM performance tests
+  nightly-test-vlm-perf-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-vlm-perf-2-gpu-h100.yml
+    secrets: inherit
+
+  # Single GPU tests
+  nightly-test-general-1-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-general-1-gpu-h100.yml
+    secrets: inherit
+
+  # 4 GPU tests
+  nightly-test-general-4-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-general-4-gpu-h100.yml
+    secrets: inherit
+
+  # 8 GPU H200 tests
+  nightly-test-general-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-general-8-gpu-h200.yml
+    secrets: inherit
+
+  # 8 GPU H20 tests
+  nightly-test-general-8-gpu-h20:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-general-8-gpu-h20.yml
+    secrets: inherit
+
+  # B200 GPU tests
+  nightly-test-perf-4-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-perf-4-gpu-b200.yml
+    secrets: inherit
+
+  nightly-test-perf-8-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-perf-8-gpu-b200.yml
+    secrets: inherit
+
+  # AMD GPU tests
+  nightly-test-general-2-gpu-mi300:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-general-2-gpu-mi300.yml
+    secrets: inherit
+
+  nightly-test-general-2-gpu-mi325:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/nightly-test-general-2-gpu-mi325.yml
+    secrets: inherit
+
+  # Final check job
+  check-all-jobs:
+    if: github.repository == 'sgl-project/sglang' && always()
+    needs:
+      - nightly-test-text-accuracy-2-gpu-h100
+      - nightly-test-text-perf-2-gpu-h100
+      - nightly-test-vlm-accuracy-2-gpu-h100
+      - nightly-test-vlm-perf-2-gpu-h100
+      - nightly-test-general-1-gpu-h100
+      - nightly-test-general-4-gpu-h100
+      - nightly-test-general-8-gpu-h200
+      - nightly-test-general-8-gpu-h20
+      - nightly-test-perf-4-gpu-b200
+      - nightly-test-perf-8-gpu-b200
+      - nightly-test-general-2-gpu-mi300
+      - nightly-test-general-2-gpu-mi325
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"

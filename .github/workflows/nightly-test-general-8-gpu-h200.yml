@@ -1,0 +1,24 @@
+name: Nightly-test-general-8-gpu-h200
+
+on:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: 8-gpu-h200
+    continue-on-error: true
+    env:
+      RUNNER_LABELS: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-h200 --continue-on-error
