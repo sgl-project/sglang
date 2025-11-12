@@ -1,9 +1,16 @@
 #include "common.h"
 #include "gemm.h"
-#include "pack.h"
 #include "vec.h"
+#include "vec_pack.h"
 
 namespace {
+// For this cpu kernel, we have some innovations aside from the existing gpu kernels:
+// 1) Use less parallel loops, i.e. 4 including l2_norm.
+// 2) Fuse part of l2_norm with the rest of the computation.
+
+#define THREAD_BUFFER_ALLOC(dst, base_ptr, offset, type, size) \
+  type* dst = reinterpret_cast<type*>((base_ptr) + (offset));  \
+  offset += (size);
 
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
@@ -22,17 +29,19 @@ inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
 
 template <typename scalar_t, int64_t chunk_size = 64>
 void chunk_gated_delta_rule_kernel_impl(
-    scalar_t* __restrict__ out,            // [B, T, HV, EV]
-    float* __restrict__ final_state_data,  // [N, HV, EK, EV]
-    scalar_t* __restrict__ q_orig,         // [B, T, HK, EK]
-    scalar_t* __restrict__ k_orig,         // [B, T, HK, EK]
-    scalar_t* __restrict__ v_orig,         // [B, T, HV, EV]
-    float* __restrict__ g_orig,            // [B, T, HV] FP32
-    scalar_t* __restrict__ b_orig,         // [B, T, HV]
-    int32_t* __restrict__ cu_seqlens_ptr,  // [N + 1] INT32
+    scalar_t* __restrict__ out,                  // [B, T, HV, EV]
+    float* __restrict__ final_state_data,        // [N, HV, EK, EV]
+    const scalar_t* __restrict__ q_orig,         // [B, T, HK, EK]
+    const scalar_t* __restrict__ k_orig,         // [B, T, HK, EK]
+    const scalar_t* __restrict__ v_orig,         // [B, T, HV, EV]
+    const float* __restrict__ g_orig,            // [B, T, HV] FP32
+    const scalar_t* __restrict__ b_orig,         // [B, T, HV]
+    const int32_t* __restrict__ cu_seqlens_ptr,  // [N + 1] INT32
     float* __restrict__ buff,
     scalar_t* __restrict__ reduced_buff,
     scalar_t* __restrict__ thread_buff,
+    const int32_t* __restrict__ chunk_offsets_ptr,
+    const int32_t* __restrict__ chunk_indices_ptr,
     bool use_qk_l2norm_in_kernel,
     const int64_t& batch_size,
     const int64_t& global_seq_len,
@@ -46,11 +55,10 @@ void chunk_gated_delta_rule_kernel_impl(
     const int64_t& kStrideT,
     const int64_t& vStrideH,
     const int64_t& vStrideT,
-    std::vector<int64_t>& chunk_offsets,
-    std::vector<std::vector<int64_t>>& chunk_indices,
     const int64_t& global_total_seq_length,
     const int64_t& global_num_chunk,
-    const int64_t& buff_size_16bit_per_thread) {
+    const int64_t& buff_size_16bit_per_thread,
+    double eps = 1e-5) {
   int64_t oStrideT = vStrideT;
   int64_t oStrideH = vStrideH;
   int64_t gStrideH = 1;
@@ -62,8 +70,10 @@ void chunk_gated_delta_rule_kernel_impl(
   int64_t final_state_StrideE = v_head_size;
   int64_t head_group = v_num_head / qk_num_head;
   float scale = 1.0 / std::sqrt(qk_head_size);
-  const int32_t vec_size = at::vec::Vectorized<float>::size();
-  const int32_t reduced_vec_size = at::vec::Vectorized<scalar_t>::size();
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t VecSize = bVec::size();
+  constexpr int64_t fVecSize = fVec::size();
 
   // Data pointers
   float* g_pad = buff;
@@ -77,17 +87,16 @@ void chunk_gated_delta_rule_kernel_impl(
   scalar_t* k_beta = v_pad + v_num_head * global_total_seq_length * v_head_size;
   scalar_t* v_beta = k_beta + v_num_head * global_total_seq_length * qk_head_size;
   scalar_t* k_cumdecay_reduced = v_beta + v_num_head * global_total_seq_length * v_head_size;
+  scalar_t* q_norm_sum = k_cumdecay_reduced + v_num_head * global_total_seq_length * qk_head_size;
+  scalar_t* k_norm_sum = q_norm_sum + qk_num_head * global_seq_len;
 
   if (use_qk_l2norm_in_kernel) {
-    using bVec = at::vec::Vectorized<scalar_t>;
-    using fVec = at::vec::Vectorized<float>;
-    constexpr int64_t VecSize = bVec::size();
-    constexpr int64_t fVecSize = fVec::size();
-    float eps = 1e-5;
     at::parallel_for(0, qk_num_head * global_seq_len, 0, [&](int64_t begin, int64_t end) {
       int64_t h_qk = 0, l = 0;
       data_index_init(begin, h_qk, qk_num_head, l, global_seq_len);
       for (int64_t i = begin; i < end; ++i) {
+        auto q_norm_sum_ptr = q_norm_sum + h_qk * global_seq_len + l;
+        auto k_norm_sum_ptr = k_norm_sum + h_qk * global_seq_len + l;
         float sum_q = float(0);
         float sum_k = float(0);
         fVec sum_q_fvec = fVec(float(0));
@@ -107,44 +116,10 @@ void chunk_gated_delta_rule_kernel_impl(
           sum_k_fvec += k_fvec0 * k_fvec0;
           sum_k_fvec += k_fvec1 * k_fvec1;
         }
-        for (; d < qk_head_size; ++d) {
-          float q_val = static_cast<float>(q_orig[q_offset + d]);
-          sum_q += q_val * q_val;
-          float k_val = static_cast<float>(k_orig[k_offset + d]);
-          sum_k += k_val * k_val;
-        }
-
         sum_q += vec_reduce_sum(sum_q_fvec);
         sum_k += vec_reduce_sum(sum_k_fvec);
-        float q_rsqrt_var = float(1) / std::sqrt(sum_q + eps);
-        float k_rsqrt_var = float(1) / std::sqrt(sum_k + eps);
-        const fVec q_scale_fvec = fVec(q_rsqrt_var);
-        const fVec k_scale_fvec = fVec(k_rsqrt_var);
-        for (d = 0; d <= qk_head_size - VecSize; d += VecSize) {
-          bVec q_bvec = bVec::loadu(q_orig + q_offset + d);
-          fVec q_fvec0, q_fvec1;
-          std::tie(q_fvec0, q_fvec1) = at::vec::convert_to_float(q_bvec);
-
-          q_fvec0 = q_fvec0 * q_scale_fvec;
-          q_fvec1 = q_fvec1 * q_scale_fvec;
-          bVec out_bvec = convert_from_float_ext<scalar_t>(q_fvec0, q_fvec1);
-          out_bvec.store(q_orig + q_offset + d);
-          bVec k_bvec = bVec::loadu(k_orig + k_offset + d);
-          fVec k_fvec0, k_fvec1;
-          std::tie(k_fvec0, k_fvec1) = at::vec::convert_to_float(k_bvec);
-
-          k_fvec0 = k_fvec0 * k_scale_fvec;
-          k_fvec1 = k_fvec1 * k_scale_fvec;
-          out_bvec = convert_from_float_ext<scalar_t>(k_fvec0, k_fvec1);
-          out_bvec.store(k_orig + k_offset + d);
-        }
-        for (; d < qk_head_size; ++d) {
-          float q_val = static_cast<float>(q_orig[q_offset + d]);
-          float k_val = static_cast<float>(k_orig[k_offset + d]);
-          q_orig[q_offset + d] = static_cast<scalar_t>(q_val * q_rsqrt_var);
-          k_orig[k_offset + d] = static_cast<scalar_t>(k_val * k_rsqrt_var);
-        }
-
+        q_norm_sum_ptr[0] = static_cast<scalar_t>(float(1) / std::sqrt(sum_q + eps));
+        k_norm_sum_ptr[0] = static_cast<scalar_t>(float(1) / std::sqrt(sum_k + eps));
         data_index_step(h_qk, qk_num_head, l, global_seq_len);
       }
     });
@@ -159,11 +134,11 @@ void chunk_gated_delta_rule_kernel_impl(
     int64_t h_qk = 0, c = 0;
     data_index_init(begin, h_qk, qk_num_head, c, global_num_chunk);
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
-      int64_t ib = chunk_indices[c][0];  // idx_batch
-      int64_t ic = chunk_indices[c][1];  // idx_chunk
+      int64_t ib = chunk_indices_ptr[c * 2];      // idx_batch
+      int64_t ic = chunk_indices_ptr[c * 2 + 1];  // idx_chunk
       int64_t l_orig = cu_seqlens_ptr[ib] + ic * chunk_size;
       int64_t l = c * chunk_size;
-      bool is_tail = (c + 1 == chunk_offsets[ib + 1]);
+      bool is_tail = (c + 1 == chunk_offsets_ptr[ib + 1]);
       int64_t seq_len = cu_seqlens_ptr[ib + 1] - cu_seqlens_ptr[ib];
       int64_t real_chunk_size = is_tail ? seq_len - ic * chunk_size : chunk_size;
       auto q_orig_ptr = q_orig + h_qk * qStrideH + l_orig * qStrideT;
@@ -181,22 +156,22 @@ void chunk_gated_delta_rule_kernel_impl(
         auto curr_k_orig = k_orig_ptr + j * kStrideT;
         auto curr_q_pad = q_pad_ptr + j * qk_head_size;
         auto curr_k_pad = k_pad_ptr + j * qk_head_size;
+        auto q_scale =
+            use_qk_l2norm_in_kernel ? *(q_norm_sum + h_qk * global_seq_len + l_orig + j) : static_cast<scalar_t>(1);
+        auto k_scale =
+            use_qk_l2norm_in_kernel ? *(k_norm_sum + h_qk * global_seq_len + l_orig + j) : static_cast<scalar_t>(1);
+        auto q_scale_vec = bVec(q_scale);
+        auto k_scale_vec = bVec(k_scale);
         int64_t i = 0;
         scalar_t scale_reduced = static_cast<scalar_t>(scale);
-        auto vec_scale_reduced = at::vec::Vectorized<scalar_t>(scale_reduced);
-        for (; i < reduced_vec_size * (qk_head_size / reduced_vec_size); i += reduced_vec_size) {
-          auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(curr_q_orig + i);
-          auto tmp2 = tmp0 * vec_scale_reduced;
-          tmp2.store(curr_q_pad + i);
-          auto tmp3 = at::vec::Vectorized<scalar_t>::loadu(curr_k_orig + i);
-          tmp3.store(curr_k_pad + i);
-        }
-        if (i < qk_head_size) {
-          auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(curr_q_orig + i, qk_head_size - i);
-          auto tmp2 = tmp0 * vec_scale_reduced;
-          tmp2.store(curr_q_pad + i, qk_head_size - i);
-          auto tmp3 = at::vec::Vectorized<scalar_t>::loadu(curr_k_orig + i, qk_head_size - i);
-          tmp3.store(curr_k_pad + i, qk_head_size - i);
+        auto vec_scale_reduced = bVec(scale_reduced);
+        for (; i < fVecSize * (qk_head_size / fVecSize); i += fVecSize) {
+          auto tmp0 = bVec::loadu(curr_q_orig + i, fVecSize);
+          auto tmp1 = tmp0 * q_scale_vec * vec_scale_reduced;
+          tmp1.store(curr_q_pad + i, fVecSize);
+          auto tmp3 = bVec::loadu(curr_k_orig + i, fVecSize);
+          auto tmp4 = tmp3 * k_scale_vec;
+          tmp4.store(curr_k_pad + i, fVecSize);
         }
 
         for (auto hi = 0; hi < head_group; hi++) {
@@ -211,30 +186,19 @@ void chunk_gated_delta_rule_kernel_impl(
           // query = query * scale
           // k_beta = key * beta.unsqueeze(-1)
           int64_t i = 0;
-          auto vec_b_reduced = at::vec::Vectorized<scalar_t>(b_orig_val_reduced);
-          for (; i < reduced_vec_size * (qk_head_size / reduced_vec_size); i += reduced_vec_size) {
-            auto tmp3 = at::vec::Vectorized<scalar_t>::loadu(curr_k_orig + i);
-            auto tmp5 = tmp3 * vec_b_reduced;
-            tmp5.store(curr_k_beta + i);
-          }
-          if (i < qk_head_size) {
-            auto tmp3 = at::vec::Vectorized<scalar_t>::loadu(curr_k_orig + i, qk_head_size - i);
-            auto tmp5 = tmp3 * vec_b_reduced;
-            tmp5.store(curr_k_beta + i, qk_head_size - i);
+          auto vec_b_reduced = bVec(b_orig_val_reduced);
+          for (; i < fVecSize * (qk_head_size / fVecSize); i += fVecSize) {
+            auto tmp0 = bVec::loadu(curr_k_orig + i, fVecSize);
+            auto tmp2 = tmp0 * k_scale_vec * vec_b_reduced;
+            tmp2.store(curr_k_beta + i, fVecSize);
           }
           // v_beta = value * beta.unsqueeze(-1)
           i = 0;
-          for (; i < reduced_vec_size * (v_head_size / reduced_vec_size); i += reduced_vec_size) {
-            auto tmp3 = at::vec::Vectorized<scalar_t>::loadu(curr_v_orig + i);
+          for (; i < VecSize * (v_head_size / VecSize); i += VecSize) {
+            auto tmp3 = bVec::loadu(curr_v_orig + i);
             tmp3.store(curr_v_pad + i);
             auto tmp5 = tmp3 * vec_b_reduced;
             tmp5.store(curr_v_beta + i);
-          }
-          if (i < v_head_size) {
-            auto tmp3 = at::vec::Vectorized<scalar_t>::loadu(curr_v_orig + i, v_head_size - i);
-            tmp3.store(curr_v_pad + i, v_head_size - i);
-            auto tmp5 = tmp3 * vec_b_reduced;
-            tmp5.store(curr_v_beta + i, v_head_size - i);
           }
         }
       }
@@ -243,14 +207,10 @@ void chunk_gated_delta_rule_kernel_impl(
         auto curr_q_pad = q_pad_ptr + j * qk_head_size;
         auto curr_k_pad = k_pad_ptr + j * qk_head_size;
         int64_t i = 0;
-        auto vec_zero = at::vec::Vectorized<scalar_t>(0.0);
-        for (; i < reduced_vec_size * (qk_head_size / reduced_vec_size); i += reduced_vec_size) {
+        auto vec_zero = bVec(0.0);
+        for (; i < VecSize * (qk_head_size / VecSize); i += VecSize) {
           vec_zero.store(curr_q_pad + i);
           vec_zero.store(curr_k_pad + i);
-        }
-        if (i < qk_head_size) {
-          vec_zero.store(curr_q_pad + i, qk_head_size - i);
-          vec_zero.store(curr_k_pad + i, qk_head_size - i);
         }
         for (auto hi = 0; hi < head_group; hi++) {
           int64_t h = h_qk * head_group + hi;
@@ -258,20 +218,13 @@ void chunk_gated_delta_rule_kernel_impl(
           auto curr_k_beta = k_beta_ptr + h * global_total_seq_length * qk_head_size + j * qk_head_size;
           auto curr_v_beta = v_beta_ptr + h * global_total_seq_length * v_head_size + j * v_head_size;
           int64_t i = 0;
-          for (; i < reduced_vec_size * (qk_head_size / reduced_vec_size); i += reduced_vec_size) {
+          for (; i < VecSize * (qk_head_size / VecSize); i += VecSize) {
             vec_zero.store(curr_k_beta + i);
           }
-          if (i < qk_head_size) {
-            vec_zero.store(curr_k_beta + i, qk_head_size - i);
-          }
           i = 0;
-          for (; i < reduced_vec_size * (v_head_size / reduced_vec_size); i += reduced_vec_size) {
+          for (; i < VecSize * (v_head_size / VecSize); i += VecSize) {
             vec_zero.store(curr_v_pad + i);
             vec_zero.store(curr_v_beta + i);
-          }
-          if (i < v_head_size) {
-            vec_zero.store(curr_v_pad + i, v_head_size - i);
-            vec_zero.store(curr_v_beta + i, v_head_size - i);
           }
         }
       }
@@ -286,26 +239,18 @@ void chunk_gated_delta_rule_kernel_impl(
     int ompIdx = at::get_thread_num();
     int64_t offset = 0;
     scalar_t* thread_buff_ptr = thread_buff + ompIdx * buff_size_16bit_per_thread;
-    scalar_t* k_transpose = thread_buff_ptr + offset;
-    offset += qk_head_size * chunk_size;
-    scalar_t* v_pack = thread_buff_ptr + offset;
-    offset += chunk_size * v_head_size;
-    scalar_t* k_beta_g = thread_buff_ptr + offset;
-    offset += chunk_size * qk_head_size;
-    scalar_t* k_beta_g_pack = thread_buff_ptr + offset;
-    offset += chunk_size * qk_head_size;
-    float* curr_attn = reinterpret_cast<float*>(thread_buff_ptr + offset);
-    offset += chunk_size * chunk_size * 2;
-    scalar_t* curr_attn_reduced = thread_buff_ptr + offset;
-    offset += chunk_size * chunk_size;
-    float* k_cumdecay = reinterpret_cast<float*>(thread_buff_ptr + offset);
-    offset += chunk_size * qk_head_size * 2;
-    float* row = reinterpret_cast<float*>(thread_buff_ptr + offset);
-    offset += chunk_size * 2;
-    float* updated = reinterpret_cast<float*>(thread_buff_ptr + offset);
+    THREAD_BUFFER_ALLOC(k_transpose, thread_buff_ptr, offset, scalar_t, qk_head_size * chunk_size);
+    THREAD_BUFFER_ALLOC(v_pack, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
+    THREAD_BUFFER_ALLOC(k_beta_g, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
+    THREAD_BUFFER_ALLOC(k_beta_g_pack, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
+    THREAD_BUFFER_ALLOC(curr_attn, thread_buff_ptr, offset, float, chunk_size* chunk_size * 2);
+    THREAD_BUFFER_ALLOC(curr_attn_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * chunk_size);
+    THREAD_BUFFER_ALLOC(k_cumdecay, thread_buff_ptr, offset, float, chunk_size* qk_head_size * 2);
+    THREAD_BUFFER_ALLOC(row, thread_buff_ptr, offset, float, chunk_size * 2);
+    THREAD_BUFFER_ALLOC(updated, thread_buff_ptr, offset, float, chunk_size * 2);
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
-      int64_t ib = chunk_indices[c][0];  // idx_batch
-      int64_t ic = chunk_indices[c][1];  // idx_chunk
+      int64_t ib = chunk_indices_ptr[c * 2];      // idx_batch
+      int64_t ic = chunk_indices_ptr[c * 2 + 1];  // idx_chunk
       int64_t l_orig = cu_seqlens_ptr[ib] + ic * chunk_size;
       int64_t seq_len = cu_seqlens_ptr[ib + 1] - cu_seqlens_ptr[ib];
       int64_t h_qk = h / head_group;
@@ -331,19 +276,19 @@ void chunk_gated_delta_rule_kernel_impl(
         // decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
         // decay_mask: [B, HV, num_chunk, chunk_size, chunk_size]
         float curr_g_pad_i = static_cast<float>(curr_g_pad[i]);
-        auto vec_curr_g_pad_i = at::vec::Vectorized<float>(curr_g_pad_i);
+        auto vec_curr_g_pad_i = fVec(curr_g_pad_i);
         int64_t j = 0;
         int64_t len = i + 1;
-        for (; j < vec_size * (len / vec_size); j += vec_size) {
-          auto tmp0 = at::vec::Vectorized<float>::loadu(curr_g_pad + j);
+        for (; j < fVecSize * (len / fVecSize); j += fVecSize) {
+          auto tmp0 = fVec::loadu(curr_g_pad + j);
           auto tmp1 = vec_curr_g_pad_i - tmp0;
-          auto tmp2 = tmp1.exp();
+          auto tmp2 = tmp1.exp_u20();
           tmp2.store(curr_decay_mask + i * chunk_size + j);
         }
         if (j < len) {
-          auto tmp0 = at::vec::Vectorized<float>::loadu(curr_g_pad + j, len - j);
+          auto tmp0 = fVec::loadu(curr_g_pad + j, len - j);
           auto tmp1 = vec_curr_g_pad_i - tmp0;
-          auto tmp2 = tmp1.exp();
+          auto tmp2 = tmp1.exp_u20();
           tmp2.store(curr_decay_mask + i * chunk_size + j, len - j);
         }
       }
@@ -360,22 +305,20 @@ void chunk_gated_delta_rule_kernel_impl(
           /* ld_dst */ chunk_size);
       // k_beta @ key.transpose(-1, -2)
       at::native::cpublas::brgemm(
-          /* M */ chunk_size,
-          /* N */ chunk_size,
-          /* K */ qk_head_size,
-          /* lda */ qk_head_size,
-          /* ldb */ chunk_size,
-          /* ldc */ chunk_size,
+          /*     M */ chunk_size,
+          /*     N */ chunk_size,
+          /*     K */ qk_head_size,
+          /*   lda */ qk_head_size,
+          /*   ldb */ chunk_size,
+          /*   ldc */ chunk_size,
           /* add_C */ false,
-          /* A */ curr_k_beta,
-          /* B */ k_transpose,
-          /* C */ curr_attn);
+          /*     A */ curr_k_beta,
+          /*     B */ k_transpose,
+          /*     C */ curr_attn);
       // attn = attn * decay_mask
       for (int64_t m = 0; m < chunk_size; m++) {
         at::vec::map2<float>(
-            [](at::vec::Vectorized<float> x, at::vec::Vectorized<float> y) {
-              return at::vec::Vectorized<float>(0) - x * y;
-            },
+            [](fVec x, fVec y) { return fVec(0) - x * y; },
             curr_attn + m * chunk_size,
             curr_attn + m * chunk_size,
             curr_decay_mask + m * chunk_size,
@@ -390,16 +333,16 @@ void chunk_gated_delta_rule_kernel_impl(
       // attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
       // attn = -attn.masked_fill(mask, 0)
       for (int i = 0; i < chunk_size; i++) {
-        const auto vec_zero = at::vec::Vectorized<float>(0);
+        const auto vec_zero = fVec(0);
         int64_t len = chunk_size - i;
-        int64_t front = len % vec_size;
+        int64_t front = len % fVecSize;
         int64_t j = i;
         // first masked vec for alignment
         if (front > 0) {
           vec_zero.store(curr_attn + i * chunk_size + j, front);
           j += front;
         }
-        for (; j < vec_size * (chunk_size / vec_size); j += vec_size) {
+        for (; j < fVecSize * (chunk_size / fVecSize); j += fVecSize) {
           vec_zero.store(curr_attn + i * chunk_size + j);
         }
       }
@@ -407,32 +350,32 @@ void chunk_gated_delta_rule_kernel_impl(
         // row = attn[..., i, :i] [B, HK, num_chunk, i]
         int64_t j = 0;
         int64_t len = i;
-        for (; j < vec_size * (len / vec_size); j += vec_size) {
-          auto tmp0 = at::vec::Vectorized<float>::loadu(curr_attn + i * chunk_size + j);
+        for (; j < fVecSize * (len / fVecSize); j += fVecSize) {
+          auto tmp0 = fVec::loadu(curr_attn + i * chunk_size + j);
           tmp0.store(row + j);
         }
         if (j < len) {
-          auto tmp0 = at::vec::Vectorized<float>::loadu(curr_attn + i * chunk_size + j, len - j);
+          auto tmp0 = fVec::loadu(curr_attn + i * chunk_size + j, len - j);
           tmp0.store(row + j, len - j);
         }
         // (row.unsqueeze(-1) * sub).sum(-2)
         fill_stub(updated, 0, i);
         for (int k = 0; k < i; k++) {
           float row_k = row[k];
-          auto vec_row_k = at::vec::Vectorized<float>(row_k);
+          auto vec_row_k = fVec(row_k);
           int64_t j = 0;
           int64_t len = i;
-          for (; j < vec_size * (len / vec_size); j += vec_size) {
-            auto tmp0 = at::vec::Vectorized<float>::loadu(curr_attn + k * chunk_size + j);
+          for (; j < fVecSize * (len / fVecSize); j += fVecSize) {
+            auto tmp0 = fVec::loadu(curr_attn + k * chunk_size + j);
             auto tmp1 = vec_row_k * tmp0;
-            auto tmp2 = at::vec::Vectorized<float>::loadu(updated + j);
+            auto tmp2 = fVec::loadu(updated + j);
             auto tmp3 = tmp1 + tmp2;
             tmp3.store(updated + j);
           }
           if (j < len) {
-            auto tmp0 = at::vec::Vectorized<float>::loadu(curr_attn + k * chunk_size + j, len - j);
+            auto tmp0 = fVec::loadu(curr_attn + k * chunk_size + j, len - j);
             auto tmp1 = vec_row_k * tmp0;
-            auto tmp2 = at::vec::Vectorized<float>::loadu(updated + j);
+            auto tmp2 = fVec::loadu(updated + j);
             auto tmp3 = tmp1 + tmp2;
             tmp3.store(updated + j, len - j);
           }
@@ -440,15 +383,15 @@ void chunk_gated_delta_rule_kernel_impl(
         // attn[..., i, :i] = row + sum(...)
         j = 0;
         len = i;
-        for (; j < vec_size * (len / vec_size); j += vec_size) {
-          auto tmp0 = at::vec::Vectorized<float>::loadu(row + j);
-          auto tmp1 = at::vec::Vectorized<float>::loadu(updated + j);
+        for (; j < fVecSize * (len / fVecSize); j += fVecSize) {
+          auto tmp0 = fVec::loadu(row + j);
+          auto tmp1 = fVec::loadu(updated + j);
           auto tmp2 = tmp0 + tmp1;
           tmp2.store(curr_attn + i * chunk_size + j);
         }
         if (j < len) {
-          auto tmp0 = at::vec::Vectorized<float>::loadu(row + j, len - j);
-          auto tmp1 = at::vec::Vectorized<float>::loadu(updated + j, len - j);
+          auto tmp0 = fVec::loadu(row + j, len - j);
+          auto tmp1 = fVec::loadu(updated + j, len - j);
           auto tmp2 = tmp0 + tmp1;
           tmp2.store(curr_attn + i * chunk_size + j, len - j);
         }
@@ -456,10 +399,7 @@ void chunk_gated_delta_rule_kernel_impl(
       for (int i = 0; i < chunk_size; i++) {
         curr_attn[i * chunk_size + i] += 1.0f;
         at::vec::map<scalar_t>(
-            [](at::vec::Vectorized<float> x) { return x; },
-            curr_attn_reduced + i * chunk_size,
-            curr_attn + i * chunk_size,
-            chunk_size);
+            [](fVec x) { return x; }, curr_attn_reduced + i * chunk_size, curr_attn + i * chunk_size, chunk_size);
       }
 
       // v_beta_attn = attn @ v_beta
@@ -477,31 +417,26 @@ void chunk_gated_delta_rule_kernel_impl(
           /* ld_dst */ v_head_size);
       // value = attn @ v_beta
       at::native::cpublas::brgemm(
-          /* M */ chunk_size,
-          /* N */ v_head_size,
-          /* K */ chunk_size,
-          /* lda */ chunk_size,
-          /* ldb */ v_head_size,
-          /* ldc */ v_head_size,
+          /*     M */ chunk_size,
+          /*     N */ v_head_size,
+          /*     K */ chunk_size,
+          /*   lda */ chunk_size,
+          /*   ldb */ v_head_size,
+          /*   ldc */ v_head_size,
           /* add_C */ false,
-          /* A */ curr_attn_reduced,
-          /* B */ v_pack,
-          /* C */ curr_value);
+          /*     A */ curr_attn_reduced,
+          /*     B */ v_pack,
+          /*     C */ curr_value);
       // k_beta_g = k_beta * g.exp().unsqueeze(-1)
       for (int64_t j = 0; j < chunk_size; j++) {
         int64_t i = 0;
         float g_exp = std::exp(curr_g_pad[j]);
         scalar_t g_exp_reduced = static_cast<scalar_t>(g_exp);
-        auto vec_g_exp_reduced = at::vec::Vectorized<scalar_t>(g_exp_reduced);
-        for (; i < reduced_vec_size * (qk_head_size / reduced_vec_size); i += reduced_vec_size) {
-          auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(curr_k_beta + j * qk_head_size + i);
+        auto vec_g_exp_reduced = bVec(g_exp_reduced);
+        for (; i < VecSize * (qk_head_size / VecSize); i += VecSize) {
+          auto tmp0 = bVec::loadu(curr_k_beta + j * qk_head_size + i);
           auto tmp1 = tmp0 * vec_g_exp_reduced;
           tmp1.store(k_beta_g + j * qk_head_size + i);
-        }
-        if (i < qk_head_size) {
-          auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(curr_k_beta + j * qk_head_size + i, qk_head_size - i);
-          auto tmp1 = tmp0 * vec_g_exp_reduced;
-          tmp1.store(k_beta_g + j * qk_head_size + i, qk_head_size - i);
         }
       }
       // pack for k_beta_g
@@ -514,19 +449,19 @@ void chunk_gated_delta_rule_kernel_impl(
           /* ld_dst */ qk_head_size);
       // k_cumdecay = attn @ k_beta_g
       at::native::cpublas::brgemm(
-          /* M */ chunk_size,
-          /* N */ qk_head_size,
-          /* K */ chunk_size,
-          /* lda */ chunk_size,
-          /* ldb */ qk_head_size,
-          /* ldc */ qk_head_size,
+          /*     M */ chunk_size,
+          /*     N */ qk_head_size,
+          /*     K */ chunk_size,
+          /*   lda */ chunk_size,
+          /*   ldb */ qk_head_size,
+          /*   ldc */ qk_head_size,
           /* add_C */ false,
-          /* A */ curr_attn_reduced,
-          /* B */ k_beta_g_pack,
-          /* C */ k_cumdecay);
+          /*     A */ curr_attn_reduced,
+          /*     B */ k_beta_g_pack,
+          /*     C */ k_cumdecay);
       for (int i = 0; i < chunk_size; i++) {
         at::vec::map<scalar_t>(
-            [](at::vec::Vectorized<float> x) { return x; },
+            [](fVec x) { return x; },
             curr_k_cumdecay_reduced + i * qk_head_size,
             k_cumdecay + i * qk_head_size,
             qk_head_size);
@@ -553,38 +488,27 @@ void chunk_gated_delta_rule_kernel_impl(
         /* row */ chunk_size * 2 +
         /* updated */ chunk_size * 2;
     scalar_t* thread_buff_ptr = thread_buff + ompIdx * buff_size_16bit_per_thread;
-    scalar_t* curr_last_recurrent_state_reduced = thread_buff_ptr + offset;
-    offset += qk_head_size * v_head_size;
-    scalar_t* curr_last_recurrent_state_pack_reduced = thread_buff_ptr + offset;
-    offset += qk_head_size * v_head_size;
-    scalar_t* k_transpose_i = thread_buff_ptr + offset;
-    offset += qk_head_size * chunk_size;
-    float* attn_i = reinterpret_cast<float*>(thread_buff_ptr + offset);
-    offset += chunk_size * chunk_size * 2;
-    scalar_t* attn_i_reduced = thread_buff_ptr + offset;
-    offset += chunk_size * chunk_size;
-    float* v_prime = reinterpret_cast<float*>(thread_buff_ptr + offset);
-    offset += chunk_size * v_head_size * 2;
-    scalar_t* v_prime_reduced = thread_buff_ptr + offset;
-    offset += chunk_size * v_head_size;
-    scalar_t* v_prime_pack_reduced = thread_buff_ptr + offset;
-    offset += chunk_size * v_head_size;
-    scalar_t* qg = thread_buff_ptr + offset;
-    offset += chunk_size * qk_head_size;
-    float* attn_inter = reinterpret_cast<float*>(thread_buff_ptr + offset);
-    offset += chunk_size * v_head_size * 2;
-    scalar_t* kg = thread_buff_ptr + offset;
-    offset += chunk_size * qk_head_size;
-    scalar_t* kg_transpose = thread_buff_ptr + offset;
-    offset += qk_head_size * chunk_size;
-    float* kgv = reinterpret_cast<float*>(thread_buff_ptr + offset);
-    offset += qk_head_size * v_head_size * 2;
+    THREAD_BUFFER_ALLOC(
+        curr_last_recurrent_state_reduced, thread_buff_ptr, offset, scalar_t, qk_head_size * v_head_size);
+    THREAD_BUFFER_ALLOC(
+        curr_last_recurrent_state_pack_reduced, thread_buff_ptr, offset, scalar_t, qk_head_size * v_head_size);
+    THREAD_BUFFER_ALLOC(k_transpose_i, thread_buff_ptr, offset, scalar_t, qk_head_size * chunk_size);
+    THREAD_BUFFER_ALLOC(attn_i, thread_buff_ptr, offset, float, chunk_size* chunk_size * 2);
+    THREAD_BUFFER_ALLOC(attn_i_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * chunk_size);
+    THREAD_BUFFER_ALLOC(v_prime, thread_buff_ptr, offset, float, chunk_size* v_head_size * 2);
+    THREAD_BUFFER_ALLOC(v_prime_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
+    THREAD_BUFFER_ALLOC(v_prime_pack_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
+    THREAD_BUFFER_ALLOC(qg, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
+    THREAD_BUFFER_ALLOC(attn_inter, thread_buff_ptr, offset, float, chunk_size* v_head_size * 2);
+    THREAD_BUFFER_ALLOC(kg, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
+    THREAD_BUFFER_ALLOC(kg_transpose, thread_buff_ptr, offset, scalar_t, qk_head_size * chunk_size);
+    THREAD_BUFFER_ALLOC(kgv, thread_buff_ptr, offset, float, qk_head_size* v_head_size * 2);
 
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       int64_t start_q = cu_seqlens_ptr[b];
       int64_t seq_len = cu_seqlens_ptr[b + 1] - start_q;
-      int64_t num_chunk = chunk_offsets[b + 1] - chunk_offsets[b];
-      int64_t chunk_offset = chunk_offsets[b];
+      int64_t num_chunk = chunk_offsets_ptr[b + 1] - chunk_offsets_ptr[b];
+      int64_t chunk_offset = chunk_offsets_ptr[b];
       int64_t len_offset = chunk_offset * chunk_size;
 
       int64_t h_qk = h / head_group;
@@ -606,7 +530,7 @@ void chunk_gated_delta_rule_kernel_impl(
       for (int64_t c = 0; c < num_chunk; c++) {
         for (int i = 0; i < qk_head_size; i++) {
           at::vec::map<scalar_t>(
-              [](at::vec::Vectorized<float> x) { return x; },
+              [](fVec x) { return x; },
               curr_last_recurrent_state_reduced + i * v_head_size,
               curr_last_recurrent_state + i * v_head_size,
               v_head_size);
@@ -647,16 +571,16 @@ void chunk_gated_delta_rule_kernel_impl(
           auto attn_i_reduced_m = attn_i_reduced + m * chunk_size;
           auto decay_mask_i_m = decay_mask_i + m * chunk_size;
           int64_t n = 0;
-          for (; n < vec_size * (chunk_size / vec_size); n += vec_size) {
-            auto tmp0 = at::vec::Vectorized<float>::loadu(attn_i_m + n);
-            auto tmp1 = at::vec::Vectorized<float>::loadu(decay_mask_i_m + n);
+          for (; n < fVecSize * (chunk_size / fVecSize); n += fVecSize) {
+            auto tmp0 = fVec::loadu(attn_i_m + n);
+            auto tmp1 = fVec::loadu(decay_mask_i_m + n);
             auto tmp2 = tmp0 * tmp1;
             auto tmp3 = at::vec::convert<scalar_t>(tmp2);
-            tmp3.store(attn_i_reduced_m + n, vec_size);
+            tmp3.store(attn_i_reduced_m + n, fVecSize);
           }
           if (n < chunk_size) {
-            auto tmp0 = at::vec::Vectorized<float>::loadu(attn_i_m + n, chunk_size - n);
-            auto tmp1 = at::vec::Vectorized<float>::loadu(decay_mask_i_m + n, chunk_size - n);
+            auto tmp0 = fVec::loadu(attn_i_m + n, chunk_size - n);
+            auto tmp1 = fVec::loadu(decay_mask_i_m + n, chunk_size - n);
             auto tmp2 = tmp0 * tmp1;
             auto tmp3 = at::vec::convert<scalar_t>(tmp2);
             tmp3.store(attn_i_reduced_m + n, chunk_size - n);
@@ -665,16 +589,16 @@ void chunk_gated_delta_rule_kernel_impl(
         // mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
         // attn_i = attn_i.masked_fill_(mask, 0)
         for (int i = 0; i < chunk_size - 1; i++) {
-          const auto vec_zero = at::vec::Vectorized<scalar_t>(0);
+          const auto vec_zero = bVec(0);
           int64_t len = chunk_size - i - 1;
-          int64_t front = len % reduced_vec_size;
+          int64_t front = len % VecSize;
           int64_t j = i + 1;
           // first masked vec for alignment
           if (front > 0) {
             vec_zero.store(attn_i_reduced + i * chunk_size + j, front);
             j += front;
           }
-          for (; j < reduced_vec_size * (chunk_size / reduced_vec_size); j += reduced_vec_size) {
+          for (; j < VecSize * (chunk_size / VecSize); j += VecSize) {
             vec_zero.store(attn_i_reduced + i * chunk_size + j);
           }
         }
@@ -692,34 +616,27 @@ void chunk_gated_delta_rule_kernel_impl(
         // k_cumdecay_i: [chunk_size, EK]
         // curr_last_recurrent_state: [EK, EV]
         at::native::cpublas::brgemm(
-            /* M */ chunk_size,
-            /* N */ v_head_size,
-            /* K */ qk_head_size,
-            /* lda */ qk_head_size,
-            /* ldb */ v_head_size,
-            /* ldc */ v_head_size,
+            /*     M */ chunk_size,
+            /*     N */ v_head_size,
+            /*     K */ qk_head_size,
+            /*   lda */ qk_head_size,
+            /*   ldb */ v_head_size,
+            /*   ldc */ v_head_size,
             /* add_C */ false,
-            /* A */ k_cumdecay_i_reduced,
-            /* B */ curr_last_recurrent_state_pack_reduced,
-            /* C */ v_prime);
+            /*     A */ k_cumdecay_i_reduced,
+            /*     B */ curr_last_recurrent_state_pack_reduced,
+            /*     C */ v_prime);
 
         // v_new = v_prime = v_i - v_prime
         // v_i: [chunk_size, EV]
         for (int64_t m = 0; m < chunk_size; m++) {
           int64_t i = 0;
-          for (; i < vec_size * (v_head_size / vec_size); i += vec_size) {
-            auto tmp0 = at::vec::Vectorized<float>::loadu(v_i + m * v_head_size + i);
-            auto tmp1 = at::vec::Vectorized<float>::loadu(v_prime + m * v_head_size + i);
+          for (; i < fVecSize * (v_head_size / fVecSize); i += fVecSize) {
+            auto tmp0 = fVec::loadu(v_i + m * v_head_size + i);
+            auto tmp1 = fVec::loadu(v_prime + m * v_head_size + i);
             auto tmp2 = tmp0 - tmp1;
             auto tmp3 = at::vec::convert<scalar_t>(tmp2);
-            tmp3.store(v_prime_reduced + m * v_head_size + i, vec_size);
-          }
-          if (i < v_head_size) {
-            auto tmp0 = at::vec::Vectorized<float>::loadu(v_i + m * v_head_size + i, v_head_size - i);
-            auto tmp1 = at::vec::Vectorized<float>::loadu(v_prime + m * v_head_size + i, v_head_size - i);
-            auto tmp2 = tmp0 - tmp1;
-            auto tmp3 = at::vec::convert<scalar_t>(tmp2);
-            tmp3.store(v_prime_reduced + m * v_head_size + i, v_head_size - i);
+            tmp3.store(v_prime_reduced + m * v_head_size + i, fVecSize);
           }
         }
 
@@ -732,16 +649,11 @@ void chunk_gated_delta_rule_kernel_impl(
           auto g_exp = std::exp(*g_pad_i_m);
           int64_t i = 0;
           scalar_t g_exp_reduced = static_cast<scalar_t>(g_exp);
-          auto vec_g_exp_reduced = at::vec::Vectorized<scalar_t>(g_exp_reduced);
-          for (; i < reduced_vec_size * (qk_head_size / reduced_vec_size); i += reduced_vec_size) {
-            auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(q_i + m * qk_head_size + i);
+          auto vec_g_exp_reduced = bVec(g_exp_reduced);
+          for (; i < VecSize * (qk_head_size / VecSize); i += VecSize) {
+            auto tmp0 = bVec::loadu(q_i + m * qk_head_size + i);
             auto tmp2 = tmp0 * vec_g_exp_reduced;
             tmp2.store(qg + m * qk_head_size + i);
-          }
-          if (i < qk_head_size) {
-            auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(q_i + m * qk_head_size + i, qk_head_size - i);
-            auto tmp2 = tmp0 * vec_g_exp_reduced;
-            tmp2.store(qg + m * qk_head_size + i, qk_head_size - i);
           }
         }
         // attn_inter = qg @ curr_last_recurrent_state: [chunk_size, EV]
@@ -785,10 +697,7 @@ void chunk_gated_delta_rule_kernel_impl(
         // core_attn_out[:, :, i] = attn_inter
         for (int64_t m = 0; m < chunk_size; m++) {
           at::vec::map<float>(
-              [](at::vec::Vectorized<float> x) { return x; },
-              core_attn_out_i + m * v_head_size,
-              attn_inter + m * v_head_size,
-              v_head_size);
+              [](fVec x) { return x; }, core_attn_out_i + m * v_head_size, attn_inter + m * v_head_size, v_head_size);
         }
 
         // last_recurrent_state = (
@@ -803,16 +712,15 @@ void chunk_gated_delta_rule_kernel_impl(
         auto g_exp_last = std::exp(g_pad_i_last[0]);
         for (int64_t m = 0; m < qk_head_size; m++) {
           int64_t i = 0;
-          auto vec_g_exp_last = at::vec::Vectorized<float>(g_exp_last);
-          for (; i < vec_size * (v_head_size / vec_size); i += vec_size) {
-            auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(curr_last_recurrent_state_reduced + m * v_head_size + i);
+          auto vec_g_exp_last = fVec(g_exp_last);
+          for (; i < fVecSize * (v_head_size / fVecSize); i += fVecSize) {
+            auto tmp0 = bVec::loadu(curr_last_recurrent_state_reduced + m * v_head_size + i);
             auto tmp1 = at::vec::convert<float>(tmp0);
             auto tmp2 = tmp1 * vec_g_exp_last;
             tmp2.store(curr_last_recurrent_state + m * v_head_size + i);
           }
           if (i < v_head_size) {
-            auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(
-                curr_last_recurrent_state_reduced + m * v_head_size + i, v_head_size - i);
+            auto tmp0 = bVec::loadu(curr_last_recurrent_state_reduced + m * v_head_size + i, v_head_size - i);
             auto tmp1 = at::vec::convert<float>(tmp0);
             auto tmp2 = tmp1 * vec_g_exp_last;
             tmp2.store(curr_last_recurrent_state + m * v_head_size + i, v_head_size - i);
@@ -832,16 +740,11 @@ void chunk_gated_delta_rule_kernel_impl(
           auto g_exp = std::exp((g_pad_i_last[0] - g_pad_i[m]));
           int64_t i = 0;
           scalar_t g_exp_reduced = static_cast<scalar_t>(g_exp);
-          auto vec_g_exp_reduced = at::vec::Vectorized<scalar_t>(g_exp_reduced);
-          for (; i < reduced_vec_size * (qk_head_size / reduced_vec_size); i += reduced_vec_size) {
-            auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(k_i + m * qk_head_size + i);
+          auto vec_g_exp_reduced = bVec(g_exp_reduced);
+          for (; i < VecSize * (qk_head_size / VecSize); i += VecSize) {
+            auto tmp0 = bVec::loadu(k_i + m * qk_head_size + i);
             auto tmp2 = tmp0 * vec_g_exp_reduced;
             tmp2.store(kg + m * qk_head_size + i);
-          }
-          if (i < qk_head_size) {
-            auto tmp0 = at::vec::Vectorized<scalar_t>::loadu(k_i + m * qk_head_size + i, qk_head_size - i);
-            auto tmp2 = tmp0 * vec_g_exp_reduced;
-            tmp2.store(kg + m * qk_head_size + i, qk_head_size - i);
           }
         }
         // kg.transpose(-1, -2): [EK, chunk_size]
@@ -868,7 +771,7 @@ void chunk_gated_delta_rule_kernel_impl(
         // last_recurrent_state = 1) + 2)
         for (int64_t m = 0; m < qk_head_size; m++) {
           at::vec::map2<float>(
-              [](at::vec::Vectorized<float> x, at::vec::Vectorized<float> y) { return x + y; },
+              [](fVec x, fVec y) { return x + y; },
               curr_last_recurrent_state + m * v_head_size,
               curr_last_recurrent_state + m * v_head_size,
               kgv + m * v_head_size,
@@ -882,10 +785,7 @@ void chunk_gated_delta_rule_kernel_impl(
       auto curr_out = out_ptr + h * oStrideH;
       for (int64_t m = 0; m < seq_len; m++) {
         at::vec::map<scalar_t>(
-            [](at::vec::Vectorized<float> x) { return x; },
-            curr_out + m * oStrideT,
-            curr_core_attn_out + m * v_head_size,
-            v_head_size);
+            [](fVec x) { return x; }, curr_out + m * oStrideT, curr_core_attn_out + m * v_head_size, v_head_size);
       }
 
       // Move to the next query
@@ -895,19 +795,16 @@ void chunk_gated_delta_rule_kernel_impl(
 }
 }  // anonymous namespace
 
-template <bool is_contiguous, bool is_last_dim_contiguous>
-static inline void
-CHECK_INPUT_SHAPE_DTYPE(at::Tensor& tensor, const int64_t& dim, const std::vector<int64_t>& sizes, at::ScalarType st) {
-  if (is_contiguous) {
-    CHECK_CONTIGUOUS(tensor);
-  }
+template <bool is_last_dim_contiguous>
+inline void
+CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::IntArrayRef& sizes, at::ScalarType st) {
+  TORCH_CHECK(tensor.sizes() == sizes, "Input tensor shape mismatch: expected ", sizes, ", got ", tensor.sizes());
+  TORCH_CHECK(tensor.dtype() == st, "Input tensor dtype mismatch");
+  CHECK_DIM(dim, tensor);
   if (is_last_dim_contiguous) {
     CHECK_LAST_DIM_CONTIGUOUS_INPUT(tensor);
-  }
-  TORCH_CHECK(tensor.dtype() == st);
-  CHECK_DIM(dim, tensor);
-  for (int64_t i = 0; i < dim; i++) {
-    CHECK_EQ(tensor.size(i), sizes[i]);
+  } else {
+    CHECK_CONTIGUOUS(tensor);
   }
 }
 
@@ -922,16 +819,17 @@ CHECK_INPUT_SHAPE_DTYPE(at::Tensor& tensor, const int64_t& dim, const std::vecto
 // head_first: bool
 // use_qk_l2norm_in_kernel: bool
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
-    at::Tensor& query,
-    at::Tensor& key,
-    at::Tensor& value,
-    at::Tensor& g,
-    at::Tensor& beta,
-    at::Tensor& initial_state,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state,
     bool output_final_state,
-    at::Tensor& cu_seqlens,
+    const at::Tensor& cu_seqlens,
     bool head_first,
-    bool use_qk_l2norm_in_kernel) {
+    bool use_qk_l2norm_in_kernel,
+    double eps = 1e-5) {
   RECORD_FUNCTION(
       "sgl-kernel::chunk_gated_delta_rule_cpu", std::vector<c10::IValue>({query, key, value, g, beta, initial_state}));
 
@@ -944,15 +842,16 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   int64_t v_head_size = value.size(3);
   int64_t batch_size = initial_state.size(0);
   CHECK_EQ(B, 1);
-  CHECK_EQ(v_num_head % qk_num_head, 0);
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(query, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(key, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
-  CHECK_INPUT_SHAPE_DTYPE<false, true>(value, 4, {B, global_seq_len, v_num_head, v_head_size}, at::kBFloat16);
-  CHECK_INPUT_SHAPE_DTYPE<true, true>(g, 3, {B, global_seq_len, v_num_head}, at::kFloat);
-  CHECK_INPUT_SHAPE_DTYPE<true, true>(beta, 3, {B, global_seq_len, v_num_head}, at::kBFloat16);
-  CHECK_INPUT_SHAPE_DTYPE<true, true>(cu_seqlens, 1, {batch_size + 1}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<true, true>(
-      initial_state, 4, {batch_size, v_num_head, qk_head_size, v_head_size}, at::kFloat);
+  TORCH_CHECK(v_num_head % qk_num_head == 0, "expect v_num_head multiple of qk_num_head.");
+  TORCH_CHECK(qk_head_size % 32 == 0, "expect qk_head_size to be multiples of 32.");
+  TORCH_CHECK(v_head_size % 32 == 0, "expect v_head_size to be multiples of 32.");
+  CHECK_INPUT_SHAPE_DTYPE<true>(query, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<true>(key, 4, {B, global_seq_len, qk_num_head, qk_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<true>(value, 4, {B, global_seq_len, v_num_head, v_head_size}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<false>(g, 3, {B, global_seq_len, v_num_head}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<false>(beta, 3, {B, global_seq_len, v_num_head}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<false>(cu_seqlens, 1, {batch_size + 1}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, 4, {batch_size, v_num_head, qk_head_size, v_head_size}, at::kFloat);
 
   at::Tensor output = at::empty_like(value, value.options());  // [B, T, HV, EV]
   at::Tensor final_state = initial_state.to(at::kFloat);       // [N, HV, EK, EV]
@@ -970,8 +869,9 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   // e.g. cu_seqlens: [0, 5, 13, 16], chunk_size = 4
   // chunk_offsets: [0, 2, 4, 5]
   // chunk_indices (batch_id, local_chunk_id): [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0]]
-  std::vector<int64_t> chunk_offsets(batch_size + 1, 0);
-  std::vector<std::vector<int64_t>> chunk_indices;
+  at::Tensor chunk_offsets = at::empty(batch_size + 1, cu_seqlens.options());
+  auto chunk_offsets_ptr = chunk_offsets.data_ptr<int32_t>();
+  chunk_offsets_ptr[0] = 0;
   int32_t* cu_seqlens_ptr = cu_seqlens.data_ptr<int32_t>();
   int64_t s = 0;
   int64_t e = 0;
@@ -984,14 +884,22 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     int64_t total_seq_length = seq_len + pad_size;
     e_pad = s_pad + total_seq_length;
     chunk_offsets[b + 1] = e_pad / chunk_size;
-    for (int64_t c = 0; c < total_seq_length / chunk_size; c++) {
-      chunk_indices.push_back({b, c});
-    }
     s = e;
     s_pad = e_pad;
   }
   int64_t global_total_seq_length = e_pad;
-  int64_t global_num_chunk = e_pad / chunk_size;
+  int64_t global_num_chunk = chunk_offsets_ptr[batch_size];
+  at::Tensor chunk_indices = at::empty(global_num_chunk * 2, cu_seqlens.options());
+  auto chunk_indices_ptr = chunk_indices.data_ptr<int32_t>();
+  int64_t curr_c = 0;
+  for (int64_t b = 0; b < batch_size; b++) {
+    int64_t batch_chunk_num = chunk_offsets_ptr[b + 1] - chunk_offsets_ptr[b];
+    for (int64_t c = 0; c < batch_chunk_num; c++) {
+      chunk_indices_ptr[curr_c * 2] = b;
+      chunk_indices_ptr[curr_c * 2 + 1] = c;
+      curr_c += 1;
+    }
+  }
 
   // Allocate buffer
   int64_t buff_size = v_num_head * global_total_seq_length                               // g_pad_data
@@ -1004,7 +912,9 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
                               + v_num_head * global_total_seq_length * v_head_size    // v_pad_data
                               + v_num_head * global_total_seq_length * qk_head_size   // k_beta_data
                               + v_num_head * global_total_seq_length * v_head_size    // v_beta_data
-                              + v_num_head * global_total_seq_length * qk_head_size;  // k_cumdecay_reduced
+                              + v_num_head * global_total_seq_length * qk_head_size   // k_cumdecay_reduced
+                              + qk_num_head * global_seq_len                          // q_norm_sum
+                              + qk_num_head * global_seq_len;                         // k_norm_sum
   at::Tensor reduced_buff_data = at::empty({reduced_buff_size}, query.options());
   int64_t num_thread = at::get_num_threads();
   int64_t buff_size_16bit_per_thread =
@@ -1045,6 +955,8 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
         buff_data.data_ptr<float>(),
         reduced_buff_data.data_ptr<scalar_t>(),
         thread_buff_data.data_ptr<scalar_t>(),
+        chunk_offsets_ptr,
+        chunk_indices_ptr,
         use_qk_l2norm_in_kernel,
         batch_size,
         global_seq_len,
@@ -1058,11 +970,10 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
         kStrideT,
         vStrideH,
         vStrideT,
-        chunk_offsets,
-        chunk_indices,
         global_total_seq_length,
         global_num_chunk,
-        buff_size_16bit_per_thread);
+        buff_size_16bit_per_thread,
+        eps);
   });
   return std::make_tuple(std::move(output), std::move(final_state));
 }

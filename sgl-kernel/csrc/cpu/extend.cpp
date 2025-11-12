@@ -1,7 +1,7 @@
 #include "common.h"
 #include "gemm.h"
-#include "pack.h"
 #include "vec.h"
+#include "vec_pack.h"
 
 namespace {
 

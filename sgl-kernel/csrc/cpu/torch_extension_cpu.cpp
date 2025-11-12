@@ -102,16 +102,17 @@ void extend_attention_cpu(
 
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
-    at::Tensor& query,
-    at::Tensor& key,
-    at::Tensor& value,
-    at::Tensor& g,
-    at::Tensor& beta,
-    at::Tensor& initial_state,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state,
     bool output_final_state,
-    at::Tensor& cu_seqlens,
+    const at::Tensor& cu_seqlens,
     bool head_first,
-    bool use_qk_l2norm_in_kernel);
+    bool use_qk_l2norm_in_kernel,
+    double eps = 1e-5);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -306,7 +307,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
       "Tensor initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
-      "bool use_qk_l2norm_in_kernel) -> (Tensor, Tensor)");
+      "bool use_qk_l2norm_in_kernel, float eps=1e-5) -> (Tensor, Tensor)");
   m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
 
   // weight prepack

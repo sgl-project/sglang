@@ -1,3 +1,6 @@
+// To use the transpose functions
+#include <ATen/native/cpu/utils.h>
+
 #include "vec.h"
 
 namespace {

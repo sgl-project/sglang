@@ -160,46 +160,47 @@ class TestMambaAttention(CustomTestCase):
         beta_ = torch.rand((B, T, HV), dtype=torch.bfloat16) * 0.05
         initial_state_ = torch.rand((N, HV, EK, EV), dtype=torch.float32) * 0.05
 
-        core_attn_out_ref, last_recurrent_state_ref = chunk_gated_delta_rule_update(
-            query=query_,
-            key=key_,
-            value=value_,
-            g=g_,
-            beta=beta_,
-            cu_seqlens=cu_seqlens_,
-            initial_state=initial_state_,
-            use_qk_l2norm_in_kernel=True,
-        )
-
-        query = query_.clone()
-        key = key_.clone()
-        value = value_.clone()
-        g = g_.clone()
-        beta = beta_.clone()
-        cu_seqlens = cu_seqlens_.clone()
-        initial_state = initial_state_.clone()
-
-        core_attn_out, last_recurrent_state = (
-            torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
-                query=query,
-                key=key,
-                value=value,
-                g=g,
-                beta=beta,
-                initial_state=initial_state_,
-                output_final_state=True,
+        for use_qk_l2norm_in_kernel in [True, False]:
+            core_attn_out_ref, last_recurrent_state_ref = chunk_gated_delta_rule_update(
+                query=query_,
+                key=key_,
+                value=value_,
+                g=g_,
+                beta=beta_,
                 cu_seqlens=cu_seqlens_,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
+                initial_state=initial_state_,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
-        )
-        atol = rtol = precision[core_attn_out.dtype]
-        torch.testing.assert_close(
-            core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
-        )
-        torch.testing.assert_close(
-            last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
-        )
+
+            query = query_.clone()
+            key = key_.clone()
+            value = value_.clone()
+            g = g_.clone()
+            beta = beta_.clone()
+            cu_seqlens = cu_seqlens_.clone()
+            initial_state = initial_state_.clone()
+
+            core_attn_out, last_recurrent_state = (
+                torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+            )
+            atol = rtol = precision[core_attn_out.dtype]
+            torch.testing.assert_close(
+                core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
+            )
+            torch.testing.assert_close(
+                last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
+            )
 
 
 if __name__ == "__main__":
