@@ -57,6 +57,7 @@ ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
 
+
 @dataclasses.dataclass
 class SingletonCache:
     data: Any = None

@@ -136,7 +136,7 @@ def load_fused_expert_weights(
             name,
             shard_id,
             expert_id,
-            )
+        )
     return True
 
 
