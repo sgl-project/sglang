@@ -717,6 +717,7 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        reasoning_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         retraction_counts = []
@@ -825,6 +826,20 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+
+                reasoning_count = 0
+                if (
+                    hasattr(self.tokenizer, "think_end_id")
+                    and self.tokenizer.think_end_id is not None
+                ):
+                    try:
+                        think_end_pos = output_ids_.index(self.tokenizer.think_end_id)
+                        reasoning_count = think_end_pos
+                    except ValueError:
+                        # think_end_id not found - reasoning may be disabled or not yet emitted
+                        reasoning_count = 0
+                reasoning_tokens.append(reasoning_count)
+
                 retraction_counts.append(req.retraction_count)
 
                 queue_times.append(req.time_stats.get_queueing_time())
@@ -945,6 +960,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    reasoning_tokens=reasoning_tokens,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,

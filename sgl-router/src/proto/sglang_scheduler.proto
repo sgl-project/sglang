@@ -175,6 +175,7 @@ message GenerateStreamChunk {
   int32 prompt_tokens = 2;
   int32 completion_tokens = 3;
   int32 cached_tokens = 4;
+  int32 reasoning_tokens = 9;
 
   // Output logprobs (if requested) - incremental for streaming
   OutputLogProbs output_logprobs = 5;
@@ -200,6 +201,7 @@ message GenerateComplete {
   int32 prompt_tokens = 3;
   int32 completion_tokens = 4;
   int32 cached_tokens = 5;
+  int32 reasoning_tokens = 12;
 
   // Output logprobs if requested (cumulative)
   OutputLogProbs output_logprobs = 6;

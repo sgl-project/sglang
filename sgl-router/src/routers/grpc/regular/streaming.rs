@@ -179,6 +179,7 @@ impl StreamingProcessor {
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completion_tokens: HashMap<u32, u32> = HashMap::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
 
         // Parser state (lazy initialization per index)
         type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
@@ -431,6 +432,7 @@ impl StreamingProcessor {
                     prompt_tokens.insert(index, complete.prompt_tokens as u32);
                     completion_tokens.insert(index, complete.completion_tokens as u32);
                     cached_tokens.insert(index, complete.cached_tokens as u32);
+                    reasoning_tokens.insert(index, complete.reasoning_tokens as u32);
                     finish_reasons.insert(index, complete.finish_reason.clone());
 
                     // Extract matched_stop
@@ -513,6 +515,15 @@ impl StreamingProcessor {
             if stream_opts.include_usage.unwrap_or(false) {
                 let total_prompt: u32 = prompt_tokens.values().sum();
                 let total_completion: u32 = completion_tokens.values().sum();
+                let total_reasoning: u32 = reasoning_tokens.values().sum();
+
+                let completion_tokens_details = if total_reasoning > 0 {
+                    Some(crate::protocols::common::CompletionTokensDetails {
+                        reasoning_tokens: Some(total_reasoning),
+                    })
+                } else {
+                    None
+                };
 
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
@@ -520,7 +531,7 @@ impl StreamingProcessor {
                         prompt_tokens: total_prompt,
                         completion_tokens: total_completion,
                         total_tokens: total_prompt + total_completion,
-                        completion_tokens_details: None,
+                        completion_tokens_details,
                     })
                     .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
                     .build();
