@@ -477,15 +477,15 @@ class CudaGraphRunner:
             )
             torch.cuda.memory._record_memory_history()
 
+        # Trigger CUDA graph capture for specific shapes.
+        # Capture the large shapes first so that the smaller shapes
+        # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
                     self._capture_one_stream()
             else:
-                # Trigger CUDA graph capture for specific shapes.
-                # Capture the large shapes first so that the smaller shapes
-                # can reuse the memory pool allocated for the large shapes.
                 set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
                     with graph_capture(
