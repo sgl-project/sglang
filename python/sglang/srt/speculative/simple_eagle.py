@@ -432,7 +432,11 @@ class SimpleEagleWorker(TpModelWorker):
             model_worker_batch, self.target_worker.model_runner
         )
 
-        forward_batch.forward_mode = ForwardMode.SIMPLE_TARGET_VERIFY
+        fforward_batch.forward_mode = (
+            ForwardMode.SIMPLE_TARGET_VERIFY
+            if not forward_batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
 
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
@@ -597,9 +601,8 @@ class SimpleEagleWorker(TpModelWorker):
             # if self.topk == 1:
             #Only evict full empty page. Do not evict partial empty page
             
-            align_evict_mask_to_page_size[num_seqs,](
-                # batch.out_cache_loc,
-                batch.seq_lens,
+            align_evict_mask_to_page_size_simple_eagle[num_seqs,](
+                batch.out_cache_loc,
                 evict_mask,
                 self.page_size,
                 2,
