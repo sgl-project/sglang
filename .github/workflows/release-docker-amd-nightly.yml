@@ -18,6 +18,7 @@ jobs:
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
+      fail-fast: false
       matrix:
         gpu_arch: ['gfx942', 'gfx942-rocm700', 'gfx950']
         build_type: ['all']
@@ -57,11 +58,12 @@ jobs:
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
   cache:
-    if: github.repository == 'sgl-project/sglang'
+    if: always() && github.repository == 'sgl-project/sglang'
     runs-on: linux-mi300-gpu-1
     environment: 'prod'
     needs: publish
     strategy:
+      fail-fast: false
       matrix:
         gpu_arch: ['gfx942', 'gfx942-rocm700']
         build_type: ['all']

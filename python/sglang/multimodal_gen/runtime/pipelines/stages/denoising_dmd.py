@@ -9,7 +9,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_parallel_rank,
     get_sp_world_size,
-    logger,
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (
@@ -268,7 +267,7 @@ class DmdDenoisingStage(DenoisingStage):
 
         denoising_loop_end_time = time.time()
         if len(timesteps) > 0:
-            logger.info(
+            self.log_info(
                 "Average time per step: %.4f seconds",
                 (denoising_loop_end_time - denoising_loop_start_time) / len(timesteps),
             )

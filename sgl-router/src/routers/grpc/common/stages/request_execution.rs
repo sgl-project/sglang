@@ -5,15 +5,13 @@ use axum::response::Response;
 use tracing::error;
 
 use super::PipelineStage;
-use crate::{
-    grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
-    routers::grpc::{
-        context::{ClientSelection, ExecutionResult, RequestContext},
-        error,
-    },
+use crate::routers::grpc::{
+    context::{ClientSelection, ExecutionResult, RequestContext},
+    error,
+    proto_wrapper::{ProtoGenerateRequest, ProtoStream},
 };
 
-type StreamResult = Result<AbortOnDropStream, Box<dyn std::error::Error + Send + Sync>>;
+type StreamResult = Result<ProtoStream, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Request execution stage: Execute gRPC requests (single or dual dispatch)
 pub struct RequestExecutionStage {
@@ -72,7 +70,7 @@ impl PipelineStage for RequestExecutionStage {
 impl RequestExecutionStage {
     async fn execute_single(
         &self,
-        proto_request: proto::GenerateRequest,
+        proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let client = clients.single_mut().ok_or_else(|| {
@@ -97,7 +95,7 @@ impl RequestExecutionStage {
 
     async fn execute_dual_dispatch(
         &self,
-        proto_request: proto::GenerateRequest,
+        proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let (prefill_client, decode_client) = clients.dual_mut().ok_or_else(|| {
@@ -108,7 +106,7 @@ impl RequestExecutionStage {
             error::internal_error("Expected dual clients but got single")
         })?;
 
-        let prefill_request = proto_request.clone();
+        let prefill_request = proto_request.clone_inner();
         let decode_request = proto_request;
 
         let (prefill_result, decode_result): (StreamResult, StreamResult) = tokio::join!(

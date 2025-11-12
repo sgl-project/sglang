@@ -1353,7 +1353,7 @@ fn build_next_request_with_tools(
             ..
         }) = items
             .iter_mut()
-            .find(|item| matches!(item, ResponseInputOutputItem::FunctionToolCall { id, .. } if id == &tool_result.call_id))
+            .find(|item| matches!(item, ResponseInputOutputItem::FunctionToolCall { call_id, .. } if call_id == &tool_result.call_id))
         {
             *output = Some(output_str);
             *status = if tool_result.is_error {

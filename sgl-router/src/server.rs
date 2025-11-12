@@ -530,6 +530,7 @@ async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>)
             is_healthy: false,
             load: 0,
             connection_mode: "unknown".to_string(),
+            runtime_type: None,
             tokenizer_path: None,
             reasoning_parser: None,
             tool_parser: None,

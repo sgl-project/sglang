@@ -10,7 +10,7 @@ from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAECo
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, PipelineConfig
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -64,7 +64,7 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 class QwenImagePipelineConfig(PipelineConfig):
     should_use_guidance: bool = False
 
-    is_image_gen: bool = True
+    task_type: ModelTaskType = ModelTaskType.T2I
 
     vae_tiling: bool = False
 
@@ -194,7 +194,7 @@ class QwenImagePipelineConfig(PipelineConfig):
 
 
 class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
-    ti2i_task = True
+    task_type: ModelTaskType = ModelTaskType.I2I
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         # TODO: lots of duplications here
