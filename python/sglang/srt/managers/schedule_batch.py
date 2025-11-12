@@ -201,8 +201,8 @@ class MultimodalDataItem:
     """
 
     modality: Modality
-    hash: int = None
-    pad_value: int = None
+    hash: List[int] = None
+    pad_value: List[int] = None
     offsets: Optional[list] = None
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
@@ -251,9 +251,25 @@ class MultimodalDataItem:
                 hashed_feature = self.feature
             else:
                 hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
+
+            # TODO: ugly code, just use for qwen3vl
+            hashed_feature = self._split_feature_for_qwen3_vl(hashed_feature)
+            self.hash = [hash_feature(feature) for feature in hashed_feature]
         assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+        self.pad_value = [i_hash % (1 << 30) for i_hash in self.hash]
+
+    def _split_feature_for_qwen3_vl(self, feature: torch.Tensor) -> List[torch.Tensor]:
+        qwen_spatial_merge_size = 2
+        feat_len = [0] + [
+            (offset[1] - offset[0] + 1) * qwen_spatial_merge_size**2
+            for offset in self.offsets
+        ]
+        feat_culen = torch.cumsum(torch.tensor(feat_len), dim=0)
+        feat_list = [
+            feature[feat_culen[i] : feat_culen[i + 1]]
+            for i in range(len(feat_culen) - 1)
+        ]
+        return feat_list
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -1662,6 +1678,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in self.reqs:
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
+
+            req.multimodal_inputs = []
 
         # Update seq_lens after allocation
         if self.enable_overlap:

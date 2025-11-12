@@ -265,21 +265,25 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         input_ids_tensor = torch.as_tensor(input_ids)
 
         # Create mapping of token_ids to pad_values for each modality
-        token_to_pad_mapping = {}
+        # token_to_pad_mapping = {}
 
+        # TODO: ugly code, just use for qwen3vl
         for item in mm_inputs.mm_items:
-            if item.is_image() and mm_inputs.im_token_id is not None:
-                token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
-            elif item.is_audio() and mm_inputs.audio_token_id is not None:
-                token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
-            elif item.is_video() and mm_inputs.video_token_id is not None:
-                token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
-            else:
-                raise ValueError(f"No multimodal token id provided for {item.modality}")
+            # if item.is_image() and mm_inputs.im_token_id is not None:
+            #     token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
+            # elif item.is_audio() and mm_inputs.audio_token_id is not None:
+            #     token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
+            # elif item.is_video() and mm_inputs.video_token_id is not None:
+            #     token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
+            # else:
+            #     raise ValueError(f"No multimodal token id provided for {item.modality}")
+            assert item.is_image() and mm_inputs.im_token_id is not None
+            for i, offset in enumerate(item.offsets):
+                input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value[i]
 
         # Apply replacements for all tokens at once
-        for token_id, pad_value in token_to_pad_mapping.items():
-            input_ids_tensor[input_ids_tensor == token_id] = pad_value
+        # for token_id, pad_value in token_to_pad_mapping.items():
+        #     input_ids_tensor[input_ids_tensor == token_id] = pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
@@ -380,7 +384,9 @@ def _get_chunked_prefill_embedding(
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        item_hashes = [item.hash for item in embedding_items_per_req]
+        item_hashes = flatten_nested_list(
+            [item.hash for item in embedding_items_per_req]
+        )
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
         embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
@@ -551,7 +557,7 @@ def embed_mm_inputs(
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
             placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
+                flatten_nested_list([item.pad_value for item in items]),
                 device=input_ids.device,
             )
             # calculate per request items length offset
