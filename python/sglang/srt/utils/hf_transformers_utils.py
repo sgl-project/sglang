@@ -45,6 +45,7 @@ from sglang.srt.configs import (
     Eagle2_5_VLConfig,
     ExaoneConfig,
     FalconH1Config,
+    JetNemotronConfig,
     KimiLinearConfig,
     KimiVLConfig,
     LongcatFlashConfig,
@@ -79,6 +80,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DotsOCRConfig,
     NemotronHConfig,
     DeepseekVLV2Config,
+    JetNemotronConfig,
 ]
 
 _CONFIG_REGISTRY = {
