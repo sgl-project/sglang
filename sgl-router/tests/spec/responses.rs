@@ -952,3 +952,250 @@ fn test_validate_input_items_structure() {
         "Input items without messages should be invalid"
     );
 }
+
+// ============================================================================
+// Normalization Tests (Normalizable Trait)
+// ============================================================================
+
+/// Test tool_choice defaults to auto when tools are present
+#[test]
+fn test_normalize_tool_choice_auto() {
+    use sglang_router_rs::protocols::validated::Normalizable;
+
+    let mut request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: Some(vec![ResponseTool {
+            r#type: ResponseToolType::Function,
+            function: Some(Function {
+                name: "test_func".to_string(),
+                description: None,
+                parameters: json!({}),
+                strict: None,
+            }),
+            server_url: None,
+            authorization: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }]),
+        tool_choice: None,
+        ..Default::default()
+    };
+
+    request.normalize();
+
+    assert!(
+        request.tool_choice.is_some(),
+        "tool_choice should be set after normalization"
+    );
+    assert!(
+        matches!(
+            request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::Auto))
+        ),
+        "tool_choice should default to auto when tools are present"
+    );
+}
+
+/// Test tool_choice defaults to none when tools array is empty
+#[test]
+fn test_normalize_tool_choice_none() {
+    use sglang_router_rs::protocols::validated::Normalizable;
+
+    let mut request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: Some(vec![]),
+        tool_choice: None,
+        ..Default::default()
+    };
+
+    request.normalize();
+
+    assert!(
+        request.tool_choice.is_some(),
+        "tool_choice should be set after normalization"
+    );
+    assert!(
+        matches!(
+            request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        ),
+        "tool_choice should default to none when tools array is empty"
+    );
+}
+
+/// Test tool_choice is not overridden if already set
+#[test]
+fn test_normalize_tool_choice_no_override() {
+    use sglang_router_rs::protocols::validated::Normalizable;
+
+    let mut request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: Some(vec![ResponseTool {
+            r#type: ResponseToolType::Function,
+            function: Some(Function {
+                name: "test_func".to_string(),
+                description: None,
+                parameters: json!({}),
+                strict: None,
+            }),
+            server_url: None,
+            authorization: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }]),
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+        ..Default::default()
+    };
+
+    request.normalize();
+
+    assert!(
+        matches!(
+            request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::Required))
+        ),
+        "tool_choice should not be overridden if already set"
+    );
+}
+
+/// Test parallel_tool_calls defaults to true when tools are present
+#[test]
+fn test_normalize_parallel_tool_calls() {
+    use sglang_router_rs::protocols::validated::Normalizable;
+
+    let mut request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: Some(vec![ResponseTool {
+            r#type: ResponseToolType::Function,
+            function: Some(Function {
+                name: "test_func".to_string(),
+                description: None,
+                parameters: json!({}),
+                strict: None,
+            }),
+            server_url: None,
+            authorization: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }]),
+        parallel_tool_calls: None,
+        ..Default::default()
+    };
+
+    request.normalize();
+
+    assert!(
+        request.parallel_tool_calls.is_some(),
+        "parallel_tool_calls should be set after normalization"
+    );
+    assert_eq!(
+        request.parallel_tool_calls,
+        Some(true),
+        "parallel_tool_calls should default to true when tools are present"
+    );
+}
+
+/// Test parallel_tool_calls is not set when tools are absent
+#[test]
+fn test_normalize_parallel_tool_calls_no_tools() {
+    use sglang_router_rs::protocols::validated::Normalizable;
+
+    let mut request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: None,
+        parallel_tool_calls: None,
+        ..Default::default()
+    };
+
+    request.normalize();
+
+    assert!(
+        request.parallel_tool_calls.is_none(),
+        "parallel_tool_calls should remain None when tools are absent"
+    );
+}
+
+/// Test parallel_tool_calls is not overridden if already set
+#[test]
+fn test_normalize_parallel_tool_calls_no_override() {
+    use sglang_router_rs::protocols::validated::Normalizable;
+
+    let mut request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        tools: Some(vec![ResponseTool {
+            r#type: ResponseToolType::Function,
+            function: Some(Function {
+                name: "test_func".to_string(),
+                description: None,
+                parameters: json!({}),
+                strict: None,
+            }),
+            server_url: None,
+            authorization: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }]),
+        parallel_tool_calls: Some(false),
+        ..Default::default()
+    };
+
+    request.normalize();
+
+    assert_eq!(
+        request.parallel_tool_calls,
+        Some(false),
+        "parallel_tool_calls should not be overridden if already set"
+    );
+}
+
+/// Test store defaults to true
+#[test]
+fn test_normalize_store_default() {
+    use sglang_router_rs::protocols::validated::Normalizable;
+
+    let mut request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        store: None,
+        ..Default::default()
+    };
+
+    request.normalize();
+
+    assert!(
+        request.store.is_some(),
+        "store should be set after normalization"
+    );
+    assert_eq!(
+        request.store,
+        Some(true),
+        "store should default to true"
+    );
+}
+
+/// Test store is not overridden if already set
+#[test]
+fn test_normalize_store_no_override() {
+    use sglang_router_rs::protocols::validated::Normalizable;
+
+    let mut request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        store: Some(false),
+        ..Default::default()
+    };
+
+    request.normalize();
+
+    assert_eq!(
+        request.store,
+        Some(false),
+        "store should not be overridden if already set to false"
+    );
+}

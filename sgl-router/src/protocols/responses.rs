@@ -11,7 +11,7 @@ use validator::Validate;
 use super::{
     common::{
         default_model, default_true, validate_stop, ChatLogProbs, Function, GenerationRequest,
-        PromptTokenUsageInfo, StringOrArray, ToolChoice, UsageInfo,
+        PromptTokenUsageInfo, StringOrArray, ToolChoice, ToolChoiceValue, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -665,8 +665,34 @@ impl Default for ResponsesRequest {
 }
 
 impl crate::protocols::validated::Normalizable for ResponsesRequest {
-    // No normalization needed for ResponsesRequest currently
-    // (Phase 3 was skipped - could add tool_choice defaults, etc. in future)
+    /// Normalize the request by applying defaults:
+    /// 1. Apply tool_choice defaults based on tools presence
+    /// 2. Apply parallel_tool_calls defaults
+    /// 3. Apply store field defaults
+    fn normalize(&mut self) {
+        // 1. Apply tool_choice defaults
+        if self.tool_choice.is_none() {
+            if let Some(tools) = &self.tools {
+                let choice_value = if !tools.is_empty() {
+                    ToolChoiceValue::Auto
+                } else {
+                    ToolChoiceValue::None
+                };
+                self.tool_choice = Some(ToolChoice::Value(choice_value));
+            }
+            // If tools is None, leave tool_choice as None (don't set it)
+        }
+
+        // 2. Apply default for parallel_tool_calls if tools are present
+        if self.parallel_tool_calls.is_none() && self.tools.is_some() {
+            self.parallel_tool_calls = Some(true);
+        }
+
+        // 3. Ensure store defaults to true if not specified
+        if self.store.is_none() {
+            self.store = Some(true);
+        }
+    }
 }
 
 impl GenerationRequest for ResponsesRequest {

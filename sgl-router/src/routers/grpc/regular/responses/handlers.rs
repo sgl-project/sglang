@@ -45,7 +45,6 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
-use validator::Validate;
 
 use super::{
     conversions,
