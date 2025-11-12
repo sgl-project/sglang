@@ -140,6 +140,13 @@ class SimpleEAGLECudaGraphRunner:
             self.spec_info_topk_index = torch.zeros((self.max_bs, 1), dtype=torch.int64)
 
             if self.require_gathered_buffer:
+                self.gathered_buffer = torch.zeros(
+                    (
+                        self.max_num_token,
+                        self.model_runner.model_config.hidden_size,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
                 if self.require_mlp_tp_gather:
                     self.global_num_tokens_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
@@ -203,6 +210,60 @@ class SimpleEAGLECudaGraphRunner:
 
         spec_info_topk_p = self.spec_info_topk_p[:bs]
         spec_info_topk_index = self.spec_info_topk_index[:bs]
+        
+        # pipeline parallelism
+        # if self.pp_size > 1:
+        #     pp_proxy_tensors = PPProxyTensors(
+        #         {k: v[:num_tokens] for k, v in self.pp_proxy_tensors.items()}
+        #     )
+
+        if self.require_mlp_tp_gather:
+            self.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [
+                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
+                        for i in range(self.dp_size)
+                    ],
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            )
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [
+                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
+                        for i in range(self.dp_size)
+                    ],
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            )
+            global_num_tokens = self.global_num_tokens_gpu
+            gathered_buffer = self.gathered_buffer[:num_tokens]
+            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
+            global_dp_buffer_len = num_tokens * self.dp_size
+        elif self.require_attn_tp_gather:
+            self.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            )
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            )
+            global_num_tokens = self.global_num_tokens_gpu
+            gathered_buffer = self.gathered_buffer[:num_tokens]
+            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
+        else:
+            global_dp_buffer_len = None
+            global_num_tokens = None
+            gathered_buffer = None
 
         verify_spec_info, draft_spec_info = self.get_spec_info()
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:

@@ -95,7 +95,7 @@ def align_evict_mask_to_page_size_simple_eagle(
 def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group):
+    with disable_dp_size(), patch_tensor_parallel_group(tp_group):
         yield
 
 
@@ -432,12 +432,7 @@ class SimpleEagleWorker(TpModelWorker):
             model_worker_batch, self.target_worker.model_runner
         )
 
-        # forward_batch.forward_mode = ForwardMode.SIMPLE_TARGET_VERIFY
-        forward_batch.forward_mode = (
-            ForwardMode.SIMPLE_TARGET_VERIFY
-            if not forward_batch.forward_mode.is_idle()
-            else ForwardMode.IDLE
-        )
+        forward_batch.forward_mode = ForwardMode.SIMPLE_TARGET_VERIFY
 
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
@@ -519,6 +514,7 @@ class SimpleEagleWorker(TpModelWorker):
                 forward_batch.req_pool_indices
             )
             forward_batch.spec_info = draft_input
+            # forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
             draft_logits_output = self.forward_draft_extend_after_decode(
                 forward_batch
             )
@@ -601,9 +597,9 @@ class SimpleEagleWorker(TpModelWorker):
             # if self.topk == 1:
             #Only evict full empty page. Do not evict partial empty page
             
-            align_evict_mask_to_page_size_simple_eagle[num_seqs,](
-                batch.out_cache_loc,
-                # batch.seq_lens,
+            align_evict_mask_to_page_size[num_seqs,](
+                # batch.out_cache_loc,
+                batch.seq_lens,
                 evict_mask,
                 self.page_size,
                 2,

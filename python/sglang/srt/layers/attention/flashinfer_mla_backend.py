@@ -611,7 +611,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+<<<<<<< Updated upstream
         if forward_batch.forward_mode.is_simple_verify() or forward_batch.forward_mode.is_target_verify():
+=======
+        if forward_batch.forward_mode.is_simple_verify():
+>>>>>>> Stashed changes
             return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope)
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
