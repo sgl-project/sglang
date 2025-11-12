@@ -566,6 +566,9 @@ class ServerArgs:
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
 
+    # encoder mode
+    mm_encoder_tp_mode: str = "weight"
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3610,6 +3613,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
+        )
+        parser.add_argument(
+            "--mm-encoder-tp-mode",
+            type=str,
+            choices=["weight", "data"],
+            default=ServerArgs.mm_encoder_tp_mode,
+            help="The mode to run encoder. ",
         )
 
     @classmethod
