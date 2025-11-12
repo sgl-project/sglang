@@ -337,5 +337,3 @@ class BaseFormatDetector(ABC):
             A function that takes a tool name (str) and returns StructureInfo
         """
         raise NotImplementedError()
-
-    # EBNF-based structured generation is no longer supported for detectors.

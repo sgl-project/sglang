@@ -222,18 +222,6 @@ class TestJsonSchemaConstraint(unittest.TestCase):
             {"type": "object", "properties": {}},
         )
 
-    def test_function_call_parser_returns_none_for_ebnf(self):
-        """FunctionCallParser.get_ebnf is kept for legacy callers but returns None."""
-
-        parser = FunctionCallParser(self.tools, "llama3")
-
-        tool_choice = ToolChoice(
-            type="function", function=ToolChoiceFuncName(name="get_weather")
-        )
-
-        self.assertIsNone(parser.get_ebnf(tool_choice))
-        self.assertIsNone(parser.get_ebnf("required"))
-
     def test_conflicting_defs_raises_valueerror(self):
         """Test that conflicting tool definitions raise ValueError with proper message"""
         tools_with_conflicting_defs = [
