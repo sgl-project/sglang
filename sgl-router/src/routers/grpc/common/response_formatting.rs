@@ -4,7 +4,7 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
-use crate::{grpc_client::sglang_proto, protocols::common::Usage};
+use crate::{grpc_client::sglang_proto as proto, protocols::common::Usage};
 
 /// Build usage information from collected gRPC responses
 ///
@@ -16,7 +16,7 @@ use crate::{grpc_client::sglang_proto, protocols::common::Usage};
 ///
 /// # Returns
 /// Usage object with aggregated token counts
-pub fn build_usage(responses: &[sglang_proto::GenerateComplete]) -> Usage {
+pub fn build_usage(responses: &[proto::GenerateComplete]) -> Usage {
     let total_prompt_tokens: u32 = responses.iter().map(|r| r.prompt_tokens as u32).sum();
     let total_completion_tokens: u32 = responses.iter().map(|r| r.completion_tokens as u32).sum();
 

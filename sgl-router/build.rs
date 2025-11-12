@@ -1,6 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only regenerate if proto files change
-    println!("cargo:rerun-if-changed=src/proto/common.proto");
     println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
     println!("cargo:rerun-if-changed=src/proto/vllm_engine.proto");
 
@@ -11,17 +10,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         // Allow proto3 optional fields
         .protoc_arg("--experimental_allow_proto3_optional")
-        // Compile all proto files
+        // Compile both proto files
         .compile_protos(
             &[
-                "src/proto/common.proto",
                 "src/proto/sglang_scheduler.proto",
                 "src/proto/vllm_engine.proto",
             ],
             &["src/proto"],
         )?;
 
-    println!("cargo:info=Protobuf compilation completed successfully");
+    println!("cargo:warning=Protobuf compilation completed successfully (sglang + vllm)");
 
     Ok(())
 }

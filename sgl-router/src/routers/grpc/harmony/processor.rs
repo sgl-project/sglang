@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
+use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
 use tracing::error;
 
 use super::HarmonyParserAdapter;
 use crate::{
-    grpc_client::sglang_proto,
+    grpc_client::sglang_proto as proto,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{ToolCall, Usage},

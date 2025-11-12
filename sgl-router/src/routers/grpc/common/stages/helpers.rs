@@ -2,16 +2,17 @@
 
 use std::sync::Arc;
 
+use proto::DisaggregatedParams;
 use rand::Rng;
 use tracing::debug;
 
-use crate::{core::Worker, grpc_client::sglang_proto};
+use crate::{core::Worker, grpc_client::sglang_proto as proto};
 
 /// Inject PD bootstrap metadata into a gRPC request
 ///
 /// Used by both chat and generate request building stages when in PD mode.
 pub fn inject_bootstrap_metadata(
-    request: &mut sglang_proto::GenerateRequest,
+    request: &mut proto::GenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
 ) {
     let hostname = prefill_worker.bootstrap_host();
@@ -21,7 +22,7 @@ pub fn inject_bootstrap_metadata(
     let room_id = rand::rng().random_range(0..i32::MAX);
 
     // Create DisaggregatedParams
-    let disagg_params = sglang_proto::DisaggregatedParams {
+    let disagg_params = DisaggregatedParams {
         bootstrap_host: hostname.to_string(),
         bootstrap_port: bootstrap_port as i32,
         bootstrap_room: room_id,

@@ -1,9 +1,17 @@
-use std::{convert::TryFrom, time::Duration};
+use std::{
+    convert::TryFrom,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use tonic::{transport::Channel, Request};
-use tracing::debug;
+use tonic::{transport::Channel, Request, Streaming};
+use tracing::{debug, warn};
 
-use super::common::{create_grpc_channel, AbortOnDropStream, AbortableClient};
 use crate::protocols::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
@@ -16,7 +24,96 @@ use crate::protocols::{
 #[allow(clippy::all)]
 pub mod proto {
     #![allow(clippy::all, unused_qualifications)]
-    tonic::include_proto!("inference.grpc");
+    tonic::include_proto!("sglang.grpc.scheduler");
+}
+
+// The generated module structure depends on the package name in the .proto file
+// package sglang.grpc.scheduler; generates a nested module structure
+
+/// A smart wrapper around Streaming<GenerateResponse> that automatically
+/// sends abort when dropped (e.g., due to client disconnection or early termination).
+///
+/// This leverages Rust's RAII pattern to ensure cleanup happens automatically,
+/// regardless of how the stream is dropped (panic, early return, client disconnect, etc.).
+pub struct AbortOnDropStream {
+    inner: Streaming<proto::GenerateResponse>,
+    request_id: String,
+    client: SglangSchedulerClient,
+    aborted: Arc<AtomicBool>,
+}
+
+impl AbortOnDropStream {
+    /// Create a new auto-aborting stream wrapper
+    pub fn new(
+        stream: Streaming<proto::GenerateResponse>,
+        request_id: String,
+        client: SglangSchedulerClient,
+    ) -> Self {
+        debug!("Created AbortOnDropStream for request {}", request_id);
+        Self {
+            inner: stream,
+            request_id,
+            client,
+            aborted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Manually mark the request as completed to prevent abort on drop.
+    /// Call this when the request completes successfully to avoid unnecessary abort RPC.
+    pub fn mark_completed(&self) {
+        // Use Release ordering to ensure that this write is visible to other threads
+        // that use Acquire on the same atomic variable
+        self.aborted.store(true, Ordering::Release);
+        debug!("Request {} marked as completed", self.request_id);
+    }
+}
+
+impl Drop for AbortOnDropStream {
+    fn drop(&mut self) {
+        // Atomically check and set the aborted flag using compare_exchange.
+        // If compare_exchange fails, it means the flag was already true (from mark_completed),
+        // so we don't need to send abort. AcqRel is used for success to synchronize with
+        // mark_completed's Release, and Acquire for failure to see writes from mark_completed.
+        if self
+            .aborted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let client = self.client.clone();
+        let request_id = self.request_id.clone();
+
+        // Spawn a background task to send abort (since Drop is sync but abort_request is async)
+        tokio::spawn(async move {
+            debug!(
+                "Stream dropped without completion for request {}, sending abort",
+                request_id
+            );
+            // Clone request_id for the error message since abort_request takes ownership
+            let request_id_for_log = request_id.clone();
+            if let Err(e) = client
+                .abort_request(request_id, "Stream dropped".to_string())
+                .await
+            {
+                warn!(
+                    "Failed to send abort on drop for request {}: {}",
+                    request_id_for_log, e
+                );
+            }
+        });
+    }
+}
+
+// Implement Stream trait to make AbortOnDropStream work like the original Streaming
+impl futures::Stream for AbortOnDropStream {
+    type Item = Result<proto::GenerateResponse, tonic::Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Delegate to the inner stream
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
 }
 
 /// gRPC client for SGLang scheduler
@@ -30,7 +127,25 @@ impl SglangSchedulerClient {
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
-        let channel = create_grpc_channel(endpoint).await?;
+        // Convert grpc:// to http:// for tonic
+        let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpc://") {
+            format!("http://{}", addr)
+        } else {
+            endpoint.to_string()
+        };
+
+        let channel = Channel::from_shared(http_endpoint)?
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            .http2_adaptive_window(true)
+            .initial_stream_window_size(Some(16 * 1024 * 1024)) // 16MB
+            .initial_connection_window_size(Some(32 * 1024 * 1024)) // 32MB
+            .connect()
+            .await?;
+
         let client = proto::sglang_scheduler_client::SglangSchedulerClient::new(channel);
 
         Ok(Self { client })
@@ -45,10 +160,7 @@ impl SglangSchedulerClient {
     pub async fn generate(
         &self,
         req: proto::GenerateRequest,
-    ) -> Result<
-        AbortOnDropStream<SglangSchedulerClient, proto::GenerateResponse>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<AbortOnDropStream, Box<dyn std::error::Error + Send + Sync>> {
         let request_id = req.request_id.clone();
         let mut client = self.client.clone();
         let request = Request::new(req);
@@ -503,17 +615,6 @@ impl SglangSchedulerClient {
         sampling.constraint = Self::build_single_constraint_from_plain(p)?;
 
         Ok(sampling)
-    }
-}
-
-// Implement AbortableClient trait for use with generic AbortOnDropStream
-impl AbortableClient for SglangSchedulerClient {
-    async fn abort_request(
-        &self,
-        request_id: String,
-        reason: String,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Self::abort_request(self, request_id, reason).await
     }
 }
 

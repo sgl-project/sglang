@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::{chat::ChatRequestBuildingStage, generate::GenerateRequestBuildingStage};
 use crate::{
-    grpc_client::sglang_proto,
+    grpc_client::sglang_proto as proto,
     routers::grpc::{
         common::stages::PipelineStage,
         context::{RequestContext, RequestType},
@@ -39,7 +39,7 @@ impl PipelineStage for RequestBuildingStage {
                 // For now, create minimal request - responses handler will populate it
                 let request_id = format!("resp-{}", Uuid::new_v4());
 
-                ctx.state.proto_request = Some(sglang_proto::GenerateRequest {
+                ctx.state.proto_request = Some(proto::GenerateRequest {
                     request_id,
                     ..Default::default()
                 });

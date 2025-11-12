@@ -6,14 +6,14 @@ use tracing::error;
 
 use super::PipelineStage;
 use crate::{
-    grpc_client::{sglang_proto, GrpcStream},
+    grpc_client::{sglang_proto as proto, sglang_scheduler::AbortOnDropStream},
     routers::grpc::{
         context::{ClientSelection, ExecutionResult, RequestContext},
         error,
     },
 };
 
-type StreamResult = Result<GrpcStream, Box<dyn std::error::Error + Send + Sync>>;
+type StreamResult = Result<AbortOnDropStream, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Request execution stage: Execute gRPC requests (single or dual dispatch)
 pub struct RequestExecutionStage {
@@ -72,7 +72,7 @@ impl PipelineStage for RequestExecutionStage {
 impl RequestExecutionStage {
     async fn execute_single(
         &self,
-        proto_request: sglang_proto::GenerateRequest,
+        proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let client = clients.single_mut().ok_or_else(|| {
@@ -97,7 +97,7 @@ impl RequestExecutionStage {
 
     async fn execute_dual_dispatch(
         &self,
-        proto_request: sglang_proto::GenerateRequest,
+        proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let (prefill_client, decode_client) = clients.dual_mut().ok_or_else(|| {
