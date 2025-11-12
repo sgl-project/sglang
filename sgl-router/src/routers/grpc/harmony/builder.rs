@@ -277,6 +277,8 @@ impl HarmonyBuilder {
                 "high" => ReasoningEffort::High,
                 "medium" => ReasoningEffort::Medium,
                 "low" => ReasoningEffort::Low,
+                // Harmony does not support minimal reasoning effort
+                "minimal" => ReasoningEffort::Low,
                 _ => ReasoningEffort::Medium,
             });
 
@@ -302,6 +304,7 @@ impl HarmonyBuilder {
                 ResponsesReasoningEffort::High => ReasoningEffort::High,
                 ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
                 ResponsesReasoningEffort::Low => ReasoningEffort::Low,
+                ResponsesReasoningEffort::Minimal => ReasoningEffort::Low,
             });
 
         self.build_system_message(reasoning_effort, with_custom_tools)
@@ -600,11 +603,11 @@ impl HarmonyBuilder {
                     .iter()
                     .rev()
                     .find_map(|item| match item {
-                        ResponseInputOutputItem::FunctionToolCall { id, name, .. }
-                            if id == call_id =>
-                        {
-                            Some(name.clone())
-                        }
+                        ResponseInputOutputItem::FunctionToolCall {
+                            call_id: item_call_id,
+                            name,
+                            ..
+                        } if item_call_id == call_id => Some(name.clone()),
                         _ => None,
                     })
                     .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;

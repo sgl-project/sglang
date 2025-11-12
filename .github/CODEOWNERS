@@ -1,8 +1,9 @@
-.github @merrymercy @zhyncs
-/docker @zhyncs @HaiShaw @ByronHsu
+.github @merrymercy @Fridge003 @ispobock
+/docker @Fridge003 @ispobock @HaiShaw @ByronHsu
 /docker/npu.Dockerfile @ping1jing2
-/python/pyproject.toml @merrymercy @zhyncs
-/python/sglang/* @merrymercy @Ying1123 @zhyncs @hnyls2002
+/python/pyproject.toml @merrymercy @Fridge003 @ispobock
+/python/sglang/* @merrymercy @Ying1123 @Fridge003 @ispobock @hnyls2002
+/python/sglang/multimodal_gen @mickqian
 /python/sglang/srt/constrained @hnyls2002
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002
 /python/sglang/srt/disaggregation/mooncake @ShangmingCai
@@ -11,14 +12,14 @@
 /python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
 /python/sglang/srt/eplb @fzyzcjy
 /python/sglang/srt/function_call @CatherineSue @JustinTong0323
-/python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf @kushanam @Edwardf0t1
+/python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @kushanam @Edwardf0t1
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg
 /python/sglang/srt/layers/attention/ascend_backend.py @ping1jing2
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
-/python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
+/python/sglang/srt/managers @merrymercy @Ying1123 @zhyncs @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/mem_cache/allocator_ascend.py @ping1jing2
-/python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock
+/python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
 /python/sglang/srt/model_executor/npu_graph_runner.py @ping1jing2
 /python/sglang/srt/multimodal @mickqian @JustinTong0323
 /python/sglang/srt/speculative @Ying1123 @merrymercy @kssteven418

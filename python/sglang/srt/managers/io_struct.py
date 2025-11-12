@@ -61,6 +61,55 @@ class BaseBatchReq(ABC):
         return self.rids
 
 
+@dataclass
+class RequestTimingMetricsMixin:
+    """
+    Mixin class containing common request-level timing metrics.
+
+    This class consolidates the timing metrics that are shared across all batch output types
+    to avoid code duplication and ensure consistency.
+    """
+
+    # Queue duration: time spent waiting in queue before request is scheduled.
+    queue_time: Optional[List[Optional[float]]]
+
+    # Forward entry time: timestamp when the request enters the forward pass stage.
+    # This corresponds to `forward_entry_time` in TimeStats.
+    # In different modes:
+    #   - Unified/PD-colocate: timestamp when forward computation begins (covers prefill + decode)
+    #   - Prefill instance (P): timestamp when prefill forward pass begins
+    #   - Decode instance (D): timestamp when decode forward pass begins
+    # Note: This is NOT the same as prefill_start_time. There may be a delay between
+    # forward_entry_time and prefill_start_time (see prefill_launch_delay).
+    forward_entry_time: Optional[List[Optional[float]]]
+
+    # Prefill launch delay: time spent waiting between forward entry and prefill start.
+    # Calculated as: prefill_start_time - forward_entry_time
+    # This represents the delay between when the request enters the forward stage
+    # and when prefill computation actually begins.
+    prefill_launch_delay: Optional[List[Optional[float]]]
+
+    # Prefill launch latency: time spent during prefill kernel launch.
+    # Calculated as: prefill_end_time_host - prefill_start_time_host
+    prefill_launch_latency: Optional[List[Optional[float]]]
+
+
+@dataclass
+class SpeculativeDecodingMetricsMixin:
+    """
+    Mixin class containing speculative decoding metrics.
+
+    This class consolidates speculative decoding metrics that are shared across
+    batch output types that support speculative decoding to avoid code duplication.
+    """
+
+    # Verify count: number of verification forward passes
+    spec_verify_ct: List[int]
+
+    # Accepted tokens: Number of accepted tokens during speculative decoding
+    spec_accepted_tokens: List[int]
+
+
 # Parameters for a session
 @dataclass
 class SessionParams:
@@ -147,6 +196,9 @@ class GenerateReqInput(BaseReq):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
+
+    # Validation step duration
+    validation_time: Optional[float] = None
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -564,6 +616,7 @@ class GenerateReqInput(BaseReq):
                 if self.bootstrap_pair_key is not None
                 else None
             ),
+            validation_time=self.validation_time,
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
@@ -684,6 +737,8 @@ class EmbeddingReqInput(BaseReq):
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # Validation step duration
+    validation_time: Optional[float] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
     # Priority for the request
@@ -774,6 +829,7 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            validation_time=self.validation_time,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
         )
@@ -815,7 +871,9 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 
 @dataclass
-class BatchTokenIDOutput(BaseBatchReq):
+class BatchTokenIDOutput(
+    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
+):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -833,8 +891,6 @@ class BatchTokenIDOutput(BaseBatchReq):
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
-    spec_verify_ct: List[int]
-    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -900,7 +956,9 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
 
 
 @dataclass
-class BatchStrOutput(BaseBatchReq):
+class BatchStrOutput(
+    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
+):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -912,8 +970,6 @@ class BatchStrOutput(BaseBatchReq):
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
-    spec_verify_ct: List[int]
-    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -972,7 +1028,7 @@ class BatchMultimodalOutput(BaseBatchReq):
 
 
 @dataclass
-class BatchEmbeddingOutput(BaseBatchReq):
+class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
@@ -1024,6 +1080,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
+    # Whether to recapture cuda graph after weight udpdate
+    recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
 
@@ -1344,6 +1402,7 @@ class ExpertDistributionReqType(Enum):
     DUMP_RECORD = 3
 
 
+@dataclass
 class ExpertDistributionReq(BaseReq):
     action: ExpertDistributionReqType
 
@@ -1514,3 +1573,6 @@ def _check_all_req_types():
             raise ValueError(
                 f"{name} is a subclass of BaseReq but not follow the naming convention."
             )
+
+
+_check_all_req_types()

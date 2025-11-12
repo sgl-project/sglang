@@ -7,6 +7,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::core::Worker;
 
+mod bucket;
 mod cache_aware;
 mod factory;
 mod power_of_two;
@@ -14,6 +15,7 @@ mod random;
 mod registry;
 mod round_robin;
 
+pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
@@ -104,6 +106,23 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketConfig {
+    pub balance_abs_threshold: usize,
+    pub balance_rel_threshold: f32,
+    pub bucket_adjust_interval_secs: usize,
+}
+
+impl Default for BucketConfig {
+    fn default() -> Self {
+        Self {
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.0001,
+            bucket_adjust_interval_secs: 5,
         }
     }
 }
