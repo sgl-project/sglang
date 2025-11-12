@@ -1,6 +1,6 @@
 //! gRPC router implementations
 
-use crate::{grpc_client::sglang_proto as proto, protocols::common::StringOrArray};
+use crate::{grpc_client::sglang_proto, protocols::common::StringOrArray};
 
 pub mod common;
 pub mod context;
@@ -16,6 +16,6 @@ pub mod utils;
 #[derive(Debug)]
 pub struct ProcessedMessages {
     pub text: String,
-    pub multimodal_inputs: Option<proto::MultimodalInputs>,
+    pub multimodal_inputs: Option<sglang_proto::MultimodalInputs>,
     pub stop_sequences: Option<StringOrArray>,
 }

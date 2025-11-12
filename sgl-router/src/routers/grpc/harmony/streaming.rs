@@ -9,10 +9,6 @@ use std::{
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
-use proto::{
-    generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
-    generate_response::Response::{Chunk, Complete},
-};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
@@ -22,7 +18,7 @@ use super::{
     processor::ResponsesIterationResult, types::HarmonyChannelDelta, HarmonyParserAdapter,
 };
 use crate::{
-    grpc_client::{sglang_proto as proto, sglang_scheduler::AbortOnDropStream},
+    grpc_client::{sglang_proto, ChunkData, GenerateResponse, GrpcStream, ResponseType},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
@@ -179,7 +175,7 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from a single stream
     async fn process_single_stream(
-        mut grpc_stream: AbortOnDropStream,
+        mut grpc_stream: GrpcStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -198,9 +194,11 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = grpc_stream.next().await {
             let response = result.map_err(|e| format!("Stream error: {}", e))?;
 
-            match response.response {
-                Some(Chunk(chunk)) => {
-                    let index = chunk.index;
+            match response.response_type() {
+                ResponseType::Chunk => {
+                    // Get common chunk data
+                    let chunk_data = response.as_chunk().ok_or("Expected chunk data")?;
+                    let index = chunk_data.index;
 
                     // Initialize parser for this index if needed
                     if let Vacant(e) = parsers.entry(index) {
@@ -220,7 +218,7 @@ impl HarmonyStreamingProcessor {
                         .ok_or("Parser not found for index")?;
 
                     let delta_result = parser
-                        .parse_chunk(&chunk.token_ids)
+                        .parse_chunk(&chunk_data.token_ids)
                         .map_err(|e| format!("Parse error: {}", e))?;
 
                     // Emit SSE event if there's a delta
@@ -240,31 +238,40 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                 }
-                Some(Complete(complete)) => {
-                    let index = complete.index;
+                ResponseType::Complete => {
+                    // Get common complete data
+                    let complete_data = response.as_complete().ok_or("Expected complete data")?;
+                    let index = complete_data.index;
 
-                    // Store final metadata
-                    finish_reasons.insert(index, Some(complete.finish_reason.clone()));
-                    matched_stops.insert(
-                        index,
-                        complete.matched_stop.as_ref().map(|m| match m {
-                            MatchedTokenId(id) => {
-                                serde_json::json!(id)
-                            }
-                            MatchedStopStr(s) => {
-                                serde_json::json!(s)
-                            }
-                        }),
-                    );
-                    prompt_tokens.insert(index, complete.prompt_tokens as u32);
+                    // Store common metadata
+                    finish_reasons.insert(index, Some(complete_data.finish_reason.clone()));
+                    prompt_tokens.insert(index, complete_data.prompt_tokens as u32);
                     *completion_tokens.entry(index).or_insert(0) =
-                        complete.completion_tokens as u32;
+                        complete_data.completion_tokens as u32;
+
+                    // Get SGLang-specific matched_stop (not in vLLM proto)
+                    use crate::grpc_client::sglang_proto::generate_complete::MatchedStop::{
+                        MatchedStopStr, MatchedTokenId,
+                    };
+                    let matched_stop_value =
+                        if let Some(sglang_complete) = response.get_sglang_complete() {
+                            // Access matched_stop from SGLang proto
+                            sglang_complete.matched_stop.as_ref().map(|m| match m {
+                                MatchedTokenId(id) => serde_json::json!(id),
+                                MatchedStopStr(s) => serde_json::json!(s),
+                            })
+                        } else {
+                            // vLLM doesn't have matched_stop field
+                            None
+                        };
+
+                    matched_stops.insert(index, matched_stop_value);
 
                     // Finalize parser and emit final chunk
                     if let Some(parser) = parsers.get_mut(&index) {
                         let matched_stop = matched_stops.get(&index).and_then(|m| m.clone());
                         let final_output = parser
-                            .finalize(complete.finish_reason.clone(), matched_stop.clone())
+                            .finalize(complete_data.finish_reason.clone(), matched_stop.clone())
                             .map_err(|e| format!("Finalize error: {}", e))?;
 
                         Self::emit_final_chunk(
@@ -277,10 +284,10 @@ impl HarmonyStreamingProcessor {
                         )?;
                     }
                 }
-                Some(proto::generate_response::Response::Error(err)) => {
-                    return Err(format!("Server error: {}", err.message));
+                ResponseType::Error => {
+                    return Err("Server error".to_string());
                 }
-                None => {}
+                ResponseType::None => {}
             }
         }
 
@@ -306,8 +313,8 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from dual streams (prefill + decode)
     async fn process_dual_stream(
-        mut prefill_stream: AbortOnDropStream,
-        mut decode_stream: AbortOnDropStream,
+        mut prefill_stream: GrpcStream,
+        mut decode_stream: GrpcStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -318,8 +325,10 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = prefill_stream.next().await {
             let response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
 
-            if let Some(Complete(complete)) = response.response {
-                prompt_tokens.insert(complete.index, complete.prompt_tokens as u32);
+            if let ResponseType::Complete = response.response_type() {
+                if let Some(complete_data) = response.as_complete() {
+                    prompt_tokens.insert(complete_data.index, complete_data.prompt_tokens as u32);
+                }
             }
         }
 
@@ -335,9 +344,10 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| format!("Decode stream error: {}", e))?;
 
-            match response.response {
-                Some(Chunk(chunk)) => {
-                    let index = chunk.index;
+            match response.response_type() {
+                ResponseType::Chunk => {
+                    let chunk_data = response.as_chunk().ok_or("Expected chunk data")?;
+                    let index = chunk_data.index;
 
                     // Initialize parser for this index if needed
                     if let Vacant(e) = parsers.entry(index) {
@@ -355,7 +365,7 @@ impl HarmonyStreamingProcessor {
                         .ok_or("Parser not found for index")?;
 
                     let delta_result = parser
-                        .parse_chunk(&chunk.token_ids)
+                        .parse_chunk(&chunk_data.token_ids)
                         .map_err(|e| format!("Parse error: {}", e))?;
 
                     if let Some(delta) = delta_result {
@@ -374,28 +384,38 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                 }
-                Some(Complete(complete)) => {
-                    let index = complete.index;
+                ResponseType::Complete => {
+                    let complete_data = response.as_complete().ok_or("Expected complete data")?;
+                    let index = complete_data.index;
 
-                    finish_reasons.insert(index, Some(complete.finish_reason.clone()));
-                    matched_stops.insert(
-                        index,
-                        complete.matched_stop.as_ref().map(|m| match m {
-                            MatchedTokenId(id) => {
-                                json!(id)
-                            }
-                            MatchedStopStr(s) => {
-                                json!(s)
-                            }
-                        }),
-                    );
+                    finish_reasons.insert(index, Some(complete_data.finish_reason.clone()));
+
+                    // Get SGLang-specific matched_stop
+                    use crate::grpc_client::sglang_proto::generate_complete::MatchedStop::{
+                        MatchedStopStr, MatchedTokenId,
+                    };
+                    let matched_stop_value =
+                        if let Some(sglang_complete) = response.get_sglang_complete() {
+                            sglang_complete.matched_stop.as_ref().map(|m| match m {
+                                MatchedTokenId(id) => {
+                                    json!(id)
+                                }
+                                MatchedStopStr(s) => {
+                                    json!(s)
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                    matched_stops.insert(index, matched_stop_value);
+
                     *completion_tokens.entry(index).or_insert(0) =
-                        complete.completion_tokens as u32;
+                        complete_data.completion_tokens as u32;
 
                     if let Some(parser) = parsers.get_mut(&index) {
                         let matched_stop = matched_stops.get(&index).and_then(|m| m.clone());
                         let final_output = parser
-                            .finalize(complete.finish_reason.clone(), matched_stop.clone())
+                            .finalize(complete_data.finish_reason.clone(), matched_stop.clone())
                             .map_err(|e| format!("Finalize error: {}", e))?;
 
                         Self::emit_final_chunk(
@@ -408,10 +428,10 @@ impl HarmonyStreamingProcessor {
                         )?;
                     }
                 }
-                Some(proto::generate_response::Response::Error(err)) => {
-                    return Err(format!("Server error: {}", err.message));
+                ResponseType::Error => {
+                    return Err("Server error".to_string());
                 }
-                None => {}
+                ResponseType::None => {}
             }
         }
 
@@ -596,7 +616,7 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from a single stream
     async fn process_responses_single_stream_mixed(
-        grpc_stream: AbortOnDropStream,
+        grpc_stream: GrpcStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp_tool_names: &std::collections::HashSet<String>,
@@ -607,8 +627,8 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from dual streams
     async fn process_responses_dual_stream_mixed(
-        mut prefill_stream: AbortOnDropStream,
-        decode_stream: AbortOnDropStream,
+        mut prefill_stream: GrpcStream,
+        decode_stream: GrpcStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp_tool_names: &std::collections::HashSet<String>,
@@ -638,7 +658,7 @@ impl HarmonyStreamingProcessor {
     /// If mcp_tool_names is Some, determines mode per-tool by checking tool name.
     /// If mcp_tool_names is None, uses default MCP mode for all tools.
     async fn process_decode_stream_with_tool_lookup(
-        mut decode_stream: AbortOnDropStream,
+        mut decode_stream: GrpcStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp_tool_names: Option<&std::collections::HashSet<String>>,
@@ -674,11 +694,13 @@ impl HarmonyStreamingProcessor {
             chunk_count += 1;
             let response = result.map_err(|e| format!("Decode stream error: {}", e))?;
 
-            match response.response {
-                Some(Chunk(chunk)) => {
+            match response.response_type() {
+                ResponseType::Chunk => {
+                    let chunk_data = response.as_chunk().ok_or("Expected chunk data")?;
+
                     // Parse chunk via Harmony parser
                     let delta_result = parser
-                        .parse_chunk(&chunk.token_ids)
+                        .parse_chunk(&chunk_data.token_ids)
                         .map_err(|e| format!("Parse error: {}", e))?;
 
                     // Emit SSE events if there's a delta
@@ -847,19 +869,31 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                 }
-                Some(Complete(complete)) => {
+                ResponseType::Complete => {
+                    let complete_data = response.as_complete().ok_or("Expected complete data")?;
+
                     // Store final metadata
-                    finish_reason = complete.finish_reason.clone();
-                    matched_stop = complete.matched_stop.as_ref().map(|m| match m {
-                        MatchedTokenId(id) => {
-                            json!(id)
-                        }
-                        MatchedStopStr(s) => {
-                            json!(s)
-                        }
-                    });
-                    prompt_tokens = complete.prompt_tokens as u32;
-                    completion_tokens = complete.completion_tokens as u32;
+                    finish_reason = complete_data.finish_reason.clone();
+
+                    // Get SGLang-specific matched_stop
+                    use crate::grpc_client::sglang_proto::generate_complete::MatchedStop::{
+                        MatchedStopStr, MatchedTokenId,
+                    };
+                    matched_stop = if let Some(sglang_complete) = response.get_sglang_complete() {
+                        sglang_complete.matched_stop.as_ref().map(|m| match m {
+                            MatchedTokenId(id) => {
+                                json!(id)
+                            }
+                            MatchedStopStr(s) => {
+                                json!(s)
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
+                    prompt_tokens = complete_data.prompt_tokens as u32;
+                    completion_tokens = complete_data.completion_tokens as u32;
 
                     // Finalize parser and get complete output
                     let final_output = parser
@@ -956,10 +990,10 @@ impl HarmonyStreamingProcessor {
                         emitter.send_event_best_effort(&event, tx);
                     }
                 }
-                Some(proto::generate_response::Response::Error(err)) => {
-                    return Err(format!("Server error: {}", err.message));
+                ResponseType::Error => {
+                    return Err("Server error".to_string());
                 }
-                None => {}
+                ResponseType::None => {}
             }
         }
 

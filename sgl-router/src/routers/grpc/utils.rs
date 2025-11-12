@@ -11,9 +11,7 @@ use uuid::Uuid;
 use super::{error, ProcessedMessages};
 use crate::{
     core::Worker,
-    grpc_client::{
-        sglang_proto as proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient,
-    },
+    grpc_client::{sglang_proto, GrpcStream},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{
@@ -589,32 +587,52 @@ pub fn parse_json_schema_response(
 /// * `Ok(Vec<GenerateComplete>)` - All complete responses collected from the stream
 /// * `Err(Response)` - Error response if the stream fails or returns an error
 pub async fn collect_stream_responses(
-    stream: &mut AbortOnDropStream,
+    stream: &mut GrpcStream,
     worker_name: &str,
-) -> Result<Vec<proto::GenerateComplete>, Response> {
-    use proto::generate_response::Response::*;
+) -> Result<Vec<sglang_proto::GenerateComplete>, Response> {
+    use crate::grpc_client::{GenerateResponse, ResponseType};
 
     let mut all_responses = Vec::new();
 
     while let Some(response) = stream.next().await {
         match response {
             Ok(gen_response) => {
-                match gen_response.response {
-                    Some(Complete(complete)) => {
-                        all_responses.push(complete);
+                // Use helper methods to handle both SGLang and vLLM responses
+                match gen_response.response_type() {
+                    ResponseType::Complete => {
+                        // Extract common complete data
+                        if let Some(complete_data) = gen_response.as_complete() {
+                            // Convert to SGLang proto format for return
+                            // TODO: When we need vLLM-specific Complete types, update this
+                            let sglang_complete = sglang_proto::GenerateComplete {
+                                output_ids: complete_data.output_ids,
+                                finish_reason: complete_data.finish_reason,
+                                prompt_tokens: complete_data.prompt_tokens,
+                                completion_tokens: complete_data.completion_tokens,
+                                cached_tokens: complete_data.cached_tokens,
+                                index: complete_data.index,
+                                // These fields are SGLang-specific, set to defaults for vLLM
+                                output_logprobs: None,
+                                all_hidden_states: vec![],
+                                matched_stop: None,
+                                input_logprobs: None,
+                            };
+                            all_responses.push(sglang_complete);
+                        }
                     }
-                    Some(Error(err)) => {
-                        error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message, "Worker generation error");
-                        // Don't mark as completed - let Drop send abort for error cases
-                        return Err(error::internal_error(format!(
-                            "{} generation failed: {}",
-                            worker_name, err.message
-                        )));
+                    ResponseType::Error => {
+                        if let Some(error_msg) = gen_response.as_error() {
+                            error!(function = "collect_stream_responses", worker = %worker_name, error = %error_msg, "Worker generation error");
+                            return Err(error::internal_error(format!(
+                                "{} generation failed: {}",
+                                worker_name, error_msg
+                            )));
+                        }
                     }
-                    Some(Chunk(_chunk)) => {
-                        // Streaming chunk - no action needed
+                    ResponseType::Chunk => {
+                        // Streaming chunk - no action needed for collection
                     }
-                    None => {
+                    ResponseType::None => {
                         // Empty response - no action needed
                     }
                 }
@@ -806,12 +824,12 @@ pub fn create_tool_parser(
     }
 }
 
-/// Convert proto::OutputLogProbs to OpenAI ChatLogProbs format
+/// Convert sglang_proto::OutputLogProbs to OpenAI ChatLogProbs format
 ///
 /// This function decodes token IDs using the tokenizer and builds the logprobs structure
 /// expected by the OpenAI API format.
 pub fn convert_proto_to_openai_logprobs(
-    proto_logprobs: &proto::OutputLogProbs,
+    proto_logprobs: &sglang_proto::OutputLogProbs,
     tokenizer: &Arc<dyn Tokenizer>,
 ) -> Result<ChatLogProbs, String> {
     let mut content_items = Vec::new();
@@ -879,12 +897,12 @@ pub fn convert_proto_to_openai_logprobs(
     })
 }
 
-/// Convert proto::OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
+/// Convert sglang_proto::OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// Each inner vec contains [logprob (f64), token_id (i32), ...]
 pub fn convert_generate_output_logprobs(
-    proto_logprobs: &proto::OutputLogProbs,
+    proto_logprobs: &sglang_proto::OutputLogProbs,
 ) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
         .token_logprobs
@@ -894,12 +912,12 @@ pub fn convert_generate_output_logprobs(
         .collect()
 }
 
-/// Convert proto::InputLogProbs to Generate format Vec<Vec<Option<f64>>>
+/// Convert sglang_proto::InputLogProbs to Generate format Vec<Vec<Option<f64>>>
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// First token has null logprob: [[null, token_id], [logprob, token_id], ...]
 pub fn convert_generate_input_logprobs(
-    proto_logprobs: &proto::InputLogProbs,
+    proto_logprobs: &sglang_proto::InputLogProbs,
 ) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
         .token_logprobs

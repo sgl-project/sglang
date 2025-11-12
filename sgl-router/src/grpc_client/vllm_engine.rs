@@ -1,17 +1,9 @@
-use std::{
-    convert::TryFrom,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{convert::TryFrom, time::Duration};
 
-use tonic::{transport::Channel, Request, Streaming};
-use tracing::{debug, warn};
+use tonic::{transport::Channel, Request};
+use tracing::debug;
 
+use super::common::{create_grpc_channel, AbortOnDropStream, AbortableClient};
 use crate::protocols::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
@@ -24,128 +16,21 @@ use crate::protocols::{
 #[allow(clippy::all)]
 pub mod proto {
     #![allow(clippy::all, unused_qualifications)]
-    tonic::include_proto!("vllm.grpc.engine");
+    tonic::include_proto!("inference.grpc");
 }
 
-// The generated module structure depends on the package name in the .proto file
-// package vllm.grpc.engine; generates a nested module structure
-
-/// A smart wrapper around Streaming<GenerateResponse> that automatically
-/// sends abort when dropped (e.g., due to client disconnection or early termination).
-///
-/// This leverages Rust's RAII pattern to ensure cleanup happens automatically,
-/// regardless of how the stream is dropped (panic, early return, client disconnect, etc.).
-pub struct AbortOnDropStream {
-    inner: Streaming<proto::GenerateResponse>,
-    request_id: String,
-    client: VllmEngineClient,
-    aborted: Arc<AtomicBool>,
-}
-
-impl AbortOnDropStream {
-    /// Create a new auto-aborting stream wrapper
-    pub fn new(
-        stream: Streaming<proto::GenerateResponse>,
-        request_id: String,
-        client: VllmEngineClient,
-    ) -> Self {
-        debug!("Created AbortOnDropStream for request {}", request_id);
-        Self {
-            inner: stream,
-            request_id,
-            client,
-            aborted: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Manually mark the request as completed to prevent abort on drop.
-    /// Call this when the request completes successfully to avoid unnecessary abort RPC.
-    pub fn mark_completed(&self) {
-        // Use Release ordering to ensure that this write is visible to other threads
-        // that use Acquire on the same atomic variable
-        self.aborted.store(true, Ordering::Release);
-        debug!("Request {} marked as completed", self.request_id);
-    }
-}
-
-impl Drop for AbortOnDropStream {
-    fn drop(&mut self) {
-        // Atomically check and set the aborted flag using compare_exchange.
-        // If compare_exchange fails, it means the flag was already true (from mark_completed),
-        // so we don't need to send abort. AcqRel is used for success to synchronize with
-        // mark_completed's Release, and Acquire for failure to see writes from mark_completed.
-        if self
-            .aborted
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-
-        let client = self.client.clone();
-        let request_id = self.request_id.clone();
-
-        // Spawn a background task to send abort (since Drop is sync but abort_request is async)
-        tokio::spawn(async move {
-            debug!(
-                "Stream dropped without completion for request {}, sending abort",
-                request_id
-            );
-            // Clone request_id for the error message since abort_request takes ownership
-            let request_id_for_log = request_id.clone();
-            if let Err(e) = client
-                .abort_request(request_id, "Stream dropped".to_string())
-                .await
-            {
-                warn!(
-                    "Failed to send abort on drop for request {}: {}",
-                    request_id_for_log, e
-                );
-            }
-        });
-    }
-}
-
-// Implement Stream trait to make AbortOnDropStream work like the original Streaming
-impl futures::Stream for AbortOnDropStream {
-    type Item = Result<proto::GenerateResponse, tonic::Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Delegate to the inner stream
-        Pin::new(&mut self.inner).poll_next(cx)
-    }
-}
-
-/// gRPC client for vLLM scheduler
+/// gRPC client for vLLM engine
 #[derive(Clone)]
 pub struct VllmEngineClient {
     client: proto::vllm_engine_client::VllmEngineClient<Channel>,
 }
 
 impl VllmEngineClient {
-    /// Create a new client and connect to the scheduler
+    /// Create a new client and connect to the engine
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        debug!("Connecting to vLLM scheduler at {}", endpoint);
+        debug!("Connecting to vLLM engine at {}", endpoint);
 
-        // Convert grpc:// to http:// for tonic
-        let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpc://") {
-            format!("http://{}", addr)
-        } else {
-            endpoint.to_string()
-        };
-
-        let channel = Channel::from_shared(http_endpoint)?
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .tcp_nodelay(true)
-            .http2_adaptive_window(true)
-            .initial_stream_window_size(Some(16 * 1024 * 1024)) // 16MB
-            .initial_connection_window_size(Some(32 * 1024 * 1024)) // 32MB
-            .connect()
-            .await?;
-
+        let channel = create_grpc_channel(endpoint).await?;
         let client = proto::vllm_engine_client::VllmEngineClient::new(channel);
 
         Ok(Self { client })
@@ -160,7 +45,10 @@ impl VllmEngineClient {
     pub async fn generate(
         &self,
         req: proto::GenerateRequest,
-    ) -> Result<AbortOnDropStream, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        AbortOnDropStream<VllmEngineClient, proto::GenerateResponse>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let request_id = req.request_id.clone();
         let mut client = self.client.clone();
         let request = Request::new(req);
@@ -260,6 +148,7 @@ impl VllmEngineClient {
             }),
             sampling_params: Some(sampling_params),
             stream: body.stream,
+            ..Default::default()
         };
 
         Ok(grpc_request)
@@ -284,6 +173,7 @@ impl VllmEngineClient {
             }),
             sampling_params: Some(sampling_params),
             stream: body.stream,
+            ..Default::default()
         };
 
         Ok(grpc_request)
@@ -319,6 +209,7 @@ impl VllmEngineClient {
             }),
             sampling_params: Some(sampling_params),
             stream: body.stream.unwrap_or(false),
+            ..Default::default()
         };
 
         Ok(grpc_request)
@@ -332,7 +223,7 @@ impl VllmEngineClient {
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = self.extract_stop_strings(request);
 
-        let max_tokens = request.max_completion_tokens.map(|v| v as i32);
+        let max_new_tokens = request.max_completion_tokens.map(|v| v as i32);
 
         // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
         let skip_special_tokens = if request.tools.is_some() {
@@ -353,7 +244,7 @@ impl VllmEngineClient {
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
-            max_tokens,
+            max_new_tokens,
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
@@ -403,7 +294,7 @@ impl VllmEngineClient {
 
         // vLLM supports: json_schema, regex, grammar, structural_tag, json_object, choice
         if let Some(ebnf) = &request.ebnf {
-            constraints.push(proto::sampling_params::Constraint::Grammar(ebnf.clone()));
+            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(ebnf.clone()));
         }
 
         if let Some(regex) = &request.regex {
@@ -420,7 +311,7 @@ impl VllmEngineClient {
                     proto::sampling_params::Constraint::StructuralTag(constraint_value)
                 }
                 "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
-                "grammar" | "ebnf" => proto::sampling_params::Constraint::Grammar(constraint_value),
+                "grammar" | "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
                 "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
                 _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
             };
@@ -443,7 +334,7 @@ impl VllmEngineClient {
         // Used by Harmony models only. Regular models use Chat API path.
         // Constraints come from Harmony preparation stage (structural_tag) or tool handling.
 
-        let max_tokens = request.max_output_tokens.map(|v| v as i32);
+        let max_new_tokens = request.max_output_tokens.map(|v| v as i32);
 
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
@@ -453,7 +344,7 @@ impl VllmEngineClient {
             frequency_penalty: 0.0,  // ResponsesRequest doesn't expose frequency_penalty
             presence_penalty: 0.0,   // ResponsesRequest doesn't expose presence_penalty
             repetition_penalty: 1.0, // ResponsesRequest doesn't expose repetition_penalty
-            max_tokens,
+            max_new_tokens,
             stop: vec![],               // No stop sequences in Responses API
             stop_token_ids: vec![],     // Handled by Harmony stop tokens
             skip_special_tokens: false, // Keep special tokens for Harmony
@@ -481,7 +372,7 @@ impl VllmEngineClient {
                     proto::sampling_params::Constraint::StructuralTag(constraint_value)
                 }
                 "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
-                "grammar" | "ebnf" => proto::sampling_params::Constraint::Grammar(constraint_value),
+                "grammar" | "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
                 "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
                 _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
             };
@@ -504,7 +395,7 @@ impl VllmEngineClient {
             constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
         }
         if let Some(ebnf) = &params.ebnf {
-            constraints.push(proto::sampling_params::Constraint::Grammar(ebnf.clone()));
+            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(ebnf.clone()));
         }
 
         match constraints.len() {
@@ -565,18 +456,18 @@ impl VllmEngineClient {
             sampling.stop_token_ids = stop_token_ids.clone();
         }
 
-        // Handle max_tokens with conversion (read from internal max_new_tokens)
+        // Handle max_new_tokens with conversion (read from internal max_new_tokens)
         if let Some(max_new_tokens) = p.max_new_tokens {
-            sampling.max_tokens = Some(
+            sampling.max_new_tokens = Some(
                 i32::try_from(max_new_tokens)
-                    .map_err(|_| "max_tokens must fit into a 32-bit signed integer".to_string())?,
+                    .map_err(|_| "max_new_tokens must fit into a 32-bit signed integer".to_string())?,
             );
         }
 
-        // Handle min_tokens with conversion (read from internal min_new_tokens)
+        // Handle min_new_tokens with conversion (read from internal min_new_tokens)
         if let Some(min_new_tokens) = p.min_new_tokens {
-            sampling.min_tokens = i32::try_from(min_new_tokens)
-                .map_err(|_| "min_tokens must fit into a 32-bit signed integer".to_string())?;
+            sampling.min_new_tokens = i32::try_from(min_new_tokens)
+                .map_err(|_| "min_new_tokens must fit into a 32-bit signed integer".to_string())?;
         }
 
         // Handle n with conversion
@@ -589,6 +480,17 @@ impl VllmEngineClient {
         sampling.constraint = Self::build_single_constraint_from_plain(p)?;
 
         Ok(sampling)
+    }
+}
+
+// Implement AbortableClient trait for use with generic AbortOnDropStream
+impl AbortableClient for VllmEngineClient {
+    async fn abort_request(
+        &self,
+        request_id: String,
+        reason: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Self::abort_request(self, request_id, reason).await
     }
 }
 
@@ -606,7 +508,7 @@ mod tests {
     fn test_generate_request_construction() {
         let sampling_params = proto::SamplingParams {
             temperature: 0.7,
-            max_tokens: Some(128),
+            max_new_tokens: Some(128),
             top_p: 0.9,
             top_k: 50,
             stop: vec!["</s>".to_string()],
@@ -631,7 +533,7 @@ mod tests {
 
         let params = gen_req.sampling_params.unwrap();
         assert_eq!(params.temperature, 0.7);
-        assert_eq!(params.max_tokens, Some(128));
+        assert_eq!(params.max_new_tokens, Some(128));
         assert_eq!(params.stop, vec!["</s>"]);
     }
 
@@ -666,7 +568,7 @@ mod tests {
         assert!(!params.ignore_eos);
         assert!(!params.include_stop_str_in_output);
         // Optional int fields should be None
-        assert_eq!(params.max_tokens, None);
+        assert_eq!(params.max_new_tokens, None);
         assert_eq!(params.logprobs, None);
         // Other non-optional fields
         assert_eq!(params.min_p, 0.0);

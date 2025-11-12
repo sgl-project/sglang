@@ -5,12 +5,12 @@
 
 use std::{sync::Arc, time::Instant};
 
-use proto::generate_complete::MatchedStop;
 use serde_json::Value;
+use sglang_proto::generate_complete::MatchedStop;
 use tracing::error;
 
 use crate::{
-    grpc_client::sglang_proto as proto,
+    grpc_client::sglang_proto,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
@@ -60,7 +60,7 @@ impl ResponseProcessor {
     #[allow(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
-        complete: &proto::GenerateComplete,
+        complete: &sglang_proto::GenerateComplete,
         index: usize,
         original_request: &ChatCompletionRequest,
         stop_decoder: &mut StopSequenceDecoder,

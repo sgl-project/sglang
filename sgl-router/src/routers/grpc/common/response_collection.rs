@@ -6,7 +6,7 @@
 use axum::response::Response;
 
 use crate::{
-    grpc_client::sglang_proto as proto,
+    grpc_client::sglang_proto,
     routers::grpc::{context::ExecutionResult, error, utils},
 };
 
@@ -24,7 +24,7 @@ use crate::{
 pub async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
-) -> Result<Vec<proto::GenerateComplete>, Response> {
+) -> Result<Vec<sglang_proto::GenerateComplete>, Response> {
     let all_responses = match execution_result {
         ExecutionResult::Single { mut stream } => {
             let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
@@ -69,8 +69,8 @@ pub async fn collect_responses(
 /// Takes input_logprobs from the first prefill response and copies them
 /// into all decode responses. This is used in PD mode when logprobs are requested.
 fn merge_prefill_logprobs(
-    prefill_responses: &[proto::GenerateComplete],
-    decode_responses: &mut [proto::GenerateComplete],
+    prefill_responses: &[sglang_proto::GenerateComplete],
+    decode_responses: &mut [sglang_proto::GenerateComplete],
 ) {
     if let Some(prefill_input_logprobs) = prefill_responses
         .first()

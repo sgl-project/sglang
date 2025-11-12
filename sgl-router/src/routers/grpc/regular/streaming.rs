@@ -7,17 +7,13 @@ use std::{collections::HashMap, io, sync::Arc, time::Instant};
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
-use proto::{
-    generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
-    generate_response::Response::{Chunk, Complete, Error},
-};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tracing::{debug, error, warn};
 
 use crate::{
-    grpc_client::{sglang_proto as proto, sglang_scheduler::AbortOnDropStream},
+    grpc_client::{sglang_proto, GenerateResponse, GrpcStream, ResponseType},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
         common::{
@@ -158,7 +154,7 @@ impl StreamingProcessor {
     /// Process streaming chunks from a single stream (Regular mode)
     pub async fn process_streaming_chunks(
         &self,
-        mut grpc_stream: AbortOnDropStream,
+        mut grpc_stream: GrpcStream,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
@@ -244,9 +240,10 @@ impl StreamingProcessor {
         while let Some(response) = grpc_stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
-            match gen_response.response {
-                Some(Chunk(chunk)) => {
-                    let index = chunk.index;
+            match gen_response.response_type() {
+                ResponseType::Chunk => {
+                    let chunk_data = gen_response.as_chunk().ok_or("Expected chunk data")?;
+                    let index = chunk_data.index;
 
                     // Get or create stop decoder for this index
                     let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
@@ -263,27 +260,32 @@ impl StreamingProcessor {
 
                     // Process tokens through stop decoder
                     let (chunk_text, _should_stop) =
-                        Self::process_chunk_tokens(stop_decoder, &chunk.token_ids);
+                        Self::process_chunk_tokens(stop_decoder, &chunk_data.token_ids);
 
                     if chunk_text.is_empty() {
                         continue;
                     }
 
-                    // Process logprobs if present
-                    let choice_logprobs = if let Some(ref proto_logprobs) = chunk.output_logprobs {
-                        match utils::convert_proto_to_openai_logprobs(
-                            proto_logprobs,
-                            &self.tokenizer,
-                        ) {
-                            Ok(logprobs) => Some(logprobs),
-                            Err(e) => {
-                                warn!("Failed to process logprobs: {}", e);
+                    // Process logprobs if present (SGLang-specific field)
+                    let choice_logprobs =
+                        if let Some(sglang_chunk) = gen_response.get_sglang_chunk() {
+                            if let Some(ref proto_logprobs) = sglang_chunk.output_logprobs {
+                                match utils::convert_proto_to_openai_logprobs(
+                                    proto_logprobs,
+                                    &self.tokenizer,
+                                ) {
+                                    Ok(logprobs) => Some(logprobs),
+                                    Err(e) => {
+                                        warn!("Failed to process logprobs: {}", e);
+                                        None
+                                    }
+                                }
+                            } else {
                                 None
                             }
-                        }
-                    } else {
-                        None
-                    };
+                        } else {
+                            None
+                        };
 
                     // Initialize stream buffer if first time
                     let stream_buffer = stream_buffers.entry(index).or_default();
@@ -398,8 +400,10 @@ impl StreamingProcessor {
                             .map_err(|_| "Failed to send content chunk".to_string())?;
                     }
                 }
-                Some(Complete(complete)) => {
-                    let index = complete.index;
+                ResponseType::Complete => {
+                    let complete_data =
+                        gen_response.as_complete().ok_or("Expected complete data")?;
+                    let index = complete_data.index;
 
                     // Flush any remaining text for this index's stop_decoder
                     if let Some(decoder) = stop_decoders.get_mut(&index) {
@@ -427,28 +431,37 @@ impl StreamingProcessor {
                         }
                     }
 
-                    // Store metadata
-                    prompt_tokens.insert(index, complete.prompt_tokens as u32);
-                    completion_tokens.insert(index, complete.completion_tokens as u32);
-                    cached_tokens.insert(index, complete.cached_tokens as u32);
-                    finish_reasons.insert(index, complete.finish_reason.clone());
+                    // Store metadata (common fields)
+                    prompt_tokens.insert(index, complete_data.prompt_tokens as u32);
+                    completion_tokens.insert(index, complete_data.completion_tokens as u32);
+                    cached_tokens.insert(index, complete_data.cached_tokens as u32);
+                    finish_reasons.insert(index, complete_data.finish_reason.clone());
 
-                    // Extract matched_stop
-                    let matched_stop_value = match &complete.matched_stop {
-                        Some(MatchedTokenId(token_id)) => {
-                            Some(Value::Number(serde_json::Number::from(*token_id)))
+                    // Extract matched_stop (SGLang-specific field)
+                    use crate::grpc_client::sglang_proto::generate_complete::MatchedStop::{
+                        MatchedStopStr, MatchedTokenId,
+                    };
+                    let matched_stop_value = if let Some(sglang_complete) =
+                        gen_response.get_sglang_complete()
+                    {
+                        match &sglang_complete.matched_stop {
+                            Some(MatchedTokenId(token_id)) => {
+                                Some(Value::Number(serde_json::Number::from(*token_id)))
+                            }
+                            Some(MatchedStopStr(stop_str)) => Some(Value::String(stop_str.clone())),
+                            None => None,
                         }
-                        Some(MatchedStopStr(stop_str)) => Some(Value::String(stop_str.clone())),
-                        None => None,
+                    } else {
+                        None
                     };
                     matched_stops.insert(index, matched_stop_value);
 
                     // Don't break - continue reading all Complete messages for n>1
                 }
-                Some(Error(error)) => {
-                    return Err(error.message);
+                ResponseType::Error => {
+                    return Err("Server error".to_string());
                 }
-                None => continue,
+                ResponseType::None => continue,
             }
         }
 
@@ -541,8 +554,8 @@ impl StreamingProcessor {
     /// Process dual streaming chunks (prefill + decode) - PD mode
     pub async fn process_dual_streaming_chunks(
         &self,
-        mut prefill_stream: AbortOnDropStream,
-        decode_stream: AbortOnDropStream,
+        mut prefill_stream: GrpcStream,
+        decode_stream: GrpcStream,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
@@ -552,14 +565,14 @@ impl StreamingProcessor {
         if original_request.logprobs {
             while let Some(response) = prefill_stream.next().await {
                 let gen_response = response.map_err(|e| format!("Prefill stream error: {}", e))?;
-                match gen_response.response {
-                    Some(Complete(_complete)) => {
+                match gen_response.response_type() {
+                    ResponseType::Complete => {
                         // Input logprobs collected but not yet used in streaming
                         // (OpenAI spec doesn't require prompt logprobs in streaming responses)
                         break;
                     }
-                    Some(Error(error)) => {
-                        return Err(format!("Prefill error: {}", error.message));
+                    ResponseType::Error => {
+                        return Err("Prefill error".to_string());
                     }
                     _ => continue,
                 }
@@ -661,7 +674,7 @@ impl StreamingProcessor {
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
     async fn process_generate_streaming(
         tokenizer: Arc<dyn Tokenizer>,
-        mut stream: AbortOnDropStream,
+        mut stream: GrpcStream,
         request_id: String,
         weight_version: String,
         _include_logprobs: bool,
@@ -676,16 +689,19 @@ impl StreamingProcessor {
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
-            match gen_response.response {
-                Some(Chunk(chunk)) => {
-                    let index = chunk.index;
+            match gen_response.response_type() {
+                ResponseType::Chunk => {
+                    let chunk_data = gen_response.as_chunk().ok_or("Expected chunk data")?;
+                    let index = chunk_data.index;
 
                     // Update completion tokens for this index
                     let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
-                    *completion_tokens += chunk.token_ids.len() as u32;
+                    *completion_tokens += chunk_data.token_ids.len() as u32;
 
                     // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
-                    let chunk_text = tokenizer.decode(&chunk.token_ids, true).unwrap_or_default();
+                    let chunk_text = tokenizer
+                        .decode(&chunk_data.token_ids, true)
+                        .unwrap_or_default();
 
                     // Accumulate text for this index
                     let accumulated_text = accumulated_texts.entry(index).or_default();
@@ -697,14 +713,14 @@ impl StreamingProcessor {
                     // Build streaming response chunk (SGLang format)
                     let chunk_response = serde_json::json!({
                         "text": accumulated_text.clone(),
-                        "output_ids": chunk.token_ids,
+                        "output_ids": chunk_data.token_ids,
                         "meta_info": {
                             "id": index_id,
                             "finish_reason": null,
-                            "prompt_tokens": chunk.prompt_tokens,
+                            "prompt_tokens": chunk_data.prompt_tokens,
                             "weight_version": &weight_version,
                             "completion_tokens": *completion_tokens,
-                            "cached_tokens": chunk.cached_tokens
+                            "cached_tokens": chunk_data.cached_tokens
                         },
                         "index": index
                     });
@@ -716,8 +732,10 @@ impl StreamingProcessor {
                     tx.send(Ok(Bytes::from(sse_chunk)))
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
-                Some(Complete(complete)) => {
-                    let index = complete.index;
+                ResponseType::Complete => {
+                    let complete_data =
+                        gen_response.as_complete().ok_or("Expected complete data")?;
+                    let index = complete_data.index;
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
                     let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
@@ -727,14 +745,14 @@ impl StreamingProcessor {
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
                         "text": accumulated_text,
-                        "output_ids": complete.output_ids[complete.output_ids.len().saturating_sub(1)..].to_vec(),
+                        "output_ids": complete_data.output_ids[complete_data.output_ids.len().saturating_sub(1)..].to_vec(),
                         "meta_info": {
                             "id": index_id,
-                            "finish_reason": complete.finish_reason,
-                            "prompt_tokens": complete.prompt_tokens,
+                            "finish_reason": complete_data.finish_reason,
+                            "prompt_tokens": complete_data.prompt_tokens,
                             "weight_version": &weight_version,
                             "completion_tokens": completion_tokens,
-                            "cached_tokens": complete.cached_tokens,
+                            "cached_tokens": complete_data.cached_tokens,
                             "e2e_latency": e2e_latency
                         },
                         "index": index
@@ -749,10 +767,10 @@ impl StreamingProcessor {
 
                     // Continue to process all completions if n>1
                 }
-                Some(Error(error)) => {
-                    return Err(error.message);
+                ResponseType::Error => {
+                    return Err("Server error".to_string());
                 }
-                None => continue,
+                ResponseType::None => continue,
             }
         }
 
@@ -765,8 +783,8 @@ impl StreamingProcessor {
     /// Process dual streaming for generate endpoint (PD mode with logprobs support)
     async fn process_generate_streaming_dual(
         tokenizer: Arc<dyn Tokenizer>,
-        mut prefill_stream: AbortOnDropStream,
-        decode_stream: AbortOnDropStream,
+        mut prefill_stream: GrpcStream,
+        decode_stream: GrpcStream,
         request_id: String,
         weight_version: String,
         return_logprob: bool,
@@ -777,17 +795,19 @@ impl StreamingProcessor {
             let mut input_logprobs = None;
             while let Some(response) = prefill_stream.next().await {
                 let gen_response = response.map_err(|e| format!("Prefill stream error: {}", e))?;
-                match gen_response.response {
-                    Some(Complete(complete)) => {
-                        // Extract input_logprobs from prefill Complete message (convert proto to SGLang format)
-                        input_logprobs = complete
-                            .input_logprobs
-                            .as_ref()
-                            .map(utils::convert_generate_input_logprobs);
+                match gen_response.response_type() {
+                    ResponseType::Complete => {
+                        // Extract input_logprobs from prefill Complete message (SGLang-specific field)
+                        if let Some(sglang_complete) = gen_response.get_sglang_complete() {
+                            input_logprobs = sglang_complete
+                                .input_logprobs
+                                .as_ref()
+                                .map(utils::convert_generate_input_logprobs);
+                        }
                         break;
                     }
-                    Some(Error(error)) => {
-                        return Err(format!("Prefill error: {}", error.message));
+                    ResponseType::Error => {
+                        return Err("Prefill error".to_string());
                     }
                     _ => continue,
                 }
@@ -822,7 +842,7 @@ impl StreamingProcessor {
     /// Process generate streaming with optional input_logprobs
     async fn process_generate_streaming_with_input_logprobs(
         tokenizer: Arc<dyn Tokenizer>,
-        mut stream: AbortOnDropStream,
+        mut stream: GrpcStream,
         request_id: String,
         weight_version: String,
         _include_logprobs: bool,
@@ -840,25 +860,31 @@ impl StreamingProcessor {
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
-            match gen_response.response {
-                Some(Chunk(chunk)) => {
-                    let index = chunk.index;
+            match gen_response.response_type() {
+                ResponseType::Chunk => {
+                    let chunk_data = gen_response.as_chunk().ok_or("Expected chunk data")?;
+                    let index = chunk_data.index;
 
                     // Update completion tokens for this index
                     let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
-                    *completion_tokens += chunk.token_ids.len() as u32;
+                    *completion_tokens += chunk_data.token_ids.len() as u32;
 
                     // Decode tokens to text
-                    let chunk_text = tokenizer.decode(&chunk.token_ids, true).unwrap_or_default();
+                    let chunk_text = tokenizer
+                        .decode(&chunk_data.token_ids, true)
+                        .unwrap_or_default();
 
                     // Accumulate text for this index
                     let accumulated_text = accumulated_texts.entry(index).or_default();
                     accumulated_text.push_str(&chunk_text);
 
-                    // Store latest output logprobs (cumulative from proto, convert to SGLang format)
-                    if let Some(ref output_logprobs) = chunk.output_logprobs {
-                        let converted = utils::convert_generate_output_logprobs(output_logprobs);
-                        accumulated_output_logprobs.insert(index, Some(converted));
+                    // Store latest output logprobs (SGLang-specific field)
+                    if let Some(sglang_chunk) = gen_response.get_sglang_chunk() {
+                        if let Some(ref output_logprobs) = sglang_chunk.output_logprobs {
+                            let converted =
+                                utils::convert_generate_output_logprobs(output_logprobs);
+                            accumulated_output_logprobs.insert(index, Some(converted));
+                        }
                     }
 
                     // Generate unique ID per index
@@ -871,16 +897,16 @@ impl StreamingProcessor {
 
                     let chunk_response = serde_json::json!({
                         "text": accumulated_text.clone(),
-                        "output_ids": chunk.token_ids,
+                        "output_ids": chunk_data.token_ids,
                         "meta_info": {
                             "id": index_id,
                             "finish_reason": null,
-                            "prompt_tokens": chunk.prompt_tokens,
+                            "prompt_tokens": chunk_data.prompt_tokens,
                             "weight_version": &weight_version,
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": current_output_logprobs,
                             "completion_tokens": *completion_tokens,
-                            "cached_tokens": chunk.cached_tokens
+                            "cached_tokens": chunk_data.cached_tokens
                         },
                         "index": index
                     });
@@ -892,8 +918,10 @@ impl StreamingProcessor {
                     tx.send(Ok(Bytes::from(sse_chunk)))
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
-                Some(Complete(complete)) => {
-                    let index = complete.index;
+                ResponseType::Complete => {
+                    let complete_data =
+                        gen_response.as_complete().ok_or("Expected complete data")?;
+                    let index = complete_data.index;
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
                     let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
@@ -905,23 +933,23 @@ impl StreamingProcessor {
 
                     // Parse finish_reason
                     let finish_reason = utils::parse_finish_reason(
-                        &complete.finish_reason,
-                        complete.completion_tokens,
+                        &complete_data.finish_reason,
+                        complete_data.completion_tokens,
                     );
 
                     // Send final chunk with finish_reason
                     let finish_response = json!({
                         "text": accumulated_text,
-                        "output_ids": complete.output_ids[complete.output_ids.len().saturating_sub(1)..].to_vec(),
+                        "output_ids": complete_data.output_ids[complete_data.output_ids.len().saturating_sub(1)..].to_vec(),
                         "meta_info": {
                             "id": index_id,
                             "finish_reason": finish_reason,
-                            "prompt_tokens": complete.prompt_tokens,
+                            "prompt_tokens": complete_data.prompt_tokens,
                             "weight_version": &weight_version,
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": final_output_logprobs,
                             "completion_tokens": completion_tokens,
-                            "cached_tokens": complete.cached_tokens,
+                            "cached_tokens": complete_data.cached_tokens,
                             "e2e_latency": e2e_latency
                         },
                         "index": index
@@ -936,10 +964,10 @@ impl StreamingProcessor {
 
                     // Continue to process all completions if n>1
                 }
-                Some(Error(error)) => {
-                    return Err(error.message);
+                ResponseType::Error => {
+                    return Err("Server error".to_string());
                 }
-                None => continue,
+                ResponseType::None => continue,
             }
         }
 
