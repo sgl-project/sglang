@@ -621,11 +621,11 @@ def kimi_k2_biased_topk_impl(
 
     scores = gating_output.sigmoid()
     num_token = scores.shape[0]
-    
+
     # When num_expert_group=1, no need for group masking
     # Directly compute scores with correction bias
     tmp_scores = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
-    
+
     # Directly select topk experts (no need to sort since num_fused_shared_experts=0)
     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
     topk_weights = scores.gather(1, topk_ids)
