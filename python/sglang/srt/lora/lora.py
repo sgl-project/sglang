@@ -117,6 +117,12 @@ class LoRAAdapter(nn.Module):
                 qkv_a_name = q_a_name.replace("q_a_proj", "qkv_proj")
                 A_q = weights[q_a_name]
                 A_kv = weights[kv_a_name]
+                # Align row-rank to configured LoRA r
+                r = int(self.config.r)
+                if A_q.shape[0] != r:
+                    A_q = A_q[:r, :]
+                if A_kv.shape[0] != r:
+                    A_kv = A_kv[:r, :]
                 # Construct qkv A by duplicating kv_a for both K and V slices
                 weights[qkv_a_name] = torch.cat((A_q, A_kv, A_kv), dim=0)
                 # Remove original fused entries to avoid downstream name matching issues
@@ -136,6 +142,12 @@ class LoRAAdapter(nn.Module):
                 qkv_b_name = q_b_name.replace("q_b_proj", "qkv_proj")
                 B_q = weights[q_b_name]
                 B_kv = weights[kv_b_name]
+                # Align column-rank to configured LoRA r
+                r = int(self.config.r)
+                if B_q.shape[1] != r:
+                    B_q = B_q[:, :r]
+                if B_kv.shape[1] != r:
+                    B_kv = B_kv[:, :r]
                 # Split kv_b equally across K and V along the output dimension
                 split = B_kv.shape[0] // 2
                 B_k = B_kv[:split, :]
