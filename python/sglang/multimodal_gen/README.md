@@ -20,7 +20,7 @@ SGLang Diffusion has the following features:
 uv pip install 'sglang[diffusion]' --prerelease=allow
 ```
 
-For more installation methods (e.g. pypi, uv, docker), check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
+For more installation methods (e.g. pypi, uv, docker), check [install.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
 
 
 ## Inference
@@ -61,7 +61,7 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
-For more usage examples (e.g. OpenAI compatible API, server mode), check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
+For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
 
 ## Contributing
 

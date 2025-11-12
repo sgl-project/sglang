@@ -1,17 +1,13 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-"""
-Hunyuan video diffusion pipeline implementation.
-
-This module contains an implementation of the Hunyuan video diffusion pipeline
-using the modular pipeline architecture.
-"""
 from diffusers.image_processor import VaeImageProcessor
 
-from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, Req
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages import (
-    ConditioningStage,
     DecodingStage,
     DenoisingStage,
     ImageEncodingStage,
@@ -20,6 +16,9 @@ from sglang.multimodal_gen.runtime.pipelines.stages import (
     LatentPreparationStage,
     TextEncodingStage,
     TimestepPreparationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines.stages.conditioning import (
+    ConditioningStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

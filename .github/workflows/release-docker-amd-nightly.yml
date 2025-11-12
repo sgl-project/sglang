@@ -18,9 +18,10 @@ jobs:
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
+      fail-fast: false
       matrix:
         gpu_arch: ['gfx942', 'gfx942-rocm700', 'gfx950']
-        build_type: ['all', 'srt']
+        build_type: ['all']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,6 +39,7 @@ jobs:
       - name: Build and Push
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
             rocm_tag="rocm630-mi30x"
@@ -52,24 +54,16 @@ jobs:
 
           tag=v${version}-${rocm_tag}
 
-          if [ "${{ matrix.build_type }}" = "all" ]; then
-            tag_suffix=""
-          elif [ "${{ matrix.build_type }}" = "srt" ]; then
-            tag_suffix="-srt"
-          else
-            echo "Unsupported build type"
-            exit 1
-          fi
-
-          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix} --no-cache
-          docker push rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix}
+          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
   cache:
-    if: github.repository == 'sgl-project/sglang'
+    if: always() && github.repository == 'sgl-project/sglang'
     runs-on: linux-mi300-gpu-1
     environment: 'prod'
     needs: publish
     strategy:
+      fail-fast: false
       matrix:
         gpu_arch: ['gfx942', 'gfx942-rocm700']
         build_type: ['all']
@@ -92,6 +86,7 @@ jobs:
           set -euxo pipefail
 
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
             rocm_tag="rocm630-mi30x"

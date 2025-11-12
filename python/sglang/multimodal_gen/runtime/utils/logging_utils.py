@@ -34,7 +34,7 @@ _warned_main_process = False
 
 _FORMAT = (
     f"{SGL_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
-    "[%(filename)s:%(lineno)d] %(message)s"
+    "[%(filename)s: %(lineno)d] %(message)s"
 )
 
 # _FORMAT = "[%(asctime)s] %(message)s"

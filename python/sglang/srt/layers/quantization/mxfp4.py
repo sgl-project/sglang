@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     direct_register_custom_op,
+    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -71,12 +72,14 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
+_is_shuffle_moe_mxfp4 = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
 
 if _is_hip:
     # import aiter
     try:
         from aiter import ActivationType, QuantType
         from aiter.fused_moe import fused_moe
+        from aiter.ops.shuffle import shuffle_weight
         from aiter.ops.triton.quant import dynamic_mxfp4_quant
         from aiter.utility.fp4_utils import e8m0_shuffle
     except ImportError as err:
@@ -799,6 +802,11 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13, w13_mx_scales = self.mxfp4_quantize(layer.w13_weight.data)
         w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
+
+        # Pre-shuffle weight
+        if _is_shuffle_moe_mxfp4:
+            w13 = shuffle_weight(w13.contiguous(), (16, 16))
+            w2 = shuffle_weight(w2.contiguous(), (16, 16))
 
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         layer.w13_weight_scale = torch.nn.Parameter(w13_mx_scales, requires_grad=False)

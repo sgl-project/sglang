@@ -11,7 +11,7 @@ from sglang.multimodal_gen.runtime.pipelines.executors.pipeline_executor import 
     Timer,
     logger,
 )
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 

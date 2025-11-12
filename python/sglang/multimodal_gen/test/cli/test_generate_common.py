@@ -47,7 +47,8 @@ class TestGenerate(TestCLIBase):
         command = [
             "sglang",
             "generate",
-            "--prompt='A curious raccoon'",
+            "--prompt",
+            "A curious raccoon",
             "--output-path=outputs",
             f"--model-path={self.model_path}",
             "--save-output",
@@ -84,7 +85,8 @@ class TestWanGenerate(TestGenerate):
         command = [
             "sglang",
             "generate",
-            "--prompt='A curious raccoon'",
+            "--prompt",
+            "A curious raccoon",
             "--output-path=outputs",
             f"--model-path={self.model_path}",
             "--save-output",

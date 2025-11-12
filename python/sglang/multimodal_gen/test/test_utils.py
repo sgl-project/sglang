@@ -1,4 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+import dataclasses
 import os
 import shlex
 import socket
@@ -6,6 +7,7 @@ import subprocess
 import sys
 import time
 import unittest
+from typing import Optional
 
 from PIL import Image
 
@@ -15,9 +17,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def run_command(command):
+def run_command(command) -> Optional[float]:
     """Runs a command and returns the execution time and status."""
-    print(f"Running command: {' '.join(command)}")
+    print(f"Running command: {shlex.join(command)}")
 
     duration = None
     with subprocess.Popen(
@@ -75,6 +77,18 @@ def check_image_size(ut, image, width, height):
     ut.assertEqual(image.size, (width, height))
 
 
+@dataclasses.dataclass
+class TestResult:
+    name: str
+    key: str
+    duration: Optional[float]
+    succeed: bool
+
+    @property
+    def duration_str(self):
+        return f"{self.duration:.4f}" if self.duration else "NA"
+
+
 class TestCLIBase(unittest.TestCase):
     model_path: str = None
     extra_args = []
@@ -84,14 +98,15 @@ class TestCLIBase(unittest.TestCase):
 
     width: int = 720
     height: int = 720
-    output_path: str = "outputs"
+    output_path: str = "test_outputs"
 
     base_command = [
         "sglang",
         "generate",
         "--text-encoder-cpu-offload",
         "--pin-cpu-memory",
-        "--prompt='A curious raccoon'",
+        "--prompt",
+        "A curious raccoon",
         "--save-output",
         "--log-level=debug",
         f"--width={width}",
@@ -105,21 +120,20 @@ class TestCLIBase(unittest.TestCase):
     def setUpClass(cls):
         cls.results = []
 
-    def _run_command(self, name, model_path: str, test_key: str = "", args=[]):
+    def _run_command(self, name: str, model_path: str, test_key: str = "", args=[]):
         command = (
             self.base_command
             + [f"--model-path={model_path}"]
             + shlex.split(args or "")
-            + [f"--output-file-name={name}"]
+            + ["--output-file-name", f"{name}"]
             + self.extra_args
         )
         duration = run_command(command)
         status = "Success" if duration else "Failed"
+        succeed = duration is not None
 
-        duration_str = f"{duration:.4f}s" if duration else "NA"
-        self.__class__.results.append(
-            {"name": name, "key": test_key, "duration": duration_str, "status": status}
-        )
+        duration = float(duration) if succeed else None
+        self.results.append(TestResult(name, test_key, duration, succeed))
 
         return name, duration, status
 
@@ -133,7 +147,7 @@ class TestGenerateBase(TestCLIBase):
 
     width: int = 720
     height: int = 720
-    output_path: str = "outputs"
+    output_path: str = "test_outputs"
     image_path: str | None = None
     prompt: str | None = "A curious raccoon"
 
@@ -142,7 +156,8 @@ class TestGenerateBase(TestCLIBase):
         "generate",
         # "--text-encoder-cpu-offload",
         # "--pin-cpu-memory",
-        f"--prompt='{prompt}'",
+        f"--prompt",
+        f"{prompt}",
         "--save-output",
         "--log-level=debug",
         f"--width={width}",
@@ -150,7 +165,7 @@ class TestGenerateBase(TestCLIBase):
         f"--output-path={output_path}",
     ]
 
-    results = []
+    results: list[TestResult] = []
 
     @classmethod
     def setUpClass(cls):
@@ -167,24 +182,28 @@ class TestGenerateBase(TestCLIBase):
             test_key: order for order, test_key in enumerate(test_keys)
         }
 
-        ordered_results: list[dict] = [{}] * len(test_keys)
-
+        ordered_results: list[TestResult] = [None] * len(test_keys)
         for result in cls.results:
-            order = test_key_to_order[result["key"]]
+            order = test_key_to_order[result.key]
             ordered_results[order] = result
 
         for result in ordered_results:
             if not result:
                 continue
             status = (
-                result["status"] and result["duration"] <= cls.thresholds[result["key"]]
+                "Succeed"
+                if (
+                    result.succeed
+                    and float(result.duration) <= float(cls.thresholds[result.key])
+                )
+                else "Failed"
             )
-            print(f"| {result['name']:<30} | {result['duration']:<8} | {status:<7} |")
+            print(f"| {result.name:<30} | {result.duration_str:<8} | {status:<7} |")
         print()
-        durations = [result["duration"] for result in cls.results]
+        durations = [result.duration_str for result in cls.results]
         print(" | ".join([""] + durations + [""]))
 
-    def _run_test(self, name, args, model_path: str, test_key: str):
+    def _run_test(self, name: str, args, model_path: str, test_key: str):
         time_threshold = self.thresholds[test_key]
         name, duration, status = self._run_command(
             name, args=args, model_path=model_path, test_key=test_key
@@ -220,7 +239,7 @@ class TestGenerateBase(TestCLIBase):
     def test_single_gpu(self):
         """single gpu"""
         self._run_test(
-            name=f"{self.model_name()}, single gpu",
+            name=f"{self.model_name()}_single_gpu",
             args=None,
             model_path=self.model_path,
             test_key="test_single_gpu",
@@ -231,7 +250,7 @@ class TestGenerateBase(TestCLIBase):
         if self.data_type == DataType.IMAGE:
             return
         self._run_test(
-            name=f"{self.model_name()}, cfg parallel",
+            name=f"{self.model_name()}_cfg_parallel",
             args="--num-gpus 2 --enable-cfg-parallel",
             model_path=self.model_path,
             test_key="test_cfg_parallel",
@@ -242,7 +261,7 @@ class TestGenerateBase(TestCLIBase):
         if self.data_type == DataType.IMAGE:
             return
         self._run_test(
-            name=f"{self.model_name()}, usp",
+            name=f"{self.model_name()}_usp",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=2",
             model_path=self.model_path,
             test_key="test_usp",
@@ -253,7 +272,7 @@ class TestGenerateBase(TestCLIBase):
         if self.data_type == DataType.IMAGE:
             return
         self._run_test(
-            name=f"{self.model_name()}, mixed",
+            name=f"{self.model_name()}_mixed",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=1 --enable-cfg-parallel",
             model_path=self.model_path,
             test_key="test_mixed",

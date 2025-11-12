@@ -205,14 +205,12 @@ class SamplingParams:
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
-        from sglang.multimodal_gen.configs.sample.registry import (
-            get_sampling_param_cls_for_name,
-        )
+        from sglang.multimodal_gen.registry import get_model_info
 
-        sampling_cls = get_sampling_param_cls_for_name(model_path)
-        logger.debug(f"Using pretrained SamplingParam: {sampling_cls}")
-        if sampling_cls is not None:
-            sampling_params: SamplingParams = sampling_cls(**kwargs)
+        model_info = get_model_info(model_path)
+        logger.debug(f"Found model info: {model_info}")
+        if model_info is not None:
+            sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         else:
             logger.warning(
                 "Couldn't find an optimal sampling param for %s. Using the default sampling param.",

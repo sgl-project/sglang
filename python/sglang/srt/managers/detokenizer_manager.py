@@ -279,8 +279,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             token_steps=recv_obj.token_steps,
             queue_time=recv_obj.queue_time,
             forward_entry_time=recv_obj.forward_entry_time,
-            prefill_delay=recv_obj.prefill_delay,
-            prefill_latency=recv_obj.prefill_latency,
+            prefill_launch_delay=recv_obj.prefill_launch_delay,
+            prefill_launch_latency=recv_obj.prefill_launch_latency,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -297,8 +297,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             queue_time=recv_obj.queue_time,
             forward_entry_time=recv_obj.forward_entry_time,
-            prefill_delay=recv_obj.prefill_delay,
-            prefill_latency=recv_obj.prefill_latency,
+            prefill_launch_delay=recv_obj.prefill_launch_delay,
+            prefill_launch_latency=recv_obj.prefill_launch_latency,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):

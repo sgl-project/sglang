@@ -140,6 +140,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         self,
         logits: torch.Tensor,
         topk: int,
+        ks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel import (
             fast_topk_transform_fused,
@@ -148,7 +149,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         )
 
         if not NSA_FUSE_TOPK:
-            return fast_topk_v2(logits, self.get_seqlens_expanded(), topk)
+            return fast_topk_v2(
+                logits, self.get_seqlens_expanded(), topk, row_starts=ks
+            )
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
             return fast_topk_transform_fused(
@@ -157,6 +160,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 page_table_size_1=self.attn_metadata.page_table_1,
                 cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
                 topk=topk,
+                row_starts=ks,
             )
         elif self.topk_transform_method == TopkTransformMethod.RAGGED:
             return fast_topk_transform_ragged_fused(
@@ -164,6 +168,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 lengths=self.get_seqlens_expanded(),
                 topk_indices_offset=self.attn_metadata.topk_indices_offset,
                 topk=topk,
+                row_starts=ks,
             )
         else:
             assert False, f"Unsupported {self.topk_transform_method = }"

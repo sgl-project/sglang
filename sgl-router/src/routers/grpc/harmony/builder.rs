@@ -603,11 +603,11 @@ impl HarmonyBuilder {
                     .iter()
                     .rev()
                     .find_map(|item| match item {
-                        ResponseInputOutputItem::FunctionToolCall { id, name, .. }
-                            if id == call_id =>
-                        {
-                            Some(name.clone())
-                        }
+                        ResponseInputOutputItem::FunctionToolCall {
+                            call_id: item_call_id,
+                            name,
+                            ..
+                        } if item_call_id == call_id => Some(name.clone()),
                         _ => None,
                     })
                     .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;

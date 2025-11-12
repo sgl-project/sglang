@@ -8,7 +8,7 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 if is_cuda():
     try:
@@ -114,7 +114,7 @@ class Indexer(CustomOp):
         self.fuse_wk_and_weights_proj = fuse_wk_and_weights_proj
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
-            self.half_device_sm_count = align(self.sm_count // 2, 8)
+            self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -345,7 +345,10 @@ class Indexer(CustomOp):
         k_scale_list = []
         ks_list = []
         ke_list = []
-        offset = 0
+
+        q_offset = 0
+        k_offset = 0
+
         seq_lens_expanded = metadata.get_seqlens_expanded()
         block_tables = metadata.get_page_table_64()
 
@@ -368,13 +371,17 @@ class Indexer(CustomOp):
                 block_tables[i],
             )
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
-            ks = torch.full((extend_seq_len,), offset, dtype=torch.int32, device="cuda")
-            ke = ks + seq_lens_expanded[offset : offset + extend_seq_len]
+            ks = torch.full(
+                (extend_seq_len,), k_offset, dtype=torch.int32, device="cuda"
+            )
+            ke = ks + seq_lens_expanded[q_offset : q_offset + extend_seq_len]
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
             ks_list.append(ks)
             ke_list.append(ke)
-            offset += extend_seq_len
+
+            q_offset += extend_seq_len
+            k_offset += seq_len
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
@@ -382,21 +389,38 @@ class Indexer(CustomOp):
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
 
+        # Suppose there are two requests, with extend_seq_len = [3, 2]
+        # and seq_lens = [10, 4]
+        # The logits matrix looks like this, with * representing the valid logits
+        # and - representing the invalid logits:
+        #
+        #  ********--|----
+        #  *********-|----
+        #  **********|----
+        #  ----------|***-
+        #  ----------|****
+        #
+        # ks = [0, 0, 0, 10, 10]
+        # ke = [8, 9, 10, 13, 14]
+
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8[:offset],
+            q_fp8[:q_offset],
             kv_fp8,
-            weights[:offset],
+            weights[:q_offset],
             ks,
             ke,
             clean_logits=False,
         )
+
         token_nums, _, _ = q_fp8.shape
         assert logits.shape[0] == len(seq_lens_expanded)
-        raw_topk_result = metadata.topk_transform(logits, self.index_topk)
+        assert logits.shape[1] == k_offset
+
+        raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
         )
-        topk_result[:offset] = raw_topk_result
+        topk_result[:q_offset] = raw_topk_result
         return topk_result
 
     def _forward_cuda_k_only(
@@ -418,7 +442,7 @@ class Indexer(CustomOp):
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
             index_k=k_fp8,
@@ -511,7 +535,7 @@ class Indexer(CustomOp):
             end_pos = seq_len
             topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
 
-            pad_len = align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
+            pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
             topk_indices = torch.nn.functional.pad(
                 topk_indices, (0, pad_len), "constant", -1
             )
@@ -599,7 +623,7 @@ class Indexer(CustomOp):
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
             index_k=k_fp8,

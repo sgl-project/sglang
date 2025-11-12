@@ -15,7 +15,6 @@ from sglang.multimodal_gen.dataset.dataloader.schema import (
     pyarrow_schema_t2v,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
-from sglang.multimodal_gen.runtime.pipelines.pipeline_registry import PipelineType
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, WorkloadType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.workflow.preprocess.components import (
@@ -32,9 +31,7 @@ logger = init_logger(__name__)
 class PreprocessWorkflow(WorkflowBase):
 
     def register_pipelines(self) -> None:
-        self.add_pipeline_config(
-            "preprocess_pipeline", (PipelineType.PREPROCESS, self.server_args)
-        )
+        self.add_pipeline_config("preprocess_pipeline", self.server_args)
 
     def register_components(self) -> None:
         assert self.server_args.preprocess_config is not None

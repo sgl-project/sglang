@@ -335,9 +335,12 @@ class ServerArgs:
         return self.host is None or self.port is None
 
     def __post_init__(self):
-        self.scheduler_port = self.settle_port(self.scheduler_port)
+        # Add randomization to avoid race condition when multiple servers start simultaneously
+        initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
+        self.scheduler_port = self.settle_port(initial_scheduler_port)
         # TODO: remove hard code
-        self.master_port = self.settle_port(self.master_port or 30005, 37)
+        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
+        self.master_port = self.settle_port(initial_master_port, 37)
         if self.moba_config_path:
             try:
                 with open(self.moba_config_path) as f:
@@ -646,14 +649,45 @@ class ServerArgs:
         scheduler_host = self.host or "localhost"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
-    def settle_port(self, port: int, port_inc: int = 42) -> int:
-        while True:
+    def settle_port(
+        self, port: int, port_inc: int = 42, max_attempts: int = 100
+    ) -> int:
+        """
+        Find an available port with retry logic.
+
+        Args:
+            port: Initial port to check
+            port_inc: Port increment for each attempt
+            max_attempts: Maximum number of attempts to find an available port
+
+        Returns:
+            An available port number
+
+        Raises:
+            RuntimeError: If no available port is found after max_attempts
+        """
+        attempts = 0
+        original_port = port
+
+        while attempts < max_attempts:
             if is_port_available(port):
+                if attempts > 0:
+                    logger.info(
+                        f"Port {original_port} was unavailable, using port {port} instead"
+                    )
                 return port
+
+            attempts += 1
             if port < 60000:
                 port += port_inc
             else:
-                port -= port_inc + 1
+                # Wrap around with randomization to avoid collision
+                port = 5000 + random.randint(0, 1000)
+
+        raise RuntimeError(
+            f"Failed to find available port after {max_attempts} attempts "
+            f"(started from port {original_port})"
+        )
 
     def post_init_serve(self):
         """

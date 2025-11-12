@@ -364,6 +364,8 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
+            for req in batch.reqs:
+                req.kv_allocated_len += self.speculative_num_steps * self.topk
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
                 num_seqs * self.speculative_num_steps * self.topk,

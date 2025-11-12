@@ -16,8 +16,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
-from sglang.multimodal_gen.runtime.pipelines import build_pipeline
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines import Req, build_pipeline
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (

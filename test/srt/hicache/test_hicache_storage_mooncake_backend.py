@@ -4,18 +4,14 @@ Usage:
     python3.10 -m pytest test/srt/hicache/test_hicache_storage_mooncake_backend.py -v
 """
 
-import json
 import os
 import subprocess
 import time
 import unittest
-from types import SimpleNamespace
 
 import requests
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_disaggregation_utils import get_rdma_devices_args
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,

@@ -50,7 +50,7 @@ class TestDeepseekV32NasBackend_flashmla(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
-            num_shots=8,
+            num_shots=20,
             data_path=None,
             num_questions=1400,
             parallel=1400,
@@ -102,7 +102,57 @@ class TestDeepseekV32NasBackend_fa3(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
-            num_shots=8,
+            num_shots=20,
+            data_path=None,
+            num_questions=1400,
+            parallel=1400,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (deepseek-v3)\n" f'{metrics["accuracy"]=:.3f}\n'
+            )
+            self.assertGreater(metrics["accuracy"], 0.935)
+
+
+class TestDeepseekV32NasBackend_fp8kvcache(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEEPSEEK_V32_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--attention-backend",
+            "nsa",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--tp",
+            "8",
+            "--dp",
+            "8",
+            "--enable-dp-attention",
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        args = SimpleNamespace(
+            num_shots=20,
             data_path=None,
             num_questions=1400,
             parallel=1400,

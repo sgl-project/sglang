@@ -96,7 +96,7 @@ _workspace_manager = FlashInferWorkspaceManager()
 
 
 def ensure_workspace_initialized(
-    max_token_num: int = 16384, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+    max_token_num: int = 2048, hidden_dim: int = 4096, use_fp32_lamport: bool = False
 ):
     """Ensure workspace is initialized"""
     if not is_flashinfer_available() or _flashinfer_comm is None:
@@ -128,7 +128,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    max_token_num: int = 16384,
+    max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
@@ -160,14 +160,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None
 
-    if input_tensor.shape[0] > max_token_num:
-        logger.debug(
-            "Input token(%d) is greater than max_token_num(%d), "
-            "falling back to standard implementation",
-            input_tensor.shape[0],
-            max_token_num,
-        )
-        return None, None
+    assert input_tensor.shape[0] <= max_token_num
 
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
