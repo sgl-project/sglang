@@ -18,6 +18,7 @@ from sglang.srt.utils import add_prefix
 
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionEmbeddings(nn.Module):
+
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
@@ -56,44 +57,9 @@ class SiglipVisionEmbeddings(nn.Module):
         return embeddings
 
 
-# Eagle2.5 Vision Head - matches NVIDIA's SiglipMultiheadAttentionPoolingHead
-class SiglipMultiheadAttentionPoolingHead(nn.Module):
-    """Multihead Attention Pooling for Eagle2.5."""
-
-    def __init__(
-        self,
-        config: SiglipVisionConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.probe = nn.Parameter(torch.randn(1, 1, config.hidden_size))
-        self.attention = nn.MultiheadAttention(
-            config.hidden_size, config.num_attention_heads, batch_first=True
-        )
-        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp = SiglipMLP(
-            config,
-            act_layer=QuickGELU,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
-        )
-
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        batch_size = hidden_state.shape[0]
-        probe = self.probe.repeat(batch_size, 1, 1)
-
-        hidden_state = self.attention(probe, hidden_state, hidden_state)[0]
-
-        residual = hidden_state
-        hidden_state = self.layernorm(hidden_state)
-        hidden_state = residual + self.mlp(hidden_state)
-
-        return hidden_state[:, 0]
-
-
 # Copied from sglang.srt.models.clip.CLIPMLP
 class SiglipMLP(nn.Module):
+
     def __init__(
         self,
         config,
@@ -125,6 +91,7 @@ class SiglipMLP(nn.Module):
 
 # Copied from sglang.srt.models.clip.CLIPEncoderLayer
 class SiglipEncoderLayer(nn.Module):
+
     def __init__(
         self,
         config: SiglipVisionConfig,
@@ -172,6 +139,7 @@ class SiglipEncoderLayer(nn.Module):
         attention_mask: torch.Tensor,
         causal_attention_mask: torch.Tensor,
     ) -> torch.Tensor:
+
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         # Siglip text model uses both `causal_attention_mask` and `attention_mask`
@@ -253,12 +221,12 @@ class SiglipEncoder(nn.Module):
 
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionTransformer(nn.Module):
+
     def __init__(
         self,
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        use_eagle_head: bool = False,
     ) -> None:
         super().__init__()
 
@@ -283,15 +251,6 @@ class SiglipVisionTransformer(nn.Module):
         # VisionAttention in SiglipEncoderLayer is multihead attention
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
-        # Eagle2.5 multihead attention pooling head (always present for Eagle2.5)
-        self.use_eagle_head = use_eagle_head
-        if use_eagle_head:
-            self.head = SiglipMultiheadAttentionPoolingHead(
-                config=config,
-                quant_config=quant_config,
-                prefix=add_prefix("head", prefix),
-            )
-
     @property
     def device(self) -> torch.device:
         return self.encoder.layers[0].layer_norm1.weight.device
@@ -311,10 +270,6 @@ class SiglipVisionTransformer(nn.Module):
 
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
-        # Apply Eagle2.5 head if enabled
-        # if self.use_eagle_head:
-        #     last_hidden_state = self.head(last_hidden_state)
-
         return last_hidden_state
 
 
@@ -325,14 +280,10 @@ class SiglipVisionModel(nn.Module):
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        use_eagle_head: bool = False,
     ):
         super().__init__()
         self.vision_model = SiglipVisionTransformer(
-            config,
-            quant_config,
-            prefix=add_prefix("vision_model", prefix),
-            use_eagle_head=use_eagle_head,
+            config, quant_config, prefix=add_prefix("vision_model", prefix)
         )
 
     @property
