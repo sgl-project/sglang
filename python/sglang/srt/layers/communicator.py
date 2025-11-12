@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -147,15 +147,24 @@ class AttnTpContext:
 
     def init_context(self, q_lora_rank, is_nsa):
         self.allow_input_scattered = (
-            _is_cuda
+            get_global_server_args().enable_attn_tp_input_scattered
+            and _is_cuda
             and q_lora_rank is not None
             and not is_nsa
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
-            and not get_moe_a2a_backend().is_deepep()
+            and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
             and not get_global_server_args().enable_piecewise_cuda_graph
+            and get_global_server_args().speculative_algorithm != "EAGLE3"
         )
+        if get_global_server_args().enable_attn_tp_input_scattered:
+            if not self.allow_input_scattered:
+                logging.info(
+                    "attn_tp_input_scattered is not enabled while other conditions are not met"
+                )
+            else:
+                logging.info("attn_tp_input_scattered is enabled")
 
     def use_input_scattered(self, forward_batch: ForwardBatch):
         return (
