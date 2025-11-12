@@ -13,7 +13,11 @@ from sglang.multimodal_gen.configs.models.encoders import (
     T5Config,
 )
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, preprocess_text
+from sglang.multimodal_gen.configs.pipelines.base import (
+    ModelTaskType,
+    PipelineConfig,
+    preprocess_text,
+)
 from sglang.multimodal_gen.configs.pipelines.hunyuan import (
     clip_postprocess_text,
     clip_preprocess_text,
@@ -29,7 +33,7 @@ class FluxPipelineConfig(PipelineConfig):
     # FIXME: duplicate with SamplingParams.guidance_scale?
     embedded_cfg_scale: float = 3.5
 
-    is_image_gen: bool = True
+    task_type: ModelTaskType = ModelTaskType.T2I
 
     vae_tiling: bool = False
 
