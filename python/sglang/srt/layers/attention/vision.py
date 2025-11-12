@@ -340,6 +340,7 @@ class VisionFlash3Attention(nn.Module):
 
         return output
 
+
 class VisionAiterAttention(nn.Module):
     def __init__(
         self,
@@ -389,6 +390,7 @@ class VisionAiterAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
         )
+
 
 class VisionAscendAttention(nn.Module):
 
