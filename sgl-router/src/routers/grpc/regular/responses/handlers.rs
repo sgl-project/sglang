@@ -83,16 +83,10 @@ pub async fn route_responses(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
 ) -> Response {
-    // 1. Validate request (includes conversation ID format)
+    // 1. Validate request (includes all field and cross-field validations)
     if let Err(validation_errors) = request.validate() {
-        // Extract the first error message for conversation field
-        let error_message = validation_errors
-            .field_errors()
-            .get("conversation")
-            .and_then(|errors| errors.first())
-            .and_then(|error| error.message.as_ref())
-            .map(|msg| msg.to_string())
-            .unwrap_or_else(|| "Invalid request parameters".to_string());
+        // Get the first validation error message
+        let error_message = validation_errors.to_string();
 
         return (
             StatusCode::BAD_REQUEST,
@@ -100,8 +94,7 @@ pub async fn route_responses(
                 "error": {
                     "message": error_message,
                     "type": "invalid_request_error",
-                    "param": "conversation",
-                    "code": "invalid_value"
+                    "code": 400
                 }
             })),
         )

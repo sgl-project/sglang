@@ -664,6 +664,11 @@ impl Default for ResponsesRequest {
     }
 }
 
+impl crate::protocols::validated::Normalizable for ResponsesRequest {
+    // No normalization needed for ResponsesRequest currently
+    // (Phase 3 was skipped - could add tool_choice defaults, etc. in future)
+}
+
 impl GenerationRequest for ResponsesRequest {
     fn is_stream(&self) -> bool {
         self.stream.unwrap_or(false)
