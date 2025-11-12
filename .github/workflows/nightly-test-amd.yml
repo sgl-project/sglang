@@ -41,7 +41,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
 
   check-all-jobs:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && always()
+    if: always()
     needs:
       - nightly-test
     runs-on: ubuntu-latest

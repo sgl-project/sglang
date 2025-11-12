@@ -84,7 +84,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v32
 
   check-all-jobs:
-    if: github.repository == 'sgl-project/sglang' && always()
+    if: always()
     needs:
       - nightly-test-4-gpu-b200
       - nightly-test-8-gpu-b200
