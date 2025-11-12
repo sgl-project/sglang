@@ -3484,9 +3484,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
         # Fuse wk and weights_proj when NSA Indexer is enabled and quant_config is FP4. For nextn, fp4 is disabled so we cannot fuse.
-        fuse_wk_and_weights_proj = is_nsa_indexer_wk_and_weights_proj_fused(
-            self.config, self.quant_config
-        ) and not is_nextn
+        fuse_wk_and_weights_proj = (
+            is_nsa_indexer_wk_and_weights_proj_fused(self.config, self.quant_config)
+            and not is_nextn
+        )
         cached_wk_and_weights_proj = {} if fuse_wk_and_weights_proj else None
 
         if is_nextn:
