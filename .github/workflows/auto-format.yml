@@ -36,12 +36,6 @@ jobs:
         run: |
           SKIP=no-commit-to-branch pre-commit run --all-files || true
 
-      - name: Run sgl-kernel clang-format
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format-18
-          find sgl-kernel -type f \( -name "*.h" -o -name "*.c" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.cu" -o -name "*.cuh" -o -name "*.cc" \) -exec clang-format-18 -i --style=file {} \; || true
-
       - name: Git push
         id: git_push
         run: |
