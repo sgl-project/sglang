@@ -180,6 +180,19 @@ def register_fake_ops():
         else:
             return torch.empty_like(query), torch.empty_like(key)
 
+    @torch.library.register_fake("sgl_kernel::multimodal_rotary_embedding_cpu")
+    def _(
+        positions,
+        query,
+        key,
+        head_size,
+        cos_sin_cache,
+        mrope_section,
+        mrope_interleaved,
+        is_neox
+    ):
+        return query, key
+
     @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope_fused_weight")
     def _(
         hidden_states,
