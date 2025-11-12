@@ -756,6 +756,13 @@ impl StepExecutor for UpdatePoliciesStep {
                         .init_cache_aware_policy(&model_id, &all_workers);
                 }
             }
+            let prefill_workers = app_context.worker_registry.get_prefill_workers();
+            let policy = app_context.policy_registry.get_prefill_policy();
+            if policy.name() == "bucket" {
+                app_context
+                    .policy_registry
+                    .init_pd_bucket_policies(&prefill_workers);
+            }
 
             debug!(
                 "Updated policies for worker {} (model: {})",

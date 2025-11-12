@@ -28,6 +28,7 @@ jobs:
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -44,18 +45,76 @@ jobs:
           echo "This pull request is a draft. Failing the workflow."
           exit 1
 
+      - name: Enforce rate limit for low-permission actors
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const HOURS = 2;
+            const actor = context.actor;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const eventName = context.eventName;
+
+            async function hasHighPermission(username) {
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
+                const perm = data.permission || 'none';
+                return perm === 'write' || perm === 'maintain' || perm === 'admin';
+              } catch (e) {
+                if (e.status === 404 || e.status === 403) return false;
+                throw e;
+              }
+            }
+
+            if (await hasHighPermission(actor)) {
+              core.info(`Triggering user '${actor}' has high permission. No rate limit applied.`);
+              return;
+            }
+
+            const cutoff = new Date(Date.now() - HOURS * 60 * 60 * 1000);
+            core.info(`Checking for workflow runs since ${cutoff.toISOString()} (last ${HOURS} hours) for event '${eventName}'.`);
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: 'pr-test.yml',
+              event: eventName,
+              per_page: 100,
+            });
+
+            const runs = data.workflow_runs || [];
+            const recentFound = runs.find((run) => {
+              if (String(run.id) === String(context.runId)) return false;
+              if (new Date(run.created_at) < cutoff) return false;
+              return (run.actor?.login === actor) || (run.triggering_actor?.login === actor);
+            });
+
+            if (recentFound) {
+              core.setFailed(
+                `User '${actor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
+                `Please wait ${HOURS} hours before triggering again.`
+              );
+            } else {
+              core.info(`No recent runs detected within the last ${HOURS} hours; proceeding.`);
+            }
+
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
             main_package:
-              - "python/**"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
 
   # =============================================== sgl-kernel ====================================================
 
@@ -237,6 +296,19 @@ jobs:
 
           echo "All benchmark tests completed!"
 
+  # =============================================== multimodal_gen ====================================================
+  multimodal-gen-test:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run placeholder test
+        run: |
+          echo "Running multimodal_gen tests..."
+          echo "This is a placeholder for future tests."
+
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
   # cuda13-kernel-smoke-test:
@@ -395,6 +467,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     strategy:
       fail-fast: false
       matrix:
@@ -746,6 +820,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -773,6 +849,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -790,7 +868,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepseek-v32
@@ -862,6 +940,8 @@ jobs:
         sgl-kernel-unit-test,
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
+
+        multimodal-gen-test,
 
         unit-test-frontend,
         unit-test-backend-1-gpu,
