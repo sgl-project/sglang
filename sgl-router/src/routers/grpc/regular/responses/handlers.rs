@@ -83,25 +83,7 @@ pub async fn route_responses(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
 ) -> Response {
-    // 1. Validate request (includes all field and cross-field validations)
-    if let Err(validation_errors) = request.validate() {
-        // Get the first validation error message
-        let error_message = validation_errors.to_string();
-
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "error": {
-                    "message": error_message,
-                    "type": "invalid_request_error",
-                    "code": 400
-                }
-            })),
-        )
-            .into_response();
-    }
-
-    // 2. Reject background mode (no longer supported)
+    // 1. Reject background mode (no longer supported)
     let is_background = request.background.unwrap_or(false);
     if is_background {
         return (
@@ -118,7 +100,7 @@ pub async fn route_responses(
             .into_response();
     }
 
-    // 3. Route based on execution mode
+    // 2. Route based on execution mode
     let is_streaming = request.stream.unwrap_or(false);
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
