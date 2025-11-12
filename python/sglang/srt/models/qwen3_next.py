@@ -5,6 +5,7 @@ from typing import Any, Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import divide, get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -38,8 +39,6 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -55,9 +54,10 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+from contextlib import nullcontext
+
 import triton
 import triton.language as tl
-from contextlib import nullcontext
 
 
 @triton.jit
@@ -352,7 +352,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        DUAL_STREAM_TOKEN_THRESHOLD =  0
+        DUAL_STREAM_TOKEN_THRESHOLD = 0
         seq_len, _ = hidden_states.shape
         if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
             current_stream = torch.cuda.current_stream()
@@ -375,13 +375,12 @@ class Qwen3GatedDeltaNet(nn.Module):
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             torch.ops.sglang.gdn_with_output(
                 hidden_states,
-                self.layer_id.
                 output,
+                self.layer_id,
             )
             return output
         else:
             return self._forward(hidden_states, forward_batch)
-        
 
     def _forward(
         self,
@@ -1053,10 +1052,11 @@ EntryClass = Qwen3NextForCausalLM
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.utils import direct_register_custom_op
 
+
 def gdn_with_output(
     hidden_states: torch.Tensor,
-    layer_id: int,
     output: torch.Tensor,
+    layer_id: int,
 ) -> None:
     context = get_forward_context()
     forward_batch = context.forward_batch
@@ -1070,13 +1070,13 @@ def gdn_with_output(
     ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
 
     output.view(ret.shape).copy_(ret)
-    return 
+    return
 
 
 def gdn_with_output_fake(
     hidden_states: torch.Tensor,
-    layer_id: int,
     output: torch.Tensor,
+    layer_id: int,
 ) -> None:
     return
 
