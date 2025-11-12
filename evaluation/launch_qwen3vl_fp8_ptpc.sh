@@ -23,4 +23,5 @@ python3 -m sglang.launch_server \
     --disable-radix-cache \
     --max-prefill-tokens 32768 \
     --cuda-graph-max-bs 128 \
+    --mm-attention-backend aiter_attn \
     2>&1 | tee log.server.log &
