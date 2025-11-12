@@ -1,10 +1,9 @@
 """Launch the inference server."""
 
-import argparse
-from importlib.metadata import version as pkg_version
 import asyncio
 import os
 import sys
+from importlib.metadata import version as pkg_version
 
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
