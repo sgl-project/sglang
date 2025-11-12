@@ -689,10 +689,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
-    def post_process(self,
-        inputs_embeds, 
-        modalities: List[Modality], 
-        embeddings: List[torch.Tensor], 
+    def post_process(
+        self,
+        inputs_embeds,
+        modalities: List[Modality],
+        embeddings: List[torch.Tensor],
         masks: List[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
@@ -702,7 +703,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             range(len(embeddings)), modalities, embeddings, masks
         ):
             if self.use_deepstack.get(modality, False):
-                embedding, deepstack_embedding = self.separate_deepstack_embeds(embedding)
+                embedding, deepstack_embedding = self.separate_deepstack_embeds(
+                    embedding
+                )
                 new_embeddings += [embedding]
                 deepstack_embeddings += [deepstack_embedding]
             else:
@@ -719,7 +722,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         )
         for i, modality, embedding, mask in zip(
             range(len(embeddings)), modalities, embeddings, masks
-        ):  
+        ):
             if mask is None:
                 continue
             indices = torch.where(mask.squeeze(dim=-1))[0]
@@ -727,7 +730,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
                     inputs_embeds.device, inputs_embeds.dtype
                 )
-                
+
         forward_batch.input_deepstack_embeds = input_deepstack_embeds
         return new_embeddings
 
