@@ -709,13 +709,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
+        # hidden_states = general_mm_embed_routine_in_model(
+        #     input_ids=input_ids,
+        #     forward_batch=forward_batch,
+        #     language_model=self.model,
+        #     multimodal_model=self,
+        #     positions=positions,
+        #     use_deepstack=self.use_deepstack,
+        # )
+
+        hidden_states = self.model(
+            input_ids=None,
             forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
+            input_embeds=forward_batch.inputs_embeds,
             positions=positions,
-            use_deepstack=self.use_deepstack,
+            input_deepstack_embeds=forward_batch.input_deepstack_embeds,
         )
 
         if not get_embedding:

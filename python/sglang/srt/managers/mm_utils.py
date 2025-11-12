@@ -631,11 +631,75 @@ def embed_mm_inputs(
     return inputs_embeds, other_info
 
 
-def _is_cudagraph_capture() -> bool:
-    try:
-        return bool(torch.cuda.is_current_stream_capturing())
-    except Exception:
-        return False
+def general_mm_embed_routine_runner(
+    input_ids: torch.Tensor,
+    forward_batch: ForwardBatch,
+    language_model: nn.Module,
+    multimodal_model: Optional[nn.Module] = None,
+    data_embedding_funcs: Dict[
+        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
+    ] = None,
+    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
+    use_deepstack: Dict[Modality, bool] = {},
+    **kwargs,
+) -> ForwardBatch:
+    """
+    Process multimodal inputs and forward through language model.
+
+    Args:
+        input_ids: Input token IDs tensor
+        forward_batch: Batch information for model forward pass
+        language_model: Base language model to use
+        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
+        placeholder_tokens: Token IDs for multimodal placeholders
+        use_deepstack: Whether to use deepstack embeddings for each modality, default False
+        **kwargs: Additional arguments passed to language model
+
+    Returns:
+        ForwardBatch
+    """
+    assert hasattr(language_model, "get_input_embeddings")
+    embed_tokens = language_model.get_input_embeddings()
+    if (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
+        and forward_batch.contains_mm_inputs()
+    ):
+        mm_inputs_list = [
+            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+        ]
+        extend_prefix_lens = [
+            prefix_len
+            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        extend_seq_lens = [
+            seq_len
+            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        inputs_embeds, other_info = embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=input_ids,
+            multimodal_model=multimodal_model,
+            input_embedding=embed_tokens,
+            data_embedding_func_mapping=data_embedding_funcs,
+            placeholder_tokens=placeholder_tokens,
+            use_deepstack=use_deepstack,
+        )
+        # add for qwen3_vl deepstack
+        if use_deepstack:
+            kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+        # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+        # just being defensive here
+        forward_batch.mm_inputs = None
+    else:
+        inputs_embeds = embed_tokens(input_ids)
+
+    forward_batch.input_embeds = inputs_embeds
+    return forward_batch
 
 
 def general_mm_embed_routine(
@@ -665,9 +729,6 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
-    if use_deepstack is None:
-        use_deepstack = {}
-
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:

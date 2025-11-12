@@ -92,6 +92,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.mm_utils import general_mm_embed_routine_runner
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -2210,6 +2211,20 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
+            if self.model_is_mrope():
+                positions = forward_batch.mrope_positions
+            else:
+                positions = forward_batch.positions
+
+            forward_batch = general_mm_embed_routine_runner(
+                input_ids=forward_batch.input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                skip_llm_forward=True,
+            )
+
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
