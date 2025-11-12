@@ -52,10 +52,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
-    from aiter.ops.shuffle import shuffle_weight
     from aiter.fused_moe import fused_moe
-
-    from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
+    from aiter.ops.shuffle import shuffle_weight
 
 
 if _is_cuda:
