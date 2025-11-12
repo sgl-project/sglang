@@ -24,7 +24,7 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -1032,7 +1032,9 @@ class Scheduler(
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
                 self._check_runtime_mem_leak()
 
-    def recv_requests(self) -> List[Req]:
+    def recv_requests(
+        self,
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.recv_skipper is not None:
@@ -2400,7 +2402,10 @@ class Scheduler(
         exec = None
         try:
             func = getattr(self, recv_req.method)
-            func(recv_req.parameters)
+            if recv_req.parameters is not None:
+                func(**recv_req.parameters)
+            else:
+                func()
         except Exception as e:
             success = False
             exec = e
