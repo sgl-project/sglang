@@ -153,6 +153,17 @@ class LoRAAdapter(nn.Module):
 
         # Refresh weight_names after potential synthesis above
         weight_names = list(weights.keys())
+        # Final cleanup: remove any remaining DeepSeek fused entries (both A and B) to
+        # ensure downstream name matching only sees normalized targets.
+        for name in list(weights.keys()):
+            if (
+                ("q_a_proj" in name)
+                or ("kv_a_proj_with_mqa" in name)
+                or ("q_b_proj" in name)
+                or ("kv_b_proj" in name)
+            ):
+                weights.pop(name, None)
+        weight_names = list(weights.keys())
 
         target_module = set()
         for weight_name in weight_names:
