@@ -37,7 +37,15 @@ tracing_enabled = False
 
 try:
     from opentelemetry import context, propagate, trace
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+        OTLPSpanExporter as GRPCSpanExporter,
+    )
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter as HTTPSpanExporter,
+    )
+    from opentelemetry.sdk.environment_variables import (
+        OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+    )
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider, id_generator
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -207,7 +215,7 @@ def process_tracing_init(otlp_endpoint, server_name):
         )
 
         processor = BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True),
+            span_exporter=get_otlp_span_exporter(otlp_endpoint),
             schedule_delay_millis=schedule_delay_millis,
             max_export_batch_size=max_export_batch_size,
         )
@@ -223,6 +231,22 @@ def process_tracing_init(otlp_endpoint, server_name):
         __get_cur_time_ns = lambda: int(time.time_ns())
 
     tracing_enabled = True
+
+
+def get_otlp_span_exporter(endpoint):
+    protocol = os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "grpc")
+    supported_protocols = {"grpc", "http/protobuf"}
+
+    if protocol not in supported_protocols:
+        raise ValueError(
+            f"Unsupported OTLP protocol '{protocol}' configured. "
+            f"Supported protocols are: {', '.join(sorted(supported_protocols))}"
+        )
+
+    if protocol == "grpc":
+        return GRPCSpanExporter(endpoint=endpoint, insecure=True)
+    elif protocol == "http/protobuf":
+        return HTTPSpanExporter(endpoint=endpoint)
 
 
 # Should be called by each tracked thread.
