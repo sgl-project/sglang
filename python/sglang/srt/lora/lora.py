@@ -223,7 +223,22 @@ class LoRAAdapter(nn.Module):
                 k_name = weight_name.replace("qkv_proj", "k_proj")
                 v_name = weight_name.replace("qkv_proj", "v_proj")
                 if "lora_A" in weight_name:
-                    weights[qkv_name] = weights[qkv_name].repeat(3, 1)
+                    # Only stack if current rows == r. If already 3r, no-op.
+                    r = int(self.config.r)
+                    rows = weights[qkv_name].shape[0]
+                    if rows == r:
+                        weights[qkv_name] = weights[qkv_name].repeat(3, 1)
+                    elif rows == 3 * r:
+                        pass
+                    else:
+                        # Bring to 3r rows by tiling or truncating
+                        if rows > 3 * r:
+                            weights[qkv_name] = weights[qkv_name][: 3 * r, :]
+                        else:
+                            reps = (3 * r + rows - 1) // rows
+                            weights[qkv_name] = weights[qkv_name].repeat(reps, 1)[
+                                : 3 * r, :
+                            ]
                 # else: no-op as LoRA B weight is already stacked.
 
     def normalize_gate_up_proj(
@@ -250,5 +265,20 @@ class LoRAAdapter(nn.Module):
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
-                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                    # Only stack if current rows == r. If already 2r, no-op.
+                    r = int(self.config.r)
+                    rows = weights[gate_up_name].shape[0]
+                    if rows == r:
+                        weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                    elif rows == 2 * r:
+                        pass
+                    else:
+                        # Bring to 2r rows by tiling or truncating
+                        if rows > 2 * r:
+                            weights[gate_up_name] = weights[gate_up_name][: 2 * r, :]
+                        else:
+                            reps = (2 * r + rows - 1) // rows
+                            weights[gate_up_name] = weights[gate_up_name].repeat(
+                                reps, 1
+                            )[: 2 * r, :]
                 # else: no-op as LoRA B weight is already stacked.
