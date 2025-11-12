@@ -286,7 +286,17 @@ class LoRAMemoryPool:
                 target_module: None for target_module in self.B_buffer
             }
             for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
+                # Map full weight name to one of the configured target modules. If no match,
+                # skip this weight (e.g., LoRA weights for modules not enabled like o_proj).
+                try:
+                    target_module = get_target_module_name(name, self.target_modules)
+                except ValueError:
+                    logger.debug(
+                        "Skipping LoRA weight not in target modules. name=%s, targets=%s",
+                        name,
+                        self.target_modules,
+                    )
+                    continue
                 if "lora_A" in name:
                     temp_A_buffer[target_module] = weights
                 else:
