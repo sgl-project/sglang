@@ -203,29 +203,15 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             vit_embeds_list = []
             for i in range(batch_size):
                 single_image = pixel_values[i : i + 1]  # [1, channels, height, width]
-                if self.config.select_layer == -1:
-                    single_vit_embeds = self.vision_model(pixel_values=single_image)
-                else:
-                    # For select_layer != -1, we need to get hidden states
-                    # This requires the vision model to output hidden states
-                    single_vit_embeds = self.vision_model(pixel_values=single_image)
-                    # Note: In NVIDIA's implementation, they access hidden_states[select_layer]
-                    # For now, we use the last hidden state as the base implementation
-
+                # Always grab the last hidden state
+                single_vit_embeds = self.vision_model(pixel_values=single_image)
                 single_vit_embeds = self.feature_compression(single_vit_embeds)
                 vit_embeds_list.append(single_vit_embeds)
             vit_embeds = torch.cat(vit_embeds_list, dim=0)
         else:
             # Single image or already properly shaped
-            if self.config.select_layer == -1:
-                vit_embeds = self.vision_model(pixel_values=pixel_values)
-            else:
-                # For select_layer != -1, we need to get hidden states
-                # This requires the vision model to output hidden states
-                vit_embeds = self.vision_model(pixel_values=pixel_values)
-                # Note: In NVIDIA's implementation, they access hidden_states[select_layer]
-                # For now, we use the last hidden state as the base implementation
-
+            vit_embeds = self.vision_model(pixel_values=pixel_values)
+            # Always grab the last hidden state
             vit_embeds = self.feature_compression(vit_embeds)
         return vit_embeds
 
@@ -286,13 +272,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
-        for name, param in params_dict.items():
-            print(f"DEBUG: Params_dict: {name}")
-
         for name, loaded_weight in weights:
-            # Skip rotary embeddings
-            if "rotary_emb.inv_freq" in name:
-                continue
             if "lm_head" in name:
                 name = name.replace("language_model.lm_head.weight", "lm_head.weight")
 
@@ -331,7 +311,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                # print(f"DEBUG: Loading weight {name}")
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -351,7 +330,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                     continue
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                # print(f"DEBUG: Loading weight {name}")
                 weight_loader(param, loaded_weight)
 
     def pad_input_ids(

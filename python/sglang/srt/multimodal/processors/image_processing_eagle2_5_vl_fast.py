@@ -5,7 +5,7 @@
 # --------------------------------------------------------
 
 # copy from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_onevision/image_processing_llava_onevision_fast.py
-# copy from https://huggingface.co/nvidia/Eagle2.5-8B/blob/main/image_processing_eagle2_5_vl_fast.py
+# copy from https://huggingface.co/nvidia/Eagle2.5-8B/blob/main/image_processing_eagle2_5_vl_fast.py with minimal modifications to prevent bug related to `resample = kwargs.pop("resample")`
 from functools import partial
 from typing import List, Optional, Union
 
