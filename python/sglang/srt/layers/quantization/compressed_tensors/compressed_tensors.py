@@ -248,6 +248,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         config_groups = config.get("config_groups", dict())
         for _, quant_config in config_groups.items():
             targets = quant_config.get("targets")
+            quant_format = cast(str, quant_config.get("format"))
             for target in targets:
                 target_scheme_map[target] = {}
                 target_scheme_map[target]["weights"] = QuantizationArgs.model_validate(
