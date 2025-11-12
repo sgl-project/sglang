@@ -47,12 +47,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    RequestRetractStatus,
-    RequestStage,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -297,16 +292,12 @@ class DecodePreallocQueue:
         )
         return kv_manager
 
-    def add(
-        self,
-        req: Req,
-        is_retracted: RequestRetractStatus = RequestRetractStatus.NOT_RETRACTED,
-    ) -> None:
+    def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
-        if is_retracted == RequestRetractStatus.RETRACTING:
+        if is_retracted:
             self.retracted_queue.append(req)
         else:
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
@@ -340,11 +331,7 @@ class DecodePreallocQueue:
             return True
         return False
 
-    def extend(
-        self,
-        reqs: List[Req],
-        is_retracted: RequestRetractStatus = RequestRetractStatus.NOT_RETRACTED,
-    ) -> None:
+    def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
@@ -371,7 +358,7 @@ class DecodePreallocQueue:
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
-            req.is_retracted = RequestRetractStatus.RETRACTED
+            req.is_retracted = False
             self._pre_alloc(req)
             allocatable_tokens -= required_tokens_for_request
 

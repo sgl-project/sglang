@@ -431,12 +431,6 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
-class RequestRetractStatus(enum.Enum):
-    NOT_RETRACTED = 1
-    RETRACTING = 2
-    RETRACTED = 3
-
-
 class Req:
     """The input and output status of a request."""
 
@@ -577,7 +571,9 @@ class Req:
         self.is_chunked = 0
 
         # For retraction
-        self.is_retracted = RequestRetractStatus.NOT_RETRACTED
+        self.is_retracted = False
+        # Indicates if the req has ever been retracted.
+        self.has_retracted = False
 
         # Incremental streamining
         self.send_token_offset: int = 0
@@ -952,7 +948,8 @@ class Req:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
-        self.is_retracted = RequestRetractStatus.RETRACTING
+        self.is_retracted = True
+        self.has_retracted = True
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
@@ -1319,13 +1316,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             multimodal_inputs.append(req.multimodal_inputs)
 
-            # Only calculate cached_tokens once. Once retracted
-            # *DO NOT* recompute the cache
-            if req.is_retracted == RequestRetractStatus.NOT_RETRACTED:
+            # Only calculate cached_tokens once. Once retracted, the 'has_retracted'
+            # flag will always True
+            if not req.has_retracted:
                 req.cached_tokens += pre_len - req.already_computed
                 req.already_computed = seq_len
-            if req.is_retracted == RequestRetractStatus.RETRACTING:
-                req.is_retracted = RequestRetractStatus.RETRACTED
+            req.is_retracted = False
 
             # Compute the relative logprob_start_len in an extend batch
             #
