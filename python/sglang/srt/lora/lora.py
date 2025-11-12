@@ -119,6 +119,15 @@ class LoRAAdapter(nn.Module):
                 A_kv = weights[kv_a_name]
                 # Construct qkv A by duplicating kv_a for both K and V slices
                 weights[qkv_a_name] = torch.cat((A_q, A_kv, A_kv), dim=0)
+                # Remove original fused entries to avoid downstream name matching issues
+                try:
+                    weights.pop(q_a_name)
+                except KeyError:
+                    pass
+                try:
+                    weights.pop(kv_a_name)
+                except KeyError:
+                    pass
 
         ds_q_b = [n for n in weight_names if ("q_b_proj" in n and "lora_B" in n)]
         for q_b_name in ds_q_b:
@@ -132,6 +141,15 @@ class LoRAAdapter(nn.Module):
                 B_k = B_kv[:split, :]
                 B_v = B_kv[split:, :]
                 weights[qkv_b_name] = torch.cat((B_q, B_k, B_v), dim=0)
+                # Remove original fused entries to avoid downstream name matching issues
+                try:
+                    weights.pop(q_b_name)
+                except KeyError:
+                    pass
+                try:
+                    weights.pop(kv_b_name)
+                except KeyError:
+                    pass
 
         # Refresh weight_names after potential synthesis above
         weight_names = list(weights.keys())
