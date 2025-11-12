@@ -166,9 +166,13 @@ class PiecewiseCudaGraphRunner:
 
         self.max_num_tokens = max(self.capture_num_tokens)
 
+        self.use_input_embeds = model_runner.is_multimodal
+
         # Graph inputs
         with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            self.input_embeds = torch.zeros((self.max_num_tokens, self.model_runner.model_config.hidden_size), dtype=self.model_runner.dtype)
+            # make sure the dtype is right.
             self.out_cache_loc = torch.zeros(
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
@@ -219,7 +223,8 @@ class PiecewiseCudaGraphRunner:
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=1,
-                input_ids=torch.randint(0, 100, (num_tokens,), device=self.device),
+                input_ids=torch.randint(0, 100, (num_tokens,), device=self.device) if not self.use_input_embeds else None,
+                input_embeds=torch.randn(num_tokens, self.model_runner.model_config.hidden_size, dtype=self.model_runner.dtype, device=self.device) if self.use_input_embeds else None,
                 req_pool_indices=torch.arange(1, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -329,7 +334,13 @@ class PiecewiseCudaGraphRunner:
         bs = 1
 
         # Graph inputs
-        input_ids = self.input_ids[:num_tokens]
+        if self.use_input_embeds:
+            input_ids = None
+            input_embeds = self.input_embeds[:num_tokens]
+        else:
+            input_ids = self.input_ids[:num_tokens]
+            input_embeds = None
+        
         out_cache_loc = self.out_cache_loc[:num_tokens]
         out_cache_loc_swa = self.out_cache_loc_swa[:num_tokens]
         positions = self.positions[:num_tokens]
@@ -355,6 +366,7 @@ class PiecewiseCudaGraphRunner:
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=input_ids,
+                input_embeds=input_embeds,
                 req_pool_indices=torch.arange(bs, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -432,6 +444,10 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ):
+        if self.use_input_embeds:
+            num_tokens = forward_batch.input_embeds.shape[0]
+        else:
+            num_tokens = len(forward_batch.input_ids)
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]

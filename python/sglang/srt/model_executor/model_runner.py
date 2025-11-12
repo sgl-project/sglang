@@ -2127,6 +2127,7 @@ class ModelRunner:
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         ):
+            print(f"piecewise cuda graph replay")
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
         if not skip_attn_backend_init:

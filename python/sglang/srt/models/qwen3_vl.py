@@ -774,11 +774,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        if input_embeds is None:
-            input_embeds = self.get_input_embeddings()(input_ids)
+        input_embeds = forward_batch.input_embeds
+        # 可能会觉得很奇怪，为什么传入了input_embeds还要赋值一次？
+        # 这是 出于兼容性考虑
+        # 在extend中，两个地方会调用这个forward：1. model_runner 直接调用forward，2. piece_wise_cuda_graph_runner 调用 forward & replay
+
+        # 另外现在
+        # 在 extend 中，会传入 input_embeds
+        # 在 decode 中，会传入 input_ids
 
         hidden_states = self.model(
-            input_ids=None,
+            input_ids=input_ids,
             forward_batch=forward_batch,
             input_embeds=input_embeds,
             positions=positions,
