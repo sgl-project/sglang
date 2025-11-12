@@ -527,6 +527,7 @@ async def async_request_sglang_generate(
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
+            "return_routed_experts": args.return_routed_experts,
             "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
@@ -2560,6 +2561,11 @@ if __name__ == "__main__":
         "--return-logprob",
         action="store_true",
         help="Return logprob.",
+    )
+    parser.add_argument(
+        "--return-routed-experts",
+        action="store_true",
+        help="Return routed experts.",
     )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
