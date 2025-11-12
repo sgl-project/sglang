@@ -519,6 +519,7 @@ class ServerArgs:
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
+    enable_dp_multimodal_encoder: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -3414,6 +3415,11 @@ class ServerArgs:
             default=ServerArgs.rl_on_policy_target,
             choices=RL_ON_POLICY_TARGET_CHOICES,
             help="The training system that SGLang needs to match for true on-policy.",
+        )
+        parser.add_argument(
+            "--enable-dp-multimodal-encoder",
+            action="store_true",
+            help="Enable multimodal encoder data parallel.",
         )
 
         # Dynamic batch tokenizer
