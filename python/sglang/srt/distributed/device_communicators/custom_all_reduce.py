@@ -420,7 +420,7 @@ class CustomAllreduce:
 
 def dispatch_custom_allreduce():
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
-    if is_hip() and get_bool_env_var("USE_AITER_CAR", default="true"):
+    if is_hip() and get_bool_env_var("SGLANG_AITER_AR", default="true"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
