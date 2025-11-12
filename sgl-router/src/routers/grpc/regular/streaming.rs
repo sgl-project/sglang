@@ -695,9 +695,10 @@ impl StreamingProcessor {
                 ProtoResponseVariant::Chunk(chunk) => {
                     let index = chunk.index();
 
-                    // Update completion tokens for this index
+                    // Both backends send delta token_ids, so accumulate for both
                     let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
                     *completion_tokens += chunk.token_ids().len() as u32;
+                    let current_completion_tokens = *completion_tokens;
 
                     // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
                     let chunk_text = tokenizer
@@ -720,7 +721,7 @@ impl StreamingProcessor {
                             "finish_reason": null,
                             "prompt_tokens": chunk.prompt_tokens(),
                             "weight_version": &weight_version,
-                            "completion_tokens": chunk.completion_tokens(),
+                            "completion_tokens": current_completion_tokens,
                             "cached_tokens": chunk.cached_tokens()
                         },
                         "index": index
@@ -860,9 +861,10 @@ impl StreamingProcessor {
                 ProtoResponseVariant::Chunk(chunk) => {
                     let index = chunk.index();
 
-                    // Update completion tokens for this index
+                    // Both backends send delta token_ids, so accumulate for both
                     let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
                     *completion_tokens += chunk.token_ids().len() as u32;
+                    let current_completion_tokens = *completion_tokens;
 
                     // Decode tokens to text
                     let chunk_text = tokenizer
@@ -887,7 +889,7 @@ impl StreamingProcessor {
                         .get(&index)
                         .and_then(|o| o.as_ref());
 
-                    let chunk_response = serde_json::json!({
+                    let chunk_response = json!({
                         "text": accumulated_text.clone(),
                         "output_ids": chunk.token_ids(),
                         "meta_info": {
@@ -897,7 +899,7 @@ impl StreamingProcessor {
                             "weight_version": &weight_version,
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": current_output_logprobs,
-                            "completion_tokens": chunk.completion_tokens(),
+                            "completion_tokens": current_completion_tokens,
                             "cached_tokens": chunk.cached_tokens()
                         },
                         "index": index
@@ -914,7 +916,10 @@ impl StreamingProcessor {
                     let index = complete.index();
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
+
+                    // Use accumulated count (we tracked deltas from both backends)
                     let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
+
                     let final_output_logprobs = accumulated_output_logprobs
                         .get(&index)
                         .and_then(|o| o.as_ref());
