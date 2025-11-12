@@ -15,6 +15,7 @@ from __future__ import annotations
 # ==============================================================================
 """Request scheduler policy"""
 
+import logging
 import os
 import random
 from collections import defaultdict
@@ -60,6 +61,8 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 
 
 IGNORE_EOS_RESERVE_TOKENS = 1
+
+logger = logging.getLogger(__name__)
 
 
 class CacheAwarePolicy(Enum):
@@ -595,6 +598,9 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            logger.warning(
+                f"Not enough space for req: {req.rid}, total_tokens: {total_tokens} >= rem_total_tokens: {self.rem_total_tokens}"
+            )
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:

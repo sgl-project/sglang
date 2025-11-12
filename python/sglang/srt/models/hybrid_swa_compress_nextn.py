@@ -7,7 +7,11 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, enable_moe_dense_fully_dp
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    enable_moe_dense_fully_dp,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     is_dp_attention_enabled,

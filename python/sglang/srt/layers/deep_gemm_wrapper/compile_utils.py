@@ -114,6 +114,11 @@ def _maybe_compile_deep_gemm_one_type_all(
             num_groups=num_groups,
             m_list=_BUILTIN_M_LIST,
         )
+        cost = time.time() - start
+        if cost > 30:
+            logger.warning(
+                f"DeepGEMM JIT Compiling for {query_key} takes {cost:.2f}s, which may cause deepep timeout"
+            )
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced

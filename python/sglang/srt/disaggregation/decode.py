@@ -229,6 +229,7 @@ class DecodePreallocQueue:
         self.retracted_queue: List[Req] = []
         self.prefill_pp_size = prefill_pp_size
         self.kv_manager = self._init_kv_manager()
+        self.max_pool_size = self.scheduler.tp_worker.model_runner.max_pool_size
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -329,8 +330,8 @@ class DecodePreallocQueue:
             )
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        if len(req.origin_input_ids) > self.max_pool_size:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_pool_size}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
@@ -490,6 +491,9 @@ class DecodePreallocQueue:
             ):
                 break
             if required_tokens_for_request > allocatable_tokens:
+                logger.warning(
+                    f"Not enough space for req: {decode_req.req.rid} {decode_req.req.bootstrap_room=}, required_tokens_for_request: {required_tokens_for_request} > allocatable_tokens: {allocatable_tokens}"
+                )
                 break
 
             allocatable_tokens -= required_tokens_for_request

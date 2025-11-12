@@ -305,7 +305,7 @@ class TpModelWorker(BaseTpWorker):
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
+            self.model_runner.max_pool_size - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert (

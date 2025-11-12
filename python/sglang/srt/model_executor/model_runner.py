@@ -1601,73 +1601,30 @@ class ModelRunner:
             full_layers_num = len(full_attention_layer_ids)
             swa_layers_num = len(swa_attention_layer_ids)
 
-            if self.model_config.hf_config.architectures[0] in [
-                "HybridSWACompressedForCausalLM",
-            ]:
-                # SWA KV cache size per pass
-                swa_cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * (self.model_config.head_dim + self.model_config.v_head_dim)
-                    * swa_layers_num
-                    * torch._utils._element_size(self.kv_cache_dtype)
-                )
-                # Full KV cache size per pass
-                full_cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * (self.model_config.head_dim + self.model_config.v_head_dim)
-                    * full_layers_num
-                    * torch._utils._element_size(self.kv_cache_dtype)
-                )
-                # swa_kv_cache_size / full_kv_cache_size ratio per request
-                swa_full_kv_cache_ratio = (
-                    self.model_config.attention_chunk_size
-                    * swa_cell_size
-                    / (self.model_config.context_len * full_cell_size)
-                )
-                # Total full KV cache tokens
-                self.full_max_total_num_tokens = int(
-                    self.kv_cache_memory
-                    / (1 + swa_full_kv_cache_ratio)
-                    / full_cell_size
-                )
-                # Total SWA KV cache tokens
-                self.swa_max_total_num_tokens = int(
-                    self.kv_cache_memory
-                    * swa_full_kv_cache_ratio
-                    / (1 + swa_full_kv_cache_ratio)
-                    / swa_cell_size
-                )
-                self.max_total_num_tokens = max(
-                    self.full_max_total_num_tokens, self.swa_max_total_num_tokens
-                )
-                logger.info(
-                    f"The swa / full KV cache size ratio is {swa_full_kv_cache_ratio:.2f}"
-                )
-            else:
-                # Algorithm:
-                # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
-                # - Find total # of tokens available across layers.
-                # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
-                total_tokens = (
-                    self.max_total_num_tokens * self.model_config.num_hidden_layers
-                )
-                full_layers_num = len(full_attention_layer_ids)
-                swa_layers_num = len(swa_attention_layer_ids)
-                swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
-
-                # Solve the equations:
-                # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
-                # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-                denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
-                self.full_max_total_num_tokens = int(total_tokens / denominator)
-                self.swa_max_total_num_tokens = int(
-                    self.full_max_total_num_tokens * swa_full_tokens_ratio
-                )
-                self.max_total_num_tokens = self.full_max_total_num_tokens
-
-            logger.info(
-                f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
+            # Algorithm:
+            # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
+            # - Find total # of tokens available across layers.
+            # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+            total_tokens = (
+                self.max_total_num_tokens * self.model_config.num_hidden_layers
             )
+            full_layers_num = len(full_attention_layer_ids)
+            swa_layers_num = len(swa_attention_layer_ids)
+            swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
+
+            # Solve the equations:
+            # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
+            # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
+            denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+            self.full_max_total_num_tokens = int(total_tokens / denominator)
+            self.swa_max_total_num_tokens = int(
+                self.full_max_total_num_tokens * swa_full_tokens_ratio
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+
+        logger.info(
+            f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
+        )
 
     def can_run_piecewise_cuda_graph(self):
         if self.server_args.enable_torch_compile:
