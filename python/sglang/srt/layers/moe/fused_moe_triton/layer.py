@@ -75,7 +75,11 @@ logger = logging.getLogger(__name__)
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    if (
+        a2a_backend.is_none()
+        or a2a_backend.is_fp4_allgather()
+        or a2a_backend.is_flashinfer_alltoallv()
+    ):
         return StandardDispatcher(moe_runner_config)
     elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         return MaybeTboDeepEPDispatcher(

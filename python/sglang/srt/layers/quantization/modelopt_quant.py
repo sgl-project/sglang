@@ -21,8 +21,8 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_a2a_backend,
     get_moe_runner_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -1113,6 +1113,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         self._cache_permute_indices = {}
 
+        self.alltoall_workspace = None
+        self.alltoall_prepare_workspace = None
+        if get_moe_a2a_backend().is_flashinfer_alltoallv():
+            from sglang.srt.layers.flashinfer_alltoall import (
+                initialize_flashinfer_alltoall_workspaces,
+            )
+
+            self.alltoall_workspace, self.alltoall_prepare_workspace = (
+                initialize_flashinfer_alltoall_workspaces()
+            )
+
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
         from sglang.srt.layers.moe import get_moe_runner_backend
@@ -1580,6 +1591,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
 
+    def fp4_quantize(
+        self, x: torch.Tensor, scale: torch.Tensor, swizzle: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.shape[0] > 0:
+            x, x_sf = fp4_quantize_flashinfer(x, scale, is_sf_swizzled_layout=swizzle)
+        else:
+            x_col = x.shape[1]
+            x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
+            x_sf = torch.zeros(0, x_col // 16, dtype=torch.uint8, device=x.device)
+        return x, x_sf
+
     def apply(
         self,
         layer: FusedMoE,
@@ -1615,28 +1637,61 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             output_dtype = x.dtype
             original_col = x.shape[1]
             x_sf = None
-
-            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+            alltoall_info = None
+            token_count = x.shape[0]
+            if get_moe_a2a_backend().is_fp4_allgather():
                 from flashinfer import nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
                 with use_symmetric_memory(
                     get_tp_group(), disabled=not is_allocation_symmetric()
                 ):
-                    if x.shape[0] > 0:
-                        x, x_sf = fp4_quantize_flashinfer(
-                            x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
-                        )
-                    else:
-                        x_col = x.shape[1]
-                        x = torch.zeros(
-                            0, x_col // 2, dtype=torch.uint8, device=x.device
-                        )
-                        x_sf = torch.zeros(
-                            0, x_col // 16, dtype=torch.uint8, device=x.device
-                        )
+                    x, x_sf = self.fp4_quantize(
+                        x, layer.w13_input_scale_quant, swizzle=False
+                    )
                 topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                     [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
+                )
+                x_sf = nvfp4_block_scale_interleave(x_sf)
+            elif get_moe_a2a_backend().is_flashinfer_alltoallv():
+                from flashinfer import nvfp4_block_scale_interleave
+                from flashinfer.comm.trtllm_alltoall import MnnvlMoe
+
+                max_num_token = (
+                    max(get_dp_global_num_tokens())
+                    if get_dp_global_num_tokens() is not None
+                    else token_count
+                )
+                alltoall_info, topk_ids, topk_weights, _ = (
+                    MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+                        topk_ids,
+                        topk_weights,
+                        None,
+                        self.alltoall_prepare_workspace,
+                        max_num_token,
+                        layer.moe_ep_rank,
+                        layer.moe_ep_size,
+                        layer.num_experts,
+                        layer.num_experts,
+                        layer.top_k,
+                    )
+                )
+                x, x_sf = self.fp4_quantize(
+                    x, layer.w13_input_scale_quant, swizzle=False
+                )
+                x = MnnvlMoe.mnnvl_moe_alltoallv(
+                    x,
+                    alltoall_info,
+                    self.alltoall_workspace,
+                    layer.moe_ep_rank,
+                    layer.moe_ep_size,
+                )
+                x_sf = MnnvlMoe.mnnvl_moe_alltoallv(
+                    x_sf,
+                    alltoall_info,
+                    self.alltoall_workspace,
+                    layer.moe_ep_rank,
+                    layer.moe_ep_size,
                 )
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
@@ -1644,7 +1699,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
-                    x.shape[0], original_col, dtype=output_dtype, device=x.device
+                    x.shape[0],
+                    layer.w2_weight.shape[1],
+                    dtype=output_dtype,
+                    device=x.device,
                 )
 
             output = flashinfer_cutlass_fused_moe(
@@ -1669,8 +1727,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                enable_alltoall=get_moe_a2a_backend().is_flashinfer_alltoallv(),
             )[0]
-            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+            # Scale by routed_scaling_factor is fused into select_experts.
+            if get_moe_a2a_backend().is_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
 
                 if forward_shared_experts is not None:
@@ -1682,6 +1742,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     global_output, output=output, sizes=get_dp_global_num_tokens()
                 )
 
+                if forward_shared_experts is not None:
+                    torch.cuda.current_stream().wait_stream(alt_stream)
+
+            elif get_moe_a2a_backend().is_flashinfer_alltoallv():
+                output = MnnvlMoe.mnnvl_moe_alltoallv_combine(
+                    output,
+                    alltoall_info,
+                    self.alltoall_workspace,
+                    ep_rank=layer.moe_ep_rank,
+                    ep_size=layer.moe_ep_size,
+                    top_k=layer.top_k,
+                    token_count=token_count,
+                )
                 if forward_shared_experts is not None:
                     torch.cuda.current_stream().wait_stream(alt_stream)
 
