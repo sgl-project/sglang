@@ -5,13 +5,16 @@
 # This backward pass is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
-import math
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
+
+from sglang.srt.utils import device_context, is_npu
+
+_is_npu = is_npu()
 
 
 def rms_norm_ref(
@@ -158,7 +161,7 @@ def _layer_norm_fwd(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     grid = (M, ngroups)
-    with torch.get_device_module(x.device).device(x.device.index):
+    with device_context(x.device):
         _layer_norm_fwd_1pass_kernel[grid](
             x,
             out,
@@ -179,6 +182,10 @@ def _layer_norm_fwd(
             num_warps=num_warps,
         )
     return out, mean, rstd
+
+
+if _is_npu:
+    from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
 
 
 def rms_norm_gated(

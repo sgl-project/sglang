@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import time
 from contextlib import AsyncExitStack
@@ -778,7 +779,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Update the status to "cancelled"
             response.status = "cancelled"
 
-        # Abort the request
+        # The response_id is the same as the rid used when submitting the request
+        self.tokenizer_manager.abort_request(rid=response_id)
+
         if task := self.background_tasks.get(response_id):
             task.cancel()
             try:
@@ -1061,7 +1064,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ):
                     function_name = previous_item.recipient[len("browser.") :]
                     action = None
-                    parsed_args = ororjson.loads(previous_item.content[0].text)
+                    parsed_args = orjson.loads(previous_item.content[0].text)
                     if function_name == "search":
                         action = openai_responses_types.response_function_web_search.ActionSearch(
                             type="search",
