@@ -5,7 +5,6 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -16,7 +15,7 @@ from sglang.test.test_utils import (
 class TestFlashAttention4(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-8B"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
@@ -49,7 +48,7 @@ class TestFlashAttention4(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.65)
+        self.assertGreater(metrics["accuracy"], 0.75)
 
 
 if __name__ == "__main__":

@@ -172,18 +172,24 @@ void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
-void fast_topk_interface(const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths);
+void fast_topk_interface(
+    const at::Tensor& score,
+    at::Tensor& indices,
+    const at::Tensor& lengths,
+    std::optional<at::Tensor> row_starts_opt = std::nullopt);
 void fast_topk_transform_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
-    const at::Tensor& cu_seqlens_q);
+    const at::Tensor& cu_seqlens_q,
+    std::optional<at::Tensor> row_starts_opt = std::nullopt);
 void fast_topk_transform_ragged_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
     at::Tensor& topk_indices_ragged,
-    const at::Tensor& topk_indices_offset);
+    const at::Tensor& topk_indices_offset,
+    std::optional<at::Tensor> row_starts_opt = std::nullopt);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
