@@ -598,7 +598,7 @@ def embed_mm_inputs(
 
     # only for qwen3vl right now,  replace the original use_deepstack with this method.
     if hasattr(multimodal_model, "post_process"):
-        embeddings = multimodal_model.post_process(
+        embeddings, forward_batch = multimodal_model.post_process(
             inputs_embeds, modalities, embeddings, indices, forward_batch
         )
 
@@ -611,7 +611,7 @@ def embed_mm_inputs(
         # in-place update
         inputs_embeds[index] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
 
-    return inputs_embeds
+    return inputs_embeds, forward_batch
 
 
 def general_mm_embed_routine(
@@ -658,7 +658,7 @@ def general_mm_embed_routine(
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
-        inputs_embeds = embed_mm_inputs(
+        inputs_embeds, forward_batch = embed_mm_inputs(
             forward_batch=forward_batch,
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
@@ -836,7 +836,7 @@ def multimodal_preprocess_routine(
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
-        inputs_embeds = embed_mm_inputs(
+        inputs_embeds, forward_batch = embed_mm_inputs(
             forward_batch=forward_batch,
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
@@ -850,7 +850,16 @@ def multimodal_preprocess_routine(
         # just being defensive here
         forward_batch.mm_inputs = None
     else:
+        # NOTE: This may reduce the performance for only-text inputs. 
+        # Using a fixed-address buffer might be better, though it could be a bit dirty.
         inputs_embeds = embed_tokens(input_ids)
+        # only for qwen3vl
+        if getattr(multimodal_model, "use_deepstack", False):
+            forward_batch.input_deepstack_embeds = torch.zeros(
+                (len(input_ids), multimodal_model.config.hidden_size * len(multimodal_model.deepstack_visual_indexes)),
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
 
     forward_batch.input_embeds = inputs_embeds
     return forward_batch

@@ -2107,13 +2107,17 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        print(f"{self.is_multimodal=}")
         if self.is_multimodal:
             forward_batch = multimodal_preprocess_routine(
                 forward_batch=forward_batch,
                 multimodal_model=self.model,
             )
             assert forward_batch.input_embeds is not None, "input_embeds is required"
-
+            print(f"{forward_batch.input_embeds.shape=}")
+            print(f"{forward_batch.input_deepstack_embeds.shape=}")
+            print(f"right!!!!!!")
+            
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2127,7 +2131,7 @@ class ModelRunner:
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         ):
-            print(f"piecewise cuda graph replay")
+            print(f"piecewise cuda graph replay")   
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
         if not skip_attn_backend_init:

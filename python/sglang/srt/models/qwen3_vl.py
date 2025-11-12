@@ -729,7 +729,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             new_embeddings.append(embedding)
 
         forward_batch.input_deepstack_embeds = input_deepstack_embeds
-        return new_embeddings
+        return new_embeddings, forward_batch
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
