@@ -567,7 +567,7 @@ class ServerArgs:
     decrypted_draft_config_file: Optional[str] = None
 
     # encoder mode
-    mm_encoder_tp_mode: str = "weight"
+    mm_enable_dp_encoder: bool = False
 
     def __post_init__(self):
         """
