@@ -69,6 +69,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from urllib.parse import urlparse
 
 import numpy as np
 import orjson
@@ -945,7 +946,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif os.path.isfile(video_file):
+            # `urlparse` supports file:// paths, and so does VideoReader
+            elif os.path.isfile(urlparse(video_file).path):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
@@ -1355,6 +1357,29 @@ def get_zmq_socket(
             socket.connect(endpoint)
 
         return socket
+
+
+def get_zmq_socket_on_host(
+    context: zmq.Context,
+    socket_type: zmq.SocketType,
+    host: Optional[str] = None,
+) -> Tuple[int, zmq.Socket]:
+    """Create and configure a ZeroMQ socket.
+
+    Args:
+        context: ZeroMQ context to create the socket from.
+        socket_type: Type of ZeroMQ socket to create.
+        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
+
+    Returns:
+        Tuple of (port, socket) where port is the randomly assigned TCP port.
+    """
+    socket = context.socket(socket_type)
+    # Bind to random TCP port
+    config_socket(socket, socket_type)
+    bind_host = f"tcp://{host}" if host else "tcp://*"
+    port = socket.bind_to_random_port(bind_host)
+    return port, socket
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
