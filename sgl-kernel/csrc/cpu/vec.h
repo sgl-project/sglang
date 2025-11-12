@@ -6,7 +6,6 @@
 
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
-#include <ATen/native/cpu/utils.h>
 
 namespace {
 
