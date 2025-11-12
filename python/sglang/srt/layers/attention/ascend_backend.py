@@ -515,7 +515,7 @@ class AscendAttnBackend(AttentionBackend):
             -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
         )
 
-        q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank)
+        q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
         q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
         if not self.graph_mode:
             num_token_padding = q.shape[0]
