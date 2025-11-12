@@ -999,12 +999,8 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), validator::
             }
             _ => {}
         },
-        ResponseInputOutputItem::Reasoning { content, .. } => {
-            if content.is_empty() {
-                let mut e = validator::ValidationError::new("reasoning_content_empty");
-                e.message = Some("Reasoning content cannot be empty".into());
-                return Err(e);
-            }
+        ResponseInputOutputItem::Reasoning { .. } => {
+            // Reasoning content can be empty - no validation needed
         }
         ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
             if output.is_empty() {

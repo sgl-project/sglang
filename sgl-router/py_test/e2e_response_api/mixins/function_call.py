@@ -171,7 +171,10 @@ class FunctionCallingBaseTest(ResponseAPIBaseTest):
                 "input": input_list,
             },
         )
-
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Response: {resp2.text}")  
+        logger.info(f"Response status code: {resp2.status_code}")
         self.assertEqual(resp2.status_code, 200)
 
         data2 = resp2.json()
