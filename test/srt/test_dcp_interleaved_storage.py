@@ -71,11 +71,11 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         # Verify: indices for rank 1 tokens (positions 1, 3) should be 0 (placeholder)
         self.assertIsNotNone(indices)
         self.assertEqual(len(indices), need_size)
-        self.assertEqual(indices[1].item(), 0)  # Position 1 -> rank 1 -> placeholder
-        self.assertEqual(indices[3].item(), 0)  # Position 3 -> rank 1 -> placeholder
-        self.assertNotEqual(indices[0].item(), 0)  # Position 0 -> rank 0 -> allocated
-        self.assertNotEqual(indices[2].item(), 0)  # Position 2 -> rank 0 -> allocated
-        self.assertNotEqual(indices[4].item(), 0)  # Position 4 -> rank 0 -> allocated
+        self.assertEqual(indices[1].item(), -1)  # Position 1 -> rank 1 -> placeholder
+        self.assertEqual(indices[3].item(), -1)  # Position 3 -> rank 1 -> placeholder
+        self.assertNotEqual(indices[0].item(), -1)  # Position 0 -> rank 0 -> allocated
+        self.assertNotEqual(indices[2].item(), -1)  # Position 2 -> rank 0 -> allocated
+        self.assertNotEqual(indices[4].item(), -1)  # Position 4 -> rank 0 -> allocated
 
         # Verify: only 3 tokens were actually allocated (for rank 0)
         # The unused indices should be returned to free pool
@@ -109,11 +109,11 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         # Verify: indices for rank 0 tokens (positions 0, 2, 4) should be 0 (placeholder)
         self.assertIsNotNone(indices)
         self.assertEqual(len(indices), need_size)
-        self.assertEqual(indices[0].item(), 0)  # Position 0 -> rank 0 -> placeholder
-        self.assertEqual(indices[2].item(), 0)  # Position 2 -> rank 0 -> placeholder
-        self.assertEqual(indices[4].item(), 0)  # Position 4 -> rank 0 -> placeholder
-        self.assertNotEqual(indices[1].item(), 0)  # Position 1 -> rank 1 -> allocated
-        self.assertNotEqual(indices[3].item(), 0)  # Position 3 -> rank 1 -> allocated
+        self.assertEqual(indices[0].item(), -1)  # Position 0 -> rank 0 -> placeholder
+        self.assertEqual(indices[2].item(), -1)  # Position 2 -> rank 0 -> placeholder
+        self.assertEqual(indices[4].item(), -1)  # Position 4 -> rank 0 -> placeholder
+        self.assertNotEqual(indices[1].item(), -1)  # Position 1 -> rank 1 -> allocated
+        self.assertNotEqual(indices[3].item(), -1)  # Position 3 -> rank 1 -> allocated
 
         # Verify: only 2 tokens were actually allocated (for rank 1)
         final_available = allocator.available_size()
@@ -193,11 +193,11 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         # Verify: indices for rank 1 tokens (positions 11, 13) should be 0 (placeholder)
         self.assertIsNotNone(indices)
         self.assertEqual(len(indices), extend_num_tokens)
-        self.assertEqual(indices[1].item(), 0)  # Position 11 -> rank 1 -> placeholder
-        self.assertEqual(indices[3].item(), 0)  # Position 13 -> rank 1 -> placeholder
-        self.assertNotEqual(indices[0].item(), 0)  # Position 10 -> rank 0 -> allocated
-        self.assertNotEqual(indices[2].item(), 0)  # Position 12 -> rank 0 -> allocated
-        self.assertNotEqual(indices[4].item(), 0)  # Position 14 -> rank 0 -> allocated
+        self.assertEqual(indices[1].item(), -1)  # Position 11 -> rank 1 -> placeholder
+        self.assertEqual(indices[3].item(), -1)  # Position 13 -> rank 1 -> placeholder
+        self.assertNotEqual(indices[0].item(), -1)  # Position 10 -> rank 0 -> allocated
+        self.assertNotEqual(indices[2].item(), -1)  # Position 12 -> rank 0 -> allocated
+        self.assertNotEqual(indices[4].item(), -1)  # Position 14 -> rank 0 -> allocated
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
@@ -235,9 +235,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         # Verify: indices for rank 1 token (position 6) should be 0 (placeholder)
         self.assertIsNotNone(indices)
         self.assertEqual(len(indices), bs)
-        self.assertNotEqual(indices[1].item(), 0)  # Position 6 -> rank 1 -> allocated
-        self.assertEqual(indices[0].item(), 0)  # Position 5 -> rank 0 -> placeholder
-        self.assertEqual(indices[2].item(), 0)  # Position 7 -> rank 0 -> placeholder
+        self.assertNotEqual(indices[1].item(), -1)  # Position 6 -> rank 1 -> allocated
+        self.assertEqual(indices[0].item(), -1)  # Position 5 -> rank 0 -> placeholder
+        self.assertEqual(indices[2].item(), -1)  # Position 7 -> rank 0 -> placeholder
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
@@ -307,12 +307,12 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         # Verify: rank 1 should only store positions 1 and 4
         self.assertIsNotNone(indices)
         self.assertEqual(len(indices), need_size)
-        self.assertEqual(indices[0].item(), 0)  # Position 0 -> rank 0 -> placeholder
-        self.assertNotEqual(indices[1].item(), 0)  # Position 1 -> rank 1 -> allocated
-        self.assertEqual(indices[2].item(), 0)  # Position 2 -> rank 2 -> placeholder
-        self.assertEqual(indices[3].item(), 0)  # Position 3 -> rank 0 -> placeholder
-        self.assertNotEqual(indices[4].item(), 0)  # Position 4 -> rank 1 -> allocated
-        self.assertEqual(indices[5].item(), 0)  # Position 5 -> rank 2 -> placeholder
+        self.assertEqual(indices[0].item(), -1)  # Position 0 -> rank 0 -> placeholder
+        self.assertNotEqual(indices[1].item(), -1)  # Position 1 -> rank 1 -> allocated
+        self.assertEqual(indices[2].item(), -1)  # Position 2 -> rank 2 -> placeholder
+        self.assertEqual(indices[3].item(), -1)  # Position 3 -> rank 0 -> placeholder
+        self.assertNotEqual(indices[4].item(), -1)  # Position 4 -> rank 1 -> allocated
+        self.assertEqual(indices[5].item(), -1)  # Position 5 -> rank 2 -> placeholder
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
@@ -387,12 +387,12 @@ class TestDCPInterleavedStorage(unittest.TestCase):
             for pos in range(seq_len):
                 if pos % 4 == rank:
                     # This token belongs to current rank
-                    self.assertNotEqual(indices[pos].item(), 0,
+                    self.assertNotEqual(indices[pos].item(), -1,
                                       f"Rank {rank}, position {pos} should be allocated")
                     expected_count += 1
                 else:
                     # This token belongs to another rank
-                    self.assertEqual(indices[pos].item(), 0,
+                    self.assertEqual(indices[pos].item(), -1,
                                    f"Rank {rank}, position {pos} should be placeholder")
 
             # Verify: available_size decreased by expected_count
@@ -461,12 +461,12 @@ class TestDCPInterleavedStorage(unittest.TestCase):
             for i, pos in enumerate(range(prefix_len, seq_len)):
                 if pos % 4 == rank:
                     # This token belongs to current rank
-                    self.assertNotEqual(indices[i].item(), 0,
+                    self.assertNotEqual(indices[i].item(), -1,
                                       f"Rank {rank}, position {pos} should be allocated")
                     expected_count += 1
                 else:
                     # This token belongs to another rank
-                    self.assertEqual(indices[i].item(), 0,
+                    self.assertEqual(indices[i].item(), -1,
                                    f"Rank {rank}, position {pos} should be placeholder")
 
             # Verify: All allocated indices are unique
@@ -523,12 +523,12 @@ class TestDCPInterleavedStorage(unittest.TestCase):
                 token_pos = seq_len_val - 1  # Decode token position
                 if token_pos % 4 == rank:
                     # This token belongs to current rank
-                    self.assertNotEqual(indices[i].item(), 0,
+                    self.assertNotEqual(indices[i].item(), -1,
                                       f"Rank {rank}, request {i}, position {token_pos} should be allocated")
                     expected_count += 1
                 else:
                     # This token belongs to another rank
-                    self.assertEqual(indices[i].item(), 0,
+                    self.assertEqual(indices[i].item(), -1,
                                    f"Rank {rank}, request {i}, position {token_pos} should be placeholder")
 
             # Verify: All allocated indices are unique
