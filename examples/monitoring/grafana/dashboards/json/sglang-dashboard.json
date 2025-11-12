@@ -147,7 +147,7 @@
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P95",
+          "legendFormat": "P50",
           "range": true,
           "refId": "C",
           "useBackend": false
@@ -164,7 +164,7 @@
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P50",
+          "legendFormat": "Avg",
           "range": true,
           "refId": "D",
           "useBackend": false
@@ -393,7 +393,7 @@
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P95",
+          "legendFormat": "P50",
           "range": true,
           "refId": "C",
           "useBackend": false
@@ -405,12 +405,12 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "avg(rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval]) /  rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval]))\r\n",
+          "expr": "avg(rate(sglang:time_to_first_token_seconds_sum[$__rate_interval]) /  rate(sglang:time_to_first_token_seconds_count[$__rate_interval]))\r\n",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "P50",
+          "legendFormat": "Avg",
           "range": true,
           "refId": "D",
           "useBackend": false

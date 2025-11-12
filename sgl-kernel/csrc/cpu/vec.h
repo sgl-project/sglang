@@ -16,6 +16,25 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
 
+// allow f16, bf16
+template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 1>
+inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const scalar_t* __restrict__ data) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  bVec x_vec = bVec::loadu(data);
+  fVec x0, x1;
+  std::tie(x0, x1) = at::vec::convert_to_float(x_vec);
+  return std::make_tuple(x0, x1);
+}
+
+// allow  f32
+inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const float* __restrict__ data) {
+  using fVec = at::vec::Vectorized<float>;
+  fVec x0 = fVec::loadu(data);
+  fVec x1 = fVec::loadu(data + fVec::size());
+  return std::make_tuple(x0, x1);
+}
+
 #if defined(CPU_CAPABILITY_AVX512)
 
 // `at::vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics
@@ -28,7 +47,7 @@ convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorize
 
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
-#define CVT_FP16_TO_FP32(a) _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC))
+#define CVT_FP16_TO_FP32(a) _mm512_cvtph_ps(a)
 
 // this doesn't handle NaN.
 inline __m512bh cvt_e4m3_bf16_intrinsic_no_nan(__m256i fp8_vec) {
