@@ -542,17 +542,8 @@ class DenoisingStage(PipelineStage):
                     ).contiguous()
                     sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
                     return sharded_tensor, True
-            elif tensor.dim() == 4:
-                # For image models, shard along the height dimension.
-                height = tensor.shape[2]
-                if height > 0 and height % sp_world_size == 0:
-                    sharded_tensor = rearrange(
-                        tensor, "b c (n h) w -> b c n h w", n=sp_world_size
-                    ).contiguous()
-                    sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :]
-                    return sharded_tensor, True
 
-            # For unsharded tensors, return as is.
+            # For 4D image tensors or unsharded 5D tensors, return as is.
             return tensor, False
 
         batch.latents, did_shard = _shard_tensor(batch.latents)
