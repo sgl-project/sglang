@@ -14,6 +14,7 @@ mod power_of_two;
 mod random;
 mod registry;
 mod round_robin;
+mod tree;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
