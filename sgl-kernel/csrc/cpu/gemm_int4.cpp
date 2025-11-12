@@ -1,9 +1,8 @@
-#include <ATen/native/CPUBlas.h>
-#include <c10/util/Unroll.h>
 #include <torch/all.h>
 
 #include "gemm.h"
 #include "vec.h"
+
 namespace {
 
 #define BLOCK_N block_size_n()
@@ -22,6 +21,7 @@ struct ActDtype<false> {
 struct alignas(32) m256i_wrapper {
   __m256i data;
 };
+
 
 #if defined(CPU_CAPABILITY_AVX512)
 inline std::array<m256i_wrapper, 2> load_zps_4vnni(const int8_t* __restrict__ zps) {
@@ -193,14 +193,14 @@ void _dequant_gemm_accum_small_M(
   __m512i vcompensate[COLS];
 
   // Load scales and zps
-  c10::ForcedUnroll<COLS>{}([&](auto i) {
+  Unroll<COLS>{}([&](auto i) {
     vscales[i] = _mm512_loadu_ps(scales_b + i * 16);
     vzps[i] = combine_m256i(load_zps_4vnni(qzeros_b + i * 16));
     if constexpr (!sym_quant_a) {
       vcompensate[i] = _mm512_setzero_epi32();
     }
   });
-  c10::ForcedUnroll<M * COLS>{}([&](auto i) { vc[i] = _mm512_setzero_epi32(); });
+  Unroll<M * COLS>{}([&](auto i) { vc[i] = _mm512_setzero_epi32(); });
 
   auto compute = [&](auto i, int k) {
     constexpr const int row = i / COLS;
@@ -232,11 +232,11 @@ void _dequant_gemm_accum_small_M(
   constexpr const int unroll = 4;
   int k = 0;
   for (; k < K / 4 / unroll; k++) {
-    c10::ForcedUnroll<unroll>{}([&](auto i) { c10::ForcedUnroll<M * COLS>{}(compute, 4 * (k * unroll + i)); });
+    Unroll<unroll>{}([&](auto i) { Unroll<M * COLS>{}(compute, 4 * (k * unroll + i)); });
   }
   k *= 4 * unroll;
   for (; k < K; k += 4) {
-    c10::ForcedUnroll<M * COLS>{}(compute, k);
+    Unroll<M * COLS>{}(compute, k);
   }
 
   // Store to C
@@ -256,7 +256,7 @@ void _dequant_gemm_accum_small_M(
     vc_float = _mm512_add_ps(vc_float, vc_old);
     _mm512_storeu_ps(C + row * ldc + col * 16, vc_float);
   };
-  c10::ForcedUnroll<M * COLS>{}(store);
+  Unroll<M * COLS>{}(store);
 }
 
 #define call_dequant_gemm_accum_small_M(M) \
@@ -397,33 +397,40 @@ inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_
   }
 }
 
-template <typename out_dtype, bool sym_quant_a>
-void _da8w4_linear_impl(
-    const at::Tensor& input,
-    const at::Tensor& input_scales,
-    const at::Tensor& input_qzeros,
-    const at::Tensor& weight,
-    const at::Tensor& weight_scales,
-    const at::Tensor& weight_qzeros,
-    const std::optional<at::Tensor>& bias,
-    at::Tensor& output) {
-  // input shape = [..., K]
-  // input is per token quantized
-  int64_t K = input.size(-1);
-  auto input_view = input.view({-1, K});
-  int64_t M = input_view.size(0);
-  TORCH_CHECK(input_scales.numel() == M, "DA8W4: unexpected input scales shape");
-  if (not sym_quant_a) {
-    TORCH_CHECK(input_scales.sizes() == input_qzeros.sizes(), "DA8W4: unexpected input qzeros shape");
-  }
 
+void fill_val_stub(int32_t* __restrict__ output, int32_t value, int64_t size) {
+  using iVec = at::vec::Vectorized<int32_t>;
+  constexpr int VecSize = iVec::size();
+  const iVec fill_val_vec = iVec(value);
+  int64_t d;
+  for (d = 0; d <= size - VecSize; d += VecSize) {
+    fill_val_vec.store(output + d);
+  }
+  for (; d < size; ++d) {
+    output[d] = value;
+  }
+}
+
+template <typename act_dtype, typename out_dtype, bool sym_quant_a>
+void _da8w4_linear_impl(
+    act_dtype* __restrict__ input,
+    const float* __restrict__ input_scales,
+    const int32_t* __restrict__ input_qzeros,
+    const uint8_t* __restrict__ weight,
+    const float* __restrict__ weight_scales,
+    const int8_t* __restrict__ weight_qzeros,
+    const float* __restrict__ bias,
+    out_dtype* __restrict__ output,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t num_groups) {
   // weight + compensation shape = [Nc, Kc, BLOCK_N * BLOCK_K / 2 + BLOCK_N*sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, BLOCK_N]
+  // scales/qzeros shape = [Nc, G, BLOCK_N]
+  int64_t Kc = K / BLOCK_K;
+  int64_t Nc = N / BLOCK_N;
   const bool use_brgemm = can_use_brgemm<int8_t>(M);
-  int64_t Nc = weight.size(0);
-  int64_t Kc = weight.size(1);
-  int64_t N = Nc * BLOCK_N;
-  TORCH_CHECK(K == Kc * BLOCK_K, "DA8W4: weight and input shapes mismatch");
   int64_t block_m = [&]() -> long {
     if (M <= 48) {
       return M;
@@ -435,25 +442,11 @@ void _da8w4_linear_impl(
       return 128;
     }
   }();
-  int64_t Mc = (M + block_m - 1) / block_m;
+  int64_t Mc = div_up(M , block_m);
   bool parallel_on_M = M > 128;
   int64_t num_blocks = parallel_on_M ? Mc * Nc : Nc;
-
-  // scales/qzeros shape = [Nc, G, BLOCK_N]
-  int64_t num_groups = weight_scales.size(1);
-  int64_t group_size = K / num_groups;
-  TORCH_CHECK(group_size % BLOCK_K == 0, "DA8W4 CPU: group_size should be divisible by BLOCK_K");
+  int64_t group_size = div_up(K, num_groups);
   int64_t block_per_group = group_size / BLOCK_K;
-
-  using Tin = typename ActDtype<sym_quant_a>::type;
-  const Tin* a_ptr = input_view.data_ptr<Tin>();
-  const float* a_scales_ptr = input_scales.data_ptr<float>();
-  const int32_t* a_qzeros_ptr = sym_quant_a ? nullptr : input_qzeros.data_ptr<int32_t>();
-  const uint8_t* b_ptr = weight.data_ptr<uint8_t>();
-  const float* b_scales_ptr = weight_scales.data_ptr<float>();
-  const int8_t* b_qzeros_ptr = weight_qzeros.data_ptr<int8_t>();
-  out_dtype* c_ptr = output.data_ptr<out_dtype>();
-  const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
 
   at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
     for (const auto i : c10::irange(begin, end)) {
@@ -465,21 +458,21 @@ void _da8w4_linear_impl(
         int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
         alignas(64) float y_buf[m_size][BLOCK_N];
         // copy bias to y_buf if bias is not None
-        auto bias_data = bias_ptr ? bias_ptr + nc * BLOCK_N : nullptr;
+        auto bias_data = bias ? bias + nc * BLOCK_N : nullptr;
         copy_bias<BLOCK_N>(bias_data, y_buf[0], m_size);
         for (int kci = 0; kci < Kc; ++kci) {
           int32_t* compensation_ptr =
               sym_quant_a ? nullptr
-                          : (int32_t*)(void*)(b_ptr + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
+                          : (int32_t*)(void*)(weight + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
                                               BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
           _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, sym_quant_a>(
               y_buf[0] /*C*/,
-              (uint8_t*)a_ptr + mci * block_m * K + kci * BLOCK_K /*A*/,
-              a_scales_ptr + mci * block_m /*scales_a*/,
-              a_qzeros_ptr + mci * block_m /*qzeros_a*/,
-              b_ptr + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))),
-              b_scales_ptr + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
-              b_qzeros_ptr + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*qzeros_b*/,
+              (uint8_t*)input + mci * block_m * K + kci * BLOCK_K /*A*/,
+              input_scales + mci * block_m /*scales_a*/,
+              input_qzeros + mci * block_m /*qzeros_a*/,
+              weight + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))),
+              weight_scales + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
+              weight_qzeros + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*qzeros_b*/,
               compensation_ptr /*Bcomp*/,
               m_size /*M*/,
               BLOCK_K /*K*/,
@@ -488,7 +481,7 @@ void _da8w4_linear_impl(
               use_brgemm);
         }
         // store y_buf to output with dtype conversion
-        store_out<out_dtype, BLOCK_N>(y_buf[0], c_ptr + mci * block_m * N + nc * BLOCK_N, m_size, N /*lda*/);
+        store_out<out_dtype, BLOCK_N>(y_buf[0], output + mci * block_m * N + nc * BLOCK_N, m_size, N /*lda*/);
       }
     }
     if (use_brgemm) {
@@ -498,6 +491,160 @@ void _da8w4_linear_impl(
 }
 
 }  // anonymous namespace
+
+/*
+return: packed_weight, packed_scales, packed_qzeros
+*/
+std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_compensation(
+  const at::Tensor& weight, const at::Tensor& scales, const at::Tensor& qzeros) {
+// weight shape = [N, K]
+// scales shape = [N, G]
+// qzeros shape = [N, G]
+TORCH_CHECK(weight.dim() == 2, "DA8W4 CPU: Weight should be a 2D tensor for packing");
+TORCH_CHECK(weight.size(1) % 2 == 0, "DA8W4 CPU: Weight should have even number of columns for packing");
+
+auto new_scales = scales;
+auto new_qzeros = qzeros;
+if (new_scales.dim() == 1) {
+  new_scales.unsqueeze_(1);
+}
+new_scales = new_scales.to(at::kFloat);
+if (new_qzeros.dim() == 1) {
+  new_qzeros.unsqueeze_(1);
+}
+new_qzeros = new_qzeros.to(at::kChar);
+int N = weight.size(0);
+int K = weight.size(1);
+int G = scales.size(1);
+int group_size = K / G;
+int block_k = group_size > 128 ? 128 : group_size;
+constexpr int block_n = block_size_n();
+int Nc = N / block_n;
+int Kc = K / block_k;
+
+// Reorder weight to [N/block_n, K/block_k, block_k, block_n]
+// Reorder scales/qzeros to [N/block_n, G, block_n]
+// weight + compensation shape = [Nc, Kc, block_n * block_k / 2 + block_n*sizeof(int32_t)]
+// scales/qzeros shape = [Nc, G, block_n]
+auto weight_view = weight.view({Nc, block_n, Kc, block_k});
+at::Tensor weight_reordered = weight_view.permute({0, 2, 3, 1}).contiguous();
+at::Tensor blocked_weight;
+at::Tensor blocked_scales = new_scales.view({Nc, block_n, G}).permute({0, 2, 1}).contiguous();
+at::Tensor blocked_qzeros = new_qzeros.view({Nc, block_n, G}).permute({0, 2, 1}).contiguous();
+// Compensation = Σ(k)(W[k][n] - ZP[n]) for each block.
+auto weight_sub_qzero = weight.view({Nc, block_n, G, -1}).to(at::kInt) - new_qzeros.view({Nc, block_n, G, -1});
+weight_sub_qzero = weight_sub_qzero.view({Nc, block_n, Kc, block_k});
+at::Tensor compensation = weight_sub_qzero.sum(-1);
+compensation = compensation.permute({0, 2, 1}).contiguous().to(at::kInt);
+int64_t buffer_size_nbytes = block_k * block_n / 2 + block_n * sizeof(int32_t);
+blocked_weight = at::empty({Nc, Kc, buffer_size_nbytes}, weight.options());
+
+auto weight_ptr = weight_reordered.data_ptr<uint8_t>();
+auto compensation_ptr = compensation.data_ptr<int32_t>();
+auto blocked_weight_ptr = blocked_weight.data_ptr<uint8_t>();
+int64_t num_blocks = Nc * Kc;
+at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
+  for (const auto i : c10::irange(begin, end)) {
+    auto in_ptr = weight_ptr + i * block_k * block_n;
+    auto out_ptr = blocked_weight_ptr + i * block_n * (block_k / 2 + sizeof(int32_t));
+    int32_t* comp_in_prt = compensation_ptr + i * block_n;
+    int32_t* comp_out_prt =
+        (int32_t*)(void*)(blocked_weight_ptr + i * block_n * (block_k / 2 + sizeof(int32_t)) + block_k * block_n / 2);
+    // Reorder weight block to VNNI4 and pack two lanes along N
+    // N=16 viewed as two lanes: a0, ...a7, b0, ...b7
+    // pack two lanes: [a0, b0], ..., [a7, b7]
+    // plain shape = [block_k, block_n]
+    // packed shape = [block_k / 4, block_n / 2, 4] viewed as [block_k, block_n / 2]
+    constexpr int n_group_size = 8;
+    constexpr int vnni_size = 4;
+    constexpr int n_group = block_n / n_group_size;  // 4
+    for (int nb = 0; nb < n_group; nb += 2) {
+      for (int k = 0; k < block_k; k += vnni_size) {
+        for (int ni = 0; ni < n_group_size; ++ni) {
+          for (int ki = 0; ki < vnni_size; ++ki) {
+            int src_idx_1 = nb * n_group_size + ni + (k + ki) * block_n;
+            int src_idx_2 = (nb + 1) * n_group_size + ni + (k + ki) * block_n;
+            int dst_idx = (nb / 2 * n_group_size + ni) * vnni_size + k * block_n / 2 + ki;
+            uint8_t src_1 = *(in_ptr + src_idx_1);
+            uint8_t src_2 = *(in_ptr + src_idx_2);
+            uint8_t dst = (src_1 & 0x0f) | ((src_2 & 0x0f) << 4);
+            *(out_ptr + dst_idx) = dst;
+          }
+        }
+      }
+    }
+    // compensation [block_n]
+    for (int nb = 0; nb < block_n; nb++) {
+      *(comp_out_prt + nb) = *(comp_in_prt + nb);
+    }
+  }
+});
+
+return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros));
+}
+
+std::tuple<at::Tensor, at::Tensor> autoawq_to_int4pack(
+  at::Tensor qweight,  // (*, K, N / 8), int32
+  at::Tensor qzeros)   // (*, K / group_size, N / 8), int32
+{
+// bitshifts: [0, 4, 1, 5, 2, 6, 3, 7] * 4
+auto bitshifts = at::tensor({0, 4, 1, 5, 2, 6, 3, 7}, at::kInt) * 4;
+// qweight: assumed shape [..., K, N/8] (int32)
+auto qweight_unsq = qweight.unsqueeze(-1);  // [..., K, N/8, 1]
+auto shape = qweight_unsq.sizes().vec();    // shape: [A, B, C, 1]
+shape[3] = 8;
+auto unpacked = at::bitwise_right_shift(qweight_unsq, bitshifts) & 0xF;
+auto qweight_final = unpacked.flatten(-2).transpose(-1, -2).to(at::kByte);
+
+auto qzeros_unsq = qzeros.unsqueeze(-1);
+auto qzeros_unpacked = at::bitwise_right_shift(qzeros_unsq, bitshifts) & 0xF;
+auto qzeros_final = qzeros_unpacked.flatten(-2).to(at::kByte);
+
+return std::make_tuple(qweight_final, qzeros_final);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
+  at::Tensor qweight,  // (*, K, N / 8), int32
+  at::Tensor qzeros,   // (*, K / group_size, N / 8), int32
+  at::Tensor scales    // (*, K / group_size, N), bfloat16
+) {
+auto res = autoawq_to_int4pack(qweight, qzeros);
+auto _qweight = std::get<0>(res);
+auto _qzeros = std::get<1>(res);
+auto _scales = scales;
+_qzeros = _qzeros.transpose(-2, -1).contiguous();  // .T
+_scales = _scales.transpose(-2, -1).contiguous();
+if (_qweight.dim() == 3) {  // Dim=3 for MOE packing, TODO: refine a unified loop
+  int E = _qweight.size(0);
+  int K = _qweight.size(2);
+  int G = _scales.size(2);
+  int group_size = K / G;
+  int block_k = group_size > 128 ? 128 : group_size;
+  int block_n = block_size_n();
+  int Nc = _qweight.size(1) / block_n;
+  int Kc = K / block_k;
+  int64_t buffer_size_nbytes = block_k * block_n / 2 + block_n * sizeof(int32_t);
+  auto blocked_weight = at::empty({E, Nc, Kc, buffer_size_nbytes}, _qweight.options());
+  auto blocked_scales = at::empty({E, Nc, G, block_n}, _scales.options()).to(at::kFloat);
+  auto blocked_qzeros = at::empty({E, Nc, G, block_n}, _qzeros.options()).to(at::kChar);
+  for (int i = 0; i < _qweight.size(0); i++) {
+    auto res_ = convert_int4_weight_packed_with_compensation(_qweight[i], _scales[i], _qzeros[i]);
+    blocked_weight[i] = std::get<0>(res_);
+    blocked_scales[i] = std::get<1>(res_);
+    blocked_qzeros[i] = std::get<2>(res_);
+  }
+  _qweight = blocked_weight;
+  _scales = blocked_scales;
+  _qzeros = blocked_qzeros;
+} else {
+  auto res_ = convert_int4_weight_packed_with_compensation(_qweight, _scales, _qzeros);
+  _qweight = std::get<0>(res_);
+  _scales = std::get<1>(res_);
+  _qzeros = std::get<2>(res_);
+}
+
+return std::make_tuple(_qweight, _qzeros, _scales);
+}
 
 at::Tensor int4_scaled_mm_cpu_with_quant(
     const at::Tensor& input,
@@ -515,33 +662,51 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   const auto st = input.scalar_type();
   TORCH_CHECK(
       st == at::kBFloat16 || st == at::kHalf, "int4_scaled_mm_cpu_with_quant: expect A to be bfloat16 or half.");
-
-  auto Aq = at::empty({M_a, K_a}, input.options().dtype(c10::kByte));
-  auto As = at::empty({M_a}, input.options().dtype(at::kFloat));
+ 
+  constexpr bool sym_quant_a = false;  // TODO: add sym quant path 
+  using Tin = typename ActDtype<sym_quant_a>::type;
+  int64_t act_buffer_size = M_a*K_a + M_a*sizeof(float) + M_a*sizeof(int32_t);
+  auto act_buffer = at::empty({act_buffer_size}, input.options().dtype(at::kByte));
+  // asym path, activation quants into uint8_t
+  auto Aq_data = act_buffer.data_ptr<uint8_t>();
+  auto As_data = reinterpret_cast<float*>(Aq_data + M_a*K_a);
   auto Azp = at::ones({M_a}, input.options().dtype(at::kInt)).mul(128);
-  bool sym_quant_a = false;  // sym_a s8s8 is unified to u8s8 with compensation (128)
+  // auto Azp_data = Azp.data_ptr<int32_t>();
+  auto Azp_data = reinterpret_cast<int32_t*>(As_data + M_a);
+  fill_val_stub(Azp_data, 128, M_a); // sym_a s8s8 is unified to u8s8 with compensation (128)
 
   auto out_sizes = input.sizes().vec();
   int64_t N = weight_scales.size(0) * weight_scales.size(-1);
   out_sizes.back() = N;
-  auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
+  auto output = at::empty(out_sizes, input.options());
+  // weight + compensation shape = [Nc, Kc, BLOCK_N * BLOCK_K / 2 + BLOCK_N*sizeof(int32_t)]
+  // scales/qzeros shape = [Nc, G, BLOCK_N]
+  int64_t Nc = weight.size(0);
+  int64_t Kc = weight.size(1);
+  TORCH_CHECK(N == Nc * BLOCK_N, "DA8W4: weight and input shapes mismatch");
+  TORCH_CHECK(K_a == Kc * BLOCK_K, "DA8W4: weight and input shapes mismatch");
+  // scales/qzeros shape = [Nc, G, BLOCK_N]
+  int64_t num_groups = weight_scales.size(1);
+
+  const uint8_t* b_ptr = weight.data_ptr<uint8_t>();
+  const float* b_scales_ptr = weight_scales.data_ptr<float>();
+  const int8_t* b_qzeros_ptr = weight_qzeros.data_ptr<int8_t>();
+  const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
 
 #define call__da8w4_linear_with_quant_impl(sym_quant_act)                                                             \
   AT_DISPATCH_FLOATING_TYPES_AND2(                                                                                    \
       at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "int4_scaled_mm_cpu_with_quant", [&] {            \
-        uint8_t* __restrict__ Aq_data = Aq.data_ptr<uint8_t>();                                                       \
-        float* __restrict__ As_data = As.data_ptr<float>();                                                           \
-        int32_t* __restrict__ Azp_data = Azp.data_ptr<int32_t>();                                                     \
         const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();                                             \
+        scalar_t* __restrict__ c_ptr = output.data_ptr<scalar_t>();                                             \
         at::parallel_for(0, M_a, 0, [&](int64_t begin, int64_t end) {                                                 \
           for (int64_t m = begin; m < end; ++m) {                                                                     \
             quantize_row_int8<scalar_t>(Aq_data + m * K_a, As_data[m], A_data + m * lda, K_a);                        \
           }                                                                                                           \
         });                                                                                                           \
-        _da8w4_linear_impl<scalar_t, sym_quant_act>(Aq, As, Azp, weight, weight_scales, weight_qzeros, bias, output); \
+        _da8w4_linear_impl<Tin, scalar_t, sym_quant_act>(Aq_data, As_data, Azp_data, b_ptr, b_scales_ptr, b_qzeros_ptr, bias_ptr, c_ptr, M_a, N, K_a, num_groups); \
       });
 
-  call__da8w4_linear_with_quant_impl(false);
+  call__da8w4_linear_with_quant_impl(sym_quant_a);
 
   return output;
 }

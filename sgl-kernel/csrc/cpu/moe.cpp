@@ -908,14 +908,10 @@ static inline void check_moe_scales(
     bool use_fp8_w8a16,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
-    const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<at::Tensor>& a1_scale,
-    const std::optional<at::Tensor>& a2_scale) {
+    const std::optional<std::vector<int64_t>> block_size) {
   if (use_int8_w8a8) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
-    TORCH_CHECK(!a1_scale.has_value(), "static quantization for activation not supported.");
-    TORCH_CHECK(!a2_scale.has_value(), "static quantization for activation not supported.");
   }
   if (use_fp8_w8a16) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
@@ -956,8 +952,6 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w1_zero,
     const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<at::Tensor>& a1_scale,
-    const std::optional<at::Tensor>& a2_scale,
     bool is_vnni) {
   RECORD_FUNCTION(
       "sgl-kernel::fused_experts_cpu", std::vector<c10::IValue>({hidden_states, w1, w2, topk_weights, topk_ids}));
@@ -1010,7 +1004,7 @@ at::Tensor fused_experts_cpu(
     CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == 3 ? 2 : 1));
   }
   // check scales
-  check_moe_scales(moe_comp_method == 1, moe_comp_method == 2, w1_scale, w2_scale, block_size, a1_scale, a2_scale);
+  check_moe_scales(moe_comp_method == 1, moe_comp_method == 2, w1_scale, w2_scale, block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -1244,8 +1238,6 @@ at::Tensor shared_expert_cpu(
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<at::Tensor>& a1_scale,
-    const std::optional<at::Tensor>& a2_scale,
     bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::shared_expert_cpu", std::vector<c10::IValue>({hidden_states, w1, w2}));
 
@@ -1280,7 +1272,7 @@ at::Tensor shared_expert_cpu(
   CHECK_EQ(packed_w2.size(1), packed_N);
 
   // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size, a1_scale, a2_scale);
+  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 

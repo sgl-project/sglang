@@ -342,8 +342,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 None,  # w1_zp
                 None,  # w2_zp
                 None,  # block_size
-                None,  # a1_scale
-                None,  # a2_scale
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
