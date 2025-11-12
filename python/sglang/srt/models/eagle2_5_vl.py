@@ -37,12 +37,6 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 
-# === Vision Components === #
-
-
-# === Vision Projection === #
-
-
 class Eagle2_5_VLVisionMLP(nn.Module):
     """MLP for projecting vision features to language space."""
 
@@ -315,9 +309,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                 break
             else:
                 # Handle regular parameters
-                if "visual" in name:
-                    # Adapt vision model parameter names if needed
-                    name = name.replace("vision_model.vision_model.", "vision_model.")
 
                 # Skip loading extra bias for GPTQ models
                 if name.endswith(".bias") and name not in params_dict:
