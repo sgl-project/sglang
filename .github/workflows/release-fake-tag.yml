@@ -26,7 +26,7 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           echo "TAG=v$version" >> $GITHUB_OUTPUT
-          
+
       - name: Create and push fake tag
         run: |
           git config user.name "sglang-bot"
