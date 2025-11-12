@@ -248,7 +248,6 @@ class NaiveDecodeSparseRetriver:
             layer.layer_id,
         )
 
-        device = forward_batch.seq_lens.device
         positions_in_page = (
             (forward_batch.seq_lens - 1) % self.cache_manager.config.page_size
         ).to(torch.int32)

@@ -249,9 +249,12 @@ class CacheManager:
     ):
         bs = req_pool_indices.shape[0]
         pre_bs = self.retrived_query[layer_id].bs
-        moving_average_update(self.retrived_query[layer_id].query[:bs], query[:bs], 
-                              req_pool_indices[:bs], self.retrived_query[layer_id].req_pool_indices[:pre_bs], 
-                              self.config.moving_average_factor)
+        if self.config.async_retrive:
+            moving_average_update(self.retrived_query[layer_id].query[:bs], query[:bs], 
+                                req_pool_indices[:bs], self.retrived_query[layer_id].req_pool_indices[:pre_bs], 
+                                self.config.moving_average_factor)
+        else:
+            self.retrived_query[layer_id].query[:bs] = query
         self.retrived_query[layer_id].req_pool_indices[:bs] = req_pool_indices
         self.retrived_query[layer_id].seq_lens[:bs] = seq_lens
         self.retrived_query[layer_id].bs = bs
