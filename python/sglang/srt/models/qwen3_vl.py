@@ -18,7 +18,6 @@ import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
