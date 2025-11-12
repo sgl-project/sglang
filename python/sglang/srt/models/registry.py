@@ -14,9 +14,6 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 
-DISABLED_MODEL_ARCHS: tuple[str, ...] = envs.SGLANG_DISABLED_MODEL_ARCHS.get()
-
-
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
