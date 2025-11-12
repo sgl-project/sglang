@@ -195,7 +195,7 @@ class SGLangFailuresAnalyzer:
 
                 conclusion = job.get("conclusion")
 
-                if conclusion in ["failure", "timed_out", "cancelled"]:
+                if conclusion == "failure":
                     # Failure detected
                     runner_failed_jobs[runner_key] += 1
                     runner_job_failures[runner_key][job_name] += 1
