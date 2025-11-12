@@ -4,7 +4,7 @@ import dataclasses
 import functools
 import math
 from functools import lru_cache, partial
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -88,6 +88,23 @@ def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Ten
         dtype=torch.int32,
         device=device,
     )
+    return cu_seqlens
+
+
+def resolve_seqlens(
+    cu_seqlens: torch.Tensor | SingletonCache | None,
+    bsz: int,
+    seq_len: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    if cu_seqlens is None:
+        cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=device)
+    elif isinstance(cu_seqlens, SingletonCache):
+        if cu_seqlens.empty():
+            cu_seqlens.set_data(_get_cu_seqlens_for_shape(bsz, seq_len, device=device))
+        cu_seqlens = cu_seqlens.get_data()
+    assert isinstance(cu_seqlens, torch.Tensor), "cu_seqlens must be a torch.Tensor"
     return cu_seqlens
 
 
@@ -260,7 +277,7 @@ class VisionTritonAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
         **kwargs,
@@ -271,8 +288,7 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
 
         # [b * s, head, head_size]
         output = torch.empty_like(q)
@@ -306,7 +322,7 @@ class VisionFlash3Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
         **kwargs,
@@ -317,14 +333,7 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-        elif isinstance(cu_seqlens, SingletonCache):
-            if cu_seqlens.empty():
-                cu_seqlens.set_data(
-                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-                )
-            cu_seqlens = cu_seqlens.get_data()
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -357,19 +366,12 @@ class VisionAiterAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
         **kwargs,
     ) -> torch.Tensor:
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-        elif isinstance(cu_seqlens, SingletonCache):
-            if cu_seqlens.empty():
-                cu_seqlens.set_data(
-                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-                )
-            cu_seqlens = cu_seqlens.get_data()
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -401,7 +403,7 @@ class VisionAscendAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
         **kwargs,
@@ -412,8 +414,7 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
 
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         if seq_lens.is_npu:
