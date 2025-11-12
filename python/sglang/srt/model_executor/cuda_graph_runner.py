@@ -477,6 +477,47 @@ class CudaGraphRunner:
             )
             torch.cuda.memory._record_memory_history()
 
+        def _capture_one_stream(stream_idx: Optional[int] = None):
+            avail_mem = get_available_gpu_memory(
+                self.model_runner.device,
+                self.model_runner.gpu_id,
+                empty_cache=False,
+            )
+            # Reverse the order to enable better memory sharing across cuda graphs.
+            capture_range = (
+                tqdm.tqdm(list(reversed(self.capture_bs)))
+                if get_tensor_model_parallel_rank() == 0
+                else reversed(self.capture_bs)
+            )
+            for i, bs in enumerate(capture_range):
+                if get_tensor_model_parallel_rank() == 0:
+                    avail_mem = get_available_gpu_memory(
+                        self.model_runner.device,
+                        self.model_runner.gpu_id,
+                        empty_cache=False,
+                    )
+                    capture_range.set_description(
+                        f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    )
+
+                with patch_model(
+                    self.model_runner.model,
+                    bs in self.compile_bs,
+                    num_tokens=bs * self.num_tokens_per_bs,
+                    tp_group=self.model_runner.tp_group,
+                ) as forward:
+                    (
+                        graph,
+                        output_buffers,
+                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
+                    # For pd_multiplexing, we need to save the graph and output buffers
+                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+                    self.graphs[key] = graph
+                    self.output_buffers[key] = output_buffers
+
+                    # Save gemlite cache after each capture
+                    save_gemlite_cache()
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -484,7 +525,7 @@ class CudaGraphRunner:
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
-                    self._capture_one_stream()
+                    _capture_one_stream()
             else:
                 set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
@@ -492,7 +533,7 @@ class CudaGraphRunner:
                         stream=sg[1]
                     ) as graph_capture_context, profile_context as prof:
                         self.stream = graph_capture_context.stream
-                        self._capture_one_stream(i)
+                        _capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
             torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
@@ -509,47 +550,6 @@ class CudaGraphRunner:
                 + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
             )
             logger.info(log_message)
-
-    def _capture_one_stream(self, stream_idx: Optional[int] = None):
-        avail_mem = get_available_gpu_memory(
-            self.model_runner.device,
-            self.model_runner.gpu_id,
-            empty_cache=False,
-        )
-        # Reverse the order to enable better memory sharing across cuda graphs.
-        capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
-            if get_tensor_model_parallel_rank() == 0
-            else reversed(self.capture_bs)
-        )
-        for i, bs in enumerate(capture_range):
-            if get_tensor_model_parallel_rank() == 0:
-                avail_mem = get_available_gpu_memory(
-                    self.model_runner.device,
-                    self.model_runner.gpu_id,
-                    empty_cache=False,
-                )
-                capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
-                )
-
-            with patch_model(
-                self.model_runner.model,
-                bs in self.compile_bs,
-                num_tokens=bs * self.num_tokens_per_bs,
-                tp_group=self.model_runner.tp_group,
-            ) as forward:
-                (
-                    graph,
-                    output_buffers,
-                ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                # For pd_multiplexing, we need to save the graph and output buffers
-                key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                self.graphs[key] = graph
-                self.output_buffers[key] = output_buffers
-
-                # Save gemlite cache after each capture
-                save_gemlite_cache()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
