@@ -1239,7 +1239,7 @@ class MLATokenToKVPool(KVCache):
         if not valid_mask.all():
             loc = loc[valid_mask]
             cache_k = cache_k[valid_mask]
-            cache_v = cache_v[valid_mask]
+            # cache_v = cache_v[valid_mask]
 
         if loc.numel() == 0:
             return
