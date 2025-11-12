@@ -124,31 +124,13 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
 
         # Build MLP connector based on configuration
         # Note: use_pixel_shuffle determines if we need to handle pixel-shuffled dimensions
-        if config.mlp_connector_layers == 2:
-            # Two-layer MLP with layer norm
-            # When pixel_shuffle is used, input dim = vit_hidden_size * (1/downsample_ratio)^2
-            input_dim = vit_hidden_size * int(1 / config.downsample_ratio) ** 2
-            self.mlp1 = nn.Sequential(
-                nn.LayerNorm(input_dim),
-                nn.Linear(input_dim, llm_hidden_size),
-                nn.GELU(),
-                nn.Linear(llm_hidden_size, llm_hidden_size),
-            )
-        elif config.mlp_connector_layers == 1 and config.use_pixel_shuffle:
-            # Single-layer MLP with pixel shuffle
-            input_dim = vit_hidden_size * int(1 / config.downsample_ratio) ** 2
-            self.mlp1 = nn.Sequential(
-                nn.Linear(input_dim, llm_hidden_size),
-            )
-        elif config.mlp_connector_layers == 1 and not config.use_pixel_shuffle:
-            # Single-layer MLP without pixel shuffle
-            self.mlp1 = nn.Sequential(
-                nn.Linear(vit_hidden_size, llm_hidden_size),
-            )
-        else:
-            raise NotImplementedError(
-                f"{config.mlp_connector_layers} layers is not implemented."
-            )
+        input_dim = vit_hidden_size * int(1 / config.downsample_ratio) ** 2
+        self.mlp1 = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, llm_hidden_size),
+            nn.GELU(),
+            nn.Linear(llm_hidden_size, llm_hidden_size),
+        )
 
         # Special tokens
         self.image_token_index = config.image_token_index
