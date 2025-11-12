@@ -100,7 +100,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# Wrap FP4 GEMM as a custom op so Dynamo can use a fake kernel during compile
 @torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
 def _sglang_fp4_gemm(
     input: torch.Tensor,
@@ -135,7 +134,6 @@ def _sglang_fp4_gemm_fake(
     return input.new_empty((M, N), dtype=out_dtype)
 
 
-# Register fake for sgl-kernel FP4 quant op (void op with out tensors)
 @torch.library.register_fake("sgl_kernel::scaled_fp4_quant")
 def _sgl_kernel_scaled_fp4_quant_fake(output, input, output_scale, input_global_scale):
     return
