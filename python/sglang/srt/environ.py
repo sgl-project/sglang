@@ -162,6 +162,9 @@ class Envs:
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
@@ -265,16 +268,6 @@ class Envs:
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
-
-    # Ktransformers
-    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
-    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
-    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
-    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
-    SGLANG_KT_AMX_METHOD = EnvStr(None)
-    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
-    SGLANG_KT_MOE_MAX_DEFERRED_EXPERTS_PER_TOKEN = EnvInt(None)
-    SGLANG_KT_MOE_TOTAL_LAYERS = EnvInt(None)
 
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
