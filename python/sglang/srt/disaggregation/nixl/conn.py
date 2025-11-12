@@ -83,8 +83,8 @@ class KVArgsRegisterInfo:
             dst_port=int(msg[2].decode("ascii")),
             agent_name=msg[3].decode("ascii"),
             agent_metadata=msg[4],
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
             gpu_id=int(msg[7].decode("ascii")),
             decode_tp_size=int(msg[8].decode("ascii")),
             decode_tp_rank=int(msg[9].decode("ascii")),
@@ -231,8 +231,8 @@ class NixlKVManager(CommonKVManager):
             ]
             for k in keys_to_remove:
                 del self.connection_pool[k]
-            if failed_bootstrap_addr in self.prefill_tp_size_table:
-                del self.prefill_tp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_attn_tp_size_table:
+                del self.prefill_attn_tp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_dp_size_table:
                 del self.prefill_dp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_pp_size_table:
@@ -647,8 +647,6 @@ class NixlKVManager(CommonKVManager):
         return self.transfer_statuses[room].is_done()
 
     def _start_bootstrap_thread(self):
-        self._bind_server_socket()
-
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
@@ -687,7 +685,6 @@ class NixlKVManager(CommonKVManager):
 
 
 class NixlKVSender(CommonKVSender):
-
     def __init__(
         self,
         mgr: NixlKVManager,
@@ -704,6 +701,7 @@ class NixlKVSender(CommonKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -755,7 +753,19 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room
             )
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List[int]] = None,
+    ):
+        if self.bootstrap_infos is None:
+            logger.error(
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"

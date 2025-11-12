@@ -1,16 +1,5 @@
-use super::pd_types::api_path;
-use crate::config::types::RetryConfig;
-use crate::core::{
-    is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
-};
-use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest, StringOrArray, UserMessageContent,
-};
-use crate::routers::header_utils;
-use crate::routers::RouterTrait;
+use std::{sync::Arc, time::Instant};
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -22,10 +11,29 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use std::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
+
+use super::pd_types::api_path;
+use crate::{
+    config::types::RetryConfig,
+    core::{
+        is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+    },
+    metrics::RouterMetrics,
+    policies::{LoadBalancingPolicy, PolicyRegistry},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        classify::ClassifyRequest,
+        common::{InputIds, StringOrArray},
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::{header_utils, RouterTrait},
+};
 
 #[derive(Debug)]
 pub struct PDRouter {
@@ -119,7 +127,7 @@ impl PDRouter {
         }
     }
 
-    pub async fn new(ctx: &Arc<crate::server::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -150,14 +158,10 @@ impl PDRouter {
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
-        if let Some(StringOrArray::Array(arr)) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
-        }
-        if let Some(text) = &req.text {
-            if text.contains("[") && text.contains("]") {
-                return None;
+        // GenerateRequest doesn't support batch via arrays, only via input_ids
+        if let Some(InputIds::Batch(batches)) = &req.input_ids {
+            if !batches.is_empty() {
+                return Some(batches.len());
             }
         }
         None
@@ -1061,18 +1065,10 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
     ) -> Response {
         let is_stream = body.stream;
-        let return_logprob = body.return_logprob;
+        let return_logprob = body.return_logprob.unwrap_or(false);
 
         let request_text = if self.policies_need_request_text() {
-            body.text
-                .as_deref()
-                .or_else(|| {
-                    body.prompt.as_ref().and_then(|p| match p {
-                        StringOrArray::String(s) => Some(s.as_str()),
-                        StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
-                    })
-                })
-                .map(|s| s.to_string())
+            body.text.as_deref().map(|s| s.to_string())
         } else {
             None
         };
@@ -1103,10 +1099,10 @@ impl RouterTrait for PDRouter {
         let request_text = if self.policies_need_request_text() {
             body.messages.first().and_then(|msg| match msg {
                 ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(_) => None,
+                    MessageContent::Text(text) => Some(text.clone()),
+                    MessageContent::Parts(_) => None,
                 },
-                ChatMessage::System { content, .. } => Some(content.clone()),
+                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
                 _ => None,
             })
         } else {
@@ -1195,10 +1191,23 @@ impl RouterTrait for PDRouter {
             .into_response()
     }
 
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Classify endpoint not implemented for PD router",
+        )
+            .into_response()
+    }
+
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::EmbeddingRequest,
+        _body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (

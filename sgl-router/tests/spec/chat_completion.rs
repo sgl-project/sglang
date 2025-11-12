@@ -1,9 +1,12 @@
 use serde_json::json;
-use sglang_router_rs::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, Function, FunctionCall, FunctionChoice, StreamOptions,
-    Tool, ToolChoice, ToolChoiceValue, ToolReference, UserMessageContent,
+use sglang_router_rs::protocols::{
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::{
+        Function, FunctionCall, FunctionChoice, StreamOptions, Tool, ToolChoice, ToolChoiceValue,
+        ToolReference,
+    },
+    validated::Normalizable,
 };
-use sglang_router_rs::protocols::validated::Normalizable;
 use validator::Validate;
 
 // Deprecated fields normalization tests
@@ -14,7 +17,7 @@ fn test_max_tokens_normalizes_to_max_completion_tokens() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         max_tokens: Some(100),
@@ -47,7 +50,7 @@ fn test_max_completion_tokens_takes_precedence() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         max_tokens: Some(100),
@@ -73,7 +76,7 @@ fn test_functions_normalizes_to_tools() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         functions: Some(vec![Function {
@@ -109,7 +112,7 @@ fn test_function_call_normalizes_to_tool_choice() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         function_call: Some(FunctionCall::None),
@@ -145,7 +148,7 @@ fn test_function_call_function_variant_normalizes() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         function_call: Some(FunctionCall::Function {
@@ -195,7 +198,7 @@ fn test_stream_options_requires_stream_enabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         stream: false,
@@ -223,7 +226,7 @@ fn test_stream_options_valid_when_stream_enabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         stream: true,
@@ -245,7 +248,7 @@ fn test_no_stream_options_valid_when_stream_disabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         stream: false,
@@ -266,7 +269,7 @@ fn test_tool_choice_function_not_found() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         tools: Some(vec![Tool {
@@ -302,7 +305,7 @@ fn test_tool_choice_function_exists_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         tools: Some(vec![Tool {
@@ -332,7 +335,7 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         tools: Some(vec![Tool {
@@ -346,8 +349,7 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
             mode: "invalid_mode".to_string(),
-            tools: vec![ToolReference {
-                tool_type: "function".to_string(),
+            tools: vec![ToolReference::Function {
                 name: "get_weather".to_string(),
             }],
             tool_type: "function".to_string(),
@@ -370,7 +372,7 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         tools: Some(vec![Tool {
@@ -384,8 +386,7 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
             mode: "auto".to_string(),
-            tools: vec![ToolReference {
-                tool_type: "function".to_string(),
+            tools: vec![ToolReference::Function {
                 name: "get_weather".to_string(),
             }],
             tool_type: "function".to_string(),
@@ -402,7 +403,7 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         tools: Some(vec![Tool {
@@ -416,8 +417,7 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
             mode: "required".to_string(),
-            tools: vec![ToolReference {
-                tool_type: "function".to_string(),
+            tools: vec![ToolReference::Function {
                 name: "get_weather".to_string(),
             }],
             tool_type: "function".to_string(),
@@ -434,7 +434,7 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         tools: Some(vec![Tool {
@@ -448,8 +448,7 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
             mode: "auto".to_string(),
-            tools: vec![ToolReference {
-                tool_type: "function".to_string(),
+            tools: vec![ToolReference::Function {
                 name: "nonexistent_tool".to_string(),
             }],
             tool_type: "function".to_string(),
@@ -472,7 +471,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         tools: Some(vec![
@@ -498,12 +497,10 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
         tool_choice: Some(ToolChoice::AllowedTools {
             mode: "auto".to_string(),
             tools: vec![
-                ToolReference {
-                    tool_type: "function".to_string(),
+                ToolReference::Function {
                     name: "get_weather".to_string(),
                 },
-                ToolReference {
-                    tool_type: "function".to_string(),
+                ToolReference::Function {
                     name: "get_time".to_string(),
                 },
             ],
@@ -521,7 +518,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            content: UserMessageContent::Text("hello".to_string()),
+            content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
         tools: Some(vec![
@@ -547,12 +544,10 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
         tool_choice: Some(ToolChoice::AllowedTools {
             mode: "auto".to_string(),
             tools: vec![
-                ToolReference {
-                    tool_type: "function".to_string(),
+                ToolReference::Function {
                     name: "get_weather".to_string(),
                 },
-                ToolReference {
-                    tool_type: "function".to_string(),
+                ToolReference::Function {
                     name: "nonexistent_tool".to_string(),
                 },
             ],
