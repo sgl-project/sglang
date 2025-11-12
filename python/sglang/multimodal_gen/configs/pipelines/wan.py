@@ -14,7 +14,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     T5Config,
 )
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, PipelineConfig
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -84,7 +84,7 @@ class WanI2V480PConfig(WanT2V480PConfig):
     """Base configuration for Wan I2V 14B 480P pipeline architecture."""
 
     # WanConfig-specific parameters with defaults
-    i2v_task: bool = True
+    task_type: ModelTaskType = ModelTaskType.I2V
     # Precision for each component
     image_encoder_config: EncoderConfig = field(default_factory=CLIPVisionConfig)
     image_encoder_precision: str = "fp32"
@@ -129,7 +129,7 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
 @dataclass
 class Wan2_2_TI2V_5B_Config(WanT2V480PConfig):
     flow_shift: float | None = 5.0
-    ti2v_task: bool = True
+    task_type: ModelTaskType = ModelTaskType.TI2V
     expand_timesteps: bool = True
     # ti2v, 5B
     vae_stride = (4, 16, 16)
