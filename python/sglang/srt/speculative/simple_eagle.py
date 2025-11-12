@@ -95,7 +95,7 @@ def align_evict_mask_to_page_size_simple_eagle(
 def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
-    with disable_dp_size(), patch_tensor_parallel_group(tp_group):
+    with patch_tensor_parallel_group(tp_group):
         yield
 
 
@@ -432,7 +432,7 @@ class SimpleEagleWorker(TpModelWorker):
             model_worker_batch, self.target_worker.model_runner
         )
 
-        fforward_batch.forward_mode = (
+        forward_batch.forward_mode = (
             ForwardMode.SIMPLE_TARGET_VERIFY
             if not forward_batch.forward_mode.is_idle()
             else ForwardMode.IDLE
