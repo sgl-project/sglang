@@ -93,7 +93,7 @@ class TestKimiK2Thinking(CustomTestCase):
         args = SimpleNamespace(
             num_questions=100,
             concurrency=5,
-            data_path="/shared/user/samples.jsonl",
+            data_path=None,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
