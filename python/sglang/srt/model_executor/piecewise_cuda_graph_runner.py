@@ -458,7 +458,7 @@ class PiecewiseCudaGraphRunner:
         bs = forward_batch.batch_size
 
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        # self.input_embeds[:num_tokens].copy_(forward_batch.input_embeds)
+        self.input_embeds[:num_tokens].copy_(forward_batch.input_embeds)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         if forward_batch.out_cache_loc_swa is not None:
