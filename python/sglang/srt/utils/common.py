@@ -69,6 +69,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from urllib.parse import urlparse
 
 import numpy as np
 import orjson
@@ -945,7 +946,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif os.path.isfile(video_file):
+            # `urlparse` supports file:// paths, and so does VideoReader
+            elif os.path.isfile(urlparse(video_file).path):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
@@ -1831,7 +1833,8 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
             "."
         )
-        major, minor = int(major), int(minor)
+        # Currently XPU version does not contain capability information.
+        major, minor = None, None
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         try:
@@ -2980,7 +2983,7 @@ def configure_gc_logger():
 
 
 # COPIED FROM DeepGEMM
-def align(x: int, y: int) -> int:
+def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
@@ -3605,3 +3608,13 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+cached_device_index = -1
+
+
+def get_current_device_stream_fast():
+    global cached_device_index
+    if cached_device_index == -1:
+        cached_device_index = torch.get_device_module().current_device()
+    return torch.get_device_module().current_stream(cached_device_index)
