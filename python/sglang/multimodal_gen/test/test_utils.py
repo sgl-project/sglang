@@ -19,7 +19,7 @@ logger = init_logger(__name__)
 
 def run_command(command) -> Optional[float]:
     """Runs a command and returns the execution time and status."""
-    print(f"Running command: {' '.join(command)}")
+    print(f"Running command: {shlex.join(command)}")
 
     duration = None
     with subprocess.Popen(
@@ -105,7 +105,8 @@ class TestCLIBase(unittest.TestCase):
         "generate",
         "--text-encoder-cpu-offload",
         "--pin-cpu-memory",
-        "--prompt='A curious raccoon'",
+        "--prompt",
+        "A curious raccoon",
         "--save-output",
         "--log-level=debug",
         f"--width={width}",
@@ -124,7 +125,7 @@ class TestCLIBase(unittest.TestCase):
             self.base_command
             + [f"--model-path={model_path}"]
             + shlex.split(args or "")
-            + [f"--output-file-name={name}"]
+            + ["--output-file-name", f"{name}"]
             + self.extra_args
         )
         duration = run_command(command)
@@ -155,7 +156,8 @@ class TestGenerateBase(TestCLIBase):
         "generate",
         # "--text-encoder-cpu-offload",
         # "--pin-cpu-memory",
-        f"--prompt='{prompt}'",
+        f"--prompt",
+        f"{prompt}",
         "--save-output",
         "--log-level=debug",
         f"--width={width}",
@@ -237,7 +239,7 @@ class TestGenerateBase(TestCLIBase):
     def test_single_gpu(self):
         """single gpu"""
         self._run_test(
-            name=f"{self.model_name()}_single gpu",
+            name=f"{self.model_name()}_single_gpu",
             args=None,
             model_path=self.model_path,
             test_key="test_single_gpu",
@@ -248,7 +250,7 @@ class TestGenerateBase(TestCLIBase):
         if self.data_type == DataType.IMAGE:
             return
         self._run_test(
-            name=f"{self.model_name()}_cfg parallel",
+            name=f"{self.model_name()}_cfg_parallel",
             args="--num-gpus 2 --enable-cfg-parallel",
             model_path=self.model_path,
             test_key="test_cfg_parallel",
