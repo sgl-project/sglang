@@ -167,7 +167,6 @@ class SGLangFailuresAnalyzer:
                     or "unknown"
                 )
                 runner_id = job.get("runner_id") or job.get("runner", {}).get("id")
-                runner_group_name = job.get("runner_group_name", "")
 
                 # Get runner labels (from runs-on field in workflow)
                 runner_labels = job.get("labels", [])
@@ -302,7 +301,7 @@ class SGLangFailuresAnalyzer:
                 job_total_runs[job_name] += 1
                 conclusion = job.get("conclusion")
 
-                if conclusion in ["failure", "timed_out", "cancelled"]:
+                if conclusion == "failure":
                     # Failure detected
                     job_total_failures[job_name] += 1
                     job_current_streak[job_name] += 1
@@ -548,8 +547,6 @@ class SGLangFailuresAnalyzer:
         print("\n" + "=" * 100)
         print("SECTION 1: Currently Broken Jobs (Active Consecutive Failures)")
         print("=" * 100)
-        print("Priority: HIGH - These jobs are failing RIGHT NOW")
-        print("-" * 100)
 
         broken_jobs = [
             (name, data) for name, data in sorted_jobs if data["current_streak"] > 0
@@ -595,8 +592,6 @@ class SGLangFailuresAnalyzer:
             print("\n" + "=" * 100)
             print("SECTION 2: Runner Health Analysis")
             print("=" * 100)
-            print("Priority: VARIES - Runner issues can cause both Sections 1 & 2")
-            print("-" * 100)
 
             # Sort runners by failure rate
             sorted_runners = sorted(
@@ -815,10 +810,6 @@ class SGLangFailuresAnalyzer:
                 "## Section 1: Currently Broken Jobs (Active Failures)"
             )
             summary_lines.append("")
-            summary_lines.append(
-                "**Priority: HIGH** - These jobs are failing RIGHT NOW"
-            )
-            summary_lines.append("")
 
             sorted_jobs = sorted(
                 report_data["job_streak_data"].items(),
@@ -852,10 +843,6 @@ class SGLangFailuresAnalyzer:
             # Section 2: Runner Health Analysis
             if report_data.get("runner_stats"):
                 summary_lines.append("## Section 2: Runner Health Analysis")
-                summary_lines.append("")
-                summary_lines.append(
-                    "**Priority: VARIES** - Runner issues can cause both Sections 1 & 2"
-                )
                 summary_lines.append("")
 
                 # Sort runners by failure rate
