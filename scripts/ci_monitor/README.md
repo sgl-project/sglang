@@ -38,11 +38,8 @@ A comprehensive toolkit to analyze CI failures and performance trends for the SG
 - **GitHub Integration**: Generate GitHub Actions summaries with recommendations
 
 ### Failures Analyzer (`ci_failures_analysis.py`)
-- **Three-Section Analysis**: Broken jobs, flaky jobs, and runner health
-- **Consecutive Failure Tracking**: Identify jobs currently failing and blocking PRs (HIGH priority)
-- **Flaky Job Detection**: Identify jobs with high overall failure rates (MEDIUM priority)
+- **Consecutive Failure Tracking**: Identify jobs currently failing
 - **Runner Health Monitoring**: Track runner failure rates and identify problematic infrastructure
-- **Root Cause Analysis**: Distinguish between code issues vs infrastructure issues
 - **Alert System**: Automatic alerts for consecutive failures and runner problems
 - **Instance Tracking**: Monitor specific runner instances for targeted remediation
 - **GitHub Integration**: Generate comprehensive summaries with actionable recommendations
@@ -165,20 +162,13 @@ python ci_failures_analysis.py --token $GITHUB_TOKEN --limit 500 --threshold 3
 
 #### Understanding the Output
 
-The script generates a **3-section report**:
+The script generates a **2-section report**:
 
 **Section 1: Currently Broken Jobs (Active Consecutive Failures)**
-- **Priority: HIGH** - Jobs failing RIGHT NOW and blocking PRs
 - Shows consecutive failure streaks
 - These need immediate attention
 
-**Section 2: Flaky Jobs (High Overall Failure Rate)**
-- **Priority: MEDIUM** - Jobs that fail frequently but may not be broken right now
-- Sorted by overall failure rate
-- These need investigation to reduce flakiness
-
-**Section 3: Runner Health Analysis**
-- **Priority: VARIES** - Runner issues can cause both Sections 1 & 2
+**Section 2: Runner Health Analysis**
 - Shows which runners have high failure rates
 - Helps identify infrastructure vs code issues
 
