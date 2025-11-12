@@ -520,7 +520,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
-            use_data_parallel = self.use_data_parallel,
+            use_data_parallel=self.use_data_parallel,
         )
 
         self.model = Qwen2Model(
