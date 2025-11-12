@@ -697,6 +697,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         indices: List[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if not self.use_deepstack:
+            return embeddings
         deepstack_embeddings = []
         new_embeddings = []
 
