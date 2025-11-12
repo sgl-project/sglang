@@ -7,6 +7,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -39,6 +40,8 @@ def fp8_mask(a, mask):
 
 def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
     """This function performs fused moe with per-column int8 quantization using native torch."""
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     B, D = a.shape
     # Perform per-token quantization

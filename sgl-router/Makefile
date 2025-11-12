@@ -1,17 +1,26 @@
-# SGLang Router Makefile
+# Model Gateway Makefile
 # Provides convenient shortcuts for common development tasks
+
+# Check if sccache is available and set RUSTC_WRAPPER accordingly
+SCCACHE := $(shell which sccache 2>/dev/null)
+ifdef SCCACHE
+    export RUSTC_WRAPPER := $(SCCACHE)
+    $(info Using sccache for compilation caching)
+else
+    $(info sccache not found. Install it for faster builds: cargo install sccache)
+endif
 
 .PHONY: help bench bench-quick bench-baseline bench-compare test build clean
 
 help: ## Show this help message
-	@echo "SGLang Router Development Commands"
+	@echo "Model Gateway Development Commands"
 	@echo "=================================="
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 
 build: ## Build the project in release mode
-	@echo "Building SGLang Router..."
+	@echo "Building SGLang Model Gateway..."
 	@cargo build --release
 
 test: ## Run all tests
@@ -50,11 +59,11 @@ check: ## Run cargo check and clippy
 	@echo "Running cargo check..."
 	@cargo check
 	@echo "Running clippy..."
-	@cargo clippy
+	@cargo clippy --all-targets --all-features -- -D warnings
 
 fmt: ## Format code with rustfmt
 	@echo "Formatting code..."
-	@cargo fmt
+	@rustup run nightly cargo fmt
 
 # Development workflow shortcuts
 dev-setup: build test ## Set up development environment
@@ -89,4 +98,34 @@ perf-monitor: ## Run continuous performance monitoring
 		watch -n 300 'make bench-quick'; \
 	else \
 		echo "Warning: 'watch' command not found. Install it or run 'make bench-quick' manually."; \
+	fi
+
+# sccache management targets
+setup-sccache: ## Install and configure sccache
+	@echo "Setting up sccache..."
+	@./scripts/setup-sccache.sh
+
+sccache-stats: ## Show sccache statistics
+	@if [ -n "$(SCCACHE)" ]; then \
+		echo "sccache statistics:"; \
+		sccache -s; \
+	else \
+		echo "sccache not installed. Run 'make setup-sccache' to install it."; \
+	fi
+
+sccache-clean: ## Clear sccache cache
+	@if [ -n "$(SCCACHE)" ]; then \
+		echo "Clearing sccache cache..."; \
+		sccache -C; \
+		echo "sccache cache cleared"; \
+	else \
+		echo "sccache not installed"; \
+	fi
+
+sccache-stop: ## Stop the sccache server
+	@if [ -n "$(SCCACHE)" ]; then \
+		echo "Stopping sccache server..."; \
+		sccache --stop-server || true; \
+	else \
+		echo "sccache not installed"; \
 	fi

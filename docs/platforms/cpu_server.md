@@ -1,18 +1,19 @@
 # CPU Servers
 
 The document addresses how to set up the [SGLang](https://github.com/sgl-project/sglang) environment and run LLM inference on CPU servers.
-Specifically, SGLang is well optimized on the CPUs equipped with Intel® AMX® Instructions,
+SGLang is enabled and optimized on the CPUs equipped with Intel® AMX® Instructions,
 which are 4th generation or newer Intel® Xeon® Scalable Processors.
 
 ## Optimized Model List
 
 A list of popular LLMs are optimized and run efficiently on CPU,
 including the most notable open-source models like Llama series, Qwen series,
-and the phenomenal high-quality reasoning model DeepSeek-R1.
+and DeepSeek series like DeepSeek-R1 and DeepSeek-V3.1-Terminus.
 
-| Model Name | BF16 | w8a8_int8 | FP8 |
+| Model Name | BF16 | W8A8_INT8 | FP8 |
 |:---:|:---:|:---:|:---:|
 | DeepSeek-R1 |   | [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8) | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1) |
+| DeepSeek-V3.1-Terminus |   | [IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8](https://huggingface.co/IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8) | [deepseek-ai/DeepSeek-V3.1-Terminus](https://huggingface.co/deepseek-ai/DeepSeek-V3.1-Terminus) |
 | Llama-3.2-3B | [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | [RedHatAI/Llama-3.2-3B-quantized.w8a8](https://huggingface.co/RedHatAI/Llama-3.2-3B-Instruct-quantized.w8a8) |   |
 | Llama-3.1-8B | [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) | [RedHatAI/Meta-Llama-3.1-8B-quantized.w8a8](https://huggingface.co/RedHatAI/Meta-Llama-3.1-8B-quantized.w8a8) |   |
 | QwQ-32B |   | [RedHatAI/QwQ-32B-quantized.w8a8](https://huggingface.co/RedHatAI/QwQ-32B-quantized.w8a8) |   |
@@ -27,7 +28,7 @@ have been verified on 6th Gen Intel® Xeon® P-core platforms.
 ### Install Using Docker
 
 It is recommended to use Docker for setting up the SGLang environment.
-A [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/Dockerfile.xeon) is provided to facilitate the installation.
+A [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xeon.Dockerfile) is provided to facilitate the installation.
 Replace `<secret>` below with your [HuggingFace access token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
@@ -36,7 +37,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-docker build -t sglang-cpu:main -f Dockerfile.xeon .
+docker build -t sglang-cpu:latest -f xeon.Dockerfile .
 
 # Initiate a docker container
 docker run \
@@ -48,7 +49,7 @@ docker run \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -p 30000:30000 \
     -e "HF_TOKEN=<secret>" \
-    sglang-cpu:main /bin/bash
+    sglang-cpu:latest /bin/bash
 ```
 
 ### Install From Source
@@ -63,7 +64,7 @@ is required to enable SGLang service with CPU engine.
 conda create -n sgl-cpu python=3.12 -y
 conda activate sgl-cpu
 
-# Optional: Set PyTorch CPU as primary pip install channel to avoid installing CUDA version
+# Set PyTorch CPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
 pip config set global.index-url https://download.pytorch.org/whl/cpu
 pip config set global.extra-index-url https://pypi.org/simple
 
@@ -81,16 +82,19 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git checkout <YOUR-DESIRED-VERSION>
 
+# Use dedicated toml file
+cd python
+cp pyproject_cpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install intel-openmp
-pip install -e "python[all_cpu]"
+pip install .
+pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
 
 # Build the CPU backend kernels
-cd sgl-kernel
+cd ../sgl-kernel
 cp pyproject_cpu.toml pyproject.toml
-pip install -v .
+pip install .
 
 # Other required environment variables
 # Recommend to set these in ~/.bashrc in order not to set every time in a new terminal
@@ -118,9 +122,9 @@ Notes:
 
 2. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
     The number of TP specified is how many TP ranks will be used during the execution.
-    In a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
-    Usually we can get the SNC information (How many available) from Operation System.
-    User can specify TP to be no more than the total available SNCs in current system.
+    On a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
+    Usually we can get the SNC information (How many available) from the Operating System.
+    Users can specify TP to be no more than the total available SNCs in current system.
 
     If the specified TP rank number differs from the total SNC count,
     the system will automatically utilize the first `n` SNCs.
@@ -134,8 +138,18 @@ Notes:
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
     ```
 
-3. A warmup step is automatically triggered when the service is started.
-The server is ready when you see the log `The server is fired up and ready to roll!`.
+    Please beware that with SGLANG_CPU_OMP_THREADS_BIND set,
+    the available memory amounts of the ranks may not be determined in prior.
+    You may need to set proper `--max-total-tokens` to avoid the out-of-memory error.
+
+3. For optimizing decoding with torch.compile, please add the flag `--enable-torch-compile`.
+    To specify the maximum batch size when using `torch.compile`, set the flag `--torch-compile-max-bs`.
+    For example, `--enable-torch-compile --torch-compile-max-bs 4` means using `torch.compile`
+    and setting the maximum batch size to 4. Currently the maximum applicable batch size
+    for optimizing with `torch.compile` is 16.
+
+4. A warmup step is automatically triggered when the service is started.
+    The server is ready when you see the log `The server is fired up and ready to roll!`.
 
 ## Benchmarking with Requests
 
@@ -159,39 +173,44 @@ python -m sglang.bench_serving -h
 ```
 
 Additionally, the requests can be formed with
-[OpenAI Completions API](https://docs.sglang.ai/backend/openai_api_completions.html)
+[OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
-## Example: Running DeepSeek-R1
+## Example: Running DeepSeek-V3.1-Terminus
 
-An example command to launch service for W8A8 DeepSeek-R1 on a Xeon® 6980P server
+An example command to launch service for W8A8_INT8 DeepSeek-V3.1-Terminus on a Xeon® 6980P server:
 
 ```bash
-python -m sglang.launch_server                 \
-    --model meituan/DeepSeek-R1-Channel-INT8   \
-    --trust-remote-code                        \
-    --disable-overlap-schedule                 \
-    --device cpu                               \
-    --quantization w8a8_int8                   \
-    --host 0.0.0.0                             \
-    --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
+python -m sglang.launch_server                                   \
+    --model IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8   \
+    --trust-remote-code                                          \
+    --disable-overlap-schedule                                   \
+    --device cpu                                                 \
+    --quantization w8a8_int8                                     \
+    --host 0.0.0.0                                               \
+    --mem-fraction-static 0.8                                    \
+    --enable-torch-compile                                       \
+    --torch-compile-max-bs 4                                     \
     --tp 6
 ```
 
-Similarly, an example command to launch service for FP8 DeepSeek-R1 would be
+Similarly, an example command to launch service for FP8 DeepSeek-V3.1-Terminus would be:
 
 ```bash
 python -m sglang.launch_server                 \
-    --model deepseek-ai/DeepSeek-R1            \
+    --model deepseek-ai/DeepSeek-V3.1-Terminus \
     --trust-remote-code                        \
     --disable-overlap-schedule                 \
     --device cpu                               \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
+    --enable-torch-compile                     \
+    --torch-compile-max-bs 4                   \
     --tp 6
 ```
+
+Note: Please set `--torch-compile-max-bs` to the maximum desired batch size for your deployment,
+which can be up to 16. The value `4` in the examples is illustrative.
 
 Then you can test with `bench_serving` command or construct your own command or script
 following [the benchmarking example](#benchmarking-with-requests).

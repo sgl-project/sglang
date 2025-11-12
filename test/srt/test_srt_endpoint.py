@@ -1,6 +1,7 @@
 """
 python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_simple_decode
 python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_logprob_with_chunked_prefill
+python3 -m unittest test_srt_endpoint.TestTokenizeDetokenize
 """
 
 import json
@@ -634,6 +635,108 @@ class TestSRTEndpoint(CustomTestCase):
 
         for f in futures:
             f.result()
+
+
+# -------------------------------------------------------------------------
+#    /tokenize & /detokenize Test Class: TestTokenizeDetokenize
+# -------------------------------------------------------------------------
+
+
+class TestTokenizeDetokenize(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.tokenize_url = f"{cls.base_url}/tokenize"
+        cls.detokenize_url = f"{cls.base_url}/detokenize"
+        cls.session = requests.Session()
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        cls.session.close()
+
+    def _post_json(self, url, payload):
+        r = self.session.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def test_tokenize_various_inputs(self):
+        single = "Hello SGLang world! 123 😊, ಪರ್ವತದ ಮೇಲೆ ಹಿಮ."
+        multi = ["First sentence.", "Second, with 中文."]
+        scenarios = [
+            {"prompt": single, "add_special_tokens": True},
+            {"prompt": single, "add_special_tokens": False},
+            {"prompt": multi, "add_special_tokens": True},
+            {"prompt": multi, "add_special_tokens": False},
+            {"prompt": "", "add_special_tokens": False},
+        ]
+        for case in scenarios:
+            payload = {"model": self.model, "prompt": case["prompt"]}
+            if "add_special_tokens" in case:
+                payload["add_special_tokens"] = case["add_special_tokens"]
+            resp = self._post_json(self.tokenize_url, payload)
+            tokens = resp["tokens"]
+            count = resp["count"]
+            self.assertIsInstance(tokens, list)
+            if not tokens:
+                self.assertEqual(count, 0)
+            else:
+                if isinstance(tokens[0], list):
+                    total = sum(len(t) for t in tokens)
+                    expected = sum(count) if isinstance(count, list) else count
+                else:
+                    total = len(tokens)
+                    expected = count
+                self.assertEqual(total, expected)
+
+    def test_tokenize_invalid_type(self):
+        r = self.session.post(
+            self.tokenize_url, json={"model": self.model, "prompt": 12345}
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_detokenize_roundtrip(self):
+        text = "Verify detokenization round trip. यह डिटोकेनाइजेशन है"
+        t0 = self._post_json(
+            self.tokenize_url,
+            {"model": self.model, "prompt": text, "add_special_tokens": False},
+        )["tokens"]
+        t1 = self._post_json(
+            self.tokenize_url,
+            {"model": self.model, "prompt": text, "add_special_tokens": True},
+        )["tokens"]
+        cases = [
+            {"tokens": t0, "skip_special_tokens": True, "expected": text},
+            {"tokens": t1, "skip_special_tokens": True, "expected": text},
+            {"tokens": t1, "skip_special_tokens": False, "expected": None},
+            {"tokens": [], "skip_special_tokens": True, "expected": ""},
+        ]
+        for case in cases:
+            payload = {"model": self.model, "tokens": case["tokens"]}
+            if "skip_special_tokens" in case:
+                payload["skip_special_tokens"] = case["skip_special_tokens"]
+            resp = self._post_json(self.detokenize_url, payload)
+            text_out = resp["text"]
+            if case["expected"] is not None:
+                self.assertEqual(text_out, case["expected"])
+            else:
+                self.assertIsInstance(text_out, str)
+
+    def test_detokenize_invalid_tokens(self):
+        r = self.session.post(
+            self.detokenize_url, json={"model": self.model, "tokens": ["a", "b"]}
+        )
+        self.assertEqual(r.status_code, 400)
+        r2 = self.session.post(
+            self.detokenize_url, json={"model": self.model, "tokens": [1, -1, 2]}
+        )
+        self.assertEqual(r2.status_code, 500)
 
 
 if __name__ == "__main__":

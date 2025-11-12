@@ -24,6 +24,7 @@ from utils import (
     CI_MULTI_LORA_MODELS,
     TORCH_DTYPES,
     LoRAModelCase,
+    ensure_reproducibility,
 )
 
 from sglang.test.runners import HFRunner, SRTRunner
@@ -76,24 +77,16 @@ class TestLoRA(CustomTestCase):
 
         return batches
 
-    def ensure_reproducibility(self):
-        seed = 42
-        random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.use_deterministic_algorithms(True)
-
     def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
                 max_new_tokens = 32
-                backend = "triton"
                 base_path = model_case.base
                 lora_adapter_paths = [a.name for a in model_case.adaptors]
                 assert len(lora_adapter_paths) >= 2
 
                 print(
-                    f"\n========== Testing multiple batches on base '{base_path}' with backend={backend}, dtype={torch_dtype} ---"
+                    f"\n========== Testing multiple batches on base '{base_path}', dtype={torch_dtype} ---"
                 )
 
                 # Initialize runners
@@ -103,7 +96,6 @@ class TestLoRA(CustomTestCase):
                     model_type="generation",
                     lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
                     max_loras_per_batch=len(lora_adapter_paths) + 1,
-                    lora_backend=backend,
                     sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
                     attention_backend="torch_native",
                 )
@@ -121,14 +113,14 @@ class TestLoRA(CustomTestCase):
                             f"\n--- Running Batch {i} --- prompts: {prompts}, lora_paths: {lora_paths}"
                         )
 
-                        self.ensure_reproducibility()
+                        ensure_reproducibility()
                         srt_outputs = srt_runner.batch_forward(
                             prompts,
                             max_new_tokens=max_new_tokens,
                             lora_paths=lora_paths,
                         )
 
-                        self.ensure_reproducibility()
+                        ensure_reproducibility()
                         hf_outputs = hf_runner.forward(
                             prompts,
                             max_new_tokens=max_new_tokens,
@@ -148,7 +140,7 @@ class TestLoRA(CustomTestCase):
                             if rouge_score < rouge_tol:
                                 raise AssertionError(
                                     f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
-                                    f"for base '{base_path}', adaptor '{lora_paths}', backend '{backend}', prompt: '{prompts}...'"
+                                    f"for base '{base_path}', adaptor '{lora_paths}', prompt: '{prompts}...'"
                                 )
 
                         print(f"--- Batch {i} Comparison Passed --- ")
