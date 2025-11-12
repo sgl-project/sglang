@@ -240,6 +240,16 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// Check if this is SGLang
+    pub fn is_sglang(&self) -> bool {
+        matches!(self, Self::Sglang(_))
+    }
+
+    /// Check if this is vLLM
+    pub fn is_vllm(&self) -> bool {
+        matches!(self, Self::Vllm(_))
+    }
+
     /// Get token IDs from either backend (output_ids in proto)
     pub fn token_ids(&self) -> &[u32] {
         match self {

@@ -248,6 +248,13 @@ impl StreamingProcessor {
                 ProtoResponseVariant::Chunk(chunk) => {
                     let index = chunk.index();
 
+                    // For vLLM, accumulate completion tokens (vLLM sends deltas)
+                    // For SGLang, skip (SGLang sends cumulative values)
+                    if chunk.is_vllm() {
+                        let tokens_count = completion_tokens.entry(index).or_insert(0);
+                        *tokens_count += chunk.token_ids().len() as u32;
+                    }
+
                     // Get or create stop decoder for this index
                     let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
                         let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim) =
@@ -429,7 +436,15 @@ impl StreamingProcessor {
 
                     // Store metadata
                     prompt_tokens.insert(index, complete.prompt_tokens() as u32);
-                    completion_tokens.insert(index, complete.completion_tokens() as u32);
+
+                    // For vLLM, use accumulated count (we tracked deltas)
+                    // For SGLang, use complete value (already cumulative)
+                    if complete.is_vllm() {
+                        completion_tokens.entry(index).or_insert(0);
+                    } else {
+                        completion_tokens.insert(index, complete.completion_tokens() as u32);
+                    }
+
                     cached_tokens.insert(index, complete.cached_tokens() as u32);
                     finish_reasons.insert(index, complete.finish_reason().to_string());
 
