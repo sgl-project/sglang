@@ -8,8 +8,8 @@ use super::{
     common::{
         default_model, default_true, validate_stop, ChatLogProbs, ContentPart, Function,
         FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
-        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue,
-        ToolReference, Usage,
+        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
+        Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };

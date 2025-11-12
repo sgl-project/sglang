@@ -1,3 +1,4 @@
+use serde_json::json;
 use sglang_router_rs::protocols::{
     common::{Function, StringOrArray, ToolChoice, ToolChoiceValue},
     responses::{
@@ -5,7 +6,6 @@ use sglang_router_rs::protocols::{
         ResponsesRequest, StringOrContentParts, TextConfig, TextFormat,
     },
 };
-use serde_json::json;
 use validator::Validate;
 
 /// Test that valid conversation IDs pass validation
@@ -363,7 +363,11 @@ fn test_validate_top_p_range() {
             top_p: Some(val),
             ..Default::default()
         };
-        assert!(request.validate().is_err(), "top_p {} should be invalid", val);
+        assert!(
+            request.validate().is_err(),
+            "top_p {} should be invalid",
+            val
+        );
     }
 }
 
@@ -387,7 +391,11 @@ fn test_validate_top_k() {
             top_k: val,
             ..Default::default()
         };
-        assert!(request.validate().is_err(), "top_k {} should be invalid", val);
+        assert!(
+            request.validate().is_err(),
+            "top_k {} should be invalid",
+            val
+        );
     }
 }
 
@@ -411,7 +419,11 @@ fn test_validate_min_p_range() {
             min_p: val,
             ..Default::default()
         };
-        assert!(request.validate().is_err(), "min_p {} should be invalid", val);
+        assert!(
+            request.validate().is_err(),
+            "min_p {} should be invalid",
+            val
+        );
     }
 }
 
@@ -514,7 +526,7 @@ fn test_validate_input_empty_text() {
     };
     let result = request.validate();
     assert!(result.is_err(), "Empty input text should be invalid");
-    
+
     if let Err(errors) = result {
         let error_msg = errors.to_string();
         assert!(
@@ -567,7 +579,10 @@ fn test_validate_stop_sequences_max() {
         ])),
         ..Default::default()
     };
-    assert!(request.validate().is_ok(), "4 stop sequences should be valid");
+    assert!(
+        request.validate().is_ok(),
+        "4 stop sequences should be valid"
+    );
 
     // Invalid: more than 4 stop sequences
     let request = ResponsesRequest {
@@ -740,7 +755,7 @@ fn test_validate_tool_choice_requires_tools() {
         result.is_err(),
         "tool_choice=auto without tools should be invalid"
     );
-    
+
     if let Err(errors) = result {
         let error_msg = errors.to_string();
         assert!(
