@@ -89,6 +89,8 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.elastic_memory_pool import ElasticSWAKVPool
+from sglang.srt.mem_cache.elasticmem_orchestrator import use_elasticmem
 from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
@@ -100,7 +102,6 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
-    elastic_pool,
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -1707,7 +1708,8 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid:
-                self.token_to_kv_pool = SWAKVPool(
+                swa_pool_class = ElasticSWAKVPool if use_elasticmem else SWAKVPool
+                self.token_to_kv_pool = swa_pool_class(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
@@ -1757,8 +1759,10 @@ class ModelRunner:
                 )
 
         # Initialize token_to_kv_pool_allocator
-        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
-        need_sort = need_sort or elastic_pool
+        need_sort = (
+            self.server_args.disaggregation_mode in ("decode", "prefill")
+            or use_elasticmem
+        )
         if self.token_to_kv_pool_allocator is None:
             if _is_npu and (
                 self.server_args.attention_backend == "ascend"

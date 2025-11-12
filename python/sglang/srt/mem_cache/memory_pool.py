@@ -43,13 +43,7 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_int_env_var,
-    is_cuda,
-    is_npu,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -63,15 +57,6 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
     import torch_npu
-
-elastic_pool = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "true")
-# elastic_pool = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "false")
-cu_page_size = get_int_env_var("SGLANG_CU_PAGE_SIZE", 2 << 20)
-if elastic_pool:
-    import signal
-
-    import kvcached.vmm_ops as vmm_ops
-    from kvcached.etensor import ETensor
 
 
 def get_tensor_size_bytes(t: torch.Tensor):
@@ -525,7 +510,6 @@ class MHATokenToKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_kv_cache_copy: bool = False,
-        pool_name: Optional[str] = None,
     ):
         super().__init__(
             size,
@@ -537,18 +521,10 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
-
-        if elastic_pool:
-            assert pool_name is not None
-            self.pool_name = pool_name
-
         self.head_num = head_num
         self.head_dim = head_dim
 
-        if elastic_pool:
-            self._create_elastic_buffers()
-        else:
-            self._create_buffers()
+        self._create_buffers()
         self._create_data_ptrs()
 
         self.device_module = torch.get_device_module(self.device)
@@ -629,50 +605,6 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
-
-    def _create_elastic_buffers(self):
-        signal.signal(signal.SIGINT, lambda sig, frame: vmm_ops.shutdown_emem())
-        signal.signal(signal.SIGTERM, lambda sig, frame: vmm_ops.shutdown_emem())
-        signal.signal(signal.SIGQUIT, lambda sig, frame: vmm_ops.shutdown_emem())
-
-        current_device_id = f"cuda:{torch.cuda.current_device()}"
-        vmm_ops.init_emem(current_device_id, cu_page_size)
-
-        assert self.size % self.page_size == 0
-        self.esize = (
-            ((self.size + self.page_size) + self.page_size - 1)
-            // self.page_size
-            * self.page_size
-        )
-        page_size = self.page_size
-        state_shape = (self.head_num, self.head_dim)
-        dtype = self.store_dtype
-        self.ek_buffer = [
-            ETensor(
-                f"{self.pool_name}-k-{i}",
-                self.esize,
-                page_size,
-                state_shape,
-                dtype,
-                current_device_id,
-            )
-            for i in range(self.layer_num)
-        ]
-        self.ev_buffer = [
-            ETensor(
-                f"{self.pool_name}-v-{i}",
-                self.esize,
-                page_size,
-                state_shape,
-                dtype,
-                current_device_id,
-            )
-            for i in range(self.layer_num)
-        ]
-        self.k_buffer = [etensor.etensor for etensor in self.ek_buffer]
-        self.v_buffer = [etensor.etensor for etensor in self.ev_buffer]
-        self.state_memsize = self.ek_buffer[0].state_memsize
-        logger.info(f"{self.esize=}, {self.k_buffer[0].shape=}")
 
     def _create_data_ptrs(self):
         self.k_data_ptrs = torch.tensor(
@@ -864,26 +796,6 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
-    def disable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
-        total_unmap_num = 0
-        for ek, ev in zip(self.ek_buffer, self.ev_buffer):
-            unmap_num, pass_indices, proc_indices = ek.disable(indices)
-            total_unmap_num += unmap_num
-            unmap_num, pass_indices, proc_indices = ev.disable(indices)
-            total_unmap_num += unmap_num
-        self.size -= len(proc_indices)
-        return total_unmap_num, pass_indices, proc_indices
-
-    def enable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
-        total_map_num = 0
-        for ek, ev in zip(self.ek_buffer, self.ev_buffer):
-            map_num, pass_indices, proc_indices = ek.enable(indices)
-            total_map_num += map_num
-            map_num, pass_indices, proc_indices = ev.enable(indices)
-            total_map_num += map_num
-        self.size += len(proc_indices)
-        return total_map_num, pass_indices, proc_indices
-
 
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
@@ -1039,22 +951,7 @@ class SWAKVPool(KVCache):
         else:
             self.custom_mem_pool = None
 
-        if elastic_pool:
-            kwargs["pool_name"] = "swa"
-        self.swa_kv_pool = token_to_kv_pool_class(
-            size=size_swa,
-            dtype=dtype,
-            layer_num=self.swa_layer_nums,
-            **kwargs,
-        )
-        if elastic_pool:
-            kwargs["pool_name"] = "full"
-        self.full_kv_pool = token_to_kv_pool_class(
-            size=size,
-            dtype=dtype,
-            layer_num=self.full_layer_nums,
-            **kwargs,
-        )
+        self._create_buffers(token_to_kv_pool_class, **kwargs)
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
@@ -1066,6 +963,20 @@ class SWAKVPool(KVCache):
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
             f"SWAKVPool mem usage: {self.mem_usage} GB, swa size: {self.size_swa}, full size: {self.size}"
+        )
+
+    def _create_buffers(self, token_to_kv_pool_class, **kwargs):
+        self.swa_kv_pool = token_to_kv_pool_class(
+            size=self.size_swa,
+            dtype=self.dtype,
+            layer_num=self.swa_layer_nums,
+            **kwargs,
+        )
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=self.size,
+            dtype=self.dtype,
+            layer_num=self.full_layer_nums,
+            **kwargs,
         )
 
     def get_kv_size_bytes(self):

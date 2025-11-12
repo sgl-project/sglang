@@ -10,7 +10,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
-from sglang.srt.mem_cache.memory_pool import elastic_pool
+from sglang.srt.mem_cache.elasticmem_orchestrator import use_elasticmem
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
 
@@ -128,7 +128,7 @@ class SchedulerMetricsMixin:
             )
 
             need_resize = (
-                elastic_pool
+                use_elasticmem
                 and (full_token_usage > 0.9 or swa_token_usage > 0.9)
                 and abs(full_token_usage - swa_token_usage) > 0.1
             )
