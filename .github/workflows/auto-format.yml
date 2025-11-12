@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
   auto-format:
@@ -31,41 +32,18 @@ jobs:
           python -m pip install pre-commit
           pre-commit install
 
-      - name: Check Python format
-        id: py_check
-        run: |
-          SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
-
       - name: Run Python format
-        id: py_fmt
-        if: ${{ failure() && steps.py_check.outcome == 'failure' }}
         run: |
           SKIP=no-commit-to-branch pre-commit run --all-files
-        continue-on-error: true
-
-      - name: Check sgl-kernel clang-format
-        id: cpp_check
-        if: always()
-        uses: DoozyX/clang-format-lint-action@v0.18.1
-        with:
-          source: sgl-kernel
-          extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 18
-          style: file
-        continue-on-error: true
 
       - name: Run sgl-kernel clang-format
-        id: cpp_fmt
-        if: ${{ failure() && steps.cpp_check.outcome == 'failure' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-format-18
           find sgl-kernel -type f \( -name "*.h" -o -name "*.c" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.cu" -o -name "*.cuh" -o -name "*.cc" \) -exec clang-format-18 -i --style=file {} \;
-        continue-on-error: true
 
       - name: Git push
         id: git_push
-        if: ${{ failure() }}
         run: |
           git diff -p > auto_format.patch
           cat auto_format.patch
@@ -87,7 +65,7 @@ jobs:
           path: auto_format.patch
 
       - name: Add comment
-        if: ${{ failure() }}
+        if: ${{ failure() && steps.git_push.outcome == 'failure' }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -95,7 +73,7 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: '🤖 Code got formatted by CI. Please request CI again if you still want to have this PR merged. If the PR is from a forked repo, please download the patch files from the GitHub Actions web page and apply them locally.'
+              body: '🤖 Code got formatted by CI. If the PR is from a forked repo, please download the patch files from the GitHub Actions web page and apply them locally.'
             })
 
       - name: Remove format label
@@ -114,8 +92,3 @@ jobs:
             } catch (error) {
               console.log('Label may have already been removed');
             }
-
-      - name: Please request CI again
-        if: ${{ failure() }}
-        run: |
-          exit 1
