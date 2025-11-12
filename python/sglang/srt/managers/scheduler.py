@@ -416,7 +416,6 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
-        self.init_kv_events(server_args.kv_events_config)
 
         # Init memory pool and cache
         self.init_memory_pool_and_cache()

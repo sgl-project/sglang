@@ -321,7 +321,7 @@ impl Tree {
         (ret_text, tenant)
     }
 
-    #[allow(unused_assignments)]
+    #[allow(unused_assignments, dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
         let mut curr = Arc::clone(&self.root);
         let mut curr_idx = 0;
@@ -529,6 +529,7 @@ impl Tree {
         self.tenant_char_count.remove(&tenant.to_string());
     }
 
+    #[allow(dead_code)]
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {
         self.tenant_char_count
             .iter()
@@ -560,6 +561,7 @@ impl Tree {
         min_tenant.unwrap_or_else(|| "empty".to_string())
     }
 
+    #[allow(dead_code)]
     pub fn get_used_size_per_tenant(&self) -> HashMap<String, usize> {
         // perform a DFS to traverse all nodes and calculate the total size used by each tenant
 
@@ -584,6 +586,7 @@ impl Tree {
         used_size_per_tenant
     }
 
+    #[allow(dead_code)]
     fn node_to_string(node: &NodeRef, prefix: &str, is_last: bool) -> String {
         let mut result = String::new();
 
@@ -641,6 +644,7 @@ impl Tree {
         result
     }
 
+    #[allow(dead_code)]
     pub fn pretty_print(&self) {
         if self.root.children.is_empty() {
             return;
