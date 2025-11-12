@@ -120,7 +120,6 @@ from sglang.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     MultimodalInputs,
     Req,
-    RequestRetractStatus,
     RequestStage,
     ScheduleBatch,
 )
@@ -1427,11 +1426,7 @@ class Scheduler(
                     prefix_keys,
                 )
 
-    def _add_request_to_queue(
-        self,
-        req: Req,
-        is_retracted: RequestRetractStatus = RequestRetractStatus.NOT_RETRACTED,
-    ):
+    def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -1449,7 +1444,7 @@ class Scheduler(
             req.time_stats.prefill_bootstrap_queue_entry_time = time.perf_counter()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
-            if is_retracted != RequestRetractStatus.RETRACTING:
+            if not is_retracted:
                 req.time_stats.decode_prealloc_queue_entry_time = time.perf_counter()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
@@ -1937,9 +1932,7 @@ class Scheduler(
             )
 
             for req in retracted_reqs:
-                self._add_request_to_queue(
-                    req, is_retracted=RequestRetractStatus.RETRACTING
-                )
+                self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
