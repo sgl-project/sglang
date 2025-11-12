@@ -74,13 +74,6 @@ try:
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
-    # Pre-build FlashInfer FP4 GEMM so torch.compile doesn't trace its JIT code paths
-    try:
-        from flashinfer.gemm import get_gemm_sm100_module_cutlass_fp4
-
-        _ = get_gemm_sm100_module_cutlass_fp4().build_and_load()
-    except Exception:
-        pass
 except ImportError:
     if is_cuda():
         from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
