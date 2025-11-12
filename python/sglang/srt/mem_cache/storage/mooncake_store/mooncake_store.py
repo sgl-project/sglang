@@ -192,10 +192,10 @@ class MooncakeStore(HiCacheStorage):
 
             # Handle JSON device_name configuration
             device_name = self.config.device_name
-            if device_name and device_name.strip().startswith('{'):
+            if device_name and device_name.strip().startswith("{"):
                 try:
                     device_config = json.loads(device_name)
-                    if storage_config and hasattr(storage_config, 'tp_rank'):
+                    if storage_config and hasattr(storage_config, "tp_rank"):
                         tp_rank = storage_config.tp_rank
                         # Try both integer and string keys since JSON parsing may convert keys
                         device_name = device_config.get(tp_rank, "")
@@ -204,7 +204,9 @@ class MooncakeStore(HiCacheStorage):
                     else:
                         device_name = ""
                 except (json.JSONDecodeError, AttributeError):
-                    logger.warning(f"Failed to parse device_name as JSON: {device_name}")
+                    logger.warning(
+                        f"Failed to parse device_name as JSON: {device_name}"
+                    )
                     device_name = ""
 
             ret_code = self.store.setup(
