@@ -362,23 +362,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
-            # topk_weights, topk_ids, _ = topk_output
-            # output = rocm_fused_experts_tkw1(
-            #     hidden_states=x,
-            #     w1=layer.w13_weight,
-            #     w2=layer.w2_weight,
-            #     topk_weights=topk_weights,
-            #     topk_ids=topk_ids,
-            #     activation=moe_runner_config.activation,
-            #     apply_router_weight_on_input=True,
-            #     use_fp8_w8a8=True,
-            #     per_channel_quant=self.weight_quant.strategy
-            #     == QuantizationStrategy.CHANNEL,
-            #     w1_scale=layer.w13_weight_scale,
-            #     w2_scale=layer.w2_weight_scale,
-            #     a1_scale=layer.w13_input_scale,
-            #     a2_scale=layer.w2_input_scale,
-            # )
             return StandardCombineInput(hidden_states=output)
         else:
             quant_info = TritonMoeQuantInfo(
