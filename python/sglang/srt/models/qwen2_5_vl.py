@@ -512,7 +512,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_encoder_tp_mode == "data"
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
