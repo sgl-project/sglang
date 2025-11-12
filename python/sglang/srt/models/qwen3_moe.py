@@ -421,20 +421,12 @@ class Qwen3MoeAttention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
-    def forward_prepare(
+    def forward_prepare_native(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if hidden_states.shape[0] == 0:
-            return hidden_states, forward_batch, None
-        if _is_npu:
-            return self.forward_prepare_npu(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
@@ -449,12 +441,33 @@ class Qwen3MoeAttention(nn.Module):
                     forward_batch=forward_batch,
                 )
                 if enable_fused_set_kv_buffer(forward_batch)
-                and self.compatible_with_fused_kv_buffer
+                   and self.compatible_with_fused_kv_buffer
                 else None
             ),
         )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
+
+    def forward_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if hidden_states.shape[0] == 0:
+            return hidden_states, forward_batch, None
+        if not _is_npu:
+            return self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            return self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
