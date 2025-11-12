@@ -110,7 +110,7 @@ Parameter Explanation:
     "device_name": "{0: \"ib0,ib1\", 1: \"ib2,ib3\", 2: \"ib4,ib5\"}"
     }
     ```
-    Or in environment variables:
+  - Or in environment variables:
     ```bash
     MOONCAKE_DEVICE="{\"0\": \"ib0,ib1\", \"1\": \"ib2,ib3\", \"2\": \"ib4,ib5\"}"
     ```
