@@ -14,7 +14,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
-use rmcp::model;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -351,12 +350,12 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, _model_id);
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_generate(headers, body, _model_id).await
+            router.route_generate(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -370,12 +369,12 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, _model_id);
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_chat(headers, body, _model_id).await
+            router.route_chat(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -389,13 +388,13 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, _model_id);
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
             router
-                .route_completion(headers, body, _model_id)
+                .route_completion(headers, body, model_id)
                 .await
         } else {
             (
@@ -488,13 +487,13 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, _model_id);
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
             router
-                .route_embeddings(headers, body, _model_id)
+                .route_embeddings(headers, body, model_id)
                 .await
         } else {
             (
