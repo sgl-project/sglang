@@ -591,7 +591,9 @@ def embed_mm_inputs(
 
     # only for qwen3vl right now,  replace the original use_deepstack with this method.
     if hasattr(multimodal_model, "post_process"):
-        embeddings = multimodal_model.post_process(inputs_embeds, modalities, embeddings, masks, forward_batch)
+        embeddings = multimodal_model.post_process(
+            inputs_embeds, modalities, embeddings, masks, forward_batch
+        )
 
     # 4. scatter embeddings into input embedding
     for i, modality, embedding, mask in zip(
