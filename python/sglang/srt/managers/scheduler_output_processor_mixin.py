@@ -17,7 +17,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
-    RequestRetractStatus,
     RequestStage,
     ScheduleBatch,
 )
@@ -28,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
         GenerationBatchResult,
+        RequestRetractStatus,
         ScheduleBatch,
         Scheduler,
     )
