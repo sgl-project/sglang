@@ -191,6 +191,15 @@ class MambaAttnBackendBase(AttentionBackend):
             device=self.device,
         )
 
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        for i in range(max_bs):
+            self.state_indices_list.append(
+                torch.arange(0, i + 1, dtype=torch.int32, device="cpu")
+            )
+            self.query_start_loc_list.append(
+                torch.empty((i + 2,), dtype=torch.int32, device="cpu")
+            )
+
     def _capture_metadata(
         self,
         bs: int,
@@ -296,6 +305,9 @@ class MambaAttnBackendBase(AttentionBackend):
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
+        return 1  # Mamba attn does not use seq lens to index kv cache
+
+    def get_cpu_graph_seq_len_fill_value(self):
         return 1  # Mamba attn does not use seq lens to index kv cache
 
 
@@ -768,6 +780,25 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
         )
 
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        if forward_mode.is_decode_or_idle():
+            self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, "cpu"))
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_mode=}")
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=self.query_start_loc_list[bs - 1],
+            mamba_cache_indices=self.state_indices_list[bs - 1],
+        )
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -839,6 +870,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_cpu_graph_state(max_bs, max_num_tokens)
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -851,6 +886,27 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+            )
+
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_capture_cpu_graph(
                 bs,
                 num_tokens,
                 req_pool_indices,
@@ -885,6 +941,9 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
+
+    def get_cpu_graph_seq_len_fill_value(self):
+        return 1
 
     def forward_decode(
         self,
