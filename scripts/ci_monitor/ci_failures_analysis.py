@@ -171,7 +171,9 @@ class SGLangFailuresAnalyzer:
 
                 # Get runner labels (from runs-on field in workflow)
                 runner_labels = job.get("labels", [])
-                runner_labels_str = ", ".join(runner_labels) if runner_labels else "unknown"
+                runner_labels_str = (
+                    ", ".join(runner_labels) if runner_labels else "unknown"
+                )
 
                 # Skip jobs without runner information (likely skipped/queued jobs)
                 if not runner_labels_str or runner_labels_str == "unknown":
@@ -188,7 +190,9 @@ class SGLangFailuresAnalyzer:
                     runner_instance_key = f"{runner_labels_str}_{runner_id}"
                     runner_instance_stats[runner_instance_key]["total_jobs"] += 1
                     # Store runner name for reference
-                    runner_instance_stats[runner_instance_key]["runner_name"] = runner_name
+                    runner_instance_stats[runner_instance_key][
+                        "runner_name"
+                    ] = runner_name
 
                 conclusion = job.get("conclusion")
 
@@ -524,7 +528,9 @@ class SGLangFailuresAnalyzer:
             reverse=True,
         )
 
-        print(f"\nTotal (unique) jobs analyzed across PR Test workflows: {len(sorted_jobs)}")
+        print(
+            f"\nTotal (unique) jobs analyzed across PR Test workflows: {len(sorted_jobs)}"
+        )
         print(
             f"Jobs with active failure streaks: {sum(1 for j in sorted_jobs if j[1]['current_streak'] > 0)}"
         )
@@ -608,7 +614,11 @@ class SGLangFailuresAnalyzer:
 
             for i, (runner_labels, stats) in enumerate(sorted_runners[:15], 1):
                 # Truncate labels if too long for display
-                display_labels = runner_labels if len(runner_labels) <= 43 else runner_labels[:40] + "..."
+                display_labels = (
+                    runner_labels
+                    if len(runner_labels) <= 43
+                    else runner_labels[:40] + "..."
+                )
                 print(
                     f"{i:<4} {display_labels:<45} {stats['failure_rate']:>10.1f}% "
                     f"{stats['failed_jobs']:<10} {stats['total_jobs']:<10} {stats['unique_jobs_with_failures']:<12}"
@@ -835,8 +845,8 @@ class SGLangFailuresAnalyzer:
                         f"| {i} | `{display_name}` | {data['current_streak']} | {data['max_streak']} |"
                     )
             else:
-                summary_lines.append("✅ No jobs are currently in a failure streak!")
-        
+                summary_lines.append("No jobs are currently in a failure streak!")
+
             summary_lines.append("")
 
             # Section 2: Runner Health Analysis
