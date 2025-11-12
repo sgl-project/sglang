@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -28,14 +28,12 @@ from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+from sglang.srt.disaggregation.mooncake.utils import (
+    check_mooncake_custom_mem_pool_enabled,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    format_tcp_address,
-    get_bool_env_var,
-    get_int_env_var,
-    is_valid_ipv6_address,
-)
+from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +172,7 @@ class MooncakeKVManager(CommonKVManager):
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = get_int_env_var(
                 "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
-                min(max(4, int(0.75 * cpu_count) // 8), 12),
+                min(max(4, int(0.5 * cpu_count) // 8), 12),
             )
             transfer_queue_size = get_int_env_var("SGLANG_DISAGGREGATION_QUEUE_SIZE", 4)
             self.transfer_queues: List[FastQueue] = [
@@ -190,9 +188,6 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for _ in range(transfer_queue_size)
             ]
-            self.state_executors = concurrent.futures.ThreadPoolExecutor(
-                transfer_thread_pool_size // transfer_queue_size
-            )
             for queue, executor in zip(self.transfer_queues, self.executors):
                 threading.Thread(
                     target=self.transfer_worker, args=(queue, executor), daemon=True
@@ -204,8 +199,8 @@ class MooncakeKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
 
-            self.enable_custom_mem_pool = get_bool_env_var(
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+            self.enable_custom_mem_pool, self.custom_mem_pool_type = (
+                check_mooncake_custom_mem_pool_enabled()
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
@@ -552,7 +547,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_aux_ptrs: list[int],
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
-        if self.enable_custom_mem_pool:
+        if self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK":
             return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
 
         transfer_blocks = []
@@ -641,6 +636,7 @@ class MooncakeKVManager(CommonKVManager):
         req: TransferInfo,
         prefill_state_indices: list[int],
         dst_state_data_ptrs: list[int],
+        executor: concurrent.futures.ThreadPoolExecutor,
     ):
         """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
@@ -662,7 +658,7 @@ class MooncakeKVManager(CommonKVManager):
                 item_lens=self.kv_args.state_item_lens,
                 prefill_data_indices=prefill_state_indices,
                 dst_data_indices=dst_state_indices,
-                executor=self.state_executors,
+                executor=executor,
             )
         else:
             return 0
@@ -810,6 +806,7 @@ class MooncakeKVManager(CommonKVManager):
                                     req,
                                     kv_chunk.state_indices,
                                     target_rank_registration_info.dst_state_data_ptrs,
+                                    executor,
                                 )
 
                             if self.pp_group.is_last_rank:
@@ -1257,6 +1254,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        if self.bootstrap_infos is None:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]

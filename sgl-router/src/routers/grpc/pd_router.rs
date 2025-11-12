@@ -1,5 +1,3 @@
-// PD (Prefill-Decode) gRPC Router Implementation
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,38 +11,24 @@ use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
-    config::types::RetryConfig,
+    app_context::AppContext,
     core::{ConnectionMode, WorkerRegistry, WorkerType},
-    policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::RouterTrait,
-    server::AppContext,
-    tokenizer::traits::Tokenizer,
-    tool_parser::ParserFactory as ToolParserFactory,
 };
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[derive(Clone)]
-#[allow(dead_code)] // Fields will be used once implementation is complete
 pub struct GrpcPDRouter {
     worker_registry: Arc<WorkerRegistry>,
-    policy_registry: Arc<PolicyRegistry>,
-    tokenizer: Arc<dyn Tokenizer>,
-    reasoning_parser_factory: ReasoningParserFactory,
-    tool_parser_factory: ToolParserFactory,
-    dp_aware: bool,
-    api_key: Option<String>,
-    retry_config: RetryConfig,
-    configured_reasoning_parser: Option<String>,
-    configured_tool_parser: Option<String>,
     pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
 }
@@ -93,15 +77,6 @@ impl GrpcPDRouter {
 
         Ok(GrpcPDRouter {
             worker_registry,
-            policy_registry,
-            tokenizer,
-            reasoning_parser_factory,
-            tool_parser_factory,
-            dp_aware: ctx.router_config.dp_aware,
-            api_key: ctx.router_config.api_key.clone(),
-            retry_config: ctx.router_config.effective_retry_config(),
-            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
-            configured_tool_parser: ctx.configured_tool_parser.clone(),
             pipeline,
             shared_components,
         })
@@ -173,7 +148,6 @@ impl std::fmt::Debug for GrpcPDRouter {
         f.debug_struct("GrpcPDRouter")
             .field("prefill_workers_count", &prefill_workers.len())
             .field("decode_workers_count", &decode_workers.len())
-            .field("dp_aware", &self.dp_aware)
             .finish()
     }
 }
@@ -185,7 +159,6 @@ impl RouterTrait for GrpcPDRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // TODO: Implement actual generation test for gRPC PD mode
         (
             StatusCode::NOT_IMPLEMENTED,
             "Health generate not yet implemented for gRPC PD",
@@ -258,6 +231,15 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()

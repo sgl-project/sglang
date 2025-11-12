@@ -23,7 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from functools import lru_cache, partial
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
 import torch
@@ -59,8 +59,8 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.utils import permute_inv
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +116,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         rms_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
         self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
 
@@ -405,6 +403,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         # Move window_index to the same device as x before using it to index x
         window_index = window_index.to(device=x.device)
+        reverse_indices = permute_inv(window_index)
 
         # Ensure rotary_pos_emb is on the same device/dtype as x
         rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
@@ -451,14 +450,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         # adapter
         x = self.merger(x)
-
-        reverse_indices = torch.argsort(window_index)
         x = x[reverse_indices, :]
 
         return x
-
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
