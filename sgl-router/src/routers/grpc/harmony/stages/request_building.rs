@@ -52,11 +52,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             ClientSelection::Dual { prefill, .. } => prefill,
         };
 
-        // Harmony models are SGLang-specific
-        // vLLM doesn't have equivalent Harmony support, so we block it
+        // Harmony model support not yet implemented for vLLM
         if builder_client.is_vllm() {
             return Err(error::not_implemented(
-                "Harmony models are SGLang-specific and not supported by vLLM backend. \
+                "Harmony model support is not yet implemented for vLLM backend. \
                  Please use runtime_type: sglang for Harmony models.",
             ));
         }
