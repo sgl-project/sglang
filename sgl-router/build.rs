@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["src/proto"],
         )?;
 
-    println!("cargo:warning=Protobuf compilation completed successfully (sglang + vllm)");
+    println!("cargo:info=Protobuf compilation completed successfully");
 
     Ok(())
 }
