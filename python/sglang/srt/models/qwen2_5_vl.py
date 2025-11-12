@@ -322,7 +322,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
-            use_data_parallel = use_data_parallel,
+            use_data_parallel=use_data_parallel,
         )
 
     def get_window_index(self, grid_thw):
