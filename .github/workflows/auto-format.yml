@@ -50,7 +50,7 @@ jobs:
           git config --local user.email "sglang-bot@users.noreply.github.com"
           git config --local user.name "sglang-bot"
           git add .
-          git commit -m "🤖 Auto-format code with isort, black, ruff, and clang-format"
+          git commit --no-verify -m "🤖 Auto-format code with isort, black, ruff, and clang-format"
           git push
 
       - name: Remove format label
