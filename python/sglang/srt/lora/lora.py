@@ -103,6 +103,39 @@ class LoRAAdapter(nn.Module):
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
         # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
+        # Additionally, handle DeepSeek fused projection naming (q_a_proj / kv_a_proj_with_mqa and q_b_proj / kv_b_proj).
+        #
+        # For DeepSeek-style fused projections:
+        # - A weights: stack as [q_a, kv_a, kv_a] along the output dimension to form qkv A.
+        # - B weights: split kv_b evenly along the output dimension to [k_b, v_b] and stack as [q_b, k_b, v_b].
+        #
+        # We synthesize qkv_proj.* entries so that the rest of the LoRA pipeline can operate on normalized names.
+        ds_q_a = [n for n in weight_names if ("q_a_proj" in n and "lora_A" in n)]
+        for q_a_name in ds_q_a:
+            kv_a_name = q_a_name.replace("q_a_proj", "kv_a_proj_with_mqa")
+            if kv_a_name in weights:
+                qkv_a_name = q_a_name.replace("q_a_proj", "qkv_proj")
+                A_q = weights[q_a_name]
+                A_kv = weights[kv_a_name]
+                # Construct qkv A by duplicating kv_a for both K and V slices
+                weights[qkv_a_name] = torch.cat((A_q, A_kv, A_kv), dim=0)
+
+        ds_q_b = [n for n in weight_names if ("q_b_proj" in n and "lora_B" in n)]
+        for q_b_name in ds_q_b:
+            kv_b_name = q_b_name.replace("q_b_proj", "kv_b_proj")
+            if kv_b_name in weights:
+                qkv_b_name = q_b_name.replace("q_b_proj", "qkv_proj")
+                B_q = weights[q_b_name]
+                B_kv = weights[kv_b_name]
+                # Split kv_b equally across K and V along the output dimension
+                split = B_kv.shape[0] // 2
+                B_k = B_kv[:split, :]
+                B_v = B_kv[split:, :]
+                weights[qkv_b_name] = torch.cat((B_q, B_k, B_v), dim=0)
+
+        # Refresh weight_names after potential synthesis above
+        weight_names = list(weights.keys())
+
         target_module = set()
         for weight_name in weight_names:
             if "k_proj" in weight_name:
