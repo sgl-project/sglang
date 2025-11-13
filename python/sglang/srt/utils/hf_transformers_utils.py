@@ -193,6 +193,16 @@ def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     )
 
 
+def _resolve_config_path(model):
+    use_modelscope = get_bool_env_var("SGLANG_USE_MODELSCOPE")
+    if use_modelscope:
+        from modelscope.hub.file_download import model_file_download
+
+        return model_file_download(model_id=model, file_path="config.json")
+    else:
+        return model  # HuggingFace will handle the path/id
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -215,12 +225,12 @@ def get_config(
         model = client.get_local_dir()
 
     try:
-        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-            from modelscope.hub.file_download import model_file_download
-
-            model = model_file_download(model_id=model, file_path="config.json")
+        model_name_or_config_path = _resolve_config_path(model)
         config = AutoConfig.from_pretrained(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            model_name_or_config_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
         )
 
     except ValueError as e:
