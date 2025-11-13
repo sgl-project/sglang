@@ -2200,7 +2200,7 @@ class ModelRunner:
             )
             # Copy cached routing experts' buffers back to CPU cache
             get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
-                forward_batch.out_cache_loc
+                forward_batch.out_cache_loc, forward_batch.out_cache_loc_cpu
             )
 
         if self.eplb_manager is not None:

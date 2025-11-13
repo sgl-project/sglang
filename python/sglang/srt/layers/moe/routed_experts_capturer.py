@@ -68,6 +68,7 @@ class _RoutedExpertsHostCache:
             ),
             dtype=torch.int32,
             device="cpu",
+            pin_memory=True,
         )
         self._finalize_allocation_log()
 
@@ -76,7 +77,7 @@ class _RoutedExpertsHostCache:
         return get_tensor_size_bytes(self.buffer)
 
     def set_experts_buffer(self, layer_id: int, loc: torch.Tensor, top_k: torch.Tensor):
-        self.buffer[layer_id, loc, :] = top_k.cpu()
+        self.buffer[layer_id, loc, :] = top_k.to(device="cpu", non_blocking=True)
 
     def _finalize_allocation_log(self):
         """Common logging and memory usage computation for captured experts buffers."""
@@ -146,9 +147,24 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
 
-    def sync_fwd_experts_buffer_DtoH(self, loc: torch.Tensor):
-        batch = loc.shape[0]
-        self.host_cache.buffer[loc] = self.device_cache.buffer[:batch].cpu()
+    def sync_fwd_experts_buffer_DtoH(
+        self, device_loc: torch.Tensor, cpu_loc: torch.Tensor
+    ):
+        batch = device_loc.shape[0]
+        # 1. .cpu()
+        # print(f"{batch=} {loc=}")
+        # self.host_cache.buffer[loc] = self.device_cache.buffer[:batch].cpu()
+        # 2. .to(device="cpu", non_blocking=True)
+        self.host_cache.buffer[cpu_loc] = self.device_cache.buffer[:batch].to(
+            device="cpu", non_blocking=True
+        )
+        # 3. .copy_(..., non_blocking=True)
+        # temp = self.device_cache.buffer[:batch].to(device="cpu", non_blocking=True)
+        # print(f"{batch=}")
+        # self.host_cache.buffer[loc].copy_(
+        #     temp,
+        #     non_blocking=True
+        # )
 
     def get_routed_experts(
         self,
@@ -184,7 +200,9 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def sync_fwd_experts_buffer_DtoH(self, loc: torch.Tensor):
+    def sync_fwd_experts_buffer_DtoH(
+        self, device_loc: torch.Tensor, cpu_loc: torch.Tensor
+    ):
         pass
 
     def get_host_cache(self):
