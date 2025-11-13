@@ -47,7 +47,7 @@ if _is_cuda:
 
     @torch.library.register_fake("sgl_kernel::sgl_per_tensor_quant_fp8")
     def _sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static):
-        return output_q.new_empty(output_q.shape)
+        return
 
     # Temporary
     try:
