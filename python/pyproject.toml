@@ -66,6 +66,7 @@ dependencies = [
   "torchaudio==2.9.0",
   "torchvision",
   "torchao==0.9.0",
+  "triton==3.5.1",
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
