@@ -1,4 +1,3 @@
-import enum
 import logging
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
@@ -448,13 +447,6 @@ class FalconH1Model(nn.Module):
                 hidden_states, _ = self.final_layernorm(hidden_states, residual)
 
         return hidden_states
-
-
-class HybridLayerType(enum.Enum):
-    full_attention = "attention"
-    swa_attention = "swa_attention"
-    linear_attention = "linear_attention"
-    mamba2 = "mamba"
 
 
 class FalconH1ForCausalLM(nn.Module):

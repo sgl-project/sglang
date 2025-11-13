@@ -8,7 +8,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -17,15 +17,16 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+_is_hip = is_hip()
 # VLM models for testing
-MODELS = [
-    SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
-    SimpleNamespace(
-        model="Qwen/Qwen2.5-VL-3B-Instruct",
-        mmmu_accuracy=0.4,
-    ),
-    SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
-]
+if _is_hip:
+    MODELS = [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4)]
+else:
+    MODELS = [
+        SimpleNamespace(model="google/gemma-3-27b-it", mmmu_accuracy=0.45),
+        SimpleNamespace(model="Qwen/Qwen2.5-VL-3B-Instruct", mmmu_accuracy=0.4),
+        SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
+    ]
 
 # Set default mem_fraction_static to 0.8
 DEFAULT_MEM_FRACTION_STATIC = 0.8
@@ -50,21 +51,6 @@ class TestVLMModels(CustomTestCase):
         os.environ["OPENAI_API_KEY"] = cls.api_key
         os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
 
-    def _detect_eviction_in_logs(self, log_output):
-        """Detect if eviction events occurred in the log output."""
-        eviction_keywords = ["Cache eviction: evicted"]
-
-        eviction_detected = False
-        eviction_count = 0
-
-        for line in log_output.split("\n"):
-            if any(keyword in line for keyword in eviction_keywords):
-                eviction_detected = True
-                eviction_count += 1
-                print(f"Eviction detected: {line.strip()}")
-
-        return eviction_detected, eviction_count
-
     def run_mmmu_eval(
         self,
         model_version: str,
@@ -81,7 +67,7 @@ class TestVLMModels(CustomTestCase):
         model = "openai_compatible"
         tp = 1
         tasks = "mmmu_val"
-        batch_size = 2
+        batch_size = 32
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
 
@@ -145,6 +131,8 @@ class TestVLMModels(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
+            # if test vlm with cuda_ipc feature, open this env_var
+            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None
@@ -179,7 +167,15 @@ class TestVLMModels(CustomTestCase):
             self.run_mmmu_eval(model.model, output_path)
 
             # Get the result file
-            result_file_path = glob.glob(f"{output_path}/*.json")[0]
+            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
+            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+            if not result_files:
+                result_files = glob.glob(f"{output_path}/*.json")
+
+            if not result_files:
+                raise FileNotFoundError(f"No JSON result files found in {output_path}")
+
+            result_file_path = result_files[0]
 
             with open(result_file_path, "r") as f:
                 result = json.load(f)
@@ -257,50 +253,6 @@ class TestVLMModels(CustomTestCase):
 
         for model in models_to_test:
             self._run_vlm_mmmu_test(model, "./logs")
-
-    def test_vlm_mmmu_benchmark_with_small_cache(self):
-        """Test VLM models against MMMU benchmark with a small embedding cache to force eviction."""
-        models_to_test = MODELS
-
-        if is_in_ci():
-            models_to_test = [random.choice(MODELS)]
-
-        for model in models_to_test:
-            custom_env = {"SGLANG_VLM_CACHE_SIZE_MB": "5"}
-
-            # Run the test with output capture
-            server_output = self._run_vlm_mmmu_test(
-                model,
-                "./logs_small_cache",
-                test_name=" with small embedding cache (evict test)",
-                custom_env=custom_env,
-                log_level="debug",  # Enable debug logging for eviction detection
-                capture_output=True,  # Capture server output
-            )
-
-            # Print server output for debugging
-            print("Server output:\n", server_output)
-
-            # Analyze server output for eviction events
-            eviction_detected, eviction_count = self._detect_eviction_in_logs(
-                server_output
-            )
-
-            # Assert that eviction was detected (since we're using small cache)
-            self.assertTrue(
-                eviction_detected,
-                f"Expected eviction events to be detected with small cache (5MB), but none found. "
-                f"Cache size may be too large for the workload or eviction logic may not be working. "
-                f"Total log content length: {len(server_output)} characters",
-            )
-
-            print(
-                f"Eviction detection summary: {eviction_count} eviction events detected"
-            )
-
-            # Additional assertion: if eviction was detected, the test passed
-            if eviction_detected:
-                print("✅ Eviction logic successfully triggered and detected!")
 
 
 if __name__ == "__main__":

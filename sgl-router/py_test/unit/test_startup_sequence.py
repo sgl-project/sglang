@@ -6,8 +6,7 @@ including router initialization, configuration validation, and startup flow.
 """
 
 import logging
-from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sglang_router.launch_router import RouterArgs, launch_router
@@ -29,7 +28,7 @@ def setup_logger():
     return logger
 
 
-from sglang_router_rs import PolicyType
+from sglang_router.sglang_router_rs import PolicyType
 
 
 class TestSetupLogger:
@@ -465,7 +464,7 @@ class TestStartupValidation:
 
     def test_pd_mode_validation_during_startup(self):
         """Test PD mode validation during startup."""
-        # PD mode without URLs should fail
+        # PD mode without URLs is now allowed (URLs are optional)
         args = RouterArgs(
             pd_disaggregation=True,
             prefill_urls=[],
@@ -473,10 +472,14 @@ class TestStartupValidation:
             service_discovery=False,
         )
 
-        with pytest.raises(
-            ValueError, match="PD disaggregation mode requires --prefill"
-        ):
+        # Should not raise validation error - URLs are now optional
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            mock_router_instance = MagicMock()
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
+
+            # This should succeed without raising an error
             launch_router(args)
+            router_mod.from_args.assert_called_once()
 
     def test_pd_mode_with_service_discovery_validation(self):
         """Test PD mode with service discovery validation during startup."""
@@ -743,7 +746,7 @@ def test_router_defaults_and_start(monkeypatch):
     assert captured["decode_selector"] is None
     assert captured["cors_allowed_origins"] is None
     assert captured["worker_urls"] == ["http://w1:8000"]
-    from sglang_router_rs import PolicyType
+    from sglang_router.sglang_router_rs import PolicyType
 
     assert captured["policy"] == PolicyType.RoundRobin
 

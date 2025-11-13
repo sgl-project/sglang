@@ -16,12 +16,13 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -37,8 +38,15 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import replace_submodule
+from sglang.srt.utils import is_npu, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+if is_npu():
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it to True
+    torch.cuda.is_available = lambda: False
+
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +75,9 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+
+        # Store eviction policy from server args
+        self.eviction_policy = server_args.lora_eviction_policy
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -130,6 +141,16 @@ class LoRAManager:
         assert (
             lora_ref.lora_id not in self.loras
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+
+        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
+            return self.create_lora_update_result(
+                success=False,
+                error_message=(
+                    f"Already have {self.num_pinned_loras} pinned adapters, "
+                    f"max allowed is {self.max_loras_per_batch - 1} (reserving 1 slot for dynamic use). "
+                    f"Please unpin some adapters or increase max_loras_per_batch."
+                ),
+            )
 
         try:
             # load configs
@@ -420,6 +441,7 @@ class LoRAManager:
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
+            eviction_policy=self.eviction_policy,
         )
 
     def set_lora_module(self, module_name, module):

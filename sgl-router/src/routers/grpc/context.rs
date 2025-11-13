@@ -4,25 +4,26 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-use crate::core::Worker;
-use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, GenerateResponse,
+use super::{
+    client::GrpcClient,
+    proto_wrapper::{ProtoGenerateComplete, ProtoGenerateRequest, ProtoStream},
 };
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::tokenizer::stop::StopSequenceDecoder;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
-
-// ============================================================================
-// Core Context Types
-// ============================================================================
+use crate::{
+    core::Worker,
+    protocols::{
+        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        generate::{GenerateRequest, GenerateResponse},
+        responses::ResponsesRequest,
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer},
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 /// Main request processing context
 ///
@@ -30,13 +31,8 @@ use crate::tool_parser::ParserFactory as ToolParserFactory;
 /// through the pipeline stages. Uses Rust's type system to enforce proper
 /// stage ordering at compile time.
 pub struct RequestContext {
-    // === Input (Immutable) ===
     pub input: RequestInput,
-
-    // === Shared Components (Immutable References) ===
     pub components: Arc<SharedComponents>,
-
-    // === Processing State (Mutable, evolves through pipeline) ===
     pub state: ProcessingState,
 }
 
@@ -52,6 +48,7 @@ pub struct RequestInput {
 pub enum RequestType {
     Chat(Arc<ChatCompletionRequest>),
     Generate(Arc<GenerateRequest>),
+    Responses(Arc<ResponsesRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -74,7 +71,7 @@ pub struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     // Stage 4: Request building outputs
-    pub proto_request: Option<proto::GenerateRequest>,
+    pub proto_request: Option<ProtoGenerateRequest>,
 
     // Stage 5: Dispatch metadata
     pub dispatch: Option<DispatchMetadata>,
@@ -82,10 +79,6 @@ pub struct ProcessingState {
     // Stage 6: Response processing state
     pub response: ResponseState,
 }
-
-// ============================================================================
-// Stage-Specific Output Types
-// ============================================================================
 
 /// Output from preparation stage (Step 1)
 pub struct PreparationOutput {
@@ -103,6 +96,19 @@ pub struct PreparationOutput {
 
     /// Filtered request (if tools were filtered)
     pub filtered_request: Option<ChatCompletionRequest>,
+
+    // Harmony-specific fields
+    /// Whether this is a Harmony request (default: false)
+    pub harmony_mode: bool,
+
+    /// Selection text for worker routing (Harmony only)
+    pub selection_text: Option<String>,
+
+    /// Harmony messages for history tracking (Harmony only)
+    pub harmony_messages: Option<Vec<super::harmony::HarmonyMessage>>,
+
+    /// Stop token IDs for Harmony models
+    pub harmony_stop_ids: Option<Vec<u32>>,
 }
 
 /// Worker selection (Step 2)
@@ -119,11 +125,11 @@ pub enum WorkerSelection {
 /// Client selection (Step 3)
 pub enum ClientSelection {
     Single {
-        client: SglangSchedulerClient,
+        client: GrpcClient,
     },
     Dual {
-        prefill: SglangSchedulerClient,
-        decode: SglangSchedulerClient,
+        prefill: GrpcClient,
+        decode: GrpcClient,
     },
 }
 
@@ -147,13 +153,23 @@ pub struct ResponseState {
     pub streaming: StreamingState,
 
     /// Collected responses (non-streaming)
-    pub collected: Option<Vec<proto::GenerateComplete>>,
+    pub collected: Option<Vec<ProtoGenerateComplete>>,
 
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,
 
     /// Final processed response
     pub final_response: Option<FinalResponse>,
+
+    /// Responses API iteration result (Harmony only, for tool loop orchestration)
+    pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
+
+    // Harmony-specific parser state
+    /// Harmony parser for non-streaming (single parser for all indices)
+    pub harmony_parser: Option<super::harmony::HarmonyParserAdapter>,
+
+    /// Harmony parsers for streaming (one per index for n>1 support)
+    pub harmony_parser_per_index: Option<HashMap<usize, super::harmony::HarmonyParserAdapter>>,
 }
 
 /// Streaming state (per-choice tracking)
@@ -174,10 +190,6 @@ pub struct StreamingState {
         HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn crate::tool_parser::ToolParser>>>>,
     pub has_tool_calls: HashMap<u32, bool>,
 }
-
-// ============================================================================
-// Context Builders
-// ============================================================================
 
 impl RequestContext {
     /// Create context for chat completion request
@@ -208,6 +220,24 @@ impl RequestContext {
         Self {
             input: RequestInput {
                 request_type: RequestType::Generate(request),
+                headers,
+                model_id,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
+    /// Create context for Responses API request
+    pub fn for_responses(
+        request: Arc<ResponsesRequest>,
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self {
+            input: RequestInput {
+                request_type: RequestType::Responses(request),
                 headers,
                 model_id,
             },
@@ -253,22 +283,31 @@ impl RequestContext {
         }
     }
 
+    /// Get responses request (panics if not responses)
+    pub fn responses_request(&self) -> &ResponsesRequest {
+        match &self.input.request_type {
+            RequestType::Responses(req) => req.as_ref(),
+            _ => panic!("Expected responses request"),
+        }
+    }
+
+    /// Get Arc clone of responses request (panics if not responses)
+    pub fn responses_request_arc(&self) -> Arc<ResponsesRequest> {
+        match &self.input.request_type {
+            RequestType::Responses(req) => Arc::clone(req),
+            _ => panic!("Expected responses request"),
+        }
+    }
+
     /// Check if request is streaming
     pub fn is_streaming(&self) -> bool {
         match &self.input.request_type {
             RequestType::Chat(req) => req.stream,
             RequestType::Generate(req) => req.stream,
+            RequestType::Responses(req) => req.stream.unwrap_or(false),
         }
     }
 }
-
-// ============================================================================
-// Default Implementations
-// ============================================================================
-
-// ============================================================================
-// Helper Methods
-// ============================================================================
 
 impl WorkerSelection {
     pub fn is_dual(&self) -> bool {
@@ -310,56 +349,56 @@ impl ClientSelection {
         matches!(self, Self::Dual { .. })
     }
 
-    pub fn single(&self) -> Option<&SglangSchedulerClient> {
+    pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
             _ => None,
         }
     }
 
-    pub fn single_mut(&mut self) -> Option<&mut SglangSchedulerClient> {
+    pub fn single_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
             _ => None,
         }
     }
 
-    pub fn dual(&self) -> Option<(&SglangSchedulerClient, &SglangSchedulerClient)> {
+    pub fn dual(&self) -> Option<(&GrpcClient, &GrpcClient)> {
         match self {
             Self::Dual { prefill, decode } => Some((prefill, decode)),
             _ => None,
         }
     }
 
-    pub fn dual_mut(&mut self) -> Option<(&mut SglangSchedulerClient, &mut SglangSchedulerClient)> {
+    pub fn dual_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient)> {
         match self {
             Self::Dual { prefill, decode } => Some((prefill, decode)),
             _ => None,
         }
     }
 
-    pub fn prefill_client(&self) -> Option<&SglangSchedulerClient> {
+    pub fn prefill_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
             _ => None,
         }
     }
 
-    pub fn prefill_client_mut(&mut self) -> Option<&mut SglangSchedulerClient> {
+    pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
             _ => None,
         }
     }
 
-    pub fn decode_client(&self) -> Option<&SglangSchedulerClient> {
+    pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
             _ => None,
         }
     }
 
-    pub fn decode_client_mut(&mut self) -> Option<&mut SglangSchedulerClient> {
+    pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
             _ => None,
@@ -367,21 +406,15 @@ impl ClientSelection {
     }
 }
 
-// ============================================================================
-// Execution and Response Types
-// ============================================================================
-
-use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
-
 /// Result of request execution (streams from workers)
-/// Uses AbortOnDropStream to automatically abort on cancellation
+/// Uses ProtoStream to automatically abort on cancellation
 pub enum ExecutionResult {
     Single {
-        stream: AbortOnDropStream,
+        stream: ProtoStream,
     },
     Dual {
-        prefill: AbortOnDropStream,
-        decode: Box<AbortOnDropStream>,
+        prefill: ProtoStream,
+        decode: Box<ProtoStream>,
     },
 }
 
