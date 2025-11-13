@@ -1,3 +1,5 @@
+import argparse
+import json
 import unittest
 
 import torch
@@ -5,6 +7,7 @@ import torch.nn as nn
 
 from sglang.srt.model_executor import model_runner as mr
 from sglang.test.test_utils import CustomTestCase
+from sglang.srt.server_args import ServerArgs
 
 HOOK_CALLS = []
 
@@ -112,6 +115,54 @@ class TestModelRunnerHooks(CustomTestCase):
 
         # No hooks should have fired
         self.assertEqual(len(HOOK_CALLS), 0)
+
+    def test_cli_hooks_reach_model_and_fire(self):
+        """
+        Ensure that when hooks are provided via CLI, they are parsed into
+        ServerArgs, passed to ModelRunner.register_hooks, and actually
+        run during a forward pass.
+        """
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        hooks_spec = [
+            {
+                "name": "outer_and_inner_from_cli",
+                "target_modules": ["outer.0", "outer.1", "inner.*"],
+                "hook_factory": "test_model_hooks:dummy_hook_factory",
+                "config": {"tag": "cli-hook"},
+            }
+        ]
+
+        cli_args = [
+            "--model-path",
+            "Qwen/Qwen2-7B-Instruct", # Dummy value; not used in this test
+            "--enable-hooks",
+            "--hooks",
+            json.dumps(hooks_spec),
+        ]
+
+        args = parser.parse_args(cli_args)
+        server_args = ServerArgs.from_cli_args(args)
+
+        self.assertTrue(server_args.enable_hooks)
+        self.assertEqual(server_args.hooks, hooks_spec)
+
+        runner = DummyModelRunner()
+        runner.register_hooks(server_args.hooks)
+
+        x = torch.randn(3, 4)
+        _ = runner.model(x)
+
+        # We expect hooks on outer.0, outer.1, inner.0, inner.1  => 4 calls
+        self.assertEqual(
+            len(HOOK_CALLS),
+            4,
+            "CLI-configured hooks did not fire expected number of times",
+        )
+
+        tags = {call["tag"] for call in HOOK_CALLS}
+        self.assertEqual(tags, {"cli-hook"})
 
 
 if __name__ == "__main__":
