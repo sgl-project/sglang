@@ -1061,7 +1061,9 @@ def set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     loc = tl.load(loc_ptr + pid_loc)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    is_valid = loc >= 0
+    safe_loc = tl.where(is_valid, loc, 0)
+    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
         src = tl.load(
@@ -1075,7 +1077,7 @@ def set_mla_kv_buffer_kernel(
             mask=mask,
         )
 
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
 
 def set_mla_kv_buffer_triton(
@@ -1232,17 +1234,10 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
 
-        # Filter out invalid indices (e.g., -1 for non-local tokens in DCP mode)
-        # In DCP interleaved storage, tokens not belonging to this rank are marked
-        # with -1 to avoid overwriting the padded slot 0 (reserved for dummy outputs)
         valid_mask = loc >= 0
         if not valid_mask.all():
             loc = loc[valid_mask]
             cache_k = cache_k[valid_mask]
-            # cache_v = cache_v[valid_mask]
-
-        if loc.numel() == 0:
-            return
 
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
@@ -1261,18 +1256,6 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
-
-        # Filter out invalid indices (e.g., -1 for non-local tokens in DCP mode)
-        # In DCP interleaved storage, tokens not belonging to this rank are marked
-        # with -1 to avoid overwriting the padded slot 0 (reserved for dummy outputs)
-        valid_mask = loc >= 0
-        if not valid_mask.all():
-            loc = loc[valid_mask]
-            cache_k_nope = cache_k_nope[valid_mask]
-            cache_k_rope = cache_k_rope[valid_mask]
-
-        if loc.numel() == 0:
-            return
 
         if self.use_nsa and self.nsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
