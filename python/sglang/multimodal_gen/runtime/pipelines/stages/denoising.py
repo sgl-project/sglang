@@ -523,24 +523,17 @@ class DenoisingStage(PipelineStage):
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
-        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         if get_sp_world_size() <= 1:
-            batch.did_sp_shard_latents = False
             return
 
-        def _shard_tensor(
-            tensor: torch.Tensor | None,
-        ) -> tuple[torch.Tensor | None, bool]:
-            if tensor is None:
-                return None, False
-            tensor, sharded = self.server_args.pipeline_config.shard_latents_for_sp(
-                batch, tensor
-            )
-            return tensor, sharded
-
-        batch.latents, did_shard = _shard_tensor(batch.latents)
-
-        batch.did_sp_shard_latents = did_shard
+        if batch.latents is not None:
+            (
+                batch.latents,
+                did_shard,
+            ) = server_args.pipeline_config.shard_latents_for_sp(batch, batch.latents)
+            batch.did_sp_shard_latents = did_shard
+        else:
+            batch.did_sp_shard_latents = False
 
         # For I2I tasks like QwenImageEdit, the image_latent (input image) should be
         # replicated on all SP ranks, not sharded, as it provides global context.
@@ -548,7 +541,9 @@ class DenoisingStage(PipelineStage):
             server_args.pipeline_config.task_type != ModelTaskType.I2I
             and batch.image_latent is not None
         ):
-            batch.image_latent, _ = _shard_tensor(batch.image_latent)
+            batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
+                batch, batch.image_latent
+            )
 
     def _postprocess_sp_latents(
         self,

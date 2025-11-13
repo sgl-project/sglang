@@ -85,7 +85,7 @@ def shard_rotary_emb_for_sp(emb):
         pad_len = sp_world_size - (seq_len % sp_world_size)
         pad = emb[-1:].repeat(pad_len, 1)
         emb = torch.cat([emb, pad], dim=0)
-    if sp_world_size and sp_world_size > 1:
+    if sp_world_size > 1:
         try:
             rank = get_sp_parallel_rank()
         except Exception:
@@ -103,7 +103,7 @@ def shard_rotary_emb_for_sp(emb):
 # config for a single pipeline
 @dataclass
 class PipelineConfig:
-    """Base configuration for all pipeline architectures."""
+    """The base configuration class for a generation pipeline."""
 
     task_type: ModelTaskType
 
@@ -212,6 +212,8 @@ class PipelineConfig:
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if latents.dim() != 5:
+            return latents, False
         time_dim = latents.shape[2]
         if time_dim > 0 and time_dim % sp_world_size == 0:
             sharded_tensor = rearrange(
@@ -514,6 +516,55 @@ class PipelineConfig:
 
 
 @dataclass
+class ImagePipelineConfig(PipelineConfig):
+    """Base config for image generation pipelines with token-like latents [B, S, D]."""
+
+    def shard_latents_for_sp(self, batch, latents):
+        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        seq_len = latents.shape[1]
+
+        # Pad to next multiple of SP degree if needed
+        if seq_len % sp_world_size != 0:
+            pad_len = sp_world_size - (seq_len % sp_world_size)
+            pad = torch.zeros(
+                (latents.shape[0], pad_len, latents.shape[2]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=1)
+            # Record padding length for later unpad
+            batch.sp_seq_pad = int(getattr(batch, "sp_seq_pad", 0)) + pad_len
+
+        sharded_tensor = rearrange(
+            latents, "b (n s) d -> b n s d", n=sp_world_size
+        ).contiguous()
+        sharded_tensor = sharded_tensor[:, rank_in_sp_group, :, :]
+        return sharded_tensor, True
+
+    def gather_latents_for_sp(self, latents):
+        # For image latents [B, S_local, D], gather along sequence dim=1
+        latents = sequence_model_parallel_all_gather(latents, dim=1)
+        return latents
+
+    def _unpad_and_unpack_latents(self, latents, batch):
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        channels = self.dit_config.arch_config.in_channels
+        batch_size = latents.shape[0]
+
+        height = 2 * (int(batch.height) // (vae_scale_factor * 2))
+        width = 2 * (int(batch.width) // (vae_scale_factor * 2))
+
+        # If SP padding was applied, remove extra tokens before reshaping
+        target_tokens = (height // 2) * (width // 2)
+        if latents.shape[1] > target_tokens:
+            latents = latents[:, :target_tokens, :]
+
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+        return latents, batch_size, channels, height, width
+
+
+@dataclass
 class SlidingTileAttnConfig(PipelineConfig):
     """Configuration for sliding tile attention."""
 
@@ -529,6 +580,20 @@ class SlidingTileAttnConfig(PipelineConfig):
     # Additional configuration specific to sliding tile attention
     pad_to_square: bool = False
     use_overlap_optimization: bool = True
+
+
+# a unified entry for pipeline creation
+def SGLangPipelineConfig(path: str, **kwargs) -> "PipelineConfig":
+    """A unified entry for pipeline creation."""
+    from sglang.multimodal_gen.registry import get_model_info
+
+    model_info = get_model_info(path)
+    if model_info is None:
+        raise ValueError(f"Model info not found for path: {path}")
+
+    pipeline_config_cls = model_info.pipeline_config_cls()
+    pipeline_config = pipeline_config_cls.from_kwargs(kwargs, config_cli_prefix=path)
+    return pipeline_config
 
 
 def parse_int_list(value: str) -> list[int]:
