@@ -43,20 +43,6 @@ _SCENARIOS = _BASELINE_CONFIG["scenarios"]
 _TEXT_SCENARIO = _SCENARIOS["text_to_image"]
 _IMAGE_EDIT_SCENARIO = _SCENARIOS["image_edit"]
 
-EXPECTED_STAGE_MS = _TEXT_SCENARIO["stages_ms"]
-
-EXPECTED_STAGE_MS_IMAGE_EDIT = _IMAGE_EDIT_SCENARIO["stages_ms"]
-
-EXPECTED_DENOISE_STEP_MS = {
-    int(idx): float(duration)
-    for idx, duration in _TEXT_SCENARIO["denoise_step_ms"].items()
-}
-
-_DEFAULTS = _BASELINE_CONFIG["defaults"]
-DEFAULT_EXPECTED_E2E_MS = float(_DEFAULTS["expected_e2e_ms"])
-DEFAULT_EXPECTED_AVG_DENOISE_MS = float(_DEFAULTS["expected_avg_denoise_ms"])
-DEFAULT_EXPECTED_MEDIAN_DENOISE_MS = float(_DEFAULTS["expected_median_denoise_ms"])
-
 STEP_SAMPLE_FRACTIONS: Sequence[float] = tuple(
     _BASELINE_CONFIG["sampling"]["step_fractions"]
 )
@@ -66,6 +52,9 @@ _DEFAULT_WARMUP_TEXT = int(_WARMUP_DEFAULTS.get("text", 1))
 _DEFAULT_WARMUP_EDIT = int(_WARMUP_DEFAULTS.get("image_edit", 0))
 
 _TOLERANCES = _BASELINE_CONFIG["tolerances"]
+
+# A global list to store results from all test classes
+_GLOBAL_PERF_RESULTS = []
 
 
 def _tolerance_from_env(var_name: str, default: float) -> float:
@@ -115,7 +104,7 @@ def _run_warmup_requests(cls, port: int) -> None:
 
     for _ in range(warmup_text_requests):
         result = client.images.generate(
-            model=getattr(cls, "MODEL_PATH", "Qwen/Qwen-Image"),
+            model=getattr(cls, "MODEL_PATH"),
             prompt=prompt,
             n=1,
             size=output_size,
@@ -137,7 +126,7 @@ def _run_warmup_requests(cls, port: int) -> None:
         for _ in range(warmup_edit_requests):
             with edit_path.open("rb") as fh:
                 result = client.images.edit(
-                    model=getattr(cls, "MODEL_PATH", "Qwen/Qwen-Image"),
+                    model=getattr(cls, "MODEL_PATH"),
                     image=fh,
                     prompt=edit_prompt,
                     n=1,
@@ -158,13 +147,14 @@ def diffusion_server(request):
         "SERVER_PORT",
         int(os.environ.get("SGLANG_TEST_SERVER_PORT", "30100")),
     )
-    model = getattr(
-        cls, "MODEL_PATH", os.environ.get("SGLANG_TEST_IMAGE_MODEL", "Qwen/Qwen-Image")
-    )
+    model = getattr(cls, "MODEL_PATH")
     wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
     serve_extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
 
-    stdout_path = Path(tempfile.gettempdir()) / f"sgl_server_{port}.log"
+    safe_model_name = model.replace("/", "_")
+    stdout_path = (
+        Path(tempfile.gettempdir()) / f"sgl_server_{port}_{safe_model_name}.log"
+    )
     stdout_path.unlink(missing_ok=True)
 
     base_command = [
@@ -256,6 +246,13 @@ def diffusion_server(request):
     request.cls.server_ctx = ctx
     request.cls.perf_log_path = perf_log_path
 
+    grace = float(getattr(cls, "STARTUP_GRACE_SECONDS", 0.0) or 0.0)
+    if grace > 0:
+        logger.info(
+            "[server-test] Waiting %.1fs before warm-ups to let model settle", grace
+        )
+        time.sleep(grace)
+
     try:
         _run_warmup_requests(cls, port)
     except Exception as exc:
@@ -277,20 +274,23 @@ def diffusion_server(request):
 
 
 @pytest.mark.usefixtures("diffusion_server")
-class DiffusionServerPerfTestBase:
-    MODEL_PATH = os.environ.get("SGLANG_TEST_IMAGE_MODEL", "Qwen/Qwen-Image")
+class DiffusionPerfTestBase:
+    MODEL_PATH: str
     SERVER_PORT = int(os.environ.get("SGLANG_TEST_SERVER_PORT", "30100"))
-    PROMPT = "A minimal colorful icon of a raccoon face, flat style"
+    PROMPT = "A Logo With Bold Large Text: SGL Diffusion"
     IMAGE_EDIT_PROMPT: str | None = None
-    IMAGE_EDIT_PATH = Path(__file__).resolve().parents[1] / "test_files" / "rabbit.jpg"
+    IMAGE_EDIT_PATH = Path(__file__).resolve().parents[1] / "test_files" / "girl.jpg"
     OUTPUT_SIZE = "1024x1024"
     WARMUP_TEXT_REQUESTS = _DEFAULT_WARMUP_TEXT
     WARMUP_IMAGE_EDIT_REQUESTS = _DEFAULT_WARMUP_EDIT
-    STAGE_EXPECTATIONS = EXPECTED_STAGE_MS
-    STEP_EXPECTATIONS = EXPECTED_DENOISE_STEP_MS
-    EXPECTED_E2E_MS = DEFAULT_EXPECTED_E2E_MS
-    EXPECTED_AVG_DENOISE_MS = DEFAULT_EXPECTED_AVG_DENOISE_MS
-    EXPECTED_MEDIAN_DENOISE_MS = DEFAULT_EXPECTED_MEDIAN_DENOISE_MS
+    STARTUP_GRACE_SECONDS = 0.0
+
+    STAGE_EXPECTATIONS: dict
+    STEP_EXPECTATIONS: dict
+    EXPECTED_E2E_MS: float
+    EXPECTED_AVG_DENOISE_MS: float
+    EXPECTED_MEDIAN_DENOISE_MS: float
+
     _perf_results: list[dict[str, Any]] = []
 
     @classmethod
@@ -299,38 +299,9 @@ class DiffusionServerPerfTestBase:
 
     @classmethod
     def teardown_class(cls):
-        results = getattr(cls, "_perf_results", [])
-        if not results:
-            return
-        lines = [
-            "",
-            f"[server-test] Perf summary for {cls.__name__}",
-            "Test Name             |   E2E (ms) | Avg Denoise (ms) | Median (ms)",
-            "----------------------+-----------+------------------+-------------",
-        ]
-        for entry in results:
-            lines.append(
-                f"{entry['test_name']:<22} | "
-                f"{entry['e2e_ms']:>9.2f} | "
-                f"{entry['avg_denoise_ms']:>16.2f} | "
-                f"{entry['median_denoise_ms']:>11.2f}"
-            )
-            stage_report = ", ".join(
-                f"{name}:{duration:.2f}ms"
-                for name, duration in entry.get("stage_metrics", {}).items()
-            )
-            if stage_report:
-                lines.append(f"    stages: {stage_report}")
-            sampled_steps = entry.get("sampled_steps") or {}
-            if sampled_steps:
-                step_report = ", ".join(
-                    f"{idx}:{duration:.2f}ms" for idx, duration in sampled_steps.items()
-                )
-                lines.append(f"    sampled steps: {step_report}")
-        lines.append("")
-        summary_text = "\n".join(lines)
-        logger.info(summary_text)
-        print(summary_text)
+        for result in cls._perf_results:
+            result["class_name"] = cls.__name__
+            _GLOBAL_PERF_RESULTS.append(result)
 
     def _client(self) -> OpenAI:
         return OpenAI(
@@ -452,18 +423,14 @@ class DiffusionServerPerfTestBase:
                 actual <= upper_bound
             ), f"Stage {stage} took {actual:.2f}ms > allowed {upper_bound:.2f}ms"
 
-        stage_report = ", ".join(f"{k}:{v:.2f}ms" for k, v in stage_metrics.items())
-        per_step_report = ", ".join(
-            f"step_{idx}:{avg_per_step[idx]:.2f}ms" for idx in sample_indices
-        )
+        # Log to pytest console during the run for immediate feedback
         logger.info(
-            "[Perf] E2E %.2f ms; Avg denoise %.2f ms; Median %.2f ms; "
-            "Stages: %s; Sampled steps: %s",
+            "[Perf] %s/%s: E2E %.2f ms; Avg denoise %.2f ms; Median %.2f ms",
+            self.__class__.__name__,
+            perf_record.get("test_name", "test"),
             e2e_ms,
             avg_duration,
             median_duration,
-            stage_report,
-            per_step_report,
         )
 
         return {
@@ -474,14 +441,47 @@ class DiffusionServerPerfTestBase:
             "sampled_steps": sampled_steps,
         }
 
+
+class TestQwenImageGeneration(DiffusionPerfTestBase):
+    """Performance tests for the Qwen/Qwen-image model."""
+
+    MODEL_PATH = "Qwen/Qwen-Image"
+    STARTUP_GRACE_SECONDS = 45.0
+    WARMUP_IMAGE_EDIT_REQUESTS = 0
+    STAGE_EXPECTATIONS = _TEXT_SCENARIO["stages_ms"]
+    STEP_EXPECTATIONS = {
+        int(k): v for k, v in _TEXT_SCENARIO["denoise_step_ms"].items()
+    }
+    EXPECTED_E2E_MS = float(_TEXT_SCENARIO["expected_e2e_ms"])
+    EXPECTED_AVG_DENOISE_MS = float(_TEXT_SCENARIO["expected_avg_denoise_ms"])
+    EXPECTED_MEDIAN_DENOISE_MS = float(_TEXT_SCENARIO["expected_median_denoise_ms"])
+
     def test_text_to_image_performance(self):
         perf_record, stage_metrics = self._run_and_collect_records(self._generate_image)
         summary = self._assert_metrics(perf_record, stage_metrics)
         self._record_result("text_to_image", summary)
 
+
+class TestQwenImageEdit(DiffusionPerfTestBase):
+    """Performance tests for the Qwen/Qwen-Image-Edit model."""
+
+    MODEL_PATH = "Qwen/Qwen-Image-Edit"
+    IMAGE_EDIT_PROMPT = "Convert 2D style to 3D style"
+    OUTPUT_SIZE = "1024x1536"
+    STARTUP_GRACE_SECONDS = 150.0
+    WARMUP_TEXT_REQUESTS = 0
+    WARMUP_IMAGE_EDIT_REQUESTS = 1
+    STAGE_EXPECTATIONS = _IMAGE_EDIT_SCENARIO["stages_ms"]
+    STEP_EXPECTATIONS = {
+        int(k): v for k, v in _IMAGE_EDIT_SCENARIO["denoise_step_ms"].items()
+    }
+    EXPECTED_E2E_MS = float(_IMAGE_EDIT_SCENARIO["expected_e2e_ms"])
+    EXPECTED_AVG_DENOISE_MS = float(_IMAGE_EDIT_SCENARIO["expected_avg_denoise_ms"])
+    EXPECTED_MEDIAN_DENOISE_MS = float(
+        _IMAGE_EDIT_SCENARIO["expected_median_denoise_ms"]
+    )
+
     def test_image_edit_performance(self):
-        if not self.IMAGE_EDIT_PROMPT:
-            pytest.skip("Image edit prompt not configured")
         perf_record, stage_metrics = self._run_and_collect_records(
             self._generate_image_edit
         )
@@ -489,19 +489,53 @@ class DiffusionServerPerfTestBase:
         self._record_result("image_edit", summary)
 
 
-class TestQwenImagePerformance(DiffusionServerPerfTestBase):
-    IMAGE_EDIT_PROMPT = "Change the rabbit's color to purple."
+def pytest_sessionfinish(session):
+    """
+    This hook is called by pytest at the end of the entire test session.
+    It prints a consolidated summary of all performance results.
+    """
+    if not _GLOBAL_PERF_RESULTS:
+        return
 
-    def test_image_edit_performance(self):
-        if not self.IMAGE_EDIT_PROMPT:
-            pytest.skip("Image edit prompt not configured")
-        original_stage_expectations = self.STAGE_EXPECTATIONS
-        try:
-            self.STAGE_EXPECTATIONS = EXPECTED_STAGE_MS_IMAGE_EDIT
-            perf_record, stage_metrics = self._run_and_collect_records(
-                self._generate_image_edit
+    print("\n\n" + "=" * 35 + " Performance Summary " + "=" * 35)
+    print(
+        f"{'Test Suite':<30} | {'Test Name':<20} | {'E2E (ms)':>12} | {'Avg Denoise (ms)':>18} | {'Median Denoise (ms)':>20}"
+    )
+    print(
+        "-" * 30
+        + "-+-"
+        + "-" * 20
+        + "-+-"
+        + "-" * 12
+        + "-+-"
+        + "-" * 18
+        + "-+-"
+        + "-" * 20
+    )
+
+    for entry in sorted(_GLOBAL_PERF_RESULTS, key=lambda x: x["class_name"]):
+        print(
+            f"{entry['class_name']:<30} | {entry['test_name']:<20} | {entry['e2e_ms']:>12.2f} | "
+            f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f}"
+        )
+
+    print("=" * 91)
+
+    print("\n\n" + "=" * 36 + " Detailed Reports " + "=" * 37)
+    for entry in sorted(_GLOBAL_PERF_RESULTS, key=lambda x: x["class_name"]):
+        print(f"\n--- Details for {entry['class_name']} / {entry['test_name']} ---")
+        stage_report = ", ".join(
+            f"{name}:{duration:.2f}ms"
+            for name, duration in entry.get("stage_metrics", {}).items()
+        )
+        if stage_report:
+            print(f"    Stages: {stage_report}")
+
+        sampled_steps = entry.get("sampled_steps") or {}
+        if sampled_steps:
+            step_report = ", ".join(
+                f"{idx}:{duration:.2f}ms"
+                for idx, duration in sorted(sampled_steps.items())
             )
-            summary = self._assert_metrics(perf_record, stage_metrics)
-            self._record_result("image_edit", summary)
-        finally:
-            self.STAGE_EXPECTATIONS = original_stage_expectations
+            print(f"    Sampled Steps: {step_report}")
+    print("=" * 91)
