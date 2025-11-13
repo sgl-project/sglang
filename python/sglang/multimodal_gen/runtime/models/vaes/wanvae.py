@@ -1144,28 +1144,30 @@ class AutoencoderKLWan(nn.Module, ParallelTiledVAE):
         self.temperal_downsample = list(config.temperal_downsample)
         self.temperal_upsample = list(config.temperal_downsample)[::-1]
 
-        #if config.decoder_base_dim is None:
+        # if config.decoder_base_dim is None:
         #    decoder_base_dim = config.base_dim
-        #else:
+        # else:
         #    decoder_base_dim = config.decoder_base_dim
         arch = config.arch_config
-        decoder_base_dim = getattr(arch, 'decoder_base_dim', None) or getattr(arch, 'base_dim', 96)
+        decoder_base_dim = getattr(arch, "decoder_base_dim", None) or getattr(
+            arch, "base_dim", 96
+        )
 
-        self.latents_mean = list(getattr(config.arch_config, 'latents_mean', None))
-        self.latents_std = list(getattr(config.arch_config, 'latents_std', None))
-        self.shift_factor = getattr(config.arch_config, 'shift_factor', None)
+        self.latents_mean = list(getattr(config.arch_config, "latents_mean", None))
+        self.latents_std = list(getattr(config.arch_config, "latents_std", None))
+        self.shift_factor = getattr(config.arch_config, "shift_factor", None)
 
         if config.load_encoder:
             self.encoder = WanEncoder3d(
-                in_channels=getattr(arch, 'in_channels', 3),
-                dim=getattr(arch, 'base_dim', 96),
+                in_channels=getattr(arch, "in_channels", 3),
+                dim=getattr(arch, "base_dim", 96),
                 z_dim=self.z_dim * 2,
-                dim_mult=getattr(arch, 'dim_mult', (1, 2, 4, 4)),
-                num_res_blocks=getattr(arch, 'num_res_blocks', 2),
-                attn_scales=getattr(arch, 'attn_scales', ()),
+                dim_mult=getattr(arch, "dim_mult", (1, 2, 4, 4)),
+                num_res_blocks=getattr(arch, "num_res_blocks", 2),
+                attn_scales=getattr(arch, "attn_scales", ()),
                 temperal_downsample=self.temperal_downsample,
-                dropout=getattr(arch, 'dropout', 0.0),
-                is_residual=getattr(arch, 'is_residual', False),
+                dropout=getattr(arch, "dropout", 0.0),
+                is_residual=getattr(arch, "is_residual", False),
             )
         self.quant_conv = WanCausalConv3d(self.z_dim * 2, self.z_dim * 2, 1)
         self.post_quant_conv = WanCausalConv3d(self.z_dim, self.z_dim, 1)
@@ -1174,16 +1176,16 @@ class AutoencoderKLWan(nn.Module, ParallelTiledVAE):
             self.decoder = WanDecoder3d(
                 dim=decoder_base_dim,
                 z_dim=self.z_dim,
-                dim_mult=getattr(arch, 'dim_mult', (1, 2, 4, 4)),
-                num_res_blocks=getattr(arch, 'num_res_blocks', 2),
-                attn_scales=getattr(arch, 'attn_scales', ()),
+                dim_mult=getattr(arch, "dim_mult", (1, 2, 4, 4)),
+                num_res_blocks=getattr(arch, "num_res_blocks", 2),
+                attn_scales=getattr(arch, "attn_scales", ()),
                 temperal_upsample=self.temperal_upsample,
-                dropout=getattr(arch, 'dropout', 0.0),
-                out_channels=getattr(arch, 'out_channels', 3),
-                is_residual=getattr(arch, 'is_residual', False),
+                dropout=getattr(arch, "dropout", 0.0),
+                out_channels=getattr(arch, "out_channels", 3),
+                is_residual=getattr(arch, "is_residual", False),
             )
 
-        self.use_feature_cache = getattr(config, 'use_feature_cache', True)
+        self.use_feature_cache = getattr(config, "use_feature_cache", True)
 
     def clear_cache(self) -> None:
 

@@ -372,7 +372,9 @@ class CLIPTextTransformer(nn.Module):
             prefix=prefix,
         )
 
-        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.arch_config.layer_norm_eps)
+        self.final_layer_norm = nn.LayerNorm(
+            embed_dim, eps=config.arch_config.layer_norm_eps
+        )
 
         # For `pooled_output` computation
         self.eos_token_id = config.arch_config.eos_token_id

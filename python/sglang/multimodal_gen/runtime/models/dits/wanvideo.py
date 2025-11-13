@@ -606,19 +606,19 @@ class WanTransformer3DModel(CachableDiT):
         arch = config.arch_config
 
         inner_dim = arch.num_attention_heads * arch.attention_head_dim
-        self.hidden_size = getattr(arch, 'hidden_size', 0)
-        self.num_attention_heads = getattr(arch, 'num_attention_heads', 40)
-        self.in_channels = getattr(arch, 'in_channels', 16)
-        self.out_channels = getattr(arch, 'out_channels', 16)
-        self.num_channels_latents = getattr(arch, 'num_channels_latents', 16)
-        self.patch_size = getattr(arch, 'patch_size', (1, 2, 2))
-        self.text_len = getattr(arch, 'text_len', 512)
+        self.hidden_size = getattr(arch, "hidden_size", 0)
+        self.num_attention_heads = getattr(arch, "num_attention_heads", 40)
+        self.in_channels = getattr(arch, "in_channels", 16)
+        self.out_channels = getattr(arch, "out_channels", 16)
+        self.num_channels_latents = getattr(arch, "num_channels_latents", 16)
+        self.patch_size = getattr(arch, "patch_size", (1, 2, 2))
+        self.text_len = getattr(arch, "text_len", 512)
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
-            in_chans=getattr(arch, 'in_channels', 16),
+            in_chans=getattr(arch, "in_channels", 16),
             embed_dim=inner_dim,
-            patch_size=getattr(arch, 'patch_size', (1, 2, 2)),
+            patch_size=getattr(arch, "patch_size", (1, 2, 2)),
             flatten=False,
         )
 
