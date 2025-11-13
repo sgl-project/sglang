@@ -65,7 +65,7 @@ class SGLangCIAnalyzer:
 
     def analyze_ci_failures(self, runs: List[Dict]) -> Dict:
         print(
-            "Analyzing CI failure data (pr-test.yml, vllm-dependency-test.yml, nightly-test.yml jobs only)..."
+            "Analyzing CI failure data (pr-test.yml, quantization-test.yml, nightly-test.yml jobs only)..."
         )
 
         job_categories = {
@@ -103,14 +103,22 @@ class SGLangCIAnalyzer:
             "nightly": [
                 "nightly-test-perf-text-models",
                 "nightly-test-eval-text-models",
+                "nightly-test-1-gpu",
+                "nightly-test-4-gpu",
+                "nightly-test-8-gpu-h200",
+                "nightly-test-8-gpu-h20",
+                "nightly-test-4-gpu-b200",
             ],
             "integration": [
                 "run-all-notebooks",
-                "vllm-dependency-test",
+                "quantization-test",
                 "test-disaggregation",
             ],
             "b200": [
                 "unit-test-backend-4-gpu-b200",
+            ],
+            "gb200": [
+                "unit-test-backend-4-gpu-gb200",
             ],
         }
 
@@ -180,12 +188,17 @@ class SGLangCIAnalyzer:
                     "unit-test-deepep-8-gpu",
                     "unit-test-backend-8-gpu-deepseek-v32",
                     "unit-test-backend-4-gpu-b200",
-                    "vllm-dependency-test",
+                    "unit-test-backend-4-gpu-gb200",
+                    "quantization-test",
                     "nightly-test-eval-text-models",
                     "nightly-test-perf-text-models",
                     "nightly-test-eval-vlms",
                     "nightly-test-perf-vlms",
                     "nightly-test-1-gpu",
+                    "nightly-test-4-gpu",
+                    "nightly-test-8-gpu-h200",
+                    "nightly-test-8-gpu-h20",
+                    "nightly-test-4-gpu-b200",
                 ]
 
                 if job_name in target_jobs:
