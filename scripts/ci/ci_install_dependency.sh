@@ -126,9 +126,6 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
     git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
-
-    # Install xformers
-    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
