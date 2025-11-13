@@ -25,41 +25,23 @@ use crate::{
 /// - Parameters as `<parameter name="key">value</parameter>`
 /// - Incremental JSON streaming for parameters
 pub struct MinimaxM2Parser {
-    /// Regex for extracting complete tool calls
+    // Regex patterns
     tool_call_extractor: Regex,
-    /// Regex for extracting function details from invoke tag
     invoke_extractor: Regex,
-    /// Regex for extracting parameter key-value pairs
     param_extractor: Regex,
 
-    /// Buffer for accumulating incomplete patterns across chunks
+    // Streaming state
     buffer: String,
-
-    /// Stores complete tool call info (name and arguments) for each tool being parsed
     prev_tool_call_arr: Vec<Value>,
-
-    /// Index of currently streaming tool call (-1 means no active tool)
     current_tool_id: i32,
-
-    /// Tracks raw JSON string content streamed to client for each tool's arguments
     streamed_args_for_tool: Vec<String>,
-
-    /// Current function name being parsed
     current_function_name: String,
-
-    /// Current parameters being accumulated
     current_parameters: HashMap<String, Value>,
-
-    /// Whether we're inside a tool call block
     in_tool_call: bool,
-
-    /// Whether the function name has been sent for current tool
     function_name_sent: bool,
-
-    /// Whether we're waiting for </minimax:tool_call> after </invoke>
     waiting_for_tool_call_end: bool,
 
-    /// Token configuration
+    // Token configuration
     tool_call_start_token: &'static str,
     tool_call_end_token: &'static str,
     invoke_start_prefix: &'static str,
@@ -109,7 +91,7 @@ impl MinimaxM2Parser {
             tool_call_extractor,
             invoke_extractor,
             param_extractor,
-            buffer: String::with_capacity(1024), // Pre-allocate reasonable capacity
+            buffer: String::new(),
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
             streamed_args_for_tool: Vec::new(),
@@ -181,13 +163,22 @@ impl MinimaxM2Parser {
         }
     }
 
-    /// Parse all tool calls from text (shared logic for complete and incremental parsing)
-    fn parse_tool_calls_from_text(&self, text: &str) -> ParserResult<Vec<ToolCall>> {
+    /// Parse all tool calls from text and return first valid position
+    fn parse_tool_calls_from_text(
+        &self,
+        text: &str,
+    ) -> ParserResult<(Vec<ToolCall>, Option<usize>)> {
         let mut tools = Vec::new();
+        let mut first_valid_pos = None;
 
         for mat in self.tool_call_extractor.find_iter(text) {
             match self.parse_tool_call(mat.as_str()) {
-                Ok(Some(tool)) => tools.push(tool),
+                Ok(Some(tool)) => {
+                    if first_valid_pos.is_none() {
+                        first_valid_pos = Some(mat.start());
+                    }
+                    tools.push(tool);
+                }
                 Ok(None) => continue,
                 Err(e) => {
                     tracing::warn!("Failed to parse tool call: {}", e);
@@ -196,7 +187,7 @@ impl MinimaxM2Parser {
             }
         }
 
-        Ok(tools)
+        Ok((tools, first_valid_pos))
     }
 
     /// Parse and stream parameters incrementally
@@ -332,24 +323,12 @@ impl ToolParser for MinimaxM2Parser {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Parse all tool calls using shared helper (filters out ones in thinking tags)
-        let tools = self.parse_tool_calls_from_text(text)?;
+        // Parse all tool calls and get first valid position
+        let (tools, first_valid_tool_pos) = self.parse_tool_calls_from_text(text)?;
 
         // If no tools were successfully parsed, return entire text as fallback
         if tools.is_empty() {
             return Ok((text.to_string(), vec![]));
-        }
-
-        // Find the position of the first successfully extracted tool call
-        // We need to match the extracted tools with their positions in text
-        let mut first_valid_tool_pos = None;
-        for mat in self.tool_call_extractor.find_iter(text) {
-            // Check if this tool call was successfully extracted
-            // by trying to parse it
-            if let Ok(Some(_)) = self.parse_tool_call(mat.as_str()) {
-                first_valid_tool_pos = Some(mat.start());
-                break;
-            }
         }
 
         // Determine what text to return as normal_text
@@ -399,20 +378,14 @@ impl ToolParser for MinimaxM2Parser {
             // If we're not in a tool call and don't see a start token, return normal text
             if !self.in_tool_call && !self.buffer.contains(self.tool_call_start_token) {
                 // Check if buffer might contain a partial start token at the end
-                // We need to keep potential partial tokens in the buffer
-                let mut could_be_partial = false;
-                for i in 1..self.tool_call_start_token.len() {
-                    if self.buffer.ends_with(&self.tool_call_start_token[..i]) {
-                        could_be_partial = true;
-                        // Return everything except the potential partial token
-                        let end = self.buffer.len() - i;
-                        normal_text = self.buffer[..end].to_string();
-                        self.buffer = self.buffer[end..].to_string();
-                        break;
-                    }
-                }
-
-                if !could_be_partial {
+                if let Some(partial_len) =
+                    helpers::ends_with_partial_token(&self.buffer, self.tool_call_start_token)
+                {
+                    // Return everything except the potential partial token
+                    let end = self.buffer.len() - partial_len;
+                    normal_text = self.buffer[..end].to_string();
+                    self.buffer = self.buffer[end..].to_string();
+                } else {
                     // No partial token, return all as normal text
                     normal_text = self.buffer.clone();
                     self.buffer.clear();
