@@ -52,10 +52,13 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const HOURS = 2;
-            const actor = context.actor;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
+            const curRun = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: context.runId
+            });
+            const triggeringActor = curRun.data.triggering_actor?.login || context.actor;
 
             async function hasHighPermission(username) {
               try {
@@ -68,8 +71,8 @@ jobs:
               }
             }
 
-            if (await hasHighPermission(actor)) {
-              core.info(`Triggering user '${actor}' has high permission. No rate limit applied.`);
+            if (await hasHighPermission(triggeringActor)) {
+              core.info(`Triggering user '${triggeringActor}' has high permission. No rate limit applied.`);
               return;
             }
 
@@ -88,12 +91,12 @@ jobs:
             const recentFound = runs.find((run) => {
               if (String(run.id) === String(context.runId)) return false;
               if (new Date(run.created_at) < cutoff) return false;
-              return (run.actor?.login === actor) || (run.triggering_actor?.login === actor);
+              return (run.actor?.login === triggeringActor) || (run.triggering_actor?.login === triggeringActor);
             });
 
             if (recentFound) {
               core.setFailed(
-                `User '${actor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
+                `User '${triggeringActor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
                 `Please wait ${HOURS} hours before triggering again.`
               );
             } else {
