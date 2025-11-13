@@ -2,7 +2,7 @@ from typing import Iterable, List, Optional
 
 import einops
 import torch
-from torch import nn
+import torch.nn as nn
 
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -390,10 +390,10 @@ class JetNemotronForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         get_embedding: bool = False,
     ) -> EmbeddingPoolerOutput | LogitsProcessorOutput:
-        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
