@@ -29,6 +29,7 @@ from huggingface_hub import snapshot_download
 
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+from sglang.utils import LazyImport
 
 if TYPE_CHECKING:
     from transformers import (
@@ -37,10 +38,16 @@ if TYPE_CHECKING:
         PreTrainedTokenizerFast,
     )
 
+AutoConfig = LazyImport("transformers", "AutoConfig")
+AutoTokenizer = LazyImport("transformers", "AutoTokenizer")
+AutoProcessor = LazyImport("transformers", "AutoProcessor")
+GenerationConfig = LazyImport("transformers", "GenerationConfig")
+PreTrainedTokenizerFast = LazyImport("transformers", "PreTrainedTokenizerFast")
+PreTrainedTokenizerBase = LazyImport("transformers", "PreTrainedTokenizerBase")
+SiglipVisionConfig = LazyImport("transformers", "SiglipVisionConfig")
+
 
 def _register_custom_configs():
-    from transformers import AutoConfig
-
     from sglang.srt.configs import (
         ChatGLMConfig,
         DbrxConfig,
@@ -162,8 +169,6 @@ def _load_deepseek_v32_model(
     revision: Optional[str] = None,
     **kwargs,
 ):
-    from transformers import AutoConfig
-
     # first get the local path
     local_path = download_from_hf(model_path)
     # then load the config file in json
@@ -207,8 +212,6 @@ def get_config(
     model_override_args: Optional[dict] = None,
     **kwargs,
 ):
-    from transformers import AutoConfig
-
     _CONFIG_REGISTRY = _register_custom_configs()
 
     is_gguf = check_gguf_file(model)
@@ -243,8 +246,6 @@ def get_config(
         # Phi4MMForCausalLM uses a hard-coded vision_config. See:
         # https://github.com/vllm-project/vllm/blob/6071e989df1531b59ef35568f83f7351afb0b51e/vllm/model_executor/models/phi4mm.py#L71
         # We set it here to support cases where num_attention_heads is not divisible by the TP size.
-        from transformers import SiglipVisionConfig
-
         vision_config = {
             "hidden_size": 1152,
             "image_size": 448,
@@ -306,8 +307,6 @@ def get_generation_config(
     **kwargs,
 ):
     try:
-        from transformers import GenerationConfig
-
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
@@ -387,8 +386,6 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
-    from transformers import AutoTokenizer, PreTrainedTokenizerFast
-
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 
@@ -466,8 +463,6 @@ def get_tokenizer(
 
 # Some models doesn't have an available processor, e.g.: InternVL
 def get_tokenizer_from_processor(processor):
-    from transformers import PreTrainedTokenizerBase
-
     if isinstance(processor, PreTrainedTokenizerBase):
         return processor
     return processor.tokenizer
@@ -482,8 +477,6 @@ def get_processor(
     use_fast: Optional[bool] = True,
     **kwargs,
 ):
-    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
-
     from sglang.srt.multimodal.customized_mm_processor_utils import (
         _CUSTOMIZED_MM_PROCESSOR,
     )
