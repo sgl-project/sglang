@@ -12,7 +12,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.distributed.utils import divide
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
@@ -401,10 +400,16 @@ class MambaMixer2(torch.nn.Module):
 
         num_prefills = metadata.num_prefills  # request count
         num_decodes = metadata.num_decodes  # token count (=request)
+        num_decode_tokens = (
+            num_decodes * metadata.draft_token_num
+            if metadata.is_target_verify
+            else num_decodes
+        )
         num_prefill_tokens = metadata.num_prefill_tokens  # token count
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
-        num_actual_tokens = num_prefill_tokens + num_decodes
+        num_actual_tokens = num_prefill_tokens + num_decode_tokens
+
         assert num_actual_tokens == projected_states.shape[0]
 
         # NOTE: V0 put prefill before decode
@@ -412,12 +417,12 @@ class MambaMixer2(torch.nn.Module):
         # Split along token dimension
         hidden_states_B_C_p, hidden_states_B_C_d = torch.split(
             hidden_states_B_C,
-            [num_prefill_tokens, num_decodes],
+            [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
         dt_p, dt_d = torch.split(
             dt,
-            [num_prefill_tokens, num_decodes],
+            [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
         # Split along batch dimension
@@ -441,7 +446,7 @@ class MambaMixer2(torch.nn.Module):
         )
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out,
-            [num_prefill_tokens, num_decodes],
+            [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
 
@@ -521,19 +526,60 @@ class MambaMixer2(torch.nn.Module):
         # Process decode requests
         if has_decode:
             # 2. Convolution sequence transformation
-            ccu = (
-                causal_conv1d_update
-                if not use_triton_causal_conv
-                else causal_conv1d_update_triton
-            )
-            hidden_states_B_C_d = ccu(
-                hidden_states_B_C_d,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=state_indices_tensor_d,
-            )
+            is_target_verify = metadata.is_target_verify
+
+            if is_target_verify:
+                assert use_triton_causal_conv
+                # For speculative decoding verification, we need to process multiple
+                # draft tokens per request. Reshape to [batch_size, draft_token_num, -1]
+                # and process with intermediate state tracking.
+                assert isinstance(
+                    layer_cache, MambaPool.SpeculativeState
+                ), "layer_cache must be SpeculativeState for speculative decoding"
+
+                draft_token_num = metadata.draft_token_num
+
+                # Reshape for batch processing
+                hidden_states_B_C_d_reshaped = (
+                    hidden_states_B_C_d.view(num_decodes, draft_token_num, -1)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
+                # Get intermediate conv window cache
+                intermediate_conv_window_cache = layer_cache.intermediate_conv_window
+
+                hidden_states_B_C_d_processed = causal_conv1d_update_triton(
+                    hidden_states_B_C_d_reshaped,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=state_indices_tensor_d[:num_decodes],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    retrieve_next_token=metadata.retrieve_next_token,
+                    retrieve_next_sibling=metadata.retrieve_next_sibling,
+                    retrieve_parent_token=metadata.retrieve_parent_token,
+                )
+                hidden_states_B_C_d = (
+                    hidden_states_B_C_d_processed.transpose(1, 2)
+                    .contiguous()
+                    .view(num_decode_tokens, -1)
+                )
+            else:
+                ccu = (
+                    causal_conv1d_update
+                    if not use_triton_causal_conv
+                    else causal_conv1d_update_triton
+                )
+                hidden_states_B_C_d = ccu(
+                    hidden_states_B_C_d,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=state_indices_tensor_d,
+                )
 
             hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
 
@@ -557,20 +603,96 @@ class MambaMixer2(torch.nn.Module):
             # - layer_state.ssm_state's slots will be selected
             #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
-            selective_state_update(
-                ssm_state,
-                hidden_states_d,
-                dt_d,
-                A_d,
-                B_d,
-                C_d,
-                D_d,
-                z=None,
-                dt_bias=dt_bias,
-                dt_softplus=True,
-                state_batch_indices=state_indices_tensor_d,
-                out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
-            )
+
+            if is_target_verify:
+                # Speculative decoding verification: run selective_state_update in a loop
+                # over draft tokens, storing intermediate states
+                assert isinstance(
+                    layer_cache, MambaPool.SpeculativeState
+                ), "layer_cache must be SpeculativeState for speculative decoding"
+
+                draft_token_num = metadata.draft_token_num
+                intermediate_state_cache = layer_cache.intermediate_ssm
+
+                state_indices_batch = state_indices_tensor_d[:num_decodes]
+
+                # Save the initial state before processing (we'll restore it at the end)
+                initial_ssm_state = ssm_state[state_indices_batch].clone()
+
+                # Allocate reusable contiguous output buffer once (kernel requires contiguous memory)
+                # Reused across all iterations to avoid repeated allocations
+                out_step_buffer = torch.empty(
+                    (num_decodes, self.num_heads // self.tp_size, self.head_dim),
+                    dtype=hidden_states_d.dtype,
+                    device=hidden_states_d.device,
+                )
+
+                # Process each draft token step, storing intermediate states
+                # To match GDN semantics: intermediate_state_cache[:, i] will contain
+                # the state AFTER processing token i (ready for token i+1)
+                for step in range(draft_token_num):
+                    # Get the slice for this draft token step across all batch items
+                    # Tokens are organized as [batch_0_token_0, ..., batch_0_token_N, batch_1_token_0, ...]
+                    step_indices = torch.arange(
+                        step,
+                        num_decode_tokens,
+                        draft_token_num,
+                        device=hidden_states_d.device,
+                    )
+
+                    # Extract inputs for this step
+                    hidden_states_step = hidden_states_d[step_indices]
+                    dt_step = dt_d[step_indices]
+                    A_step = A_d
+                    B_step = B_d[step_indices]
+                    C_step = C_d[step_indices]
+                    D_step = D_d
+
+                    # Run selective_state_update for this step
+                    # Kernel writes to contiguous buffer, then we copy to strided output
+                    selective_state_update(
+                        ssm_state,
+                        hidden_states_step,
+                        dt_step,
+                        A_step,
+                        B_step,
+                        C_step,
+                        D_step,
+                        z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_indices_batch,
+                        out=out_step_buffer,
+                    )
+
+                    # Copy to preallocated buffer at correct strided positions
+                    preallocated_ssm_out_d[step_indices] = out_step_buffer.view(
+                        num_decodes, -1
+                    )
+
+                    # Store state AFTER processing token (matches GDN semantics)
+                    # intermediate_state_cache[:, step] = state after processing token step
+                    intermediate_state_cache[state_indices_batch, step] = ssm_state[
+                        state_indices_batch
+                    ].clone()
+
+                # Restore the original state (since we only wanted to compute outputs and cache intermediate states)
+                ssm_state[state_indices_batch] = initial_ssm_state
+            else:
+                selective_state_update(
+                    ssm_state,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_tensor_d,
+                    out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                )
 
         # 4. gated MLP
         # GatedRMSNorm internally applying SiLU to the gate
