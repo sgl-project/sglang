@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+#include <ATen/cuda/Exceptions.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/all.h>
+
 #include "pos_enc.cuh"
 #include "utils.h"
 
