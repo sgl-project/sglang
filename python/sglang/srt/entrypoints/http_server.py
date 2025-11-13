@@ -1431,8 +1431,8 @@ def launch_server(
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
-# Minimal 32x32 black PNG (base64, GLM4v and qwen3-vl requires at least 32x32 sized image)
-MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+# Minimal 32x32 black PNG (base64, GLM4v requires at least 28x28 sized image)
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEElEQVQImWNgYGD4z8DAAAQYAAH7u8WFAAAAAElFTkSuQmCC"
 
 
 def _execute_server_warmup(
