@@ -38,6 +38,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
@@ -64,7 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
-    deepgemm_scale_ue8m0_supported,
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -369,7 +370,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 return
             else:
-                if deepgemm_scale_ue8m0_supported():
+                if (
+                    deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                    and hasattr(self.quant_config, "weight_block_size")
+                    and self.quant_config.weight_block_size is not None
+                    and self.w8a8_block_fp8_linear
+                    is deepgemm_w8a8_block_fp8_linear_with_fallback
+                ):
                     requant_weight_ue8m0_inplace(
                         layer.weight,
                         layer.weight_scale_inv,
