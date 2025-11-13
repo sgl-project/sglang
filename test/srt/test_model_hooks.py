@@ -71,7 +71,7 @@ class TestModelRunnerHooks(CustomTestCase):
         hook_specs = [
             {
                 "target_modules": ["outer.0", "outer.1"],
-                "hook_factory": ("test_model_hooks:dummy_hook_factory"),
+                "hook_factory": "test_model_hooks:dummy_hook_factory",
                 "config": {"tag": "forward-ok"},
             },
             {
