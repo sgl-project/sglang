@@ -262,10 +262,10 @@ def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
     K, N = b.shape
-    
+
     # DeepGEMM has minimum dimension requirements for TMA descriptors
     MIN_DEEPGEMM_DIM = 16
-    
+
     if (
         _ENABLE_MM_DEEPGEMM
         and ENABLE_JIT_DEEPGEMM
