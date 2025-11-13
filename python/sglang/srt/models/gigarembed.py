@@ -6,12 +6,18 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoConfig
+<<<<<<< HEAD
 import logging
+=======
+>>>>>>> ae1985c70efabc9aab097714b81745c1c5ab9ed3
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+<<<<<<< HEAD
 logger = logging.getLogger(__name__)
+=======
+>>>>>>> ae1985c70efabc9aab097714b81745c1c5ab9ed3
 
 def _first_not_none(*vals):
     for v in vals:
@@ -108,6 +114,7 @@ class GigarEmbedModel(nn.Module):
                 pp_proxy_tensors=None, input_embeds=None, get_embedding=False):
 
         if self.hf_model is None:
+<<<<<<< HEAD
             raise RuntimeError("forward called before load_weights()")
 
         if get_embedding:
@@ -210,10 +217,38 @@ class GigarEmbedModel(nn.Module):
             return EmbeddingPoolerOutput(embeddings=final_embeddings)
 
         # For non-embedding mode, return a dummy tensor
+=======
+            raise RuntimeError("forward вызван до load_weights()")
+
+>>>>>>> ae1985c70efabc9aab097714b81745c1c5ab9ed3
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         
         device = input_ids.device
+<<<<<<< HEAD
+=======
+        attn_mask = (input_ids != self.pad_id).to(device=device)   # [B, L], bool/0-1 — ок
+
+        if attn_mask.dim() == 1:
+            attn_mask = attn_mask.unsqueeze(0)
+        attn_mask = attn_mask.to(device=device)
+
+        if get_embedding:
+            out = self.hf_model(
+                input_ids=input_ids,          # ← ТОЛЬКО input_ids
+                attention_mask=attn_mask,
+                pool_mask=attn_mask,          # для latent-attention pooling
+                return_embeddings=True,
+                return_dict=True,
+            )
+            emb = out.get("sentence_embeddings") if isinstance(out, dict) else out
+            if emb is None:
+                emb = out.get("embeddings") if isinstance(out, dict) else None
+            if emb is None:
+                raise RuntimeError("HF-модель не вернула эмбеддинги")
+            return EmbeddingPoolerOutput(embeddings=emb.float())
+
+>>>>>>> ae1985c70efabc9aab097714b81745c1c5ab9ed3
         vocab_size = int(getattr(getattr(self.config, "text_config", self.config), "vocab_size", 128256))
         dummy = torch.zeros((input_ids.size(0), vocab_size), dtype=torch.float32, device=device)
         return EmbeddingPoolerOutput(embeddings=dummy)
