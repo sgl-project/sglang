@@ -508,35 +508,6 @@ def _get_single_image_embedding_and_combine(
     return embedding
 
 
-async def _cal_single_image_embedding(
-    pixel_value, modality, offsets, image_grid_thw, embedder
-):
-    single_hash = hash_feature(pixel_value)
-    # combined_hash = MultiModalStaticCache.combine_hashes([single_hash])
-    embedding = embedding_cache.get([single_hash], single_hash)
-    if embedding is not None:
-        # print("hit!")
-        return {
-            "cached": True,
-            "hash": single_hash,
-            "embedding": embedding,
-        }
-
-    single_item = MultimodalDataItem(
-        modality=modality,
-        hash=single_hash,
-        offsets=offsets,
-        feature=pixel_value,
-        model_specific_data={"image_grid_thw": image_grid_thw},
-    )
-    single_embedding = embedder([single_item])
-    return {
-        "cached": False,
-        "hash": single_hash,
-        "embedding": single_embedding,
-    }
-
-
 def _get_multimodal_mask(
     input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
 ) -> torch.Tensor:
