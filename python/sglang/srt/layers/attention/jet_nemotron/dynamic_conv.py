@@ -111,7 +111,6 @@ class DynamicShortConvolution(nn.Module):
         if cu_seqlens is not None:
             assert cache is not None, "Cache must be provided for varlen mode."
             B = len(cu_seqlens) - 1
-            T, _ = x.shape
             W = self.kernel_size
 
             out = dynamic_conv_triton_cache_varlen(
