@@ -1,9 +1,8 @@
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 
 import einops
 import torch
 from torch import nn
-from transformers.utils import logging
 
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -29,8 +28,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.utils import add_prefix
-
-logger = logging.get_logger(__name__)
 
 
 class JetBlock(nn.Module):
@@ -238,7 +235,7 @@ class JetNemotronDecoderLayer(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
-        layer_id: int,
+        layer_id: int = 0,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -393,7 +390,7 @@ class JetNemotronForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        inputs_embeds: torch.Tensor | None = None,
         get_embedding: bool = False,
     ) -> EmbeddingPoolerOutput | LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
@@ -408,8 +405,9 @@ class JetNemotronForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        stacked_params_mapping: list[tuple[str, str, str | int]] = [
+            # (param_name, shard_weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
