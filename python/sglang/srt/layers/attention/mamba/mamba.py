@@ -525,29 +525,22 @@ class MambaMixer2(torch.nn.Module):
 
         # Process decode requests
         if has_decode:
-            # 2. Convolution sequence transformation
             is_target_verify = metadata.is_target_verify
 
+            # 2. Convolution sequence transformation
             if is_target_verify:
-                assert use_triton_causal_conv
-                # For speculative decoding verification, we need to process multiple
-                # draft tokens per request. Reshape to [batch_size, draft_token_num, -1]
-                # and process with intermediate state tracking.
+                assert (
+                    use_triton_causal_conv
+                ), "Speculative decoding requires use_triton_causal_conv=True for intermediate state support"
                 assert isinstance(
                     layer_cache, MambaPool.SpeculativeState
                 ), "layer_cache must be SpeculativeState for speculative decoding"
-
                 draft_token_num = metadata.draft_token_num
 
                 # Reshape for batch processing
-                hidden_states_B_C_d_reshaped = (
-                    hidden_states_B_C_d.view(num_decodes, draft_token_num, -1)
-                    .transpose(1, 2)
-                    .contiguous()
-                )
-
-                # Get intermediate conv window cache
-                intermediate_conv_window_cache = layer_cache.intermediate_conv_window
+                hidden_states_B_C_d_reshaped = hidden_states_B_C_d.view(
+                    num_decodes, draft_token_num, -1
+                ).transpose(1, 2)
 
                 hidden_states_B_C_d_processed = causal_conv1d_update_triton(
                     hidden_states_B_C_d_reshaped,
@@ -556,16 +549,14 @@ class MambaMixer2(torch.nn.Module):
                     self.conv1d.bias,
                     self.activation,
                     conv_state_indices=state_indices_tensor_d[:num_decodes],
-                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_conv_window=layer_cache.intermediate_conv_window,
                     retrieve_next_token=metadata.retrieve_next_token,
                     retrieve_next_sibling=metadata.retrieve_next_sibling,
                     retrieve_parent_token=metadata.retrieve_parent_token,
                 )
-                hidden_states_B_C_d = (
-                    hidden_states_B_C_d_processed.transpose(1, 2)
-                    .contiguous()
-                    .view(num_decode_tokens, -1)
-                )
+                hidden_states_B_C_d = hidden_states_B_C_d_processed.transpose(
+                    1, 2
+                ).view(num_decode_tokens, -1)
             else:
                 ccu = (
                     causal_conv1d_update
@@ -599,19 +590,7 @@ class MambaMixer2(torch.nn.Module):
                 -1, self.num_heads // self.tp_size, self.head_dim
             )
 
-            # - the hidden is reshaped into (bs, num_heads, head_dim)
-            # - layer_state.ssm_state's slots will be selected
-            #   using state_indices_tensor_d
-            # NOTE: final output is an in-place update of out tensor
-
             if is_target_verify:
-                # Speculative decoding verification: run selective_state_update in a loop
-                # over draft tokens, storing intermediate states
-                assert isinstance(
-                    layer_cache, MambaPool.SpeculativeState
-                ), "layer_cache must be SpeculativeState for speculative decoding"
-
-                draft_token_num = metadata.draft_token_num
                 intermediate_state_cache = layer_cache.intermediate_ssm
 
                 state_indices_batch = state_indices_tensor_d[:num_decodes]
@@ -623,41 +602,30 @@ class MambaMixer2(torch.nn.Module):
                 # Reused across all iterations to avoid repeated allocations
                 out_step_buffer = torch.empty(
                     (num_decodes, self.num_heads // self.tp_size, self.head_dim),
-                    dtype=hidden_states_d.dtype,
-                    device=hidden_states_d.device,
+                    dtype=preallocated_ssm_out_d.dtype,
+                    device=preallocated_ssm_out_d.device,
+                )
+                all_step_indices = (
+                    torch.arange(num_decode_tokens, device=hidden_states_d.device)
+                    .view(num_decodes, draft_token_num)
+                    .t()
                 )
 
-                # Process each draft token step, storing intermediate states
-                # To match GDN semantics: intermediate_state_cache[:, i] will contain
-                # the state AFTER processing token i (ready for token i+1)
                 for step in range(draft_token_num):
                     # Get the slice for this draft token step across all batch items
                     # Tokens are organized as [batch_0_token_0, ..., batch_0_token_N, batch_1_token_0, ...]
-                    step_indices = torch.arange(
-                        step,
-                        num_decode_tokens,
-                        draft_token_num,
-                        device=hidden_states_d.device,
-                    )
-
-                    # Extract inputs for this step
-                    hidden_states_step = hidden_states_d[step_indices]
-                    dt_step = dt_d[step_indices]
-                    A_step = A_d
-                    B_step = B_d[step_indices]
-                    C_step = C_d[step_indices]
-                    D_step = D_d
+                    step_indices = all_step_indices[step]
 
                     # Run selective_state_update for this step
                     # Kernel writes to contiguous buffer, then we copy to strided output
                     selective_state_update(
                         ssm_state,
-                        hidden_states_step,
-                        dt_step,
-                        A_step,
-                        B_step,
-                        C_step,
-                        D_step,
+                        hidden_states_d[step_indices],
+                        dt_d[step_indices],
+                        A_d,
+                        B_d[step_indices],
+                        C_d[step_indices],
+                        D_d,
                         z=None,
                         dt_bias=dt_bias,
                         dt_softplus=True,
@@ -670,13 +638,10 @@ class MambaMixer2(torch.nn.Module):
                         num_decodes, -1
                     )
 
-                    # Store state AFTER processing token (matches GDN semantics)
-                    # intermediate_state_cache[:, step] = state after processing token step
                     intermediate_state_cache[state_indices_batch, step] = ssm_state[
                         state_indices_batch
                     ].clone()
 
-                # Restore the original state (since we only wanted to compute outputs and cache intermediate states)
                 ssm_state[state_indices_batch] = initial_ssm_state
             else:
                 selective_state_update(
