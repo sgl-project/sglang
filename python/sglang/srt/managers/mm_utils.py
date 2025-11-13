@@ -2,7 +2,6 @@
 Multi-modality utils
 """
 
-import asyncio
 import hashlib
 import pickle
 from abc import abstractmethod
@@ -388,11 +387,14 @@ def _get_chunked_prefill_embedding(
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        item_hashes = [item.hash for item in embedding_items]
+        item_hashes = [item.hash for item in embedding_items_per_req]
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
         embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
-            if CACHE_SINGLE_IMAGE_EMBEDDING:
+            if (
+                CACHE_SINGLE_IMAGE_EMBEDDING
+                and embedding_items_per_req[0].modality == Modality.IMAGE
+            ):
                 embedding_per_req = _get_single_image_embedding_and_combine(
                     embedding_items_per_req, data_embedding_func
                 )
@@ -439,25 +441,62 @@ def _get_single_image_embedding_and_combine(
             ]
         )
 
-        async def _cal_single_embeddings():
-            tasks = [
-                _cal_single_image_embedding(
-                    merged_pixel_values[pixel_size_cum[j] : pixel_size_cum[j + 1], :],
-                    item.modality,
-                    img_token_id_offsets[j],
-                    img_grid_thws[j].unsqueeze(0),
-                    embedder,
-                )
-                for j in range(len(img_token_id_offsets))
-            ]
-            return await asyncio.gather(*tasks)
+        token_counts = [(end - start + 1) for (start, end) in img_token_id_offsets]
 
-        results = asyncio.run(_cal_single_embeddings())
-        for result in results:
-            single_embedding = result["embedding"]
-            embedding_list.append(single_embedding)
-            if not result["cached"]:
-                if not embedding_cache.put(result["hash"], single_embedding):
+        all_items_metadata = []
+        new_computed_items = []
+        computed_items_offset_start = 0
+        for i in range(len(img_token_id_offsets)):
+            pixel_value = merged_pixel_values[
+                pixel_size_cum[i] : pixel_size_cum[i + 1], :
+            ]
+            single_hash = hash_feature(pixel_value)
+
+            embedding = embedding_cache.get([single_hash], single_hash)
+            if embedding is not None:
+                all_items_metadata.append(
+                    {
+                        "image_idx": i,
+                        "cached": True,
+                        "hash": single_hash,
+                        "embedding": embedding,
+                    }
+                )
+            else:
+                single_item = MultimodalDataItem(
+                    modality=item.modality,
+                    hash=single_hash,
+                    offsets=img_token_id_offsets[i],
+                    feature=pixel_value,
+                    model_specific_data={
+                        "image_grid_thw": img_grid_thws[i].unsqueeze(0)
+                    },
+                )
+                new_computed_items.append(single_item)
+                all_items_metadata.append(
+                    {
+                        "image_idx": i,
+                        "cached": False,
+                        "hash": single_hash,
+                        "offset": [
+                            computed_items_offset_start,
+                            computed_items_offset_start + token_counts[i],
+                        ],
+                    }
+                )
+                computed_items_offset_start += token_counts[i]
+
+        if len(new_computed_items) > 0:
+            new_computed_embeddings = embedder(new_computed_items)
+
+        for metadata in all_items_metadata:
+            if metadata["cached"]:
+                embedding_list.append(metadata["embedding"])
+            else:
+                offset = metadata["offset"]
+                embedding = new_computed_embeddings[offset[0] : offset[1]]
+                embedding_list.append(embedding)
+                if not embedding_cache.set(metadata["hash"], embedding):
                     print_warning_once(
                         "Multimodal embedding cache is full. This typically occurs when a single "
                         "embedding exceeds the cache size limit. Consider increasing the "
@@ -473,8 +512,10 @@ async def _cal_single_image_embedding(
     pixel_value, modality, offsets, image_grid_thw, embedder
 ):
     single_hash = hash_feature(pixel_value)
-    embedding = embedding_cache.get(single_hash)
+    # combined_hash = MultiModalStaticCache.combine_hashes([single_hash])
+    embedding = embedding_cache.get([single_hash], single_hash)
     if embedding is not None:
+        # print("hit!")
         return {
             "cached": True,
             "hash": single_hash,
@@ -769,6 +810,8 @@ def general_mm_embed_routine(
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
+        # torch.cuda.synchronize()
+        # s_time = time.time()
         inputs_embeds, other_info = embed_mm_inputs(
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
@@ -780,6 +823,9 @@ def general_mm_embed_routine(
             placeholder_tokens=placeholder_tokens,
             use_deepstack=use_deepstack,
         )
+        # torch.cuda.synchronize()
+        # e_time = time.time()
+        # print(f"encode cost {(e_time - s_time) * 1000} ms")
         # add for qwen3_vl deepstack
         if use_deepstack:
             kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
@@ -789,12 +835,16 @@ def general_mm_embed_routine(
     else:
         inputs_embeds = embed_tokens(input_ids)
 
+    # s_time = time.time()
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=inputs_embeds,
         **kwargs,
     )
+    # torch.cuda.synchronize()
+    # e_time = time.time()
+    # print(f"llm cost {(e_time - s_time) * 1000} ms")
     return hidden_states
 
 
