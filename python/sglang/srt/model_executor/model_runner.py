@@ -2065,19 +2065,18 @@ class ModelRunner:
         name_to_module = dict(self.model.named_modules())
 
         for spec in hook_specs:
-            target_patterns = spec.get("target_modules", [])
-            if target_patterns == []:
+            spec_name = spec.get("name", "")
+            target_patterns = spec.get("target_modules")
+            if not target_patterns:
                 logger.warning(
-                    "Hook spec '%s' has no 'target_modules', skipping",
-                    spec.get("name", ""),
+                    f"Hook spec '{spec_name}' has no 'target_modules', skipping"
                 )
                 continue
 
-            hook_factory_path = spec.get("hook_factory", None)
+            hook_factory_path = spec.get("hook_factory")
             if not hook_factory_path:
                 logger.warning(
-                    "Hook spec '%s' has no 'hook_factory', skipping",
-                    spec.get("name", ""),
+                    f"Hook spec '{spec_name}' has no 'hook_factory', skipping"
                 )
                 continue
 
