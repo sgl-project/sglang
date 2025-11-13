@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from transformers import (
         PretrainedConfig,
         PreTrainedTokenizer,
-        PreTrainedTokenizerBase,
         PreTrainedTokenizerFast,
     )
 
@@ -388,7 +387,7 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
@@ -467,6 +466,8 @@ def get_tokenizer(
 
 # Some models doesn't have an available processor, e.g.: InternVL
 def get_tokenizer_from_processor(processor):
+    from transformers import PreTrainedTokenizerBase
+
     if isinstance(processor, PreTrainedTokenizerBase):
         return processor
     return processor.tokenizer
