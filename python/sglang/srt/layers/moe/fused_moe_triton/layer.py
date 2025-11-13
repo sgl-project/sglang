@@ -25,6 +25,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.kt_ep_wrapper import (
+    KTEPWrapperMethod,
+    create_kt_config_from_server_args,
+)
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -36,15 +40,11 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    CompressedTensorsWNA16AMXEPMoEMethod,
-    CompressedTensorsWNA16AMXMoEMethod,
-    CompressedTensorsWNA16MoEMethod,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -206,10 +206,19 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
-        if quant_config is not None:
-            self.quant_method = quant_config.get_quant_method(self, prefix)
-        if self.quant_method is None:
-            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+        server_args = get_global_server_args()
+        kt_config = create_kt_config_from_server_args(server_args, layer_id)
+        if kt_config is not None:
+            if quant_config is not None:
+                gpu_method = quant_config.get_quant_method(self, prefix)
+            else:
+                gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+            self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
+        else:
+            if quant_config is not None:
+                self.quant_method = quant_config.get_quant_method(self, prefix)
+            if self.quant_method is None:
+                self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
 
         self.quant_method.create_weights(
             layer=self,
@@ -222,8 +231,6 @@ class FusedMoE(torch.nn.Module):
                 if not use_weight_loader_fused
                 else self.weight_loader_fused
             ),
-            intermediate_size_full=intermediate_size,
-            top_k=top_k,
             with_bias=with_bias,
         )
 
@@ -510,9 +517,12 @@ class FusedMoE(torch.nn.Module):
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:
+            require_global_experts = getattr(
+                param, "_sglang_require_global_experts", False
+            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
-                    self.layer_id, expert_id
+                    self.layer_id, expert_id, require_global_experts
                 )
             )
 
@@ -541,11 +551,7 @@ class FusedMoE(torch.nn.Module):
 
         if isinstance(
             self.quant_method,
-            (
-                CompressedTensorsWNA16MoEMethod,
-                CompressedTensorsWNA16AMXMoEMethod,
-                CompressedTensorsWNA16AMXEPMoEMethod,
-            ),
+            KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
                 if expert_id >= self.quant_method.num_gpu_experts:
@@ -573,15 +579,17 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
+        method = self.quant_method
+        if method.__class__.__name__ == "KTEPWrapperMethod":
+            method = method.gpu_method
+
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
-                self.quant_method.__class__.__name__
+                method.__class__.__name__
                 in [
                     "CompressedTensorsWNA16MarlinMoEMethod",
                     "CompressedTensorsWNA16MoEMethod",
-                    "CompressedTensorsWNA16AMXMoEMethod",
-                    "CompressedTensorsWNA16AMXEPMoEMethod",
                 ]
             )
             else loaded_weight

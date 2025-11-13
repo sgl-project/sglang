@@ -36,6 +36,11 @@ pub struct WorkerConfigRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrap_port: Option<u16>,
 
+    /// Runtime type (optional: "sglang", "vllm", default: "sglang")
+    /// Only relevant for gRPC workers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+
     // gRPC-specific configuration (optional, ignored in HTTP mode)
     /// Tokenizer path for gRPC mode
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +137,10 @@ pub struct WorkerInfo {
 
     /// Connection mode (http or grpc)
     pub connection_mode: String,
+
+    /// Runtime type (sglang or vllm, for gRPC workers)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_type: Option<String>,
 
     // gRPC-specific fields (None for HTTP workers)
     #[serde(skip_serializing_if = "Option::is_none")]
