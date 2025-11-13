@@ -301,7 +301,7 @@ jobs:
 
   # =============================================== multimodal_gen ====================================================
   multimodal-gen-test:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
     steps:
