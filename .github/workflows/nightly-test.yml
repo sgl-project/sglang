@@ -110,7 +110,7 @@ jobs:
   nightly-test-1-gpu:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 1-gpu-runner
-    continue-on-error: true
+
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
