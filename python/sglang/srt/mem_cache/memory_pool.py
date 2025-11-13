@@ -305,7 +305,7 @@ class MambaPool:
         else:
             self.mamba_cache.conv.zero_()
         self.mamba_cache.temporal.zero_()
-        
+
         self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
