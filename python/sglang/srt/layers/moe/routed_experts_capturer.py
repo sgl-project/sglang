@@ -151,20 +151,10 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self, device_loc: torch.Tensor, cpu_loc: torch.Tensor
     ):
         batch = device_loc.shape[0]
-        # 1. .cpu()
-        # print(f"{batch=} {loc=}")
-        # self.host_cache.buffer[loc] = self.device_cache.buffer[:batch].cpu()
-        # 2. .to(device="cpu", non_blocking=True)
+
         self.host_cache.buffer[cpu_loc] = self.device_cache.buffer[:batch].to(
             device="cpu", non_blocking=True
         )
-        # 3. .copy_(..., non_blocking=True)
-        # temp = self.device_cache.buffer[:batch].to(device="cpu", non_blocking=True)
-        # print(f"{batch=}")
-        # self.host_cache.buffer[loc].copy_(
-        #     temp,
-        #     non_blocking=True
-        # )
 
     def get_routed_experts(
         self,
