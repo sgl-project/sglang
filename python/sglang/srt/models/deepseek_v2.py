@@ -3370,9 +3370,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2).contiguous()
-                )
+                if _use_npu_einsum_mm:
+                    self_attn.w_vc = bind_or_assign(
+                        self_attn.w_vc, w_vc.contiguous().transpose(1, 2).contiguous()
+                    )
+                else:
+                    self_attn.w_vc = bind_or_assign(
+                        self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                    )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
