@@ -576,7 +576,15 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # Placeholder for post_process
-        return embeddings, forward_batch
+        new_embeddings = []
+        for i, (modality, embedding, index) in enumerate(
+            zip(modalities, embeddings, indices)
+        ):
+            if embedding is None or index is None:
+                continue
+
+            new_embeddings.append(embedding)
+        return new_embeddings, forward_batch
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -632,7 +640,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             forward_batch=forward_batch,
             input_embeds=input_embeds,
             positions=positions,
-            input_deepstack_embeds=forward_batch.input_deepstack_embeds,
         )
 
         aux_hidden_states = None
