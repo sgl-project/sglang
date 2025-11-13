@@ -184,9 +184,9 @@ class DecodeKVCacheOffloadManager:
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, prefill_offloaded_len: int):
-        # FIXME: not sure which length to use here: kv_allocated_len or kv_committed_len
+        kv_committed_len = req.pop_committed_kv_cache()
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, prefill_offloaded_len : req.kv_allocated_len
+            req.req_pool_idx, prefill_offloaded_len:kv_committed_len
         ]
 
         # Free the incremental part of the request
