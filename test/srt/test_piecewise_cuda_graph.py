@@ -55,7 +55,7 @@ class TestPiecewiseCudaGraphBenchmark(CustomTestCase):
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestPiecewiseCudaGraphLlama31FP4Blackwell(CustomTestCase):
+class TestPiecewiseCudaGraphLlama31FP4(CustomTestCase):
     """MGSM test: piecewise CUDA graph with NVFP4 Llama3.1 8B on Blackwell."""
 
     @classmethod
