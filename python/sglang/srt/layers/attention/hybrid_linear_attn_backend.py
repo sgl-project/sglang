@@ -1,6 +1,7 @@
 from typing import Optional, Union
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -775,7 +776,6 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
     ):
         dynamic_conv_fn = kwargs["dynamic_conv"]
         head_v_dim = kwargs["head_v_dim"]
-        head_k_dim = kwargs["head_k_dim"]
         a = kwargs["a"]
         b = kwargs["b"]
         A_log = kwargs["A_log"]
@@ -801,12 +801,8 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
         )
         conv_states[cache_indices] = conv_state
 
-        batch_size = q.shape[0]
-        num_heads = q.shape[1] // head_k_dim
-        q = q.view(1, batch_size, num_heads, head_k_dim)
-        k = k.view(1, batch_size, num_heads, head_k_dim)
         v = v.squeeze(1)
-        v = v.view(1, batch_size, v.shape[1] // head_v_dim, head_v_dim)
+        v = v.view(1, v.shape[0], v.shape[1] // head_v_dim, head_v_dim)
 
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
@@ -838,14 +834,13 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
     ):
         dynamic_conv_fn = kwargs["dynamic_conv"]
         head_v_dim = kwargs["head_v_dim"]
-        head_k_dim = kwargs["head_k_dim"]
         a = kwargs["a"]
         b = kwargs["b"]
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
         hidden_states = kwargs["hidden_states"]
-        seq_len = kwargs["seq_len"]
+        seq_len = hidden_states.shape[0]
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
 
@@ -892,15 +887,12 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
                 layer_id=layer_id,
             )
 
-        actual_seq_len = q.shape[0]
-        num_heads = q.shape[1] // head_k_dim
-        num_value_heads = v.shape[1] // head_v_dim
-
-        q = q.view(1, actual_seq_len, num_heads, head_k_dim)
-        k = k.view(1, actual_seq_len, num_heads, head_k_dim)
-        v = v.view(1, actual_seq_len, num_value_heads, head_v_dim)
-
-        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+        v = v.view(1, v.shape[0], v.shape[1] // head_v_dim, head_v_dim)
+        g = -A_log.float().exp() * F.softplus(
+            a.float() + dt_bias
+        )  # needed for numerical stability
+        g = g.unsqueeze(0)
+        beta = F.sigmoid(b).unsqueeze(0)
 
         if is_target_verify:
             core_attn_out = fused_recurrent_gated_delta_rule_update(

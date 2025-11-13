@@ -1,9 +1,7 @@
-import math
-from typing import Any, Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Tuple
 
+import einops
 import torch
-import torch.nn.functional as F
-from einops import rearrange
 from torch import nn
 from transformers.utils import logging
 
@@ -13,14 +11,14 @@ from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGa
 from sglang.srt.layers.attention.jet_nemotron.dynamic_conv import (
     DynamicShortConvolution,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -44,106 +42,110 @@ class JetBlock(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        jet_block_config = JetBlockConfig(**config.efficient_attention_config["jet"])
-        self.mode = jet_block_config.mode
 
         self.config = config
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
-        self.hidden_size = config.hidden_size
-        self.expand_v = jet_block_config.expand_v
-        self.conv_size = jet_block_config.conv_size
-        self.head_dim = jet_block_config.head_dim
-        self.num_heads = jet_block_config.num_heads
-        self.key_dim = int(self.num_heads * self.head_dim)
-        self.value_dim = int(self.key_dim * self.expand_v)
-        self.head_k_dim = jet_block_config.head_dim
-        self.head_v_dim = int(jet_block_config.head_dim * self.expand_v)
-        self.layer_id = layer_id
-        self.autotune_interval = (
-            32 * 16 * 1024
-        )  # 32 batch size * 16 num head * 1024 sequence length
 
-        # Consistency check: Ensure expand_v produces integer values
-        if not math.isclose(self.key_dim * self.expand_v, self.value_dim, rel_tol=1e-5):
-            raise ValueError(
-                f"expand_v={self.expand_v} does not produce an integer value when multiplied by key_dim={self.key_dim}. "
-                f"Resulting value_dim would be {self.key_dim * self.expand_v}, which is invalid for nn.Linear."
-            )
-        if not math.isclose(
-            self.head_dim * self.expand_v, self.head_v_dim, rel_tol=1e-5
-        ):
-            raise ValueError(
-                f"expand_v={self.expand_v} does not produce an integer value when multiplied by head_dim={self.head_dim}. "
-                f"Resulting head_v_dim would be {self.head_dim * self.expand_v}, which is invalid for FusedRMSNormGated."
-            )
-        assert self.mode in [
-            "chunk",
-            "fused_recurrent",
-        ], f"Not supported mode `{jet_block_config.mode}`."
-
-        self.q_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
-        self.a_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
-
-        self.A_log = nn.Parameter(
-            torch.empty(self.num_heads // self.attn_tp_size, dtype=torch.float32)
+        jet_block_config = JetBlockConfig(
+            **self.config.efficient_attention_config[self.config.layer_types[layer_id]]
         )
-        self.dt_bias = nn.Parameter(torch.ones(self.num_heads // self.attn_tp_size))
+
+        hidden_size = self.config.hidden_size
+        num_heads = jet_block_config.num_heads
+        head_k_dim = jet_block_config.head_dim
+        total_k_dim = num_heads * head_k_dim
+        head_v_dim = int(head_k_dim * jet_block_config.expand_v)
+        total_v_dim = num_heads * head_v_dim
+        conv_size = jet_block_config.conv_size
+
+        self.qkvabz_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [
+                total_k_dim,
+                total_k_dim,
+                total_v_dim,
+                num_heads,
+                num_heads,
+                total_v_dim,
+            ],
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("qkvabz_proj", prefix),
+        )
+
+        self.o_proj = RowParallelLinear(total_v_dim, hidden_size, bias=False)
+
+        self.A_log = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(torch.ones(num_heads))
 
         self.dynamic_conv1d = DynamicShortConvolution(
             quant_config=quant_config,
             prefix=add_prefix("dynamic_conv1d", prefix),
-            hidden_size=self.value_dim,
-            kernel_size=self.conv_size,
-            generator_input_size=self.hidden_size,
+            hidden_size=total_v_dim,
+            kernel_size=conv_size,
+            generator_input_size=hidden_size,
             generator_reduction=jet_block_config.dconv_generator_reduction,
         )
 
-        self.g_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
         self.o_norm = RMSNormGated(
-            self.head_v_dim,
+            head_v_dim,
             eps=float(jet_block_config.norm_eps),
         )
-        self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+        # Attributes.
+        self.conv_size = conv_size
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.layer_id = layer_id
+        self.num_heads = num_heads
+        self.total_k_dim = total_k_dim
+        self.total_v_dim = total_v_dim
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ):
-        q_len, _ = (
-            hidden_states.shape
-        )  # q_len is some combo of batch size and sequence length
+    ) -> torch.Tensor:
+        qkvabz, _ = self.qkvabz_proj(hidden_states)
+        q, k, v, a, b, z = qkvabz.split(
+            [
+                self.total_k_dim,
+                self.total_k_dim,
+                self.total_v_dim,
+                self.num_heads,
+                self.num_heads,
+                self.total_v_dim,
+            ],
+            dim=-1,
+        )
 
-        q = F.silu(self.q_proj(hidden_states))
-        k = F.silu(self.k_proj(hidden_states))
-        v = self.v_proj(hidden_states)
+        q = nn.functional.silu(q)
+        q = einops.rearrange(q, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
+        k = nn.functional.silu(k)
+        k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
 
         kwargs = {
             "dynamic_conv": self.dynamic_conv1d,
             "head_v_dim": self.head_v_dim,
-            "head_k_dim": self.head_k_dim,
-            "a": self.a_proj(hidden_states),
-            "b": self.b_proj(hidden_states),
+            "a": a,
+            "b": b,
             "A_log": self.A_log,
             "dt_bias": self.dt_bias,
             "layer_id": self.layer_id,
             "hidden_states": hidden_states,
-            "seq_len": q_len,
         }
 
         o = forward_batch.attn_backend.forward(
             q=q, k=k, v=v, layer=None, forward_batch=forward_batch, **kwargs
         ).squeeze(0)
-        g = self.g_proj(hidden_states)
-        g = rearrange(g, "t (h d) -> t h d", h=self.num_heads)
-        o = self.o_norm(o, g)
-        o = rearrange(o, "t h d -> t (h d)")
-        o = self.o_proj(o)
+
+        z = einops.rearrange(z, "l (h d) -> l h d", h=self.num_heads)
+
+        o = self.o_norm(o, z)
+
+        o = einops.rearrange(o, "l h d -> l (h d)")
+
+        o, _ = self.o_proj(o)
 
         return o
 
@@ -191,75 +193,64 @@ class JetNemotronAttention(nn.Module):
         self,
         config: JetNemotronConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        sliding_window: int = -1,
-    ):
+    ) -> None:
         super().__init__()
+
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
-        self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
-        self.head_dim = self.hidden_size // self.num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.layer_id = layer_id
-        self.sliding_window = sliding_window
+
+        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
+
+        self.q_size = self.config.num_attention_heads * self.head_dim
+        self.kv_size = self.config.num_key_value_heads * self.head_dim
 
         self.qkv_proj = QKVParallelLinear(
-            config.hidden_size,
+            self.config.hidden_size,
             self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
             bias=True,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            prefix=add_prefix("qkv_proj", prefix),
         )
-
         self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            config.hidden_size,
+            self.config.num_attention_heads * self.head_dim,
+            self.config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-        )
-
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            sliding_window_size=sliding_window,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
-            head_size=self.head_dim,
+            self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            is_neox_style=True,
-            rope_scaling=config.rope_scaling,
-            dtype=torch.get_default_dtype(),
+            max_position=self.config.max_position_embeddings,
+            base=int(self.config.rope_theta),
+            rope_scaling=self.config.rope_scaling,
+        )
+
+        match self.config.layer_types[layer_id]:
+            case "attn":
+                sliding_window_size = -1
+
+            case "swa":
+                sliding_window_size = self.config.efficient_attention_config["swa"][
+                    "window_size"
+                ]
+
+            case _:
+                raise NotImplementedError
+
+        self.attn = RadixAttention(
+            self.config.num_attention_heads,
+            self.head_dim,
+            self.head_dim**-0.5,
+            num_kv_heads=self.config.num_key_value_heads,
+            layer_id=layer_id,
+            sliding_window_size=sliding_window_size,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -285,56 +276,63 @@ class JetNemotronDecoderLayer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.hidden_size = config.hidden_size
 
-        if config.layer_types[layer_id] == "attn":
-            self.self_attn = JetNemotronAttention(
-                config, layer_id, quant_config, prefix
-            )
-        elif config.layer_types[layer_id] == "swa":
-            assert (
-                config.efficient_attention_config is not None
-            ), "Efficient attention config must be provided in JetNemotronConfig."
-            assert (
-                "swa" in config.efficient_attention_config
-            ), "Sliding Window Attention is enabled but no `swa` configuration found in `efficient_attention_config`."
-            self.self_attn = JetNemotronAttention(
-                config,
-                layer_id,
-                quant_config,
-                prefix,
-                sliding_window=config.efficient_attention_config["swa"]["window_size"],
-            )
-        else:
-            self.self_attn = JetBlock(config, layer_id, quant_config, prefix)
+        match config.layer_types[layer_id]:
+            case "attn" | "swa":
+                self.self_attn = JetNemotronAttention(
+                    config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("self_attn", prefix),
+                    layer_id=layer_id,
+                )
+
+            case "jet":
+                self.self_attn = JetBlock(
+                    config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("self_attn", prefix),
+                    layer_id=layer_id,
+                )
+
+            case _:
+                raise NotImplementedError
 
         self.mlp = JetNemotronMLP(config, quant_config, prefix)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.layer_id = layer_id
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        **kwargs: Any,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Self Attention
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
 
         hidden_states = residual + hidden_states
 
+        # Fully Connected
         residual = hidden_states
+
         hidden_states = self.post_attention_layernorm(hidden_states)
+
         hidden_states = self.mlp(hidden_states)
+
         hidden_states = residual + hidden_states
-        return hidden_states
+
+        return hidden_states, None
 
 
 class JetNemotronModel(nn.Module):
@@ -378,7 +376,9 @@ class JetNemotronModel(nn.Module):
         for idx, decoder_layer in enumerate(self.layers):
             if idx in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states)
-            hidden_states = decoder_layer(positions, hidden_states, forward_batch)
+            hidden_states, _ = decoder_layer(
+                positions, hidden_states, forward_batch, None
+            )
 
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
@@ -390,14 +390,16 @@ class JetNemotronForCausalLM(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-    ):
+    ) -> None:
         super().__init__()
+
         self.config = config
         self.quant_config = quant_config
+
         self.model = JetNemotronModel(config, quant_config, prefix)
-        self.vocab_size = config.vocab_size
+
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -407,7 +409,9 @@ class JetNemotronForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+
         self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(PoolingType.LAST, normalize=True)
         self.capture_aux_hidden_states = False
 
     @torch.no_grad()
@@ -417,47 +421,63 @@ class JetNemotronForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
+        get_embedding: bool = False,
+    ) -> EmbeddingPoolerOutput | LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-        )
 
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
-    ) -> Set[str]:
+        if not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return self.pooler(hidden_states, forward_batch)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("qkvabz_proj", "q_proj", 0),
+            ("qkvabz_proj", "k_proj", 1),
+            ("qkvabz_proj", "v_proj", 2),
+            ("qkvabz_proj", "a_proj", 3),
+            ("qkvabz_proj", "b_proj", 4),
+            ("qkvabz_proj", "g_proj", 5),
         ]
 
         params_dict = dict(self.named_parameters())
         for weight_name, loaded_weight in weights:
-            if weight_name.startswith("model.layers."):
-                layer_id = int(weight_name.split(".")[2])
-                layer_type = self.config.layer_types[layer_id]
-            else:
-                layer_type = None
-            for param_name, shard_weight_name_part, shard_id in stacked_params_mapping:
-                # jet attention q_proj, k_proj, v_proj shouldn't be merged
-                if shard_weight_name_part not in weight_name or (
-                    layer_type == "jet" and "self_attn" in weight_name
-                ):
+            # Handle stacked parameters first.
+            for (
+                param_name_part,
+                shard_weight_name_part,
+                shard_id,
+            ) in stacked_params_mapping:
+                if shard_weight_name_part not in weight_name.split("."):
                     continue
-                param_name = weight_name.replace(shard_weight_name_part, param_name)
+
+                param_name = weight_name.replace(
+                    shard_weight_name_part, param_name_part
+                )
+
+                if param_name not in params_dict:
+                    # Fall back to direct match if no such stacked parameter.
+                    continue
+
                 param = params_dict[param_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
+
             else:
-                param = params_dict[weight_name]
+                param_name = weight_name
+
+                param = params_dict[param_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
