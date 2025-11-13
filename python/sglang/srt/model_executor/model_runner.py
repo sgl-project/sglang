@@ -1316,7 +1316,6 @@ class ModelRunner:
                         * math.ceil(self.model_config.head_dim / 2) # two neightbour dims are packed into one byte
                         * num_layers
                         * 2 # key and value
-                        * 2 # scale and zero
                         * 1 # two int4 pack to one byte
                     )
                 else:
@@ -1325,7 +1324,6 @@ class ModelRunner:
                         * self.model_config.head_dim
                         * num_layers
                         * 2 # key and value
-                        * 2 # scale and zero
                         * 1 # int8 is one byte
                     )
                 # quantize on head dimension, so need add scale buffer
@@ -1334,9 +1332,8 @@ class ModelRunner:
                         self.model_config.get_num_kv_heads(get_attention_tp_size())
                         * num_layers
                         * 2 # key and value
-                        * 1 # int8 is one byte
+                        * 2 # scale and zero
                     )
-                    * num_layers
                     * torch._utils._element_size(torch.float32)
                 )
             else:
