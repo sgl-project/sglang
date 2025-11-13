@@ -653,6 +653,11 @@ def wait_cmo_stream():
     cur_stream.wait_stream(get_cmo_stream())
 
 
+@lru_cache(maxsize=1)
+def get_device_module():
+    return torch.get_device_module()
+
+
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)
