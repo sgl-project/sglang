@@ -28,7 +28,6 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     bool enable_pdl,
-    int64_t cuda_stream,
     const std::optional<at::Tensor>& v,
     const std::optional<at::Tensor>& k_buffer,
     const std::optional<at::Tensor>& v_buffer,
@@ -88,7 +87,7 @@ void apply_rope_pos_ids_cos_sin_cache(
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
     // to avoid changing original code path; but this branch is feature-complete and should switch to this later

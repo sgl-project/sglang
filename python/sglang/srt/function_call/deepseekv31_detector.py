@@ -11,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -209,14 +208,4 @@ class DeepSeekV31Detector(BaseFormatDetector):
             begin="<｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>",
             end="<｜tool▁call▁end｜>",
             trigger="<｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>",
-        )
-
-    def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            tool_call_separator="",
-            call_rule_fmt='"<｜tool▁call▁begin｜>{name}<｜tool▁sep｜>{arguments_rule}<｜tool▁call▁end｜>"',
-            function_format="json",
         )

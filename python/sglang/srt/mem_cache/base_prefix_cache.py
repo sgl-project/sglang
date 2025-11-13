@@ -1,12 +1,33 @@
+from __future__ import annotations
+
+import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Tuple,
+    runtime_checkable,
+)
 
 import torch
 
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.metrics.collector import RadixCacheMetricsCollector
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-else:
-    Req = Any  # Placeholder for Req type when not type checking
+
+
+@runtime_checkable
+class PrefixCacheTrait(Protocol):
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    page_size: int
+    disable: bool
 
 
 class MatchResult(NamedTuple):
@@ -28,8 +49,24 @@ class MatchResult(NamedTuple):
     host_hit_length: int = 0
 
 
-class BasePrefixCache(ABC):
+class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
+
+    metrics_collector: Optional[RadixCacheMetricsCollector] = (
+        None  # metrics collector for the cache
+    )
+
+    def init_metrics_collector(self):
+        self.metrics_collector = RadixCacheMetricsCollector(
+            labels={"cache_type": self.__class__.__name__}
+        )
+
+    def update_eviction_metrics(self, num_evicted: int, start_time: float):
+        if self.metrics_collector is not None and num_evicted > 0:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     @abstractmethod
     def reset(self):

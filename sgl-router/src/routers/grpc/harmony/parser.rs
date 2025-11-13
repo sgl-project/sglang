@@ -103,10 +103,10 @@ impl HarmonyParserAdapter {
     /// # Returns
     ///
     /// Tuple of (analysis, commentary, final_text)
-    fn parse_messages(
+    pub fn parse_messages(
         messages: &[openai_harmony::chat::Message],
     ) -> (Option<String>, Option<Vec<ToolCall>>, String) {
-        let mut analysis = None;
+        let mut analysis: Option<String> = None;
         let mut commentary: Option<Vec<ToolCall>> = None;
         let mut final_text = String::new();
 
@@ -119,6 +119,60 @@ impl HarmonyParserAdapter {
             let channel = msg.channel.as_deref().unwrap_or("");
             let recipient = msg.recipient.as_deref();
 
+            // IMPORTANT: Check recipient FIRST before channel
+            // The model sometimes generates tool calls with channel="analysis" + recipient="functions.*"
+            // instead of channel="commentary" + recipient="functions.*"
+            // We should trust the recipient field to determine if this is a tool call
+            if let Some(recipient_str) = recipient {
+                if recipient_str.starts_with("functions.") {
+                    // This is a tool call, regardless of channel
+                    let function_name = recipient_str.strip_prefix("functions.").unwrap();
+
+                    // Process each content item separately
+                    for content in &msg.content {
+                        if let openai_harmony::chat::Content::Text(tc) = content {
+                            let call_id = format!("call_{}", Uuid::new_v4());
+                            let tool_call = ToolCall {
+                                id: call_id,
+                                tool_type: "function".to_string(),
+                                function: FunctionCallResponse {
+                                    name: function_name.to_string(),
+                                    arguments: Some(tc.text.clone()),
+                                },
+                            };
+
+                            match commentary.as_mut() {
+                                Some(calls) => calls.push(tool_call),
+                                None => commentary = Some(vec![tool_call]),
+                            }
+                        }
+                    }
+                    // Skip further channel processing for this message
+                    continue;
+                } else if recipient_str.starts_with("python")
+                    || recipient_str.starts_with("browser")
+                    || recipient_str.starts_with("container")
+                {
+                    // Built-in tools → treat as reasoning
+                    // For Chat API, we add to analysis content
+                    let text = Self::extract_text_from_content(&msg.content);
+
+                    if !text.is_empty() {
+                        // Append to analysis (built-in tools are reasoning)
+                        match analysis.as_mut() {
+                            Some(existing) => {
+                                existing.push('\n');
+                                existing.push_str(&text);
+                            }
+                            None => analysis = Some(text),
+                        }
+                    }
+                    // Skip further channel processing
+                    continue;
+                }
+            }
+
+            // Now process by channel (only if not already handled by recipient)
             match channel {
                 "analysis" => {
                     // Process each content item
@@ -130,51 +184,25 @@ impl HarmonyParserAdapter {
                     }
                 }
                 "commentary" => {
-                    // Handle different recipient types
-                    if let Some(recipient_str) = recipient {
-                        if recipient_str.starts_with("functions.") {
-                            let function_name = recipient_str.strip_prefix("functions.").unwrap();
+                    // If we reach here, recipient was not "functions.*" or built-in tools
+                    // Commentary channel should always have a recipient
+                    // This is likely a model bug - log warning and treat as reasoning
+                    tracing::warn!(
+                        channel = "commentary",
+                        recipient = ?recipient,
+                        "Commentary message without valid recipient, treating as reasoning"
+                    );
 
-                            // Process each content item separately
-                            for content in &msg.content {
-                                if let openai_harmony::chat::Content::Text(tc) = content {
-                                    let call_id = format!("call_{}", Uuid::new_v4());
-                                    let tool_call = ToolCall {
-                                        id: call_id,
-                                        tool_type: "function".to_string(),
-                                        function: FunctionCallResponse {
-                                            name: function_name.to_string(),
-                                            arguments: Some(tc.text.clone()),
-                                        },
-                                    };
+                    let text = Self::extract_text_from_content(&msg.content);
 
-                                    match commentary.as_mut() {
-                                        Some(calls) => calls.push(tool_call),
-                                        None => commentary = Some(vec![tool_call]),
-                                    }
-                                }
+                    if !text.is_empty() {
+                        match analysis.as_mut() {
+                            Some(existing) => {
+                                existing.push('\n');
+                                existing.push_str(&text);
                             }
-                        } else if recipient_str.starts_with("python")
-                            || recipient_str.starts_with("browser")
-                            || recipient_str.starts_with("container")
-                        {
-                            // Built-in tools → treat as reasoning
-                            // For Chat API, we add to analysis content
-                            let text = Self::extract_text_from_content(&msg.content);
-
-                            if !text.is_empty() {
-                                // Append to analysis (built-in tools are reasoning)
-                                match analysis.as_mut() {
-                                    Some(existing) => {
-                                        existing.push('\n');
-                                        existing.push_str(&text);
-                                    }
-                                    None => analysis = Some(text),
-                                }
-                            }
+                            None => analysis = Some(text),
                         }
-                        // Unknown recipient would raise ValueError
-                        // For now, we silently ignore (can add logging later)
                     }
                 }
                 "final" => {
@@ -215,16 +243,9 @@ impl HarmonyParserAdapter {
     ) -> Result<HarmonyChannelOutput, String> {
         // Feed all tokens to the parser
         for &token_id in output_ids {
-            self.parser.process(token_id).map_err(|e| {
-                // Log the full output_ids context on error
-                tracing::error!(
-                    token_id = token_id,
-                    output_ids = ?output_ids,
-                    error = %e,
-                    "Harmony parser failed to process token"
-                );
-                format!("Failed to process token {}: {}", token_id, e)
-            })?;
+            self.parser
+                .process(token_id)
+                .map_err(|e| format!("Failed to process token {}: {}", token_id, e))?;
         }
 
         // Extract all completed messages from the parser
@@ -240,7 +261,7 @@ impl HarmonyParserAdapter {
         let final_finish_reason = if commentary.is_some() {
             "tool_calls".to_string()
         } else {
-            finish_reason
+            finish_reason.clone()
         };
 
         Ok(HarmonyChannelOutput {
@@ -258,6 +279,51 @@ impl HarmonyParserAdapter {
     /// Used for validation checks.
     pub fn get_messages(&self) -> Vec<openai_harmony::chat::Message> {
         self.parser.messages().to_vec()
+    }
+
+    /// Extract incomplete commentary content from parser state
+    ///
+    /// When the stream ends, there may be incomplete commentary content in the parser
+    /// that hasn't been finalized into a completed message. This method extracts
+    /// such content and converts it to tool calls.
+    ///
+    /// # Returns
+    ///
+    /// Optional vector of ToolCall if incomplete commentary is found
+    pub fn extract_incomplete_commentary(&self) -> Option<Vec<ToolCall>> {
+        // Check if current channel is commentary
+        let current_channel = self.parser.current_channel();
+        if current_channel.as_deref() != Some("commentary") {
+            return None;
+        }
+
+        // Get current recipient (should be "functions.{name}")
+        let recipient = self.parser.current_recipient()?;
+        if !recipient.starts_with("functions.") {
+            return None;
+        }
+
+        // Get current incomplete content
+        let content = self.parser.current_content().ok()?;
+        if content.is_empty() {
+            return None;
+        }
+
+        // Extract function name from recipient
+        let function_name = recipient.strip_prefix("functions.").unwrap();
+
+        // Create tool call from incomplete content
+        let call_id = format!("call_{}", Uuid::new_v4());
+        let tool_call = ToolCall {
+            id: call_id,
+            tool_type: "function".to_string(),
+            function: FunctionCallResponse {
+                name: function_name.to_string(),
+                arguments: Some(content),
+            },
+        };
+
+        Some(vec![tool_call])
     }
 
     /// Parse streaming chunk

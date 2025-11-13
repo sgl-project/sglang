@@ -31,6 +31,7 @@ Its core features include:
    basic_usage/gpt_oss.md
    basic_usage/llama4.md
    basic_usage/qwen3.md
+   basic_usage/qwen3_vl.md
 
 .. toctree::
    :maxdepth: 1
@@ -96,6 +97,7 @@ Its core features include:
    references/faq.md
    references/environment_variables.md
    references/production_metrics.md
+   references/production_request_trace.md
    references/multi_node_deployment/multi_node_index.rst
    references/custom_chat_template.md
    references/frontend/frontend_index.rst

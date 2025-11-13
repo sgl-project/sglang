@@ -202,8 +202,6 @@ def popen_launch_workers_and_router(
             "--grpc-mode",  # Enable gRPC for this worker
             "--mem-fraction-static",
             "0.8",
-            "--attention-backend",
-            "fa3",
         ]
 
         # Add TP size

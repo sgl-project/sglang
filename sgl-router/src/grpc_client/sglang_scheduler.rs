@@ -240,7 +240,7 @@ impl SglangSchedulerClient {
     }
 
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
-    pub fn build_generate_request(
+    pub fn build_generate_request_from_chat(
         &self,
         request_id: String,
         body: &ChatCompletionRequest,
@@ -250,7 +250,8 @@ impl SglangSchedulerClient {
         tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling params
-        let sampling_params = self.build_grpc_sampling_params(body, tool_call_constraint)?;
+        let sampling_params =
+            self.build_grpc_sampling_params_from_chat(body, tool_call_constraint)?;
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -303,6 +304,9 @@ impl SglangSchedulerClient {
     }
 
     /// Build a GenerateRequest from ResponsesRequest (OpenAI Responses API)
+    ///
+    /// NOTE: This is used by the Harmony router only. The Regular router uses
+    /// responses_to_chat() conversion and goes through the chat pipeline.
     pub fn build_generate_request_from_responses(
         &self,
         request_id: String,
@@ -310,9 +314,11 @@ impl SglangSchedulerClient {
         processed_text: String,
         token_ids: Vec<u32>,
         harmony_stop_ids: Option<Vec<u32>>,
+        constraint: Option<(String, String)>,
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling params from ResponsesRequest
-        let mut sampling_params = self.build_grpc_sampling_params_from_responses(body)?;
+        let mut sampling_params =
+            self.build_grpc_sampling_params_from_responses(body, constraint)?;
 
         // Inject Harmony stop token IDs if provided
         if let Some(stop_ids) = harmony_stop_ids {
@@ -338,8 +344,8 @@ impl SglangSchedulerClient {
         Ok(grpc_request)
     }
 
-    /// Build gRPC SamplingParams from OpenAI request
-    fn build_grpc_sampling_params(
+    /// Build gRPC SamplingParams from ChatCompletionRequest
+    fn build_grpc_sampling_params_from_chat(
         &self,
         request: &ChatCompletionRequest,
         tool_call_constraint: Option<(String, String)>,
@@ -375,7 +381,7 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1) as i32,
-            constraint: self.build_constraint(request, tool_call_constraint)?,
+            constraint: self.build_constraint_for_chat(request, tool_call_constraint)?,
             ..Default::default()
         })
     }
@@ -390,17 +396,30 @@ impl SglangSchedulerClient {
     }
 
     /// Build constraint for structured generation
-    fn build_constraint(
+    fn build_constraint_for_chat(
         &self,
         request: &ChatCompletionRequest,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
-            let schema_str = serde_json::to_string(&json_schema.schema)
-                .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+        // Handle response_format constraints
+        match &request.response_format {
+            Some(ResponseFormat::JsonObject) => {
+                // json_object mode - constrain to valid JSON object
+                let schema = serde_json::json!({"type": "object"});
+                let schema_str = serde_json::to_string(&schema)
+                    .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+            }
+            Some(ResponseFormat::JsonSchema { json_schema }) => {
+                let schema_str = serde_json::to_string(&json_schema.schema)
+                    .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+            }
+            Some(ResponseFormat::Text) | None => {
+                // No constraint for text format
+            }
         }
 
         if let Some(ebnf) = &request.ebnf {
@@ -413,7 +432,7 @@ impl SglangSchedulerClient {
             constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
         }
 
-        // Handle tool call constraint
+        // Handle tool call constraint from preparation stage
         if let Some((constraint_type, constraint_value)) = tool_call_constraint {
             if !constraints.is_empty() {
                 return Err("Constrained decoding is not compatible with tool calls.".to_string());
@@ -441,9 +460,10 @@ impl SglangSchedulerClient {
     fn build_grpc_sampling_params_from_responses(
         &self,
         request: &ResponsesRequest,
+        constraint: Option<(String, String)>,
     ) -> Result<proto::SamplingParams, String> {
-        // ResponsesRequest doesn't have stop sequences in the same way
-        // Tools are handled externally by MCP loop, not via constraints
+        // Used by Harmony models only. Regular models use Chat API path.
+        // Constraints come from Harmony preparation stage (structural_tag) or tool handling.
 
         let max_new_tokens = request.max_output_tokens.map(|v| v as i32);
 
@@ -462,10 +482,37 @@ impl SglangSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: false,
             no_stop_trim: false,
-            n: 1,             // Responses API doesn't support n>1
-            constraint: None, // No constraints - tools handled by MCP
+            n: 1, // Responses API doesn't support n>1
+            constraint: self.build_constraint_for_responses(constraint)?,
             ..Default::default()
         })
+    }
+
+    /// Build constraint for Responses API
+    ///
+    /// Handles constraints from Harmony preparation stage (structural_tag for Harmony models,
+    /// structured output via text field, or tool call constraints).
+    ///
+    /// Note: Regular gRPC models use Chat API path with response_format, not this function.
+    fn build_constraint_for_responses(
+        &self,
+        constraint: Option<(String, String)>,
+    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
+        if let Some((constraint_type, constraint_value)) = constraint {
+            let parsed_constraint = match constraint_type.as_str() {
+                "structural_tag" => {
+                    // Harmony models: structural tag from preparation stage
+                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
+                }
+                "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
+                "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
+                "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
+                _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
+            };
+            Ok(Some(parsed_constraint))
+        } else {
+            Ok(None)
+        }
     }
 
     fn build_single_constraint_from_plain(

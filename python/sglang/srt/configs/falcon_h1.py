@@ -19,7 +19,6 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.layers.dp_attention import get_tensor_model_parallel_world_size
 
 logger = logging.get_logger(__name__)
 
@@ -297,8 +296,10 @@ class FalconH1Config(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self):
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         shape = Mamba2StateShape.create(
-            tp_world_size=get_tensor_model_parallel_world_size(),
+            tp_world_size=get_attention_tp_size(),
             intermediate_size=self.mamba_intermediate,
             n_groups=self.mamba_n_groups,
             num_heads=self.mamba_n_heads,

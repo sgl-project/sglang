@@ -2,6 +2,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -16,7 +17,7 @@ from sglang.test.test_utils import (
 class TestCppRadixCache(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_EXPERIMENTAL_CPP_RADIX_TREE"] = "1"
+        envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.set(True)
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

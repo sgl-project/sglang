@@ -35,7 +35,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -100,7 +100,9 @@ class BaseTpWorker(ABC):
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path, recv_req.load_format
+            recv_req.model_path,
+            recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
 
@@ -309,6 +311,7 @@ class TpModelWorker(BaseTpWorker):
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 
     @property
@@ -381,6 +384,7 @@ class TpModelWorker(BaseTpWorker):
 
             if (
                 self.enable_overlap
+                and not self.enable_spec
                 and model_worker_batch.sampling_info.grammars is not None
             ):
 
@@ -425,3 +429,26 @@ class TpModelWorker(BaseTpWorker):
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+
+    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        if batch.split_index == 0:
+            model_worker_batch = batch.get_model_worker_batch()
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            batch.split_forward_batch = forward_batch
+            batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
+        else:
+            model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
+
+        logits_output, can_run_cuda_graph = self.model_runner.forward(
+            batch.split_forward_batch, split_forward_count=batch.split_forward_count
+        )
+        if logits_output:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        else:
+            next_token_ids = None
+        batch_result = GenerationBatchResult(
+            logits_output=logits_output,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+        batch_result.next_token_ids = next_token_ids
+        return batch_result

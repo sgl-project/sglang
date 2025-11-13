@@ -16,7 +16,7 @@ use tracing::debug;
 
 use super::types::HarmonyBuildOutput;
 use crate::protocols::{
-    chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{ContentPart, Tool},
     responses::{
         ReasoningEffort as ResponsesReasoningEffort, ResponseContentPart, ResponseInput,
@@ -277,6 +277,8 @@ impl HarmonyBuilder {
                 "high" => ReasoningEffort::High,
                 "medium" => ReasoningEffort::Medium,
                 "low" => ReasoningEffort::Low,
+                // Harmony does not support minimal reasoning effort
+                "minimal" => ReasoningEffort::Low,
                 _ => ReasoningEffort::Medium,
             });
 
@@ -302,6 +304,7 @@ impl HarmonyBuilder {
                 ResponsesReasoningEffort::High => ReasoningEffort::High,
                 ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
                 ResponsesReasoningEffort::Low => ReasoningEffort::Low,
+                ResponsesReasoningEffort::Minimal => ReasoningEffort::Low,
             });
 
         self.build_system_message(reasoning_effort, with_custom_tools)
@@ -600,11 +603,11 @@ impl HarmonyBuilder {
                     .iter()
                     .rev()
                     .find_map(|item| match item {
-                        ResponseInputOutputItem::FunctionToolCall { id, name, .. }
-                            if id == call_id =>
-                        {
-                            Some(name.clone())
-                        }
+                        ResponseInputOutputItem::FunctionToolCall {
+                            call_id: item_call_id,
+                            name,
+                            ..
+                        } if item_call_id == call_id => Some(name.clone()),
                         _ => None,
                     })
                     .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;
@@ -701,7 +704,7 @@ impl HarmonyBuilder {
                         },
                         recipient: None,
                         content: vec![Content::Text(TextContent {
-                            text: content.clone(),
+                            text: content.to_simple_string(),
                         })],
                         channel: None,
                         content_type: None,
@@ -712,8 +715,8 @@ impl HarmonyBuilder {
                 ChatMessage::User { content, name } => {
                     // Extract text from user content
                     let text = match content {
-                        UserMessageContent::Text(text) => text.clone(),
-                        UserMessageContent::Parts(parts) => {
+                        MessageContent::Text(text) => text.clone(),
+                        MessageContent::Parts(parts) => {
                             // For multimodal content, extract text parts
                             parts
                                 .iter()
@@ -769,7 +772,11 @@ impl HarmonyBuilder {
                     } else {
                         // Regular assistant message with content
                         // Combine content with reasoning if present
-                        let mut text = content.clone().unwrap_or_default();
+                        let mut text = content
+                            .as_ref()
+                            .map(|c| c.to_simple_string())
+                            .unwrap_or_default();
+
                         if let Some(reasoning) = reasoning_content {
                             if !text.is_empty() {
                                 text.push('\n');
@@ -810,7 +817,7 @@ impl HarmonyBuilder {
                         },
                         recipient: Some("assistant".to_string()),
                         content: vec![Content::Text(TextContent {
-                            text: content.clone(),
+                            text: content.to_simple_string(),
                         })],
                         channel: None,
                         content_type: None,

@@ -1,7 +1,7 @@
 import json
 from abc import ABC, abstractmethod
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import dill
 import orjson
@@ -126,3 +126,69 @@ class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     THINKING_START_TOKEN_ID: int = 128798
     THINKING_END_TOKEN_ID: int = 128799
     NEW_LINE_TOKEN_ID: int = 201
+
+
+# Adapted from DeepSeek's implementation: https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/ngram_norepeat.py
+class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
+    """Block n-gram repetitions within a sliding window for DeepSeek-OCR outputs."""
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        custom_param_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> torch.Tensor:
+        if not custom_param_list:
+            return logits
+
+        for batch_idx, params in enumerate(custom_param_list):
+            if not params:
+                continue
+
+            req = params.get("__req__")
+            if req is None:
+                continue
+
+            try:
+                ngram_size = int(params.get("ngram_size") or 0)
+                window_size = int(params.get("window_size") or 0)
+            except (TypeError, ValueError):
+                continue
+
+            if ngram_size <= 0 or window_size <= 0:
+                continue
+
+            sequence: List[int] = req.origin_input_ids + req.output_ids
+            if len(sequence) < ngram_size:
+                continue
+
+            search_start = max(0, len(sequence) - window_size)
+            search_end = len(sequence) - ngram_size + 1
+            if search_end <= search_start:
+                continue
+
+            if ngram_size > 1:
+                current_prefix = tuple(sequence[-(ngram_size - 1) :])
+            else:
+                current_prefix = tuple()
+
+            banned_tokens: Set[int] = set()
+            for idx in range(search_start, search_end):
+                ngram = sequence[idx : idx + ngram_size]
+                if ngram_size == 1 or tuple(ngram[:-1]) == current_prefix:
+                    banned_tokens.add(ngram[-1])
+
+            whitelist_ids = params.get("whitelist_token_ids") or []
+            try:
+                whitelist = {int(token_id) for token_id in whitelist_ids}
+            except (TypeError, ValueError):
+                whitelist = set()
+
+            banned_tokens.difference_update(whitelist)
+
+            if not banned_tokens:
+                continue
+
+            indices = list(banned_tokens)
+            logits[batch_idx, indices] = -float("inf")
+
+        return logits

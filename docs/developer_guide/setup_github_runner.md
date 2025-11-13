@@ -23,7 +23,7 @@ Run these commands inside the container.
 
 ```
 apt update && apt install -y curl python3-pip git
-pip install upgrade pip
+pip install --upgrade pip
 export RUNNER_ALLOW_RUNASROOT=1
 ```
 
