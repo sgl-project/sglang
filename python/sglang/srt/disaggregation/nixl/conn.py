@@ -83,8 +83,8 @@ class KVArgsRegisterInfo:
             dst_port=int(msg[2].decode("ascii")),
             agent_name=msg[3].decode("ascii"),
             agent_metadata=msg[4],
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
             gpu_id=int(msg[7].decode("ascii")),
             decode_tp_size=int(msg[8].decode("ascii")),
             decode_tp_rank=int(msg[9].decode("ascii")),
@@ -647,8 +647,6 @@ class NixlKVManager(CommonKVManager):
         return self.transfer_statuses[room].is_done()
 
     def _start_bootstrap_thread(self):
-        self._bind_server_socket()
-
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
@@ -687,7 +685,6 @@ class NixlKVManager(CommonKVManager):
 
 
 class NixlKVSender(CommonKVSender):
-
     def __init__(
         self,
         mgr: NixlKVManager,

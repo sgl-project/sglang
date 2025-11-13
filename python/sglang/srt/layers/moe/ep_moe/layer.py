@@ -11,7 +11,6 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -113,8 +112,16 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
-        if self.deepep_mode.enable_low_latency() and not _is_npu:
+        if (
+            self.deepep_mode.enable_low_latency()
+            and not _is_npu
+            and not (
+                get_moe_runner_backend().is_flashinfer_cutedsl()
+                and self.quant_config.get_name() == "modelopt_fp4"
+            )
+        ):
             # NPU supports low_latency deepep without deepgemm
+            # FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
@@ -505,7 +512,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         except:
             pass
 
-    if should_use_flashinfer_trtllm_moe() and quant_config is not None:
+    if get_moe_runner_backend().is_flashinfer_trtllm() and quant_config is not None:
         # FIXME: FlashInferFusedMoE only supports fp8 quant now
         return FlashInferFusedMoE
     if get_moe_runner_backend().is_flashinfer_cutlass():
