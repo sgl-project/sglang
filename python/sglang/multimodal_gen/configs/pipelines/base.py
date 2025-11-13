@@ -582,20 +582,6 @@ class SlidingTileAttnConfig(PipelineConfig):
     use_overlap_optimization: bool = True
 
 
-# a unified entry for pipeline creation
-def SGLangPipelineConfig(path: str, **kwargs) -> "PipelineConfig":
-    """A unified entry for pipeline creation."""
-    from sglang.multimodal_gen.registry import get_model_info
-
-    model_info = get_model_info(path)
-    if model_info is None:
-        raise ValueError(f"Model info not found for path: {path}")
-
-    pipeline_config_cls = model_info.pipeline_config_cls()
-    pipeline_config = pipeline_config_cls.from_kwargs(kwargs, config_cli_prefix=path)
-    return pipeline_config
-
-
 def parse_int_list(value: str) -> list[int]:
     """Parse a comma-separated string of integers into a list."""
     if not value:
