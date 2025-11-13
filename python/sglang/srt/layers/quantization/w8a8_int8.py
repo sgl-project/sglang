@@ -8,7 +8,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig, get_moe_a2a_backend
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
@@ -1009,27 +1009,6 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         origin_weight.untyped_storage().resize_(0)
         return new_weight
 
-    def permute_weight(self, w: torch.Tensor, tile_n: int):
-        *dims, n = w.shape
-        order = list(range(len(dims))) + [-2, -3, -1]
-        return (
-            w.reshape(*dims, 2, n // tile_n, tile_n // 2).permute(order).reshape(*dims, n).contiguous()
-        )
-
-    def reshape_w13_weight(self, weight: torch.Tensor, dim: int):
-        # Achieving greater computing power through reshape on Ascend.
-        original_shape = weight.shape
-        if dim < 0:
-            dim += len(original_shape)
-
-        weight = weight.view(
-            *original_shape[:dim], 2, -1, 64, *original_shape[dim + 1:]
-        )
-        weight = weight.transpose(dim, dim + 1).contiguous()
-        weight = weight.view(*original_shape[:dim], -1, *original_shape[dim + 1:])
-
-        return weight.contiguous()
-
     def process_weight_with_fused_deepep(self, layer: torch.nn.Module) -> None:
         w13 = self.release_weight_cache(layer.w13_weight)
         torch_npu.npu_format_cast_(w13, 2)
@@ -1059,7 +1038,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
 
-    def process_weight_common(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_data = self.release_weight_cache(layer.w13_weight.data)
         layer.w13_weight = Parameter(weight_data, requires_grad=False)
 
@@ -1086,12 +1065,6 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.data = torch_npu.npu_format_cast(
                 layer.w2_weight.data, 29
             )
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if get_bool_env_var("ENABLE_ASCEND_FUSED_DEEPEP"):
-            self.process_weight_with_fused_deepep(layer)
-        else:
-            self.process_weight_common(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
