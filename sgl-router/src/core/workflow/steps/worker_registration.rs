@@ -354,7 +354,9 @@ impl StepExecutor for DiscoverMetadataStep {
                         if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
                             labels.insert("model_path".to_string(), model_path);
                         }
-                        if let Some(served_model_name) = server_info.served_model_name.filter(|s| !s.is_empty()) {
+                        if let Some(served_model_name) =
+                            server_info.served_model_name.filter(|s| !s.is_empty())
+                        {
                             labels.insert("served_model_name".to_string(), served_model_name);
                         }
 
