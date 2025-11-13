@@ -40,7 +40,7 @@ class TinyModel(nn.Module):
         )
 
     def forward(self, x):
-        return self.mlp(x)
+        return self.outer(x)
 
 
 class DummyModelRunner:
@@ -67,16 +67,13 @@ class TestModelRunnerHooks(CustomTestCase):
         runner = DummyModelRunner()
         hook_specs = [
             {
-                # TinyModel.named_modules() includes: "", "mlp", "mlp.0", "mlp.1", "mlp.2"
                 "target_modules": ["outer.0", "outer.1"],
-                # IMPORTANT: this path assumes the file lives at
-                # sglang/test/test_model_runner_hooks.py
-                "hook_factory": ("sglang.test.srt.test_model_hooks:dummy_hook_factory"),
+                "hook_factory": ("test_model_hooks:dummy_hook_factory"),
                 "config": {"tag": "forward-ok"},
             },
             {
-                "target_modules": ["outer.inner.*"],
-                "hook_factory": ("sglang.test.set.test_model_hooks:dummy_hook_factory"),
+                "target_modules": ["inner.*"],
+                "hook_factory": ("test_model_hooks:dummy_hook_factory"),
                 "config": {"tag": "forward-ok"},
             },
         ]
@@ -103,7 +100,7 @@ class TestModelRunnerHooks(CustomTestCase):
             {
                 "name": "no_match",
                 "target_modules": ["does_not_exist.*"],
-                "hook_factory": ("sglang.test.test_model_hooks:dummy_hook_factory"),
+                "hook_factory": ("test_model_hooks:dummy_hook_factory"),
                 "config": {"tag": "unused"},
             }
         ]
