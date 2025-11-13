@@ -556,7 +556,7 @@ def test_flash_mla_fp8(
     blocked_v = blocked_k[..., :dv]
 
     tile_scheduler_metadata, num_splits = get_mla_metadata(
-        cache_seqlens, s_q * h_q // h_kv, h_kv
+        cache_seqlens, s_q * h_q // h_kv, h_kv, is_fp8_kvcache=use_fp8
     )
 
     init_dtype = q.dtype
