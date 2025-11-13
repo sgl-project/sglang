@@ -494,6 +494,7 @@ def get_embedding_and_mask(
 
 
 def embed_mm_inputs(
+    forward_batch: ForwardBatch,
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
     extend_seq_lens: List[int],
@@ -503,8 +504,6 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[
         Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
-    placeholder_tokens: dict[Modality, List[int]] = None,
-    use_deepstack: Dict[Modality, bool] = {},
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -515,12 +514,10 @@ def embed_mm_inputs(
         extend_seq_lens: Sequence lengths for each request
         input_ids: Input token IDs tensor
         input_embedding: Embedding layer for text tokens
-        placeholder_tokens: Token IDs for multimodal placeholders (uses pad_values if None)
 
     Returns:
         Combined embedding tensor with multimodal content integrated
     """
-    other_info = {}
     if mm_inputs_list is None:
         return None
 
@@ -530,8 +527,7 @@ def embed_mm_inputs(
     for mm_inputs in mm_inputs_list:
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
 
-    # deepstack_embeddings: per-modality
-    modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
+    modalities, embeddings, masks = [], [], []
 
     # 2. Get multimodal embedding separately
     # Try get mm embedding if any
@@ -580,11 +576,6 @@ def embed_mm_inputs(
                 items_offset_list=items_offsets,
             )
 
-            if use_deepstack.get(modality, None) and embedding is not None:
-                embedding, deepstack_embedding = (
-                    multimodal_model.separate_deepstack_embeds(embedding)
-                )
-                deepstack_embeddings += [deepstack_embedding]
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
@@ -598,108 +589,29 @@ def embed_mm_inputs(
     input_ids.clamp_(min=0, max=vocab_size - 1)
     inputs_embeds = input_embedding(input_ids)
 
-    # deepstack embedding
-    if use_deepstack:
-        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
+    indices = []
+    for mask in masks:
+        if mask is not None:
+            indices.append(torch.where(mask.squeeze(dim=-1))[0])
+        else:
+            indices.append(None)
 
-        deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
-            inputs_embeds.shape[-1] * num_deepstack_embeddings,
+    # only for qwen3vl right now,  replace the original use_deepstack with this method.
+    if hasattr(multimodal_model, "post_process"):
+        embeddings, forward_batch = multimodal_model.post_process(
+            inputs_embeds, modalities, embeddings, indices, forward_batch
         )
-        # a zero-filled embedding, with the same length of inputs_embeds, but different hidden_size
-        input_deepstack_embeds = torch.zeros(
-            deepstack_embedding_shape,
-            device=inputs_embeds.device,
-            dtype=inputs_embeds.dtype,
-        )
-
-        other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
-    for i, modality, embedding, mask in zip(
-        range(len(embeddings)), modalities, embeddings, masks
+    for i, modality, embedding, index in zip(
+        range(len(embeddings)), modalities, embeddings, indices
     ):
-        if embedding is None or mask is None:
+        if embedding is None or index is None:
             continue
         # in-place update
-        indices = torch.where(mask.squeeze(dim=-1))[0]
-        inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
-        if use_deepstack.get(modality, None):
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
+        inputs_embeds[index] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
 
-    return inputs_embeds, other_info
-
-
-def general_mm_embed_routine_runner(
-    input_ids: torch.Tensor,
-    forward_batch: ForwardBatch,
-    language_model: nn.Module,
-    multimodal_model: Optional[nn.Module] = None,
-    data_embedding_funcs: Dict[
-        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
-    ] = None,
-    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
-    use_deepstack: Dict[Modality, bool] = {},
-    **kwargs,
-) -> ForwardBatch:
-    """
-    Process multimodal inputs and forward through language model.
-
-    Args:
-        input_ids: Input token IDs tensor
-        forward_batch: Batch information for model forward pass
-        language_model: Base language model to use
-        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
-        placeholder_tokens: Token IDs for multimodal placeholders
-        use_deepstack: Whether to use deepstack embeddings for each modality, default False
-        **kwargs: Additional arguments passed to language model
-
-    Returns:
-        ForwardBatch
-    """
-    assert hasattr(language_model, "get_input_embeddings")
-    embed_tokens = language_model.get_input_embeddings()
-    if (
-        not forward_batch.forward_mode.is_decode()
-        and not forward_batch.forward_mode.is_target_verify()
-        and forward_batch.contains_mm_inputs()
-    ):
-        mm_inputs_list = [
-            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-        ]
-        extend_prefix_lens = [
-            prefix_len
-            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        extend_seq_lens = [
-            seq_len
-            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        inputs_embeds, other_info = embed_mm_inputs(
-            mm_inputs_list=mm_inputs_list,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            input_ids=input_ids,
-            multimodal_model=multimodal_model,
-            input_embedding=embed_tokens,
-            data_embedding_func_mapping=data_embedding_funcs,
-            placeholder_tokens=placeholder_tokens,
-            use_deepstack=use_deepstack,
-        )
-        # add for qwen3_vl deepstack
-        if use_deepstack:
-            kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-        # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
-        # just being defensive here
-        forward_batch.mm_inputs = None
-    else:
-        inputs_embeds = embed_tokens(input_ids)
-
-    forward_batch.input_embeds = inputs_embeds
-    return forward_batch
+    return inputs_embeds, forward_batch
 
 
 def general_mm_embed_routine(
@@ -710,8 +622,7 @@ def general_mm_embed_routine(
     data_embedding_funcs: Dict[
         Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
-    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
-    use_deepstack: Dict[Modality, bool] = {},
+    skip_llm_forward: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -722,8 +633,6 @@ def general_mm_embed_routine(
         forward_batch: Batch information for model forward pass
         language_model: Base language model to use
         data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
-        placeholder_tokens: Token IDs for multimodal placeholders
-        use_deepstack: Whether to use deepstack embeddings for each modality, default False
         **kwargs: Additional arguments passed to language model
 
     Returns:
@@ -732,19 +641,14 @@ def general_mm_embed_routine(
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
-        # read positions to avoid UnboundLocalError
-        pos = kwargs.get("positions", None)
-        fb_pos = getattr(forward_batch, "positions", None)
-        if pos is None and fb_pos is not None:
-            pos = fb_pos
-
-        is_decode = forward_batch.forward_mode.is_decode()
-        is_target_verify = forward_batch.forward_mode.is_target_verify()
-        has_mm = forward_batch.contains_mm_inputs()
-
-        # mm prefill
-        if (not is_decode) and (not is_target_verify) and has_mm:
-            mm_inputs_list = [mm for mm in forward_batch.mm_inputs if mm is not None]
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.contains_mm_inputs()
+        ):
+            mm_inputs_list = [
+                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+            ]
             extend_prefix_lens = [
                 prefix_len
                 for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
@@ -756,7 +660,8 @@ def general_mm_embed_routine(
                 if forward_batch.mm_inputs[i] is not None
             ]
 
-            inputs_embeds, other_info = embed_mm_inputs(
+            inputs_embeds, forward_batch = embed_mm_inputs(
+                forward_batch=forward_batch,
                 mm_inputs_list=mm_inputs_list,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_seq_lens=extend_seq_lens,
@@ -764,31 +669,17 @@ def general_mm_embed_routine(
                 multimodal_model=multimodal_model,
                 input_embedding=embed_tokens,
                 data_embedding_func_mapping=data_embedding_funcs,
-                placeholder_tokens=placeholder_tokens,
-                use_deepstack=use_deepstack,
             )
-
-            mm_pos = None
-            if other_info is not None:
-                for key in ("mrope_positions", "positions", "position_ids"):
-                    if other_info.get(key) is not None:
-                        mm_pos = other_info[key]
-                        break
-
-            if mm_pos is not None:
-                mm_pos = mm_pos.to(
-                    device=inputs_embeds.device, dtype=torch.int64, non_blocking=True
-                )
-                kwargs["positions"] = mm_pos
-                forward_batch.positions = mm_pos
-                pos = mm_pos
-
-            if use_deepstack:
-                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-
+            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+            # just being defensive here
             forward_batch.mm_inputs = None
+        else:
+            inputs_embeds = embed_tokens(input_ids)
     else:
         inputs_embeds = None
+
+    if skip_llm_forward:
+        return inputs_embeds
 
     hidden_states = language_model(
         input_ids=None,
@@ -905,3 +796,77 @@ def hash_feature(f):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
         return tensor_hash([reconstruct_t])
     return data_hash(f)
+
+
+def multimodal_preprocess_routine(
+    forward_batch: ForwardBatch,
+    multimodal_model: Optional[nn.Module] = None,
+    data_embedding_funcs: Dict[
+        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
+    ] = None,
+) -> torch.Tensor:
+    """
+    Process multimodal inputs and forward through language model.
+    Args:
+        input_ids: Input token IDs tensor
+        forward_batch: Batch information for model forward pass
+        language_model: Base language model to use
+        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
+        **kwargs: Additional arguments passed to language model
+    Returns:
+        Hidden states from language model forward pass
+    """
+    language_model = multimodal_model.model
+
+    assert hasattr(language_model, "get_input_embeddings")
+    embed_tokens = language_model.get_input_embeddings()
+    input_ids = forward_batch.input_ids
+    if (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
+        and forward_batch.contains_mm_inputs()
+    ):
+        mm_inputs_list = [
+            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+        ]
+        extend_prefix_lens = [
+            prefix_len
+            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        extend_seq_lens = [
+            seq_len
+            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        inputs_embeds, forward_batch = embed_mm_inputs(
+            forward_batch=forward_batch,
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=forward_batch.input_ids,
+            multimodal_model=multimodal_model,
+            input_embedding=embed_tokens,
+            data_embedding_func_mapping=data_embedding_funcs,
+        )
+        # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+        # just being defensive here
+        forward_batch.mm_inputs = None
+    else:
+        # NOTE: This may reduce the performance for only-text inputs.
+        # Using a fixed-address buffer might be better, though it could be a bit dirty.
+        inputs_embeds = embed_tokens(input_ids)
+        # only for qwen3vl
+        if getattr(multimodal_model, "use_deepstack", False):
+            forward_batch.input_deepstack_embeds = torch.zeros(
+                (
+                    len(input_ids),
+                    multimodal_model.config.hidden_size
+                    * len(multimodal_model.deepstack_visual_indexes),
+                ),
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
+
+    forward_batch.input_embeds = inputs_embeds
+    return forward_batch

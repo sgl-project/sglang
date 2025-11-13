@@ -343,6 +343,9 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    # For Qwen3-VL
+    input_deepstack_embeds: Optional[torch.Tensor] = None
+
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None

@@ -92,7 +92,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.mm_utils import general_mm_embed_routine_runner
+from sglang.srt.managers.mm_utils import multimodal_preprocess_routine
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -2139,6 +2139,14 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+
+        if self.is_multimodal:
+            forward_batch = multimodal_preprocess_routine(
+                forward_batch=forward_batch,
+                multimodal_model=self.model,
+            )
+            assert forward_batch.input_embeds is not None, "input_embeds is required"
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2211,20 +2219,6 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
-            if self.model_is_mrope():
-                positions = forward_batch.mrope_positions
-            else:
-                positions = forward_batch.positions
-
-            forward_batch = general_mm_embed_routine_runner(
-                input_ids=forward_batch.input_ids,
-                forward_batch=forward_batch,
-                language_model=self.model,
-                multimodal_model=self,
-                positions=positions,
-                skip_llm_forward=True,
-            )
-
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2289,6 +2283,7 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            forward_batch.input_deepstack_embeds = None
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
