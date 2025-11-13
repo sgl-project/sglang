@@ -12,7 +12,6 @@ import os
 import re
 import shutil
 import sys
-import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -39,11 +38,26 @@ except ImportError:
 # Add new runner labels and models here as needed
 RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "1-gpu-runner": [
-        "moonshotai/Kimi-VL-A3B-Instruct",
         "deepseek-ai/DeepSeek-OCR",
+        "google/gemma-3-4b-it",
+        "lmms-lab/llava-onevision-qwen2-0.5b-ov",
+        "lmsys/sglang-ci-dsv3-test",
+        "lmsys/sglang-EAGLE-llama2-chat-7B",
+        "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B",
+        "meta-llama/Llama-2-7b-chat-hf",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        "moonshotai/Kimi-VL-A3B-Instruct",
+        "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+        "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8"
+        "OpenGVLab/InternVL2_5-2B",
         "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "Qwen/QwQ-32B-AWQ",
     ],
     "2-gpu-runner": [
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "moonshotai/Kimi-Linear-48B-A3B-Instruct",
     ],
     "8-gpu-h200": [
@@ -54,7 +68,7 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "8-gpu-b200": ["deepseek-ai/DeepSeek-V3.1", "deepseek-ai/DeepSeek-V3.2-Exp"],
     "4-gpu-b200": ["nvidia/DeepSeek-V3-0324-FP4"],
     "4-gpu-gb200": ["nvidia/DeepSeek-V3-0324-FP4"],
-    "linux-mi300-gpu-8": ["deepseek-ai/DeepSeek-V3-0324"],
+    "4-gpu-h100": ["lmsys/sglang-ci-dsv3-test", "lmsys/sglang-ci-dsv3-test-NextN"]
 }
 
 
@@ -304,7 +318,7 @@ def validate_model(
 
 def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -> bool:
     """
-    Download a model from HuggingFace with retry logic.
+    Download a model from HuggingFace.
 
     Completely removes the model cache directory before downloading to ensure a clean download.
 
@@ -326,58 +340,30 @@ def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -
     cache_model_name = "models--" + model_id.replace("/", "--")
     model_cache_path = Path(cache_dir) / cache_model_name
 
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        if attempt > 1:
-            print(f"  Retry attempt {attempt}/{max_retries} for {model_id}")
-
-        if model_cache_path.exists():
-            print(f"  Removing entire model directory: {model_cache_path}")
-            try:
-                shutil.rmtree(model_cache_path)
-                print(f"    ✓ Successfully removed model directory")
-            except Exception as e:
-                print(f"    ✗ Failed to remove model directory: {e}")
-                print(f"    Attempting download anyway...")
-        else:
-            if attempt == 1:
-                print(f"  Model directory not found in cache (will download fresh)")
-
-        print(
-            f"  Downloading from HuggingFace (this may take a while for large models)..."
-        )
-
+    if model_cache_path.exists():
+        print(f"  Removing entire model directory: {model_cache_path}")
         try:
-            snapshot_download(
-                repo_id=model_id,
-                allow_patterns=["*.safetensors", "*.bin", "*.json", "*.txt", "*.model"],
-                ignore_patterns=["*.msgpack", "*.h5", "*.ot"],  # codespell:ignore ot
-                resume_download=False,  # Always start fresh after rmtree
-            )
-            print(f"  ✓ Download API call succeeded: {model_id}")
-
-            # Immediately validate the download to ensure it's complete
-            is_valid, error_msg, _ = validate_model(model_id, cache_dir)
-            if is_valid:
-                print(f"  ✓ Download validation passed: {model_id}")
-                return True
-            else:
-                print(f"  ✗ Download validation failed: {error_msg}")
-                if attempt == max_retries:
-                    print(f"  ✗ All {max_retries} attempts failed for {model_id}")
-                    return False
-                # Continue to retry logic below
-
+            shutil.rmtree(model_cache_path)
+            print(f"    ✓ Successfully removed model directory")
         except Exception as e:
-            print(f"  ✗ Download attempt {attempt} failed: {e}")
-            if attempt == max_retries:
-                print(f"  ✗ All {max_retries} download attempts failed for {model_id}")
-                return False
+            print(f"    ✗ Failed to remove model directory: {e}")
+            print(f"    Attempting download anyway...")
+    else:
+        print(f"  Model directory not found in cache (will download fresh)")
 
-        # Wait before retrying (for both exceptions and validation failures)
-        wait_time = attempt * 2  # Progressive backoff: 2s, 4s, 6s
-        print(f"    Waiting {wait_time}s before retry...")
-        time.sleep(wait_time)
+    print(f"  Downloading from HuggingFace (this may take a while for large models)...")
+
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            allow_patterns=["*.safetensors", "*.bin", "*.json", "*.txt", "*.model"],
+            ignore_patterns=["*.msgpack", "*.h5", "*.ot"],  # codespell:ignore ot
+        )
+        print(f"  ✓ Download completed: {model_id}")
+        return True
+    except Exception as e:
+        print(f"  ✗ Download failed: {e}")
+        return False
 
 
 def get_runner_labels() -> List[str]:
