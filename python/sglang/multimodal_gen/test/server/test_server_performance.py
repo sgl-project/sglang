@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import statistics
 import subprocess
@@ -34,92 +35,55 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 
-EXPECTED_STAGE_MS = {
-    "InputValidationStage": 0.10,
-    "TextEncodingStage": 834.20,
-    "ConditioningStage": 0.10,
-    "TimestepPreparationStage": 10.60,
-    "LatentPreparationStage": 5.20,
-    "DenoisingStage": 21202.60,
-    "DecodingStage": 327.60,
-}
+_BASELINE_PATH = Path(__file__).with_name("perf_baselines.json")
+with _BASELINE_PATH.open("r", encoding="utf-8") as _fh:
+    _BASELINE_CONFIG = json.load(_fh)
 
-EXPECTED_STAGE_MS_IMAGE_EDIT = {
-    "InputValidationStage": 9.5,
-    "TextEncodingStage": 1084.46,
-    "ConditioningStage": 0.13,
-    "TimestepPreparationStage": 13.78,
-    "LatentPreparationStage": 6.76,
-    "DenoisingStage": 27563.38,
-    "DecodingStage": 425.88,
-}
+_SCENARIOS = _BASELINE_CONFIG["scenarios"]
+_TEXT_SCENARIO = _SCENARIOS["text_to_image"]
+_IMAGE_EDIT_SCENARIO = _SCENARIOS["image_edit"]
+
+EXPECTED_STAGE_MS = _TEXT_SCENARIO["stages_ms"]
+
+EXPECTED_STAGE_MS_IMAGE_EDIT = _IMAGE_EDIT_SCENARIO["stages_ms"]
 
 EXPECTED_DENOISE_STEP_MS = {
-    0: 1077.77,
-    1: 345.13,
-    2: 413.80,
-    3: 405.49,
-    4: 408.14,
-    5: 409.06,
-    6: 408.85,
-    7: 410.53,
-    8: 407.51,
-    9: 409.44,
-    10: 408.65,
-    11: 410.14,
-    12: 411.74,
-    13: 409.59,
-    14: 409.17,
-    15: 410.78,
-    16: 410.66,
-    17: 410.58,
-    18: 411.27,
-    19: 410.51,
-    20: 409.03,
-    21: 410.16,
-    22: 409.42,
-    23: 411.03,
-    24: 410.18,
-    25: 409.72,
-    26: 410.26,
-    27: 410.21,
-    28: 410.71,
-    29: 410.76,
-    30: 411.06,
-    31: 410.10,
-    32: 410.55,
-    33: 410.77,
-    34: 410.74,
-    35: 411.75,
-    36: 410.78,
-    37: 411.56,
-    38: 410.85,
-    39: 411.08,
-    40: 411.12,
-    41: 411.10,
-    42: 411.09,
-    43: 410.87,
-    44: 411.37,
-    45: 411.68,
-    46: 411.00,
-    47: 410.09,
-    48: 412.72,
-    49: 410.42,
+    int(idx): float(duration)
+    for idx, duration in _TEXT_SCENARIO["denoise_step_ms"].items()
 }
 
-DEFAULT_EXPECTED_E2E_MS = 22383.71
-DEFAULT_EXPECTED_AVG_DENOISE_MS = 422.42
-DEFAULT_EXPECTED_MEDIAN_DENOISE_MS = 410.62
+_DEFAULTS = _BASELINE_CONFIG["defaults"]
+DEFAULT_EXPECTED_E2E_MS = float(_DEFAULTS["expected_e2e_ms"])
+DEFAULT_EXPECTED_AVG_DENOISE_MS = float(_DEFAULTS["expected_avg_denoise_ms"])
+DEFAULT_EXPECTED_MEDIAN_DENOISE_MS = float(_DEFAULTS["expected_median_denoise_ms"])
 
-STEP_SAMPLE_FRACTIONS: Sequence[float] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
-
-E2E_TOLERANCE_RATIO = float(os.environ.get("SGLANG_E2E_TOLERANCE", "0.25"))
-STAGE_TOLERANCE_RATIO = float(os.environ.get("SGLANG_STAGE_TIME_TOLERANCE", "0.30"))
-DENOISE_STEP_TOLERANCE_RATIO = float(
-    os.environ.get("SGLANG_DENOISE_STEP_TOLERANCE", "0.10")
+STEP_SAMPLE_FRACTIONS: Sequence[float] = tuple(
+    _BASELINE_CONFIG["sampling"]["step_fractions"]
 )
-DENOISE_AGG_TOLERANCE_RATIO = float(
-    os.environ.get("SGLANG_DENOISE_AGG_TOLERANCE", "0.10")
+
+_WARMUP_DEFAULTS = _BASELINE_CONFIG["sampling"].get("warmup_requests", {})
+_DEFAULT_WARMUP_TEXT = int(_WARMUP_DEFAULTS.get("text", 1))
+_DEFAULT_WARMUP_EDIT = int(_WARMUP_DEFAULTS.get("image_edit", 0))
+
+_TOLERANCES = _BASELINE_CONFIG["tolerances"]
+
+
+def _tolerance_from_env(var_name: str, default: float) -> float:
+    override = os.environ.get(var_name)
+    if override is not None:
+        return float(override)
+    return float(default)
+
+
+E2E_TOLERANCE_RATIO = _tolerance_from_env("SGLANG_E2E_TOLERANCE", _TOLERANCES["e2e"])
+STAGE_TOLERANCE_RATIO = _tolerance_from_env(
+    "SGLANG_STAGE_TIME_TOLERANCE", _TOLERANCES["stage"]
+)
+DENOISE_STEP_TOLERANCE_RATIO = _tolerance_from_env(
+    "SGLANG_DENOISE_STEP_TOLERANCE", _TOLERANCES["denoise_step"]
+)
+DENOISE_AGG_TOLERANCE_RATIO = _tolerance_from_env(
+    "SGLANG_DENOISE_AGG_TOLERANCE", _TOLERANCES["denoise_agg"]
 )
 
 
@@ -320,8 +284,8 @@ class DiffusionServerPerfTestBase:
     IMAGE_EDIT_PROMPT: str | None = None
     IMAGE_EDIT_PATH = Path(__file__).resolve().parents[1] / "test_files" / "rabbit.jpg"
     OUTPUT_SIZE = "1024x1024"
-    WARMUP_TEXT_REQUESTS = 1
-    WARMUP_IMAGE_EDIT_REQUESTS = 0
+    WARMUP_TEXT_REQUESTS = _DEFAULT_WARMUP_TEXT
+    WARMUP_IMAGE_EDIT_REQUESTS = _DEFAULT_WARMUP_EDIT
     STAGE_EXPECTATIONS = EXPECTED_STAGE_MS
     STEP_EXPECTATIONS = EXPECTED_DENOISE_STEP_MS
     EXPECTED_E2E_MS = DEFAULT_EXPECTED_E2E_MS

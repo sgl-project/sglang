@@ -318,9 +318,6 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run diffusion server tests
-        env:
-          SGLANG_TEST_IMAGE_MODEL: Qwen/Qwen-Image
-          SGLANG_TEST_SERVER_PORT: 30100
         timeout-minutes: 60
         run: |
           cd python

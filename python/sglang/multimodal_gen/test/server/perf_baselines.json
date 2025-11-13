@@ -1,0 +1,103 @@
+{
+  "metadata": {
+    "model": "Qwen/Qwen-Image",
+    "hardware": "CI H100 80GB pool",
+    "description": "Reference numbers captured from the CI diffusion server baseline run"
+  },
+  "defaults": {
+    "expected_e2e_ms": 22383.71,
+    "expected_avg_denoise_ms": 422.42,
+    "expected_median_denoise_ms": 410.62
+  },
+  "tolerances": {
+    "e2e": 0.25,
+    "stage": 0.3,
+    "denoise_step": 0.1,
+    "denoise_agg": 0.1
+  },
+  "sampling": {
+    "step_fractions": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+    "warmup_requests": {
+      "text": 1,
+      "image_edit": 0
+    }
+  },
+  "scenarios": {
+    "text_to_image": {
+      "notes": "Single-image generation using the default prompt",
+      "stages_ms": {
+        "InputValidationStage": 0.1,
+        "TextEncodingStage": 834.2,
+        "ConditioningStage": 0.1,
+        "TimestepPreparationStage": 10.6,
+        "LatentPreparationStage": 5.2,
+        "DenoisingStage": 21202.6,
+        "DecodingStage": 327.6
+      },
+      "denoise_step_ms": {
+        "0": 1077.77,
+        "1": 345.13,
+        "2": 413.8,
+        "3": 405.49,
+        "4": 408.14,
+        "5": 409.06,
+        "6": 408.85,
+        "7": 410.53,
+        "8": 407.51,
+        "9": 409.44,
+        "10": 408.65,
+        "11": 410.14,
+        "12": 411.74,
+        "13": 409.59,
+        "14": 409.17,
+        "15": 410.78,
+        "16": 410.66,
+        "17": 410.58,
+        "18": 411.27,
+        "19": 410.51,
+        "20": 409.03,
+        "21": 410.16,
+        "22": 409.42,
+        "23": 411.03,
+        "24": 410.18,
+        "25": 409.72,
+        "26": 410.26,
+        "27": 410.21,
+        "28": 410.71,
+        "29": 410.76,
+        "30": 411.06,
+        "31": 410.1,
+        "32": 410.55,
+        "33": 410.77,
+        "34": 410.74,
+        "35": 411.75,
+        "36": 410.78,
+        "37": 411.56,
+        "38": 410.85,
+        "39": 411.08,
+        "40": 411.12,
+        "41": 411.1,
+        "42": 411.09,
+        "43": 410.87,
+        "44": 411.37,
+        "45": 411.68,
+        "46": 411.0,
+        "47": 410.09,
+        "48": 412.72,
+        "49": 410.42
+      }
+    },
+    "image_edit": {
+      "notes": "Rabbit color-edit scenario with a single uploaded reference image, Qwen/Qwen-Image-Edit",
+      "stages_ms": {
+        "InputValidationStage": 9.5,
+        "TextEncodingStage": 1084.46,
+        "ConditioningStage": 0.13,
+        "TimestepPreparationStage": 13.78,
+        "LatentPreparationStage": 6.76,
+        "DenoisingStage": 27563.38,
+        "DecodingStage": 425.88
+      }
+    }
+  }
+}
