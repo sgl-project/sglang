@@ -42,7 +42,6 @@ from sglang.srt.configs import (
     DeepseekVL2Config,
     DotsOCRConfig,
     DotsVLMConfig,
-    Eagle2_5_VLConfig,
     ExaoneConfig,
     FalconH1Config,
     JetNemotronConfig,
@@ -64,7 +63,6 @@ from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
     DbrxConfig,
-    Eagle2_5_VLConfig,
     ExaoneConfig,
     DeepseekVL2Config,
     MultiModalityConfig,
