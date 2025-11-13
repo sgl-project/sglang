@@ -16,7 +16,7 @@ class TestFlux_T2V(TestGenerateBase):
     data_type: DataType = DataType.IMAGE
     thresholds = {
         "test_single_gpu": 6.5 * 1.05,
-        "test_usp": 9.41 * 1.05,
+        "test_usp": 8.3 * 1.05,
     }
 
     def test_cfg_parallel(self):
@@ -31,8 +31,8 @@ class TestQwenImage(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 11.7 * 1.05,
-        "test_usp": 43.5 * 1.05,
+        "test_single_gpu": 10.4 * 1.05,
+        "test_usp": 20.2 * 1.05,
     }
 
     def test_cfg_parallel(self):
@@ -47,8 +47,8 @@ class TestQwenImageEdit(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 43.5 * 1.05,
-        "test_usp": 43.5 * 1.05,
+        "test_single_gpu": 33.4 * 1.05,
+        "test_usp": 26.9 * 1.05,
     }
 
     prompt: str | None = (
