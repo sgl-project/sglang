@@ -21,12 +21,14 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -64,9 +66,10 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
-    from kt_kernel import AMXMoEWrapper
+    from kt_kernel import KTMoEWrapper
 
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
@@ -256,7 +259,7 @@ class CudaGraphRunner:
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
-            AMXMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -320,11 +323,11 @@ class CudaGraphRunner:
                 self.pp_proxy_tensors = {
                     "hidden_states": torch.zeros(
                         (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
+                        dtype=self.model_runner.model_config.dtype,
                     ),
                     "residual": torch.zeros(
                         (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
+                        dtype=self.model_runner.model_config.dtype,
                     ),
                 }
 
@@ -446,14 +449,34 @@ class CudaGraphRunner:
             and is_ngram_supported
         )
 
+    def _init_profile_context_and_memory_record(self):
+        profile_context = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        )
+        torch.cuda.memory._record_memory_history()
+        return profile_context
+
+    def _post_process_after_profile(self, prof_context):
+        torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+        log_message = (
+            "Sorted by CUDA Time:\n"
+            + prof_context.key_averages(group_by_input_shape=True).table(
+                sort_by="cuda_time_total", row_limit=10
+            )
+            + "\n\nSorted by CPU Time:\n"
+            + prof_context.key_averages(group_by_input_shape=True).table(
+                sort_by="cpu_time_total", row_limit=10
+            )
+            + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
+        )
+        logger.info(log_message)
+
     def capture(self) -> None:
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
-            profile_context = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-            )
-            torch.cuda.memory._record_memory_history()
+            profile_context = self._init_profile_context_and_memory_record()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -502,23 +525,19 @@ class CudaGraphRunner:
                     save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
-            torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
-            torch.cuda.memory._record_memory_history(enabled=None)
-            log_message = (
-                "Sorted by CUDA Time:\n"
-                + prof.key_averages(group_by_input_shape=True).table(
-                    sort_by="cuda_time_total", row_limit=10
-                )
-                + "\n\nSorted by CPU Time:\n"
-                + prof.key_averages(group_by_input_shape=True).table(
-                    sort_by="cpu_time_total", row_limit=10
-                )
-                + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
-            )
-            logger.info(log_message)
+            self._post_process_after_profile(prof)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with self.device_module.graph(graph, pool=pool, stream=stream):
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.model_runner.server_args.enable_memory_saver
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        )
+        graph_fn = (
+            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if memory_saver_adapter.enabled
+            else self.device_module.graph
+        )
+        with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
 
@@ -648,7 +667,11 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+            )
             set_is_extend_in_batch(False)
 
             kwargs = {}

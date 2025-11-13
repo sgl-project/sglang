@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.utils import ceil_div, is_sm100_supported, offloader
+from sglang.srt.utils import ceil_div, is_blackwell_supported, offloader
 
 try:
     from vllm import _custom_ops as ops
@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.utils import (
-    align,
+    ceil_align,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
@@ -129,7 +129,7 @@ def cutlass_block_fp8_supported() -> bool:
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
 ENABLE_FLASHINFER_GEMM = (
     get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
-    and is_sm100_supported()
+    and is_blackwell_supported()
     and is_flashinfer_available()
 )
 if ENABLE_FLASHINFER_GEMM:
@@ -263,19 +263,32 @@ def aiter_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
+    # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
+    # if input_scale not None, input is quanted
+    if input_scale is not None:
+        q_input = input_2d
+        x_scale = input_scale
+
+    else:
+        q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
+
     output = gemm_a8w8_blockscale(
-        q_input, weight, x_scale, weight_scale, dtype=input.dtype
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
 
     if bias is not None:
         output += bias
 
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(
+        dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
+    ).view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(
@@ -495,7 +508,7 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros(
-        (align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device
+        (ceil_align(m, 128), ceil_align(n, 128)), dtype=x.dtype, device=x.device
     )
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)

@@ -612,18 +612,23 @@ class SGLangPerfAnalyzer:
 
         total_runs = len(runs)
         for i, run in enumerate(runs, 1):
-            print(f"Processing run {i}/{total_runs}: #{run.get('run_number')}")
+            if not isinstance(run, dict):
+                print(f"  Warning: run #{i} is not a dict, skipping.")
+                continue
 
             run_info = {
                 "run_number": run.get("run_number"),
                 "created_at": run.get("created_at"),
-                "head_sha": run.get("head_sha", "")[:8],
-                "author": run.get("head_commit", {})
-                .get("author", {})
-                .get("name", "Unknown"),
+                "head_sha": (run.get("head_sha") or "")[:8],
+                "author": "Unknown",
                 "pr_number": None,
                 "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
             }
+            head_commit = run.get("head_commit", {})
+            if isinstance(head_commit, dict):
+                run_info["author"] = head_commit.get("author", {}).get(
+                    "name", "Unknown"
+                )
 
             # Extract PR number
             pull_requests = run.get("pull_requests", [])
