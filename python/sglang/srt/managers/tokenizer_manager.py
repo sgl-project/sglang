@@ -81,6 +81,10 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.tracing.trace import (
+    extract_trace_headers,
+    trace_set_remote_propagate_context_batch,
+)
 from sglang.srt.tracing.trace_metric_warpper import (
     RequestStage,
     SglangStageContext,
@@ -88,7 +92,6 @@ from sglang.srt.tracing.trace_metric_warpper import (
     global_get_stage_context,
     global_set_stage_context,
 )
-from sglang.srt.tracing.trace import trace_set_remote_propagate_context_batch, extract_trace_headers
 from sglang.srt.utils import (
     configure_gc_warning,
     dataclass_to_string_truncated,

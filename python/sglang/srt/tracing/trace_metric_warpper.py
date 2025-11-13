@@ -188,7 +188,7 @@ class SglangStageContext(SglangTraceReqContext):
         if isinstance(propagation_context, dict):
             super().trace_set_proc_propagate_context(propagation_context)
         else:
-            super().trace_req_start(ts, external_trace_header = external_trace_header)
+            super().trace_req_start(ts, external_trace_header=external_trace_header)
 
     def metric_trace_slice_start(
         self,

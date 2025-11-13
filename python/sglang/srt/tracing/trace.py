@@ -24,11 +24,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from sglang.srt.utils import get_int_env_var
-
-from typing import Any, Dict, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
@@ -399,7 +397,11 @@ class SglangTraceReqContext:
         if self.tracing_enable:
             self.thread_context.last_span_context = trace_context.prev_span_context
 
-    def trace_req_start(self, ts: Optional[int] = None, external_trace_header: Optional[Dict[str, str]] = None):
+    def trace_req_start(
+        self,
+        ts: Optional[int] = None,
+        external_trace_header: Optional[Dict[str, str]] = None,
+    ):
         if not self.tracing_enable:
             return
 

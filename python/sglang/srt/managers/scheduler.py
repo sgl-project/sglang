@@ -158,6 +158,7 @@ from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.tracing.trace_metric_warpper import (
     NoOpTimeRecorder,
     RequestStage,
@@ -165,7 +166,6 @@ from sglang.srt.tracing.trace_metric_warpper import (
     metric_trace_slice_batch,
     trace_event_batch,
 )
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
