@@ -131,6 +131,7 @@ sglang = "sglang.cli.main:main"
   "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
   "srt/speculative/cpp_ngram/*.cpp",
   "srt/speculative/cpp_ngram/*.h",
+  "srt/compilation/*.cpp",
 ]
 
 [tool.setuptools.packages.find]
