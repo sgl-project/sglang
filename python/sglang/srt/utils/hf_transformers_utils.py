@@ -58,7 +58,12 @@ from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, get_bool_env_var
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_remote_url,
+    logger,
+    lru_cache_frozenset,
+)
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -213,7 +218,7 @@ def get_config(
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             from modelscope.hub.file_download import model_file_download
 
-            model = model_file_download(model_id=model,file_path='config.json')
+            model = model_file_download(model_id=model, file_path="config.json")
         config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
