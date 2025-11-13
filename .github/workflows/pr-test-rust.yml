@@ -166,8 +166,8 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-router
-          python3 -m pip install --upgrade --no-cache-dir --ignore-installed blinker zope.event
-          python3 -m pip install --upgrade --no-cache-dir --ignore-installed genai-bench==0.0.2
+          python3 -m pip install --upgrade --no-cache-dir blinker
+          python3 -m pip install --upgrade --no-cache-dir genai-bench==0.0.2
           genai-bench --version
           python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router
