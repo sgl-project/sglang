@@ -46,7 +46,7 @@ enable_hf_transfer()
 class DisabledTqdm(tqdm):
 
     def __init__(self, *args, **kwargs):
-        kwargs['disable'] = True
+        kwargs["disable"] = True
         super().__init__(*args, **kwargs)
 
 
