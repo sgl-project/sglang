@@ -127,9 +127,13 @@ def _sglang_fp4_gemm_fake(
     return input.new_empty((M, N), dtype=out_dtype)
 
 
-@torch.library.register_fake("sgl_kernel::scaled_fp4_quant")
-def _sgl_kernel_scaled_fp4_quant_fake(output, input, output_scale, input_global_scale):
-    return
+if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
+
+    @torch.library.register_fake("sgl_kernel::scaled_fp4_quant")
+    def _sgl_kernel_scaled_fp4_quant_fake(
+        output, input, output_scale, input_global_scale
+    ):
+        return
 
 
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
