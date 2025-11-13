@@ -53,8 +53,8 @@ class TestRouterConfigValidation:
         assert args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert args.policy == "cache_aware"
 
-    def test_pd_config_without_urls_raises_error(self):
-        """Test that PD mode without URLs raises validation error."""
+    def test_pd_config_without_urls_allowed(self):
+        """Test that PD mode without URLs is now allowed (URLs are optional)."""
         args = RouterArgs(
             pd_disaggregation=True,
             prefill_urls=[],
@@ -62,11 +62,14 @@ class TestRouterConfigValidation:
             service_discovery=False,
         )
 
-        # This should raise an error when trying to launch
-        with pytest.raises(
-            ValueError, match="PD disaggregation mode requires --prefill"
-        ):
+        # Should not raise validation error - URLs are now optional
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            mock_router_instance = MagicMock()
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
+
+            # This should succeed without raising an error
             launch_router(args)
+            router_mod.from_args.assert_called_once()
 
     def test_pd_config_with_service_discovery_allows_empty_urls(self):
         """Test that PD mode with service discovery allows empty URLs."""
