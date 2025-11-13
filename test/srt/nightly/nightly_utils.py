@@ -250,6 +250,11 @@ class NightlyBenchmarkRunner:
             )
 
             # Build and run benchmark command
+            # Prepare extra args with run_name if variant is specified
+            bench_args = list(extra_bench_args) if extra_bench_args else []
+            if variant:
+                bench_args.extend(["--run-name", variant])
+
             command = self.build_benchmark_command(
                 model_path,
                 batch_sizes,
@@ -257,7 +262,7 @@ class NightlyBenchmarkRunner:
                 output_lens,
                 profile_path_prefix,
                 json_output_file,
-                extra_args=extra_bench_args,
+                extra_args=bench_args,
             )
 
             result, cmd_success = self.run_benchmark_command(command, model_description)
