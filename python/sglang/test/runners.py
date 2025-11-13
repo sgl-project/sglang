@@ -353,7 +353,7 @@ class HFRunner:
                     scores = []
                     for conv in prompts:
                         conv_formatted = self.tokenizer.apply_chat_template(
-                            conv, tokenize=False
+                            conv, tokenize=False, return_dict=False
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
