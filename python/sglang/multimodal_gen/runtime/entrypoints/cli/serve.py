@@ -35,7 +35,7 @@ def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None =
 
 
 class ServeSubcommand(CLISubcommand):
-    """The `serve` subcommand for the sgl-diffusion CLI"""
+    """The `serve` subcommand for the sglang-diffusion CLI"""
 
     def __init__(self) -> None:
         self.name = "serve"
