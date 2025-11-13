@@ -208,7 +208,6 @@ class AiterAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
-
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
@@ -389,8 +388,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.req_to_token.stride(0),
                 )
 
-                #if _use_mla_ps_kernel:
-                if self.kv_cache_dtype == fp8_dtype:
+                #if self.kv_cache_dtype == fp8_dtype:
+                if _use_mla_ps_kernel:
                     nhead_kv = 1
                     page_size = 1
 
@@ -516,8 +515,8 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        #if self.use_mla and _use_mla_ps_kernel:
-        if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
+        #if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
+        if self.use_mla and _use_mla_ps_kernel:
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
                 1
@@ -583,7 +582,6 @@ class AiterAttnBackend(AttentionBackend):
                     self.cuda_graph_kv_last_page_len[:bs], dim=0
                 )
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-
                 max_q_len = 1
 
                 if _use_mla_ps_kernel:
@@ -657,8 +655,8 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = self.num_draft_tokens
 
-                #if _use_mla_ps_kernel:
-                if self.kv_cache_dtype == fp8_dtype:
+                #if self.kv_cache_dtype == fp8_dtype:
+                if _use_mla_ps_kernel:
                     nhead_kv = 1
                     page_size = 1
 
@@ -702,7 +700,6 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                 )
-
             else:
                 seq_lens_sum = seq_lens.sum().item()
                 self.indices_updater_prefill.update(
@@ -790,7 +787,6 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
             )
-            
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -824,34 +820,35 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
 
-            #if self.use_mla and _use_mla_ps_kernel:
-            #    qo_indptr = self.qo_indptr_[: bs + 1]
-            #    qo_indptr[1 : bs + 1] = torch.cumsum(
-            #        self.cuda_graph_kv_last_page_len[:bs], dim=0
-            #    )
+            if self.use_mla and (_use_mla_ps_kernel and self.num_draft_tokens == None):
 
-            #    max_q_len = 1
+                qo_indptr = self.qo_indptr_[: bs + 1]
+                qo_indptr[1 : bs + 1] = torch.cumsum(
+                    self.cuda_graph_kv_last_page_len[:bs], dim=0
+                )
 
-            #    nhead_kv = 1
-            #    page_size = 1
+                max_q_len = 1
 
-            #    meta = get_mla_metadata_v1(
-            #        qo_indptr,
-            #        kv_indptr,
-            #        self.num_head // nhead_kv,
-            #        nhead_kv,
-            #        True,
-            #        self.work_metadata,
-            #        self.work_info_set,
-            #        self.work_indptr,
-            #        self.reduce_indptr,
-            #        self.reduce_final_map,
-            #        self.reduce_partial_map,
-            #        kv_granularity=max(page_size, 16),
-            #        max_seqlen_qo=max_q_len,
-            #        uni_seqlen_qo=max_q_len,
-            #        fast_mode=True,
-            #    )
+                nhead_kv = 1
+                page_size = 1
+
+                meta = get_mla_metadata_v1(
+                    qo_indptr,
+                    kv_indptr,
+                    self.num_head // nhead_kv,
+                    nhead_kv,
+                    True,
+                    self.work_metadata,
+                    self.work_info_set,
+                    self.work_indptr,
+                    self.reduce_indptr,
+                    self.reduce_final_map,
+                    self.reduce_partial_map,
+                    kv_granularity=max(page_size, 16),
+                    max_seqlen_qo=max_q_len,
+                    uni_seqlen_qo=max_q_len,
+                    fast_mode=True,
+                )
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -877,8 +874,8 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
 
-            #if self.use_mla and _use_mla_ps_kernel:
-            if self.use_mla and self.kv_cache_dtype == fp8_dtype:
+            #if self.use_mla and self.kv_cache_dtype == fp8_dtype:
+            if self.use_mla and _use_mla_ps_kernel:
                 max_q_len = self.num_draft_tokens
 
                 nhead_kv = 1
@@ -981,7 +978,6 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             qo_indptr = self.forward_metadata.qo_indptr
-
             K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
             kv_lora_rank = V_Buffer.shape[-1]
@@ -1028,7 +1024,6 @@ class AiterAttnBackend(AttentionBackend):
                     k_prefix, v_prefix = torch.split(
                         kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
                     )
-                    
                     k_prefix = torch.cat(
                         [
                             k_prefix,
