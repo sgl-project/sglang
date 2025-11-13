@@ -48,7 +48,8 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
-        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
+        # Test both 4k and 32k input lengths
+        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096,32768"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "512"))
         cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
         cls.runner.setup_profile_directory()
