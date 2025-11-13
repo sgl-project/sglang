@@ -184,9 +184,7 @@ class TestAutoWeightsLoader(CustomTestCase):
         ]
 
         # Should not raise error for vision_tower weights
-        loader = AutoWeightsLoader(
-            module, ignore_unexpected_prefixes=["vision_tower"]
-        )
+        loader = AutoWeightsLoader(module, ignore_unexpected_prefixes=["vision_tower"])
         loaded = loader.load_weights(iter(weights))
 
         # Should only load the actual module weight
