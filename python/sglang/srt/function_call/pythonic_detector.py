@@ -2,7 +2,7 @@ import ast
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -12,7 +12,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
 logger = logging.getLogger(__name__)
 
@@ -223,12 +222,3 @@ class PythonicDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
-
-    def build_ebnf(self, tools: List[Tool]) -> Optional[str]:
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token="[",
-            sequence_end_token="]",
-            tool_call_separator=",",
-            function_format="pythonic",
-        )

@@ -1094,3 +1094,50 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             is_k_full=self.is_k_full,
         ).to(orig_dtype)
         return StandardCombineInput(hidden_states=output)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @torch.library.register_fake("sgl_kernel::gptq_gemm")
+    def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
+        return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
+
+    @torch.library.register_fake("sgl_kernel::gptq_marlin_repack")
+    def _(b_q_weight, perm, size_k, size_n, num_bits):
+        return b_q_weight.new_empty(
+            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
+        )
+
+    @torch.library.register_fake("sgl_kernel::gptq_shuffle")
+    def _(q_weight, q_perm, bit):
+        return
+
+    @torch.library.register_fake("sgl_kernel::moe_wna16_marlin_gemm")
+    def _(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        b_zeros,
+        g_idx,
+        perm,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        is_ep,
+        b_q_type_id,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    ):
+        return c

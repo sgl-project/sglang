@@ -222,58 +222,6 @@ class TestJsonSchemaConstraint(unittest.TestCase):
             {"type": "object", "properties": {}},
         )
 
-    def test_json_schema_vs_ebnf_constraint_generation(self):
-        """Test direct comparison between JSON schema and EBNF constraint generation"""
-
-        # Test with specific tool choice
-        tool_choice = ToolChoice(
-            type="function", function=ToolChoiceFuncName(name="get_weather")
-        )
-
-        # Generate JSON schema constraint
-        json_schema = get_json_schema_constraint(self.tools, tool_choice)
-
-        self.assertIsNotNone(json_schema)
-        jsonschema.Draft202012Validator.check_schema(json_schema)
-
-        # Generate EBNF constraint using FunctionCallParser
-        parser = FunctionCallParser(
-            self.tools, "llama3"
-        )  # Use a parser that supports EBNF
-        ebnf_constraint = parser.get_ebnf(tool_choice)
-
-        # Verify JSON schema constraint
-        self.assertEqual(json_schema["type"], "array")
-        self.assertEqual(json_schema["minItems"], 1)
-        self.assertEqual(json_schema["maxItems"], 1)
-
-        # Verify EBNF constraint
-        self.assertIsNotNone(ebnf_constraint)
-        self.assertIsInstance(ebnf_constraint, str)
-        self.assertIn("get_weather", ebnf_constraint)
-
-        # Test with required tool choice
-        required_json_schema = get_json_schema_constraint(self.tools, "required")
-
-        self.assertIsNotNone(required_json_schema)
-        jsonschema.Draft202012Validator.check_schema(required_json_schema)
-
-        required_ebnf_constraint = parser.get_ebnf("required")
-
-        # Verify required JSON schema constraint
-        self.assertEqual(required_json_schema["type"], "array")
-        self.assertEqual(required_json_schema["minItems"], 1)
-        self.assertIn("anyOf", required_json_schema["items"])
-
-        # Verify required EBNF constraint
-        self.assertIsNotNone(required_ebnf_constraint)
-        self.assertIsInstance(required_ebnf_constraint, str)
-
-        # Both should contain references to the available tools
-        tool_names = [tool.function.name for tool in self.tools]
-        for tool_name in tool_names:
-            self.assertIn(tool_name, required_ebnf_constraint)
-
     def test_conflicting_defs_raises_valueerror(self):
         """Test that conflicting tool definitions raise ValueError with proper message"""
         tools_with_conflicting_defs = [

@@ -81,9 +81,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    CompressedTensorsWNA16MoEMethod,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -153,6 +150,8 @@ _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
+    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
         batched_gemm_afp4wfp4_pre_quant,
@@ -781,13 +780,7 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if (
-                not _is_cuda
-                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-                or isinstance(
-                    self.experts.quant_method, CompressedTensorsWNA16MoEMethod
-                )
-            ):
+            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
@@ -850,7 +843,6 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-            or isinstance(self.experts.quant_method, CompressedTensorsWNA16MoEMethod)
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
@@ -1507,13 +1499,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q_lora = self.q_a_layernorm(q)
-            q = self.q_b_proj(q_lora)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+
             if self.use_nsa:
+                q_lora = self.q_a_layernorm(q)
+                q = self.q_b_proj(q_lora)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
                 _ = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
@@ -1522,6 +1515,26 @@ class DeepseekV2AttentionMLA(nn.Module):
                     layer_id=self.layer_id,
                     return_indices=False,
                 )
+
+            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+
+                q, _, _, _ = fused_rms_fp8_group_quant(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    None,
+                    None,
+                    None,
+                    group_size=128,
+                    dtype_quant=torch.float8_e4m3fn,
+                    res1=None,
+                    output_unquantized_inp1=False,
+                )
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            else:
+                q = self.q_a_layernorm(q)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1531,7 +1544,31 @@ class DeepseekV2AttentionMLA(nn.Module):
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
-        kv_a = self.kv_a_layernorm(kv_a)
+
+        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+
+            kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
+                kv_a,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.variance_epsilon,
+                None,
+                None,
+                None,
+                group_size=128,
+                dtype_quant=torch.float8_e4m3fn,
+                res1=None,
+                output_unquantized_inp1=True,  # return unqaunt kv_a
+            )
+            kv = self.kv_b_proj(
+                kv_a_quanted,
+            )[0]
+
+        else:
+            kv_a = self.kv_a_layernorm(kv_a)
+            kv = self.kv_b_proj(kv_a)[0]
+
+        # kv_a = self.kv_a_layernorm(kv_a)
+
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -1617,8 +1654,27 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.variance_epsilon,
                     )
                 else:
-                    q = self.q_a_layernorm(q)
-                    k_nope = self.kv_a_layernorm(k_nope)
+                    if (
+                        _use_aiter_gfx95
+                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                    ):
+
+                        q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            k_nope,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.variance_epsilon,
+                            group_size=128,
+                            dtype_quant=torch.float8_e4m3fn,
+                            res1=None,
+                            output_unquantized_inp1=False,
+                        )
+
+                    else:
+                        q = self.q_a_layernorm(q)
+                        k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_nsa:
@@ -1946,8 +2002,27 @@ class DeepseekV2AttentionMLA(nn.Module):
                         self.kv_a_layernorm.variance_epsilon,
                     )
                 else:
-                    q = self.q_a_layernorm(q)
-                    k_nope = self.kv_a_layernorm(k_nope)
+                    if (
+                        _use_aiter_gfx95
+                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                    ):
+
+                        q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            k_nope,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.variance_epsilon,
+                            group_size=128,
+                            dtype_quant=torch.float8_e4m3fn,
+                            res1=None,
+                            output_unquantized_inp1=False,
+                        )
+
+                    else:
+                        q = self.q_a_layernorm(q)
+                        k_nope = self.kv_a_layernorm(k_nope)
 
             q_lora = q.clone()  # required for topk_indices
             k_nope = k_nope.unsqueeze(1)
@@ -2673,12 +2748,29 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         quant_format = (
             "mxfp4"
-            if _is_gfx95_supported
-            and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None) is not None
-            and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
-            is not None
-            and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
-            else ""
+            if (
+                _is_gfx95_supported
+                and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+                is not None
+                and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+                is not None
+                and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
+            )
+            else (
+                "fp8"
+                if (
+                    _is_gfx95_supported
+                    and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+                    is not None
+                    and getattr(
+                        self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None
+                    )
+                    is not None
+                    and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype
+                    == getattr(torch, "float8_e4m3fn", None)
+                )
+                else ""
+            )
         )
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -3491,8 +3583,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
-        fuse_wk_and_weights_proj = is_nsa_indexer_wk_and_weights_proj_fused(
-            self.config, self.quant_config
+        # Fuse wk and weights_proj when NSA Indexer is enabled and quant_config is FP4. For nextn, fp4 is disabled so we cannot fuse.
+        fuse_wk_and_weights_proj = (
+            is_nsa_indexer_wk_and_weights_proj_fused(self.config, self.quant_config)
+            and not is_nextn
         )
         cached_wk_and_weights_proj = {} if fuse_wk_and_weights_proj else None
 
@@ -3723,12 +3817,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                                     param, "weight_loader", default_weight_loader
                                 )
                                 maybe_executor_submit(
-                                    executor,
-                                    futures,
-                                    use_async_loading,
-                                    weight_loader,
-                                    param,
-                                    fused_weight,
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(param, fused_weight),
                                 )
                                 cached_wk_and_weights_proj.pop(wk_name)
                                 cached_wk_and_weights_proj.pop(weights_proj_name)

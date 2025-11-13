@@ -92,9 +92,8 @@ class StateManagementTests(ResponseAPIBaseTest):
 
     def test_mutually_exclusive_parameters(self):
         """Test that previous_response_id and conversation are mutually exclusive."""
-        # Create conversation and response
-        conv_resp = self.create_conversation()
-        conversation_id = conv_resp.json()["id"]
+        # TODO: Remove this once the conversation API is implemented for GRPC backend
+        conversation_id = "conv_123"
 
         resp1 = self.create_response("Test")
         response1_id = resp1.json()["id"]

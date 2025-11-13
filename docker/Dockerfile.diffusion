@@ -50,7 +50,7 @@ RUN source $HOME/.local/bin/env && \
     source /opt/venv/bin/activate && \
     uv pip install nvitop && \
     uv pip install --no-cache-dir --upgrade pip && \
-    uv pip install --no-cache-dir --prerelease=allow./python[diffusion]
+    uv pip install --no-cache-dir --prerelease=allow ./python[diffusion]
 
 COPY . .
 

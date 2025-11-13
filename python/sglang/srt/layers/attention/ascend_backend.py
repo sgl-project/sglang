@@ -403,6 +403,11 @@ class AscendAttnBackend(AttentionBackend):
             assert (
                 layer.qk_head_dim != layer.v_head_dim
             ), "FIA only supports qk_head_dim != v_head_dim"
+
+            # Wait for the KV transfer to complete before performing attention computation.
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
             num_token_padding = q.shape[0]
             q, k, v = [
                 data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]

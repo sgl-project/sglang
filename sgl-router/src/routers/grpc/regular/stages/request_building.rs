@@ -2,15 +2,13 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use uuid::Uuid;
+use tracing::error;
 
 use super::{chat::ChatRequestBuildingStage, generate::GenerateRequestBuildingStage};
-use crate::{
-    grpc_client::proto,
-    routers::grpc::{
-        common::stages::PipelineStage,
-        context::{RequestContext, RequestType},
-    },
+use crate::routers::grpc::{
+    common::stages::PipelineStage,
+    context::{RequestContext, RequestType},
+    error as grpc_error,
 };
 
 /// Request building stage (delegates to endpoint-specific implementations)
@@ -35,15 +33,13 @@ impl PipelineStage for RequestBuildingStage {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
             RequestType::Responses(_request) => {
-                // Responses API builds request during the MCP loop
-                // For now, create minimal request - responses handler will populate it
-                let request_id = format!("resp-{}", Uuid::new_v4());
-
-                ctx.state.proto_request = Some(proto::GenerateRequest {
-                    request_id,
-                    ..Default::default()
-                });
-                Ok(None)
+                error!(
+                    function = "RequestBuildingStage::execute",
+                    "RequestType::Responses reached regular request building stage"
+                );
+                Err(grpc_error::internal_error(
+                    "RequestType::Responses reached regular request building stage",
+                ))
             }
         }
     }

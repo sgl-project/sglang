@@ -26,7 +26,7 @@ impl PipelineStage for DispatchMetadataStage {
             error::internal_error("Proto request not built")
         })?;
 
-        let request_id = proto_request.request_id.clone();
+        let request_id = proto_request.request_id().to_string();
         let model = match &ctx.input.request_type {
             RequestType::Chat(req) => req.model.clone(),
             RequestType::Generate(_req) => {

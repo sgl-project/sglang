@@ -3,31 +3,29 @@ set -euo pipefail
 
 # Get version from SGLang version.py file
 SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
-SGLANG_VERSION="v0.5.0rc0"   # Default version, will be overridden if version.py is found
+SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if version.py is found
 
-if [ -f "$SGLANG_VERSION_FILE" ]; then
-  VERSION_FROM_FILE=$(python3 -c '
-import re, sys
-with open(sys.argv[1], "r") as f:
-    content = f.read()
-    match = re.search(r"__version__\s*=\s*[\"'"'"'](.*?)[\"'"'"']", content)
-    if match:
-        print("v" + match.group(1))
-' "$SGLANG_VERSION_FILE" 2>/dev/null || echo "")
-
-  if [ -n "$VERSION_FROM_FILE" ]; then
+TMP_VERSION_FILE=$(mktemp)
+if git fetch origin main --quiet; then
+  if git show origin/main:python/sglang/version.py >"$TMP_VERSION_FILE" 2>/dev/null; then
+    VERSION_FROM_FILE="v$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)"
+    if [ -n "$VERSION_FROM_FILE" ]; then
       SGLANG_VERSION="$VERSION_FROM_FILE"
-      echo "Using SGLang version from version.py: $SGLANG_VERSION"
+      echo "Using SGLang version from origin/main: $SGLANG_VERSION"
+    else
+      echo "Warning: Could not parse version from origin/main; using default $SGLANG_VERSION" >&2
+    fi
   else
-      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using default: $SGLANG_VERSION" >&2
+    echo "Warning: version.py not found on origin/main; using default $SGLANG_VERSION" >&2
   fi
 else
-  echo "Warning: version.py not found, using default version: $SGLANG_VERSION" >&2
+  echo "Warning: failed to fetch origin/main; using default $SGLANG_VERSION" >&2
 fi
+rm -f "$TMP_VERSION_FILE"
 
 
 # Default base tags (can be overridden by command line arguments)
-DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm630-mi30x"
+DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi35x"
 
 # Parse command line arguments
@@ -121,9 +119,9 @@ find_latest_image() {
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
   echo "Using hard-coded fallback…" >&2
   if [[ "${gpu_arch}" == "mi35x" ]]; then
-    echo "rocm/sgl-dev:v0.5.0rc0-rocm700-mi35x-20250812"
+    echo "rocm/sgl-dev:v0.5.5-rocm700-mi35x-20251110"
   else
-    echo "rocm/sgl-dev:v0.5.0rc0-rocm630-mi30x-20250812"
+    echo "rocm/sgl-dev:v0.5.5-rocm700-mi30x-20251110"
   fi
 }
 
