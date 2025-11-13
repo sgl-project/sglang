@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.model_executor import model_runner as mr
-from sglang.test.test_utils import CustomTestCase
 from sglang.srt.server_args import ServerArgs
+from sglang.test.test_utils import CustomTestCase
 
 HOOK_CALLS = []
 
@@ -136,7 +136,7 @@ class TestModelRunnerHooks(CustomTestCase):
 
         cli_args = [
             "--model-path",
-            "Qwen/Qwen2-7B-Instruct", # Dummy value; not used in this test
+            "Qwen/Qwen2-7B-Instruct",  # Dummy value; not used in this test
             "--enable-hooks",
             "--hooks",
             json.dumps(hooks_spec),
