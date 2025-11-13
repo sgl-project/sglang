@@ -127,7 +127,7 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 fi
-
+$PIP_CMD uninstall xformers || true
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
