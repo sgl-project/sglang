@@ -71,6 +71,7 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    dst_completion_flag_ptr: int
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -97,6 +98,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            dst_completion_flag_ptr=int(msg[8].decode("ascii")),
         )
 
 
@@ -164,6 +166,25 @@ class MooncakeKVManager(CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+
+            self.num_completion_flags = get_int_env_var(
+                "SGLANG_DISAGGREGATION_PREFILL_NUM_COMPLETION_FLAGS", 1024
+            )
+            self.completion_flag_byte_size = np.dtype(np.int32).itemsize
+            self.completion_flag_buffers = [
+                np.array([1], dtype=np.int32) for _ in range(self.num_completion_flags)
+            ]
+            self.completion_flag_ptrs = [
+                buf.ctypes.data for buf in self.completion_flag_buffers
+            ]
+            self.engine.batch_register(
+                self.completion_flag_ptrs,
+                [self.completion_flag_byte_size] * self.num_completion_flags,
+            )
+            self.completion_flag_pool = self.completion_flag_ptrs.copy()
+            self.request_src_completion_flag_ptrs = {}
+            self.completion_flag_lock = threading.Lock()
+
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -203,6 +224,27 @@ class MooncakeKVManager(CommonKVManager):
                 check_mooncake_custom_mem_pool_enabled()
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+
+            self.num_completion_flags = get_int_env_var(
+                "SGLANG_DISAGGREGATION_DECODE_NUM_COMPLETION_FLAGS", 1024
+            )
+            self.completion_flag_byte_size = np.dtype(np.int32).itemsize
+            self.completion_flag_buffers = [
+                np.array([0], dtype=np.int32) for _ in range(self.num_completion_flags)
+            ]
+            self.completion_flag_ptrs = [
+                buf.ctypes.data for buf in self.completion_flag_buffers
+            ]
+            self.engine.batch_register(
+                self.completion_flag_ptrs,
+                [self.completion_flag_byte_size] * self.num_completion_flags,
+            )
+            self.completion_flag_pool = list(
+                zip(self.completion_flag_ptrs, self.completion_flag_buffers)
+            )
+            self.request_dst_completion_flag_ptrs = {}
+            self.completion_flag_lock = threading.Lock()
+
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
@@ -258,6 +300,14 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        # This "sync" function does not wait until the receiver completely
+        # receives the data. It is "sync" with respect to the async IO engine
+        # on the sender side. After this function returns, we used to unblock
+        # the receiver via the RPC channel, creating a race condition with
+        # the data transfer.
+        #
+        # A completion flag is now included at the end of the data transfer to
+        # unblock the receiver side.
         return self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
@@ -809,6 +859,7 @@ class MooncakeKVManager(CommonKVManager):
                                     executor,
                                 )
 
+                            ret = 0
                             if self.pp_group.is_last_rank:
                                 # Only the last chunk we need to send the aux data
                                 ret = self.send_aux(
@@ -816,7 +867,21 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk.prefill_aux_index,
                                     target_rank_registration_info.dst_aux_ptrs,
                                 )
-                            polls.append(True if ret == 0 else False)
+
+                            # Set the completion flag on the decode side
+                            ret_flag = 0
+                            assert req.dst_completion_flag_ptr != 0, "Destination completion flag pointer cannot be zero."
+                            src_ptr = self.request_src_completion_flag_ptrs[
+                                kv_chunk.room
+                            ]
+                            ret_flag = self.engine.batch_transfer_sync(
+                                req.mooncake_session_id,
+                                [src_ptr],
+                                [req.dst_completion_flag_ptr],
+                                [self.completion_flag_byte_size],
+                            )
+
+                            polls.append(True if ret == 0 and ret_flag == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
@@ -1090,6 +1155,19 @@ class MooncakeKVSender(CommonKVSender):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.conclude_state = None
         self.init_time = time.time()
+        with self.kv_mgr.completion_flag_lock:
+            if not self.kv_mgr.completion_flag_pool:
+                raise RuntimeError("Completion flag pool exhausted.")
+            ptr = self.kv_mgr.completion_flag_pool.pop()
+            self.kv_mgr.request_src_completion_flag_ptrs[self.bootstrap_room] = ptr
+
+    def _release_resources(self):
+        with self.kv_mgr.completion_flag_lock:
+            ptr = self.kv_mgr.request_src_completion_flag_ptrs.pop(
+                self.bootstrap_room, None
+            )
+            if ptr:
+                self.kv_mgr.completion_flag_pool.append(ptr)
 
     def send(
         self,
@@ -1146,6 +1224,7 @@ class MooncakeKVSender(CommonKVSender):
     def clear(self) -> None:
         if self.bootstrap_room in self.kv_mgr.request_status:
             self.kv_mgr.request_status.pop(self.bootstrap_room)
+        self._release_resources()
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
@@ -1167,6 +1246,7 @@ class MooncakeKVSender(CommonKVSender):
         )
         # Explicitly set the status to failure since this request has been aborted
         self.conclude_state = KVPoll.Failed
+        self._release_resources()
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
@@ -1185,10 +1265,26 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.session_id = mgr.get_session_id()
         self.conclude_state = None
         self.init_time = None
+        with mgr.completion_flag_lock:
+            if not mgr.completion_flag_pool:
+                raise RuntimeError("Completion flag pool exhausted.")
+            ptr, buf = mgr.completion_flag_pool.pop()
+            self.completion_flag_ptr = ptr
+            self.completion_flag_buf = buf
+            self.completion_flag_buf[0] = 0
+            mgr.request_dst_completion_flag_ptrs[bootstrap_room] = (ptr, buf)
         super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
 
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+
+    def _release_resources(self):
+        with self.kv_mgr.completion_flag_lock:
+            pair = self.kv_mgr.request_dst_completion_flag_ptrs.pop(
+                self.bootstrap_room, None
+            )
+            if pair:
+                self.kv_mgr.completion_flag_pool.append(pair)
 
     def _get_bootstrap_info_from_server(
         self, engine_rank, target_dp_group, target_pp_rank
@@ -1280,16 +1376,27 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
+                        str(self.completion_flag_ptr).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
-            status = self.kv_mgr.check_status(self.bootstrap_room)
-            if status in (KVPoll.Success, KVPoll.Failed):
-                self.conclude_state = status
-            elif status == KVPoll.WaitingForInput:
+            current_mgr_status = self.kv_mgr.check_status(self.bootstrap_room)
+
+            if current_mgr_status == KVPoll.Success:
+                if self.completion_flag_buf[0] != 1:
+                    return KVPoll.WaitingForInput # Continue waiting
+                else:
+                    logger.debug(f"[{self.bootstrap_room}] completion flag set.")
+                    self.completion_flag_buf[0] = 0 # Reset flag
+                    self.conclude_state = KVPoll.Success # Mark as truly successful
+                    return KVPoll.Success # Return success
+            elif current_mgr_status == KVPoll.Failed:
+                self.conclude_state = KVPoll.Failed
+                return KVPoll.Failed
+            elif current_mgr_status == KVPoll.WaitingForInput:
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
@@ -1304,9 +1411,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         )
                         self.conclude_state = KVPoll.Failed
                         return KVPoll.Failed
-
-            return status
-
+                return KVPoll.WaitingForInput # Still waiting for input
+            else: # KVPoll.Bootstrapping or other states
+                return current_mgr_status
         else:
             return self.conclude_state
 
@@ -1319,6 +1426,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
         if self.bootstrap_room in self.kv_mgr.prefill_response_tracker:
             self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room)
+
+        self._release_resources()
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
@@ -1340,6 +1449,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         )
         # Explicitly set the status to failure since this request has been aborted
         self.conclude_state = KVPoll.Failed
+        self._release_resources()
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
