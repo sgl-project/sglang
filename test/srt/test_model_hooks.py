@@ -129,7 +129,7 @@ class TestModelRunnerHooks(CustomTestCase):
             {
                 "name": "outer_and_inner_from_cli",
                 "target_modules": ["outer.0", "outer.1", "inner.*"],
-                "hook_factory": "test_model_hooks:dummy_hook_factory",
+                "hook_factory": ("test_model_hooks:dummy_hook_factory"),
                 "config": {"tag": "cli-hook"},
             }
         ]
