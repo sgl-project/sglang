@@ -20,21 +20,17 @@ Page-aligned memory pool.
 """
 
 import abc
-import logging
 from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.elasticmem_orchestrator import cu_page_size
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
-
-logger = logging.getLogger(__name__)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -131,8 +127,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
-        self.invalid_pages = None
-
         self.clear()
 
     def clear(self):
@@ -143,12 +137,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
-        if self.invalid_pages is None:
-            self.invalid_pages = torch.empty(
-                (0,), dtype=torch.int64, device=self.device
-            )
-        mask = ~torch.isin(self.free_pages, self.invalid_pages)
-        self.free_pages = self.free_pages[mask]
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -183,70 +171,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
-    def has_invalid(self) -> bool:
-        return len(self.invalid_pages) > 0
-
-    def disable(self, need_size: int) -> int:
-        self.merge_and_sort_free()
-        logger.debug(f"{(need_size, len(self.free_pages))=}")
-        if need_size > len(self.free_pages):
-            return 0
-
-        select_index = self.free_pages[-need_size:].tolist()
-        self.free_pages = self.free_pages[:-need_size]
-        unmap_num, pass_indices, proc_indices = self._kvcache.disable(select_index)
-
-        self.free_pages = torch.cat(
-            (
-                self.free_pages,
-                torch.tensor(pass_indices, dtype=torch.int64, device=self.device),
-            )
-        )
-        self.invalid_pages = torch.cat(
-            (
-                self.invalid_pages,
-                torch.tensor(proc_indices, dtype=torch.int64, device=self.device),
-            )
-        )
-
-        self.size = self._kvcache.size
-
-        return unmap_num
-
-    def enable(self, need_size: int) -> int:
-        expand_size = 0
-        invalid_size = len(self.invalid_pages)
-        if need_size > invalid_size:
-            expand_size = need_size - invalid_size
-        logger.debug(f"{(need_size, invalid_size, expand_size)=}")
-
-        self.invalid_pages, _ = torch.sort(self.invalid_pages)
-
-        select_index = self.invalid_pages[:need_size].tolist()
-        select_index.extend(
-            range(self.size + invalid_size, self.size + invalid_size + expand_size)
-        )
-
-        self.invalid_pages = self.invalid_pages[need_size:]
-        map_num, pass_indices, proc_indices = self._kvcache.enable(select_index)
-
-        self.invalid_pages = torch.cat(
-            (
-                self.invalid_pages,
-                torch.tensor(pass_indices, dtype=torch.int64, device=self.device),
-            )
-        )
-        self.release_pages = torch.cat(
-            (
-                self.release_pages,
-                torch.tensor(proc_indices, dtype=torch.int64, device=self.device),
-            )
-        )
-
-        self.size = self._kvcache.size
-
-        return map_num
-
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
@@ -264,29 +188,31 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self.full_attn_allocator = TokenToKVPoolAllocator(
-            size,
-            dtype,
-            device,
-            kvcache.full_kv_pool,
-            need_sort,
-        )
-        self.swa_attn_allocator = TokenToKVPoolAllocator(
-            size_swa,
-            dtype,
-            device,
-            kvcache.swa_kv_pool,
-            need_sort,
-        )
-        # expand as full pool may expand
-        self.full_to_swa_index_mapping = torch.empty(
-            (size + size_swa + 1) * 10,
-            dtype=torch.int64,
-            device=device,
-        )
+        self._create_allocator()
         self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
+
+    def _create_allocator(self):
+        self.full_attn_allocator = TokenToKVPoolAllocator(
+            self._size_full,
+            self.dtype,
+            self.device,
+            self._kvcache.full_kv_pool,
+            self.need_sort,
+        )
+        self.swa_attn_allocator = TokenToKVPoolAllocator(
+            self._size_swa,
+            self.dtype,
+            self.device,
+            self._kvcache.swa_kv_pool,
+            self.need_sort,
+        )
+        self.full_to_swa_index_mapping = torch.empty(
+            self._size_full + self._size_swa + 1,
+            dtype=torch.int64,
+            device=self.device,
+        )
 
     def available_size(self):
         raise NotImplementedError()
@@ -367,41 +293,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping.fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
-
-    def has_invalid(self, is_swa: bool = True) -> bool:
-        if is_swa:
-            return self.swa_attn_allocator.has_invalid()
-        else:
-            return self.full_attn_allocator.has_invalid()
-
-    def cu_page_to_token(
-        self, cu_page_num: int, layer_num: int, state_memsize: int
-    ) -> int:
-        cu_mem = cu_page_num * cu_page_size
-        cu_mem_per_kv_layer = cu_mem // 2 // layer_num
-        token_num = cu_mem_per_kv_layer // state_memsize
-        return token_num
-
-    def transfer_token(self, token_num: int, swa_to_full: bool = True) -> None:
-        allocator_disable = (
-            self.swa_attn_allocator if swa_to_full else self.full_attn_allocator
-        )
-        allocator_enable = (
-            self.full_attn_allocator if swa_to_full else self.swa_attn_allocator
-        )
-
-        unmap_num = allocator_disable.disable(token_num)
-        need_size = self.cu_page_to_token(
-            unmap_num,
-            allocator_enable._kvcache.layer_num,
-            allocator_enable._kvcache.state_memsize,
-        )
-        map_num = allocator_enable.enable(need_size)
-
-        self._size_swa = self.swa_attn_allocator.size
-        self._size_full = self.full_attn_allocator.size
-
-        logger.info(f"{(unmap_num, map_num)=}, {(self._size_swa, self._size_full)=}")
 
 
 @triton.jit

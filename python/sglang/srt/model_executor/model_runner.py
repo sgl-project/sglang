@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.elastic_allocator import ElasticSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.elastic_memory_pool import ElasticSWAKVPool
 from sglang.srt.mem_cache.elasticmem_orchestrator import use_elasticmem
 from sglang.srt.mem_cache.memory_pool import (
@@ -1779,7 +1780,12 @@ class ModelRunner:
             else:
                 if self.page_size == 1:
                     if self.is_hybrid:
-                        self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        swa_allocator_class = (
+                            ElasticSWATokenToKVPoolAllocator
+                            if use_elasticmem
+                            else SWATokenToKVPoolAllocator
+                        )
+                        self.token_to_kv_pool_allocator = swa_allocator_class(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
