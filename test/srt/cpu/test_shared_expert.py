@@ -68,8 +68,6 @@ class TestSharedExpert(CustomTestCase):
             None,
             None,
             None,
-            None,
-            None,
             False,
         )
 
@@ -125,8 +123,6 @@ class TestSharedExpert(CustomTestCase):
             False,
             w1_s,
             w2_s,
-            None,
-            None,
             None,
             False,
         )
@@ -198,8 +194,6 @@ class TestSharedExpert(CustomTestCase):
             w1s,
             w2s,
             [BLOCK_N, BLOCK_K],
-            None,
-            None,
             True,
         )
 
