@@ -144,7 +144,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         assert "weight_loader" in extra_weight_attrs
 
         # Fused gate_up_proj (column parallel)
-        w13_weight_packed = torch.nn.Parameter(
+        w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 intermediate_size_per_partition * 2,
@@ -153,11 +153,11 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight_packed", w13_weight_packed)
-        set_weight_attrs(w13_weight_packed, extra_weight_attrs)
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
 
         # down_proj (row parallel)
-        w2_weight_packed = torch.nn.Parameter(
+        w2_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 hidden_size,
@@ -166,8 +166,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_packed", w2_weight_packed)
-        set_weight_attrs(w2_weight_packed, extra_weight_attrs)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
 
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
@@ -181,7 +181,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
@@ -193,7 +193,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # Input scales
@@ -212,7 +212,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
         # Pre-populate the strides
-        device = layer.w13_weight_packed.device
+        device = layer.w13_weight.device
 
         self.a_strides1 = torch.full(
             (num_experts, 3),
@@ -257,22 +257,22 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: Module) -> None:
         dtype = torch.bfloat16
-        device = layer.w2_weight_packed.device
+        device = layer.w2_weight.device
 
         # Interleave w13_weight_scale (gate_up_proj)
-        w13_weight_scale = layer.w13_weight_scale.to(dtype)
+        w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
         w13_weight_scale = interleave_scales(w13_weight_scale)
-        layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
 
         # Interleave w2_weight_scale (down_proj)
-        w2_weight_scale = layer.w2_weight_scale.to(dtype)
+        w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
         w2_weight_scale = interleave_scales(w2_weight_scale)
-        layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+        layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
         w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
         new_w13_input_scale = torch.tensor(
-            [1],
+            [w13_input_scale_max],
             dtype=dtype,
             device=device,
         )
@@ -280,7 +280,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         w2_input_scale_max = layer.w2_input_scale.max().to(dtype).item()
         new_w2_input_scale = torch.tensor(
-            [1], dtype=dtype, device=device
+            [w2_input_scale_max], dtype=dtype, device=device
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
@@ -305,10 +305,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         output = cutlass_w4a8_moe(
             x,
-            layer.w13_weight_packed,
-            layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
             topk_weights,
             topk_ids,
             self.a_strides1,
@@ -341,10 +341,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         output = cutlass_w4a8_moe_deepep_ll(
             hidden_states,
-            layer.w13_weight_packed,
-            layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
             topk_ids,
             masked_m,
             layer.quant_method.a_strides1,
@@ -385,11 +385,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         if num_tokens > 0:
             return cutlass_w4a8_moe_deepep_normal(
                 hidden_states,
-                hidden_states,
-                layer.w13_weight_packed,
-                layer.w2_weight_packed,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
                 topk_weights,
                 topk_idx,
                 self.a_strides1,
