@@ -31,6 +31,9 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_decode_cuda_graph_runner import (
+    EAGLEDecodeCudaGraphRunner,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -211,6 +214,7 @@ class EAGLEWorker(TpModelWorker):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
+        self.cuda_graph_runner_for_decode = None
 
         if self.server_args.disable_cuda_graph or _is_npu:
             return
@@ -241,6 +245,20 @@ class EAGLEWorker(TpModelWorker):
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            )
+        
+        # Capture decode
+        if self.server_args.speculative_batch_size_threshold is not None:
+            self.cuda_graph_runner_for_decode = EAGLEDecodeCudaGraphRunner(self)
+            tic = time.perf_counter()
+            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture decode cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            )
+            self.cuda_graph_runner_for_decode.capture()
+            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture decode cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
     @property

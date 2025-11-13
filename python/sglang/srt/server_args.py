@@ -394,6 +394,8 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    # Dynamic speculative decoding
+    speculative_batch_size_threshold: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -2807,7 +2809,13 @@ class ServerArgs:
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
         )
-
+        # Dynamic Speculative Decoding
+        parser.add_argument(
+            "--speculative-batch-size-threshold",
+            type=int,
+            default=ServerArgs.speculative_batch_size_threshold,
+            help="The threshold batch size to turn off speculative decode afterwards.",
+        )
         # Expert parallelism
         parser.add_argument(
             "--expert-parallel-size",

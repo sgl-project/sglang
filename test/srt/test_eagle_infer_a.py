@@ -1,5 +1,6 @@
 import unittest
 
+import os
 import requests
 import torch
 import asyncio
@@ -25,8 +26,8 @@ torch_dtype = torch.float16
 prefill_tolerance = 5e-2
 decode_tolerance: float = 5e-2
 
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714"
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693"
+DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "/shared/public/sharing/yubwang/Qwen3-4B_eagle3_lss/Qwen3-4B_eagle3"
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "/shared/public/elr-models/Qwen/Qwen3-4B/9e1b55c76f4b5bf0d14d37da8010110060f512e0"
 
 async def async_stream_ramp_up(engine, prompts, params, tokens_per_request: int, tokenizer):
     outputs = [""] * len(prompts)
@@ -86,6 +87,8 @@ class TestEAGLEEngine(CustomTestCase):
     }
 
     def setUp(self):
+        print("setup being called!!!!!!!!!!!")
+        os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         self.prompt = "Today is a sunny day and I like"
         self.sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
@@ -94,6 +97,9 @@ class TestEAGLEEngine(CustomTestCase):
         )
         self.ref_output = ref_engine.generate(self.prompt, self.sampling_params)["text"]
         ref_engine.shutdown()
+
+    def tearDown(self):
+        del os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"]
 
     def test_correctness(self):
         configs = [
@@ -216,16 +222,16 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_algorithm": "EAGLE3",
         "speculative_num_steps": 5,
         "speculative_eagle_topk": 3,
-        "speculative_num_draft_tokens": 15,
+        "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
-        # "cuda_graph_max_bs": 4,
+        "cuda_graph_max_bs": 2,
         "dtype": "float16",
-        "disable_cuda_graph": True,
+        "disable_cuda_graph": False,
         "attention_backend": "fa3",
         "watchdog_timeout": 30000,
         "skip_server_warmup": True,
         "base_gpu_id": base_gpu_id,
-        "enable_torch_compile": False,
+        "speculative_batch_size_threshold": 2,
     }
     NUM_CONFIGS = 1
     THRESHOLDS = {

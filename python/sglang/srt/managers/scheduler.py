@@ -1961,7 +1961,7 @@ class Scheduler(
 
         # Update speculative decoding enablement flag for the current batch
         if not self.spec_algorithm.is_none() and batch is not None:
-            threshold = envs.SGLANG_SPEC_DECODE_BATCH_SIZE_THRESHOLD.get()
+            threshold = self.server_args.speculative_batch_size_threshold
             previous_enabled = batch.is_spec_enabled_for_batch
             batch.is_spec_enabled_for_batch = threshold is None or batch.batch_size() <= threshold
             if previous_enabled and not batch.is_spec_enabled_for_batch:
