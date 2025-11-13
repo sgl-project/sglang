@@ -170,6 +170,9 @@ jobs:
           pip uninstall -y sglang-router
           maturin build --profile ci --features vendored-openssl
           pip install target/wheels/*.whl
+          python3 -m pip install --upgrade --no-cache-dir --ignore-installed blinker
+          python3 -m pip install --upgrade --no-cache-dir --ignore-installed genai-bench==0.0.2
+          genai-bench --version
 
       - name: Run Python unit tests
         run: |
