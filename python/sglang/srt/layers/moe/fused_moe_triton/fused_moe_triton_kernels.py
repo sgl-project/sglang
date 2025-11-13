@@ -808,23 +808,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
-'''
-_DB_CACHE: Dict[tuple, Dict[str, Dict[str, Any]]] = {}
-
-@functools.lru_cache(maxsize=None)
-def _load_db(topk: int, hidden: int, dtype: str) -> Dict[str, Dict[str, Any]]:
-    dtype_clean = str(dtype).replace("torch.", "").strip()
-    file_name = f"moe_sum_reduce_t{topk}_h{hidden}_{dtype_clean}.json"
-    file_path = pathlib.Path(__file__).with_name(file_name)
-
-    if not file_path.exists():
-        warnings.warn(f"Config file '{file_name}' missing �[m~F~R use default.", UserWarning)
-        return {}
-
-    return json.loads(file_path.read_text())
-'''
-
-
 def _dev_tag() -> str:
     return torch.cuda.get_device_name(0).replace(" ", "-").replace("_", "-")
 
