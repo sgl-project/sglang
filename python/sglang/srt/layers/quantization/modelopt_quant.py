@@ -1451,7 +1451,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = _slice_scale(w2_input_scale)
 
             if CUTEDSL_MOE_NVFP4_DISPATCH:
-                assert torch.all(w13_input_scale == w13_input_scale[0])
+                # When using dummy weights (e.g., during compile_deep_gemm), the input scales
+                # may have random values. In this case, use the first scale for all experts.
+                if not torch.all(w13_input_scale == w13_input_scale[0]):
+                    # Check if we're in precompile stage or using dummy weights
+                    if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
+                        logger.warning_once(
+                            "w13_input_scale values differ across experts during DeepGEMM precompile. "
+                            "Using the first expert's scale for all experts."
+                        )
+                        w13_input_scale = w13_input_scale[0].repeat(len(w13_input_scale))
+                    else:
+                        raise AssertionError(
+                            f"CUTEDSL_MOE_NVFP4_DISPATCH requires all experts to have identical input scales. "
+                            f"Got {w13_input_scale}. Consider setting SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE=1."
+                        )
                 w13_input_scale = w13_input_scale[0]
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
