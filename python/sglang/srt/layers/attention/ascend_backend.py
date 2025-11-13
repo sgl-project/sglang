@@ -1016,7 +1016,7 @@ class AscendAttnBackend(AttentionBackend):
             or self.use_mla
             or (not self.use_fia and layer.qk_head_dim > 128)
         ):
-            logger.error(
+            raise NotImplementedError(
                 "The 'enable-mixed-chunk' feature is currently unsupported in the following scenarios: "
                 "1. When using the MLA backend on Ascend NPU devices, "
                 "2. When using the deepseekv3.2 model on Ascend NPU devices, "
