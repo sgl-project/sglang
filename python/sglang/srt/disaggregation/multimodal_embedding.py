@@ -10,14 +10,13 @@
 from __future__ import annotations
 
 import logging
-import time
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
+from sglang.srt.disaggregation.base import KVArgs, KVPoll
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -39,7 +38,7 @@ from sglang.srt.managers.schedule_batch import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
 
 
 logger = logging.getLogger(__name__)
@@ -316,7 +315,7 @@ class SchedulerDisaggregationMultimodalEmbeddingMixin:
         last_chunk: bool = False,
     ):
         assert last_chunk == True
-        if last_chunk:
+        if not isinstance(req.disagg_embedding_sender, FakeKVSender):
             self.disagg_metadata_buffers.set_buf(req)
 
         # Send using block_indices

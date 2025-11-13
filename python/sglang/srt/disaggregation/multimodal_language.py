@@ -10,17 +10,13 @@
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import os
-import re
-import threading
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Deque, List, Tuple
 
-import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
@@ -45,7 +41,6 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DynamicGradMode
 
 if TYPE_CHECKING:
@@ -458,12 +453,16 @@ class MultimodalLanguageTransferQueue:
                             continue
 
                         # Only after successful allocation, cache partial data and free old allocation
-                        language_req.partial_input_embeds = embedding_data
-                        language_req.partial_fill_ids = fill_ids.tolist()
-                        language_req.partial_mrope_positions = mrope_positions
-                        language_req.partial_aux_datas = aux_datas
+                        language_req.partial_input_embeds = embedding_data.clone()
+                        language_req.partial_mrope_positions = mrope_positions.clone()
+                        language_req.partial_aux_datas = aux_datas.clone()
+                        language_req.partial_deepstack_embedding = (
+                            deepstack_embedding.clone()
+                            if deepstack_embedding is not None
+                            else None
+                        )
                         language_req.partial_sent_tokens = sent_tokens
-                        language_req.partial_deepstack_embedding = deepstack_embedding
+                        language_req.partial_fill_ids = fill_ids.tolist()
 
                         # Free old allocation
                         self.req_to_metadata_buffer_idx_allocator.free(

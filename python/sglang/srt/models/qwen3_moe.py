@@ -673,7 +673,11 @@ class Qwen3MoeModel(Qwen2MoeModel):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process deepstack embeddings for first 3 layers (if provided)."""
-        if self._input_deepstack_embeds is not None and layer_idx in range(3):
+        if (
+            self._input_deepstack_embeds is not None
+            and self._input_deepstack_embeds.numel() > 0
+            and layer_idx in range(3)
+        ):
             sep = self.hidden_size * layer_idx
             hidden_states.add_(
                 self._input_deepstack_embeds[:, sep : sep + self.hidden_size]
