@@ -123,15 +123,8 @@ class RadixAttention(nn.Module):
             torch.ops.sglang.unified_attention_with_output(
                 q, k, v, output, save_kv_cache, self.layer_id, **kwargs
             )
-            if not is_in_piecewise_cuda_graph():
-                print(f"piece unified", flush=True)
-                if self.layer_id == 0:
-                    timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    torch.save(output, f"output_{timestamp}.pt")
             return output
         else:
-            if not is_in_piecewise_cuda_graph():
-                print(f"piece normal", flush=True)
             return forward_batch.attn_backend.forward(
                 q,
                 k,

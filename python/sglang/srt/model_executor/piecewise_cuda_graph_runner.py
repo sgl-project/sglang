@@ -466,9 +466,9 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
-            assert (
-                forward_batch.input_deepstack_embeds is not None
-            ), "input_deepstack_embeds is required"
+            # assert (
+            #     forward_batch.input_deepstack_embeds is not None
+            # ), "input_deepstack_embeds is required"
             with set_forward_context(
                 forward_batch, self.attention_layers, self.quant_config
             ):
@@ -553,11 +553,11 @@ class PiecewiseCudaGraphRunner:
             )
             input_deepstack_embeds = self.input_deepstack_embeds[:static_num_tokens]
 
-        print(f"input_embeds.shape={input_embeds.shape}")
-        print(f"input_deepstack_embeds.shape={input_deepstack_embeds.shape}")
-        print(f"{input_embeds.reshape(-1)[:10]=}")
-        print(f"{input_deepstack_embeds.reshape(-1)[:10]=}")
-        print(f"", flush=True)
+        # print(f"input_embeds.shape={input_embeds.shape}")
+        # print(f"input_deepstack_embeds.shape={input_deepstack_embeds.shape}")
+        # print(f"{input_embeds.reshape(-1)[:10]=}")
+        # print(f"{input_deepstack_embeds.reshape(-1)[:10]=}")
+        # print(f"", flush=True)
         static_forward_batch = ForwardBatch(
             forward_mode=forward_batch.forward_mode,
             batch_size=bs,
