@@ -145,6 +145,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_clamp_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
+        is_gated: bool = True,
     ):
         super().__init__()
         if params_dtype is None:
@@ -208,6 +209,7 @@ class FusedMoE(torch.nn.Module):
             routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
+            is_gated=is_gated,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -326,7 +328,6 @@ class FusedMoE(torch.nn.Module):
         tp_rank: int,
         is_bias: bool = False,
     ):
-
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         assert shard_id in {"w1", "w3", "w13"}
@@ -335,10 +336,12 @@ class FusedMoE(torch.nn.Module):
             # if this weight is a bias, the last dimension must be the sharded dimension
             shard_dim = -1
 
-        if shard_id in {"w1", "w3"}:
+        if shard_id in {"w1", "w3"} and self.moe_runner_config.is_gated:
             # non-fused version
             shard_size = expert_data.shape[shard_dim] // 2
-        elif shard_id in {"w13"}:
+        elif shard_id in {"w13"} or (
+            shard_id in {"w1", "w3"} and not self.moe_runner_config.is_gated
+        ):
             # fused version
             shard_size = expert_data.shape[shard_dim]
         else:
@@ -460,7 +463,6 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         tp_rank: int,
     ):
-
         if shard_id == "w2":
             self._load_w2(
                 shard_id=shard_id,
@@ -497,7 +499,6 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: Optional[int],
     ) -> None:
-
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
@@ -586,7 +587,6 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-
         tp_rank = self.moe_tp_rank
 
         # compressed-tensors checkpoints with packed weights are stored flipped
@@ -609,9 +609,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(
-                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
-            )
+            raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
         if get_moe_runner_backend().is_flashinfer_trtllm() and (
@@ -810,7 +808,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         if shard_id not in ("w13", "w2"):
-            raise ValueError(f"shard_id must be ['w13','w2'] but " f"got {shard_id}.")
+            raise ValueError(f"shard_id must be ['w13','w2'] but got {shard_id}.")
 
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
@@ -903,7 +901,6 @@ class FusedMoE(torch.nn.Module):
         ckpt_up_proj_name: str,
         num_experts: int,
     ) -> List[Tuple[str, str, int, str]]:
-
         return [
             # (param_name, weight_name, expert_id, shard_id)
             (
@@ -1003,6 +1000,9 @@ class FlashInferFusedMoE(FusedMoE):
         assert (
             self.num_fused_shared_experts == 0
         ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+        assert (
+            self.moe_runner_config.is_gated
+        ), "Only gated MoEs are supported for flashinfer blockscale fp8 moe"
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -1069,6 +1069,10 @@ class FlashInferFP4MoE(FusedMoE):
             topk_output: TopKOutput object with Bypassed format
         """
         assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+
+        assert (
+            self.moe_runner_config.is_gated
+        ), "Only gated MoEs are supported for flashinfer fp4 moe"
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
