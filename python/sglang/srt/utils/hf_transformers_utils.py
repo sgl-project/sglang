@@ -37,6 +37,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs import (
+    AfmoeConfig,
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
@@ -61,6 +62,7 @@ from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_P
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
+    AfmoeConfig,
     ChatGLMConfig,
     DbrxConfig,
     ExaoneConfig,
