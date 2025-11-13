@@ -90,7 +90,7 @@
     "image_edit": {
       "notes": "Rabbit color-edit scenario with a single uploaded reference image, Qwen/Qwen-Image-Edit",
       "stages_ms": {
-        "InputValidationStage": 9.5,
+        "InputValidationStage": 18,
         "TextEncodingStage": 1084.46,
         "ConditioningStage": 0.13,
         "TimestepPreparationStage": 13.78,
