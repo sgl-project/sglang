@@ -24,17 +24,15 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from sglang.srt.utils import get_int_env_var
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Req
 from typing import Any, Dict, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
-tracing_enabled = False
+opentelemetry_initialized = False
 _trace_context_propagator = None
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
@@ -69,10 +67,6 @@ except ImportError:
     logger.info("opentelemetry package is not installed, tracing disabled")
 
 
-def is_tracing_enabled() -> bool:
-    return tracing_enabled
-
-
 def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
     return {h: headers[h] for h in TRACE_HEADERS if h in headers}
 
@@ -88,36 +82,38 @@ class SglangTraceThreadInfo:
 
 
 @dataclass
+class SglangTraceEvent:
+    event_name: str
+    ts: int
+    attrs: Dict[str, Any]
+
+
+@dataclass
 class SglangTraceSliceContext:
     slice_name: str
+    start_time_ns: int
+    end_time_ns: Optional[int] = None
     span: Optional[trace.span.Span] = None
     # When True, defers slice_name assignment until trace_slice_end()
     anonymous: bool = False
+    # For nested slices, if parent slice is anonymous,
+    # child slice will be create lazily ultil parent slice_name is assigned.
+    lazy_flag: bool = False
+    level: int = 1
+    attrs: Optional[Dict[str, Any]] = None
+    events: Optional[List[SglangTraceEvent]] = None
+    parent_slice: Optional[SglangTraceSliceContext] = None
+    child_slices: Optional[List[SglangTraceSliceContext]] = None
+    prev_span_context: Optional[trace.span.SpanContext] = None
 
 
 @dataclass
 class SglangTraceThreadContext:
     thread_info: SglangTraceThreadInfo
-    cur_slice_stack: List[SglangTraceSliceContext]
+    cur_slice: Optional[SglangTraceSliceContext] = None
     thread_span: Optional[trace.span.Span] = None
     # Record the most recently completed span as the previous span for the next span to be created.
     last_span_context: Optional[trace.span.SpanContext] = None
-
-
-@dataclass
-class SglangTraceReqContext:
-    rid: str
-    start_time_ns: int
-    threads_context: Dict[int, SglangTraceThreadContext]
-    bootstrap_room: Optional[int] = None
-
-    # Indicates whether this instance is a replica from the main process.
-    # When True, root_span is None and only root_span_context is preserved.
-    is_copy: bool = False
-    bootstrap_room_span: Optional[trace.span.Span] = None
-    bootstrap_room_span_context: Optional[context.Context] = None
-    root_span: Optional[trace.span.Span] = None
-    root_span_context: Optional[context.Context] = None
 
 
 @dataclass
@@ -138,10 +134,12 @@ class SglangTracePropagateContext:
                 },
             }
         else:
-            return {"root_span": carrier, "prev_span": "None"}
+            return {"root_span": carrier, "prev_span": None}
 
     @classmethod
     def instance_from_dict(cls, d):
+        if not isinstance(d, dict):
+            return None
         if "root_span" not in d or "prev_span" not in d:
             return None
 
@@ -181,9 +179,10 @@ class SglangTraceCustomIdGenerator(id_generator.IdGenerator):
 # global variables
 remote_trace_contexts: Dict[str, SglangTracePropagateContext] = {}
 threads_info: Dict[int, SglangTraceThreadInfo] = {}
-reqs_context: Dict[str, SglangTraceReqContext] = {}
 
-__get_cur_time_ns = lambda: int(time.time() * 1e9)
+get_cur_time_ns = lambda: int(time.time() * 1e9)
+if hasattr(time, "time_ns"):
+    get_cur_time_ns = lambda: int(time.time_ns())
 
 
 def __get_host_id() -> str:
@@ -208,10 +207,10 @@ def __get_host_id() -> str:
 
 # Should be called by each tracked process.
 def process_tracing_init(otlp_endpoint, server_name):
-    global tracing_enabled
-    global __get_cur_time_ns
+    global opentelemetry_initialized
+    global get_cur_time_ns
     if not opentelemetry_imported:
-        tracing_enabled = False
+        opentelemetry_initialized = False
         return
 
     try:
@@ -241,13 +240,14 @@ def process_tracing_init(otlp_endpoint, server_name):
     except Exception as e:
         logger.error(f": initialize opentelemetry error:{e}")
         logger.warning("pelease set correct otlp endpoint")
-        tracing_enabled = False
+        opentelemetry_initialized = False
         return
 
-    if hasattr(time, "time_ns"):
-        __get_cur_time_ns = lambda: int(time.time_ns())
+    opentelemetry_initialized = True
 
-    tracing_enabled = True
+
+def get_opentelemetry_initialized():
+    return opentelemetry_initialized
 
 
 def get_otlp_span_exporter(endpoint):
@@ -270,7 +270,7 @@ def get_otlp_span_exporter(endpoint):
 def trace_set_thread_info(
     thread_label: str, tp_rank: Optional[int] = None, dp_rank: Optional[int] = None
 ):
-    if not tracing_enabled:
+    if not opentelemetry_initialized:
         return
 
     pid = threading.get_native_id()
@@ -287,129 +287,451 @@ def trace_set_thread_info(
     )
 
 
-def __create_thread_context(pid, req_span_context, ts: Optional[int] = None):
-    if pid not in threads_info:
-        trace_set_thread_info("unknown")
+class SglangTraceReqContext:
+    def __init__(
+        self,
+        rid,
+        bootstrap_room=None,
+        role="null",
+        tracing_enable=False,
+        trace_level=1,
+    ):
+        self.tracing_enable: bool = tracing_enable and opentelemetry_initialized
+        if not self.tracing_enable:
+            return
 
-    thread_info = threads_info[pid]
-    thread_context = SglangTraceThreadContext(
-        thread_info=thread_info,
-        cur_slice_stack=[],
-    )
+        self.rid: str = str(rid)
+        self.start_time_ns: Optional[int] = None
+        self.thread_context: Optional[SglangTraceThreadContext] = None
+        self.bootstrap_room: Optional[int] = bootstrap_room
+        self.role: str = role
 
-    thread_name = f"{thread_info.thread_label}"
-    if thread_info.tp_rank is not None:
-        thread_name += f" [TP {thread_info.tp_rank}] "
-    thread_name += f"(host:{thread_info.host_id[:8]} | pid:{pid})"
-    ts = ts or __get_cur_time_ns()
-    thread_context.thread_span = thread_context.thread_info.tracer.start_span(
-        name=thread_name,
-        start_time=ts,
-        context=req_span_context,
-    )
+        self.tracing_enable: bool = tracing_enable
+        self.trace_level = trace_level
 
-    if thread_info.tp_rank is not None:
-        thread_context.thread_span.set_attributes({"tp_rank": thread_info.tp_rank})
+        # Indicates whether this instance is a replica from the main process.
+        # When True, root_span is None and only root_span_context is preserved.
+        self.is_copy: bool = False
+        self.bootstrap_room_span: Optional[trace.span.Span] = None
+        self.bootstrap_room_span_context: Optional[context.Context] = None
+        self.root_span: Optional[trace.span.Span] = None
+        self.root_span_context: Optional[context.Context] = None
 
-    thread_context.thread_span.set_attributes(
-        {
-            "host_id": thread_info.host_id,
-            "pid": thread_info.pid,
-            "thread_label": thread_info.thread_label,
-        }
-    )
+        self.pid: int = threading.get_native_id()
 
-    return thread_context
+    def is_tracing_enabled(self) -> bool:
+        return self.tracing_enable
 
+    def __create_thread_context(self, ts: int):
+        if self.pid not in threads_info:
+            trace_set_thread_info("unknown")
 
-def trace_get_proc_propagate_context(
-    rid, remote_propagate=False
-) -> Optional[Dict[str, Any]]:
-    if not tracing_enabled:
-        return None
-
-    rid = str(rid)
-    if rid not in reqs_context or not reqs_context[rid].root_span_context:
-        return None
-
-    pid = threading.get_native_id()
-    prev_span_context = None
-    thread_context = reqs_context[rid].threads_context[pid]
-    if thread_context.cur_slice_stack:
-        cur_slice_info = thread_context.cur_slice_stack[0]
-        prev_span_context = cur_slice_info.span.get_span_context()
-    elif thread_context.last_span_context:
-        prev_span_context = thread_context.last_span_context
-
-    root_span_context = reqs_context[rid].root_span_context
-    if remote_propagate:
-        root_span_context = reqs_context[rid].bootstrap_room_span_context
-
-    trace_context = SglangTracePropagateContext(root_span_context, prev_span_context)
-    return trace_context.to_dict()
-
-
-def trace_set_proc_propagate_context(rid, trace_context: Optional[Dict[str, Any]]):
-    if not tracing_enabled:
-        return
-    if not trace_context:
-        return
-
-    trace_context = SglangTracePropagateContext.instance_from_dict(trace_context)
-    if not trace_context:
-        return
-
-    rid = str(rid)
-    # Create a copy of the request context
-    if rid not in reqs_context:
-        reqs_context[rid] = SglangTraceReqContext(
-            rid=rid,
-            start_time_ns=__get_cur_time_ns(),
-            threads_context={},
-            root_span_context=trace_context.root_span_context,
-            is_copy=True,
+        thread_info = threads_info[self.pid]
+        thread_context = SglangTraceThreadContext(
+            thread_info=thread_info,
         )
 
-    pid = threading.get_native_id()
+        thread_name = f"{thread_info.thread_label}"
+        if thread_info.tp_rank is not None:
+            thread_name += f" [TP {thread_info.tp_rank}] "
+        thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
+        thread_context.thread_span = thread_context.thread_info.tracer.start_span(
+            name=thread_name,
+            start_time=ts,
+            context=self.root_span_context,
+        )
 
-    if pid in reqs_context[rid].threads_context:
-        return
+        if thread_info.tp_rank is not None:
+            thread_context.thread_span.set_attributes({"tp_rank": thread_info.tp_rank})
 
-    # Create new thread context.
-    reqs_context[rid].threads_context[pid] = __create_thread_context(
-        pid,
-        trace_context.root_span_context,
-        reqs_context[rid].start_time_ns,
-    )
+        thread_context.thread_span.set_attributes(
+            {
+                "host_id": thread_info.host_id,
+                "pid": thread_info.pid,
+                "thread_label": thread_info.thread_label,
+            }
+        )
 
-    reqs_context[rid].threads_context[
-        pid
-    ].last_span_context = trace_context.prev_span_context
+        return thread_context
+
+    def trace_get_proc_propagate_context(
+        self, remote_propagate=False
+    ) -> Optional[Dict[str, Any]]:
+        if not self.tracing_enable:
+            return None
+
+        if not self.root_span_context:
+            return None
+
+        prev_span_context = None
+        if self.thread_context.cur_slice:
+            cur_slice = self.thread_context.cur_slice
+            if cur_slice.span:
+                prev_span_context = cur_slice.span.get_span_context()
+
+        if not prev_span_context:
+            # may be None
+            prev_span_context = self.thread_context.last_span_context
+
+        root_span_context = self.root_span_context
+        if remote_propagate:
+            root_span_context = self.bootstrap_room_span_context
+
+        trace_context = SglangTracePropagateContext(
+            root_span_context, prev_span_context
+        )
+        return trace_context.to_dict()
+
+    def trace_set_proc_propagate_context(self, trace_context: Optional[Dict[str, Any]]):
+        if not self.tracing_enable:
+            return
+
+        self.start_time_ns = get_cur_time_ns()
+        self.is_copy = True
+
+        trace_context = SglangTracePropagateContext.instance_from_dict(trace_context)
+        if not trace_context:
+            self.tracing_enable = False
+        else:
+            self.root_span_context = trace_context.root_span_context
+
+        self.thread_context = self.__create_thread_context(self.start_time_ns)
+        if self.tracing_enable:
+            self.thread_context.last_span_context = trace_context.prev_span_context
+
+    def trace_req_start(self, ts: Optional[int] = None, external_trace_header: Optional[Dict[str, str]] = None):
+        if not self.tracing_enable:
+            return
+
+        ts = ts or get_cur_time_ns()
+
+        # create req context and root span
+        bootstrap_room = 0 if self.bootstrap_room is None else self.bootstrap_room
+        self.start_time_ns = ts
+
+        # create bootstrap room span
+        tracer = threads_info[self.pid].tracer
+        if str(bootstrap_room) not in remote_trace_contexts:
+            attrs = {"bootstrap_room": str(hex(bootstrap_room))}
+            external_trace_context = _trace_context_propagator.extract(
+                external_trace_header
+            )
+            bootstrap_room_span = tracer.start_span(
+                name=f"Bootstrap Room {hex(bootstrap_room)}",
+                start_time=ts,
+                attributes=attrs,
+                context=external_trace_context,
+            )
+            self.bootstrap_room_span = bootstrap_room_span
+            self.bootstrap_room_span_context = trace.set_span_in_context(
+                bootstrap_room_span
+            )
+        else:
+            self.bootstrap_room_span_context = remote_trace_contexts[
+                str(bootstrap_room)
+            ].root_span_context
+
+        # Drop the worker_id added by MultiTokenizer
+        orig_rid = self.rid.split("_")[-1]
+        role = "" if self.role == "null" else self.role
+        attrs = {"rid": orig_rid}
+        root_span = tracer.start_span(
+            name=f"{role} Req {orig_rid[:8]}",
+            start_time=ts,
+            context=self.bootstrap_room_span_context,
+            attributes=attrs,
+        )
+
+        root_span.set_attributes(
+            {
+                "rid": self.rid,
+            }
+        )
+
+        self.root_span = root_span
+        self.root_span_context = trace.set_span_in_context(root_span)
+
+        # create thread context and thread span
+        self.thread_context = self.__create_thread_context(ts)
+
+        if self.tracing_enable and str(self.bootstrap_room) in remote_trace_contexts:
+            self.thread_context.last_span_context = remote_trace_contexts[
+                str(self.bootstrap_room)
+            ].prev_span_context
+
+    def trace_req_finish(
+        self, ts: Optional[int] = None, attrs: Optional[Dict[str, Any]] = None
+    ):
+        if not self.tracing_enable:
+            return
+
+        ts = ts or get_cur_time_ns()
+
+        # End all unclosed thread spans.
+        if self.thread_context.thread_span:
+            self.thread_context.thread_span.end(end_time=ts)
+
+        if attrs:
+            self.root_span.set_attributes(attrs)
+
+        self.root_span.end(end_time=ts)
+        if str(self.bootstrap_room) in remote_trace_contexts:
+            del remote_trace_contexts[str(self.bootstrap_room)]
+        else:
+            self.bootstrap_room_span.end(end_time=ts)
+
+    def __create_slice_span(self, _slice: SglangTraceSliceContext):
+        parent_span = self.thread_context.thread_span
+        if _slice.parent_slice:
+            parent_span = _slice.parent_slice.span
+
+        parent_span_context = trace.set_span_in_context(parent_span)
+        span = self.thread_context.thread_info.tracer.start_span(
+            name=_slice.slice_name,
+            start_time=_slice.start_time_ns,
+            context=parent_span_context,
+        )
+
+        if _slice.prev_span_context:
+            span.add_link(_slice.prev_span_context)
+
+        _slice.span = span
+
+        if _slice.attrs:
+            span.set_attributes(_slice.attrs)
+        if _slice.events:
+            for event in _slice.events:
+                span.add_event(
+                    name=event.event_name,
+                    timestamp=event.ts,
+                    attributes=event.attrs,
+                )
+        _slice.lazy_flag = False
+        _slice.anonymous = False
+        _slice.attrs = {}
+        _slice.events = []
+
+    def __end_slice_span(self, _slice: SglangTraceSliceContext):
+        # child_slices is not empty but they have not created span
+        # if cur_slice.lazy_flag is True before.
+        if _slice.child_slices:
+            for child_slice in _slice.child_slices:
+                self.__create_slice_span(child_slice)
+                self.__end_slice_span(child_slice)
+            _slice.child_slices = []
+
+        _slice.span.end(end_time=_slice.end_time)
+        _slice.parent_slice = None
+
+    def trace_slice_start(
+        self,
+        name: str,
+        ts: Optional[int] = None,
+        anonymous: bool = False,
+        level: int = 1,
+    ):
+        if not self.tracing_enable:
+            return
+
+        ts = ts or get_cur_time_ns()
+
+        cur_slice = SglangTraceSliceContext(
+            slice_name=name,
+            start_time_ns=ts,
+            anonymous=anonymous,
+            level=level,
+            attrs={},
+            events=[],
+            parent_slice=self.thread_context.cur_slice,
+            child_slices=[],
+        )
+        if self.thread_context.cur_slice:
+            self.thread_context.cur_slice.child_slices.append(cur_slice)
+        self.thread_context.cur_slice = cur_slice
+
+        if level > self.trace_level:
+            cur_slice.lazy_flag = True
+            return
+
+        # find prev span, only first level slice has previous span
+        if not cur_slice.parent_slice:
+            if self.thread_context.last_span_context:
+                cur_slice.prev_span_context = self.thread_context.last_span_context
+
+        # check if span creation is lazy
+        if anonymous or (cur_slice.parent_slice and cur_slice.parent_slice.lazy_flag):
+            cur_slice.lazy_flag = True
+            return
+
+        self.__create_slice_span(cur_slice)
+
+    def __release_slice_reference_tree(self, _slice: SglangTraceSliceContext):
+        for child_slice in _slice.child_slices:
+            self.__release_slice_reference_tree(child_slice)
+        _slice.child_slices = []
+        _slice.parent_slice = None
+
+    def __trace_slice_end_flag_process(self, auto_next_anon, thread_finish_flag, ts):
+        # If this is the last slice in the thread,
+        # release the thread context and check whether to release the request context.
+        if thread_finish_flag:
+            if self.thread_context.thread_span:
+                self.thread_context.thread_span.end(end_time=ts)
+                self.thread_context.thread_span = None
+
+            # unlikely path, excepting error API usage
+            if self.thread_context.cur_slice is not None:
+                logger.warning(f"thread_finish_flag can not be set at nested slice.")
+                while self.thread_context.cur_slice.parent_slice:
+                    self.thread_context.cur_slice = (
+                        self.thread_context.cur_slice.parent_slice
+                    )
+                self.__release_slice_reference_tree(
+                    self.thread_context.cur_slice.parent_slice
+                )
+
+            return
+
+        if auto_next_anon:
+            self.trace_slice_start("", ts=ts, anonymous=True)
+
+    def trace_slice_end(
+        self,
+        name: str,
+        ts: Optional[int] = None,
+        attrs: Optional[Dict[str, Any]] = None,
+        auto_next_anon: bool = False,
+        thread_finish_flag: bool = False,
+        level: int = 1,
+    ):
+        if not self.tracing_enable:
+            return
+
+        if not self.thread_context.cur_slice:
+            logger.warning(
+                f"No matching with the SLICE_START event {name} is required."
+            )
+            return
+
+        cur_slice = self.thread_context.cur_slice
+        ts = ts or get_cur_time_ns()
+
+        if level > self.trace_level:
+            # release obj loop references to avoid GC block
+            self.thread_context.cur_slice = cur_slice.parent_slice
+            if cur_slice.parent_slice:
+                cur_slice.parent_slice.child_slices.remove(cur_slice)
+            self.__release_slice_reference_tree(cur_slice)
+            self.__trace_slice_end_flag_process(auto_next_anon, thread_finish_flag, ts)
+            return
+
+        # check if slice_name matching and level matching
+        # unlikely path, excepting error API usage
+        if not cur_slice.anonymous and (
+            cur_slice.slice_name != name or cur_slice.level != level
+        ):
+            logger.warning(
+                f"Slice name mismatch: {name} != {cur_slice.slice_name} or level mismatch: {level} != {cur_slice.level}"
+            )
+            self.thread_context.cur_slice = cur_slice.parent_slice
+            if cur_slice.parent_slice:
+                cur_slice.parent_slice.child_slices.remove(cur_slice)
+            self.__release_slice_reference_tree(cur_slice)
+            return
+
+        cur_slice.end_time = ts
+        cur_slice.slice_name = name
+        cur_slice.level = level
+
+        if cur_slice.lazy_flag:
+            # check if span can be created now
+            if cur_slice.parent_slice and cur_slice.parent_slice.lazy_flag:
+                if attrs:
+                    cur_slice.attrs.update(attrs)
+                self.thread_context.cur_slice = cur_slice.parent_slice
+                self.__trace_slice_end_flag_process(
+                    auto_next_anon, thread_finish_flag, ts
+                )
+                return
+
+            self.__create_slice_span(cur_slice)
+
+        span = cur_slice.span
+
+        if attrs:
+            span.set_attributes(attrs)
+
+        self.thread_context.cur_slice = cur_slice.parent_slice
+        # only for first level slice
+        if not cur_slice.parent_slice:
+            self.thread_context.last_span_context = span.get_span_context()
+        else:
+            cur_slice.parent_slice.child_slices.remove(cur_slice)
+        self.__end_slice_span(cur_slice)
+
+        self.__trace_slice_end_flag_process(auto_next_anon, thread_finish_flag, ts)
+
+    # alias
+    trace_slice = trace_slice_end
+
+    # Add event to the current slice on the same thread with the same rid.
+    def trace_event(
+        self, name: str, ts: Optional[int] = None, attrs: Dict[str, Any] = None
+    ):
+        if not self.tracing_enable:
+            return
+
+        if not self.thread_context.cur_slice:
+            logger.warning(f"No slice is currently being traced.")
+            return
+
+        cur_slice = self.thread_context.cur_slice
+        ts = ts or get_cur_time_ns()
+
+        if cur_slice.span:
+            cur_slice.span.add_event(name=name, timestamp=ts, attributes=attrs)
+        else:
+            cur_slice.events.append(SglangTraceEvent(name, ts, attrs))
+
+    # Add attrs to the current slice on the same thread with the same rid.
+    def trace_slice_add_attr(self, attrs: Dict[str, Any]):
+        if not self.tracing_enable:
+            return
+
+        if not self.thread_context.cur_slice:
+            logger.warning(f"No slice is currently being traced.")
+            return
+
+        cur_slice = self.thread_context.cur_slice
+        if cur_slice.span:
+            cur_slice.span.set_attributes(attrs)
+        else:
+            cur_slice.span.attrs.update(attrs)
 
 
-def trace_get_remote_propagate_context(bootstrap_room_list: List[str]):
-    if not tracing_enabled:
+def trace_get_remote_propagate_context_batch(
+    req_context_list: List[SglangTraceReqContext],
+):
+    if not opentelemetry_initialized:
         return ""
 
-    reqs_trace_contexts = {}
-    for bootstrap_room in bootstrap_room_list:
+    reqs_propagate_contexts = {}
+    for req_context in req_context_list:
         # In the router, rid is also the bootstrap room.
-        bootstrap_room = str(bootstrap_room)
+        bootstrap_room = str(req_context.bootstrap_room)
 
-        if bootstrap_room not in reqs_context:
+        if not bootstrap_room:
             continue
 
-        _context = trace_get_proc_propagate_context(
-            bootstrap_room, remote_propagate=True
-        )
-        reqs_trace_contexts[bootstrap_room] = _context
+        _context = req_context.trace_get_proc_propagate_context(remote_propagate=True)
+        reqs_propagate_contexts[bootstrap_room] = _context
 
-    json_str = json.dumps(reqs_trace_contexts, ensure_ascii=False)
+    json_str = json.dumps(reqs_propagate_contexts, ensure_ascii=False)
     return base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
 
 
-def trace_set_remote_propagate_context(base64_str):
-    if not tracing_enabled:
+def trace_set_remote_propagate_context_batch(base64_str):
+    if not opentelemetry_initialized:
         return
 
     if base64_str is None or base64_str == "" or base64_str == "None":
@@ -417,321 +739,14 @@ def trace_set_remote_propagate_context(base64_str):
 
     base64_bytes = base64.b64decode(base64_str)
     json_str = base64_bytes.decode("utf-8")
-    remote_reqs_trace_contexts = json.loads(json_str)
+    remote_reqs_propagate_contexts = json.loads(json_str)
 
-    for bootstrap_room in remote_reqs_trace_contexts:
+    for bootstrap_room in remote_reqs_propagate_contexts:
         if bootstrap_room in remote_trace_contexts:
             continue
 
         remote_trace_contexts[bootstrap_room] = (
             SglangTracePropagateContext.instance_from_dict(
-                remote_reqs_trace_contexts[bootstrap_room]
+                remote_reqs_propagate_contexts[bootstrap_room]
             )
         )
-
-
-def trace_req_start(
-    rid: str,
-    bootstrap_room: Optional[int] = None,
-    ts: Optional[int] = None,
-    role: Optional[str] = "null",
-    external_trace_header: Optional[Dict[str, str]] = None,
-):
-    if not tracing_enabled:
-        return
-
-    rid = str(rid)
-
-    ts = ts or __get_cur_time_ns()
-
-    pid = threading.get_native_id()
-    if pid not in threads_info:
-        return
-
-    # create req context and root span
-    bootstrap_room = 0 if bootstrap_room is None else bootstrap_room
-    reqs_context[rid] = SglangTraceReqContext(
-        rid=rid,
-        start_time_ns=ts,
-        threads_context={},
-        bootstrap_room=bootstrap_room,
-        is_copy=False,
-    )
-
-    # create bootstrap room span
-    tracer = threads_info[pid].tracer
-    if str(bootstrap_room) not in remote_trace_contexts:
-        attrs = {"bootstrap_room": str(hex(bootstrap_room))}
-        external_trace_context = _trace_context_propagator.extract(
-            external_trace_header
-        )
-        bootstrap_room_span = tracer.start_span(
-            name=f"Bootstrap Room {hex(bootstrap_room)}",
-            start_time=ts,
-            attributes=attrs,
-            context=external_trace_context,
-        )
-        reqs_context[rid].bootstrap_room_span = bootstrap_room_span
-        bootstrap_room_span_context = trace.set_span_in_context(bootstrap_room_span)
-    else:
-        bootstrap_room_span_context = remote_trace_contexts[
-            str(bootstrap_room)
-        ].root_span_context
-
-    # Drop the worker_id added by MultiTokenizer
-    orig_rid = rid.split("_")[-1]
-    role = "" if role == "null" else role
-    attrs = {"rid": orig_rid}
-    root_span = tracer.start_span(
-        name=f"{role} Req {orig_rid[:8]}",
-        start_time=ts,
-        context=bootstrap_room_span_context,
-        attributes=attrs,
-    )
-
-    root_span.set_attributes(
-        {
-            "rid": rid,
-        }
-    )
-
-    reqs_context[rid].root_span = root_span
-    reqs_context[rid].root_span_context = trace.set_span_in_context(root_span)
-    reqs_context[rid].bootstrap_room_span_context = bootstrap_room_span_context
-
-    # create thread context and thread span
-    reqs_context[rid].threads_context[pid] = __create_thread_context(
-        pid,
-        reqs_context[rid].root_span_context,
-        ts,
-    )
-    if str(bootstrap_room) in remote_trace_contexts:
-        reqs_context[rid].threads_context[pid].last_span_context = (
-            remote_trace_contexts[str(bootstrap_room)].prev_span_context
-        )
-
-
-def trace_req_finish(
-    rid: str, ts: Optional[int] = None, attrs: Optional[Dict[str, Any]] = None
-):
-    if not tracing_enabled:
-        return
-
-    rid = str(rid)
-    if rid not in reqs_context:
-        return
-
-    req_context = reqs_context[rid]
-    ts = ts or __get_cur_time_ns()
-
-    # End all unclosed thread spans.
-    for thread_context in req_context.threads_context.values():
-        thread_context.thread_span.end(end_time=ts)
-
-    if attrs:
-        req_context.root_span.set_attributes(attrs)
-
-    req_context.root_span.end(end_time=ts)
-    if str(req_context.bootstrap_room) in remote_trace_contexts:
-        del remote_trace_contexts[str(req_context.bootstrap_room)]
-    else:
-        req_context.bootstrap_room_span.end(end_time=ts)
-
-    del reqs_context[rid]
-
-
-def trace_slice_start(
-    name: str,
-    rid: str,
-    ts: Optional[int] = None,
-    anonymous: bool = False,
-):
-    if not tracing_enabled:
-        return
-
-    rid = str(rid)
-    if rid not in reqs_context:
-        return
-
-    pid = threading.get_native_id()
-    if pid not in reqs_context[rid].threads_context:
-        return
-
-    thread_context = reqs_context[rid].threads_context[pid]
-
-    ts = ts or __get_cur_time_ns()
-
-    slice_info = SglangTraceSliceContext(
-        slice_name=name,
-        anonymous=anonymous,
-    )
-
-    # find prev slice
-    prev_span_context = None
-    if not thread_context.cur_slice_stack:
-        if thread_context.last_span_context:
-            prev_span_context = thread_context.last_span_context
-
-    parent_span = thread_context.thread_span
-    if thread_context.cur_slice_stack:
-        parent_span = thread_context.cur_slice_stack[-1].span
-
-    parent_span_context = trace.set_span_in_context(parent_span)
-    span = thread_context.thread_info.tracer.start_span(
-        name=slice_info.slice_name,
-        start_time=ts,
-        context=parent_span_context,
-    )
-
-    if prev_span_context:
-        span.add_link(prev_span_context)
-
-    slice_info.span = span
-
-    thread_context.cur_slice_stack.append(slice_info)
-
-
-def trace_slice_end(
-    name: str,
-    rid: str,
-    ts: Optional[int] = None,
-    attrs: Optional[Dict[str, Any]] = None,
-    auto_next_anon: bool = False,
-    thread_finish_flag: bool = False,
-):
-    if not tracing_enabled:
-        return
-
-    rid = str(rid)
-    if rid not in reqs_context:
-        return
-
-    pid = threading.get_native_id()
-    if pid not in reqs_context[rid].threads_context:
-        return
-
-    thread_context = reqs_context[rid].threads_context[pid]
-
-    if not thread_context.cur_slice_stack:
-        logger.warning(f"No matching with the SLICE_START event{name} is required.")
-        return
-
-    ts = ts or __get_cur_time_ns()
-    slice_info = thread_context.cur_slice_stack[-1]
-    span = slice_info.span
-
-    if slice_info.anonymous:
-        span.update_name(name)
-    else:
-        span = slice_info.span
-        if slice_info.slice_name != name:
-            span.set_status(trace.Status(trace.StatusCode.ERROR))
-            logger.warning(f"Slice name mismatch: {name} != {slice_info.slice_name}")
-
-    if attrs:
-        span.set_attributes(attrs)
-
-    span.end(end_time=ts)
-
-    thread_context.cur_slice_stack.pop()
-    if len(thread_context.cur_slice_stack) == 0:
-        thread_context.last_span_context = span.get_span_context()
-
-    # If this is the last slice in the thread,
-    # release the thread context and check whether to release the request context.
-    if thread_finish_flag:
-        thread_context.thread_span.end(end_time=ts)
-        del reqs_context[rid].threads_context[pid]
-        if reqs_context[rid].is_copy and not reqs_context[rid].threads_context:
-            del reqs_context[rid]
-        return
-
-    if auto_next_anon:
-        trace_slice_start("", rid, ts, True)
-
-
-# alias
-trace_slice = trace_slice_end
-
-
-# Add event to the current slice on the same thread with the same rid.
-def trace_event(
-    name: str, rid: str, ts: Optional[int] = None, attrs: Dict[str, Any] = None
-):
-    if not tracing_enabled:
-        return
-
-    rid = str(rid)
-    if rid not in reqs_context:
-        return
-
-    pid = threading.get_native_id()
-    if pid not in reqs_context[rid].threads_context:
-        return
-
-    thread_context = reqs_context[rid].threads_context[pid]
-
-    if not thread_context.cur_slice_stack:
-        logger.warning(f"No slice is currently being traced.")
-        return
-
-    ts = ts or __get_cur_time_ns()
-
-    slice_info = thread_context.cur_slice_stack[-1]
-    slice_info.span.add_event(name=name, timestamp=ts, attributes=attrs)
-
-
-# Add attrs to the current slice on the same thread with the same rid.
-def trace_slice_add_attr(rid: str, attrs: Dict[str, Any]):
-    if not tracing_enabled:
-        return
-
-    rid = str(rid)
-    if rid not in reqs_context:
-        return
-
-    pid = threading.get_native_id()
-    if pid not in reqs_context[rid].threads_context:
-        return
-
-    thread_context = reqs_context[rid].threads_context[pid]
-
-    if not thread_context.cur_slice_stack:
-        logger.warning(f"No slice is currently being traced.")
-        return
-
-    slice_info = thread_context.cur_slice_stack[-1]
-    slice_info.span.set_attributes(attrs)
-
-
-def trace_slice_batch(
-    name: str,
-    reqs: List[Req],
-):
-    if not tracing_enabled:
-        return
-
-    for req in reqs:
-        trace_slice(
-            name,
-            req.rid,
-            auto_next_anon=not req.finished(),
-            thread_finish_flag=req.finished(),
-        )
-
-
-def trace_event_batch(
-    name: str,
-    reqs: List[Req],
-    ts: Optional[int] = None,
-    attrs: Dict[str, Any] = {},
-):
-    if not tracing_enabled:
-        return
-
-    bid = uuid.uuid4().hex[:8]
-    _attrs = {"bid": bid, "batch_size": len(reqs)}
-    _attrs.update(attrs)
-
-    for req in reqs:
-        trace_event(name, req.rid, ts=ts, attrs=_attrs)

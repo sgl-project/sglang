@@ -27,6 +27,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.tracing.trace_metric_warpper import SglangStageContext
 from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
@@ -687,14 +688,14 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
-
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    # For observability
+    stage_context: Optional[Union[SglangStageContext, Dict]] = None
 
 
 @dataclass
@@ -746,9 +747,6 @@ class EmbeddingReqInput(BaseReq):
 
     # For background responses (OpenAI responses API)
     background: bool = False
-
-    # tracing context
-    trace_context: Optional[Dict] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
@@ -853,6 +851,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # For observability
+    stage_context: Optional[Union[SglangStageContext, Dict]] = None
 
 
 @dataclass

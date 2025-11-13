@@ -14,14 +14,9 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-    RequestStage,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+from sglang.srt.tracing.trace_metric_warpper import RequestStage
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -50,15 +45,18 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.forward_entry_time = req.time_stats.completion_time = (
                     time.perf_counter()
                 )
-                trace_slice_end(
+                req.stage_context.metric_trace_slice_end(
                     RequestStage.DECODE_QUICK_FINISH,
-                    req.rid,
                     thread_finish_flag=True,
                 )
                 release_kv_cache(req, self.tree_cache)
+            else:
+                req.stage_context.metric_trace_slice_end(
+                    RequestStage.DECODE_FAKE_OUTPUT,
+                    auto_next_anon=True,
+                )
 
         # Note: Logprobs should be handled on the prefill engine.
-        trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
         self.stream_output(batch.reqs, batch.return_logprob)
 
     def process_batch_result_prefill(
@@ -168,9 +166,8 @@ class SchedulerOutputProcessorMixin:
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
-                    trace_slice(
+                    req.stage_context.metric_trace_slice(
                         RequestStage.PREFILL_FORWARD,
-                        req.rid,
                         auto_next_anon=not req.finished(),
                         thread_finish_flag=req.finished(),
                     )
@@ -203,10 +200,9 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
-                    trace_slice(
+                    req.stage_context.metric_trace_slice(
                         RequestStage.PREFILL_CHUNKED_FORWARD,
-                        req.rid,
-                        auto_next_anon=True,
+                        auto_next_anon=(req.is_chunked != 0),
                     )
 
         else:  # embedding or reward model
@@ -240,6 +236,12 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(0)
                     req.check_finished()
 
+                    req.stage_context.metric_trace_slice(
+                        RequestStage.PREFILL_FORWARD,
+                        auto_next_anon=not req.finished(),
+                        thread_finish_flag=req.finished(),
+                    )
+
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
                     else:
@@ -248,12 +250,10 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-                trace_slice(
-                    RequestStage.PREFILL_FORWARD,
-                    req.rid,
-                    auto_next_anon=not req.finished(),
-                    thread_finish_flag=req.finished(),
-                )
+                    req.stage_context.metric_trace_slice(
+                        RequestStage.PREFILL_CHUNKED_FORWARD,
+                        auto_next_anon=(req.is_chunked != 0),
+                    )
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 

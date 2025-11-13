@@ -42,19 +42,14 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    Req,
-    RequestStage,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     NSATokenToKVPool,
     SWAKVPool,
 )
-from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
+from sglang.srt.tracing.trace_metric_warpper import RequestStage, trace_event_batch
 from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 
 if TYPE_CHECKING:
@@ -198,9 +193,10 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
         )
         self._process_req(req)
-        req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
-        trace_slice_end(RequestStage.PREFILL_PREPARE, req.rid, auto_next_anon=True)
+        req.stage_context.metric_trace_slice_end(
+            RequestStage.PREFILL_PREPARE, auto_next_anon=True
+        )
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -290,10 +286,9 @@ class PrefillBootstrapQueue:
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
-            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
-            trace_slice_end(
-                RequestStage.PREFILL_BOOTSTRAP, req.rid, auto_next_anon=True
+            req.stage_context.metric_trace_slice_end(
+                RequestStage.PREFILL_BOOTSTRAP, auto_next_anon=True
             )
 
         self.queue = [
@@ -431,8 +426,6 @@ class SchedulerDisaggregationPrefillMixin:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
-                req.add_latency(RequestStage.PREFILL_FORWARD)
-                trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
@@ -459,6 +452,9 @@ class SchedulerDisaggregationPrefillMixin:
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
+                req.stage_context.metric_trace_slice(
+                    RequestStage.PREFILL_FORWARD, auto_next_anon=True
+                )
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -497,8 +493,9 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
-                trace_slice(
-                    RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
+                req.stage_context.metric_trace_slice(
+                    RequestStage.PREFILL_CHUNKED_FORWARD,
+                    auto_next_anon=(req.is_chunked != 0),
                 )
 
         self.maybe_send_health_check_signal()
@@ -568,11 +565,10 @@ class SchedulerDisaggregationPrefillMixin:
         )
         for req in done_reqs:
             req: Req
-            req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
-            trace_slice(
-                RequestStage.PREFILL_TRANSFER_KV_CACHE, req.rid, thread_finish_flag=True
+            req.stage_context.metric_trace_slice(
+                RequestStage.PREFILL_TRANSFER_KV_CACHE, thread_finish_flag=True
             )
 
         self.disagg_prefill_inflight_queue = undone_reqs

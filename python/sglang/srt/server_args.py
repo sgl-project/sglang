@@ -318,7 +318,8 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
-    enable_trace: bool = False
+    trace_level: int = 0
+    trace_module: str = "request"
     otlp_traces_endpoint: str = "localhost:4317"
 
     # RequestMetricsExporter configuration
@@ -2446,9 +2447,16 @@ class ServerArgs:
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
         parser.add_argument(
-            "--enable-trace",
-            action="store_true",
-            help="Enable opentelemetry trace",
+            "--trace-level",
+            type=int,
+            default=ServerArgs.trace_level,
+            help="Enable opentelemetry trace level",
+        )
+        parser.add_argument(
+            "--trace-module",
+            type=str,
+            default=ServerArgs.trace_module,
+            help="Enable opentelemetry trace level",
         )
         parser.add_argument(
             "--otlp-traces-endpoint",

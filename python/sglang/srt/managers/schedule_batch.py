@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import enum
-
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Copyright 2023-2024 SGLang Team
@@ -39,7 +37,6 @@ import copy
 import dataclasses
 import logging
 import re
-import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
@@ -81,6 +78,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.tracing.trace_metric_warpper import NoOpTimeRecorder, SglangStageContext
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -402,35 +400,6 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
-class RequestStage(str, enum.Enum):
-    # Tokenizer
-    TOKENIZE = "tokenize"
-    TOKENIZER_DISPATCH = "dispatch"
-
-    # DP controller
-    DC_DISPATCH = "dc_dispatch"
-
-    # common/non-disaggregation
-    PREFILL_WAITING = "prefill_waiting"
-    REQUEST_PROCESS = "request_process"
-    DECODE_LOOP = "decode_loop"
-    PREFILL_FORWARD = "prefill_forward"
-    PREFILL_CHUNKED_FORWARD = "chunked_prefill"
-
-    # disaggregation prefill
-    PREFILL_PREPARE = "prefill_prepare"
-    PREFILL_BOOTSTRAP = "prefill_bootstrap"
-    PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
-
-    # disaggregation decode
-    DECODE_PREPARE = "decode_prepare"
-    DECODE_BOOTSTRAP = "decode_bootstrap"
-    DECODE_WAITING = "decode_waiting"
-    DECODE_TRANSFERRED = "decode_transferred"
-    DECODE_FAKE_OUTPUT = "fake_output"
-    DECODE_QUICK_FINISH = "quick_finish"
-
-
 class Req:
     """The input and output status of a request."""
 
@@ -463,6 +432,7 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        stage_context: Optional[SglangStageContext] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -650,11 +620,11 @@ class Req:
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
 
-        # For metrics
+        # For metrics or trace
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
+        self.stage_context = stage_context if stage_context else NoOpTimeRecorder()
         self.has_log_time_stats: bool = False
-        self.last_tic = time.monotonic()
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -728,16 +698,6 @@ class Req:
         ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
-
-    def add_latency(self, stage: RequestStage):
-        if self.metrics_collector is None:
-            return
-
-        now = time.monotonic()
-        self.metrics_collector.observe_per_stage_req_latency(
-            stage.value, now - self.last_tic
-        )
-        self.last_tic = now
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:

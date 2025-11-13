@@ -120,7 +120,6 @@ from sglang.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     MultimodalInputs,
     Req,
-    RequestStage,
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -159,15 +158,14 @@ from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.tracing.trace import (
-    process_tracing_init,
+from sglang.srt.tracing.trace_metric_warpper import (
+    NoOpTimeRecorder,
+    RequestStage,
+    SglangStageContext,
+    metric_trace_slice_batch,
     trace_event_batch,
-    trace_set_proc_propagate_context,
-    trace_set_thread_info,
-    trace_slice_batch,
-    trace_slice_end,
-    trace_slice_start,
 )
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -265,7 +263,6 @@ class Scheduler(
         self.enable_kv_cache_events = bool(
             server_args.kv_events_config and tp_rank == 0
         )
-        self.enable_trace = server_args.enable_trace
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -1136,14 +1133,6 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
-        if self.enable_trace:
-            for req in recv_reqs:
-                if isinstance(
-                    req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                ):
-                    trace_set_proc_propagate_context(req.rid, req.trace_context)
-                    trace_slice_start("", req.rid, anonymous=True)
-
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -1243,6 +1232,7 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        self._req_stage_context_init(recv_req)
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1284,6 +1274,7 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
+                stage_context=recv_req.stage_context,
             )
             req.tokenizer = self.tokenizer
 
@@ -1313,6 +1304,9 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
+            req.stage_context = (
+                recv_req.stage_context if recv_req.stage_context else NoOpTimeRecorder()
+            )
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -1456,7 +1450,9 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
-            trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
+            req.stage_context.metric_trace_slice_end(
+                RequestStage.REQUEST_PROCESS, auto_next_anon=True
+            )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1541,6 +1537,7 @@ class Scheduler(
         self,
         recv_req: TokenizedEmbeddingReqInput,
     ):
+        self._req_stage_context_init(recv_req)
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -1550,6 +1547,7 @@ class Scheduler(
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
             http_worker_ipc=recv_req.http_worker_ipc,
+            stage_context=recv_req.stage_context,
         )
         req.tokenizer = self.tokenizer
 
@@ -1850,11 +1848,6 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        if self.enable_metrics:
-            # only record queue time when enable_metrics is True to avoid overhead
-            for req in can_run_list:
-                req.add_latency(RequestStage.PREFILL_WAITING)
-
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
@@ -1881,6 +1874,14 @@ class Scheduler(
                     self.metrics_collector.observe_queue_time(
                         req.time_stats.get_queueing_time(),
                     )
+                req.stage_context.metric_trace_slice(
+                    RequestStage.PREFILL_WAITING, auto_next_anon=True
+                )
+
+        if self.chunked_req and self.chunked_req.is_chunked == 1:
+            self.chunked_req.stage_context.metric_trace_slice_start(
+                RequestStage.PREFILL_CHUNKED_FORWARD
+            )
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -2124,7 +2125,7 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
-            trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
+            metric_trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
@@ -2598,6 +2599,27 @@ class Scheduler(
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
+    def _req_stage_context_init(
+        self, req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+    ):
+        if self.server_args.trace_level == 0 and not self.server_args.enable_metrics:
+            req.stage_context = NoOpTimeRecorder()
+            return
+
+        bootstrap_room = req.bootstrap_room if hasattr(req, "bootstrap_room") else None
+
+        req.stage_context = SglangStageContext(
+            req.rid,
+            bootstrap_room,
+            module_name="request",
+            server_args=self.server_args,
+            metrics_collector=(
+                self.metrics_collector if self.server_args.enable_metrics else None
+            ),
+            propagation_context=req.stage_context,
+        )
+        req.stage_context.metric_trace_slice_start(RequestStage.ANONYMOUS)
+
 
 class IdleSleeper:
     """
@@ -2689,7 +2711,7 @@ def run_scheduler_process(
         numa_bind_to_node(numa_node[gpu_id])
 
     # Set up tracing
-    if server_args.enable_trace:
+    if server_args.trace_level > 0:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "Scheduler"
         if server_args.disaggregation_mode == "prefill":
