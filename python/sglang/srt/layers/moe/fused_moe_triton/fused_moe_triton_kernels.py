@@ -816,7 +816,8 @@ def _dev_tag() -> str:
 def _load_db(topk: int, hidden: int, dtype: str) -> dict:
     dtype_clean = str(dtype).replace("torch.", "").strip()
     file_name = f"moe_sum_reduce_{_dev_tag()}_t{topk}_h{hidden}_{dtype_clean}.json"
-    file_path = pathlib.Path(__file__).with_name(file_name)
+    #file_path = pathlib.Path(__file__).with_name(file_name)
+    file_path = pathlib.Path(__file__).parent / "triton_3_4_0" / file_name
     if not file_path.exists():
         warnings.warn(f"Config file '{file_name}' not found → use default.", UserWarning)
         return {}
