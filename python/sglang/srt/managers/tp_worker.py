@@ -315,7 +315,18 @@ class TpModelWorker:
             )
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        # Force EXTEND mode for embedding models to prevent decode mode
+        # This ensures we always get full sequence lengths instead of just [1,1,1,...]
+        if not self.model_runner.is_generation:
+            # Create a copy of the batch with forced EXTEND mode
+            import copy
+            embedding_batch = copy.copy(model_worker_batch)
+            from sglang.srt.model_executor.forward_batch_info import ForwardMode
+            embedding_batch.forward_mode = ForwardMode.EXTEND
+            forward_batch = ForwardBatch.init_new(embedding_batch, self.model_runner)
+        else:
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            
         logits_output, _ = self.model_runner.forward(forward_batch)
         # Debug information
         logger.debug(f"forward_batch.batch_size: {forward_batch.batch_size}")

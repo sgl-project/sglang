@@ -112,9 +112,31 @@ class GigarEmbedModel(nn.Module):
 
         if get_embedding:
             # Check if we have sequence length information
+            # For embedding models, we should always have proper sequence lengths now
+            seq_lens = None
             if hasattr(forward_batch, 'extend_seq_lens') and forward_batch.extend_seq_lens is not None:
-                # Get sequence lengths
                 seq_lens = forward_batch.extend_seq_lens.tolist()
+                logger.info(f"Using extend_seq_lens: {seq_lens}")
+            elif hasattr(forward_batch, 'seq_lens_cpu') and forward_batch.seq_lens_cpu is not None:
+                seq_lens = list(forward_batch.seq_lens_cpu)
+                logger.info(f"Using seq_lens_cpu: {seq_lens}")
+            else:
+                logger.warning("No sequence length information available, falling back to input_ids shape")
+                # Fallback: try to infer from input_ids shape
+                if input_ids.dim() == 1:
+                    seq_lens = [input_ids.size(0)]
+                else:
+                    # Assume all sequences have the same length (not ideal but better than nothing)
+                    total_tokens = input_ids.numel()
+                    batch_size = input_ids.size(0)
+                    seq_lens = [total_tokens // batch_size] * batch_size
+                    
+            # Validate sequence lengths
+            if seq_lens is None or not seq_lens or sum(seq_lens) == 0:
+                logger.error(f"Invalid sequence lengths: {seq_lens}")
+                # Fallback to single sequence processing
+                seq_lens = [input_ids.size(0) if input_ids.dim() == 1 else input_ids.size(1)]
+                logger.info(f"Fallback seq_lens: {seq_lens}")
 
                 # Convert the combined tensor into a batch of tensors
                 # Split input_ids into individual sequences

@@ -314,8 +314,14 @@ class ForwardBatch:
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 
+        # For embedding models, always use EXTEND mode to ensure proper sequence lengths
+        forward_mode = batch.forward_mode
+        if not model_runner.model_config.is_generation:
+            from sglang.srt.model_executor.forward_batch_info import ForwardMode
+            forward_mode = ForwardMode.EXTEND
+            
         ret = cls(
-            forward_mode=batch.forward_mode,
+            forward_mode=forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
