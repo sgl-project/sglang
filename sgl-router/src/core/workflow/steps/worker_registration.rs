@@ -351,15 +351,11 @@ impl StepExecutor for DiscoverMetadataStep {
                 match get_server_info(&config.url, config.api_key.as_deref()).await {
                     Ok(server_info) => {
                         let mut labels = HashMap::new();
-                        if let Some(model_path) = server_info.model_path {
-                            if !model_path.is_empty() {
-                                labels.insert("model_path".to_string(), model_path);
-                            }
+                        if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
+                            labels.insert("model_path".to_string(), model_path);
                         }
-                        if let Some(served_model_name) = server_info.served_model_name {
-                            if !served_model_name.is_empty() {
-                                labels.insert("served_model_name".to_string(), served_model_name);
-                            }
+                        if let Some(served_model_name) = server_info.served_model_name.filter(|s| !s.is_empty()) {
+                            labels.insert("served_model_name".to_string(), served_model_name);
                         }
 
                         Ok((labels, None))
