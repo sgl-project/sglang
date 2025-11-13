@@ -251,8 +251,7 @@ def _matmul_persistent_deepgemm(
 
 
 def matmul_persistent(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None,
-    dispatch_keys=None,
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
     if (
         _ENABLE_MM_DEEPGEMM
@@ -278,9 +277,6 @@ def matmul_persistent(
             return out_deepgemm
 
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
-
-    if dispatch_keys is not None:
-        return _original_aten_mm_kernel.call_boxed(dispatch_keys, a, b)
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
@@ -544,8 +540,8 @@ def mean_dim(
     return output
 
 
-def mm_batch_invariant(dispatch_keys, a, b):
-    return matmul_persistent(a, b, dispatch_keys=dispatch_keys)
+def mm_batch_invariant(a, b):
+    return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
@@ -913,8 +909,6 @@ _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _original_torch_bmm = None
 
-_original_aten_mm_kernel = None
-
 
 def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
@@ -927,12 +921,9 @@ def enable_batch_invariant_mode(
     if _batch_invariant_MODE:
         return
 
-    global _original_aten_mm_kernel
-    _original_aten_mm_kernel = torch.library.get_kernel("aten::mm", "CUDA")
-
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "CUDA", with_keyset=True)
+    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "CUDA")
     _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "CUDA")
     _batch_invariant_LIB.impl(
         "aten::_log_softmax", _log_softmax_batch_invariant, "CUDA"
