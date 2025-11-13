@@ -8,7 +8,7 @@ namespace {
 #define BLOCK_N block_size_n()
 #define BLOCK_M 128
 
-template <bool sym_quant_a>
+template <bool sym_quant_act>
 struct ActDtype;
 template <>
 struct ActDtype<true> {
@@ -79,7 +79,7 @@ void _dequant_weight_zp_only(const uint8_t* __restrict__ B, int8_t* dqB, const i
   }
 }
 
-template <bool accum, int64_t N, bool sym_quant_a>
+template <bool accum, int64_t N, bool sym_quant_act>
 void _dequant_and_store(
     float* __restrict__ output,
     const int32_t* __restrict__ input,
@@ -96,7 +96,7 @@ void _dequant_and_store(
     __m512 va_scale = _mm512_set1_ps(a_scale);
     int32_t a_zp;
     __m512i va_zp;
-    if constexpr (!sym_quant_a) {
+    if constexpr (!sym_quant_act) {
       a_zp = *(zp_a + m * ldsa);
       va_zp = _mm512_set1_epi32(a_zp);
     }
@@ -104,7 +104,7 @@ void _dequant_and_store(
 #pragma GCC unroll 2
     for (; n < N; n += 16) {
       __m512i vc = _mm512_loadu_si512(input + m * ldi + n);
-      if constexpr (!sym_quant_a) {
+      if constexpr (!sym_quant_act) {
         __m512i vb_comp = _mm512_loadu_si512(comp_b + n);
         vc = _mm512_sub_epi32(vc, _mm512_mullo_epi32(vb_comp, va_zp));
       }
@@ -121,7 +121,7 @@ void _dequant_and_store(
     }
     for (; n < N; ++n) {
       float dq_val;
-      if constexpr (sym_quant_a) {
+      if constexpr (sym_quant_act) {
         dq_val = (float)input[m * ldi + n] * a_scale * scale_b[n];
       } else {
         dq_val = (float)(input[m * ldi + n] - a_zp * comp_b[n]) * a_scale * scale_b[n];
@@ -167,7 +167,7 @@ static inline __m512i _mm512_sign_epi8(__m512i a, __m512i b) {
   return _mm512_mask_sub_epi8(a, blt0, zero, a);
 }
 
-template <int64_t M, int64_t N, int64_t ldb, bool sym_quant_a>
+template <int64_t M, int64_t N, int64_t ldb, bool sym_quant_act>
 void _dequant_gemm_accum_small_M(
     float* __restrict__ C,
     const uint8_t* A,
@@ -179,7 +179,7 @@ void _dequant_gemm_accum_small_M(
     int64_t K,
     int64_t lda,
     int64_t ldc) {
-  // if sym_quant_a is true, A pointer type is passed in as uint8_t* but actually int8_t*.
+  // if sym_quant_act is true, A pointer type is passed in as uint8_t* but actually int8_t*.
 
   constexpr int COLS = N / 16;
   // Computing compensation is faster than loading it for small M
@@ -196,7 +196,7 @@ void _dequant_gemm_accum_small_M(
   Unroll<COLS>{}([&](auto i) {
     vscales[i] = _mm512_loadu_ps(scales_b + i * 16);
     vzps[i] = combine_m256i(load_zps_4vnni(qzeros_b + i * 16));
-    if constexpr (!sym_quant_a) {
+    if constexpr (!sym_quant_act) {
       vcompensate[i] = _mm512_setzero_epi32();
     }
   });
@@ -214,12 +214,12 @@ void _dequant_gemm_accum_small_M(
       int B_offset = k * ldb + col * 16 * 2;
       vb[col] = combine_m256i(load_uint4_as_int8(B + B_offset));
       vb[col] = _mm512_sub_epi8(vb[col], vzps[col]);
-      if constexpr (!sym_quant_a) {
+      if constexpr (!sym_quant_act) {
         vcompensate[col] = _mm512_dpbusd_epi32(vcompensate[col], ones, vb[col]);
       }
       _mm_prefetch(B + B_offset + 128 * ldb, _MM_HINT_T0);
     }
-    if constexpr (sym_quant_a) {
+    if constexpr (sym_quant_act) {
       auto vsb = _mm512_sign_epi8(vb[col], va);
       auto vabsa = _mm512_sign_epi8(va, va);
       vc[i] = _mm512_dpbusds_epi32(vc[i], vabsa, vsb);
@@ -245,7 +245,7 @@ void _dequant_gemm_accum_small_M(
     constexpr const int col = i % COLS;
     // compute (qC - compensate * zp_a) * scale_a * scale_b
     __m512 vc_float;
-    if constexpr (!sym_quant_a) {
+    if constexpr (!sym_quant_act) {
       vc[i] = _mm512_sub_epi32(vc[i], _mm512_mullo_epi32(vcompensate[col], _mm512_set1_epi32(*(qzeros_a + row))));
     }
     vc_float = _mm512_cvtepi32_ps(vc[i]);
@@ -259,11 +259,11 @@ void _dequant_gemm_accum_small_M(
   Unroll<M * COLS>{}(store);
 }
 
-#define call_dequant_gemm_accum_small_M(M) \
-  _dequant_gemm_accum_small_M<M, N, ldb, sym_quant_a>(C, A, scales_a, qzeros_a, B, scales_b, qzeros_b, K, lda, ldc);
+#define CALL_DEQUANT_GEMM_ACCUM_SMALL_M(M) \
+  _dequant_gemm_accum_small_M<M, N, ldb, sym_quant_act>(C, A, scales_a, qzeros_a, B, scales_b, qzeros_b, K, lda, ldc);
 #endif
 
-template <int64_t N, int64_t ldb, bool sym_quant_a>
+template <int64_t N, int64_t ldb, bool sym_quant_act>
 void _dequant_gemm_accum(
     float* C,
     const uint8_t* A,
@@ -273,6 +273,7 @@ void _dequant_gemm_accum(
     const float* scales_b,
     const int8_t* qzeros_b,
     const int32_t* compensation,
+    int8_t* dqB,
     int64_t M,
     int64_t K,
     int64_t lda,
@@ -284,25 +285,25 @@ void _dequant_gemm_accum(
   if (!use_brgemm) {
     switch (M) {
       case 1:
-        call_dequant_gemm_accum_small_M(1);
-        return;
+        CALL_DEQUANT_GEMM_ACCUM_SMALL_M(1);
+        break;
       case 2:
-        call_dequant_gemm_accum_small_M(2);
-        return;
+        CALL_DEQUANT_GEMM_ACCUM_SMALL_M(2);
+        break;
       case 3:
-        call_dequant_gemm_accum_small_M(3);
-        return;
+        CALL_DEQUANT_GEMM_ACCUM_SMALL_M(3);
+        break;
       case 4:
-        call_dequant_gemm_accum_small_M(4);
-        return;
+        CALL_DEQUANT_GEMM_ACCUM_SMALL_M(4);
+        break;
       default:
         TORCH_CHECK(false, "tinygemm_kernel: unexpected M for AVX path!");
     }
+    return;
   }
 
-  int8_t dqB[K * N];
   _dequant_weight_zp_only<N, ldb>(B, dqB, qzeros_b, K);
-  using Tin = typename ActDtype<sym_quant_a>::type;
+  using Tin = typename ActDtype<sym_quant_act>::type;
   Tin* A_ptr = (Tin*)A;
   if (use_brgemm) {
     int32_t C_i32[M * N];
@@ -310,7 +311,7 @@ void _dequant_gemm_accum(
         M, N, K, lda, N /*ldb*/, N /*ldc*/, false /* add_C */, A_ptr, dqB, C_i32, true /* is_vnni */);
     _mm_prefetch(B + N * K / 2, _MM_HINT_T0);
     _mm_prefetch(A + K, _MM_HINT_T0);
-    _dequant_and_store<true, N, sym_quant_a>(
+    _dequant_and_store<true, N, sym_quant_act>(
         C, C_i32, scales_a, qzeros_a, scales_b, compensation, M, N /*ldi*/, ldc, 1 /*ldsa*/);
   } else
 #endif
@@ -411,7 +412,7 @@ void fill_val_stub(int32_t* __restrict__ output, int32_t value, int64_t size) {
   }
 }
 
-template <typename act_dtype, typename out_dtype, bool sym_quant_a>
+template <typename act_dtype, typename out_dtype, bool sym_quant_act>
 void _da8w4_linear_impl(
     act_dtype* __restrict__ input,
     const float* __restrict__ input_scales,
@@ -422,6 +423,7 @@ void _da8w4_linear_impl(
     const float* __restrict__ bias,
     out_dtype* __restrict__ output,
     float* __restrict__ output_temp,
+    int8_t* __restrict__ dequant_weight_temp,
     int64_t M,
     int64_t N,
     int64_t K,
@@ -451,6 +453,7 @@ void _da8w4_linear_impl(
   at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
     int tid = get_thread_num();
     float* C_tmp = output_temp + tid * block_m * BLOCK_N;
+    int8_t* dqB_tmp = dequant_weight_temp + tid * BLOCK_K * BLOCK_N;
     for (const auto i : c10::irange(begin, end)) {
       int64_t mc = parallel_on_M ? i / Nc : 0;
       int64_t nc = parallel_on_M ? i % Nc : i;
@@ -463,10 +466,10 @@ void _da8w4_linear_impl(
         copy_bias<BLOCK_N>(bias_data, C_tmp, m_size);
         for (int kci = 0; kci < Kc; ++kci) {
           int32_t* compensation_ptr =
-              sym_quant_a ? nullptr
-                          : (int32_t*)(void*)(weight + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
-                                              BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
-          _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, sym_quant_a>(
+              sym_quant_act ? nullptr
+                            : (int32_t*)(void*)(weight + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
+                                                BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
+          _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, sym_quant_act>(
               /*C*/ C_tmp,
               /*A*/ (uint8_t*)input + mci * block_m * K + kci * BLOCK_K,
               /*scales_a*/ input_scales + mci * block_m,
@@ -475,6 +478,7 @@ void _da8w4_linear_impl(
               /*scales_b*/ weight_scales + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
               /*qzeros_b*/ weight_qzeros + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
               /*Bcomp*/ compensation_ptr,
+              /*dqB_tmp*/ dqB_tmp,
               /*M*/ m_size,
               /*K*/ BLOCK_K,
               /*lda*/ K,
@@ -664,9 +668,11 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   TORCH_CHECK(
       st == at::kBFloat16 || st == at::kHalf, "int4_scaled_mm_cpu_with_quant: expect A to be bfloat16 or half.");
 
-  constexpr bool sym_quant_a = false;  // TODO: add sym quant path
-  using Tin = typename ActDtype<sym_quant_a>::type;
-  int64_t act_buffer_size = M_a * K_a + M_a * sizeof(float) + M_a * sizeof(int32_t);
+  constexpr bool sym_quant_act = false;  // TODO: add sym quant path
+  using Tin = typename ActDtype<sym_quant_act>::type;
+  int64_t act_buffer_size = /* act quant */ M_a * K_a +
+                            /* act scale */ M_a * sizeof(float) +
+                            /* act zp */ M_a * sizeof(int32_t);
   auto act_buffer = at::empty({act_buffer_size}, input.options().dtype(at::kByte));
   // asym path, activation quants into uint8_t
   auto Aq_data = act_buffer.data_ptr<uint8_t>();
@@ -692,10 +698,13 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   const int8_t* b_qzeros_ptr = weight_qzeros.data_ptr<int8_t>();
   const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
   int num_threads = at::get_num_threads();
-  auto c_temp_buffer =
-      at::empty({int(num_threads * BLOCK_M * BLOCK_N * sizeof(float))}, input.options().dtype(at::kChar));
+  int64_t temp_buffer_size = /* output temp */ num_threads * BLOCK_M * BLOCK_N * sizeof(float) +
+                             /*  weight dequant temp */ num_threads * BLOCK_K * BLOCK_N;
+  auto c_temp_buffer = at::empty({temp_buffer_size}, input.options().dtype(at::kChar));
   float* c_temp_ptr = (float*)((void*)(c_temp_buffer.data_ptr<int8_t>()));
-#define call__da8w4_linear_with_quant_impl(sym_quant_act)                                                  \
+  int8_t* dqB_temp_ptr = (int8_t*)((void*)(c_temp_ptr + num_threads * BLOCK_M * BLOCK_N));
+
+#define LAUNCH_DA8W4_LINEAR_WITH_QUANT_IMPL(sym_quant_act)                                                 \
   AT_DISPATCH_FLOATING_TYPES_AND2(                                                                         \
       at::ScalarType::BFloat16, at::ScalarType::Half, output_dtype, "int4_scaled_mm_cpu_with_quant", [&] { \
         const scalar_t* __restrict__ A_data = input.data_ptr<scalar_t>();                                  \
@@ -715,13 +724,14 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
             bias_ptr,                                                                                      \
             c_ptr,                                                                                         \
             c_temp_ptr,                                                                                    \
+            dqB_temp_ptr,                                                                                  \
             M_a,                                                                                           \
             N,                                                                                             \
             K_a,                                                                                           \
             num_groups);                                                                                   \
       });
 
-  call__da8w4_linear_with_quant_impl(sym_quant_a);
+  LAUNCH_DA8W4_LINEAR_WITH_QUANT_IMPL(sym_quant_act);
 
   return output;
 }
@@ -750,6 +760,7 @@ void tinygemm_kernel(
     const float* scales_b,
     const int8_t* qzeros_b,
     const int32_t* compensation,
+    int8_t* dqB_tmp,
     int64_t M,
     int64_t K,
     int64_t lda,
@@ -759,7 +770,7 @@ void tinygemm_kernel(
     bool use_brgemm) {
   // TODO: add sym quant act, now only asym
   _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, false>(
-      C_temp, A, scales_a, qzeros_a, B, scales_b, qzeros_b, compensation, M, K, lda, ldc_f, use_brgemm);
+      C_temp, A, scales_a, qzeros_a, B, scales_b, qzeros_b, compensation, dqB_tmp, M, K, lda, ldc_f, use_brgemm);
   if (store_out) {
     // copy from Ctmp to C
     for (int64_t m = 0; m < M; ++m) {
@@ -779,6 +790,7 @@ void tinygemm_kernel(
       const float* scales_b,                \
       const int8_t* qzeros_b,               \
       const int32_t* compensation,          \
+      int8_t* dqB_tmp,                      \
       int64_t M,                            \
       int64_t K,                            \
       int64_t lda,                          \

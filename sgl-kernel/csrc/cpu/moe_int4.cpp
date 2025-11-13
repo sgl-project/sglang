@@ -195,6 +195,7 @@ void fused_experts_int4_w4a8_kernel_impl(
     float* __restrict__ As_tmp,
     int32_t* __restrict__ Azp_tmp,
     float* __restrict__ C_tmp,
+    int8_t* __restrict__ dqB_tmp,
     const scalar_t* __restrict__ input,
     const uint8_t* __restrict__ packed_w1,
     const uint8_t* __restrict__ packed_w2,
@@ -231,6 +232,7 @@ void fused_experts_int4_w4a8_kernel_impl(
   // intermediate_cache0 (scalar_t):     + M * topk * 2 * N
   // Aq_tmp (uint8_t):                   + max(M * K, M * topk * N)
   // As_tmp (float):                     + M * topk
+  // dqB_tmp (int8_t)                    + num_threads * BLOCK_K * BlOCK_N
 
   // stage 0: quantize input to uint8, [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
@@ -250,7 +252,7 @@ void fused_experts_int4_w4a8_kernel_impl(
   int64_t num_groups = K / group_size;
 
   const int64_t stride_e = 2 * NB * Kc * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t)));
-  const bool sym_quant_a = false;
+  const bool sym_quant_act = false;
   // weight + compensation shape = [E, Nc, Kc, block_n * BLOCK_K / 2 + block_n*sizeof(int32_t)]
   // scales/qzeros shape = [E, Nc, G, block_n]
 
@@ -258,6 +260,8 @@ void fused_experts_int4_w4a8_kernel_impl(
   at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
     // get local pointers
     int tid = at::get_thread_num();
+    int8_t* dqB_tmp1 = dqB_tmp + tid * BLOCK_K * BLOCK_N;
+    int8_t* dqB_tmp2 = dqB_tmp1 + BLOCK_K * BLOCK_N;
     alignas(64) float As[BLOCK_M];
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
@@ -291,9 +295,9 @@ void fused_experts_int4_w4a8_kernel_impl(
       copy_bias<BLOCK_N>(nullptr, C1, m_size, BLOCK_N);
       for (int kci = 0; kci < Kc; ++kci) {
         int32_t* compensation_ptr =
-            sym_quant_a ? nullptr
-                        : (int32_t*)(void*)(B + (nb * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
-                                            BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
+            sym_quant_act ? nullptr
+                          : (int32_t*)(void*)(B + (nb * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
+                                              BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
         tinygemm_kernel<scalar_t>(
             ic0 + offset * 2 * N + nb * BLOCK_N,
             C0,
@@ -304,6 +308,7 @@ void fused_experts_int4_w4a8_kernel_impl(
             Bs + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
             Bz + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*qzeros_b*/,
             compensation_ptr,
+            dqB_tmp1,
             m_size,
             BLOCK_K,
             K,
@@ -315,9 +320,9 @@ void fused_experts_int4_w4a8_kernel_impl(
 
       for (int kci = 0; kci < Kc; ++kci) {
         int32_t* compensation_ptr =
-            sym_quant_a ? nullptr
-                        : (int32_t*)(void*)(B + (nb1 * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
-                                            BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
+            sym_quant_act ? nullptr
+                          : (int32_t*)(void*)(B + (nb1 * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
+                                              BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
         tinygemm_kernel<scalar_t>(
             ic0 + offset * 2 * N + nb1 * BLOCK_N,
             C1,
@@ -328,6 +333,7 @@ void fused_experts_int4_w4a8_kernel_impl(
             Bs + nb1 * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
             Bz + nb1 * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*qzeros_b*/,
             compensation_ptr,
+            dqB_tmp2,
             m_size,
             BLOCK_K,
             K,
@@ -369,6 +375,7 @@ void fused_experts_int4_w4a8_kernel_impl(
   // parallel on [MB2, NB2]
   at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
     int tid = at::get_thread_num();
+    int8_t* dqB_tmp1 = dqB_tmp + tid * BLOCK_K * BLOCK_N;
     float* __restrict__ C2 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     bool is_brgemm_used = false;
     for (int64_t i = begin; i < end; ++i) {
@@ -396,11 +403,11 @@ void fused_experts_int4_w4a8_kernel_impl(
       copy_bias<BLOCK_N>(nullptr, C2, m_size, BLOCK_N);
       for (int kci = 0; kci < Kc; ++kci) {
         int32_t* compensation_ptr =
-            sym_quant_a ? nullptr
-                        : (int32_t*)(void*)(B + (nb * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
-                                            BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
+            sym_quant_act ? nullptr
+                          : (int32_t*)(void*)(B + (nb * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
+                                              BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
         tinygemm_kernel<scalar_t>(
-            nullptr,
+            nullptr, /*store_out is false*/
             C2,
             A + kci * BLOCK_K,
             As,
@@ -409,6 +416,7 @@ void fused_experts_int4_w4a8_kernel_impl(
             Bs + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*scales_b*/,
             Bz + nb * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N /*zeros_b*/,
             compensation_ptr,
+            dqB_tmp1,
             m_size,
             BLOCK_K,
             IC,
@@ -452,6 +460,7 @@ void fused_experts_int4_w4a8_kernel_impl(
       float* __restrict__ As_tmp,                          \
       int32_t* __restrict__ Azp_tmp,                       \
       float* __restrict__ C_tmp,                           \
+      int8_t* __restrict__ dqB_tmp,                        \
       const TYPE* __restrict__ input,                      \
       const uint8_t* __restrict__ packed_w1,               \
       const uint8_t* __restrict__ packed_w2,               \

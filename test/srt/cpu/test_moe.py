@@ -6,11 +6,11 @@ import unittest
 import sgl_kernel
 import torch
 
+from sglang.srt.layers.amx_utils import CPUMoECompMethod
+
 kernel = torch.ops.sgl_kernel
 
 torch.manual_seed(128)
-
-from enum import IntEnum
 
 from utils import (
     BLOCK_K,
@@ -27,13 +27,6 @@ from utils import (
 )
 
 from sglang.test.test_utils import CustomTestCase
-
-
-class CPUMoECompMethod(IntEnum):
-    BF16_GEMM = 0
-    INT8_W8A8_GEMM = 1
-    FP8_W8A16_GEMM = 2
-    INT4_W4A8_GEMM = 3
 
 
 def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
@@ -89,7 +82,7 @@ class TestFusedExperts(CustomTestCase):
     E_fp8 = [8]
     topk_fp8 = [4]
 
-    M_int4 = [1]
+    M_int4 = [1, 6]
     N_int4 = [512]
     K_int4 = [256]
     E_int4 = [8]

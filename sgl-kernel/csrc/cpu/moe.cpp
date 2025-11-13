@@ -968,7 +968,7 @@ at::Tensor fused_experts_cpu(
   CHECK_INPUT(w2);
   CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
   CHECK_DIM(2, hidden_states);
-  if (moe_comp_method == 3 && is_vnni) {
+  if (moe_comp_method == static_cast<int>(CPUQuantMethod::INT4_W4A8) && is_vnni) {
     CHECK_DIM(4, w1);
     CHECK_DIM(4, w2);
   } else {
@@ -988,23 +988,29 @@ at::Tensor fused_experts_cpu(
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
-  int64_t N = moe_comp_method == 3 ? w1_scale.value().size(1) * w1_scale.value().size(3) / 2 : w1.size(1) / 2;
+  int64_t N = moe_comp_method == CPUQuantMethod::INT4_W4A8 ? w1_scale.value().size(1) * w1_scale.value().size(3) / 2
+                                                           : w1.size(1) / 2;
   int64_t E = w1.size(0);
   int64_t topk = topk_weights_.size(1);
 
   // we use int32_t compensation for int8 w8a8
-  int64_t packed_K = get_row_size(K, moe_comp_method == 1);
-  int64_t packed_N = get_row_size(N, moe_comp_method == 1);
+  int64_t packed_K = get_row_size(K, moe_comp_method == CPUQuantMethod::INT8_W8A8);
+  int64_t packed_N = get_row_size(N, moe_comp_method == CPUQuantMethod::INT8_W8A8);
 
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
-  if (moe_comp_method != 3) {
+  if (!(moe_comp_method == CPUQuantMethod::INT4_W4A8)) {
     CHECK_EQ(w2.size(1), K);
-    CHECK_EQ(packed_w1.size(2), packed_K / (moe_comp_method == 3 ? 2 : 1));
-    CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == 3 ? 2 : 1));
+    CHECK_EQ(packed_w1.size(2), packed_K / (moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 2 : 1));
+    CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 2 : 1));
   }
   // check scales
-  check_moe_scales(moe_comp_method == 1, moe_comp_method == 2, w1_scale, w2_scale, block_size);
+  check_moe_scales(
+      moe_comp_method == CPUQuantMethod::INT8_W8A8,
+      moe_comp_method == CPUQuantMethod::FP8_W8A16,
+      w1_scale,
+      w2_scale,
+      block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -1060,24 +1066,21 @@ at::Tensor fused_experts_cpu(
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //
-  int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
-                               num_threads * BLOCK_M * K * (moe_comp_method == 1 | moe_comp_method == 3 ? 1 : 2) +
-                               num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
+  int64_t buffer_size_nbytes =
+      M * topk * N * 2 + M * topk * K * 2 +
+      num_threads * BLOCK_M * K *
+          (moe_comp_method == CPUQuantMethod::INT8_W8A8 | moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 1 : 2) +
+      num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
 
-  // moe_comp_method :
-  //    BF16_GEMM = 0
-  //    INT8_W8A8_GEMM = 1
-  //    FP8_W8A16_GEMM = 2
-  //    INT4_W4A8_GEMM = 3
-
-  if (moe_comp_method == 1) {
+  if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
-  if (moe_comp_method == 2) {
+  if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
   }
-  if (moe_comp_method == 3) {
-    buffer_size_nbytes += M * topk * 2 * N * 2 + std::max(M * K, M * topk * N) + M * topk * sizeof(float);
+  if (moe_comp_method == CPUQuantMethod::INT4_W4A8) {
+    buffer_size_nbytes += M * topk * 2 * N * 2 + std::max(M * K, M * topk * N) + M * topk * sizeof(float) +
+                          num_threads * 2 * BLOCK_K * BLOCK_N;
   }
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
@@ -1085,7 +1088,7 @@ at::Tensor fused_experts_cpu(
     scalar_t* __restrict__ intermediate_cache1 = (scalar_t*)((void*)(buffer2.data_ptr<int8_t>()));
     scalar_t* __restrict__ intermediate_cache2 = intermediate_cache1 + M * topk * N;
 
-    if (moe_comp_method == 1) {
+    if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
       uint8_t* __restrict__ A_tmp = (uint8_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
@@ -1119,7 +1122,7 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad);
-    } else if (moe_comp_method == 2) {
+    } else if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
       // here we just ignore C_tmp as it is not used
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
@@ -1152,12 +1155,13 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad);
-    } else if (moe_comp_method == 3) {
+    } else if (moe_comp_method == CPUQuantMethod::INT4_W4A8) {
       uint8_t* __restrict__ A_tmp = (uint8_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       float* __restrict__ As_tmp = (float*)((void*)(Aq_tmp + std::max(M * K, M * topk * N)));
+      int8_t* __restrict__ dqB_tmp = (int8_t*)((void*)(As_tmp + M * topk));
 
       // weight + compensation shape = [Nc, Kc, block_n * block_k / 2 + block_n*sizeof(int32_t)]
       // scales/qzeros shape = [E, Nc, G, block_n]
@@ -1174,6 +1178,7 @@ at::Tensor fused_experts_cpu(
           As_tmp,
           nullptr,
           C_tmp,
+          dqB_tmp,
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<uint8_t>(),
           packed_w2.data_ptr<uint8_t>(),

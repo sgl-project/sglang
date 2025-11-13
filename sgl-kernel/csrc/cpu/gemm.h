@@ -38,11 +38,6 @@ inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
   return M > 4;
 }
 
-template <>
-inline bool can_use_brgemm<at::quint4x2>(int M) {
-  return M > 4;
-}
-
 // work around compiler internal error
 #define BLOCK_K 128  // 4 * TILE_K
 
@@ -59,6 +54,16 @@ inline int64_t get_row_size<int8_t>(int64_t K) {
 
 inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
+}
+
+enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3 };
+
+constexpr bool operator==(CPUQuantMethod a, int64_t b) {
+  return static_cast<int64_t>(a) == b;
+}
+
+constexpr bool operator==(int64_t a, CPUQuantMethod b) {
+  return a == static_cast<int64_t>(b);
 }
 
 // pack weight to vnni format
@@ -152,6 +157,7 @@ void fused_experts_int4_w4a8_kernel_impl(
     float* __restrict__ As_tmp,
     int32_t* __restrict__ Azp_tmp,
     float* __restrict__ C_tmp,
+    int8_t* __restrict__ dqB_tmp,
     const scalar_t* __restrict__ input,
     const uint8_t* __restrict__ packed_w1,
     const uint8_t* __restrict__ packed_w2,
@@ -251,6 +257,7 @@ void tinygemm_kernel(
     const float* scales_b,
     const int8_t* qzeros_b,
     const int32_t* compensation,
+    int8_t* dqB_tmp,
     int64_t M,
     int64_t K,
     int64_t lda,
