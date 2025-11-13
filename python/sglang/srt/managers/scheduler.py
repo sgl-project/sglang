@@ -160,7 +160,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.tracing.trace_metric_warpper import (
-    NoOpTimeRecorder,
+    NoOpStageContext,
     RequestStage,
     SglangStageContext,
     metric_trace_slice_batch,
@@ -1305,7 +1305,7 @@ class Scheduler(
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             req.stage_context = (
-                recv_req.stage_context if recv_req.stage_context else NoOpTimeRecorder()
+                recv_req.stage_context if recv_req.stage_context else NoOpStageContext()
             )
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
@@ -2603,7 +2603,7 @@ class Scheduler(
         self, req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
     ):
         if self.server_args.trace_level == 0 and not self.server_args.enable_metrics:
-            req.stage_context = NoOpTimeRecorder()
+            req.stage_context = NoOpStageContext()
             return
 
         bootstrap_room = req.bootstrap_room if hasattr(req, "bootstrap_room") else None

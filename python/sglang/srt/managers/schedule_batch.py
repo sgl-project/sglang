@@ -78,7 +78,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.tracing.trace_metric_warpper import NoOpTimeRecorder, SglangStageContext
+from sglang.srt.tracing.trace_metric_warpper import NoOpStageContext, SglangStageContext
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -623,7 +623,7 @@ class Req:
         # For metrics or trace
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
-        self.stage_context = stage_context if stage_context else NoOpTimeRecorder()
+        self.stage_context = stage_context if stage_context else NoOpStageContext()
         self.has_log_time_stats: bool = False
 
         # For disaggregation

@@ -240,7 +240,7 @@ class SglangStageContext(SglangTraceReqContext):
     metric_trace_slice = metric_trace_slice_end
 
 
-class NoOpTimeRecorder:
+class NoOpStageContext:
     __slots__ = ()
 
     def __getattr__(self, name):
@@ -332,13 +332,13 @@ def global_init_stage_context(
     return stage_context
 
 
-def global_get_stage_context(rid) -> Union[SglangStageContext, NoOpTimeRecorder]:
+def global_get_stage_context(rid) -> Union[SglangStageContext, NoOpStageContext]:
     pid = threading.get_native_id()
     rid = str(rid)
     if pid in global_stage_context_table:
         if rid in global_stage_context_table[pid]:
             return global_stage_context_table[pid][rid]
-    return NoOpTimeRecorder()
+    return NoOpStageContext()
 
 
 def global_set_stage_context(stage_context):
