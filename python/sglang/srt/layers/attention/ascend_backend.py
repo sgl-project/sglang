@@ -86,7 +86,6 @@ class AscendAttnMaskBuilder:
         mask_flag = (
             torch.ones((max_seq_len, max_seq_len), dtype=torch.bool)
             .tril_()
-            .view(max_seq_len, max_seq_len)
         )
         # Create upper triangle matrix used to mark mask positions.
         mask_flag = ~mask_flag
