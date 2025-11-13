@@ -595,9 +595,6 @@ class MambaMixer2(torch.nn.Module):
 
                 state_indices_batch = state_indices_tensor_d[:num_decodes]
 
-                # Save the initial state before processing (we'll restore it at the end)
-                initial_ssm_state = ssm_state[state_indices_batch].clone()
-
                 # Allocate reusable contiguous output buffer once (kernel requires contiguous memory)
                 # Reused across all iterations to avoid repeated allocations
                 out_step_buffer = torch.empty(
@@ -631,18 +628,16 @@ class MambaMixer2(torch.nn.Module):
                         dt_softplus=True,
                         state_batch_indices=state_indices_batch,
                         out=out_step_buffer,
+                        disable_state_update=True,
+                        intermediate_states_buffer=intermediate_state_cache,
+                        cache_steps=draft_token_num,
+                        step_idx=step,
                     )
 
                     # Copy to preallocated buffer at correct strided positions
                     preallocated_ssm_out_d[step_indices] = out_step_buffer.view(
                         num_decodes, -1
                     )
-
-                    intermediate_state_cache[state_indices_batch, step] = ssm_state[
-                        state_indices_batch
-                    ].clone()
-
-                ssm_state[state_indices_batch] = initial_ssm_state
             else:
                 selective_state_update(
                     ssm_state,

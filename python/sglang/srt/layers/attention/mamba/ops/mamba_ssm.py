@@ -42,6 +42,12 @@ else:
 @triton.heuristics(
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
 )
+@triton.heuristics(
+    {
+        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
+        is not None
+    }
+)
 @triton.jit
 def _selective_scan_update_kernel(
     # Pointers to matrices
@@ -57,6 +63,9 @@ def _selective_scan_update_kernel(
     out_ptr,
     state_batch_indices_ptr,
     pad_slot_id,
+    intermediate_states_buffer,
+    cache_steps,
+    step_idx,
     # Matrix dimensions
     batch,
     nheads,
@@ -101,6 +110,8 @@ def _selective_scan_update_kernel(
     HAS_D: tl.constexpr,
     HAS_Z: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
+    DISABLE_STATE_UPDATE: tl.constexpr,
+    CACHE_INTERMEDIATE_STATES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
@@ -184,10 +195,26 @@ def _selective_scan_update_kernel(
     dB = B[None, :] * dt[:, None] if not TIE_HDIM else B * dt
     state = state * dA + dB * x[:, None]
 
-    mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
-    if HAS_STATE_BATCH_INDICES:
-        mask &= state_batch_idx != pad_slot_id
-    tl.store(state_ptrs, state, mask=mask)
+    if CACHE_INTERMEDIATE_STATES:
+        if HAS_STATE_BATCH_INDICES:
+            if state_batch_idx != pad_slot_id:
+                cache_ptr_base = (
+                    intermediate_states_buffer
+                    + state_batch_idx * cache_steps * nheads * dim * dstate
+                    + step_idx * nheads * dim * dstate
+                    + pid_h * dim * dstate
+                )
+                cache_ptrs = cache_ptr_base + (
+                    offs_m[:, None] * dstate + offs_n[None, :]
+                )
+                tl.store(cache_ptrs, state, mask=mask)
+
+    if not DISABLE_STATE_UPDATE:
+        mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
+        if HAS_STATE_BATCH_INDICES:
+            mask &= state_batch_idx != pad_slot_id
+        tl.store(state_ptrs, state, mask=mask)
+
     out = tl.sum(state * C[None, :], axis=1)
     if HAS_D:
         out += x * D
@@ -210,6 +237,10 @@ def selective_state_update(
     state_batch_indices=None,
     pad_slot_id=PAD_SLOT_ID,
     out=None,
+    disable_state_update=False,
+    intermediate_states_buffer=None,
+    cache_steps=None,
+    step_idx=0,
 ):
     """
     Argument:
@@ -230,6 +261,10 @@ def selective_state_update(
             indices 0 and 3
         out: Preallocated ssm output tensor. Assume same shape as x.
              In-place updated.
+        disable_state_update: If True, don't write back to state (for speculative verify)
+        intermediate_states_buffer: Buffer to cache intermediate states
+        cache_steps: Total number of steps in the buffer
+        step_idx: Current step index (which position to write in buffer)
     """
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -305,6 +340,9 @@ def selective_state_update(
             out,
             state_batch_indices,
             pad_slot_id,
+            intermediate_states_buffer,
+            cache_steps if cache_steps is not None else 0,
+            step_idx,
             batch,
             nheads,
             dim,
@@ -340,5 +378,6 @@ def selective_state_update(
             dt_softplus,
             tie_hdim,
             BLOCK_SIZE_M,
+            DISABLE_STATE_UPDATE=disable_state_update,
             num_warps=num_warps,
         )
