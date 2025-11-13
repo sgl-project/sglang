@@ -13,7 +13,7 @@ def _call_once(func: Callable):
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        if getattr(func, "_has_call_once", default=False):
+        if getattr(func, "_has_call_once", False):
             logger.debug("Function {} has already been called.".format(func.__name__))
             return
         else:
