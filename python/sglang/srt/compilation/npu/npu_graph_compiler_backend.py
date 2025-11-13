@@ -26,11 +26,15 @@ from sglang.srt.compilation.npu.passes.w8a8_int8 import (
 
 
 class NpuGraphCompilerBackend:
+    def __init__(self, model_type: torch.dtype):
+        self.model_type = model_type
+
     def __call__(self, graph: torch.fx.GraphModule, example_inputs) -> Callable:
         DisableContext.compiled_function_args[DisableContext.batch_size] = (
             example_inputs
         )
-        NpuGraphCompilerBackend.apply_passes(graph)
+        if self.model_type == torch.bfloat16:
+            NpuGraphCompilerBackend.apply_passes(graph)
         return graph
 
     def apply_passes(graph_module: torch.fx.GraphModule):

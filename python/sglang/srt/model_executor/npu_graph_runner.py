@@ -101,7 +101,9 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def _capture_graph(self, graph, pool, stream, run_once_fn, bs: int):
         if self.enable_torch_compile:
-            compiler = NpuGraphCompiler(run_once_fn)
+            compiler = NpuGraphCompiler(
+                run_once_fn, self.model_runner.model_config.dtype
+            )
 
             patch_dynamo_context_call()
             DisableContext.batch_size = bs
