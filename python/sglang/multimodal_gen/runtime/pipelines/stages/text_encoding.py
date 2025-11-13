@@ -243,19 +243,34 @@ class TextEncodingStage(PipelineStage):
 
             # Prepare tokenizer args
             tok_kwargs = self.prepare_tokenizer_kwargs(
-                encoder_config.tokenizer_kwargs,
+                getattr(encoder_config.arch_config, 'tokenizer_kwargs', {}),
                 **text_encoder_extra_arg,
             )
 
             text_inputs = tokenizer(processed_texts, **tok_kwargs).to(target_device)
             input_ids = text_inputs["input_ids"]
+            if isinstance(input_ids, torch.Tensor) and input_ids.device != target_device:
+                input_ids = input_ids.to(target_device)
+            elif isinstance(input_ids, list):
+                input_ids = torch.tensor(input_ids, dtype=torch.long, device=target_device)
+
             is_flux = isinstance(server_args.pipeline_config, FluxPipelineConfig)
             is_flux_t5 = is_flux and i == 1
 
+            #if is_flux_t5:
+            #    attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
+            #else:
+            #    attention_mask = text_inputs["attention_mask"]
             if is_flux_t5:
                 attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
             else:
                 attention_mask = text_inputs["attention_mask"]
+                # Ensure attention_mask is a tensor
+                if isinstance(attention_mask, torch.Tensor) and attention_mask.device != target_device:
+                    attention_mask = attention_mask.to(target_device)
+                elif isinstance(attention_mask, list):
+                    attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=target_device)
+
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 outputs: BaseEncoderOutput = text_encoder(
                     input_ids=input_ids,

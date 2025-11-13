@@ -603,29 +603,31 @@ class WanTransformer3DModel(CachableDiT):
     def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
-        inner_dim = config.num_attention_heads * config.attention_head_dim
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.in_channels = config.in_channels
-        self.out_channels = config.out_channels
-        self.num_channels_latents = config.num_channels_latents
-        self.patch_size = config.patch_size
-        self.text_len = config.text_len
+        arch = config.arch_config
+
+        inner_dim = arch.num_attention_heads * arch.attention_head_dim
+        self.hidden_size = getattr(arch, 'hidden_size', 0)
+        self.num_attention_heads = getattr(arch, 'num_attention_heads', 40)
+        self.in_channels = getattr(arch, 'in_channels', 16)
+        self.out_channels = getattr(arch, 'out_channels', 16)
+        self.num_channels_latents = getattr(arch, 'num_channels_latents', 16)
+        self.patch_size = getattr(arch, 'patch_size', (1, 2, 2))
+        self.text_len = getattr(arch, 'text_len', 512)
 
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
-            in_chans=config.in_channels,
+            in_chans=getattr(arch, 'in_channels', 16),
             embed_dim=inner_dim,
-            patch_size=config.patch_size,
+            patch_size=getattr(arch, 'patch_size', (1, 2, 2)),
             flatten=False,
         )
 
         # 2. Condition embeddings
         self.condition_embedder = WanTimeTextImageEmbedding(
             dim=inner_dim,
-            time_freq_dim=config.freq_dim,
-            text_embed_dim=config.text_dim,
-            image_embed_dim=config.image_dim,
+            time_freq_dim=arch.freq_dim,
+            text_embed_dim=arch.text_dim,
+            image_embed_dim=arch.image_dim,
         )
 
         # 3. Transformer blocks
@@ -639,17 +641,17 @@ class WanTransformer3DModel(CachableDiT):
             [
                 transformer_block(
                     inner_dim,
-                    config.ffn_dim,
-                    config.num_attention_heads,
-                    config.qk_norm,
-                    config.cross_attn_norm,
-                    config.eps,
-                    config.added_kv_proj_dim,
+                    arch.ffn_dim,
+                    arch.num_attention_heads,
+                    arch.qk_norm,
+                    arch.cross_attn_norm,
+                    arch.eps,
+                    arch.added_kv_proj_dim,
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
                     prefix=f"{config.prefix}.blocks.{i}",
                 )
-                for i in range(config.num_layers)
+                for i in range(arch.num_layers)
             ]
         )
 
@@ -657,13 +659,13 @@ class WanTransformer3DModel(CachableDiT):
         self.norm_out = LayerNormScaleShift(
             inner_dim,
             norm_type="layer",
-            eps=config.eps,
+            eps=arch.eps,
             elementwise_affine=False,
             dtype=torch.float32,
             compute_dtype=torch.float32,
         )
         self.proj_out = nn.Linear(
-            inner_dim, config.out_channels * math.prod(config.patch_size)
+            inner_dim, arch.out_channels * math.prod(arch.patch_size)
         )
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5

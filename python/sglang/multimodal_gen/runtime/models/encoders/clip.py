@@ -319,7 +319,7 @@ class CLIPEncoder(nn.Module):
         self.config = config
 
         if num_hidden_layers_override is None:
-            num_hidden_layers = config.num_hidden_layers
+            num_hidden_layers = config.arch_config.num_hidden_layers
         else:
             num_hidden_layers = num_hidden_layers_override
         self.layers = nn.ModuleList(
@@ -361,7 +361,7 @@ class CLIPTextTransformer(nn.Module):
     ):
         super().__init__()
         self.config = config
-        embed_dim = config.hidden_size
+        embed_dim = config.arch_config.hidden_size
 
         self.embeddings = CLIPTextEmbeddings(config)
 
@@ -372,10 +372,10 @@ class CLIPTextTransformer(nn.Module):
             prefix=prefix,
         )
 
-        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.arch_config.layer_norm_eps)
 
         # For `pooled_output` computation
-        self.eos_token_id = config.eos_token_id
+        self.eos_token_id = config.arch_config.eos_token_id
 
     def forward(
         self,

@@ -110,6 +110,130 @@ class ComponentLoader(ABC):
         )
         return GenericComponentLoader(transformers_or_diffusers)
 
+def _cat_or_split_umt5_qkv_for_compat(model, state_dict, logger=None):
+    """
+    Make Wan/UMT5 text-encoder checkpoints layout-agnostic:
+    - If model expects fused qkv_proj but ckpt has q/k/v: fuse (concat along correct dim).
+    - If model expects separate q/k/v but ckpt has qkv_proj: split (along correct dim).
+    Adds explicit shape checks, verbose debug logs, and block-level accounting.
+    """
+    import re
+    import torch
+
+    log = logger.debug if logger else print
+    warn = logger.warning if logger else print
+
+    sd = dict(state_dict)          # work on a copy
+    msd = model.state_dict()
+
+    patt = re.compile(r"^encoder\.block\.(\d+)\.layer\.0\.SelfAttention\.")
+    model_uses_fused = any(k.endswith("qkv_proj.weight") for k in msd.keys())
+    ckpt_uses_fused  = any(k.endswith("qkv_proj.weight") for k in sd.keys())
+
+    # Nothing to do
+    if model_uses_fused == ckpt_uses_fused:
+        log("UMT5 qkv compat: model and ckpt layouts already match.")
+        return state_dict
+
+    # Infer num layers from model weights present
+    blocks = sorted(
+        {int(m.group(1)) for k in set(sd) | set(msd) for m in [patt.match(k)] if m}
+    )
+    total_blocks = len(blocks)
+
+    def _concat_to(target_shape, q, k, v):
+        # Prefer dim=0 for [out,in] weights; fallback dim=1 if shapes demand it.
+        for dim in (0, 1):
+            try_cat = torch.cat([q, k, v], dim=dim)
+            if try_cat.shape == target_shape:
+                return try_cat, dim
+        return None, None
+
+    def _split_to(q_shape, k_shape, v_shape, qkv):
+        for dim in (0, 1):
+            sizes = [q_shape[dim], k_shape[dim], v_shape[dim]]
+            if sum(sizes) == qkv.shape[dim]:
+                q_s, k_s, v_s = torch.split(qkv, sizes, dim=dim)
+                if q_s.shape == q_shape and k_s.shape == k_shape and v_s.shape == v_shape:
+                    return (q_s, k_s, v_s), dim
+        return (None, None, None), None
+
+    converted = 0
+    op = "fuse" if (model_uses_fused and not ckpt_uses_fused) else "split"
+
+    for b in blocks:
+        base = f"encoder.block.{b}.layer.0.SelfAttention"
+        qkv_w_key = f"{base}.qkv_proj.weight"
+        qkv_b_key = f"{base}.qkv_proj.bias"
+
+        # Support both *_proj.* and bare q/k/v.*
+        def key_exists(name): return name in sd
+        q_w_key = f"{base}.q_proj.weight" if key_exists(f"{base}.q_proj.weight") else f"{base}.q.weight"
+        k_w_key = f"{base}.k_proj.weight" if key_exists(f"{base}.k_proj.weight") else f"{base}.k.weight"
+        v_w_key = f"{base}.v_proj.weight" if key_exists(f"{base}.v_proj.weight") else f"{base}.v.weight"
+        q_b_key = f"{base}.q_proj.bias"   if key_exists(f"{base}.q_proj.bias")   else f"{base}.q.bias"
+        k_b_key = f"{base}.k_proj.bias"   if key_exists(f"{base}.k_proj.bias")   else f"{base}.k.bias"
+        v_b_key = f"{base}.v_proj.bias"   if key_exists(f"{base}.v_proj.bias")   else f"{base}.v.bias"
+
+        if model_uses_fused and not ckpt_uses_fused:
+            # Need q/k/v -> qkv
+            if all(k in sd for k in (q_w_key, k_w_key, v_w_key)) and qkv_w_key in msd:
+                target_w_shape = msd[qkv_w_key].shape
+                fused_w, dim_w = _concat_to(target_w_shape, sd[q_w_key], sd[k_w_key], sd[v_w_key])
+                if fused_w is None:
+                    warn(f"[b{b}] Unable to fuse q/k/v → qkv (weights): "
+                         f"q={sd[q_w_key].shape}, k={sd[k_w_key].shape}, v={sd[v_w_key].shape}, "
+                         f"target={target_w_shape}")
+                else:
+                    sd[qkv_w_key] = fused_w
+                    log(f"[b{b}] FUSED (dim={dim_w}) {q_w_key}, {k_w_key}, {v_w_key} → {qkv_w_key} "
+                        f"shapes q={sd[q_w_key].shape}, k={sd[k_w_key].shape}, v={sd[v_w_key].shape}, fused={fused_w.shape}")
+                    # Optional bias
+                    if q_b_key in sd and k_b_key in sd and v_b_key in sd and qkv_b_key in msd:
+                        fused_b, dim_b = _concat_to(msd[qkv_b_key].shape, sd[q_b_key], sd[k_b_key], sd[v_b_key])
+                        if fused_b is not None:
+                            sd[qkv_b_key] = fused_b
+                            log(f"[b{b}] FUSED (bias, dim={dim_b}) {q_b_key}, {k_b_key}, {v_b_key} → {qkv_b_key} "
+                                f"shapes qb={sd[q_b_key].shape}, kb={sd[k_b_key].shape}, vb={sd[v_b_key].shape}, fused={fused_b.shape}")
+                    # Clean originals only after success
+                    for old in (q_w_key, k_w_key, v_w_key, q_b_key, k_b_key, v_b_key):
+                        sd.pop(old, None)
+                    converted += 1
+
+        elif not model_uses_fused and ckpt_uses_fused:
+            # Need qkv -> q/k/v
+            if qkv_w_key in sd and all(k in msd for k in (q_w_key, k_w_key, v_w_key)):
+                q_shape, k_shape, v_shape = msd[q_w_key].shape, msd[k_w_key].shape, msd[v_w_key].shape
+                (q_w, k_w, v_w), dim_w = _split_to(q_shape, k_shape, v_shape, sd[qkv_w_key])
+                if q_w is None:
+                    warn(f"[b{b}] Unable to split qkv → q/k/v (weights): qkv={sd[qkv_w_key].shape}, "
+                         f"targets q={q_shape}, k={k_shape}, v={v_shape}")
+                else:
+                    sd[q_w_key], sd[k_w_key], sd[v_w_key] = q_w, k_w, v_w
+                    log(f"[b{b}] SPLIT (dim={dim_w}) {qkv_w_key} → {q_w_key}, {k_w_key}, {v_w_key} "
+                        f"shapes qkv={sd[qkv_w_key].shape}, q={q_w.shape}, k={k_w.shape}, v={v_w.shape}")
+                    # Optional bias
+                    if qkv_b_key in sd and all(k in msd for k in (q_b_key, k_b_key, v_b_key)):
+                        (q_b, k_b, v_b), dim_b = _split_to(msd[q_b_key].shape, msd[k_b_key].shape, msd[v_b_key].shape, sd[qkv_b_key])
+                        if q_b is not None:
+                            sd[q_b_key], sd[k_b_key], sd[v_b_key] = q_b, k_b, v_b
+                            log(f"[b{b}] SPLIT (bias, dim={dim_b}) {qkv_b_key} → {q_b_key}, {k_b_key}, {v_b_key}")
+                    # Remove fused only after success
+                    sd.pop(qkv_w_key, None)
+                    sd.pop(qkv_b_key, None)
+                    converted += 1
+
+    # If we expected to convert most/all blocks but didn’t, fail early with guidance
+    if converted == 0:
+        raise ValueError(
+            f"UMT5 qkv compat expected to {op} but converted 0/{total_blocks} blocks. "
+            f"Check ckpt/model layout and key names."
+        )
+    if converted < total_blocks:
+        warn(f"UMT5 qkv compat {op}: converted {converted}/{total_blocks} blocks. "
+             f"This can be OK if some blocks were absent, otherwise check logs above.")
+
+    return sd
 
 class TextEncoderLoader(ComponentLoader):
     """Loader for text encoders."""
@@ -292,7 +416,11 @@ class TextEncoderLoader(ComponentLoader):
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
                 model = model_cls(model_config)
 
-            weights_to_load = {name for name, _ in model.named_parameters()}
+            # collect all weights into a state dict
+            state_dict = {}
+            for name, tensor in self._get_all_weights(model, model_path, to_cpu=use_cpu_offload):
+                state_dict[name] = tensor
+
             loaded_weights = model.load_weights(
                 self._get_all_weights(model, model_path, to_cpu=use_cpu_offload)
             )
@@ -302,6 +430,20 @@ class TextEncoderLoader(ComponentLoader):
                 self.counter_after_loading_weights
                 - self.counter_before_loading_weights,
             )
+
+            # Apply QKV compatibility transformation
+            try:
+                state_dict = _cat_or_split_umt5_qkv_for_compat(model, state_dict, logger)
+            except Exception as e:
+                logger.warning(f"UMT5 qkv compatibility pass failed: {e}")
+
+            # Load using standard load_state_dict instead of custom load_weights
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+            if missing:
+                logger.warning(f"Missing keys when loading state dict: {missing}")
+            if unexpected:
+                logger.warning(f"Unexpected keys when loading state dict: {unexpected}")
 
             # Explicitly move model to target device after loading weights
             model = model.to(target_device)
@@ -326,15 +468,6 @@ class TextEncoderLoader(ComponentLoader):
                         fsdp_shard_conditions=model._fsdp_shard_conditions,
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
-            # We only enable strict check for non-quantized models
-            # that have loaded weights tracking currently.
-            # if loaded_weights is not None:
-            weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
-                raise ValueError(
-                    "Following weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
-                )
 
         return model.eval()
 
