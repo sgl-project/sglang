@@ -2065,12 +2065,24 @@ class ModelRunner:
         name_to_module = dict(self.model.named_modules())
 
         for spec in hook_specs:
-            target_patterns = spec["target_modules"]
-            hook_factory_path = spec.get("hook_factory")
+            target_patterns = spec.get("target_modules", [])
+            if target_patterns == []:
+                logger.warning(
+                    "Hook spec '%s' has no 'target_modules', skipping",
+                    spec.get("name", ""),
+                )
+                continue
+
+            hook_factory_path = spec.get("hook_factory", None)
+            if not hook_factory_path:
+                logger.warning(
+                    "Hook spec '%s' has no 'hook_factory', skipping",
+                    spec.get("name", ""),
+                )
+                continue
+
             config = spec.get("config") or {}
-
             hook_factory = resolve_callable(hook_factory_path)
-
             hook = hook_factory(config) if hook_factory else None
 
             # Resolve patterns like "model.layers.*.mlp"
