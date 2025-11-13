@@ -193,11 +193,12 @@ def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     )
 
 
-def _resolve_config_path(model):
+def _resolve_config_path(model: str):
     use_modelscope = get_bool_env_var("SGLANG_USE_MODELSCOPE")
-    if use_modelscope:
+    if use_modelscope and (model is not None and model.count("/") == 1):
         from modelscope.hub.file_download import model_file_download
 
+        print(f"hello from hf_transformers_utils:200 {model}")
         return model_file_download(model_id=model, file_path="config.json")
     else:
         return model  # HuggingFace will handle the path/id
