@@ -55,12 +55,12 @@ void chunk_gated_delta_rule_kernel_impl(
     const int64_t& kStrideT,
     const int64_t& vStrideH,
     const int64_t& vStrideT,
+    const int64_t& oStrideH,
+    const int64_t& oStrideT,
     const int64_t& global_total_seq_length,
     const int64_t& global_num_chunk,
     const int64_t& buff_size_16bit_per_thread,
     double eps = 1e-5) {
-  int64_t oStrideT = vStrideT;
-  int64_t oStrideH = vStrideH;
   int64_t gStrideH = 1;
   int64_t gStrideT = v_num_head;
   int64_t bStrideH = 1;
@@ -863,6 +863,8 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   int64_t kStrideT = key.stride(1);
   int64_t vStrideH = value.stride(2);
   int64_t vStrideT = value.stride(1);
+  int64_t oStrideH = output.stride(2);
+  int64_t oStrideT = output.stride(1);
 
   constexpr int64_t chunk_size = 64;
   // Deduce the global chunks
@@ -970,6 +972,8 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
         kStrideT,
         vStrideH,
         vStrideT,
+        oStrideH,
+        oStrideT,
         global_total_seq_length,
         global_num_chunk,
         buff_size_16bit_per_thread,
