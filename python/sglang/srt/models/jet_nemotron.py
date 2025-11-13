@@ -6,7 +6,6 @@ from torch import nn
 from transformers.utils import logging
 
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.jet_nemotron.dynamic_conv import (
     DynamicShortConvolution,
@@ -28,6 +27,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.utils import add_prefix
 
 logger = logging.get_logger(__name__)
@@ -38,7 +38,7 @@ class JetBlock(nn.Module):
         self,
         config: JetNemotronConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -155,44 +155,6 @@ class JetBlock(nn.Module):
         return o
 
 
-class JetNemotronMLP(nn.Module):
-    def __init__(
-        self,
-        config: JetNemotronConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_up_proj = MergedColumnParallelLinear(
-            self.hidden_size,
-            [self.intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            self.intermediate_size,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        if config.hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, hidden_state):
-        gate_up, _ = self.gate_up_proj(hidden_state)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
-
 class JetNemotronAttention(nn.Module):
     def __init__(
         self,
@@ -277,9 +239,9 @@ class JetNemotronDecoderLayer(nn.Module):
         self,
         config: JetNemotronConfig,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-    ):
+    ) -> None:
         super().__init__()
 
         match config.layer_types[layer_id]:
@@ -302,7 +264,13 @@ class JetNemotronDecoderLayer(nn.Module):
             case _:
                 raise NotImplementedError
 
-        self.mlp = JetNemotronMLP(config, quant_config, prefix)
+        self.mlp = Qwen2MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -344,7 +312,7 @@ class JetNemotronModel(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()

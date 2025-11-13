@@ -14,11 +14,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.jet_nemotron import (
-    JetNemotronAttention,
-    JetNemotronForCausalLM,
-    JetNemotronMLP,
-)
+from sglang.srt.models.jet_nemotron import JetNemotronAttention, JetNemotronForCausalLM
+from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.utils import add_prefix
 
 
@@ -43,7 +40,13 @@ class JetNemotronDecoderLayerEagle3(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        self.mlp = JetNemotronMLP(config, quant_config, prefix)
+        self.mlp = Qwen2MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
