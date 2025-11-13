@@ -1,29 +1,14 @@
-# Copyright 2025 NVIDIA CORPORATION & AFFILIATES
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# SPDX-License-Identifier: Apache-2.0
-# Modified
-
 from __future__ import annotations
 
-from collections import OrderedDict
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers.activations import ACT2FN
+
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import add_prefix
 
 from .dconv_fwd_cache_varlen import dynamic_conv_triton_cache_varlen
 from .dconv_speculative_step import (
@@ -33,68 +18,66 @@ from .dconv_speculative_step import (
 from .dconv_step import causal_conv_step_triton
 
 
-class DynamicShortConvolution(nn.Module):
-    """
-    Simple wrapper around `nn.Conv1d` that accepts dimension last.
-    """
+class DynamicShortConvolutionKernelGenerator(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
 
+        self.w1 = ColumnParallelLinear(
+            input_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("w1", prefix),
+        )
+
+        self.act = nn.SiLU()
+
+        self.w2 = RowParallelLinear(
+            hidden_size,
+            output_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("w2", prefix),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self.w1(x)
+        x = self.act(x)
+        x, _ = self.w2(x)
+        return x
+
+
+class DynamicShortConvolution(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         kernel_size: int,
-        generator_input_size: Optional[int] = None,
-        generator_reduction: Optional[int] = None,
-        generator_activation: str = "silu",
-        activation: Optional[str] = "silu",
-        use_fast_conv1d: bool = True,
-        implementation: str = "naive",
-    ) -> DynamicShortConvolution:
+        generator_input_size: int,
+        generator_reduction: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
 
+        generator_hidden_size = hidden_size // generator_reduction
+
+        self.kernel_generator = DynamicShortConvolutionKernelGenerator(
+            input_size=generator_input_size,
+            hidden_size=generator_hidden_size,
+            output_size=hidden_size * kernel_size,
+            quant_config=quant_config,
+            prefix=add_prefix("kernel_generator", prefix),
+        )
+
         self.hidden_size = hidden_size
-        self.generator_input_size = (
-            hidden_size if generator_input_size is None else generator_input_size
-        )
-        self.generator_hidden_size = (
-            hidden_size
-            if generator_reduction is None
-            else (hidden_size // generator_reduction)
-        )
         self.kernel_size = kernel_size
-        self.activation = None
-        self.use_fast_conv1d = use_fast_conv1d
-        self.implementation = implementation
-
-        if activation is not None:
-            assert activation in [
-                "silu",
-                "swish",
-            ], f"Activation `{activation}` not supported yet."
-            self.activation = activation
-
-        self.kernel_generator = nn.Sequential(
-            OrderedDict(
-                [
-                    (
-                        "w1",
-                        nn.Linear(
-                            self.generator_input_size,
-                            self.generator_hidden_size,
-                            bias=False,
-                        ),
-                    ),
-                    ("act", ACT2FN[generator_activation]),
-                    (
-                        "w2",
-                        nn.Linear(
-                            self.generator_hidden_size,
-                            self.hidden_size * self.kernel_size,
-                            bias=True,
-                        ),
-                    ),
-                ]
-            )
-        )
 
     def get_kernel(self, x: torch.Tensor) -> torch.Tensor:
         flat_kernels = self.kernel_generator(x)
@@ -111,7 +94,6 @@ class DynamicShortConvolution(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
         cache: Optional[torch.Tensor] = None,
         output_final_state: bool = False,
         cu_seqlens: Optional[torch.LongTensor] = None,
@@ -126,54 +108,11 @@ class DynamicShortConvolution(nn.Module):
         is_topk1: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x (`torch.Tensor`):
-                Tensor of shape `[B, T, D]`.
-                If `seq_idx` is provided, shape `[T, D]`.
-            mask (`Optional[torch.Tensor]`):
-                Attention mask dealing with padded positions.
-            cache (`Optional[torch.Tensor]`):
-                Previous cache tensor of shape `[N, D, W]`, where `W` is the kernel size.
-                If provided, the cache is updated **inplace**.
-            output_final_state (Optional[bool]):
-                Whether to output the final state of shape `[N, D, W]`. Default: `False`.
-            cu_seqlens (Optional[torch.LongTensor]):
-                Cumulative sequence lengths for each batch. Used for varlen. Default: `None`.
-                Shape: [B+1]
-            cache_indices (`Optional[torch.Tensor]`):
-                Indices of the cache for each sequence. Shape: [B].
-            seq_idx (`Optional[torch.Tensor]`):
-                Indices of the sequence for each token. Shape: [T].
-            has_initial_state (`Optional[torch.Tensor]`):
-                Whether the initial state is provided. Shape: [B].
-            intermediate_conv_window (`Optional[torch.Tensor]`):
-                Shape `[N, W-2+speculative_num_draft_tokens, D]`
-                If provided, the intermediate conv window is updated **inplace** and cache_indices must be provided.
-                Cache is used but not updated. Used for speculative decoding verification.
-            retrieve_next_token (`Optional[torch.Tensor]`):
-                Shape `[N, NP2_T]`, retrieve the next token for each token in the sequence.
-            retrieve_next_sibling (`Optional[torch.Tensor]`):
-                Shape `[N, NP2_T]`, retrieve the next sibling token for each token in the sequence.
-            retrieve_parent_token (`Optional[torch.Tensor]`):
-                Shape `[N, NP2_T]`, retrieve the parent token for each token in the sequence.
-            is_topk1 (`Optional[bool]`):
-                Whether to use topk1 mode. Default: `False`.
-
-        Returns:
-            Tensor of shape `[B, T, D]`.
-        """
-
-        """
-        x: [B, T, D]
-        return: [B, T, D]
-        """
         if cu_seqlens is not None:
             assert cache is not None, "Cache must be provided for varlen mode."
             B = len(cu_seqlens) - 1
             T, _ = x.shape
             W = self.kernel_size
-            input_dtype = x.dtype
 
             out = dynamic_conv_triton_cache_varlen(
                 x,
@@ -184,9 +123,7 @@ class DynamicShortConvolution(nn.Module):
                 has_initial_state,
                 seq_idx,
             )
-            if self.activation is not None:
-                out = ACT2FN[self.activation](out)
-            out = out.to(input_dtype)
+            out = nn.functional.silu(out)
             if output_final_state:
                 for i in range(B):
                     start_idx = cu_seqlens[i].item()
@@ -230,17 +167,14 @@ class DynamicShortConvolution(nn.Module):
                     cache_indices,
                     intermediate_conv_window,
                 )
-                if self.activation is not None:
-                    out = ACT2FN[self.activation](out)
-                return out
+                return nn.functional.silu(out)
             else:
-                out = (
+                return (
                     causal_dynamic_conv1d_update(
                         x=x.transpose(1, 2).contiguous(),
                         conv_state=cache,
                         weight=self.get_kernel(generator_input),
                         bias=None,
-                        activation=self.activation,
                         cache_seqlens=None,
                         conv_state_indices=cache_indices,
                         num_accepted_tokens=None,
@@ -252,10 +186,6 @@ class DynamicShortConvolution(nn.Module):
                     .transpose(1, 2)
                     .contiguous()
                 )
-                return out
-
-        if mask is not None:
-            x = x.mul_(mask.unsqueeze(-1))
 
         # during the decoding phase, we assume the batch is composed of sequences of length 1
         assert T == 1
@@ -268,8 +198,7 @@ class DynamicShortConvolution(nn.Module):
         cache: torch.Tensor,
         generator_input: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert x.shape[1] == 1, "x must be of shape [B, 1, D]"
-        shape = x.shape  # Keep original shape [B, 1, D] for return
+        shape = x.shape
         generator_input = x if generator_input is None else generator_input
 
         kernels_triton = self.get_kernel(generator_input.squeeze(1))  # [B, D, W]
@@ -279,8 +208,5 @@ class DynamicShortConvolution(nn.Module):
             cache,
             kernels_triton,
         )
-
-        if self.activation is not None:
-            x_out_triton = ACT2FN[self.activation](x_out_triton)
-
+        x_out_triton = nn.functional.silu(x_out_triton)
         return x_out_triton.view(shape), cache

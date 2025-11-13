@@ -94,11 +94,12 @@ class JetBlock(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(self.num_heads // self.attn_tp_size))
 
         self.dynamic_conv1d = DynamicShortConvolution(
+            quant_config=quant_config,
+            prefix=add_prefix("dynamic_conv1d", prefix),
             hidden_size=self.value_dim,
             kernel_size=self.conv_size,
             generator_input_size=self.hidden_size,
             generator_reduction=jet_block_config.dconv_generator_reduction,
-            implementation=jet_block_config.dconv_implementation,
         )
 
         self.g_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)

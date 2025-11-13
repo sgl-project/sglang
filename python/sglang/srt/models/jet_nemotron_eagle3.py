@@ -16,7 +16,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.jet_nemotron import (
-    JetBlock,
     JetNemotronAttention,
     JetNemotronForCausalLM,
     JetNemotronMLP,
@@ -38,39 +37,17 @@ class JetNemotronDecoderLayerEagle3(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        if config.midlayer_type == "attn":
-            self.self_attn = JetNemotronAttention(
-                config, layer_id, quant_config, prefix
-            )
-        elif config.midlayer_type == "swa":
-            assert (
-                config.efficient_attention_config is not None
-            ), "Efficient attention config must be provided in JetNemotronConfig."
-            self.self_attn = JetNemotronAttention(
-                config,
-                layer_id,
-                quant_config,
-                prefix,
-                sliding_window=config.efficient_attention_config["swa"]["window_size"],
-            )
-        else:
-            config.hidden_size = config.hidden_size * 2
-            self.self_attn = JetBlock(config, layer_id, quant_config, prefix)
-            config.hidden_size = config.hidden_size // 2
-            self.self_attn.o_proj = nn.Linear(
-                self.self_attn.value_dim, config.hidden_size, bias=False
-            )
-        if config.midlayer_type in ["attn", "swa"]:
-            self.self_attn.qkv_proj = QKVParallelLinear(
-                2 * config.hidden_size,
-                self.self_attn.head_dim,
-                config.num_attention_heads,
-                config.num_key_value_heads,
-                bias=True,
-                quant_config=quant_config,
-                tp_rank=self.self_attn.attn_tp_rank,
-                tp_size=self.self_attn.attn_tp_size,
-            )
+        self.self_attn = JetNemotronAttention(config, layer_id, quant_config, prefix)
+        self.self_attn.qkv_proj = QKVParallelLinear(
+            2 * config.hidden_size,
+            self.self_attn.head_dim,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            bias=True,
+            quant_config=quant_config,
+            tp_rank=self.self_attn.attn_tp_rank,
+            tp_size=self.self_attn.attn_tp_size,
+        )
 
         self.mlp = JetNemotronMLP(config, quant_config, prefix)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

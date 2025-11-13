@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import triton
@@ -583,7 +583,6 @@ def causal_dynamic_conv1d_update(
     conv_state: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    activation: Union[bool, str, None] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
@@ -623,10 +622,6 @@ def causal_dynamic_conv1d_update(
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
         assert pad_slot_id is not None
         assert x.stride(1) == 1
-    if isinstance(activation, bool):
-        activation = "silu" if activation is True else None
-    elif activation is not None:
-        assert activation in ["silu", "swish"]
     unsqueeze = x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1
@@ -767,7 +762,7 @@ def causal_dynamic_conv1d_update(
         # META
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
+        SILU_ACTIVATION=True,
         IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
