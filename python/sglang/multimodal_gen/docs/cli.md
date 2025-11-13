@@ -323,7 +323,7 @@ sglang serve --model-path Qwen/Qwen-Image #T2I
 sglang serve --model-path Qwen/Qwen-Image-Edit #TI2I
 ```
 
-This launches a FastAPI server (default: `http://localhost:3000/v1`). You can then send requests viia OpenAI Python SDk or CURL:
+This launches a FastAPI server (default: `http://localhost:3000/v1`). You can then send requests via OpenAI Python SDK or CURL:
 
 ---
 
