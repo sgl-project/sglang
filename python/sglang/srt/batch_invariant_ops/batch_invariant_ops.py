@@ -278,7 +278,8 @@ def matmul_persistent(
 
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
 
-    return _matmul_persistent_triton(a=a, b=b, bias=bias)
+    # return _matmul_persistent_triton(a=a, b=b, bias=bias)
+    return torch.einsum('ik,kj->ij', a, b)
 
 
 @triton.jit
