@@ -48,12 +48,14 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     NSATokenToKVPool,
     SWAKVPool,
 )
-from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj, require_mlp_sync
+from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
+from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -198,6 +200,7 @@ class PrefillBootstrapQueue:
         self._process_req(req)
         req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
+        trace_slice_end(RequestStage.PREFILL_PREPARE, req.rid, auto_next_anon=True)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -289,6 +292,10 @@ class PrefillBootstrapQueue:
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
+            trace_slice_end(
+                RequestStage.PREFILL_BOOTSTRAP, req.rid, auto_next_anon=True
+            )
+
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
@@ -304,6 +311,20 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def get_next_disagg_prefill_batch_to_run(
+        self: Scheduler,
+    ) -> Optional[ScheduleBatch]:
+        self.process_prefill_chunk()
+
+        batch = self.get_new_batch_prefill()
+        if self.require_mlp_sync:
+            batch = self.prepare_mlp_sync_batch(batch)
+
+        if batch:
+            trace_event_batch("schedule", batch.reqs)
+
+        return batch
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -314,22 +335,16 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.process_prefill_chunk()
-            batch = self.get_new_batch_prefill()
-
-            if require_mlp_sync(self.server_args):
-                batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
-
-            if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
-
-            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+            else:
                 self.self_check_during_idle()
+
+            self.process_disagg_prefill_inflight_queue()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -346,11 +361,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.process_prefill_chunk()
-            batch = self.get_new_batch_prefill()
-
-            if require_mlp_sync(self.server_args):
-                batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
             batch_result = None
@@ -361,14 +372,12 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
+            elif batch is None:
+                self.self_check_during_idle()
 
-            if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
+            self.process_disagg_prefill_inflight_queue()
 
             self.launch_batch_sample_if_needed(batch_result)
-
-            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
-                self.self_check_during_idle()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -423,6 +432,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 req.add_latency(RequestStage.PREFILL_FORWARD)
+                trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
@@ -458,7 +468,7 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        self.tree_cache.cache_finished_req(req)
+                        release_kv_cache(req, self.tree_cache)
                         prepare_abort(
                             req,
                             error_message,
@@ -487,6 +497,9 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                trace_slice(
+                    RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
+                )
 
         self.maybe_send_health_check_signal()
 
@@ -521,7 +534,7 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                self.tree_cache.cache_finished_req(req)  # unlock the tree
+                release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -534,7 +547,7 @@ class SchedulerDisaggregationPrefillMixin:
                 except Exception as e:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
-                self.tree_cache.cache_finished_req(req)  # unlock the tree
+                release_kv_cache(req, self.tree_cache)  # unlock the tree
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -558,6 +571,9 @@ class SchedulerDisaggregationPrefillMixin:
             req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
+            trace_slice(
+                RequestStage.PREFILL_TRANSFER_KV_CACHE, req.rid, thread_finish_flag=True
+            )
 
         self.disagg_prefill_inflight_queue = undone_reqs
 
@@ -569,7 +585,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_tp_group().cpu_group,
+            self.tp_worker.get_attention_tp_cpu_group(),
         )
 
         transferred_rids: List[str] = []
@@ -596,7 +612,12 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     self.send_kv_chunk(self.chunked_req)
                 # chunked request keeps its rid but will get a new req_pool_idx
-                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                if self.tp_worker.model_runner.mambaish_config is not None:
+                    self.req_to_token_pool.free(
+                        self.chunked_req.req_pool_idx, free_mamba_cache=False
+                    )
+                else:
+                    self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
                 self.running_batch.batch_is_full = False
 
     def send_kv_chunk(
@@ -703,8 +724,11 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             data = None
 
-        if self.tp_size != 1:
+        if self.attn_tp_size != 1:
             data = broadcast_pyobj(
-                data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
+                data,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
             )
         return data

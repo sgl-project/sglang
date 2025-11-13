@@ -125,8 +125,13 @@ class RotaryEmbedding(CustomOp):
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-        if get_global_server_args().rl_on_policy_target == "fsdp":
+        self._apply_rotary_emb_wrapped = _apply_rotary_emb
+
+        if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
+            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
+                self._apply_rotary_emb_wrapped
+            )
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -135,7 +140,7 @@ class RotaryEmbedding(CustomOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         init_device = (
-            "cpu" if get_global_server_args().rl_on_policy_target == "fsdp" else None
+            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
         )
         inv_freq = 1.0 / (
             base
@@ -146,7 +151,7 @@ class RotaryEmbedding(CustomOp):
                 / self.rotary_dim
             )
         )
-        if get_global_server_args().rl_on_policy_target == "fsdp":
+        if get_global_server_args().rl_on_policy_target is not None:
             inv_freq = inv_freq.cuda()
         return inv_freq
 
@@ -185,14 +190,16 @@ class RotaryEmbedding(CustomOp):
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = self._apply_rotary_emb_wrapped(
+            query_rot, cos, sin, self.is_neox_style
+        )
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
@@ -312,10 +319,20 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # TODO: make a wrapper, and XPU will implement this kernel later.
-        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
-        return self.forward_native(positions, query, key, offsets)
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+        return torch.ops.sgl_kernel.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
@@ -806,7 +823,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
         cos_sin = self.cos_sin_cache[
             torch.add(positions, offsets) if offsets is not None else positions
         ]
@@ -1285,6 +1301,31 @@ def triton_mrope(
     return q, k
 
 
+@torch._dynamo.disable()
+def triton_mrope_wrapper(
+    query,
+    key,
+    cos,
+    sin,
+    mrope_section,
+    head_size,
+    rotary_dim,
+    mrope_interleaved,
+    is_neox_style,
+):
+    return triton_mrope(
+        query,
+        key,
+        cos,
+        sin,
+        mrope_section,
+        head_size,
+        rotary_dim,
+        mrope_interleaved,
+        is_neox_style,
+    )
+
+
 class MRotaryEmbedding(RotaryEmbedding):
     """Rotary Embedding with Multimodal Sections."""
 
@@ -1421,9 +1462,12 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         if positions.ndim == 2 and self.mrope_section and _is_cuda:
             return self._forward_triton(positions, query, key)
+        elif _is_npu:
+            return self._forward_npu(positions, query, key)
         else:
             return self._forward_native(positions, query, key)
 
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_triton(
         self,
         positions: torch.Tensor,
@@ -1442,7 +1486,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         if positions.ndim == 2:
             assert self.mrope_section
 
-            q, k = triton_mrope(
+            q, k = triton_mrope_wrapper(
                 query,
                 key,
                 cos,
@@ -1468,6 +1512,32 @@ class MRotaryEmbedding(RotaryEmbedding):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def _forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # TODO: remove this when npu_mrope supports QNumHeads * QHeadSize > 4096
+        if query.shape[1] > 4096:
+            return self._forward_native(positions, query, key)
+        rotary_mode = "half"
+        if self.is_neox_style:
+            rotary_mode = "half"
+        else:
+            rotary_mode = "interleave"
+        mrope_section = [0, 0, 0]
+        query_out, key_out = torch_npu.npu_mrope(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
+        )
+        return query_out, key_out
 
     # Copied from https://github.com/huggingface/transformers/blob/c8e0e603de9b3d49161a15fe6e8ea84badfb5d02/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1439
     @staticmethod

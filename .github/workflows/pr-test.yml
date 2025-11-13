@@ -28,6 +28,7 @@ jobs:
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -44,18 +45,79 @@ jobs:
           echo "This pull request is a draft. Failing the workflow."
           exit 1
 
+      - name: Enforce rate limit for low-permission actors
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const HOURS = 2;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const eventName = context.eventName;
+            const curRun = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: context.runId
+            });
+            const triggeringActor = curRun.data.triggering_actor?.login || context.actor;
+
+            async function hasHighPermission(username) {
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
+                const perm = data.permission || 'none';
+                return perm === 'write' || perm === 'maintain' || perm === 'admin';
+              } catch (e) {
+                if (e.status === 404 || e.status === 403) return false;
+                throw e;
+              }
+            }
+
+            if (await hasHighPermission(triggeringActor)) {
+              core.info(`Triggering user '${triggeringActor}' has high permission. No rate limit applied.`);
+              return;
+            }
+
+            const cutoff = new Date(Date.now() - HOURS * 60 * 60 * 1000);
+            core.info(`Checking for workflow runs since ${cutoff.toISOString()} (last ${HOURS} hours) for event '${eventName}'.`);
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: 'pr-test.yml',
+              event: eventName,
+              per_page: 100,
+            });
+
+            const runs = data.workflow_runs || [];
+            const recentFound = runs.find((run) => {
+              if (String(run.id) === String(context.runId)) return false;
+              if (new Date(run.created_at) < cutoff) return false;
+              return (run.actor?.login === triggeringActor) || (run.triggering_actor?.login === triggeringActor);
+            });
+
+            if (recentFound) {
+              core.setFailed(
+                `User '${triggeringActor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
+                `Please wait ${HOURS} hours before triggering again.`
+              );
+            } else {
+              core.info(`No recent runs detected within the last ${HOURS} hours; proceeding.`);
+            }
+
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
             main_package:
-              - "python/**"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
 
   # =============================================== sgl-kernel ====================================================
 
@@ -68,8 +130,9 @@ jobs:
         include:
           - python-version: "3.10"
             cuda-version: "12.9"
-          - python-version: "3.10"
-            cuda-version: "13.0"
+          # Add back when CUDA 13.0 is supported on CI
+          # - python-version: "3.10"
+          #   cuda-version: "13.0"
     name: Build Wheel
     steps:
       - name: Cleanup
@@ -94,6 +157,45 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
+          path: sgl-kernel/dist/*
+
+  sgl-kernel-build-wheels-arm:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    runs-on: arm-kernel-build-node
+    strategy:
+      matrix:
+        include:
+          - python-version: "3.10"
+            cuda-version: "12.9"
+    name: Build Wheel Arm
+    steps:
+      - name: Cleanup
+        run: |
+          if [ -d "$GITHUB_WORKSPACE" ]; then
+            sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+          else
+            echo "$GITHUB_WORKSPACE does not exist, nothing to clean"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+        run: |
+          cd sgl-kernel
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
           path: sgl-kernel/dist/*
 
   sgl-kernel-unit-test:
@@ -197,6 +299,19 @@ jobs:
 
           echo "All benchmark tests completed!"
 
+  # =============================================== multimodal_gen ====================================================
+  multimodal-gen-test:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run placeholder test
+        run: |
+          echo "Running multimodal_gen tests..."
+          echo "This is a placeholder for future tests."
+
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
   # cuda13-kernel-smoke-test:
@@ -265,7 +380,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -286,10 +401,10 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 11
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
   unit-test-backend-2-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-1-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
@@ -355,10 +470,12 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -379,7 +496,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -706,6 +823,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -727,33 +846,6 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
-
-  unit-test-backend-8-gpu-deepseek-v32:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 8-gpu-h200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} RUN_DEEPSEEK_V32=1 bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200-deepseek-v32
 
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -784,6 +876,35 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
+  unit-test-backend-4-gpu-gb200:
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
+    if: always() && !failure() && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    runs-on: 4-gpu-gb200
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9-aarch64
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
+
+      - name: Run test
+        timeout-minutes: 45
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+
   pr-test-finish:
     needs:
       [
@@ -793,6 +914,8 @@ jobs:
         sgl-kernel-unit-test,
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
+
+        multimodal-gen-test,
 
         unit-test-frontend,
         unit-test-backend-1-gpu,
@@ -808,6 +931,7 @@ jobs:
         unit-test-deepep-4-gpu,
         unit-test-deepep-8-gpu,
         unit-test-backend-4-gpu-b200,
+        unit-test-backend-4-gpu-gb200,
       ]
     if: always()
     runs-on: ubuntu-latest
