@@ -136,6 +136,7 @@ class Envs:
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
+    SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
@@ -161,6 +162,9 @@ class Envs:
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
@@ -180,7 +184,7 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
 
     # Mooncake KV Transfer
-    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvBool(False)
+    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
 
     # AMD & ROCm
@@ -197,6 +201,8 @@ class Envs:
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    # Default to the pick from flashinfer
+    SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
 
     # Triton
@@ -212,6 +218,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
+    SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -262,14 +269,6 @@ class Envs:
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
-    # Ktransformers
-    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
-    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
-    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
-    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
-    SGLANG_KT_AMX_METHOD = EnvStr(None)
-    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
-
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
@@ -279,6 +278,9 @@ class Envs:
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+
+    # Ngram
+    SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
     # fmt: on
 

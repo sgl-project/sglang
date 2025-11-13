@@ -17,7 +17,7 @@ from sglang.srt.managers.utils import (
     get_logprob_from_pp_outputs,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj, require_mlp_sync
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -576,7 +576,7 @@ class SchedulerPPMixin:
                 self.process_prefill_chunk()
 
                 batch = self.get_new_batch_prefill()
-                if require_mlp_sync(self.server_args):
+                if self.require_mlp_sync:
                     batch = self.prepare_mlp_sync_batch(batch)
                 mbs[mb_id] = batch
 
