@@ -83,10 +83,7 @@ class AscendAttnMaskBuilder:
         :return: A boolean tensor representing the mask flag.
         """
         # Construct lower triangle matrix.
-        mask_flag = (
-            torch.ones((max_seq_len, max_seq_len), dtype=torch.bool)
-            .tril_()
-        )
+        mask_flag = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool).tril_()
         # Create upper triangle matrix used to mark mask positions.
         mask_flag = ~mask_flag
         return mask_flag
