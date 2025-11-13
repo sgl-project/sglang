@@ -177,7 +177,9 @@ class SchedulerOutputProcessorMixin:
 
         else:  # embedding or reward model
             embeddings = result.embeddings.tolist()
-
+            logger.info(f"batch.reqs size {len(batch.reqs)}")
+            logger.info(f"embeddings size {len(embeddings)}")
+            logger.info(f"result.embeddings size {result.embeddings.shape}")
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
