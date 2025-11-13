@@ -280,20 +280,9 @@ The server exposes these endpoints (OpenAPI tag `videos`):
 
 SGLang Diffusion supports image generation and editing with models such as **Qwen-Image**, **Qwen-Image-Edit**, and **FLUX**. You can use these either through the CLI or via an OpenAI-compatible HTTP API.
 
-#### CLI Usage
+### CLI Usage
 
-##### Text → Image (FLUX)
-
-```bash
-sglang generate \
-  --model-path black-forest-labs/FLUX.1-dev \
-  --prompt "A logo with bold large text: SGL Diffusion" \
-  --save-output \
-  --output-path outputs \
-  --output-file-name flux_logo.png
-````
-
-##### Text → Image (Qwen-Image)
+##### `T2I` Text → Image (Qwen-Image)
 
 ```bash
 sglang generate \
@@ -305,7 +294,7 @@ sglang generate \
   --output-path outputs
 ```
 
-##### Image → Image (Edit) (Qwen-Image-Edit)
+##### `TI2I` Image → Image (Edit) (Qwen-Image-Edit)
 
 ```bash
 sglang generate \
@@ -322,23 +311,25 @@ These commands create a temporary diffusion job, save the output image under `--
 
 ---
 
-#### HTTP API (OpenAI-Compatible Schema)
+### HTTP API Server (OpenAI-Compatible Schema)
 
 You can also serve image models and interact with them using OpenAI-style endpoints.
 
-##### 1. Start a Local Server
+#### Start a Local Server
 
 ```bash
-sglang serve --model-path Qwen/Qwen-Image
+sglang serve --model-path Qwen/Qwen-Image #T2I
 # or
-sglang serve --model-path Qwen/Qwen-Image-Edit
+sglang serve --model-path Qwen/Qwen-Image-Edit #TI2I
 ```
 
-This launches a FastAPI server (default: `http://localhost:3000/v1`).
+This launches a FastAPI server (default: `http://localhost:3000/v1`). You can then send requests viia OpenAI Python SDk or CURL:
 
 ---
 
-##### 2. Text → Image (OpenAI Python SDK)
+#### Sending Requests
+
+##### `T2I` Text → Image (OpenAI Python SDK)
 
 ```python
 import base64
@@ -367,7 +358,7 @@ print("Saved meme.png")
 
 ---
 
-##### 3. Text → Image (curl)
+##### `T2I` Text → Image (curl)
 
 ```bash
 export OPENAI_API_BASE="http://localhost:3000/v1"
@@ -403,7 +394,7 @@ You can decode the `b64_json` field to retrieve the generated image.
 
 ---
 
-##### 4. Image Edit (Python SDK)
+##### `TI2I` Image Edit (Python SDK)
 
 ```python
 import base64
@@ -434,7 +425,7 @@ print("Saved meme.png")
 ```
 ---
 
-##### 5. Image Edit (curl)
+##### `TI2I` Image Edit (curl)
 
 ```bash
 export OPENAI_API_BASE="http://localhost:3000/v1"
