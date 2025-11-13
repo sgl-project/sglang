@@ -6,7 +6,7 @@ import unittest
 import sgl_kernel
 import torch
 
-from sglang.srt.layers.amx_utils import CPUMoECompMethod
+from sglang.srt.layers.amx_utils import CPUQuantMethod
 
 kernel = torch.ops.sgl_kernel
 
@@ -52,7 +52,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         topk_weights,
         topk_ids,
         inplace,
-        CPUMoECompMethod.BF16_GEMM,
+        CPUQuantMethod.UNQUANT,
         None,
         None,
         None,
@@ -165,7 +165,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             inplace,
-            CPUMoECompMethod.INT8_W8A8_GEMM,
+            CPUQuantMethod.INT8_W8A8,
             w1_s,
             w2_s,
             None,
@@ -237,7 +237,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,
-            CPUMoECompMethod.FP8_W8A16_GEMM,
+            CPUQuantMethod.FP8_W8A16,
             w1s,
             w2s,
             None,
@@ -338,7 +338,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,
-            CPUMoECompMethod.INT4_W4A8_GEMM,
+            CPUQuantMethod.INT4_W4A8,
             awq_w13_scales_pack,
             awq_w2_scales_pack,
             awq_w13_zero_pack,

@@ -9,11 +9,11 @@ logger = logging.getLogger(__name__)
 from enum import IntEnum
 
 
-class CPUMoECompMethod(IntEnum):
-    BF16_GEMM = 0
-    INT8_W8A8_GEMM = 1
-    FP8_W8A16_GEMM = 2
-    INT4_W4A8_GEMM = 3
+class CPUQuantMethod(IntEnum):
+    UNQUANT = 0
+    INT8_W8A8 = 1
+    FP8_W8A16 = 2
+    INT4_W4A8 = 3
 
 
 def amx_process_weight_after_loading(weight):

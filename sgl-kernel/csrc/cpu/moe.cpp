@@ -968,7 +968,7 @@ at::Tensor fused_experts_cpu(
   CHECK_INPUT(w2);
   CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
   CHECK_DIM(2, hidden_states);
-  if (moe_comp_method == static_cast<int>(CPUQuantMethod::INT4_W4A8) && is_vnni) {
+  if (moe_comp_method == CPUQuantMethod::INT4_W4A8 && is_vnni) {
     CHECK_DIM(4, w1);
     CHECK_DIM(4, w2);
   } else {

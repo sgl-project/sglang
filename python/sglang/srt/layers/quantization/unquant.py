@@ -8,7 +8,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import (
-    CPUMoECompMethod,
+    CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -333,7 +333,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_weights,
                 topk_ids,
                 False,  # inplace # See [Note] inplace should be False in fused_experts.
-                CPUMoECompMethod.BF16_GEMM,
+                CPUQuantMethod.UNQUANT,
                 None,  # w1_scale
                 None,  # w2_scale
                 None,  # w1_zp

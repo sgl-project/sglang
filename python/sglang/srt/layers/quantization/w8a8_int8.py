@@ -8,7 +8,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.amx_utils import (
-    CPUMoECompMethod,
+    CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -544,7 +544,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
-                CPUMoECompMethod.INT8_W8A8_GEMM,
+                CPUQuantMethod.INT8_W8A8,
                 layer.w13_weight_scale,  # w1_scale
                 layer.w2_weight_scale,  # w2_scale
                 None,  # w1_zp
