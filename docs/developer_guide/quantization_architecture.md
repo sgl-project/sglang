@@ -1,23 +1,31 @@
 # Quantization Architecture
 
-## 1. Overview
+## Overview
 
-All quantization implementations are centralized in the `python/sglang/srt/layers/quantization/` directory, connecting model construction, weight loading, and inference execution via unified abstractions and lifecycle hooks. The core goals are:
+All quantization implementations are centralized in `python/sglang/srt/layers/quantization/`, connecting model construction, weight loading, and inference via unified abstractions and lifecycle hooks. The architecture employs a three-stage lifecycle that decouples parameter allocation, weight transformation, and computation:
 
-- Select quantization schemes in a configuration-driven manner, compatible with common formats like HuggingFace;
-- Provide reusable quantization interfaces for linear layers, MoE layers, KV Cache, and other components;
-- Support multiple hardware backends (CUDA, ROCm, etc.) with clear fallback strategies when dependencies are missing;
-- Enable new quantization schemes to integrate into the entire inference stack with minimal interface implementation.
+- **`create_weights`**: Pre-allocates memory for quantized weights, scales, zero points, and quantization parameters during model construction. Establishes memory layout prior to data flow.
 
-The core base classes for quantization are defined in `base_config.py`:
+- **`process_weights_after_loading`**: Transforms loaded weights and scales into kernel-optimal formats (CUTLASS-compatible interleaving, dtype conversions, stride pre-computation) to minimize inference overhead.
 
-- `QuantizeMethodBase`: Declares weight registration (`create_weights`), forward execution (`apply`), and post-loading processing (`process_weights_after_loading`).
-- `LinearMethodBase` / `FusedMoEMethodBase`: Constrain quantization methods for standard linear layers and fused MoE layers respectively, providing additional context information such as expert routing and parallelism.
-- `QuantizationConfig`: Responsible for parsing quantization configurations, validating hardware capabilities and activation dtypes, and returning the correct quantization method instances layer by layer.
+- **`apply`**: Executes quantized forward pass by quantizing activations, invoking computational kernels (CUTLASS, Marlin, Triton), and dequantizing outputs.
 
-The quantization method registry is located in `__init__.py`, mapping native schemes (AWQ, GPTQ, FP8, W4AFp8, ModelOpt, etc.) to string identifiers, and injecting additional configurations based on CUDA/HIP capabilities when necessary (e.g., `quark` configuration under ROCm).
+Architecture goals:
 
-## 2. Directory Structure
+- Configuration-driven quantization scheme selection, compatible with HuggingFace formats
+- Reusable quantization interfaces for linear layers, MoE layers, KV cache, and other components
+- Multi-backend support (CUDA, ROCm) with fallback strategies for missing dependencies
+- Minimal interface implementation required for new quantization scheme integration
+
+Core base classes in `base_config.py`:
+
+- `QuantizeMethodBase`: Abstract base class defining the three-stage lifecycle: `create_weights`, `apply`, and `process_weights_after_loading`
+- `LinearMethodBase` / `FusedMoEMethodBase`: Specialized base classes for linear and fused MoE layers, providing context for expert routing and parallelism
+- `QuantizationConfig`: Configuration abstraction for parsing quantization configs, validating hardware capabilities and activation dtypes, and returning quantization method instances per layer
+
+The quantization method registry in `__init__.py` maps native schemes (AWQ, GPTQ, FP8, W4AFp8, ModelOpt, etc.) to string identifiers and injects platform-specific configurations based on CUDA/HIP capabilities (e.g., `quark` under ROCm).
+
+## Directory Structure
 
 ```
 python/sglang/srt/layers/quantization/
@@ -40,14 +48,16 @@ python/sglang/srt/layers/quantization/
 └── quark/                         # ROCm-specific MXFP4 / INT4
 ```
 
-Other quantization-related modules:
+Related modules:
 
-- `python/sglang/srt/configs/model_config.py`: Parses HuggingFace configurations and `hf_quant_config.json`, and normalizes quantization scheme names in `_parse_quant_hf_config`.
-- `python/sglang/srt/model_loader/weight_utils.py`: Instantiates `QuantizationConfig` based on scheme names, downloads or reads external quantization configuration files, and performs hardware capability validation.
-- `python/sglang/srt/model_loader/loader.py`: Injects quantization configuration into the model during the `_initialize_model` phase, and calls the `process_weights_after_loading` hook for each layer after loading checkpoints.
-- `python/sglang/srt/layers/linear.py`: Common base class for all linear layers, responsible for storing `quant_method`, registering quantization weights, and uniformly dispatching `apply` during forward pass.
+- `python/sglang/srt/configs/model_config.py`: Parses HuggingFace configs and `hf_quant_config.json`, normalizes quantization scheme names via `_parse_quant_hf_config`
+- `python/sglang/srt/model_loader/weight_utils.py`: Instantiates `QuantizationConfig` from scheme names, downloads/reads external quantization configs, validates hardware capabilities
+- `python/sglang/srt/model_loader/loader.py`: Injects quantization config during `_initialize_model`, calls `process_weights_after_loading` hook per layer after checkpoint loading
+- `python/sglang/srt/layers/linear.py`: Base class for linear layers, stores `quant_method`, registers quantization weights, dispatches `apply` during forward pass
 
-## 3. Overall Workflow
+## Overall Workflow
+
+The quantization workflow comprises four phases: configuration parsing, model construction, weight loading, and inference execution.
 
 ```
 ModelConfig._parse_quant_hf_config → Determine quant_method (e.g., w4afp8)
@@ -59,70 +69,226 @@ _initialize_model(...) → Pass quant_config to model/layers
 LinearBase.quant_method.create_weights → Register quantization weight placeholders
       ↓
 DefaultModelLoader.load_weights_and_postprocess →
-    Call quant_method.process_weights_after_loading layer by layer
+    First: load_weights() fills quantized weight tensors
+    Then: Call quant_method.process_weights_after_loading layer by layer
       ↓
 During inference: LinearBase.forward → quant_method.apply executes quantized GEMM
 ```
 
-### 3.1 Configuration Parsing
+### Configuration Parsing
 
-1. `ModelConfig._parse_quant_hf_config` reads `config.json`, `hf_quant_config.json` from the model directory, or explicit user parameters, and uniformly generates quantization method identifiers (e.g., `w4afp8`, `awq`).
-2. `loader._get_quantization_config` calls `weight_utils.get_quant_config`, which obtains the configuration class (e.g., `W4AFp8Config`) via the `quantization.get_quantization_config` function based on the identifier, then calls `from_config` to instantiate the configuration object, filling in hardware requirements, activation dtypes, skip layer lists, additional configuration file names, etc.
-3. `QuantizationConfig.from_config` parses the raw configuration dictionary into an object, preserving all context for subsequent decisions.
+Configuration parsing identifies the quantization scheme from model metadata and instantiates the configuration object:
 
-### 3.2 Model Construction
+1. `ModelConfig._parse_quant_hf_config` reads `config.json` or `hf_quant_config.json`, generating quantization method identifiers (e.g., `w4afp8`, `awq`). ModelOpt `quant_algo == "MIXED_PRECISION"` maps to `w4afp8`.
 
-1. The model loader passes `quant_config` to the model constructor in `_initialize_model`.
-2. Each module inheriting from `LinearBase` or `FusedMoE` calls `quant_config.get_quant_method(self, prefix)` in `__init__`:
-   - If the current layer needs quantization, returns a specific quantization method instance (e.g., `Fp8LinearMethod`, `W4AFp8MoEMethod`).
-   - If in the skip list, falls back to `UnquantizedLinearMethod`.
-3. The quantization method's `create_weights` registers weight placeholders (quantized weights, scale, zero point, input scaling, etc.) at this stage, and binds custom `weight_loader` if needed.
+2. `loader._get_quantization_config` calls `weight_utils.get_quant_config`, which resolves the configuration class via `quantization.get_quantization_config` and instantiates it via `from_config`, populating hardware requirements, activation dtypes, skip layers, and additional config files.
 
-### 3.3 Weight Loading and Post-processing
+3. `QuantizationConfig.from_config` parses the configuration dictionary and validates hardware capabilities:
+   - **NVIDIA GPU**: CUDA compute capability (70=Volta, 75=Turing, 80=Ampere, 90=Hopper)
+   - **AMD GPU**: ROCm/HIP platform detection; some schemes require specific GCN architectures (e.g., gfx94)
 
-1. `DefaultModelLoader.load_weights_and_postprocess` loads checkpoint weights layer by layer, filling the previously registered tensors.
-2. After loading, iterates through the model again, calling `process_weights_after_loading` for modules with `quant_method`:
-   - Repack or transpose weights to match kernel-required layouts (e.g., Marlin, CUTLASS, block quantization formats);
-   - Convert scale/zero point dtypes to reduce forward overhead;
-   - Pre-compute constants like stride, group size, expert mappings, and store them in module cache.
+### Model Construction
 
-### 3.4 Inference Execution
+Model construction injects quantization methods into layers and registers parameter placeholders:
 
-During forward propagation, the linear layer's `forward` method uniformly calls `self.quant_method.apply(self, x, bias)`, while MoE layers call `FusedMoEMethodBase.apply` derived implementations. These functions internally handle:
+1. The model loader passes `quant_config` to `_initialize_model`, propagating it through the model hierarchy (e.g., `DeepseekV2ForCausalLM` → `DeepseekV2DecoderLayer` → `DeepseekV2AttentionMLA` → `RowParallelLinear`).
 
-1. Quantizing input activations or reading pre-quantized tensors;
-2. Calling underlying CUDA/ROCm/Triton kernels to execute quantized matrix multiplication or MoE routing;
-3. Dequantizing outputs, adding bias, and returning to the upper network.
+2. Modules inheriting from `LinearBase` or `FusedMoE` call `quant_config.get_quant_method(self, prefix)` in `__init__`:
+   - Returns quantization method instance (e.g., `Fp8LinearMethod`, `W4AFp8MoEMethod`) if quantization is required
+   - Falls back to `UnquantizedLinearMethod` for skipped layers
 
-## 4. Unified Structure of Quantization Methods and W4AFp8 Example
+3. `create_weights` registers weight placeholders (quantized weights, scales, zero points, input scaling) and optionally binds custom `weight_loader`. Parameters are allocated via `torch.empty` or `torch.zeros`, establishing memory layout without data.
 
-Regardless of FP8, INT8, INT4, or third-party formats, all quantization methods follow a consistent structure:
+**Call Flow for `create_weights`**:
+```
+DeepseekV2DecoderLayer.__init__()
+      ↓
+DeepseekV2AttentionMLA.__init__()
+      ↓
+RowParallelLinear.__init__()
+      ↓
+LinearBase.__init__()  # self.quant_method is set via quant_config.get_quant_method()
+      ↓
+quant_config.get_quant_method() → Returns Fp8LinearMethod or W4AFp8MoEMethod
+      ↓
+RowParallelLinear.__init__() continues execution
+      ↓
+Fp8LinearMethod.create_weights() or W4AFp8MoEMethod.create_weights()
+      ↓
+Register weight, weight_scale, input_scale and other parameter placeholders
+```
 
-1. **Inherit Abstract Base Classes**: Linear layer methods inherit `LinearMethodBase`, MoE layer methods inherit `FusedMoEMethodBase`, both implementing the interfaces specified by `QuantizeMethodBase`.
+### Weight Loading and Post-processing
+
+Weight loading fills quantized tensors from checkpoints, followed by format transformation for kernel optimization:
+
+1. `DefaultModelLoader.load_weights_and_postprocess` calls `model.load_weights()` to populate registered tensors layer by layer.
+
+2. After loading completes, the system iterates through the model calling `process_weights_after_loading` for modules with `quant_method`:
+   - Repack/transpose weights to match kernel layouts (Marlin, CUTLASS, block quantization)
+   - Convert scale/zero point dtypes (float32 → bfloat16) to reduce forward overhead
+   - Interleave scales to match kernel memory access patterns for improved cache locality
+   - Pre-compute stride, group size, expert mappings, and cache in module attributes
+
+**Call Flow for `process_weights_after_loading`**:
+```
+Scheduler.__init__()
+      ↓
+TpModelWorker.__init__()
+      ↓
+ModelRunner.__init__()
+      ↓
+ModelRunner.initialize()
+      ↓
+get_model()
+      ↓
+DefaultModelLoader.load_model()
+      ↓
+DefaultModelLoader.load_weights_and_postprocess()
+      ↓
+model.load_weights() → Load weight data from checkpoint
+      ↓
+Iterate through layers, calling quant_method.process_weights_after_loading()
+      ↓
+Fp8LinearMethod.process_weights_after_loading()
+      └─→ or W4AFp8MoEMethod.process_weights_after_loading()
+```
+
+### Inference Execution
+
+Forward propagation dispatches quantization methods through the `apply` interface:
+
+Linear layers call `self.quant_method.apply(self, x, bias)`; MoE layers call implementations of `FusedMoEMethodBase.apply`. These functions:
+
+1. Quantize input activations or read pre-quantized tensors
+2. Invoke CUDA/ROCm/Triton kernels for quantized GEMM or MoE routing
+3. Dequantize outputs, add bias, and return to upstream layers
+
+**Call Flow for `apply`**:
+```
+DeepseekV2DecoderLayer.forward()
+      ↓
+DeepseekV2AttentionMLA.forward()
+      ↓
+RowParallelLinear.forward()
+      ↓
+self.quant_method.apply()
+      ↓
+Fp8LinearMethod.apply()
+      └─→ or W4AFp8MoEMethod.apply()
+      ↓
+Call underlying kernel (CUTLASS/Marlin/torch) to execute quantized GEMM
+```
+
+## Class Inheritance Hierarchy
+
+The quantization architecture employs an inheritance hierarchy separating configuration management from method implementation:
+
+### Configuration Class Hierarchy
+
+```
+QuantizationConfig (Abstract base class, defined in base_config.py)
+  Responsibilities:
+    - Parse quantization configuration from dictionaries
+    - Validate hardware capabilities (CUDA compute capability, ROCm architecture)
+    - Validate activation data types
+    - Return correct quantization method instances layer by layer
+  
+  Key Methods:
+    ├─ from_config(): Parse from configuration dictionary and instantiate
+    ├─ get_quant_method(layer, prefix): Return quantization method based on layer type
+    ├─ get_min_capability(): Validate hardware compatibility
+    │  Hardware validation includes:
+    │  • NVIDIA GPU: Check via CUDA compute capability (e.g., 70=Volta, 75=Turing, 80=Ampere, 90=Hopper)
+    │  • AMD GPU: Check via ROCm/HIP platform detection; some schemes require specific GCN architectures (e.g., gfx94)
+    └─ get_supported_act_dtypes(): Return supported activation data types
+  
+      ↓
+  
+  W4AFp8Config (Concrete configuration class)
+      └─→ get_quant_method() returns based on layer type:
+          ├─→ LinearBase → Fp8LinearMethod
+          └─→ FusedMoE → W4AFp8MoEMethod
+```
+
+### Quantization Method Class Hierarchy
+
+```
+QuantizeMethodBase (Abstract base class, defined in base_config.py)
+  Responsibilities:
+    - Weight registration (model construction stage)
+    - Post-loading weight processing (after weight loading completes)
+    - Forward execution (inference stage)
+  
+  Core Interface:
+    ├─ create_weights(): Register quantization weight placeholders
+    ├─ process_weights_after_loading(): Post-process weights
+    └─ apply(): Execute quantized computation during forward propagation
+  
+      ├─→ LinearMethodBase
+      │     └─→ Fp8LinearMethod (for regular linear layers)
+      │     └─→ UnquantizedLinearMethod (fallback for skipped layers)
+      │     └─→ [Other linear quantization methods]
+      │
+      └─→ FusedMoEMethodBase
+            └─→ W4AFp8MoEMethod (for MoE layers with INT4 weights + FP8 activations)
+            └─→ [Other MoE quantization methods]
+```
+
+### Quantization Method Registry
+
+The quantization method registry in `__init__.py`:
+
+- Maps string identifiers (`"w4afp8"`, `"fp8"`, `"awq"`, etc.) to configuration classes
+- Injects platform-specific configurations based on CUDA/HIP capabilities (e.g., `quark` under ROCm)
+- Performs dependency detection for optional quantization backends
+
+## Unified Structure of Quantization Methods and W4AFp8 Example
+
+All quantization methods (FP8, INT8, INT4, third-party formats) follow a consistent structure:
+
+1. **Inherit Abstract Base Classes**: Linear methods inherit `LinearMethodBase`, MoE methods inherit `FusedMoEMethodBase`, both implementing `QuantizeMethodBase` interfaces.
 2. **Implement Three Core Methods**:
-   - `create_weights`: Register quantized weights, scale, zero point tensors, and optionally define weight loaders;
-   - `apply`: Execute forward quantization operations (including activation quantization, kernel calls, dequantization);
-   - `process_weights_after_loading` (optional): Perform re-quantization, packing, transposition, etc. after weights are loaded.
-3. **Configuration-Driven**: Each scheme provides a `QuantizationConfig` subclass, implementing interfaces like `from_config`, `get_quant_method`, `get_supported_act_dtypes`, `get_min_capability` for parsing external configurations and checking hardware compatibility.
-4. **Unified Lifecycle**: Uniformly call `create_weights` during model initialization, execute `process_weights_after_loading` during weight loading, and call `apply` during inference. New schemes only need to implement these hooks to integrate into the entire pipeline.
+   - `create_weights`: Register quantized weights, scales, zero points, and optionally define weight loaders
+   - `apply`: Execute quantized forward pass (activation quantization, kernel invocation, dequantization)
+   - `process_weights_after_loading` (optional): Re-quantize, pack, transpose weights after loading
+3. **Configuration-Driven**: Each scheme provides a `QuantizationConfig` subclass implementing `from_config`, `get_quant_method`, `get_supported_act_dtypes`, `get_min_capability` for parsing configs and validating hardware compatibility.
+4. **Unified Lifecycle**: `create_weights` during initialization, `process_weights_after_loading` during weight loading, `apply` during inference. New schemes implement these hooks to integrate into the pipeline.
 
-**The following uses W4AFp8 as an example to demonstrate the complete workflow of configuration parsing, weight registration, post-processing, and inference.**
+The following uses W4AFp8 to demonstrate the complete workflow: configuration parsing, weight registration, post-processing, and inference.
 
-### 4.1 Configuration Identification and Object Construction
+### W4AFp8 Configuration Identification and Object Construction
 
-- When `quant_algo == "MIXED_PRECISION"` in `hf_quant_config.json`, `ModelConfig` maps the quantization scheme to `w4afp8` and validates hardware compatibility:
+`W4AFp8Config` inherits from `QuantizationConfig` and maps configuration parameters to quantization method instances.
+
+**Configuration Recognition**: `ModelConfig._parse_modelopt_quant_config` maps `quant_algo == "MIXED_PRECISION"` in `hf_quant_config.json` to `w4afp8` and validates hardware compatibility:
+
+```python
+# ModelConfig._parse_modelopt_quant_config
+if quant_algo == "MIXED_PRECISION":
+    return {"quant_method": "w4afp8"}
+```
+
+**Object Construction**: `weight_utils.get_quant_config` resolves `W4AFp8Config` via `quantization.get_quantization_config` using identifier `"w4afp8"`, then instantiates via `from_config`. Additional JSON files in the model directory are loaded in `from_config`, supplementing skip layers, expert mappings, etc.
+
+**Key Methods**:
+- `W4AFp8Config.from_config()`: Parse configuration dictionary and instantiate
+- `W4AFp8Config.get_quant_method(layer, prefix)`: Returns quantization method instance based on layer type:
   ```python
-  # ModelConfig._parse_modelopt_quant_config
-  if quant_algo == "MIXED_PRECISION":
-      return {"quant_method": "w4afp8"}
+  if isinstance(layer, LinearBase):
+      return Fp8LinearMethod(self)  # Regular layers use Fp8LinearMethod
+  elif isinstance(layer, FusedMoE):
+      return W4AFp8MoEMethod(self)  # MoE layers use W4AFp8MoEMethod
   ```
-- `weight_utils.get_quant_config` internally obtains the configuration class (e.g., `W4AFp8Config`) via the `quantization.get_quantization_config` function, using the quantization method identifier (e.g., `"w4afp8"`), then calls `from_config` to instantiate the configuration object; if the model directory provides additional JSON files, they will be loaded in `from_config`, supplementing skip layers, expert mappings, etc.
-- Configuration instances contain activation scaling schemes (dynamic or static) for linear/MoE layers, weight quantization group size, whether to enable quantization formats built into checkpoints, etc.
 
-### 4.2 Model Construction and Method Injection
+Configuration instances contain activation scaling schemes (dynamic/static), weight quantization group size, and checkpoint quantization format flags.
 
-- `_initialize_model` passes `quant_config` to models like `DeepseekV2ForCausalLM`, then propagates it layer by layer to decoder layers, MoE modules, and linear layers.
-- `LinearBase` layers call `quant_config.get_quant_method`: For the W4AFp8 scheme, regular linear layers receive `Fp8LinearMethod` (using FP8 activations), while MoE layers receive `W4AFp8MoEMethod` (using INT4 weights + FP8 activations); layers in the skip list use unquantized implementations:
+### W4AFp8 Model Construction and Method Injection
+
+`W4AFp8Config` injects quantization methods into layers during model construction:
+
+- `_initialize_model` passes `quant_config` to models (e.g., `DeepseekV2ForCausalLM`), propagating it to decoder layers, MoE modules, and linear layers.
+- `LinearBase` layers call `quant_config.get_quant_method`: W4AFp8 assigns `Fp8LinearMethod` (FP8 activations) to regular linear layers and `W4AFp8MoEMethod` (INT4 weights + FP8 activations) to MoE layers. Skipped layers use `UnquantizedLinearMethod`:
   ```python
   # LinearBase.__init__
   if quant_config is None:
@@ -130,92 +296,138 @@ Regardless of FP8, INT8, INT4, or third-party formats, all quantization methods 
   else:
       self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
   ```
-- `create_weights` registers packed INT4/INT8 weight tensors, scale (scaling factor), input activation scaling, expert weight indices, and other parameters, and binds custom loading logic for checkpoint loaders.
+- `create_weights` registers packed INT4/INT8 weight tensors, scales, input activation scaling, expert weight indices, and binds custom loading logic for checkpoint loaders.
 
-### 4.3 Weight Loading and Post-processing
+### W4AFp8MoEMethod Implementation Details
 
-- Checkpoint loading phase fills quantized weights and scale.
-- `W4AFp8MoEMethod.process_weights_after_loading` will:
-  - Convert weight scale to bfloat16 and interleave according to the order required by CUTLASS kernels:
-    ```python
-    # Convert and interleave weight scale
+`W4AFp8MoEMethod` implements W4AFp8 for MoE layers following the three-stage lifecycle:
+
+#### create_weights
+
+Pre-allocates quantization parameters during `FusedMoE` initialization:
+
+- **Quantized weight tensors**: `w13_weight` (gate/up projection) and `w2_weight` (down projection), `int8` dtype (packed INT4)
+- **Weight scales**: `w13_weight_scale_inv` and `w2_weight_scale_inv`, group-wise (128 elements per group)
+- **Activation scales**: `w13_input_scale` and `w2_input_scale` for static quantization
+- **Computation metadata**: Stride arrays, expert offsets, problem sizes
+
+Parameters are allocated via `torch.empty` or `torch.zeros`, establishing memory layout without data.
+
+```python
+def create_weights(self, layer, num_experts, hidden_size, ...):
+    # Create quantized weight containers (INT8 type, packed INT4)
+    layer.register_parameter("w13_weight", torch.empty(..., dtype=torch.int8))
+    layer.register_parameter("w2_weight", torch.empty(..., dtype=torch.int8))
+    # Create weight scale factors (group-wise, 128 elements per group)
+    layer.register_parameter("w13_weight_scale_inv", torch.zeros(...))
+    layer.register_parameter("w2_weight_scale_inv", torch.zeros(...))
+    # Create input scale factors (used in static quantization)
+    layer.register_parameter("w13_input_scale", torch.ones(..., dtype=torch.bfloat16))
+    # Initialize stride and other computation metadata
+    self.a_strides1 = torch.full((num_experts, 3), hidden_size, ...)
+```
+
+#### process_weights_after_loading
+
+Transforms loaded weights and scales to kernel-optimal formats:
+
+- **Weight scale optimization**: Convert scales from float32 to bfloat16 (50% memory reduction), then interleave via `interleave_scales` to match CUTLASS memory access patterns (TRT-LLM reference), improving cache locality.
+
+- **Input scale aggregation**: In static quantization, aggregate per-expert input scales into a single scalar to reduce inference overhead.
+
+```python
+def process_weights_after_loading(self, layer: Module) -> None:
+    # Convert weight scale to bfloat16 and rearrange to match CUTLASS layout
     w13_weight_scale = layer.w13_weight_scale_inv.to(torch.bfloat16)
     w13_weight_scale = interleave_scales(w13_weight_scale)
     layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
-    ```
-  - Aggregate input scale, cache maximum value to reduce per-element operations during inference:
-    ```python
-    # Calculate and cache maximum input scale
+    
+    # Aggregate input scale into a single scalar (static quantization mode)
     w13_input_scale_max = layer.w13_input_scale.max().to(torch.bfloat16).item()
-    new_w13_input_scale = torch.tensor([w13_input_scale_max], dtype=torch.bfloat16, device=device)
-    layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
-    ```
-  - Prepare constants like stride, expert routing parameters, etc., to avoid repeated construction in forward pass.
-- `Fp8LinearMethod` also selects data layouts required by Marlin, block quantization, or CUTLASS kernels at this stage based on hardware.
+    layer.w13_input_scale = Parameter(
+        torch.tensor([w13_input_scale_max], dtype=torch.bfloat16, device=device),
+        requires_grad=False
+    )
+```
 
-### 4.4 Quantized Inference
+#### apply
 
-- Linear layers execute `Fp8LinearMethod.apply`: Quantize input, call selected kernel for FP8 GEMM, dequantize output:
-  ```python
-  # Fp8LinearMethod.apply
-  return apply_fp8_linear(
-      input=x,
-      weight=layer.weight,
-      weight_scale=layer.weight_scale,
-      input_scale=layer.input_scale,
-      bias=bias,
-      cutlass_fp8_supported=self.cutlass_fp8_supported,
-  )
-  ```
-- MoE layers execute `W4AFp8MoEMethod.apply`: Calls `cutlass_w4a8_moe`, passing quantized weights, scales, expert routing results, and input scaling factors, completing mixed-precision computation with INT4 weights + FP8 activations, and finally fusing routing scaling factors before returning:
-  ```python
-  # W4AFp8MoEMethod.apply
-  output = cutlass_w4a8_moe(
-      x,
-      layer.w13_weight,                                   # INT4 quantized weights
-      layer.w2_weight,                                    # INT4 quantized weights
-      layer.w13_weight_scale_inv,                         # Weight scale
-      layer.w2_weight_scale_inv,                          # Weight scale
-      topk_weights,                                      # Expert routing weights
-      topk_ids,                                          # Expert routing IDs
-      self.a_strides1, self.b_strides1, self.c_strides1,  # GEMM1 strides
-      self.a_strides2, self.b_strides2, self.c_strides2,  # GEMM2 strides
-      self.s_strides13, self.s_strides2,                  # Scale strides
-      self.expert_offsets,                               # Expert offsets
-      self.problem_sizes1, self.problem_sizes2,          # Problem sizes
-      layer.w13_input_scale,                             # Input scale
-      layer.w2_input_scale,                              # Input scale
-  )
-  # Fuse routing scaling factor
-  if self.moe_runner_config.routed_scaling_factor is not None:
-      output *= self.moe_runner_config.routed_scaling_factor
-  return StandardCombineInput(hidden_states=output)
-  ```
+Executes quantized forward pass:
 
-## 5. Supported Quantization Schemes Overview
+Collects preprocessed data (activations, rearranged weights/scales, routing results) and invokes `cutlass_w4a8_moe` kernel for two GEMM operations:
+- **GEMM1**: `w13_weight` (gate/up projection)
+- **GEMM2**: `w2_weight` (down projection)
+
+`cutlass_w4a8_moe` wraps CUTLASS, implementing INT4 weight + FP8 activation mixed-precision GEMM, leveraging hardware quantized computation capabilities.
+
+```python
+def apply(self, layer, dispatch_output) -> CombineInput:
+    from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+    
+    x = dispatch_output.hidden_states
+    topk_weights, topk_ids, _ = dispatch_output.topk_output
+    
+    # Call CUTLASS kernel to execute mixed-precision MoE computation
+    output = cutlass_w4a8_moe(
+        x, layer.w13_weight, layer.w2_weight,
+        layer.w13_weight_scale_inv, layer.w2_weight_scale_inv,
+        topk_weights, topk_ids,
+        self.a_strides1, self.b_strides1, self.c_strides1,  # GEMM1 strides
+        self.a_strides2, self.b_strides2, self.c_strides2,  # GEMM2 strides
+        self.s_strides13, self.s_strides2,                  # Scale strides
+        self.expert_offsets, self.problem_sizes1, self.problem_sizes2,
+        layer.w13_input_scale, layer.w2_input_scale,
+    )
+    # Apply routing scale factor
+    if self.moe_runner_config.routed_scaling_factor is not None:
+        output *= self.moe_runner_config.routed_scaling_factor
+    return StandardCombineInput(hidden_states=output)
+```
+
+### Fp8LinearMethod Implementation
+
+For regular linear layers, `W4AFp8Config` assigns `Fp8LinearMethod`:
+
+- **`create_weights`**: Register `weight`, `weight_scale`, `input_scale` placeholders
+- **`process_weights_after_loading`**: Transform weights/scales to hardware-optimal layouts (Marlin, CUTLASS, etc.)
+- **`apply`**: Invoke appropriate kernel (Marlin, CUTLASS, etc.) for FP8 GEMM:
+
+```python
+# Fp8LinearMethod.apply
+return apply_fp8_linear(
+    input=x,
+    weight=layer.weight,
+    weight_scale=layer.weight_scale,
+    input_scale=layer.input_scale,
+    bias=bias,
+    cutlass_fp8_supported=self.cutlass_fp8_supported,
+)
+```
+
+## Supported Quantization Schemes Overview
 
 | Category              | Representative Configurations                                                                 | Description                                                                              |
 | --------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| FP8 Series            | `fp8`, `w8a8_fp8`, `modelopt_fp8`, `fbgemm_fp8`                                               | Native FP8, W8A8-FP8 hybrid, ModelOpt/FBGEMM extensions                                  |
+| FP8 Series            | `fp8`, `w8a8_fp8`, `modelopt_fp8`, `fbgemm_fp8`                                               | Native FP8, W8A8-FP8 hybrid, ModelOpt/FBGEMM implementations                                  |
 | INT8 Series           | `w8a8_int8`, `blockwise_int8`                                                                 | Classic 8bit weight/activation, blockwise INT8                                           |
 | INT4/Mixed Precision  | `w4afp8`, `qoq`, `moe_wna16`                                                                  | 4bit weight + FP8 activation, QoQ, WNA16 (W4A16/W8A16)                                  |
 | FP4 / MXFP4           | `modelopt_fp4`, `petit_nvfp4`, `mxfp4`, `quark`                                               | FP4 / MXFP4 schemes, `quark` is ROCm-specific                                           |
 | Pre-quantized Formats | `awq`, `awq_marlin`, `gptq`, `gptq_marlin`, `gguf`, `compressed-tensors`, `auto-round`, `modelopt` | Integration with external toolchains or compressed tensor frameworks, `modelopt` auto-detects FP8/FP4 |
 | KV Cache Quantization | `BaseKVCacheMethod` and its subclasses in `kv_cache.py`                                       | Provides scale and zero-point management for attention caches                           |
 
-## 6. Steps to Extend New Quantization Schemes
+## Steps to Extend New Quantization Schemes
 
-1. **Implement Configuration Class**: Inherit from `QuantizationConfig`, parse custom parameters and implement `get_quant_method`.
-2. **Implement Quantization Method Class**: Inherit from `LinearMethodBase` / `FusedMoEMethodBase`, implement `create_weights`, `apply`, and optionally `process_weights_after_loading`.
-3. **Register Scheme**: Register string identifier and configuration class mapping in `BASE_QUANTIZATION_METHODS` in `__init__.py`, and add dependency detection logic if necessary.
-4. **Integrate Utilities**: If new kernels or utility functions are needed, implement them in `utils.py`, `int8_utils.py`, or separate files, and call them in `apply`.
-5. **Write Tests and Examples**: Ensure unit tests or inference scripts pass on target hardware, validating that configuration parsing and lifecycle hooks work as expected.
+The decoupled architecture enables straightforward integration of new quantization schemes. To integrate a new scheme (e.g., W2A8):
 
-## 7. Summary
+1. **Implement Configuration Class**: Inherit from `QuantizationConfig`, parse custom parameters, implement `get_quant_method`. Handle hardware capability validation and activation dtype checking.
 
-The quantization system uses a "configuration-driven + unified abstraction" architecture that clearly separates responsibilities for configuration parsing, method selection, weight registration, and inference execution:
+2. **Implement Quantization Method Class**: Inherit from `LinearMethodBase` / `FusedMoEMethodBase`, implement the three-stage lifecycle:
+   - `create_weights`: Register quantized weight placeholders and parameter containers
+   - `apply`: Execute quantized forward pass
+   - `process_weights_after_loading` (optional): Format conversion and optimization after weight loading
 
-- Model configuration stage determines quantization scheme and instantiates `QuantizationConfig`;
-- Model construction stage injects quantization methods layer by layer and registers required parameters;
-- Weight loading stage completes format conversion and data rearrangement;
-- Inference stage uniformly dispatches underlying kernels through the quantization method's `apply`.
+3. **Register Scheme**: Register string identifier and configuration class mapping in `BASE_QUANTIZATION_METHODS` in `__init__.py`. Add dependency detection logic if needed (e.g., CUTLASS, Marlin, kernel dependencies).
+
+4. **Integrate Utilities**: Implement new kernels/utilities in `utils.py`, `int8_utils.py`, or separate files. Call from `apply`. Ensure target hardware backend compatibility.
+
+5. **Write Tests**: Ensure unit tests or inference scripts pass on target hardware, validating configuration parsing and lifecycle hooks. Test hardware capability detection and fallback behavior.
