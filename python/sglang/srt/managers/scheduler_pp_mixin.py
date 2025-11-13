@@ -373,15 +373,10 @@ class SchedulerPPMixin:
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
         if bootstrapped_rids is not None:
-            (
-                good_consensus_bootstrapped_rids,
-                bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids,
-                    bad_rids_to_check=bad_consensus_bootstrapped_rids,
+                    rids_to_check=bootstrapped_rids,
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -392,47 +387,36 @@ class SchedulerPPMixin:
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            bootstrapped_reqs, failed_reqs = (
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                    return_failed_reqs=True
+                )
             )
+            bootstrapped_rids = [req.rid for req in bootstrapped_reqs] + [
+                req.rid for req in failed_reqs
+            ]
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
+            bootstrapped_rids = self.recv_pyobj_from_prev_stage()
+            bootstrapped_reqs = (
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                    rids_to_check=bootstrapped_rids
+                )
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
-            )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
-            )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+        self.waiting_queue.extend(bootstrapped_reqs)
+        return bootstrapped_rids
 
     def _pp_pd_get_transferred_ids(self: Scheduler):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = self.get_transferred_rids()
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self.recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            curr_transferred_rids = self.get_transferred_rids()
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
@@ -544,6 +528,7 @@ class SchedulerPPMixin:
         send_bootstrapped_work = []
         send_consensus_bootstrapped_work = []
         send_proxy_work = []
+        send_output_work = []
         send_release_work = []
         send_transfer_work = []
 
@@ -562,8 +547,10 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.recv_requests()
-                self._pp_commit_comm_work(send_req_work)
                 self.process_input_requests(recv_reqs)
+
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(send_req_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
@@ -574,21 +561,20 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk()
-
                 batch = self.get_new_batch_prefill()
                 if require_mlp_sync(self.server_args):
                     batch = self.prepare_mlp_sync_batch(batch)
                 mbs[mb_id] = batch
-
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                self._pp_commit_comm_work(send_proxy_work)
+
                 if self.server_args.pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    self._pp_commit_comm_work(work=send_output_work)
+                    next_pp_outputs, next_batch_result, d2h_event, send_output_work = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -598,12 +584,14 @@ class SchedulerPPMixin:
                             pp_outputs,
                         )
                     )
+                self._pp_commit_comm_work(send_proxy_work)
                 if self.cur_batch:
                     result, event = self._pp_launch_batch(
                         mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
                     )
                 if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
+                    self._pp_commit_comm_work(work=send_output_work)
+                    next_pp_outputs, next_batch_result, d2h_event, send_output_work = (
                         self._pp_send_recv_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
@@ -664,9 +652,9 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
 
-                if self.delayed_weight_sync_fn:
-                    self.delayed_weight_sync_fn()
-                    self.delayed_weight_sync_fn = None
+                #if self.delayed_weight_sync_fn:
+                    #self.delayed_weight_sync_fn()
+                    #self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
