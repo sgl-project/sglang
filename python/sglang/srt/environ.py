@@ -279,6 +279,9 @@ class Envs:
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
+    # Ngram
+    SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+
     # fmt: on
 
 
