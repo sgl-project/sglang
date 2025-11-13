@@ -1,4 +1,4 @@
-SGlang exports request trace data based on the OpenTelemetry Collector. You can enable tracing by adding the `--enable-trace` and configure the OpenTelemetry Collector endpoint using `--otlp-traces-endpoint` when launching the server.
+SGlang exports request trace data based on the OpenTelemetry Collector. You can enable tracing by adding the `--trace-level` and configure the OpenTelemetry Collector endpoint using `--otlp-traces-endpoint` when launching the server. The `--trace-level` option accepts configurable values from `1` to `3`, with higher numbers indicating more detailed tracing. Additionally, you can use `--trace-module` to specify the module to trace; currently, only `request` is supported.
 
 You can find example screenshots of the visualization in https://github.com/sgl-project/sglang/issues/8965.
 
@@ -26,7 +26,7 @@ This section explains how to configure the request tracing and export the trace 
     export SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS=500
     export SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=64
     # start the prefill and decode server
-    python -m sglang.launch_server --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other option>
+    python -m sglang.launch_server --trace-level 3 --otlp-traces-endpoint 0.0.0.0:4317 [--trace-module request] <other option>
     # start the mini lb
     python -m sglang_router.launch_router --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other option>
     ```
@@ -61,62 +61,65 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
     ```
     The "thread label" can be regarded as the name of the thread, used to distinguish different threads in the visualization view.
 
-2. Mark the beginning and end of a request
-    ```
-    trace_req_start(rid, bootstrap_room)
-    trace_req_finish(rid)
-    ```
-    These two APIs must be called within the same process, for example, in the tokenizer.
+2. create a time recorder for a request
+    Each request needs to call `SglangStageContext()` to initialize a time recorder, which is used to generate slice spans and request stage metrics. You can either store it within the request object or maintain it as a global variable. A set of APIs for managing the global time recorder is provided in `python/sglang/srt/tracing/trace_metric_warpper.py`.
 
-3. Add tracing for slice
+3. Mark the beginning and end of a request
+    ```
+    # The time recorder calls trace_req_start() by default when it is created.
+    stage_context.trace_req_finish()
+    ```
+    SglangStageContext() and trace_req_finish() must be called within the same process, for example, in the tokenizer.
+
+4. Add tracing for slice
 
     * Add slice tracing normally:
         ```python
-        trace_slice_start("slice A", rid)
-        trace_slice_end("slice A", rid)
+        stage_context.metric_trace_slice_start(RequestStage.TOKENIZER)
+        stage_context.metric_trace_slice_end(RequestStage.TOKENIZER)
         ```
 
-    - Use the "anonymous" flag to not specify a slice name at the start of the slice, allowing the slice name to be determined by trace_slice_end.
+    - Use the `ANONYMOUS` to not specify a slice name at the start of the slice, allowing the slice name to be determined by trace_slice_end.
     <br>Note: Anonymous slices must not be nested.
         ```python
-        trace_slice_start("", rid, anonymous = True)
-        trace_slice_end("slice A", rid)
+        stage_context.metric_trace_slice_start(RequestStage.ANONYMOUS)
+        stage_context.metric_trace_slice_end(RequestStage.TOKENIZER)
         ```
 
     - In trace_slice_end, use auto_next_anon to automatically create the next anonymous slice, which can reduce the number of instrumentation points needed.
         ```python
-        trace_slice_start("", rid, anonymous = True)
-        trace_slice_end("slice A", rid, auto_next_anon = True)
-        trace_slice_end("slice B", rid, auto_next_anon = True)
-        trace_slice_end("slice C", rid, auto_next_anon = True)
-        trace_slice_end("slice D", rid)
+        stage_context.metric_trace_slice_start(RequestStage.ANONYMOUS)
+        stage_context.metric_trace_slice_end(RequestStage.A, auto_next_anon = True)
+        stage_context.metric_trace_slice_end(RequestStage.B, auto_next_anon = True)
+        stage_context.metric_trace_slice_end(RequestStage.C, auto_next_anon = True)
+        stage_context.metric_trace_slice_end(RequestStage.D)
         ```
     - The end of the last slice in a thread must be marked with thread_finish_flag=True; otherwise, the thread's span will not be properly generated.
         ```python
-        trace_slice_end("slice D", rid, thread_finish_flag = True)
+        stage_context.metric_trace_slice_end(RequestStage.D, thread_finish_flag = True)
         ```
 
-4. When the request execution flow transfers to another thread, the trace context needs to be explicitly propagated.
+5. When the request execution flow transfers to another thread, the trace context needs to be explicitly propagated.
     - sender: Execute the following code before sending the request to another thread via ZMQ
         ```python
-        trace_context = trace_get_proc_propagate_context(rid)
-        req.trace_context = trace_context
+        trace_context = stage_context.trace_get_proc_propagate_context(rid)
+        req.stage_context = trace_context
         ```
     - receiver: Execute the following code after receiving the request via ZMQ
         ```python
-        trace_set_proc_propagate_context(rid, req.trace_context)
+        stage_context = SglangStageContext(......,propagation_context = req.stage_context)
         ```
 
-5. When the request execution flow transfers to another node(PD disaggregation), the trace context needs to be explicitly propagated.
+6. When the request execution flow transfers to another node(PD disaggregation), the trace context needs to be explicitly propagated.
     - sender: Execute the following code before sending the request to node thread via http
         ```python
-        trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
+        trace_context = trace_get_remote_propagate_context_batch(bootstrap_room_list)
         headers = {"trace_context": trace_context}
         session.post(url, headers=headers)
         ```
     - receiver: Execute the following code after receiving the request via http
         ```python
-        trace_set_remote_propagate_context(request.headers['trace_context'])
+        trace_set_remote_propagate_context_batch(request.headers['trace_context'])
         ```
 
 ## How to Extend the Tracing Framework to Support Complex Tracing Scenarios
