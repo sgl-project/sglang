@@ -67,7 +67,6 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
 )
-from sglang.srt.managers.mm_utils import multimodal_preprocess_routine
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     compute_initial_expert_location_metadata,
@@ -91,6 +90,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.mm_utils import multimodal_preprocess_routine
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -2116,13 +2116,13 @@ class ModelRunner:
             assert forward_batch.input_embeds is not None, "input_embeds is required"
             print(f"{forward_batch.input_embeds.shape=}")
             print(f"{forward_batch.input_deepstack_embeds.shape=}")
-            print(f"right!!!!!!")
+            print(f"right!!!!!!", flush=True)
 
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
-            kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16() 
+            kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
             # should we convert to bfloat16?
         if not self.is_generation:
             kwargs["get_embedding"] = True
@@ -2131,7 +2131,7 @@ class ModelRunner:
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         ):
-            print(f"piecewise cuda graph replay")   
+            print(f"piecewise cuda graph replay")
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
         if not skip_attn_backend_init:
@@ -2223,7 +2223,7 @@ class ModelRunner:
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
-        
+
         if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,

@@ -34,10 +34,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -721,10 +718,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 embedding, deepstack_embedding = self.separate_deepstack_embeds(
                     embedding
                 )
-                if index is not None:
-                    input_deepstack_embeds[index] = deepstack_embedding.to(
-                        inputs_embeds.device, inputs_embeds.dtype
-                    )
+                if index is None or deepstack_embedding is None:
+                    continue
+                input_deepstack_embeds[index] = deepstack_embedding.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
 
             new_embeddings.append(embedding)
 
@@ -746,7 +744,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds = None,
+        input_embeds=None,
         get_embedding: bool = False,
     ):
         """Run forward pass for Qwen3-VL.
@@ -763,6 +761,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
+        else:
+            positions = forward_batch.positions
 
         if not (
             forward_batch.forward_mode.is_decode()
@@ -777,7 +777,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_embeds = forward_batch.input_embeds
         # It may seem strange to assign input_embeds again even after passing it as an argument.
         # This is for compatibility considerations.
-        # In the 'extend' scenario, this forward function is called from two places: 
+        # In the 'extend' scenario, this forward function is called from two places:
         # 1. model_runner calls forward directly,
         # 2. piece_wise_cuda_graph_runner calls forward and replay.
 

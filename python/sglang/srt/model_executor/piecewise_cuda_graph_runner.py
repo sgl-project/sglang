@@ -174,7 +174,10 @@ class PiecewiseCudaGraphRunner:
         # Graph inputs
         with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            self.input_embeds = torch.zeros((self.max_num_tokens, self.model_runner.model_config.hidden_size), dtype=self.model_runner.dtype)
+            self.input_embeds = torch.zeros(
+                (self.max_num_tokens, self.model_runner.model_config.hidden_size),
+                dtype=self.model_runner.dtype,
+            )
             # TODO: make sure the dtype is right.
             self.out_cache_loc = torch.zeros(
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
@@ -187,7 +190,14 @@ class PiecewiseCudaGraphRunner:
                 (3, self.max_num_tokens), dtype=torch.int64
             )
             if self.use_deepstack:
-                self.input_deepstack_embeds = torch.zeros((self.max_num_tokens, self.model_runner.model_config.hidden_size * len(self.model_runner.model.deepstack_visual_indexes)), dtype=self.model_runner.dtype)
+                self.input_deepstack_embeds = torch.zeros(
+                    (
+                        self.max_num_tokens,
+                        self.model_runner.model_config.hidden_size
+                        * len(self.model_runner.model.deepstack_visual_indexes),
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         self.attention_layers = self.model_runner.attention_layers
@@ -228,8 +238,21 @@ class PiecewiseCudaGraphRunner:
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=1,
-                input_ids=torch.randint(0, 100, (num_tokens,), device=self.device) if not self.use_input_embeds else None,
-                input_embeds=torch.randn(num_tokens, self.model_runner.model_config.hidden_size, dtype=self.model_runner.dtype, device=self.device) if self.use_input_embeds else None,
+                input_ids=(
+                    torch.randint(0, 100, (num_tokens,), device=self.device)
+                    if not self.use_input_embeds
+                    else None
+                ),
+                input_embeds=(
+                    torch.randn(
+                        num_tokens,
+                        self.model_runner.model_config.hidden_size,
+                        dtype=self.model_runner.dtype,
+                        device=self.device,
+                    )
+                    if self.use_input_embeds
+                    else None
+                ),
                 req_pool_indices=torch.arange(1, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -259,14 +282,25 @@ class PiecewiseCudaGraphRunner:
                 global_num_tokens_for_logprob_gpu=None,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
-                mrope_positions=torch.zeros((3, num_tokens), dtype=torch.int64),
+                mrope_positions=self.mrope_positions[:, :num_tokens],
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
-                input_deepstack_embeds = torch.zeros((num_tokens, self.model_runner.model_config.hidden_size * len(self.model_runner.model.deepstack_visual_indexes)), dtype=self.model_runner.dtype) if self.use_deepstack else None,
+                input_deepstack_embeds=(
+                    torch.zeros(
+                        (
+                            num_tokens,
+                            self.model_runner.model_config.hidden_size
+                            * len(self.model_runner.model.deepstack_visual_indexes),
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
+                    if self.use_deepstack
+                    else None
+                ),
             )
 
         # Attention backend
@@ -346,11 +380,11 @@ class PiecewiseCudaGraphRunner:
         else:
             input_ids = self.input_ids[:num_tokens]
             input_embeds = None
-        
+
         input_deepstack_embeds = None
         if self.use_deepstack:
             input_deepstack_embeds = self.input_deepstack_embeds[:num_tokens]
-                
+
         out_cache_loc = self.out_cache_loc[:num_tokens]
         out_cache_loc_swa = self.out_cache_loc_swa[:num_tokens]
         positions = self.positions[:num_tokens]
@@ -432,6 +466,9 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
+            assert (
+                forward_batch.input_deepstack_embeds is not None
+            ), "input_deepstack_embeds is required"
             with set_forward_context(
                 forward_batch, self.attention_layers, self.quant_config
             ):
@@ -460,10 +497,11 @@ class PiecewiseCudaGraphRunner:
             num_tokens = forward_batch.input_embeds.shape[0]
         else:
             num_tokens = len(forward_batch.input_ids)
-        
+
         if self.use_deepstack:
             print(f"zero_")
-            self.input_deepstack_embeds.zero_() # may be removed.
+            self.input_deepstack_embeds.zero_()  # may be removed.
+            self.input_embeds.zero_()
 
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
@@ -473,7 +511,7 @@ class PiecewiseCudaGraphRunner:
             self.out_cache_loc_swa.zero_()
         bs = forward_batch.batch_size
 
-        if self.use_input_embeds: 
+        if self.use_input_embeds:
             self.input_embeds[:num_tokens].copy_(forward_batch.input_embeds)
         else:
             self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -510,9 +548,16 @@ class PiecewiseCudaGraphRunner:
 
         input_deepstack_embeds = None
         if self.use_deepstack:
-            self.input_deepstack_embeds[:num_tokens].copy_(forward_batch.input_deepstack_embeds)
+            self.input_deepstack_embeds[:num_tokens].copy_(
+                forward_batch.input_deepstack_embeds
+            )
             input_deepstack_embeds = self.input_deepstack_embeds[:static_num_tokens]
 
+        print(f"input_embeds.shape={input_embeds.shape}")
+        print(f"input_deepstack_embeds.shape={input_deepstack_embeds.shape}")
+        print(f"{input_embeds.reshape(-1)[:10]=}")
+        print(f"{input_deepstack_embeds.reshape(-1)[:10]=}")
+        print(f"", flush=True)
         static_forward_batch = ForwardBatch(
             forward_mode=forward_batch.forward_mode,
             batch_size=bs,
@@ -567,6 +612,7 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        print(f"replay!!")
         with enable_piecewise_cuda_graph():
             if self.model_runner.tp_group.ca_comm is not None:
                 old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
