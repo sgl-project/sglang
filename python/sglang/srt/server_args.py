@@ -3666,6 +3666,20 @@ class ServerArgs:
             help="The path of the decrypted draft config file.",
         )
 
+        # For registering hooks
+        parser.add_argument(
+            "--enable-hooks",
+            dest="enable_hooks",
+            action="store_true",
+            help="Enable forward hooks on the model",
+        )
+        parser.add_argument(
+            "--hooks",
+            type=json_list_type,
+            default=None,
+            help="The hooks to be attached. Only run when hooks are enabled",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
