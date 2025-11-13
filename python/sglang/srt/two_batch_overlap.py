@@ -1006,9 +1006,6 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def combine_b(self, **kwargs):
         return self._execute("combine_b", **kwargs)
 
-    def fused_moe(self, **kwargs) -> torch.Tensor:
-        return self._execute("fused_moe", **kwargs)
-
     def set_quant_config(self, quant_config: dict):
         super().set_quant_config(quant_config)
         for inner in self._inners:

@@ -26,6 +26,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
 
 __all__ = [
     "BaseDispatcher",
@@ -48,4 +49,5 @@ __all__ = [
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
+    "NpuFuseEPDispatcher",
 ]
