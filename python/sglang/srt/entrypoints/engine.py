@@ -184,6 +184,7 @@ class Engine(EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -218,6 +219,7 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
+            rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -264,6 +266,7 @@ class Engine(EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -300,6 +303,7 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
+            rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -315,6 +319,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
@@ -326,6 +331,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = self.loop.run_until_complete(generator.__anext__())
@@ -338,6 +344,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -351,6 +358,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
@@ -725,7 +733,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.16.post5",
+            "0.3.17",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -788,22 +796,24 @@ def _launch_subprocesses(
 
     scheduler_procs = []
     if server_args.dp_size == 1:
+        # Launch tensor parallel scheduler processes
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
         scheduler_pipe_readers = []
 
-        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+        )
+
+        nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
         tp_rank_range = range(
             tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
             tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
-        )
-
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
         )
 
         for pp_rank in pp_rank_range:

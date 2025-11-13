@@ -51,7 +51,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
   ```
 
-- To enable `torch.compile` acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. By default, the cache path is located at `/tmp/torchinductor_root`, you can customize it using environment variable `TORCHINDUCTOR_CACHE_DIR`. For more details, please refer to [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html) and [Enabling cache for torch.compile](https://docs.sglang.ai/backend/hyperparameter_tuning.html#enabling-cache-for-torch-compile).
+- To enable `torch.compile` acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. By default, the cache path is located at `/tmp/torchinductor_root`, you can customize it using environment variable `TORCHINDUCTOR_CACHE_DIR`. For more details, please refer to [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html) and [Enabling cache for torch.compile](https://docs.sglang.ai/references/torch_compile_cache.html).
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports other [quantization strategies (INT8/FP8)](https://github.com/sgl-project/sglang/blob/v0.3.6/python/sglang/srt/server_args.py#L671) as well.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
@@ -314,8 +314,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--hicache-size` | The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set. | `0` | Type: int |
 | `--hicache-write-policy` | The write policy of hierarchical cache. | `write_through` | `write_back`, `write_through`, `write_through_selective` |
 | `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used. | `lru` | `lru`, `lfu` |
-| `--hicache-io-backend` | The IO backend for KV cache transfer between CPU and GPU | `kernel` | `direct`, `kernel` |
-| `--hicache-mem-layout` | The layout of host memory pool for hierarchical cache. | `layer_first` | `layer_first`, `page_first`, `page_first_direct` |
+| `--hicache-io-backend` | The IO backend for KV cache transfer between CPU and GPU | `kernel` | `direct`, `kernel`, `kernel_ascend` |
+| `--hicache-mem-layout` | The layout of host memory pool for hierarchical cache. | `layer_first` | `layer_first`, `page_first`, `page_first_direct`, `page_first_kv_split` |
 | `--hicache-storage-backend` | The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name). | `None` | `file`, `mooncake`, `hf3fs`, `nixl`, `aibrix`, `dynamic`, `eic` |
 | `--hicache-storage-prefetch-policy` | Control when prefetching from the storage backend should stop. | `best_effort` | `best_effort`, `wait_complete`, `timeout` |
 | `--hicache-storage-backend-extra-config` | A dictionary in JSON string format containing extra configuration for the storage backend. | `None` | Type: str |

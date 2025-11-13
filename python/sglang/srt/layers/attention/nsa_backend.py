@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
@@ -20,6 +21,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     NSA_FUSE_TOPK,
     compute_nsa_seqlens,
 )
+from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
@@ -48,6 +50,10 @@ if _is_hip:
         )
 else:
     from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+
+# Reuse this workspace buffer across all NSA backend instances
+global_workspace_buffer = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +141,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         self,
         logits: torch.Tensor,
         topk: int,
+        ks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel import (
             fast_topk_transform_fused,
@@ -143,7 +150,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         )
 
         if not NSA_FUSE_TOPK:
-            return fast_topk_v2(logits, self.get_seqlens_expanded(), topk)
+            return fast_topk_v2(
+                logits, self.get_seqlens_expanded(), topk, row_starts=ks
+            )
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
             return fast_topk_transform_fused(
@@ -152,6 +161,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 page_table_size_1=self.attn_metadata.page_table_1,
                 cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
                 topk=topk,
+                row_starts=ks,
             )
         elif self.topk_transform_method == TopkTransformMethod.RAGGED:
             return fast_topk_transform_ragged_fused(
@@ -159,6 +169,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 lengths=self.get_seqlens_expanded(),
                 topk_indices_offset=self.attn_metadata.topk_indices_offset,
                 topk=topk,
+                row_starts=ks,
             )
         else:
             assert False, f"Unsupported {self.topk_transform_method = }"
@@ -230,6 +241,20 @@ class NativeSparseAttnBackend(AttentionBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+
+        # Allocate global workspace buffer for TRTLLm ragged attention kernel (SM100/B200)
+        device_sm_major = torch.cuda.get_device_capability()[0]
+        if device_sm_major >= 10:
+            global global_workspace_buffer
+            if global_workspace_buffer is None:
+                global_workspace_buffer = torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_workspace_buffer
+        else:
+            self.workspace_buffer = None
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -887,7 +912,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         if NSA_PREFILL_IMPL == "tilelang":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -897,7 +922,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
         elif NSA_PREFILL_IMPL == "flashmla_sparse":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
 
             # NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 has no effect here,
             # because the flashmla_sparse kernel doesn't support fp8 compute
@@ -923,7 +948,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
         elif NSA_PREFILL_IMPL == "flashmla_kv":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1007,7 +1032,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         if NSA_DECODE_IMPL == "flashmla_sparse":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1017,7 +1042,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
         elif NSA_DECODE_IMPL == "flashmla_kv":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1030,7 +1055,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
         elif NSA_DECODE_IMPL == "tilelang":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1196,9 +1221,34 @@ class NativeSparseAttnBackend(AttentionBackend):
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Determine FA version: FA3 for SM90 (Hopper), FA4 for SM100+ (Blackwell and beyond)
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
         device_sm_major = torch.cuda.get_device_capability()[0]
-        fa_version = 4 if device_sm_major >= 10 else 3
+        if device_sm_major >= 10:
+            import flashinfer
+
+            seq_lens = metadata.cache_seqlens_int32
+            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=seq_lens,
+                max_q_len=metadata.max_seq_len_q,
+                max_kv_len=max_seqlen_k,
+                bmm1_scale=layer.scaling,
+                bmm2_scale=1.0,
+                o_sf_scale=1.0,
+                batch_size=forward_batch.batch_size,
+                window_left=-1,
+                cum_seq_lens_q=cu_seqlens_q,
+                cum_seq_lens_kv=cu_seqlens_k,
+                enable_pdl=False,
+                is_causal=causal,
+                return_lse=False,
+            )
+
+        # Use FA3 for SM90 (Hopper/H200)
+        fa_version = 3
 
         return flash_attn_varlen_func(
             q=q,
