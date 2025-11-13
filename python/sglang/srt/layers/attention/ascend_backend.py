@@ -62,16 +62,16 @@ class AscendAttnMaskBuilder:
         )
 
         # Initialize FIA mask
-        fia_mask_length = 2048
-        self.fia_mask = self.generate_mask_flag(fia_mask_length).to(self.device)
+        fia_mask_len = 2048
+        self.fia_mask = self.generate_mask_flag(fia_mask_len).to(self.device)
 
         # Initialize MTP mask
-        mtp_mask_length = 2048
-        self.mtp_mask = self.generate_mask_flag(mtp_mask_length).to(self.device)
+        mtp_mask_len = 2048
+        self.mtp_mask = self.generate_mask_flag(mtp_mask_len).to(self.device)
 
         # Initialize mixed chunk mask cache
-        mixed_chunk_cache_size = 8192
-        self.mix_mask_cache = self.generate_attn_mask(mixed_chunk_cache_size, "mix")
+        mixed_chunk_cache_len = 8192
+        self.mix_mask_cache = self.generate_attn_mask(mixed_chunk_cache_len, "mix")
         self.mix_seq_len_cached = self.mix_mask_cache.shape[0]
 
     @staticmethod
