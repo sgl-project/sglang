@@ -75,7 +75,7 @@ class JetBlock(nn.Module):
         self.o_proj = RowParallelLinear(total_v_dim, hidden_size, bias=False)
 
         self.A_log = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
-        self.dt_bias = nn.Parameter(torch.ones(num_heads))
+        self.dt_bias = nn.Parameter(torch.empty(num_heads))
 
         self.dynamic_conv1d = DynamicShortConvolution(
             quant_config=quant_config,
@@ -120,9 +120,14 @@ class JetBlock(nn.Module):
         )
 
         q = nn.functional.silu(q)
-        q = einops.rearrange(q, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
+        q = einops.rearrange(
+            q, "l (h d) -> 1 l h d", h=self.num_heads, d=self.head_k_dim
+        )
+
         k = nn.functional.silu(k)
-        k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
+        k = einops.rearrange(
+            k, "l (h d) -> 1 l h d", h=self.num_heads, d=self.head_k_dim
+        )
 
         kwargs = {
             "dynamic_conv": self.dynamic_conv1d,
@@ -343,7 +348,7 @@ class JetNemotronModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.vocab_size = config.vocab_size
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,

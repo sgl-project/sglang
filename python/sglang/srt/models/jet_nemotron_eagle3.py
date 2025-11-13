@@ -2,7 +2,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.utils import logging
 
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.layers.layernorm import RMSNorm
@@ -20,10 +19,7 @@ from sglang.srt.models.jet_nemotron import (
     JetNemotronForCausalLM,
     JetNemotronMLP,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
-
-logger = logging.get_logger(__name__)
 
 
 class JetNemotronDecoderLayerEagle3(nn.Module):
@@ -35,7 +31,6 @@ class JetNemotronDecoderLayerEagle3(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.hidden_size = config.hidden_size
 
         self.self_attn = JetNemotronAttention(config, layer_id, quant_config, prefix)
         self.self_attn.qkv_proj = QKVParallelLinear(
@@ -45,8 +40,7 @@ class JetNemotronDecoderLayerEagle3(nn.Module):
             config.num_key_value_heads,
             bias=True,
             quant_config=quant_config,
-            tp_rank=self.self_attn.attn_tp_rank,
-            tp_size=self.self_attn.attn_tp_size,
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         self.mlp = JetNemotronMLP(config, quant_config, prefix)
@@ -63,7 +57,7 @@ class JetNemotronDecoderLayerEagle3(nn.Module):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         residual = hidden_states
         input_embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
@@ -94,7 +88,7 @@ class JetNemotronModelEagle3(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.vocab_size = config.vocab_size
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
@@ -140,7 +134,6 @@ class JetNemotronForCausalLMEagle3(JetNemotronForCausalLM):
     ):
         nn.Module.__init__(self)
         self.config = config
-        self.vocab_size = config.vocab_size
 
         if config.draft_vocab_size is None:
             config.draft_vocab_size = config.vocab_size
@@ -149,8 +142,6 @@ class JetNemotronForCausalLMEagle3(JetNemotronForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            bias=False,
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
 
         self.model = JetNemotronModelEagle3(config, quant_config, prefix)

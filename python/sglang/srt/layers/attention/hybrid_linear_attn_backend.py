@@ -874,7 +874,7 @@ class JetNemotronAttnBackend(MambaAttnBackendBase):
             v = v.view(seq_len, -1)
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
-            v, conv_state = dynamic_conv_fn(
+            v, _ = dynamic_conv_fn(
                 x=v,  # B, D (varlen)
                 generator_input=hidden_states,  # B, D
                 mask=None,
