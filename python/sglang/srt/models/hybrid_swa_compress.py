@@ -394,7 +394,6 @@ class HybridSWACompressedAttention(nn.Module):
         num_kv_heads: int,
         head_dim: Optional[int] = None,
         v_head_dim: Optional[int] = None,
-        v_scale: Optional[float] = None,
         sliding_window_size: int = -1,  # if is -1 ,normal attention,else ,window attention
         attention_bias: bool = False,
         add_swa_attention_sink_bias: bool = False,  # todo sink bias
@@ -431,8 +430,6 @@ class HybridSWACompressedAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.k_size = self.num_kv_heads * self.head_dim
         self.v_size = self.num_kv_heads * self.v_head_dim
-
-        self.v_scale = v_scale
 
         self.scaling = self.head_dim**-0.5
 
@@ -509,11 +506,7 @@ class HybridSWACompressedAttention(nn.Module):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-
         q, k = self.rotary_emb(positions, q, k)
-        if self.v_scale is not None:
-            v = v * self.v_scale
-
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -541,8 +534,6 @@ class HybridSWACompressedAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         # [t, h, d]
 
-        if self.v_scale is not None:
-            v = v * self.v_scale
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
         return output
@@ -566,7 +557,9 @@ class HybridSWACompressedDecoderLayer(nn.Module):
         max_position_embeddings = getattr(
             config, "context_len", getattr(config, "max_position_embeddings", 32768)
         )
-        logger.info(f"max_position_embeddings in config: {max_position_embeddings}")
+        logger.warning_once(
+            f"max_position_embeddings in config: {max_position_embeddings}"
+        )
 
         if self.is_compressed_softmax_layer():
             self.self_attn = HybridSWACompressedAttention(
@@ -575,7 +568,6 @@ class HybridSWACompressedDecoderLayer(nn.Module):
                 num_kv_heads=config.compression_softmax_num_kv_heads,
                 head_dim=config.compression_softmax_qk_head_dim,
                 v_head_dim=getattr(config, "compression_softmax_v_head_dim", None),
-                v_scale=getattr(config, "attention_value_scale", None),
                 sliding_window_size=config.sliding_window_size,
                 attention_bias=config.attention_bias,
                 add_swa_attention_sink_bias=getattr(
@@ -596,7 +588,6 @@ class HybridSWACompressedDecoderLayer(nn.Module):
                 num_kv_heads=config.num_key_value_heads,
                 head_dim=config.head_dim,
                 v_head_dim=getattr(config, "v_head_dim", None),
-                v_scale=getattr(config, "attention_value_scale", None),
                 sliding_window_size=-1,  # normal attention
                 attention_bias=config.attention_bias,
                 layer_id=layer_id,
@@ -920,6 +911,7 @@ class HybridSWACompressedForCausalLM(nn.Module):
         self.model = HybridSWACompressedModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
+        self.v_scale = getattr(config, "attention_value_scale", None)
 
         # TODO: temporary used when adapt mimo-v2, should be removed when release.
         assert not getattr(config, "add_compression_swa_gate", False)
@@ -1064,6 +1056,13 @@ class HybridSWACompressedForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
+                if (
+                    weight_name == "v_proj"
+                    and self.v_scale is not None
+                    and self.v_scale != 1.0
+                ):
+                    loaded_weight *= self.v_scale
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
