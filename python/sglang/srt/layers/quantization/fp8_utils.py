@@ -89,13 +89,6 @@ def cutlass_fp8_supported():
     return False
 
 
-def deepgemm_scale_ue8m0_supported():
-    # In BLACKWELL DeepGEMM, the scale must be e8m0
-    if deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
-        return True
-    return False
-
-
 def normalize_e4m3fn_to_e4m3fnuz(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
