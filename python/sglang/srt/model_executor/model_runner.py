@@ -161,6 +161,17 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_xpu_xmx_available = xpu_has_xmx_support()
+
+if _is_npu:
+    from sglang.srt.hardware_backend.ascend_npu.utils import init_ascend_npu_backend
+
+    init_ascend_npu_backend()
+
 MLA_ATTENTION_BACKENDS = [
     "aiter",
     "flashinfer",
@@ -198,12 +209,6 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_xpu_xmx_available = xpu_has_xmx_support()
-
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 
@@ -214,12 +219,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 
 logger = logging.getLogger(__name__)
-
-if _is_npu:
-    import torch_npu
-
-    torch.npu.config.allow_internal_format = True
-    torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 class RankZeroFilter(logging.Filter):
