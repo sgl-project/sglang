@@ -111,6 +111,7 @@ suites = {
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_request_queue_validation.py", 30),
         TestFile("test_retract_decode.py", 450),
+        TestFile("test_runner_hooks.py", 5),
         TestFile("test_score_api.py", 310),
         TestFile("test_server_args.py", 1),
         TestFile("test_speculative_registry.py", 1),
