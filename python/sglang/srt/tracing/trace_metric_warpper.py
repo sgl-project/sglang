@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.tracing.trace import (
-    SglangTraceReqContext,
+    SGLangTraceReqContext,
     get_cur_time_ns,
     get_opentelemetry_initialized,
 )
@@ -139,7 +139,7 @@ class RequestStage:
     ANONYMOUS = RequestStageConfig("")
 
 
-class SglangStageContext(SglangTraceReqContext):
+class SGLangStageContext(SGLangTraceReqContext):
     def __init__(
         self,
         rid,
@@ -297,11 +297,11 @@ Used when the stage_context cannot be integrated into the request object.
 format:
     {
         thread_id: {
-            "rid": SglangStageContext
+            "rid": SGLangStageContext
         }
     }
 """
-global_stage_context_table: Dict[int, Dict[str, SglangStageContext]] = {}
+global_stage_context_table: Dict[int, Dict[str, SGLangStageContext]] = {}
 
 
 def global_init_stage_context(
@@ -316,7 +316,7 @@ def global_init_stage_context(
 ):
     pid = threading.get_native_id()
     rid = str(rid)
-    stage_context = SglangStageContext(
+    stage_context = SGLangStageContext(
         rid=rid,
         bootstrap_room=bootstrap_room,
         module_name=module_name,
@@ -332,7 +332,7 @@ def global_init_stage_context(
     return stage_context
 
 
-def global_get_stage_context(rid) -> Union[SglangStageContext, NoOpStageContext]:
+def global_get_stage_context(rid) -> Union[SGLangStageContext, NoOpStageContext]:
     pid = threading.get_native_id()
     rid = str(rid)
     if pid in global_stage_context_table:

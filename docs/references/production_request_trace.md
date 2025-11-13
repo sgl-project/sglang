@@ -62,14 +62,14 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
     The "thread label" can be regarded as the name of the thread, used to distinguish different threads in the visualization view.
 
 2. create a time recorder for a request
-    Each request needs to call `SglangStageContext()` to initialize a time recorder, which is used to generate slice spans and request stage metrics. You can either store it within the request object or maintain it as a global variable. A set of APIs for managing the global time recorder is provided in `python/sglang/srt/tracing/trace_metric_warpper.py`.
+    Each request needs to call `SGLangStageContext()` to initialize a time recorder, which is used to generate slice spans and request stage metrics. You can either store it within the request object or maintain it as a global variable. A set of APIs for managing the global time recorder is provided in `python/sglang/srt/tracing/trace_metric_warpper.py`.
 
 3. Mark the beginning and end of a request
     ```
     # The time recorder calls trace_req_start() by default when it is created.
     stage_context.trace_req_finish()
     ```
-    SglangStageContext() and trace_req_finish() must be called within the same process, for example, in the tokenizer.
+    SGLangStageContext() and trace_req_finish() must be called within the same process, for example, in the tokenizer.
 
 4. Add tracing for slice
 
@@ -107,7 +107,7 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
         ```
     - receiver: Execute the following code after receiving the request via ZMQ
         ```python
-        stage_context = SglangStageContext(......,propagation_context = req.stage_context)
+        stage_context = SGLangStageContext(......,propagation_context = req.stage_context)
         ```
 
 6. When the request execution flow transfers to another node(PD disaggregation), the trace context needs to be explicitly propagated.
@@ -126,22 +126,22 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
 
 The currently provided tracing package still has potential for further development. If you wish to build more advanced features upon it, you must first understand its existing design principles.
 
-The core of the tracing framework's implementation lies in the design of the span structure and the trace context. To aggregate scattered slices and enable concurrent tracking of multiple requests, we have designed a two-level trace context structure and a four-level span structure: `SglangTraceReqContext`, `SglangTraceThreadContext`. Their relationship is as follows:
+The core of the tracing framework's implementation lies in the design of the span structure and the trace context. To aggregate scattered slices and enable concurrent tracking of multiple requests, we have designed a two-level trace context structure and a four-level span structure: `SGLangTraceReqContext`, `SGLangTraceThreadContext`. Their relationship is as follows:
 ```
-SglangTraceReqContext (req_id="req-123")
-├── SglangTraceThreadContext(thread_label="scheduler", tp_rank=0)
+SGLangTraceReqContext (req_id="req-123")
+├── SGLangTraceThreadContext(thread_label="scheduler", tp_rank=0)
 |
-└── SglangTraceThreadContext(thread_label="scheduler", tp_rank=1)
+└── SGLangTraceThreadContext(thread_label="scheduler", tp_rank=1)
 ```
 
-Each traced request maintains a global `SglangTraceReqContext`. For every thread processing the request, a corresponding `SglangTraceThreadContext` is recorded and composed within the `SglangTraceReqContext`. Within each thread, every currently traced slice (possibly nested) is stored in a list.
+Each traced request maintains a global `SGLangTraceReqContext`. For every thread processing the request, a corresponding `SGLangTraceThreadContext` is recorded and composed within the `SGLangTraceReqContext`. Within each thread, every currently traced slice (possibly nested) is stored in a list.
 
 In addition to the above hierarchy, each slice also records its previous slice via Span.add_link(), which can be used to trace the execution flow.
 
-When the request execution flow transfers to a new thread, the trace context needs to be explicitly propagated. In the framework, this is represented by `SglangTracePropagateContext`, which contains the context of the request span and the previous slice span.
+When the request execution flow transfers to a new thread, the trace context needs to be explicitly propagated. In the framework, this is represented by `SGLangTracePropagateContext`, which contains the context of the request span and the previous slice span.
 
 
-We designed a four-level span structure, consisting of `bootstrap_room_span`, `req_root_span`, `thread_span`, and `slice_span`. Among them, `req_root_span` and `thread_span` correspond to `SglangTraceReqContext` and `SglangTraceThreadContext`, respectively, and `slice_span` is stored within the `SglangTraceThreadContext`. The `bootstrap_room_span` is designed to accommodate the separation of PD-disaggregation. On different nodes, we may want to add certain attributes to the `req_root_span`. However, if the `req_root_span` is shared across all nodes, the Prefill and Decode nodes would not be allowed to add attributes due to the constraints imposed by OpenTelemetry's design.
+We designed a four-level span structure, consisting of `bootstrap_room_span`, `req_root_span`, `thread_span`, and `slice_span`. Among them, `req_root_span` and `thread_span` correspond to `SGLangTraceReqContext` and `SGLangTraceThreadContext`, respectively, and `slice_span` is stored within the `SGLangTraceThreadContext`. The `bootstrap_room_span` is designed to accommodate the separation of PD-disaggregation. On different nodes, we may want to add certain attributes to the `req_root_span`. However, if the `req_root_span` is shared across all nodes, the Prefill and Decode nodes would not be allowed to add attributes due to the constraints imposed by OpenTelemetry's design.
 
 ```
 bootstrap room span

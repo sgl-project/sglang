@@ -87,7 +87,7 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.tracing.trace_metric_warpper import (
     RequestStage,
-    SglangStageContext,
+    SGLangStageContext,
     global_del_stage_context,
     global_get_stage_context,
     global_set_stage_context,
@@ -2348,7 +2348,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             bootstrap_room = (
                 obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
             )
-            stage_context = SglangStageContext(
+            stage_context = SGLangStageContext(
                 rid=obj.rid,
                 bootstrap_room=bootstrap_room,
                 module_name="request",
@@ -2372,7 +2372,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
                     else None
                 )
-                stage_context = SglangStageContext(
+                stage_context = SGLangStageContext(
                     rid=obj.rid[i],
                     bootstrap_room=bootstrap_room,
                     module_name="request",

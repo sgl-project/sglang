@@ -78,7 +78,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.tracing.trace_metric_warpper import NoOpStageContext, SglangStageContext
+from sglang.srt.tracing.trace_metric_warpper import NoOpStageContext, SGLangStageContext
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -432,7 +432,7 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
-        stage_context: Optional[SglangStageContext] = None,
+        stage_context: Optional[SGLangStageContext] = None,
     ):
         # Input and output info
         self.rid = rid

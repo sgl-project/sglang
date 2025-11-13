@@ -42,7 +42,7 @@ from sglang.srt.server_args import (
     ServerArgs,
 )
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.tracing.trace_metric_warpper import RequestStage, SglangStageContext
+from sglang.srt.tracing.trace_metric_warpper import RequestStage, SGLangStageContext
 from sglang.srt.utils.common import (
     bind_port,
     configure_ipv6,
@@ -176,7 +176,7 @@ class DataParallelController:
             bootstrap_room = (
                 req.bootstrap_room if hasattr(req, "bootstrap_room") else None
             )
-            stage_context = SglangStageContext(
+            stage_context = SGLangStageContext(
                 req.rid,
                 bootstrap_room=bootstrap_room,
                 module_name="request",

@@ -162,7 +162,7 @@ from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.tracing.trace_metric_warpper import (
     NoOpStageContext,
     RequestStage,
-    SglangStageContext,
+    SGLangStageContext,
     metric_trace_slice_batch,
     trace_event_batch,
 )
@@ -2608,7 +2608,7 @@ class Scheduler(
 
         bootstrap_room = req.bootstrap_room if hasattr(req, "bootstrap_room") else None
 
-        req.stage_context = SglangStageContext(
+        req.stage_context = SGLangStageContext(
             req.rid,
             bootstrap_room,
             module_name="request",

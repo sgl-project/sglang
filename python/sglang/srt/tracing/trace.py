@@ -70,7 +70,7 @@ def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
 
 
 @dataclass
-class SglangTraceThreadInfo:
+class SGLangTraceThreadInfo:
     host_id: str
     pid: int
     thread_label: str
@@ -80,14 +80,14 @@ class SglangTraceThreadInfo:
 
 
 @dataclass
-class SglangTraceEvent:
+class SGLangTraceEvent:
     event_name: str
     ts: int
     attrs: Dict[str, Any]
 
 
 @dataclass
-class SglangTraceSliceContext:
+class SGLangTraceSliceContext:
     slice_name: str
     start_time_ns: int
     end_time_ns: Optional[int] = None
@@ -99,23 +99,23 @@ class SglangTraceSliceContext:
     lazy_flag: bool = False
     level: int = 1
     attrs: Optional[Dict[str, Any]] = None
-    events: Optional[List[SglangTraceEvent]] = None
-    parent_slice: Optional[SglangTraceSliceContext] = None
-    child_slices: Optional[List[SglangTraceSliceContext]] = None
+    events: Optional[List[SGLangTraceEvent]] = None
+    parent_slice: Optional[SGLangTraceSliceContext] = None
+    child_slices: Optional[List[SGLangTraceSliceContext]] = None
     prev_span_context: Optional[trace.span.SpanContext] = None
 
 
 @dataclass
-class SglangTraceThreadContext:
-    thread_info: SglangTraceThreadInfo
-    cur_slice: Optional[SglangTraceSliceContext] = None
+class SGLangTraceThreadContext:
+    thread_info: SGLangTraceThreadInfo
+    cur_slice: Optional[SGLangTraceSliceContext] = None
     thread_span: Optional[trace.span.Span] = None
     # Record the most recently completed span as the previous span for the next span to be created.
     last_span_context: Optional[trace.span.SpanContext] = None
 
 
 @dataclass
-class SglangTracePropagateContext:
+class SGLangTracePropagateContext:
     root_span_context: context.Context
     prev_span_context: Optional[trace.span.SpanContext]
 
@@ -156,7 +156,7 @@ class SglangTracePropagateContext:
         return cls(root_span_context, prev_span_context)
 
 
-class SglangTraceCustomIdGenerator(id_generator.IdGenerator):
+class SGLangTraceCustomIdGenerator(id_generator.IdGenerator):
     """
     The default IdGenerator may produce duplicate trace IDs across multiple TP scheduler processes,
     hence a custom IdGenerator is implemented.
@@ -175,8 +175,8 @@ class SglangTraceCustomIdGenerator(id_generator.IdGenerator):
 
 
 # global variables
-remote_trace_contexts: Dict[str, SglangTracePropagateContext] = {}
-threads_info: Dict[int, SglangTraceThreadInfo] = {}
+remote_trace_contexts: Dict[str, SGLangTracePropagateContext] = {}
+threads_info: Dict[int, SGLangTraceThreadInfo] = {}
 
 get_cur_time_ns = lambda: int(time.time() * 1e9)
 if hasattr(time, "time_ns"):
@@ -219,7 +219,7 @@ def process_tracing_init(otlp_endpoint, server_name):
             }
         )
         tracer_provider = TracerProvider(
-            resource=resource, id_generator=SglangTraceCustomIdGenerator()
+            resource=resource, id_generator=SGLangTraceCustomIdGenerator()
         )
 
         schedule_delay_millis = get_int_env_var(
@@ -276,7 +276,7 @@ def trace_set_thread_info(
     if pid in threads_info:
         return
 
-    threads_info[pid] = SglangTraceThreadInfo(
+    threads_info[pid] = SGLangTraceThreadInfo(
         host_id=__get_host_id(),
         pid=pid,
         thread_label=thread_label,
@@ -286,7 +286,7 @@ def trace_set_thread_info(
     )
 
 
-class SglangTraceReqContext:
+class SGLangTraceReqContext:
     def __init__(
         self,
         rid,
@@ -301,7 +301,7 @@ class SglangTraceReqContext:
             return
 
         self.start_time_ns: Optional[int] = None
-        self.thread_context: Optional[SglangTraceThreadContext] = None
+        self.thread_context: Optional[SGLangTraceThreadContext] = None
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.role: str = role
 
@@ -326,7 +326,7 @@ class SglangTraceReqContext:
             trace_set_thread_info("unknown")
 
         thread_info = threads_info[self.pid]
-        thread_context = SglangTraceThreadContext(
+        thread_context = SGLangTraceThreadContext(
             thread_info=thread_info,
         )
 
@@ -376,7 +376,7 @@ class SglangTraceReqContext:
         if remote_propagate:
             root_span_context = self.bootstrap_room_span_context
 
-        trace_context = SglangTracePropagateContext(
+        trace_context = SGLangTracePropagateContext(
             root_span_context, prev_span_context
         )
         return trace_context.to_dict()
@@ -388,7 +388,7 @@ class SglangTraceReqContext:
         self.start_time_ns = get_cur_time_ns()
         self.is_copy = True
 
-        trace_context = SglangTracePropagateContext.instance_from_dict(trace_context)
+        trace_context = SGLangTracePropagateContext.instance_from_dict(trace_context)
         if not trace_context:
             self.tracing_enable = False
         else:
@@ -483,7 +483,7 @@ class SglangTraceReqContext:
         else:
             self.bootstrap_room_span.end(end_time=ts)
 
-    def __create_slice_span(self, _slice: SglangTraceSliceContext):
+    def __create_slice_span(self, _slice: SGLangTraceSliceContext):
         parent_span = self.thread_context.thread_span
         if _slice.parent_slice:
             parent_span = _slice.parent_slice.span
@@ -514,7 +514,7 @@ class SglangTraceReqContext:
         _slice.attrs = {}
         _slice.events = []
 
-    def __end_slice_span(self, _slice: SglangTraceSliceContext):
+    def __end_slice_span(self, _slice: SGLangTraceSliceContext):
         # child_slices is not empty but they have not created span
         # if cur_slice.lazy_flag is True before.
         if _slice.child_slices:
@@ -538,7 +538,7 @@ class SglangTraceReqContext:
 
         ts = ts or get_cur_time_ns()
 
-        cur_slice = SglangTraceSliceContext(
+        cur_slice = SGLangTraceSliceContext(
             slice_name=name,
             start_time_ns=ts,
             anonymous=anonymous,
@@ -568,7 +568,7 @@ class SglangTraceReqContext:
 
         self.__create_slice_span(cur_slice)
 
-    def __release_slice_reference_tree(self, _slice: SglangTraceSliceContext):
+    def __release_slice_reference_tree(self, _slice: SGLangTraceSliceContext):
         for child_slice in _slice.child_slices:
             self.__release_slice_reference_tree(child_slice)
         _slice.child_slices = []
@@ -694,7 +694,7 @@ class SglangTraceReqContext:
         if cur_slice.span:
             cur_slice.span.add_event(name=name, timestamp=ts, attributes=attrs)
         else:
-            cur_slice.events.append(SglangTraceEvent(name, ts, attrs))
+            cur_slice.events.append(SGLangTraceEvent(name, ts, attrs))
 
     # Add attrs to the current slice on the same thread with the same rid.
     def trace_slice_add_attr(self, attrs: Dict[str, Any]):
@@ -713,7 +713,7 @@ class SglangTraceReqContext:
 
 
 def trace_get_remote_propagate_context_batch(
-    req_context_list: List[SglangTraceReqContext],
+    req_context_list: List[SGLangTraceReqContext],
 ):
     if not opentelemetry_initialized:
         return ""
@@ -749,7 +749,7 @@ def trace_set_remote_propagate_context_batch(base64_str):
             continue
 
         remote_trace_contexts[bootstrap_room] = (
-            SglangTracePropagateContext.instance_from_dict(
+            SGLangTracePropagateContext.instance_from_dict(
                 remote_reqs_propagate_contexts[bootstrap_room]
             )
         )
