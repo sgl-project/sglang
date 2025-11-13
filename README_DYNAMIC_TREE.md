@@ -52,7 +52,3 @@ Select the largest configuration that does not exceed the current batch size. (i
 python3 -m sglang.test.send_one --batch-size bs
 ```
 adjust `bs` and observe the accept length
-
-
-## Others
-For hybrid models like Qwen3Next, `speculative-num-draft-tokens` should be a constant for server_args and configs in current implementation.
