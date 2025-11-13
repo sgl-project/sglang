@@ -131,6 +131,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             return CompressedTensorsWNA16AMXEPMoEMethod(quant_config, layer_number)
 
         if quant_config.target_scheme_map:
+            
+            # Use 'Linear' as the default target for fused MoE layers in llm-compressor
+            if 'Linear' in quant_config.target_scheme_map.keys(): 
+                prefix = 'Linear'
+
             matched_target = find_matched_target(
                 layer_name=prefix,
                 module=layer,
