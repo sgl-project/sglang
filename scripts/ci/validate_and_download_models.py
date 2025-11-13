@@ -342,7 +342,9 @@ def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -
             if attempt == 1:
                 print(f"  Model directory not found in cache (will download fresh)")
 
-        print(f"  Downloading from HuggingFace (this may take a while for large models)...")
+        print(
+            f"  Downloading from HuggingFace (this may take a while for large models)..."
+        )
 
         try:
             snapshot_download(
