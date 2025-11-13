@@ -329,22 +329,10 @@ class LazyImport:
         if isinstance(other, LazyImport):
             other_type = other._load()
         elif isinstance(other, tuple):
-            # Handle chaining: A | (B, C) -> (A, B, C)
             return (self_type,) + other
         else:
             other_type = other
         return (self_type, other_type)
-
-    def __ror__(self, other):
-        self_type = self._load()
-        if isinstance(other, LazyImport):
-            other_type = other._load()
-        elif isinstance(other, tuple):
-            # Handle chaining: (A, B) | C -> (A, B, C)
-            return other + (self_type,)
-        else:
-            other_type = other
-        return (other_type, self_type)
 
     def __instancecheck__(self, instance):
         return isinstance(instance, self._load())
