@@ -2356,6 +2356,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ts=int(created_time * 1e9),
                 external_trace_header=external_trace_header,
             )
+            if not stage_context.tracing_enable:
+                return
+
             # store into global table,
             # because stage_context can not be passed to _handle_batch_output
             global_set_stage_context(stage_context)
@@ -2377,6 +2380,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     ts=int(created_time * 1e9),
                     external_trace_header=external_trace_header,
                 )
+                if not stage_context.tracing_enable:
+                    return
+
                 global_set_stage_context(stage_context)
                 stage_context.metric_trace_slice_start(
                     RequestStage.ANONYMOUS,

@@ -208,6 +208,7 @@ def process_tracing_init(otlp_endpoint, server_name):
     global opentelemetry_initialized
     global get_cur_time_ns
     if not opentelemetry_imported:
+        logger.warning("opentelemetry package is not installed!!! audo disable tracing")
         opentelemetry_initialized = False
         return
 
@@ -295,10 +296,10 @@ class SglangTraceReqContext:
         trace_level=1,
     ):
         self.tracing_enable: bool = tracing_enable and opentelemetry_initialized
+        self.rid: str = str(rid)
         if not self.tracing_enable:
             return
 
-        self.rid: str = str(rid)
         self.start_time_ns: Optional[int] = None
         self.thread_context: Optional[SglangTraceThreadContext] = None
         self.bootstrap_room: Optional[int] = bootstrap_room
