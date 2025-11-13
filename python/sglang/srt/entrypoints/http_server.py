@@ -1529,11 +1529,16 @@ def _execute_server_warmup(
 
     try:
         if server_args.disaggregation_mode == "null":
+            logger.info(f"Start of co-locate warmup ...")
             res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=600,
+                timeout=(
+                    server_args.warmup_timeout
+                    if server_args.warmup_timeout is not None
+                    else 300
+                ),
             )
             assert res.status_code == 200, f"{res}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -1559,7 +1564,11 @@ def _execute_server_warmup(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=1800,  # because of deep gemm precache is very long if not precache.
+                timeout=(
+                    server_args.warmup_timeout
+                    if server_args.warmup_timeout is not None
+                    else 1800
+                ),  # because of deep gemm precache is very long if not precache.
             )
             if res.status_code == 200:
                 logger.info(

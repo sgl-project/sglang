@@ -292,6 +292,7 @@ class ServerArgs:
     constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
+    warmup_timeout: Optional[float] = None  # timeout for warmup request
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
@@ -2286,6 +2287,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dist_timeout,
             help="Set timeout for torch.distributed initialization.",
+        )
+        parser.add_argument(
+            "--warmup-timeout",
+            type=float,
+            default=ServerArgs.warmup_timeout,
+            help="Set warmup timeout in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm",
         )
         parser.add_argument(
             "--download-dir",
