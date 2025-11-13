@@ -26,7 +26,7 @@ MODELS = [
 DEFAULT_MEM_FRACTION_STATIC = 0.8
 
 
-class TestVLMModels(CustomTestCase):
+class TestVLMEncoderDP(CustomTestCase):
     parsed_args = None  # Class variable to store args
 
     @classmethod
@@ -264,7 +264,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Store the parsed args object on the class
-    TestVLMModels.parsed_args = args
+    TestVLMEncoderDP.parsed_args = args
 
     # Pass args to unittest
     unittest.main(argv=[sys.argv[0]])
