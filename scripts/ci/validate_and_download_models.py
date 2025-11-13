@@ -50,7 +50,7 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "moonshotai/Kimi-VL-A3B-Instruct",
         "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
-        "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8"
+        "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8",
         "OpenGVLab/InternVL2_5-2B",
         "Qwen/Qwen3-8B",
         "Qwen/Qwen3-Coder-30B-A3B-Instruct",
@@ -68,7 +68,7 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "8-gpu-b200": ["deepseek-ai/DeepSeek-V3.1", "deepseek-ai/DeepSeek-V3.2-Exp"],
     "4-gpu-b200": ["nvidia/DeepSeek-V3-0324-FP4"],
     "4-gpu-gb200": ["nvidia/DeepSeek-V3-0324-FP4"],
-    "4-gpu-h100": ["lmsys/sglang-ci-dsv3-test", "lmsys/sglang-ci-dsv3-test-NextN"]
+    "4-gpu-h100": ["lmsys/sglang-ci-dsv3-test", "lmsys/sglang-ci-dsv3-test-NextN"],
 }
 
 
