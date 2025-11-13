@@ -1470,7 +1470,11 @@ def _execute_server_warmup(
 
     # Send a warmup request
     if model_info["is_generation"]:
-        if is_vlm and not server_args.skip_tokenizer_init:
+        if (
+            is_vlm
+            and not server_args.skip_tokenizer_init
+            and not server_args.skip_server_vlm_warmup
+        ):
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
@@ -1488,7 +1492,11 @@ def _execute_server_warmup(
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
-    elif is_vlm and server_args.disaggregation_mode == "null":
+    elif (
+        is_vlm
+        and server_args.disaggregation_mode == "null"
+        and not server_args.skip_server_vlm_warmup
+    ):
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         json_data = {
             "model": _global_state.tokenizer_manager.served_model_name,
@@ -1535,7 +1543,7 @@ def _execute_server_warmup(
                 headers=headers,
                 timeout=600,
             )
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:

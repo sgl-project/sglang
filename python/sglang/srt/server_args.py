@@ -245,6 +245,7 @@ class ServerArgs:
     port: int = 30000
     grpc_mode: bool = False
     skip_server_warmup: bool = False
+    skip_server_vlm_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
@@ -2003,6 +2004,11 @@ class ServerArgs:
             "--skip-server-warmup",
             action="store_true",
             help="If set, skip warmup.",
+        )
+        parser.add_argument(
+            "--skip-server-vlm-warmup",
+            action="store_true",
+            help="If set, skip VLM related server warmup.",
         )
         parser.add_argument(
             "--warmups",
