@@ -716,7 +716,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
                 intermediate_states_buffer=intermediate_state_cache,
-                cache_steps=forward_batch.spec_info.draft_token_num,
+                cache_steps=intermediate_state_cache.shape[1],
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
