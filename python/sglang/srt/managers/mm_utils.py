@@ -820,53 +820,58 @@ def multimodal_preprocess_routine(
 
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
-    input_ids = forward_batch.input_ids
-    if (
-        not forward_batch.forward_mode.is_decode()
-        and not forward_batch.forward_mode.is_target_verify()
-        and forward_batch.contains_mm_inputs()
-    ):
-        mm_inputs_list = [
-            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-        ]
-        extend_prefix_lens = [
-            prefix_len
-            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        extend_seq_lens = [
-            seq_len
-            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        inputs_embeds, forward_batch = embed_mm_inputs(
-            forward_batch=forward_batch,
-            mm_inputs_list=mm_inputs_list,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            input_ids=forward_batch.input_ids,
-            multimodal_model=multimodal_model,
-            input_embedding=embed_tokens,
-            data_embedding_func_mapping=data_embedding_funcs,
-        )
-        # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
-        # just being defensive here
-        forward_batch.mm_inputs = None
-    else:
-        # NOTE: This may reduce the performance for only-text inputs.
-        # Using a fixed-address buffer might be better, though it could be a bit dirty.
-        inputs_embeds = embed_tokens(input_ids)
-        # only for qwen3vl
-        if getattr(multimodal_model, "use_deepstack", False):
-            forward_batch.input_deepstack_embeds = torch.zeros(
-                (
-                    len(input_ids),
-                    multimodal_model.config.hidden_size
-                    * len(multimodal_model.deepstack_visual_indexes),
-                ),
-                device=inputs_embeds.device,
-                dtype=inputs_embeds.dtype,
-            )
+    if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
 
-    forward_batch.input_embeds = inputs_embeds
+        input_ids = forward_batch.input_ids
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.contains_mm_inputs()
+        ):
+            mm_inputs_list = [
+                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+            ]
+            extend_prefix_lens = [
+                prefix_len
+                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            extend_seq_lens = [
+                seq_len
+                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            inputs_embeds, forward_batch = embed_mm_inputs(
+                forward_batch=forward_batch,
+                mm_inputs_list=mm_inputs_list,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                input_ids=forward_batch.input_ids,
+                multimodal_model=multimodal_model,
+                input_embedding=embed_tokens,
+                data_embedding_func_mapping=data_embedding_funcs,
+            )
+            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+            # just being defensive here
+            forward_batch.mm_inputs = None
+        else:
+            # NOTE: This may reduce the performance for only-text inputs.
+            # Using a fixed-address buffer might be better, though it could be a bit dirty.
+            inputs_embeds = embed_tokens(input_ids)
+            # only for qwen3vl
+            if getattr(multimodal_model, "use_deepstack", False):
+                forward_batch.input_deepstack_embeds = torch.zeros(
+                    (
+                        len(input_ids),
+                        multimodal_model.config.hidden_size
+                        * len(multimodal_model.deepstack_visual_indexes),
+                    ),
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
+                )
+
+        forward_batch.input_embeds = inputs_embeds
+    else:
+        forward_batch.input_embeds = None
+
     return forward_batch
