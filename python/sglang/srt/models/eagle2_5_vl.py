@@ -11,12 +11,14 @@ This implements NVIDIA's Eagle2.5-8B vision-language model which combines:
 """
 
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from transformers.models.siglip import SiglipVisionConfig
 
-from sglang.srt.configs.eagle2_5_vl import Eagle2_5_VLConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -33,6 +35,38 @@ from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+class Eagle2_5_VLConfig(PretrainedConfig):
+    model_type = "eagle_2_5_vl"
+    sub_configs = {
+        "text_config": Qwen2Config,
+        "vision_config": SiglipVisionConfig,
+    }
+    _auto_class = "AutoConfig"
+
+    def __init__(
+        self,
+        *,
+        text_config: dict[str, Any] | None = None,
+        vision_config: dict[str, Any] | None = None,
+        image_token_id: int | None = None,
+        video_token_id: int | None = None,
+        **kwargs,
+    ):
+        self.text_config = (
+            Qwen2Config(**text_config) if text_config is not None else Qwen2Config()
+        )
+        self.vision_config = (
+            SiglipVisionConfig(**vision_config)
+            if vision_config is not None
+            else SiglipVisionConfig()
+        )
+
+        self.image_token_id = image_token_id if image_token_id is not None else -1
+        self.video_token_id = video_token_id if video_token_id is not None else -1
+
+        super().__init__(**kwargs)
 
 
 class Eagle2_5_VLForConditionalGeneration(nn.Module):
@@ -84,7 +118,7 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         llm_hidden_size = config.text_config.hidden_size
 
         # Build MLP connector based on configuration
-        # Note: use_pixel_shuffle determines if we need to handle pixel-shuffled dimensions
+        # Always use pixel shuffle for downsampling vision features
         input_dim = vit_hidden_size * int(1 / config.downsample_ratio) ** 2
         self.mlp1 = nn.Sequential(
             nn.LayerNorm(input_dim),
@@ -124,10 +158,9 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
 
     def feature_compression(self, vit_embeds):
         """Compress vision features using pixel shuffle and MLP."""
-        if self.config.use_pixel_shuffle:
-            vit_embeds = self.pixel_shuffle(
-                vit_embeds, scale_factor=self.config.downsample_ratio
-            )
+        vit_embeds = self.pixel_shuffle(
+            vit_embeds, scale_factor=self.config.downsample_ratio
+        )
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
