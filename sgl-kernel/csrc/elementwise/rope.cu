@@ -88,7 +88,7 @@ void apply_rope_pos_ids_cos_sin_cache(
   size_t k_rope_stride_h = k_rope.stride(1);
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(q.scalar_type(), c_type, [&] {
     // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
     // to avoid changing original code path; but this branch is feature-complete and should switch to this later
     if (save_kv_cache) {

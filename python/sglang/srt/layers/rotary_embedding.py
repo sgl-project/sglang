@@ -113,8 +113,7 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        if dtype == torch.float32 or (
-            (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
+        if ((not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
             and not (_is_xpu)
         ):
@@ -276,7 +275,6 @@ class RotaryEmbedding(CustomOp):
         if (
             _is_cuda
             and (self.head_size in [64, 128, 256, 512])
-            and self.dtype != torch.float32
         ):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
