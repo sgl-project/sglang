@@ -29,9 +29,12 @@ jobs:
       main_package: ${{ steps.filter.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
+      skip_unit_test: ${{ steps.determine-skip-unit-test.outputs.skip_unit_test }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Fail if the PR does not have the 'run-ci' label
         if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
@@ -118,6 +121,45 @@ jobs:
               - "sgl-kernel/**"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+
+      - name: Determine SRT model-only changes
+        id: determine-skip-unit-test
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import re
+          from pathlib import Path
+
+
+          def diff_files():
+              commands = [
+                  ["git", "diff", "--name-only", "HEAD^", "HEAD"],
+                  ["git", "diff", "--name-only"],
+              ]
+              for cmd in commands:
+                  try:
+                      output = subprocess.check_output(cmd, text=True)
+                  except subprocess.CalledProcessError:
+                      continue
+                  files = [line.strip() for line in output.splitlines() if line.strip()]
+                  if files:
+                      return files
+              return []
+
+
+          changed_files = diff_files()
+          print(f"Changed files: {changed_files}")
+
+          skip = False
+          if changed_files and all(path.startswith("test/srt/models/") for path in changed_files):
+              run_suite = Path("test/srt/run_suite.py").read_text()
+              entries = {match.group(1) for match in re.finditer(r'TestFile\("([^"]+)"', run_suite)}
+              skip = all(str(Path(file).relative_to("test/srt")) in entries for file in changed_files)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"skip_unit_test={'true' if skip else 'false'}\n")
+          PY
 
   # =============================================== sgl-kernel ====================================================
 
@@ -347,8 +389,10 @@ jobs:
 
   unit-test-frontend:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -374,8 +418,10 @@ jobs:
 
   unit-test-backend-1-gpu:
     needs: [check-changes, unit-test-frontend, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
@@ -405,8 +451,10 @@ jobs:
 
   unit-test-backend-2-gpu:
     needs: [check-changes, unit-test-backend-1-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 2-gpu-runner
     strategy:
       fail-fast: false
@@ -436,8 +484,10 @@ jobs:
 
   unit-test-backend-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 4-gpu-h100
     strategy:
       fail-fast: false
@@ -467,8 +517,10 @@ jobs:
 
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
@@ -500,8 +552,10 @@ jobs:
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 8-gpu-h20
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
@@ -533,8 +587,10 @@ jobs:
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -592,8 +648,10 @@ jobs:
 
   performance-test-1-gpu-part-2:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -643,8 +701,10 @@ jobs:
 
   performance-test-1-gpu-part-3:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -676,8 +736,10 @@ jobs:
 
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -733,8 +795,10 @@ jobs:
 
   accuracy-test-1-gpu:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -763,8 +827,10 @@ jobs:
 
   accuracy-test-2-gpu:
     needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -793,8 +859,10 @@ jobs:
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 4-gpu-h100
     steps:
       - name: Checkout code
@@ -820,8 +888,10 @@ jobs:
 
   unit-test-deepep-8-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
@@ -849,11 +919,11 @@ jobs:
 
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 4-gpu-b200
-    strategy:
-      fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -878,11 +948,11 @@ jobs:
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: >
+      always() && (!failure() || needs.check-changes.outputs.skip_unit_test == 'true') && !cancelled() &&
+      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true')) &&
+      needs.check-changes.outputs.skip_unit_test != 'true'
     runs-on: 4-gpu-gb200
-    strategy:
-      fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
