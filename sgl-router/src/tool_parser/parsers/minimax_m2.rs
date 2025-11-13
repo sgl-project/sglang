@@ -16,14 +16,30 @@ use crate::{
 
 /// MiniMax M2 format parser for tool calls
 ///
-/// Handles the MiniMax M2 specific format:
-/// `<minimax:tool_call><invoke name="func"><parameter name="key">value</parameter></invoke></minimax:tool_call>`
+/// Implements the MiniMax-M2 model's XML-based tool calling format as specified in the
+/// official chat template. The M2 model uses a structured XML format for function invocations
+/// to ensure reliable parsing and execution.
 ///
-/// Features:
-/// - Namespaced XML tags (`minimax:tool_call`)
-/// - Function wrapped in `<invoke name="...">` tags
-/// - Parameters as `<parameter name="key">value</parameter>`
-/// - Incremental JSON streaming for parameters
+/// ## Format Reference
+/// - HuggingFace Model: https://huggingface.co/MiniMaxAI/MiniMax-M2
+/// - Chat Template: https://huggingface.co/MiniMaxAI/MiniMax-M2?chat_template=default
+///
+/// ## Tool Call Structure
+/// ```xml
+/// <minimax:tool_call>
+///   <invoke name="function_name">
+///     <parameter name="param1">value1</parameter>
+///     <parameter name="param2">value2</parameter>
+///   </invoke>
+/// </minimax:tool_call>
+/// ```
+///
+/// ## Key Features
+/// - **Namespaced XML tags**: Uses `minimax:` namespace to avoid conflicts
+/// - **Structured invocation**: Functions wrapped in `<invoke name="...">` tags
+/// - **Named parameters**: Each parameter uses `<parameter name="key">value</parameter>`
+/// - **Incremental streaming**: Converts XML to JSON progressively during streaming
+/// - **XML entity decoding**: Handles encoded entities (`&lt;`, `&gt;`, etc.) in parameter values
 pub struct MinimaxM2Parser {
     // Regex patterns
     tool_call_extractor: Regex,
@@ -44,7 +60,6 @@ pub struct MinimaxM2Parser {
     // Token configuration
     tool_call_start_token: &'static str,
     tool_call_end_token: &'static str,
-    invoke_start_prefix: &'static str,
     invoke_end_token: &'static str,
 }
 
@@ -102,7 +117,6 @@ impl MinimaxM2Parser {
             waiting_for_tool_call_end: false,
             tool_call_start_token: "<minimax:tool_call>",
             tool_call_end_token: "</minimax:tool_call>",
-            invoke_start_prefix: r#"<invoke name=""#,
             invoke_end_token: "</invoke>",
         }
     }
@@ -414,61 +428,55 @@ impl ToolParser for MinimaxM2Parser {
 
             // We're in a tool call, try to parse function name if not sent yet
             if !self.function_name_sent {
-                // Look for function name pattern: <invoke name="...">
-                if let Some(pos) = self.buffer.find(self.invoke_start_prefix) {
-                    // Find the closing quote after name=
-                    let name_start = pos + self.invoke_start_prefix.len();
-                    if let Some(quote_end) = self.buffer[name_start..].find('"') {
-                        let function_name = self.buffer[name_start..name_start + quote_end]
-                            .trim()
-                            .to_string();
+                // Use regex to extract function name from <invoke name="..."> pattern
+                // Check if we have enough text to match the invoke pattern
+                if let Some(captures) = self.invoke_extractor.captures(&self.buffer) {
+                    let function_name = captures
+                        .get(1)
+                        .map_or("", |m| m.as_str())
+                        .trim()
+                        .to_string();
 
-                        // Validate function name
-                        if tool_indices.contains_key(&function_name) {
-                            self.current_function_name = function_name.clone();
-                            self.function_name_sent = true;
+                    // Validate function name
+                    if tool_indices.contains_key(&function_name) {
+                        self.current_function_name = function_name.clone();
+                        self.function_name_sent = true;
 
-                            // Initialize tool call tracking
-                            if self.current_tool_id == -1 {
-                                self.current_tool_id = 0;
-                            }
-
-                            // Ensure tracking arrays are large enough
-                            while self.prev_tool_call_arr.len() <= self.current_tool_id as usize {
-                                self.prev_tool_call_arr.push(Value::Null);
-                            }
-                            while self.streamed_args_for_tool.len() <= self.current_tool_id as usize
-                            {
-                                self.streamed_args_for_tool.push(String::new());
-                            }
-
-                            // Send tool name with empty parameters
-                            calls.push(ToolCallItem {
-                                tool_index: self.current_tool_id as usize,
-                                name: Some(function_name),
-                                parameters: String::new(),
-                            });
-
-                            // Remove processed part up to and including the closing >
-                            if let Some(close_bracket) =
-                                self.buffer[name_start + quote_end..].find('>')
-                            {
-                                self.buffer = self.buffer
-                                    [name_start + quote_end + close_bracket + 1..]
-                                    .to_string();
-                            }
-                            continue;
-                        } else {
-                            // Invalid function name, reset state
-                            tracing::warn!("Invalid function name: {}", function_name);
-                            self.in_tool_call = false;
-                            normal_text.push_str(&self.buffer);
-                            self.buffer.clear();
-                            break;
+                        // Initialize tool call tracking
+                        if self.current_tool_id == -1 {
+                            self.current_tool_id = 0;
                         }
+
+                        // Ensure tracking arrays are large enough
+                        helpers::ensure_capacity(
+                            self.current_tool_id,
+                            &mut self.prev_tool_call_arr,
+                            &mut self.streamed_args_for_tool,
+                        );
+
+                        // Send tool name with empty parameters
+                        calls.push(ToolCallItem {
+                            tool_index: self.current_tool_id as usize,
+                            name: Some(function_name),
+                            parameters: String::new(),
+                        });
+
+                        // Find the position after the opening invoke tag (after the >)
+                        // We only want to remove up to the opening tag, not the full match
+                        if let Some(pos) = self.buffer.find('>') {
+                            self.buffer = self.buffer[pos + 1..].to_string();
+                        }
+                        continue;
+                    } else {
+                        // Invalid function name, reset state
+                        tracing::warn!("Invalid function name: {}", function_name);
+                        self.in_tool_call = false;
+                        normal_text.push_str(&self.buffer);
+                        self.buffer.clear();
+                        break;
                     }
                 }
-                // Function name not complete yet, wait for more text
+                // No complete invoke pattern found yet, wait for more text
                 break;
             }
 
