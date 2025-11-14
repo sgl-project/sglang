@@ -16,9 +16,9 @@ from enum import Enum
 from typing import Any, Optional
 
 from sglang.multimodal_gen.configs.configs import PreprocessConfig
-from sglang.multimodal_gen.configs.pipelines import FluxPipelineConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, STA_Mode
-from sglang.multimodal_gen.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
