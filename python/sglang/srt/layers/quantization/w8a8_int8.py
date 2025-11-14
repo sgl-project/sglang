@@ -548,6 +548,10 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 None,  # block_size
                 layer.w13_input_scale,  # a1_scale
                 layer.w2_input_scale,  # a2_scale
+                None,  # w1 bias
+                None,  # w3 bias
+                None,  # alpha
+                None,  # limit
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
