@@ -180,11 +180,12 @@ pub async fn ensure_request_mcp_client(
         required: false,
     };
 
-    // Use McpManager to get or create dynamic client
-    match mcp_manager.get_or_create_client(server_config).await {
+    // Create uncached client for request-scoped dynamic MCP
+    // The client will be automatically dropped when the request completes
+    match mcp_manager.create_uncached_client(server_config).await {
         Ok(_client) => Some(mcp_manager.clone()),
         Err(err) => {
-            warn!("Failed to get/create MCP connection: {}", err);
+            warn!("Failed to create uncached MCP connection: {}", err);
             None
         }
     }

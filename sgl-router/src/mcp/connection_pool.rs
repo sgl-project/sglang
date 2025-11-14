@@ -47,7 +47,7 @@ pub struct McpConnectionPool {
 
     /// Global proxy configuration (applied to all dynamic servers)
     /// Can be overridden per-server via McpServerConfig.proxy
-    global_proxy: Option<McpProxyConfig>,
+    pub(crate) global_proxy: Option<McpProxyConfig>,
 
     /// Optional eviction callback (called when LRU evicts a connection)
     /// Used to clean up tools from inventory

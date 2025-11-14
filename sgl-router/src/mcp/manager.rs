@@ -151,6 +151,31 @@ impl McpManager {
         Ok(client)
     }
 
+    /// Create a new client without caching (for request-scoped dynamic clients)
+    ///
+    /// This is used for dynamic MCP clients from request server_url that should
+    /// not persist across requests. The client will be dropped when the request completes.
+    ///
+    /// # Arguments
+    /// * `server_config` - Server configuration
+    ///
+    /// # Returns
+    /// Arc to the newly created MCP client (not cached in the pool)
+    pub async fn create_uncached_client(
+        &self,
+        server_config: McpServerConfig,
+    ) -> McpResult<Arc<McpClient>> {
+        // Check if it's a static server first
+        let server_name = server_config.name.clone();
+        if let Some(client) = self.static_clients.get(&server_name) {
+            return Ok(Arc::clone(client.value()));
+        }
+
+        // Create new connection without caching
+        let client = Self::connect_server(&server_config, self.connection_pool.global_proxy.as_ref()).await?;
+        Ok(Arc::new(client))
+    }
+
     pub fn list_static_servers(&self) -> Vec<String> {
         self.static_clients
             .iter()
