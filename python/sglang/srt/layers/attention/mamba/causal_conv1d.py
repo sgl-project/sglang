@@ -7,6 +7,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from sgl_kernel import causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
@@ -127,3 +128,109 @@ def causal_conv1d_update(
     if unsqueeze:
         x = x.squeeze(-1)
     return x
+
+
+def causal_conv1d_ref(
+    x,
+    weight,
+    bias=None,
+    initial_states=None,
+    return_final_states=False,
+    final_states_out=None,
+    activation=None,
+):
+    if activation not in [None, "silu", "swish"]:
+        raise NotImplementedError("activation must be None, silu, or swish")
+    dtype_in = x.dtype
+    x = x.to(weight.dtype)
+    seqlen = x.shape[-1]
+    dim, width = weight.shape
+    if initial_states is None:
+        out = F.conv1d(x, weight.unsqueeze(1), bias, padding=width - 1, groups=dim)
+    else:
+        x = torch.cat([initial_states, x], dim=-1)
+        out = F.conv1d(x, weight.unsqueeze(1), bias, padding=0, groups=dim)
+    out = out[..., :seqlen]
+    if return_final_states:
+        final_states = F.pad(x, (width - 1 - x.shape[-1], 0)).to(
+            dtype_in
+        )  # (batch, dim, width - 1)
+        if final_states_out is not None:
+            final_states_out.copy_(final_states)
+        else:
+            final_states_out = final_states
+    out = (out if activation is None else F.silu(out)).to(dtype=dtype_in)
+    return out if not return_final_states else (out, final_states_out)
+
+
+def causal_conv1d_fn_cpu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    query_start_loc: Optional[torch.Tensor] = None,
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    conv_states: Optional[torch.Tensor] = None,
+    activation: Optional[str] = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    **kwargs,
+):
+    batch_size = query_start_loc.shape[0] - 1
+    start_q = 0
+    for i in range(batch_size):
+        end_q = query_start_loc[i + 1]
+        x_i, final_states = causal_conv1d_ref(
+            x[:, start_q:end_q],
+            weight,
+            bias,
+            activation=activation,
+            initial_states=(
+                conv_states[cache_indices[i]] if has_initial_state[i] else None
+            ),
+            return_final_states=True,
+        )
+        x[:, start_q:end_q] = x_i
+        conv_states[cache_indices[i]] = final_states.to(conv_states.dtype, copy=False)
+        start_q = end_q
+    return x
+
+
+def causal_conv1d_update_ref(
+    hidden_states,
+    conv_state,
+    weight,
+    bias=None,
+    activation=None,
+):
+    _, hidden_size, seq_len = hidden_states.shape
+    state_len = conv_state.shape[-1]
+
+    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
+    out = F.conv1d(
+        hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size
+    )
+    out = F.silu(out[:, :, -seq_len:])
+    out = out.to(hidden_states.dtype)
+    return out, hidden_states_new[:, :, -state_len:]
+
+
+def causal_conv1d_update_cpu(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    activation: Optional[str] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    conv_state_indices: Optional[torch.Tensor] = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+):
+    mixed_qkv, new_conv_states = causal_conv1d_update_ref(
+        x.unsqueeze(1).transpose(1, 2),
+        conv_state[conv_state_indices],
+        weight,
+        bias,
+        activation,
+    )
+    mixed_qkv = mixed_qkv.squeeze(-1)
+    conv_state[conv_state_indices] = new_conv_states.to(conv_state.dtype, copy=False)
+    return mixed_qkv
