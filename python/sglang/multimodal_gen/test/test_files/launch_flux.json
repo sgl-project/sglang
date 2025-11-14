@@ -1,0 +1,11 @@
+{
+    "model_path": "black-forest-labs/FLUX.1-dev",
+    "prompt": "A beautiful woman in a red dress walking down a street",
+    "text_encoder_cpu_offload": true,
+    "pin_cpu_memory": true,
+    "save_output": true,
+    "width": 720,
+    "height": 720,
+    "output_path": "outputs",
+    "output_file_name": "FLUX.1-dev, single gpu"
+}

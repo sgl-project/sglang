@@ -132,6 +132,8 @@ class SchedulerUpdateWeightsMixin:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
+        torch.get_device_module().synchronize()
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(

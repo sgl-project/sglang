@@ -79,6 +79,10 @@ class ForwardMode(IntEnum):
 
     DRAFT_EXTEND_V2 = auto()
 
+    # Used in disaggregated decode worker
+    # Represent a batch of requests having their KV cache ready to start decoding
+    PREBUILT = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -141,6 +145,16 @@ class ForwardMode(IntEnum):
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
 
+    def is_extend_without_speculative(self):
+        return (
+            self.is_extend()
+            and not self.is_target_verify()
+            and not self.is_draft_extend()
+        )
+
+    def is_prebuilt(self):
+        return self == ForwardMode.PREBUILT
+
 
 @total_ordering
 class CaptureHiddenMode(IntEnum):
@@ -186,6 +200,10 @@ class ForwardBatch:
 
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+
+    # The indices of output tokens in the token_to_kv_pool_swa
+    # TODO(shiyang, biao): integrate out_cache_loc_swa into multiple attention backends
+    out_cache_loc_swa: Optional[torch.Tensor] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -557,6 +575,25 @@ class ForwardBatch:
 
         self.mrope_positions = next_input_positions
 
+    def _expand_mrope_from_input(
+        self,
+        mm_input: MultimodalInputs,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if mm_input.mrope_position_delta.device.type != device:
+            # transfer mrope_position_delta to device when the first running,
+            # avoiding successvie host-to-device data transfer
+            mm_input.mrope_position_delta = mm_input.mrope_position_delta.to(
+                device, non_blocking=True
+            )
+
+        mrope_position_deltas = mm_input.mrope_position_delta.flatten()
+        mrope_positions = (
+            (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
+        )
+        return mrope_positions
+
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
@@ -575,20 +612,10 @@ class ForwardBatch:
                         device=model_runner.device,
                     )
                 else:
-                    if mm_input.mrope_position_delta.device.type != model_runner.device:
-                        # transfer mrope_position_delta to device when the first running,
-                        # avoiding successvie host-to-device data transfer
-                        mm_input.mrope_position_delta = (
-                            mm_input.mrope_position_delta.to(
-                                model_runner.device, non_blocking=True
-                            )
-                        )
-                    mrope_position_deltas = mm_input.mrope_position_delta.flatten()
-                    mrope_positions_list[batch_idx] = (
-                        (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
-                        .unsqueeze(0)
-                        .repeat(3, 1)
+                    mrope_positions = self._expand_mrope_from_input(
+                        mm_input, self.seq_lens[batch_idx], model_runner.device
                     )
+                    mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
@@ -613,6 +640,10 @@ class ForwardBatch:
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
+                    if mrope_positions.numel() == 0:
+                        mrope_positions = self._expand_mrope_from_input(
+                            mm_input, self.seq_lens[batch_idx], model_runner.device
+                        )
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
@@ -706,7 +737,9 @@ class ForwardBatch:
             num_tokens = global_num_tokens[0]
 
         self.global_dp_buffer_len = buffer_len
-        set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
+        set_dp_buffer_len(
+            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+        )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size

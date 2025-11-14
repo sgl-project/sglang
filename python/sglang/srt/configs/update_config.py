@@ -41,10 +41,16 @@ def get_moe_padding_size(weight_block_size):
     return DEFAULT_MOE_PADDING_SIZE
 
 
-def get_num_heads_padding_size(tp_size, weight_block_size):
-    pad_size = (
-        tp_size * 2 if tp_size % 2 == 1 and weight_block_size is not None else tp_size
-    )
+def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
+    pad_size = tp_size
+
+    if weight_block_size is not None and head_dim % weight_block_size[0] != 0:
+        import math
+
+        pad_size = tp_size * (
+            math.lcm(head_dim, weight_block_size[0]) // weight_block_size[0]
+        )
+
     return pad_size
 
 
@@ -100,6 +106,13 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config.hf_config.head_dim = (
                 model_config.hidden_size // model_config.num_attention_heads
             )
+        if hasattr(model_config.hf_config, "qk_nope_head_dim") and hasattr(
+            model_config.hf_config, "qk_rope_head_dim"
+        ):
+            model_config.hf_config.qk_head_dim = (
+                model_config.hf_config.qk_nope_head_dim
+                + model_config.hf_config.qk_rope_head_dim
+            )
 
         query_heads_per_kv = (
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
@@ -107,7 +120,12 @@ def adjust_config_with_unaligned_cpu_tp(
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-        pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+        head_dim = (
+            model_config.hf_config.qk_head_dim
+            if hasattr(model_config.hf_config, "qk_head_dim")
+            else model_config.hf_config.head_dim
+        )
+        pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
 
         model_config.num_key_value_heads = num_key_value_heads
