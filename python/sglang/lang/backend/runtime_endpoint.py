@@ -104,6 +104,7 @@ class RuntimeEndpoint(BaseBackend):
     def commit_lazy_operations(self, s: StreamExecutor):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
+        self._add_videos(s, data)
         res = http_request(
             self.base_url + "/generate",
             json=data,
@@ -115,6 +116,7 @@ class RuntimeEndpoint(BaseBackend):
     def fill_image(self, s: StreamExecutor):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
+
         res = http_request(
             self.base_url + "/generate",
             json=data,
@@ -181,6 +183,7 @@ class RuntimeEndpoint(BaseBackend):
                 data[item] = value
 
         self._add_images(s, data)
+        self._add_videos(s, data)
 
         res = http_request(
             self.base_url + "/generate",
@@ -222,6 +225,7 @@ class RuntimeEndpoint(BaseBackend):
 
         data["stream"] = True
         self._add_images(s, data)
+        self._add_videos(s, data)
 
         res = http_request(
             self.base_url + "/generate",
@@ -324,6 +328,8 @@ class RuntimeEndpoint(BaseBackend):
 
     def _generate_http_request(self, s: StreamExecutor, data):
         self._add_images(s, data)
+        self._add_videos(s, data)
+
         res = http_request(
             self.base_url + "/generate",
             json=data,
@@ -337,6 +343,11 @@ class RuntimeEndpoint(BaseBackend):
         if s.images_:
             assert len(s.images_) == 1, "Only support one image."
             data["image_data"] = s.images_[0][1]
+
+    def _add_videos(self, s: StreamExecutor, data):
+        if s.videos_:
+            assert len(s.videos_) == 1, "Only support one video."
+            data["video_data"] = s.videos_
 
     def _assert_success(self, res):
         if res.status_code != 200:

@@ -13,13 +13,11 @@ import time
 import traceback
 import urllib.request
 import weakref
-from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
-import numpy as np
 import pybase64
 import requests
 from IPython.display import HTML, display
@@ -209,52 +207,6 @@ def encode_frame(frame):
 
     # Return the bytes of the frame
     return frame_bytes
-
-
-def encode_video_base64(video_path: str, num_frames: int = 16):
-    import cv2  # pip install opencv-python-headless
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Could not open video file:{video_path}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"target_frames: {num_frames}")
-
-    frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-
-    frames = []
-    for _ in range(total_frames):
-        ret, frame = cap.read()
-        if ret:
-            frames.append(frame)
-        else:
-            # Handle the case where the frame could not be read
-            # print(f"Warning: Could not read frame at index {i}.")
-            pass
-
-    cap.release()
-
-    # Safely select frames based on frame_indices, avoiding IndexError
-    frames = [frames[i] for i in frame_indices if i < len(frames)]
-
-    # If there are not enough frames, duplicate the last frame until we reach the target
-    while len(frames) < num_frames:
-        frames.append(frames[-1])
-
-    # Use ThreadPoolExecutor to process and encode frames in parallel
-    with ThreadPoolExecutor() as executor:
-        encoded_frames = list(executor.map(encode_frame, frames))
-
-    # encoded_frames = list(map(encode_frame, frames))
-
-    # Concatenate all frames bytes
-    video_bytes = b"".join(encoded_frames)
-
-    # Encode the concatenated bytes to base64
-    video_base64 = "video:" + pybase64.b64encode(video_bytes).decode("utf-8")
-
-    return video_base64
 
 
 def _is_chinese_char(cp: int):
