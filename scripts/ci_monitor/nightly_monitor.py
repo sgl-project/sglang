@@ -131,7 +131,9 @@ class NightlyTestMonitor:
             print(f"  Warning: Could not fetch logs for job {job_id}: {e}")
             return None
 
-    def parse_metrics_from_logs(self, logs: str, job_name: str) -> Dict[str, List[float]]:
+    def parse_metrics_from_logs(
+        self, logs: str, job_name: str
+    ) -> Dict[str, List[float]]:
         """
         Parse performance metrics from job logs.
 
@@ -203,7 +205,11 @@ class NightlyTestMonitor:
             # Decode base64 content
             content = base64.b64decode(data["content"]).decode("utf-8")
             return json.loads(content)
-        except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError) as e:
+        except (
+            requests.exceptions.RequestException,
+            json.JSONDecodeError,
+            KeyError,
+        ) as e:
             print(f"Warning: Could not fetch historical data from {file_path}: {e}")
             return None
 
@@ -233,7 +239,7 @@ class NightlyTestMonitor:
         historical_metrics = []
 
         # Fetch recent files (limit to avoid too many API calls)
-        for file_path in historical_paths[:min(days * 2, 14)]:  # Max 14 files
+        for file_path in historical_paths[: min(days * 2, 14)]:  # Max 14 files
             historical_data = self.fetch_historical_data(file_path)
             if not historical_data:
                 continue
@@ -449,7 +455,9 @@ class NightlyTestMonitor:
                     if metric_data:
                         values = [m["value"] for m in metric_data]
                         avg_value = sum(values) / len(values)
-                        print(f"    - {metric_name}: {avg_value:.2f} (avg, n={len(values)})")
+                        print(
+                            f"    - {metric_name}: {avg_value:.2f} (avg, n={len(values)})"
+                        )
 
             # Show recent failures
             if job_stat["recent_failures"]:
