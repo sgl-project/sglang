@@ -702,6 +702,7 @@ class FlashInferAttnBackend(AttentionBackend):
         print(f"{q.reshape(-1)[:10]=}", flush=True)
         print(f"{k.reshape(-1)[:10]=}", flush=True)
         print(f"{v.reshape(-1)[:10]=}", flush=True)
+        # torch.save(forward.input_deepstack_embeds)
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]

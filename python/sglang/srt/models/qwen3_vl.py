@@ -571,12 +571,12 @@ class Qwen3LLMModel(Qwen3Model):
             )
 
             # process deepstack
-            if (
-                input_deepstack_embeds is not None
-                and layer_idx in self.deepstack_embed_to_decoder_layer
-            ):
-                sep = self.hidden_size * layer_idx
-                hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
+            # if (
+            #     input_deepstack_embeds is not None
+            #     and layer_idx in self.deepstack_embed_to_decoder_layer
+            # ):
+            #     sep = self.hidden_size * layer_idx
+            #     hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -759,20 +759,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
-        else:
-            positions = forward_batch.positions
+        # if self.is_mrope_enabled:
+        positions = forward_batch.mrope_positions
+        # else:
+        # positions = forward_batch.positions
 
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
+        # if not (
+        #     forward_batch.forward_mode.is_decode()
+        #     or not forward_batch.contains_image_inputs()
+        # ):
+        #     if self.is_mrope_enabled:
+        #         assert positions.ndim == 2 and positions.size(0) == 3, (
+        #             "multimodal section rotary embedding requires "
+        #             f"(3, seq_len) positions, but got {positions.size()}"
+        #         )
 
         input_embeds = forward_batch.input_embeds
         # It may seem strange to assign input_embeds again even after passing it as an argument.
