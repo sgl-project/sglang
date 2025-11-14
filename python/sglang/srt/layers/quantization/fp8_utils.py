@@ -129,7 +129,7 @@ def cutlass_block_fp8_supported() -> bool:
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
 ENABLE_FLASHINFER_FP8_GEMM = (
-    envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.value
+    envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
     and is_blackwell_supported()
     and is_flashinfer_available()
 )
