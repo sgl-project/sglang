@@ -137,7 +137,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
 
 
 @unittest.skip(
-    "Temporarily disabling this test to fix CI. It should be re-enabled when #11800 is done."
+    "Disabling this test to speed up CI. Prefer to test it within nightly test."
 )
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"
@@ -207,11 +207,12 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
 
 
 if __name__ == "__main__":
-    del (
-        TestOpenAIMLLMServerBase,
-        ImageOpenAITestMixin,
-        VideoOpenAITestMixin,
-        AudioOpenAITestMixin,
-        OmniOpenAITestMixin,
-    )
+    # Note: Cannot delete mixin classes imported via * since they're not in local scope
+    # del (
+    #     TestOpenAIMLLMServerBase,
+    #     ImageOpenAITestMixin,
+    #     VideoOpenAITestMixin,
+    #     AudioOpenAITestMixin,
+    #     OmniOpenAITestMixin,
+    # )
     unittest.main()

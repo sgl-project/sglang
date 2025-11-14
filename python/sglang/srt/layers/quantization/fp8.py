@@ -87,7 +87,6 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
-    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -516,16 +515,6 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )
-
-
-def get_tile_tokens_dim(num_tokens, top_k, num_experts):
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = (num_tokens * top_k) // num_experts
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-    return tile_tokens_dim
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -1256,9 +1245,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 routed_scaling_factor=(
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
-                tile_tokens_dim=get_tile_tokens_dim(
-                    x.shape[0], topk_config.top_k, layer.num_experts
-                ),
+                tile_tokens_dim=None,
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=False,
             )
@@ -1335,3 +1322,10 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+
+
+if _is_cuda:
+
+    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
+    def _(mat_a, mat_b, scales_a, scales_b, out_dtype, bias):
+        return mat_a.new_empty((mat_a.shape[0], mat_b.shape[-1]), dtype=out_dtype)
