@@ -423,8 +423,15 @@ class ForwardBatch:
             )
             return ret
 
-        # Override the positions with spec_info
-        if (
+        # Override the positions with diffusion or spec_info
+        if batch.diffusion_config is not None:
+            block_size = batch.diffusion_config.block_size
+            ret.positions = torch.tensor(
+                [[i for i in range(block_offset, block_offset + block_size)]
+                 for block_offset in batch.diffusion_block_offsets],
+                dtype=torch.int32
+            ).to(device, non_blocking=True)
+        elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):

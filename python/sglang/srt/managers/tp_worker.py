@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.diffusion.algorithm.base import DiffusionAlgorithm
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -234,6 +235,10 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=is_draft_worker,
         )
 
+        if server_args.diffusion_algorithm is not None:
+            self.diffusion_algorithm = DiffusionAlgorithm.from_server_args(
+                server_args)
+
         self._model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -340,6 +345,9 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.token_to_kv_pool.size,
         )
 
+    def is_diffusion(self):
+        return hasattr(self, "diffusion_algorithm")
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -368,6 +376,15 @@ class TpModelWorker(BaseTpWorker):
             )
 
         if self.pp_group.is_last_rank:
+            if self.is_diffusion():
+                logits_output, next_token_ids, can_run_cuda_graph = self.diffusion_algorithm.run(
+                    self.model_runner, forward_batch)
+                return GenerationBatchResult(
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                )
+
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
