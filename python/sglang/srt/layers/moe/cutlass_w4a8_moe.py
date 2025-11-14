@@ -176,7 +176,7 @@ def cutlass_w4a8_moe(
         (m * topk, n), dtype=torch.float8_e4m3fn, device=device
     )
     silu_mul_static_tensorwise_quant_for_cutlass_moe(
-        c1, intermediate_q, a2_scale.float(), m * topk, n
+        c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
     )
 
     cutlass_w4a8_moe_mm(

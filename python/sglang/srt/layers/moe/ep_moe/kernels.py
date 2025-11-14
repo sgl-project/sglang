@@ -233,8 +233,11 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
     offset = BLOCK_SIZE * tl.program_id(1) + tl.arange(0, BLOCK_SIZE)
     mask = offset < hidden_size
 
+    start_src_idx = tl.program_id(0)
+    step = tl.num_programs(0)
+
     for src_idx_int32 in tl.range(
-        tl.program_id(0), num_tokens, tl.num_programs(0), num_stages=NUM_STAGES
+        start_src_idx, num_tokens, step, num_stages=NUM_STAGES
     ):
         src_idx = src_idx_int32.to(tl.int64)
         token_src2dst_ptr = src2dst_ptr + src_idx * topk
@@ -431,13 +434,14 @@ def silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe(
     input_ptr,
     output_ptr,
     scale_ptr,
-    num_tokens,
+    num_tokens_tensor_ptr,
     intermediate_size,
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
     OutDtype = output_ptr.dtype.element_ty
 
+    num_tokens = tl.load(num_tokens_tensor_ptr)
     numel = num_tokens * intermediate_size
     gate_ptr = input_ptr
     up_ptr = input_ptr + intermediate_size
@@ -462,18 +466,19 @@ def silu_mul_static_tensorwise_quant_for_cutlass_moe(
     input: torch.Tensor,
     output: torch.Tensor,
     scale: torch.Tensor,
-    num_tokens: int,
+    num_tokens_tensor: torch.Tensor,
+    expected_num_tokens: int,
     intermediate_size: int,
 ):
     grid, block_dim = _get_launch_config_1d(
-        input.device, num_tokens * intermediate_size
+        input.device, expected_num_tokens * intermediate_size
     )
 
     silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe[grid](
         input_ptr=input,
         output_ptr=output,
         scale_ptr=scale,
-        num_tokens=num_tokens,
+        num_tokens_tensor_ptr=num_tokens_tensor,
         intermediate_size=intermediate_size,
         BLOCK_SIZE=block_dim,
         NUM_STAGES=3,
@@ -503,8 +508,11 @@ def post_reorder_triton_kernel_for_cutlass_moe(
     down_output_ptr_offs = down_output_ptr + offset
     output_ptr_offs = output_ptr + offset
 
+    start_src_idx = tl.program_id(0)
+    step = tl.num_programs(0)
+
     for src_idx_int32 in tl.range(
-        tl.program_id(0), num_tokens, tl.num_programs(0), num_stages=NUM_STAGES
+        start_src_idx, num_tokens, step, num_stages=NUM_STAGES
     ):
         src_idx = src_idx_int32.to(tl.int64)
         token_src2dst_ptr = src2dst_ptr + src_idx * topk
