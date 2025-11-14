@@ -108,6 +108,17 @@ def test_kimi_k2_specific_case(seq_length, num_experts, topk):
             weight_sums, torch.ones_like(weight_sums), rtol=1e-3, atol=1e-4
         )
 
+    # Check weights match (after sorting)
+    # Weights are the most important - they determine the actual MoE output
+    output_check = torch.allclose(
+        ref_output.sort()[0].to(torch.float32),
+        output.sort()[0].to(torch.float32),
+        rtol=1e-02,
+        atol=1e-03,
+    )
+
     assert output_check, f"Output mismatch for Kimi K2 specific case"
 
+
+if __name__ == "__main__":
     pytest.main([__file__])
