@@ -122,8 +122,6 @@ class SchedulerPPMixin:
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
-                        # FIXME(lsyin): remove this assert
-                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             all_gather_group=self.attn_tp_group,
