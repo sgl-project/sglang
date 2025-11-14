@@ -184,6 +184,7 @@ class Engine(EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -218,6 +219,7 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
+            rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -264,6 +266,7 @@ class Engine(EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -300,6 +303,7 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
+            rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -315,6 +319,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
@@ -326,6 +331,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = self.loop.run_until_complete(generator.__anext__())
@@ -338,6 +344,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -351,6 +358,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
@@ -725,7 +733,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.16.post5",
+            "0.3.17",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
