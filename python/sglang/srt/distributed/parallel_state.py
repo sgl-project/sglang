@@ -675,7 +675,8 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or not supports_custom_op():
+        if _is_npu or _is_cpu or not supports_custom_op():
+            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         else:
             torch.ops.sglang.reg_reduce_scatter_tensor(
@@ -741,7 +742,8 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu or not _supports_custom_op:
+        if _is_npu or _is_xpu or _is_cpu or not _supports_custom_op:
+            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
