@@ -15,6 +15,86 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # General tests - 1 GPU
+  nightly-test-general-1-gpu-runner:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-1-gpu --continue-on-error
+
+  # General tests - 4 GPU H100
+  nightly-test-general-4-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 4-gpu-h100
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-4-gpu --continue-on-error
+
+  # General tests - 8 GPU H200
+  nightly-test-general-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          GPU_CONFIG: "8-gpu-h200"
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-h200 --continue-on-error
+
+  # General tests - 8 GPU H20
+  nightly-test-general-8-gpu-h20:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h20
+    env:
+      SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          GPU_CONFIG: "8-gpu-h20"
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
+
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
@@ -113,87 +193,7 @@ jobs:
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_vlms
 
-  # Single GPU tests
-  nightly-test-general-1-gpu-runner:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 60
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-1-gpu --continue-on-error
-
-  # 4 GPU tests
-  nightly-test-general-4-gpu-h100:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 4-gpu-h100
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-4-gpu --continue-on-error
-
-  # 8 GPU H200 tests
-  nightly-test-general-8-gpu-h200:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 8-gpu-h200
-    env:
-      RUNNER_LABELS: 8-gpu-h200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          GPU_CONFIG: "8-gpu-h200"
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-8-gpu-h200 --continue-on-error
-
-  # 8 GPU H20 tests
-  nightly-test-general-8-gpu-h20:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 8-gpu-h20
-    env:
-      SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          GPU_CONFIG: "8-gpu-h20"
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
-
-  # B200 GPU tests
+  # B200 Performance tests - 4 GPU
   nightly-test-perf-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 4-gpu-b200
@@ -211,6 +211,7 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite nightly-4-gpu-b200 --continue-on-error
 
+  # B200 Performance tests - 8 GPU
   nightly-test-perf-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-b200
@@ -266,14 +267,14 @@ jobs:
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
-      - nightly-test-text-accuracy-2-gpu-runner
-      - nightly-test-text-perf-2-gpu-runner
-      - nightly-test-vlm-accuracy-2-gpu-runner
-      - nightly-test-vlm-perf-2-gpu-runner
       - nightly-test-general-1-gpu-runner
       - nightly-test-general-4-gpu-h100
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-h20
+      - nightly-test-text-accuracy-2-gpu-runner
+      - nightly-test-text-perf-2-gpu-runner
+      - nightly-test-vlm-accuracy-2-gpu-runner
+      - nightly-test-vlm-perf-2-gpu-runner
       - nightly-test-perf-4-gpu-b200
       - nightly-test-perf-8-gpu-b200
     runs-on: ubuntu-latest
