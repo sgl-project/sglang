@@ -185,7 +185,8 @@ class TestPiecewiseCudaGraphFP8(CustomTestCase):
                 "--enable-piecewise-cuda-graph",
                 "--quantization",
                 "modelopt_fp8",
-                "--kv-cache-dtype bfloat16",
+                "--kv-cache-dtype",
+                "bfloat16",
             ],
         )
 
