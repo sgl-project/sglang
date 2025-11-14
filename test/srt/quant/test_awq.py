@@ -1,7 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
