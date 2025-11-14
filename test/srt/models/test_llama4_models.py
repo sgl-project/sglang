@@ -1,4 +1,3 @@
-import random
 import unittest
 from types import SimpleNamespace
 
