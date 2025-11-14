@@ -577,8 +577,7 @@ cargo build
 cargo test
 
 # Fast Python development (rebuilds and installs in debug mode)
-cd bindings/python
-maturin develop --manifest-path ../../Cargo.toml
+cd bindings/python && maturin develop
 
 # Run Python tests
 cd ../..  # Back to sgl-router root
