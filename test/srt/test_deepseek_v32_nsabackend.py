@@ -66,13 +66,15 @@ class TestDeepseekV32NasBackend_flashmla(CustomTestCase):
         print(f"{metrics=}")
 
         if is_in_ci():
-            TEST_RESULTS.append({
-                "variant": "flashmla",
-                "prefill_backend": "flashmla_sparse",
-                "decode_backend": "flashmla_kv",
-                "kv_cache": "fp16",
-                "accuracy": metrics["accuracy"]
-            })
+            TEST_RESULTS.append(
+                {
+                    "variant": "flashmla",
+                    "prefill_backend": "flashmla_sparse",
+                    "decode_backend": "flashmla_kv",
+                    "kv_cache": "fp16",
+                    "accuracy": metrics["accuracy"],
+                }
+            )
         self.assertGreater(metrics["accuracy"], 0.935)
 
 
@@ -122,13 +124,15 @@ class TestDeepseekV32NasBackend_fa3(CustomTestCase):
         print(f"{metrics=}")
 
         if is_in_ci():
-            TEST_RESULTS.append({
-                "variant": "fa3",
-                "prefill_backend": "fa3",
-                "decode_backend": "fa3",
-                "kv_cache": "fp16",
-                "accuracy": metrics["accuracy"]
-            })
+            TEST_RESULTS.append(
+                {
+                    "variant": "fa3",
+                    "prefill_backend": "fa3",
+                    "decode_backend": "fa3",
+                    "kv_cache": "fp16",
+                    "accuracy": metrics["accuracy"],
+                }
+            )
         self.assertGreater(metrics["accuracy"], 0.935)
 
 
@@ -176,13 +180,15 @@ class TestDeepseekV32NasBackend_fp8kvcache(CustomTestCase):
         print(f"{metrics=}")
 
         if is_in_ci():
-            TEST_RESULTS.append({
-                "variant": "fp8kvcache",
-                "prefill_backend": "default",
-                "decode_backend": "default",
-                "kv_cache": "fp8_e4m3",
-                "accuracy": metrics["accuracy"]
-            })
+            TEST_RESULTS.append(
+                {
+                    "variant": "fp8kvcache",
+                    "prefill_backend": "default",
+                    "decode_backend": "default",
+                    "kv_cache": "fp8_e4m3",
+                    "accuracy": metrics["accuracy"],
+                }
+            )
 
             # Write the summary table after all tests complete
             _write_summary_table()
