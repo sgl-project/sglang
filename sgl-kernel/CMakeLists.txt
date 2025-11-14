@@ -97,15 +97,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
-# flash-attention origin
-FetchContent_Declare(
-    repo-flash-attention-origin
-    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
-    GIT_TAG        9dbed03d1a7a5862998c182c83d8265fea9dc21b
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-flash-attention-origin)
-
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
@@ -598,7 +589,7 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
 # TODO: find a better install condition.
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     # flash_attn/cute
-    install(DIRECTORY "${repo-flash-attention-origin_SOURCE_DIR}/flash_attn/cute/"
+    install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
             DESTINATION "flash_attn/cute"
             PATTERN ".git*" EXCLUDE
             PATTERN "__pycache__" EXCLUDE)
