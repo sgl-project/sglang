@@ -19,6 +19,8 @@ jobs:
 
       - name: Run test
         timeout-minutes: 30
+        env:
+          GPU_CONFIG: "8-gpu-h200"
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly-8-gpu-h200 --continue-on-error
