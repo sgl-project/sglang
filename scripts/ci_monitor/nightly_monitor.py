@@ -598,10 +598,46 @@ class NightlyTestMonitor:
                         }
                     )
 
+            # Check for performance regressions >10%
+            if job_stat.get("performance_metrics"):
+                perf_metrics = job_stat["performance_metrics"]
+                comparisons = self.compare_with_historical(perf_metrics, days=7)
+
+                for metric_name, comparison in comparisons.items():
+                    percent_change = comparison.get("percent_change")
+                    if percent_change is None:
+                        continue
+
+                    # Flag performance regressions >10%
+                    # For throughput metrics, negative change is bad
+                    # For latency/ttft metrics, positive change is bad
+                    is_regression = False
+                    if "throughput" in metric_name.lower():
+                        if percent_change < -10:  # >10% decrease in throughput
+                            is_regression = True
+                    elif (
+                        "latency" in metric_name.lower()
+                        or "ttft" in metric_name.lower()
+                    ):
+                        if percent_change > 10:  # >10% increase in latency
+                            is_regression = True
+
+                    if is_regression:
+                        regressions.append(
+                            {
+                                "job_name": job_name,
+                                "type": "performance_regression",
+                                "metric_name": metric_name,
+                                "percent_change": percent_change,
+                                "current_avg": comparison["current_avg"],
+                                "historical_avg": comparison["historical_avg"],
+                            }
+                        )
+
         if regressions:
-            print("\n" + "⚠" * 40)
-            print("POTENTIAL REGRESSIONS DETECTED:")
-            print("⚠" * 40)
+            print("\n" + "=" * 80)
+            print("REGRESSIONS DETECTED:")
+            print("=" * 80)
             for regression in regressions:
                 print(f"\nJob: {regression['job_name']}")
                 if regression["type"] == "high_failure_rate":
@@ -613,7 +649,14 @@ class NightlyTestMonitor:
                     print(
                         f"  {regression['recent_failure_count']} recent consecutive failures"
                     )
-            print("⚠" * 40)
+                elif regression["type"] == "performance_regression":
+                    print(f"  Performance regression: {regression['metric_name']}")
+                    print(
+                        f"    Change: {regression['percent_change']:+.1f}% "
+                        f"(current: {regression['current_avg']:.2f}, "
+                        f"7d avg: {regression['historical_avg']:.2f})"
+                    )
+            print("=" * 80)
 
         return regressions
 
