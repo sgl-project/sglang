@@ -26,9 +26,6 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
   return static_cast<float>(a) == static_cast<float>(b);
 }
 
-//------------------------------------------------------------------------------
-// Simplified Kernel for Kimi K2 (384 experts, num_expert_group=1)
-//------------------------------------------------------------------------------
 template <typename T>
 __global__ void kimi_k2_moe_fused_gate_kernel(
     T* input,
@@ -40,109 +37,84 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
     bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
-  // Each warp processes one row
-  int64_t thread_row = blockIdx.x * WARPS_PER_CTA + threadIdx.y;
-  if (thread_row >= num_rows) return;
+  int64_t row_idx = blockIdx.x * WARPS_PER_CTA + threadIdx.y;
+  if (row_idx >= num_rows) return;
 
-  int tidx = threadIdx.x;
-  int first_expert = tidx * VPT;
+  int lane_id = threadIdx.x;
+  int warp_id = threadIdx.y;
 
-  // Read data for this thread
-  T row_chunk[VPT];
-  T bias_chunk[VPT];
+  __shared__ float shared_scores[NUM_EXPERTS * WARPS_PER_CTA];
+  __shared__ float shared_original_scores[NUM_EXPERTS * WARPS_PER_CTA];
 
-  T* thread_row_ptr = input + thread_row * NUM_EXPERTS + first_expert;
-  T* bias_thread_ptr = bias + first_expert;
+  float* warp_scores = shared_scores + warp_id * NUM_EXPERTS;
+  float* warp_original_scores = shared_original_scores + warp_id * NUM_EXPERTS;
 
-#pragma unroll
-  for (int ii = 0; ii < VPT; ++ii) {
-    row_chunk[ii] = thread_row_ptr[ii];
-    bias_chunk[ii] = bias_thread_ptr[ii];
+  for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
+    T input_val = input[row_idx * NUM_EXPERTS + expert];
+    T bias_val = bias[expert];
+
+    float sigmoid_val = 1.0f / (1.0f + expf(-static_cast<float>(input_val)));
+    float biased_val = sigmoid_val + static_cast<float>(bias_val);
+    float sigmoid_val = 1.0f / (1.0f + expf(-static_cast<float>(input_val)));
+    float biased_val = sigmoid_val + static_cast<float>(bias_val);
+
+    warp_scores[expert] = biased_val;
+    warp_original_scores[expert] = sigmoid_val;
   }
 
   __syncthreads();
 
-  // Sigmoid activation
-#pragma unroll
-  for (int ii = 0; ii < VPT; ++ii) {
-    row_chunk[ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
+  for (int k = 0; k < topk; k++) {
+    float max_val = -FLT_MAX;
+    int max_expert = -1;
+
+    for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
+      if (warp_scores[expert] > max_val) {
+        max_val = warp_scores[expert];
+        max_expert = expert;
+      }
+    }
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+      float other_val = __shfl_down_sync(0xFFFFFFFF, max_val, offset);
+      int other_expert = __shfl_down_sync(0xFFFFFFFF, max_expert, offset);
+
+      if (other_val > max_val || (other_val == max_val && other_expert < max_expert)) {
+        max_val = other_val;
+        max_expert = other_expert;
+      }
+    }
+
+    if (lane_id == 0 && max_expert != -1) {
+      int64_t output_idx = row_idx * topk + k;
+      output_ptr[output_idx] = warp_original_scores[max_expert];
+      indices_ptr[output_idx] = max_expert;
+      warp_scores[max_expert] = -FLT_MAX;
+    }
+
+    __syncwarp();
   }
 
   __syncthreads();
 
-  // Add bias
-#pragma unroll
-  for (int ii = 0; ii < VPT; ++ii) {
-    bias_chunk[ii] = row_chunk[ii] + bias_chunk[ii];
-  }
+  if (renormalize && lane_id == 0) {
+    float sum = 0.0f;
+    for (int k = 0; k < topk; k++) {
+      sum += output_ptr[row_idx * topk + k];
+    }
 
-  // TopK selection
-  float output_sum = 0.0f;
-
-  for (int k_idx = 0; k_idx < topk; ++k_idx) {
-    // Find local max in thread's chunk
-    T max_val = bias_chunk[0];
-    int expert = first_expert;
-
-    if (!cmp_eq(max_val, static_cast<T>(-FLT_MAX))) {
-#pragma unroll
-      for (int ii = 1; ii < VPT; ++ii) {
-        T val = bias_chunk[ii];
-        if (cmp_gt(val, max_val)) {
-          max_val = val;
-          expert = first_expert + ii;
+    if (sum > 0.0f) {
+      for (int k = 0; k < topk; k++) {
+        int64_t idx = row_idx * topk + k;
+        output_ptr[idx] /= sum;
+        if (apply_routed_scaling_factor_on_output) {
+          output_ptr[idx] *= static_cast<float>(routed_scaling_factor);
         }
-      }
-    } else {
-      max_val = static_cast<T>(-FLT_MAX);
-    }
-
-    // Warp reduction to find global max
-#pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-      T other_max = static_cast<T>(__shfl_xor_sync(0xFFFFFFFF, static_cast<float>(max_val), mask, WARP_SIZE));
-      int other_expert = __shfl_xor_sync(0xFFFFFFFF, expert, mask, WARP_SIZE);
-
-      if (cmp_gt(other_max, max_val) || (cmp_eq(other_max, max_val) && other_expert < expert)) {
-        max_val = other_max;
-        expert = other_expert;
-      }
-    }
-
-    // Write result
-    int thread_to_clear = expert / VPT;
-    int64_t idx = topk * thread_row + k_idx;
-
-    if (tidx == thread_to_clear) {
-      int expert_to_clear = expert % VPT;
-      bias_chunk[expert_to_clear] = static_cast<T>(-FLT_MAX);
-      output_ptr[idx] = static_cast<float>(row_chunk[expert_to_clear]);
-      indices_ptr[idx] = static_cast<int32_t>(expert);
-    }
-
-    __syncthreads();
-
-    if (tidx == 0) {
-      output_sum += output_ptr[idx];
-    }
-  }
-
-  // Normalize weights
-  if (renormalize && tidx == 0) {
-#pragma unroll
-    for (int ii = 0; ii < topk; ++ii) {
-      int64_t idx = topk * thread_row + ii;
-      output_ptr[idx] = output_ptr[idx] / output_sum;
-      if (apply_routed_scaling_factor_on_output) {
-        output_ptr[idx] *= routed_scaling_factor;
       }
     }
   }
 }
 
-//------------------------------------------------------------------------------
-// Host Launcher
-//------------------------------------------------------------------------------
 std::vector<at::Tensor> kimi_k2_moe_fused_gate(
     at::Tensor& input,
     at::Tensor& bias,
