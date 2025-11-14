@@ -241,18 +241,22 @@ class SchedulerPPMixin:
                     )
         return result, event
 
-    def get_rids(self: Scheduler, req_queue: List[Req], *poll_statuses):
+    def get_rids(self: Scheduler, req_queue: List[Req], *poll_statuses_group):
         """
-        Used by PP, get the transferred rids but **do not pop**
+        Used by PP, get the required rids with the given poll statuses.
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in req_queue],
             self.tp_worker.get_attention_tp_cpu_group(),
         )
         rids: List = []
-        for poll_status in poll_statuses:
+        for poll_statuses in poll_statuses_group:
             rids.append(
-                [req.rid for req, poll in zip(req_queue, polls) if poll in poll_status]
+                [
+                    req.rid
+                    for req, poll in zip(req_queue, polls)
+                    if poll in poll_statuses
+                ]
             )
         return tuple(rids) if len(rids) > 1 else rids[0]
 
