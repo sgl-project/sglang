@@ -165,30 +165,21 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+
+        self._init_completion_flags(
+            mode=(
+                "prefill"
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else "decode"
+            )
+        )
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-
-            self.num_completion_flags = get_int_env_var(
-                "SGLANG_DISAGGREGATION_PREFILL_NUM_COMPLETION_FLAGS", 1024
-            )
-            self.completion_flag_byte_size = np.dtype(np.int32).itemsize
-            self.completion_flag_buffers = [
-                np.array([1], dtype=np.int32) for _ in range(self.num_completion_flags)
-            ]
-            self.completion_flag_ptrs = [
-                buf.ctypes.data for buf in self.completion_flag_buffers
-            ]
-            self.engine.batch_register(
-                self.completion_flag_ptrs,
-                [self.completion_flag_byte_size] * self.num_completion_flags,
-            )
-            self.completion_flag_pool = self.completion_flag_ptrs.copy()
-            self.request_src_completion_flag_ptrs = {}
-            self.completion_flag_lock = threading.Lock()
-
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = get_int_env_var(
@@ -219,37 +210,17 @@ class MooncakeKVManager(CommonKVManager):
             self.bootstrap_timeout = get_int_env_var(
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
-
             self.enable_custom_mem_pool, self.custom_mem_pool_type = (
                 check_mooncake_custom_mem_pool_enabled()
             )
+
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-
-            self.num_completion_flags = get_int_env_var(
-                "SGLANG_DISAGGREGATION_DECODE_NUM_COMPLETION_FLAGS", 1024
-            )
-            self.completion_flag_byte_size = np.dtype(np.int32).itemsize
-            self.completion_flag_buffers = [
-                np.array([0], dtype=np.int32) for _ in range(self.num_completion_flags)
-            ]
-            self.completion_flag_ptrs = [
-                buf.ctypes.data for buf in self.completion_flag_buffers
-            ]
-            self.engine.batch_register(
-                self.completion_flag_ptrs,
-                [self.completion_flag_byte_size] * self.num_completion_flags,
-            )
-            self.completion_flag_pool = list(
-                zip(self.completion_flag_ptrs, self.completion_flag_buffers)
-            )
-            self.request_dst_completion_flag_ptrs = {}
-            self.completion_flag_lock = threading.Lock()
-
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
@@ -268,6 +239,61 @@ class MooncakeKVManager(CommonKVManager):
 
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Helper that initialises the completion‑flag buffers (shared)
+    # ------------------------------------------------------------------
+    def _init_completion_flags(self, mode: str) -> None:
+        """
+        Initialise completion‑flag buffers and register them with the engine.
+
+        Parameters
+        ----------
+        mode : str
+            Either ``"prefill"`` or ``"decode"``. Determines the initial buffer value
+            and the shape of ``completion_flag_pool``.
+        """
+        if mode not in {"prefill", "decode"}:
+            raise ValueError(f"Unsupported completion flag mode: {mode!r}")
+
+        # Environment‑specific number of flags
+        env_var = (
+            "SGLANG_DISAGGREGATION_PREFILL_NUM_COMPLETION_FLAGS"
+            if mode == "prefill"
+            else "SGLANG_DISAGGREGATION_DECODE_NUM_COMPLETION_FLAGS"
+        )
+        self.num_completion_flags = get_int_env_var(env_var, 1024)
+
+        self.completion_flag_byte_size = np.dtype(np.int32).itemsize
+        init_val = 1 if mode == "prefill" else 0
+        self.completion_flag_buffers = [
+            np.array([init_val], dtype=np.int32)
+            for _ in range(self.num_completion_flags)
+        ]
+        self.completion_flag_ptrs = [
+            buf.ctypes.data for buf in self.completion_flag_buffers
+        ]
+
+        # Register buffers with the engine
+        self.engine.batch_register(
+            self.completion_flag_ptrs,
+            [self.completion_flag_byte_size] * self.num_completion_flags,
+        )
+
+        # Pool / request dictionary depends on mode
+        if mode == "prefill":
+            # Prefill side only needs a simple list of pointers
+            self.completion_flag_pool = self.completion_flag_ptrs.copy()
+            self.request_src_completion_flag_ptrs = {}
+        else:
+            # Decode side needs a pair (ptr, buffer) for each flag
+            self.completion_flag_pool = list(
+                zip(self.completion_flag_ptrs, self.completion_flag_buffers)
+            )
+            self.request_dst_completion_flag_ptrs = {}
+
+        # Common lock for flag access
+        self.completion_flag_lock = threading.Lock()
 
     def init_engine(self):
         self.engine = MooncakeTransferEngine(
@@ -870,9 +896,13 @@ class MooncakeKVManager(CommonKVManager):
 
                             # Set the completion flag on the decode side
                             ret_flag = 0
-                            assert req.dst_completion_flag_ptr != 0, "Destination completion flag pointer cannot be zero."
+                            assert (
+                                req.dst_completion_flag_ptr != 0
+                            ), "Destination completion flag pointer cannot be zero."
                             with self.completion_flag_lock:
-                                src_ptr = self.request_src_completion_flag_ptrs.get(kv_chunk.room)
+                                src_ptr = self.request_src_completion_flag_ptrs.get(
+                                    kv_chunk.room
+                                )
 
                             if src_ptr:
                                 ret_flag = self.engine.batch_transfer_sync(
@@ -1394,12 +1424,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
             if current_mgr_status == KVPoll.Success:
                 if self.completion_flag_buf[0] != 1:
-                    return KVPoll.WaitingForInput # Continue waiting
+                    return KVPoll.WaitingForInput  # Continue waiting
                 else:
                     logger.debug(f"[{self.bootstrap_room}] completion flag set.")
-                    self.completion_flag_buf[0] = 0 # Reset flag
-                    self.conclude_state = KVPoll.Success # Mark as truly successful
-                    return KVPoll.Success # Return success
+                    self.completion_flag_buf[0] = 0  # Reset flag
+                    self.conclude_state = KVPoll.Success  # Mark as truly successful
+                    return KVPoll.Success  # Return success
             elif current_mgr_status == KVPoll.Failed:
                 self.conclude_state = KVPoll.Failed
                 return KVPoll.Failed
@@ -1418,8 +1448,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         )
                         self.conclude_state = KVPoll.Failed
                         return KVPoll.Failed
-                return KVPoll.WaitingForInput # Still waiting for input
-            else: # KVPoll.Bootstrapping or other states
+                return KVPoll.WaitingForInput  # Still waiting for input
+            else:  # KVPoll.Bootstrapping or other states
                 return current_mgr_status
         else:
             return self.conclude_state
