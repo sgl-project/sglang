@@ -217,6 +217,7 @@ suites = {
         TestFile("test_cpp_radix_cache.py", 60),
     ],
     "nightly-4-gpu-b200": [
+        TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
         TestFile("test_fp4_moe.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
@@ -249,14 +250,10 @@ suites = {
         TestFile("layers/moe/test_moe_runners.py"),
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
-        TestFile("models/lora/test_lora.py"),
-        TestFile("models/lora/test_lora_backend.py"),
-        TestFile("models/lora/test_lora_cuda_graph.py"),
-        TestFile("models/lora/test_lora_eviction.py"),
-        TestFile("models/lora/test_lora_qwen3.py"),
-        TestFile("models/lora/test_lora_tp.py"),
-        TestFile("models/lora/test_lora_update.py"),
-        TestFile("models/lora/test_multi_lora_backend.py"),
+        TestFile("lora/test_lora_cuda_graph.py"),
+        TestFile("lora/test_lora_qwen3.py"),
+        TestFile("lora/test_lora_tp.py"),
+        TestFile("lora/test_lora_update.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
@@ -393,7 +390,7 @@ suite_amd = {
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 150),
-        TestFile("lora/test_lora_backend.py", 99),
+        # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
@@ -525,6 +522,7 @@ suite_ascend = {
     "per-commit-1-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_hicache_mha.py", 400),
     ],
     "per-commit-2-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
