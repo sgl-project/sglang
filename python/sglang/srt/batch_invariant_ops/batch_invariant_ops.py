@@ -18,6 +18,10 @@ if ENABLE_JIT_DEEPGEMM:
 _ENABLE_MM_DEEPGEMM = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
 )
+# If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
+_ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0"
+)
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
 )
@@ -278,8 +282,10 @@ def matmul_persistent(
 
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
 
-    # return _matmul_persistent_triton(a=a, b=b, bias=bias)
-    return torch.einsum('ik,kj->ij', a, b)
+    if _ENABLE_MM_FALLBACK_VARIANT:
+        return torch.einsum("ik,kj->ij", a, b)
+
+    return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
 
 @triton.jit
