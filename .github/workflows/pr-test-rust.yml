@@ -57,16 +57,18 @@ jobs:
       - name: Test maturin build
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: bindings/python
+          manifest-path: ../../Cargo.toml
           args: --release --out dist --features vendored-openssl
           rust-toolchain: stable
           sccache: true
 
       - name: List built wheel
-        run: ls -lh dist/
+        run: ls -lh bindings/python/dist/
 
       - name: Test wheel install
         run: |
-          pip install dist/*.whl
+          pip install bindings/python/dist/*.whl
           python -c "import sglang_router; print('Python package: OK')"
           python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
@@ -165,11 +167,11 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
-          cd sgl-router
+          cd sgl-router/bindings/python
           python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router
-          maturin build --profile ci --features vendored-openssl
-          pip install target/wheels/*.whl
+          maturin build --manifest-path ../../Cargo.toml --profile ci --features vendored-openssl --out dist
+          pip install dist/*.whl
 
       - name: Run Python unit tests
         run: |
@@ -274,11 +276,11 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
-          cd sgl-router
+          cd sgl-router/bindings/python
           python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router
-          maturin build --profile ci --features vendored-openssl
-          pip install target/wheels/*.whl
+          maturin build --manifest-path ../../Cargo.toml --profile ci --features vendored-openssl --out dist
+          pip install dist/*.whl
 
       - name: Run Python E2E response API tests
         run: |

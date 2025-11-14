@@ -1,6 +1,6 @@
 [package]
-name = "sglang_router_rs"
-version = "0.0.0"
+name = "sglang-router"
+version = "0.2.2"
 edition = "2021"
 
 [features]

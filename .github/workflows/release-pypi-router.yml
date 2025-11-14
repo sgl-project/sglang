@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - sgl-router/pyproject.toml
+      - sgl-router/bindings/python/pyproject.toml
   workflow_dispatch:
 
 jobs:
@@ -77,6 +77,8 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: bindings/python
+          manifest-path: ../../Cargo.toml
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
@@ -136,6 +138,8 @@ jobs:
       - name: Build SDist
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: bindings/python
+          manifest-path: ../../Cargo.toml
           command: sdist
           args: --out dist
           rust-toolchain: stable
