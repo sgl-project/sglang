@@ -19,7 +19,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Dict, Union
 
 import numpy as np
 import torch
@@ -48,7 +48,19 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self._init_arch_map()
+        self.update_attr_name = self._get_update_attr_name(model_runner)
+        self.update_attr_type = self._get_update_attr_type(model_runner)
+
+    def _init_arch_map(self):
+        self.update_attr_name: Dict[str, str] = {
+            AttentionArch.MLA: "actual_seq_lengths_kv",
+            AttentionArch.MHA: "context_lens",
+        }
+        self.update_attr_type: Dict[str, Union[list, torch.Tensor]] = {
+            AttentionArch.MLA: [],
+            AttentionArch.MHA: torch.Tensor(),
+        }
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
@@ -63,13 +75,17 @@ class NPUGraphRunner(CudaGraphRunner):
             out = run_once_fn()
         return out
 
+    def _get_update_attr_name(self, model_runner):
+        return self.update_attr_name[model_runner.model_config.attention_arch]
+
+    def _get_update_attr_type(self, model_runner):
+        return self.update_attr_type[model_runner.model_config.attention_arch]
+
     def _update_inputs(self, seq_lens):
-        if self.use_mla:
-            self.graphs[self.bs].update(
-                cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
-            )
-        else:
-            self.graphs[self.bs].update(cpu_update_input=[{"context_lens": seq_lens}])
+        if isinstance(self.update_attr_type, torch.Tensor):
+            seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+
+        self.graphs[self.bs].update(cpu_update_input=[{self.update_attr_name: seq_lens}])
 
     def _cache_loc_dtype(self):
         return torch.int32
@@ -124,14 +140,8 @@ class NPUGraphRunner(CudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
-            if self.use_mla:
-                actual_seq_len_kv = seq_lens
-            else:
-                actual_seq_len_kv = torch.from_numpy(
-                    np.array(seq_lens).astype(np.int32)
-                )
             thread = threading.Thread(
-                target=self._update_inputs, args=(actual_seq_len_kv,)
+                target=self._update_inputs, args=(seq_lens,)
             )
             thread.start()
             self.graphs[self.bs].replay()

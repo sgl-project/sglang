@@ -68,6 +68,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
+    is_npu,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
 )
@@ -78,6 +79,10 @@ _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_norm_rope import split_qkv_norm_rope
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -392,6 +397,30 @@ class Qwen3MoeAttention(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+        self.rotary_emb.get_cos_sin_with_position(positions, layer_id=self.layer_id)
+        q, k, v = split_qkv_norm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            self.q_norm.variance_epsilon,
+            q_bias=getattr(self.q_norm, "bias", None),
+            k_bias=getattr(self.k_norm, "bias", None),
+        )
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -400,6 +429,12 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
+        if _is_npu:
+            return self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
