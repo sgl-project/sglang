@@ -75,6 +75,11 @@ class EnvField:
         return self.get()
 
 
+class EnvTuple(EnvField):
+    def parse(self, value: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip())
+
+
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
         return value
@@ -125,6 +130,7 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
