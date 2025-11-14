@@ -10,12 +10,10 @@ python3 -m unittest test_tokenizer_batch_encode.TestTokenizerBatchEncodeUnit.tes
 python3 -m unittest test_tokenizer_batch_encode.TestTokenizerBatchEncodeLogic.test_batch_processing_path
 """
 
-import asyncio
 import unittest
-from typing import List
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import Mock, patch
 
-from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
