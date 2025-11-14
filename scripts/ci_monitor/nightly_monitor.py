@@ -7,6 +7,7 @@ Analyzes metrics from GitHub summaries and tracks trends over time.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -60,6 +61,10 @@ class NightlyTestMonitor:
             "accuracy": re.compile(r"Accuracy:\s*([\d.]+)"),
             "gsm8k_score": re.compile(r"GSM8K Score:\s*([\d.]+)"),
         }
+
+        # Historical data repository
+        self.data_repo = "sglang-bot/sglang-ci-data"
+        self.data_branch = "main"
 
     def get_nightly_runs(self, days: int = 7) -> List[Dict]:
         """Get nightly test workflow runs from the last N days"""
@@ -154,6 +159,103 @@ class NightlyTestMonitor:
                         continue
 
         return dict(metrics)
+
+    def get_historical_data_paths(self) -> List[str]:
+        """
+        Get list of available nightly monitor data files from the data repository.
+
+        Returns:
+            List of file paths in the repository
+        """
+        url = f"{self.base_url}/repos/{self.data_repo}/contents/nightly_monitor"
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            contents = response.json()
+
+            # Filter for JSON files
+            json_files = [
+                item["path"]
+                for item in contents
+                if item["type"] == "file" and item["name"].endswith(".json")
+            ]
+            return sorted(json_files, reverse=True)  # Most recent first
+        except requests.exceptions.RequestException as e:
+            print(f"Warning: Could not fetch historical data paths: {e}")
+            return []
+
+    def fetch_historical_data(self, file_path: str) -> Optional[Dict]:
+        """
+        Fetch a specific historical data file from the repository.
+
+        Args:
+            file_path: Path to the file in the repository
+
+        Returns:
+            Dictionary with historical data, or None if fetch failed
+        """
+        url = f"{self.base_url}/repos/{self.data_repo}/contents/{file_path}"
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+            # Decode base64 content
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            return json.loads(content)
+        except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError) as e:
+            print(f"Warning: Could not fetch historical data from {file_path}: {e}")
+            return None
+
+    def get_recent_historical_metrics(
+        self, job_name: str, metric_name: str, days: int = 7
+    ) -> List[Dict]:
+        """
+        Get recent historical metrics for a specific job and metric.
+
+        Args:
+            job_name: Name of the job
+            metric_name: Name of the metric (e.g., 'output_throughput')
+            days: Number of days to look back
+
+        Returns:
+            List of metric data points with timestamps
+        """
+        print(
+            f"  Fetching historical {metric_name} data for {job_name} (last {days} days)..."
+        )
+
+        historical_paths = self.get_historical_data_paths()
+        if not historical_paths:
+            return []
+
+        cutoff_date = datetime.now() - timedelta(days=days)
+        historical_metrics = []
+
+        # Fetch recent files (limit to avoid too many API calls)
+        for file_path in historical_paths[:min(days * 2, 14)]:  # Max 14 files
+            historical_data = self.fetch_historical_data(file_path)
+            if not historical_data:
+                continue
+
+            # Check if this file has data for our job
+            job_stats = historical_data.get("job_stats", {}).get(job_name, {})
+            if not job_stats:
+                continue
+
+            # Extract metrics
+            perf_metrics = job_stats.get("performance_metrics", {}).get(metric_name, [])
+            for metric_entry in perf_metrics:
+                try:
+                    timestamp = datetime.fromisoformat(
+                        metric_entry["timestamp"].replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                    if timestamp >= cutoff_date:
+                        historical_metrics.append(metric_entry)
+                except (ValueError, KeyError):
+                    continue
+
+        return sorted(historical_metrics, key=lambda x: x["timestamp"])
 
     def analyze_nightly_tests(self, runs: List[Dict]) -> Dict:
         """Analyze nightly test runs for failures and performance"""
