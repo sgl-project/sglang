@@ -96,7 +96,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
     transform_scale_ue8m0_inplace,
-    ENABLE_FLASHINFER_GEMM,
+    ENABLE_FLASHINFER_FP8_GEMM,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -3421,7 +3421,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = True
 
         if (
-            not ENABLE_FLASHINFER_GEMM
+            not ENABLE_FLASHINFER_FP8_GEMM
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             and hasattr(self.quant_config, "weight_block_size")
