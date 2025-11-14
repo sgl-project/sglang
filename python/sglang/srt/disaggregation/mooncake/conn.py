@@ -871,15 +871,22 @@ class MooncakeKVManager(CommonKVManager):
                             # Set the completion flag on the decode side
                             ret_flag = 0
                             assert req.dst_completion_flag_ptr != 0, "Destination completion flag pointer cannot be zero."
-                            src_ptr = self.request_src_completion_flag_ptrs[
-                                kv_chunk.room
-                            ]
-                            ret_flag = self.engine.batch_transfer_sync(
-                                req.mooncake_session_id,
-                                [src_ptr],
-                                [req.dst_completion_flag_ptr],
-                                [self.completion_flag_byte_size],
-                            )
+                            with self.completion_flag_lock:
+                                src_ptr = self.request_src_completion_flag_ptrs.get(kv_chunk.room)
+
+                            if src_ptr:
+                                ret_flag = self.engine.batch_transfer_sync(
+                                    req.mooncake_session_id,
+                                    [src_ptr],
+                                    [req.dst_completion_flag_ptr],
+                                    [self.completion_flag_byte_size],
+                                )
+                            else:
+                                logger.warning(
+                                    f"Source completion flag for room {kv_chunk.room} not found. "
+                                    f"Request may have been cleared or aborted. Skipping flag transfer."
+                                )
+                                ret_flag = -1  # Mark as failed
 
                             polls.append(True if ret == 0 and ret_flag == 0 else False)
                             dst_ranks_infos.append(
