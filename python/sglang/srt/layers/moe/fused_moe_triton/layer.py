@@ -521,7 +521,9 @@ class FusedMoE(torch.nn.Module):
 
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
-            self._weight_loader_impl(
+            # Without global metadata, treat expert_id as a global id and
+            # let the physical loader map it to a local expert id (or skip)
+            self._weight_loader_physical(
                 param=param,
                 loaded_weight=loaded_weight,
                 weight_name=weight_name,
