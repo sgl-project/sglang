@@ -104,15 +104,18 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type == "cuda":
+        device_type = logits.device.type
+        if device_type == "cuda":
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
-        elif logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
+        elif device_type == "xpu":
+            apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif device_type == "cpu" and self.apply_vocab_mask_cpu:
             self.apply_vocab_mask_cpu(logits, vocab_mask)
         else:
-            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+            raise RuntimeError(f"Unsupported device: {device_type}")
 
     def copy(self):
         matcher = GrammarMatcher(
