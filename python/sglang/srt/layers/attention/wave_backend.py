@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -97,7 +97,7 @@ class WaveAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
-        if model_runner.is_hybrid_gdn:
+        if model_runner.is_hybrid:
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
         else:
@@ -1141,10 +1141,10 @@ def update_sliding_window_buffer(
     # full to swa index mapping
     if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
         kv_last_index = window_kv_indptr[-1]
-        window_kv_indices[
-            :kv_last_index
-        ] = token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            window_kv_indices[:kv_last_index]
+        window_kv_indices[:kv_last_index] = (
+            token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                window_kv_indices[:kv_last_index]
+            )
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
 
@@ -1178,9 +1178,9 @@ def update_sliding_window_buffer_cuda_graph(
     # full to swa index mapping
     if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
         kv_last_index = window_kv_indptr[-1]
-        window_kv_indices[
-            :kv_last_index
-        ] = token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            window_kv_indices[:kv_last_index]
+        window_kv_indices[:kv_last_index] = (
+            token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                window_kv_indices[:kv_last_index]
+            )
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
