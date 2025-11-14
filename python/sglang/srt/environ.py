@@ -75,6 +75,11 @@ class EnvField:
         return self.get()
 
 
+class EnvTuple(EnvField):
+    def parse(self, value: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip())
+
+
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
         return value
@@ -125,6 +130,7 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -281,6 +287,9 @@ class Envs:
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+
+    # Warmup
+    SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
 
     # fmt: on
 
