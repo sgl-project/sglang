@@ -843,14 +843,14 @@ class ServerArgs:
             )
 
         if self.ring_degree > 1:
-            if self.attention_backend != None and self.attention_backend != "fa3":
+            if self.attention_backend != None and self.attention_backend != "fa":
                 raise ValueError(
-                    "Ring Attention is only supported for fa3 backend for now"
+                    "Ring Attention is only supported for flash attention backend for now"
                 )
             else:
-                self.attention_backend = "fa3"
+                self.attention_backend = "fa"
                 logger.info(
-                    "Ring Attention is currently only supported for fa3, attention_backend has been automatically set to fa3"
+                    "Ring Attention is currently only supported for flash attention, attention_backend has been automatically set to flash attention"
                 )
 
         if self.sp_degree == -1:
