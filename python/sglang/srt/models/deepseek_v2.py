@@ -775,7 +775,6 @@ class DeepseekV2MoE(nn.Module):
         event0 = torch.cuda.Event()
         event1 = torch.cuda.Event()
 
-        # router_logits: (num_tokens, n_experts)
         event0.record()
         shared_output = self._forward_shared_experts(
             hidden_states, gemm_output_zero_allocator
@@ -783,7 +782,7 @@ class DeepseekV2MoE(nn.Module):
 
         with torch.cuda.stream(self.alt_stream):
             event0.wait()
-
+            # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
