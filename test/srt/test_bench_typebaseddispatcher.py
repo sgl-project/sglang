@@ -25,6 +25,7 @@ class TypeBasedDispatcherList:
             return self._fallback_fn(obj)
         raise ValueError(f"Invalid object: {obj}")
 
+
 def create_test_mapping(num_types=30):
     types = [type(f"RequestType{i}", (), {}) for i in range(num_types)]
 
@@ -216,8 +217,6 @@ def simulate_real_workload():
     print("\n" + "=" * 60)
     print("simulate real workload")
     print("=" * 60)
-
-    from collections import Counter
 
     mapping = create_test_mapping(30)
 
