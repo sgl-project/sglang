@@ -115,6 +115,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 1-gpu-runner
     continue-on-error: true
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
