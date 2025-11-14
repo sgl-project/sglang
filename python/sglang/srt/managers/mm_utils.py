@@ -673,7 +673,9 @@ def general_mm_embed_routine(
             # just being defensive here
             forward_batch.mm_inputs = None
         else:
-            inputs_embeds = None
+            inputs_embeds = embed_tokens(input_ids)
+    else:
+        inputs_embeds = None
 
     if skip_llm_forward:
         return inputs_embeds
