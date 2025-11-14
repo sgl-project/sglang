@@ -184,6 +184,7 @@ class TestDeepseekV3FP4CutlassMoE(CustomTestCase):
             "flashinfer_cutlass",
             "--quantization",
             "modelopt_fp4",
+            "--enable-single-batch-overlap",
         ]
         cls.process = popen_launch_server(
             cls.model,
