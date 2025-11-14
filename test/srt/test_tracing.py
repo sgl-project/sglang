@@ -10,7 +10,6 @@ import requests
 import zmq
 
 from sglang import Engine
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.tracing.trace import *
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.test.test_utils import (
