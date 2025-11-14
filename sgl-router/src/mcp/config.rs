@@ -36,6 +36,11 @@ pub struct McpServerConfig {
     #[serde(flatten)]
     pub transport: McpTransport,
 
+    /// Optional label for built-in tool routing (e.g., "web_search", "file_search")
+    /// Used to map built-in tool types to specific MCP servers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
     /// Per-server proxy override (overrides global proxy)
     /// Set to `null` in YAML to force direct connection (no proxy)
     #[serde(default)]

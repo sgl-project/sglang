@@ -81,7 +81,9 @@ impl ToolLike for ResponseTool {
     fn is_builtin(&self) -> bool {
         matches!(
             self.r#type,
-            ResponseToolType::WebSearchPreview | ResponseToolType::CodeInterpreter
+            ResponseToolType::WebSearch
+                | ResponseToolType::FileSearch
+                | ResponseToolType::CodeInterpreter
         )
     }
 
@@ -397,7 +399,8 @@ impl HarmonyBuilder {
                         .iter()
                         .map(|tool| match tool.r#type {
                             ResponseToolType::Function => "function",
-                            ResponseToolType::WebSearchPreview => "web_search_preview",
+                            ResponseToolType::WebSearch => "web_search",
+                            ResponseToolType::FileSearch => "file_search",
                             ResponseToolType::CodeInterpreter => "code_interpreter",
                             ResponseToolType::Mcp => "mcp",
                         })

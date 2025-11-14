@@ -175,8 +175,12 @@ impl StepExecutor for RegisterMcpServerStep {
                     message: "MCP manager not initialized".to_string(),
                 })?;
 
-        // Register the client in the manager's client map
-        mcp_manager.register_static_server(config_request.name.clone(), mcp_client);
+        // Register the client in the manager's client map with label if present
+        mcp_manager.register_static_server_with_label(
+            config_request.name.clone(),
+            mcp_client,
+            config_request.config.label.clone(),
+        );
 
         info!("Registered MCP server: {}", config_request.name);
 

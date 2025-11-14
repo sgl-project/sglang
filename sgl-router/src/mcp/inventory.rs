@@ -97,6 +97,21 @@ impl ToolInventory {
             .collect()
     }
 
+    /// Get all tools from a specific server
+    pub fn list_tools_by_server(&self, server_name: &str) -> Vec<Tool> {
+        self.tools
+            .iter()
+            .filter_map(|entry| {
+                let cached = entry.value();
+                if cached.server_name == server_name {
+                    Some(cached.tool.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     // ============================================================================
     // Prompt Methods
     // ============================================================================

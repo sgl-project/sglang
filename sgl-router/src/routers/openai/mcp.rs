@@ -175,6 +175,7 @@ pub async fn ensure_request_mcp_client(
     let server_config = mcp::McpServerConfig {
         name,
         transport,
+        label: None,
         proxy: None,
         required: false,
     };

@@ -1,0 +1,9 @@
+# Test MCP configuration for e2e tests
+# This file is used by py_test to configure MCP servers for testing built-in tools
+
+servers:
+  - name: brave_web_search_test
+    label: web_search  # Built-in tool label for web search
+    protocol: sse
+    url: http://localhost:8001/sse
+    required: true

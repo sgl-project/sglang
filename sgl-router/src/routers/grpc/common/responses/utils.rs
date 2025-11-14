@@ -12,7 +12,7 @@ use tracing::{debug, error, warn};
 use crate::{
     core::WorkerRegistry,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
-    mcp::McpManager,
+    mcp::{BuiltinToolDetector, McpManager},
     protocols::{
         common::Tool,
         responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
@@ -25,8 +25,11 @@ use crate::{
 
 /// Ensure MCP connection succeeds if MCP tools are declared
 ///
-/// Checks if request declares MCP tools, and if so, validates that
+/// Checks if request declares MCP tools or built-in tools, and if so, validates that
 /// the MCP client can be created and connected.
+///
+/// Built-in tools (web_search, file_search, code_interpreter) also use the MCP
+/// infrastructure and therefore need to go through the tool loop.
 pub async fn ensure_mcp_connection(
     mcp_manager: &Arc<McpManager>,
     tools: Option<&[ResponseTool]>,
@@ -36,6 +39,12 @@ pub async fn ensure_mcp_connection(
             t.iter()
                 .any(|tool| matches!(tool.r#type, ResponseToolType::Mcp))
         })
+        .unwrap_or(false);
+
+    // Check for built-in tools (web_search, file_search, code_interpreter)
+    // These also require the tool loop since they delegate to MCP servers
+    let has_builtin_tools = tools
+        .map(BuiltinToolDetector::has_builtin_tools)
         .unwrap_or(false);
 
     if has_mcp_tools {
@@ -55,7 +64,8 @@ pub async fn ensure_mcp_connection(
         }
     }
 
-    Ok(has_mcp_tools)
+    // Return true if either MCP tools OR built-in tools are present
+    Ok(has_mcp_tools || has_builtin_tools)
 }
 
 /// Validate that workers are available for the requested model

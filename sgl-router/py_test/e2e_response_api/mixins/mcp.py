@@ -377,3 +377,99 @@ class MCPTests(ResponseAPIBaseTest):
             has_location,
             "function_call_arguments.delta should contain location/seattle",
         )
+
+    def test_web_search_builtin_tool(self):
+        """Test web search built-in tool (non-streaming).
+
+        Built-in tools delegate to MCP servers but hide MCP details from the API.
+        Response should contain web_search_call items, not mcp_call or mcp_list_tools.
+        """
+        resp = self.create_response(
+            self.MCP_TEST_PROMPT,
+            tools=[{"type": "web_search"}],
+            stream=False,
+        )
+        # Should successfully make the request
+        self.assertEqual(resp.status_code, 200, f"Response: {resp.text}")
+
+        data = resp.json()
+
+        # Basic response structure
+        self.assertIn("id", data)
+        self.assertIn("status", data)
+        self.assertEqual(data["status"], "completed")
+        self.assertIn("output", data)
+        self.assertIn("model", data)
+
+        # Verify output array is not empty
+        output = data["output"]
+        self.assertIsInstance(output, list)
+        self.assertGreater(len(output), 0)
+
+        # Check for web_search_call output types
+        output_types = [item.get("type") for item in output]
+
+        # Should have web_search_call items
+        web_search_calls = [
+            item for item in output if item.get("type") == "web_search_call"
+        ]
+        self.assertGreater(
+            len(web_search_calls),
+            0,
+            "Response should contain at least one web_search_call",
+        )
+
+        # Built-in tools should NOT expose mcp_list_tools or mcp_call
+        self.assertNotIn(
+            "mcp_list_tools",
+            output_types,
+            "Built-in tools should not expose mcp_list_tools",
+        )
+        self.assertNotIn(
+            "mcp_call", output_types, "Built-in tools should not expose mcp_call"
+        )
+
+        # Verify web_search_call structure
+        for ws_call in web_search_calls:
+            # Check required fields
+            self.assertIn("id", ws_call)
+            self.assertIn("status", ws_call)
+            self.assertIn("action", ws_call)
+
+            # Verify ID format (should be ws_<id> without call_ prefix)
+            self.assertTrue(
+                ws_call["id"].startswith("ws_"),
+                f"web_search_call id should start with 'ws_', got: {ws_call['id']}",
+            )
+            self.assertNotIn(
+                "call_call_",
+                ws_call["id"],
+                "web_search_call id should not have double 'call_' prefix",
+            )
+
+            # Verify status
+            self.assertEqual(ws_call["status"], "completed")
+
+            # Verify action structure
+            action = ws_call["action"]
+            self.assertIsInstance(action, dict)
+            self.assertIn("type", action)
+            self.assertEqual(action["type"], "search")
+            self.assertIn("query", action)
+            self.assertIsInstance(action["query"], str)
+            self.assertGreater(len(action["query"]), 0, "Query should not be empty")
+
+            # Should NOT have results or error fields (simplified output)
+            self.assertNotIn(
+                "results", ws_call, "web_search_call should not have results field"
+            )
+            self.assertNotIn(
+                "error", ws_call, "web_search_call should not have error field"
+            )
+
+        # Should have final message with assistant response
+        messages = [item for item in output if item.get("type") == "message"]
+        if self.mcp_validation_mode == "strict":
+            self.assertGreater(
+                len(messages), 0, "Response should contain at least one message"
+            )

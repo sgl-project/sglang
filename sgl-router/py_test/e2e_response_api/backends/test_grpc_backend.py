@@ -47,6 +47,8 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
                 "memory",
                 "--tool-call-parser",
                 "qwen",
+                "--mcp-config-path",
+                "py_test/fixtures/mcp_test_config.yaml",
             ],
         )
 
@@ -164,6 +166,10 @@ class TestGrpcHarmonyBackend(
     @unittest.skip("TODO: 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
+
+    @unittest.skip("TODO: Not Implemented")
+    def test_web_search_builtin_tool(self):
+        super().test_web_search_builtin_tool()
 
     # Inherited from MCPTests:
     # - test_mcp_basic_tool_call

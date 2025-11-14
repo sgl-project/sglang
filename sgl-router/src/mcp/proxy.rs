@@ -122,6 +122,7 @@ mod tests {
                 url: "http://localhost:3000/sse".to_string(),
                 token: None,
             },
+            label: None,
             proxy: None,
             required: false,
         };
@@ -141,6 +142,7 @@ mod tests {
                 url: "http://localhost:3000/sse".to_string(),
                 token: None,
             },
+            label: None,
             proxy: None,
             required: false,
         };
@@ -177,6 +179,7 @@ mod tests {
                 url: "http://localhost:3000/sse".to_string(),
                 token: None,
             },
+            label: None,
             proxy: Some(server_proxy),
             required: false,
         };

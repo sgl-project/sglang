@@ -47,7 +47,7 @@ pub struct ResponseTool {
 impl Default for ResponseTool {
     fn default() -> Self {
         Self {
-            r#type: ResponseToolType::WebSearchPreview,
+            r#type: ResponseToolType::Function,
             function: None,
             server_url: None,
             authorization: None,
@@ -63,7 +63,8 @@ impl Default for ResponseTool {
 #[serde(rename_all = "snake_case")]
 pub enum ResponseToolType {
     Function,
-    WebSearchPreview,
+    WebSearch,
+    FileSearch,
     CodeInterpreter,
     Mcp,
 }
@@ -251,6 +252,24 @@ pub enum ResponseOutputItem {
         output: String,
         server_label: String,
     },
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        status: String,
+        action: WebSearchAction,
+    },
+}
+
+// ============================================================================
+// Built-in Tool Types
+// ============================================================================
+
+/// Web search action for built-in web search tool
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebSearchAction {
+    #[serde(rename = "type")]
+    pub action_type: String, // "search"
+    pub query: String,
 }
 
 // ============================================================================

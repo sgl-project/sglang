@@ -3,6 +3,7 @@
 //! Provides MCP client functionality including tools, prompts, resources, and OAuth.
 //! Supports stdio, SSE, and HTTP transports with connection pooling and caching.
 
+pub mod builtin_tools;
 pub mod config;
 pub mod connection_pool;
 pub mod error;
@@ -13,6 +14,10 @@ pub mod proxy;
 pub mod tool_args;
 
 // Re-export the main types for convenience
+pub use builtin_tools::{
+    BuiltinToolCall, BuiltinToolConverter, BuiltinToolDetector, BuiltinToolFormatter,
+    BuiltinToolResult, BuiltinToolType,
+};
 pub use config::{
     InventoryConfig, McpConfig, McpPoolConfig, McpProxyConfig, McpServerConfig, McpTransport,
     Prompt, RawResource, Tool, WarmupServer,

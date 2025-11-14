@@ -230,6 +230,7 @@ mod tests {
                 url: url.to_string(),
                 token: None,
             },
+            label: None,
             proxy: None,
             required: false,
         }

@@ -21,7 +21,10 @@ use uuid::Uuid;
 
 use super::conversions;
 use crate::{
-    mcp::{self, McpManager},
+    mcp::{
+        self, BuiltinToolConverter, BuiltinToolDetector, BuiltinToolFormatter, BuiltinToolResult,
+        BuiltinToolType, McpManager,
+    },
     protocols::{
         chat::{
             ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -31,7 +34,7 @@ use crate::{
         responses::{
             self, McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponseOutputItem, ResponseStatus, ResponseToolType, ResponsesRequest,
-            ResponsesResponse,
+            ResponsesResponse, WebSearchAction,
         },
     },
     routers::grpc::{
@@ -95,6 +98,19 @@ fn extract_all_tool_calls_from_chat(
     }
 }
 
+/// Record for tracking built-in tool calls
+#[derive(Debug, Clone)]
+struct BuiltinCallRecord {
+    call_id: String,
+    tool_type: BuiltinToolType,
+    #[allow(dead_code)]
+    tool_name: String,
+    #[allow(dead_code)]
+    arguments: String,
+    output: String,
+    success: bool,
+}
+
 /// State for tracking multi-turn tool calling loop
 struct ToolLoopState {
     iteration: usize,
@@ -102,6 +118,7 @@ struct ToolLoopState {
     conversation_history: Vec<ResponseInputOutputItem>,
     original_input: ResponseInput,
     mcp_call_items: Vec<ResponseOutputItem>,
+    builtin_call_items: Vec<BuiltinCallRecord>,
     server_label: String,
 }
 
@@ -113,6 +130,7 @@ impl ToolLoopState {
             conversation_history: Vec::new(),
             original_input,
             mcp_call_items: Vec::new(),
+            builtin_call_items: Vec::new(),
             server_label,
         }
     }
@@ -147,6 +165,37 @@ impl ToolLoopState {
             error.as_deref(),
         );
         self.mcp_call_items.push(mcp_call);
+    }
+
+    fn record_builtin_call(
+        &mut self,
+        call_id: String,
+        tool_type: BuiltinToolType,
+        tool_name: String,
+        arguments: String,
+        output: String,
+        success: bool,
+    ) {
+        // Add function_tool_call item to conversation history
+        self.conversation_history
+            .push(ResponseInputOutputItem::FunctionToolCall {
+                id: call_id.clone(),
+                call_id: call_id.clone(),
+                name: tool_name.clone(),
+                arguments: arguments.clone(),
+                output: Some(output.clone()),
+                status: Some("completed".to_string()),
+            });
+
+        // Track built-in call separately for formatting later
+        self.builtin_call_items.push(BuiltinCallRecord {
+            call_id,
+            tool_type,
+            tool_name,
+            arguments,
+            output,
+            success,
+        });
     }
 }
 
@@ -240,12 +289,112 @@ pub(super) async fn execute_tool_loop(
         server_label, max_tool_calls, MAX_ITERATIONS
     );
 
-    // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = ctx.mcp_manager.list_tools();
+    // Detect and convert built-in tools first
+    let (builtin_tool_map, builtin_mcp_tools, builtin_server_names) = if let Some(tools) =
+        &original_request.tools
+    {
+        if BuiltinToolDetector::has_builtin_tools(tools) {
+            debug!("Built-in tools detected in request, starting conversion");
+
+            // Detect built-in tool types
+            let builtin_types = match BuiltinToolDetector::detect(tools) {
+                Ok(types) => {
+                    debug!(
+                        "Detected {} built-in tool type(s): {:?}",
+                        types.len(),
+                        types.iter().map(|t| t.fixed_label()).collect::<Vec<_>>()
+                    );
+                    types
+                }
+                Err(e) => {
+                    error!("Built-in tool validation failed: {}", e);
+                    return Err(error::bad_request(e));
+                }
+            };
+
+            // Convert built-in tools to MCP tools with synthetic names
+            let converted = match BuiltinToolConverter::convert_to_mcp(
+                &builtin_types,
+                &ctx.mcp_manager,
+            )
+            .await
+            {
+                Ok(tools) => {
+                    debug!(
+                        "Successfully converted built-in tools to {} MCP tool(s)",
+                        tools.len()
+                    );
+                    tools
+                }
+                Err(e) => {
+                    error!("Failed to convert built-in tools to MCP: {}", e);
+                    return Err(error::bad_request(format!("Built-in tool error: {}", e)));
+                }
+            };
+
+            // Build map: synthetic_name -> (tool_type, server_name)
+            // Also track which servers are used for built-in tools to exclude their original tools
+            let mut map = HashMap::new();
+            let mut tools_to_add = Vec::new();
+            let mut server_names_used = std::collections::HashSet::new();
+
+            for (server_name, tool) in converted {
+                let synthetic_name = tool.name.to_string();
+
+                // Determine tool type from synthetic name prefix (centralized in BuiltinToolType)
+                let Some(tool_type) = BuiltinToolType::from_synthetic_name(&synthetic_name) else {
+                    continue;
+                };
+
+                debug!(
+                    "Mapped built-in tool: {} -> {} (label: {}, server: {})",
+                    synthetic_name,
+                    match tool_type {
+                        BuiltinToolType::WebSearch => "WebSearch",
+                        BuiltinToolType::FileSearch => "FileSearch",
+                        BuiltinToolType::CodeInterpreter => "CodeInterpreter",
+                    },
+                    tool_type.fixed_label(),
+                    server_name
+                );
+
+                map.insert(synthetic_name.clone(), (tool_type, server_name.clone()));
+                server_names_used.insert(server_name);
+                tools_to_add.push(tool);
+            }
+
+            debug!(
+                "Built-in tool conversion complete: {} synthetic tool name(s) mapped to {} MCP tool(s), excluding servers: {:?}",
+                map.len(),
+                tools_to_add.len(),
+                server_names_used
+            );
+            (map, tools_to_add, server_names_used)
+        } else {
+            (HashMap::new(), Vec::new(), std::collections::HashSet::new())
+        }
+    } else {
+        (HashMap::new(), Vec::new(), std::collections::HashSet::new())
+    };
+
+    // Get MCP tools, filtering out servers that are used for built-in tools
+    let mut mcp_tools: Vec<mcp::Tool> = if builtin_server_names.is_empty() {
+        // No built-in tools, get all MCP tools
+        ctx.mcp_manager.list_tools()
+    } else {
+        // Filter out tools from servers used by built-in tools
+        ctx.mcp_manager
+            .list_tools_excluding_servers(&builtin_server_names)
+    };
+
+    // Add built-in tools (with synthetic names)
+    mcp_tools.extend(builtin_mcp_tools);
+
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     debug!(
-        "Converted {} MCP tools to chat format",
-        mcp_chat_tools.len()
+        "Converted {} total tools to chat format ({} built-in)",
+        mcp_chat_tools.len(),
+        builtin_tool_map.len()
     );
 
     loop {
@@ -362,16 +511,39 @@ pub(super) async fn execute_tool_loop(
                 return Ok(responses_response);
             }
 
-            // Execute all MCP tools
+            // Execute all MCP tools (including built-in tools with synthetic names)
             for (call_id, tool_name, args_json_str) in mcp_tool_calls {
+                // Check if this is a built-in tool
+                let is_builtin_tool = builtin_tool_map.contains_key(&tool_name);
+
+                // For built-in tools, strip the synthetic prefix to get the real tool name
+                // e.g., "web_search_builtin__brave_web_search" -> "brave_web_search"
+                let actual_tool_name = if is_builtin_tool {
+                    // Extract the real tool name after the "__" separator
+                    tool_name
+                        .split_once("__")
+                        .map(|(_, real_name)| real_name)
+                        .unwrap_or(&tool_name)
+                } else {
+                    &tool_name
+                };
+
                 debug!(
-                    "Calling MCP tool '{}' (call_id: {}) with args: {}",
-                    tool_name, call_id, args_json_str
+                    "Calling {} tool '{}' (call_id: {}) with args: {}{}",
+                    if is_builtin_tool { "built-in" } else { "MCP" },
+                    tool_name,
+                    call_id,
+                    args_json_str,
+                    if is_builtin_tool {
+                        format!(" [actual: {}]", actual_tool_name)
+                    } else {
+                        String::new()
+                    }
                 );
 
                 let (output_str, success, error) = match ctx
                     .mcp_manager
-                    .call_tool(tool_name.as_str(), args_json_str.as_str())
+                    .call_tool(actual_tool_name, args_json_str.as_str())
                     .await
                 {
                     Ok(result) => match serde_json::to_string(&result) {
@@ -392,15 +564,27 @@ pub(super) async fn execute_tool_loop(
                     }
                 };
 
-                // Record the call in state
-                state.record_call(
-                    call_id,
-                    tool_name,
-                    args_json_str,
-                    output_str,
-                    success,
-                    error,
-                );
+                // Record the call in state (differently for built-in tools)
+                if is_builtin_tool {
+                    let (tool_type, _server_name) = builtin_tool_map.get(&tool_name).unwrap();
+                    state.record_builtin_call(
+                        call_id,
+                        *tool_type,
+                        tool_name,
+                        args_json_str,
+                        output_str,
+                        success,
+                    );
+                } else {
+                    state.record_call(
+                        call_id,
+                        tool_name,
+                        args_json_str,
+                        output_str,
+                        success,
+                        error,
+                    );
+                }
 
                 // Increment total calls counter
                 state.total_calls += 1;
@@ -484,19 +668,74 @@ pub(super) async fn execute_tool_loop(
                 error::internal_error(format!("Failed to convert to responses format: {}", e))
             })?;
 
-            // Inject MCP metadata into output
+            // Inject MCP metadata and built-in tool outputs
             if state.total_calls > 0 {
-                // Prepend mcp_list_tools item
-                let mcp_list_tools = build_mcp_list_tools_item(&ctx.mcp_manager, &server_label);
-                responses_response.output.insert(0, mcp_list_tools);
+                let mcp_call_count = state.mcp_call_items.len();
+                let builtin_call_count = state.builtin_call_items.len();
 
-                // Append all mcp_call items at the end
-                responses_response.output.extend(state.mcp_call_items);
+                // Only add MCP metadata if there were actual MCP tool calls (not built-in)
+                if mcp_call_count > 0 {
+                    // Prepend mcp_list_tools item
+                    let mcp_list_tools = build_mcp_list_tools_item(&ctx.mcp_manager, &server_label);
+                    responses_response.output.insert(0, mcp_list_tools);
 
-                debug!(
-                    "Injected MCP metadata: 1 mcp_list_tools + {} mcp_call items",
-                    state.total_calls
-                );
+                    // Append all mcp_call items for regular MCP tools
+                    responses_response.output.extend(state.mcp_call_items);
+
+                    debug!(
+                        "Injected MCP metadata: 1 mcp_list_tools + {} mcp_call items",
+                        mcp_call_count
+                    );
+                }
+
+                // Format and append built-in tool outputs as web_search_call, etc.
+                // Built-in tools should NOT expose mcp_list_tools or mcp_call outputs
+                if builtin_call_count > 0 {
+                    for builtin_call in &state.builtin_call_items {
+                        let result = BuiltinToolResult {
+                            tool_type: builtin_call.tool_type,
+                            call_id: builtin_call.call_id.clone(),
+                            arguments: builtin_call.arguments.clone(),
+                            mcp_output: serde_json::from_str(&builtin_call.output)
+                                .unwrap_or_else(|_| json!({"error": "Failed to parse output"})),
+                            is_error: !builtin_call.success,
+                        };
+
+                        match BuiltinToolFormatter::format_output(result) {
+                            Ok(output_item) => responses_response.output.push(output_item),
+                            Err(e) => {
+                                error!("Failed to format built-in tool output: {}", e);
+                                // Construct tool-specific error output item instead of defaulting to web_search
+                                match builtin_call.tool_type {
+                                    BuiltinToolType::WebSearch => {
+                                        responses_response.output.push(
+                                            ResponseOutputItem::WebSearchCall {
+                                                id: format!("ws_{}", builtin_call.call_id),
+                                                status: "failed".to_string(),
+                                                action: WebSearchAction {
+                                                    action_type: "search".to_string(),
+                                                    query: "".to_string(),
+                                                },
+                                            },
+                                        );
+                                    }
+                                    // TODO: Add cases for FileSearch and CodeInterpreter when implemented.
+                                    _ => {
+                                        error!(
+                                            "Formatting failed for an unhandled built-in tool type: {:?}",
+                                             builtin_call.tool_type
+                                             );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    debug!(
+                        "Injected {} built-in tool output items (hiding MCP details)",
+                        builtin_call_count
+                    );
+                }
             }
 
             return Ok(responses_response);

@@ -39,6 +39,8 @@ pub struct McpManager {
     inventory: Arc<ToolInventory>,
     connection_pool: Arc<McpConnectionPool>,
     _config: McpConfig,
+    // Map server names to their labels for built-in tool routing
+    server_labels: Arc<DashMap<String, String>>,
 }
 
 impl McpManager {
@@ -69,6 +71,10 @@ impl McpManager {
 
         // Connect to all static servers from config
         for server_config in &config.servers {
+            debug!(
+                "Loading MCP server from config: name={}, label={:?}",
+                server_config.name, server_config.label
+            );
             match Self::connect_server(server_config, global_proxy).await {
                 Ok(client) => {
                     let client_arc = Arc::new(client);
@@ -90,11 +96,20 @@ impl McpManager {
             warn!("No static MCP servers connected");
         }
 
+        // Initialize server_labels map with labels from config
+        let server_labels = Arc::new(DashMap::new());
+        for server in &config.servers {
+            if let Some(ref label) = server.label {
+                server_labels.insert(server.name.clone(), label.clone());
+            }
+        }
+
         Ok(Self {
             static_clients,
             inventory,
             connection_pool,
             _config: config,
+            server_labels,
         })
     }
 
@@ -147,9 +162,54 @@ impl McpManager {
         self.static_clients.contains_key(server_name)
     }
 
+    /// Get static MCP server name by label
+    ///
+    /// Returns the first static server with matching label, or None if not found.
+    ///
+    /// # Important
+    /// This method ONLY searches static servers from mcp.yaml configuration.
+    /// Dynamic servers (from request server_url) are NOT included in the search.
+    /// This is intentional - built-in tools only work with dedicated static servers.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // In mcp.yaml:
+    /// // - name: brave-search
+    /// //   label: web_search
+    ///
+    /// let server = manager.get_server_by_label("web_search");
+    /// assert_eq!(server, Some("brave-search".to_string()));
+    /// ```
+    pub fn get_server_by_label(&self, label: &str) -> Option<String> {
+        // Find the first server with the given label
+        self.server_labels
+            .iter()
+            .find(|entry| entry.value() == label)
+            .map(|entry| entry.key().clone())
+    }
+
     pub fn register_static_server(&self, name: String, client: Arc<McpClient>) {
+        self.register_static_server_with_label(name, client, None);
+    }
+
+    pub fn register_static_server_with_label(
+        &self,
+        name: String,
+        client: Arc<McpClient>,
+        label: Option<String>,
+    ) {
         self.static_clients.insert(name.clone(), client);
-        info!("Registered static MCP server: {}", name);
+
+        // Store the label in the labels map for get_server_by_label lookups
+        if let Some(label_value) = label {
+            self.server_labels.insert(name.clone(), label_value.clone());
+            info!(
+                "Registered static MCP server: {} with label '{}'",
+                name, label_value
+            );
+        } else {
+            info!("Registered static MCP server: {}", name);
+        }
     }
 
     /// List all available tools from all servers
@@ -159,6 +219,56 @@ impl McpManager {
             .into_iter()
             .map(|(_tool_name, _server_name, tool_info)| tool_info)
             .collect()
+    }
+
+    /// List all available tools, excluding specified servers
+    /// Used by built-in tools to filter out original tools from dedicated servers
+    pub fn list_tools_excluding_servers(
+        &self,
+        excluded_servers: &std::collections::HashSet<String>,
+    ) -> Vec<Tool> {
+        self.inventory
+            .list_tools()
+            .into_iter()
+            .filter_map(|(tool_name, server_name, tool_info)| {
+                if excluded_servers.contains(&server_name) {
+                    tracing::debug!(
+                        "Filtering out original tool '{}' from server '{}' (used by built-in tool)",
+                        tool_name,
+                        server_name
+                    );
+                    None
+                } else {
+                    Some(tool_info)
+                }
+            })
+            .collect()
+    }
+
+    /// List tools from a specific server
+    ///
+    /// Returns all tools available from the specified server from the cached inventory.
+    /// This is much faster than querying the MCP server directly and avoids timeout issues.
+    ///
+    /// # Arguments
+    /// * `server_name` - Name of the static MCP server
+    ///
+    /// # Returns
+    /// * `Ok(Vec<Tool>)` - List of tools from the server inventory
+    /// * `Err(McpError)` - If server not found
+    ///
+    /// # Example
+    /// ```ignore
+    /// let tools = manager.list_tools_for_server("brave-search").await?;
+    /// ```
+    pub async fn list_tools_for_server(&self, server_name: &str) -> McpResult<Vec<Tool>> {
+        // Check if the server exists
+        if !self.static_clients.contains_key(server_name) {
+            return Err(McpError::ServerNotFound(server_name.to_string()));
+        }
+
+        // Get tools from the cached inventory
+        Ok(self.inventory.list_tools_by_server(server_name))
     }
 
     /// Call a tool by name with automatic type coercion

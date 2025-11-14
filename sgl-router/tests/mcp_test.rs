@@ -51,6 +51,7 @@ async fn test_server_connection_with_mock() {
 
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "mock_server".to_string(),
             transport: McpTransport::Streamable {
                 url: mock_server.url(),
@@ -89,6 +90,7 @@ async fn test_tool_availability_checking() {
 
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "mock_server".to_string(),
             transport: McpTransport::Streamable {
                 url: mock_server.url(),
@@ -138,6 +140,7 @@ async fn test_multi_server_connection() {
     let config = McpConfig {
         servers: vec![
             McpServerConfig {
+                label: None,
                 name: "mock_server_1".to_string(),
                 transport: McpTransport::Streamable {
                     url: mock_server1.url(),
@@ -147,6 +150,7 @@ async fn test_multi_server_connection() {
                 required: false,
             },
             McpServerConfig {
+                label: None,
                 name: "mock_server_2".to_string(),
                 transport: McpTransport::Streamable {
                     url: mock_server2.url(),
@@ -183,6 +187,7 @@ async fn test_tool_execution_with_mock() {
 
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "mock_server".to_string(),
             transport: McpTransport::Streamable {
                 url: mock_server.url(),
@@ -240,6 +245,7 @@ async fn test_concurrent_tool_execution() {
 
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "mock_server".to_string(),
             transport: McpTransport::Streamable {
                 url: mock_server.url(),
@@ -283,6 +289,7 @@ async fn test_tool_execution_errors() {
 
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "mock_server".to_string(),
             transport: McpTransport::Streamable {
                 url: mock_server.url(),
@@ -319,6 +326,7 @@ async fn test_tool_execution_errors() {
 async fn test_connection_without_server() {
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "nonexistent".to_string(),
             transport: McpTransport::Stdio {
                 command: "/nonexistent/command".to_string(),
@@ -354,6 +362,7 @@ async fn test_tool_info_structure() {
 
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "mock_server".to_string(),
             transport: McpTransport::Streamable {
                 url: mock_server.url(),
@@ -394,6 +403,7 @@ async fn test_sse_connection() {
     // This tests that SSE configuration is properly handled even when connection fails
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "sse_test".to_string(),
             transport: McpTransport::Stdio {
                 command: "/nonexistent/sse/server".to_string(),
@@ -427,6 +437,7 @@ async fn test_sse_connection() {
 async fn test_transport_types() {
     // HTTP/Streamable transport
     let http_config = McpServerConfig {
+        label: None,
         name: "http_server".to_string(),
         transport: McpTransport::Streamable {
             url: "http://localhost:8080/mcp".to_string(),
@@ -439,6 +450,7 @@ async fn test_transport_types() {
 
     // SSE transport
     let sse_config = McpServerConfig {
+        label: None,
         name: "sse_server".to_string(),
         transport: McpTransport::Sse {
             url: "http://localhost:8081/sse".to_string(),
@@ -451,6 +463,7 @@ async fn test_transport_types() {
 
     // STDIO transport
     let stdio_config = McpServerConfig {
+        label: None,
         name: "stdio_server".to_string(),
         transport: McpTransport::Stdio {
             command: "mcp-server".to_string(),
@@ -472,6 +485,7 @@ async fn test_complete_workflow() {
     // 1. Initialize configuration
     let config = McpConfig {
         servers: vec![McpServerConfig {
+            label: None,
             name: "integration_test".to_string(),
             transport: McpTransport::Streamable {
                 url: mock_server.url(),

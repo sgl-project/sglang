@@ -75,6 +75,10 @@ class TestOpenaiBackend(
     def test_mixed_mcp_and_function_tools_streaming(self):
         super().test_mixed_mcp_and_function_tools_streaming()
 
+    @unittest.skip("TODO: Not Implemented")
+    def test_web_search_builtin_tool(self):
+        super().test_web_search_builtin_tool()
+
 
 class TestXaiBackend(StateManagementTests):
     """End to end tests for XAI backend."""

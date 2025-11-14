@@ -307,7 +307,7 @@ fn test_responses_request_creation() {
         temperature: Some(0.7),
         tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
         tools: Some(vec![ResponseTool {
-            r#type: ResponseToolType::WebSearchPreview,
+            r#type: ResponseToolType::WebSearch,
             ..Default::default()
         }]),
         top_logprobs: Some(5),
