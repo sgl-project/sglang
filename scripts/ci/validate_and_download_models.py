@@ -351,9 +351,18 @@ def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -
 
     print(f"Downloading model: {model_id}")
 
+    # Ensure the cache directory exists
+    cache_path = Path(cache_dir)
+    try:
+        cache_path.mkdir(parents=True, exist_ok=True)
+        print(f"  Ensured cache directory exists: {cache_dir}")
+    except Exception as e:
+        print(f"  ✗ Failed to create cache directory: {e}")
+        return False
+
     # Completely remove the model directory from cache
     cache_model_name = "models--" + model_id.replace("/", "--")
-    model_cache_path = Path(cache_dir) / cache_model_name
+    model_cache_path = cache_path / cache_model_name
 
     if model_cache_path.exists():
         print(f"  Removing entire model directory: {model_cache_path}")
@@ -368,17 +377,42 @@ def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -
 
     print(f"  Downloading from HuggingFace (this may take a while for large models)...")
 
-    try:
-        snapshot_download(
-            repo_id=model_id,
-            allow_patterns=["*.safetensors", "*.bin", "*.json", "*.txt", "*.model"],
-            ignore_patterns=["*.msgpack", "*.h5", "*.ot"],  # codespell:ignore ot
-        )
-        print(f"  ✓ Download completed: {model_id}")
-        return True
-    except Exception as e:
-        print(f"  ✗ Download failed: {e}")
-        return False
+    # Retry download up to 3 times to handle transient failures
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            if attempt > 1:
+                print(f"  Retry attempt {attempt}/{max_retries}...")
+
+            snapshot_download(
+                repo_id=model_id,
+                allow_patterns=["*.safetensors", "*.bin", "*.json", "*.txt", "*.model"],
+                ignore_patterns=["*.msgpack", "*.h5", "*.ot"],  # codespell:ignore ot
+            )
+            print(f"  ✓ Download completed: {model_id}")
+            return True
+        except Exception as e:
+            if attempt < max_retries:
+                print(f"  ✗ Download attempt {attempt} failed: {e}")
+                print(f"  Cleaning up partial download before retry...")
+                # Clean up partial download to ensure fresh retry
+                if model_cache_path.exists():
+                    try:
+                        shutil.rmtree(model_cache_path)
+                        print(f"    ✓ Cleaned up partial download")
+                    except Exception as cleanup_error:
+                        print(f"    ⚠ Failed to clean up: {cleanup_error}")
+                print(f"  Retrying...")
+            else:
+                print(f"  ✗ Download failed after {max_retries} attempts: {e}")
+                # Clean up failed download
+                if model_cache_path.exists():
+                    try:
+                        shutil.rmtree(model_cache_path)
+                        print(f"    ✓ Cleaned up failed download")
+                    except Exception as cleanup_error:
+                        print(f"    ⚠ Failed to clean up: {cleanup_error}")
+                return False
 
 
 def get_runner_labels() -> List[str]:
