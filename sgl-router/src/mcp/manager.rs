@@ -515,7 +515,6 @@ impl McpManager {
         server_name: &str,
         client: &Arc<McpClient>,
     ) {
-        // Tools -> Static inventory
         match client.peer().list_all_tools().await {
             Ok(ts) => {
                 info!(
@@ -530,7 +529,6 @@ impl McpManager {
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
         }
 
-        // Prompts
         match client.peer().list_all_prompts().await {
             Ok(ps) => {
                 info!("Discovered {} prompts from '{}'", ps.len(), server_name);
@@ -541,7 +539,6 @@ impl McpManager {
             Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
         }
 
-        // Resources
         match client.peer().list_all_resources().await {
             Ok(rs) => {
                 info!("Discovered {} resources from '{}'", rs.len(), server_name);
@@ -556,7 +553,6 @@ impl McpManager {
     /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
     /// Used for refreshing static servers
     async fn load_server_inventory_internal(&self, server_name: &str, client: &McpClient) {
-        // Tools -> Static inventory (this is for refresh of config servers)
         match client.peer().list_all_tools().await {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_name);
@@ -571,7 +567,6 @@ impl McpManager {
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
         }
 
-        // Prompts
         match client.peer().list_all_prompts().await {
             Ok(ps) => {
                 info!("Discovered {} prompts from '{}'", ps.len(), server_name);
@@ -583,7 +578,6 @@ impl McpManager {
             Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
         }
 
-        // Resources
         match client.peer().list_all_resources().await {
             Ok(rs) => {
                 info!("Discovered {} resources from '{}'", rs.len(), server_name);

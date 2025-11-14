@@ -199,10 +199,7 @@ impl ToolInventory {
 
     /// Clear all cached items for a specific server (called when LRU evicts client)
     pub fn clear_server_tools(&self, server_name: &str) {
-        // Clear from static tools (where key is (server_name, tool_name))
         self.static_tools.retain(|key, _| key.0 != server_name);
-
-        // Clear prompts and resources
         self.prompts
             .retain(|_, cached| cached.server_name != server_name);
         self.resources
