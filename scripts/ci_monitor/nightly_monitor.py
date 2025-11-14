@@ -464,6 +464,63 @@ class NightlyTestMonitor:
 
         return stats
 
+    def generate_github_summary(self, stats: Dict, regressions: List[Dict]):
+        """Generate GitHub Actions step summary"""
+        github_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if not github_summary:
+            return
+
+        with open(github_summary, "a") as f:
+            f.write("# Nightly Test Monitor Report\n\n")
+            f.write(
+                f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+
+            # Summary stats
+            f.write("## Summary\n\n")
+            f.write(f"- Total Runs: {stats['total_runs']}\n")
+            f.write(
+                f"- Successful: {stats['successful_runs']} "
+                f"({stats['successful_runs']/max(1, stats['total_runs'])*100:.1f}%)\n"
+            )
+            f.write(
+                f"- Failed: {stats['failed_runs']} "
+                f"({stats['failed_runs']/max(1, stats['total_runs'])*100:.1f}%)\n\n"
+            )
+
+            # Regressions
+            if regressions:
+                f.write("## Regressions Detected\n\n")
+                for reg in regressions:
+                    if reg["type"] == "performance_regression":
+                        f.write(
+                            f"- **{reg['job_name']}**: {reg['metric_name']} "
+                            f"({reg['percent_change']:+.1f}%)\n"
+                        )
+
+            # Performance metrics table
+            f.write("\n## Performance Metrics\n\n")
+            f.write("| Job | Metric | Current | Change |\n")
+            f.write("|-----|--------|---------|--------|\n")
+
+            for job_name, job_stat in stats["job_stats"].items():
+                if job_stat.get("performance_metrics"):
+                    perf_metrics = job_stat["performance_metrics"]
+                    comparisons = self.compare_with_historical(perf_metrics, days=7)
+
+                    for metric_name, metric_data in perf_metrics.items():
+                        if metric_data:
+                            values = [m["value"] for m in metric_data]
+                            avg_value = sum(values) / len(values)
+                            comparison = comparisons.get(metric_name, {})
+                            percent_change = comparison.get("percent_change")
+
+                            if percent_change is not None:
+                                f.write(
+                                    f"| {job_name} | {metric_name} | {avg_value:.2f} | "
+                                    f"{percent_change:+.1f}% |\n"
+                                )
+
     def generate_report(self, stats: Dict, output_file: str = None):
         """Generate a human-readable report"""
         print("\n" + "=" * 80)
@@ -690,6 +747,9 @@ def main():
 
     # Detect regressions
     regressions = monitor.detect_regressions(stats)
+
+    # Generate GitHub Actions summary
+    monitor.generate_github_summary(stats, regressions)
 
     # Exit with error code if regressions detected
     if regressions:
