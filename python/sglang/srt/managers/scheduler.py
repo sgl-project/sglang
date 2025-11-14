@@ -180,6 +180,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
+    patch_torch,
     point_to_point_pyobj,
     require_mlp_sync,
     set_gpu_proc_affinity,
@@ -294,6 +295,9 @@ class Scheduler(
         # Init pdmux context
         if self.enable_pdmux:
             self.init_pdmux()
+
+        if get_bool_env_var("SGLANG_SANITY_CHECK_TORCH_EMPTY"):
+            patch_torch.handle_sanity_check_torch_empty()
 
         # Init tokenizer
         self.init_tokenizer()
