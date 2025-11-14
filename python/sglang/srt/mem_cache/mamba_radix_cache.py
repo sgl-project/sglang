@@ -326,6 +326,7 @@ class MambaRadixCache(BasePrefixCache):
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
         disable: bool = False,
+        enable_metrics: bool = False,
     ):
         assert isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
@@ -339,6 +340,9 @@ class MambaRadixCache(BasePrefixCache):
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         self.key_match_fn = _key_match_page_size1
         self.get_child_key_fn = get_child_key
@@ -426,20 +430,21 @@ class MambaRadixCache(BasePrefixCache):
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         return self._insert_helper(self.root_node, key, value, mamba_value)
 
-    def cache_finished_req(self, req: Req, is_insert=True) -> None:
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
+        kv_committed_len = req.pop_committed_kv_cache()
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx,
-                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_committed_len
         ]
 
         page_aligned_len = len(kv_indices)
@@ -448,11 +453,7 @@ class MambaRadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
-        mamba_value = (
-            self.req_to_token_pool.get_mamba_indices(req.req_pool_idx)
-            .unsqueeze(-1)
-            .clone()
-        )
+        mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
 
         if is_insert:
             new_prefix_len, mamba_exist = self.insert(
@@ -469,8 +470,11 @@ class MambaRadixCache(BasePrefixCache):
             )
             mamba_exist = True
 
-        self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
-        self.dec_lock_ref(req.last_node)
+        if req.req_pool_idx is not None:
+            self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
+            self.dec_lock_ref(req.last_node)
+        else:  # for abort case
+            self.req_to_token_pool.mamba_pool.free(mamba_value)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

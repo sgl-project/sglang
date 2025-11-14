@@ -5,12 +5,11 @@
 
 use std::{sync::Arc, time::Instant};
 
-use proto::generate_complete::MatchedStop;
 use serde_json::Value;
 use tracing::error;
 
 use crate::{
-    grpc_client::proto,
+    grpc_client::sglang_proto::generate_complete::MatchedStop,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
@@ -20,7 +19,9 @@ use crate::{
     routers::grpc::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        error, utils,
+        error,
+        proto_wrapper::ProtoGenerateComplete,
+        utils,
     },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
@@ -60,7 +61,7 @@ impl ResponseProcessor {
     #[allow(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
-        complete: &proto::GenerateComplete,
+        complete: &ProtoGenerateComplete,
         index: usize,
         original_request: &ChatCompletionRequest,
         stop_decoder: &mut StopSequenceDecoder,
@@ -71,7 +72,7 @@ impl ResponseProcessor {
         stop_decoder.reset();
         // Decode tokens
         let outputs = stop_decoder
-            .process_tokens(&complete.output_ids)
+            .process_tokens(complete.output_ids())
             .map_err(|e| format!("Failed to process tokens: {}", e))?;
 
         // Accumulate text with early breaks
@@ -153,7 +154,7 @@ impl ResponseProcessor {
         }
 
         // Step 3: Use finish reason directly from proto (already OpenAI-compatible string)
-        let finish_reason_str = &complete.finish_reason;
+        let finish_reason_str = complete.finish_reason();
 
         // Override finish reason if we have tool calls
         let final_finish_reason_str = if tool_calls.is_some() {
@@ -163,7 +164,7 @@ impl ResponseProcessor {
         };
 
         // Extract matched_stop information from proto
-        let matched_stop = match &complete.matched_stop {
+        let matched_stop = match complete.matched_stop() {
             Some(MatchedStop::MatchedTokenId(token_id)) => {
                 Some(Value::Number(serde_json::Number::from(*token_id)))
             }
@@ -172,7 +173,7 @@ impl ResponseProcessor {
         };
 
         // Step 4: Convert output logprobs if present
-        let logprobs = if let Some(proto_logprobs) = &complete.output_logprobs {
+        let logprobs = if let Some(proto_logprobs) = complete.output_logprobs() {
             match utils::convert_proto_to_openai_logprobs(proto_logprobs, &self.tokenizer) {
                 Ok(logprobs) => Some(logprobs),
                 Err(e) => {
@@ -197,16 +198,14 @@ impl ResponseProcessor {
         };
 
         // Step 6: Build ChatChoice
-        let choice = ChatChoice {
+        Ok(ChatChoice {
             index: index as u32,
             message: chat_message,
             logprobs,
             finish_reason: Some(final_finish_reason_str.to_string()),
             matched_stop,
             hidden_states: None,
-        };
-
-        Ok(choice)
+        })
     }
 
     /// Process non-streaming chat response (collects all responses and builds final response)
@@ -289,14 +288,14 @@ impl ResponseProcessor {
         let usage = response_formatting::build_usage(&all_responses);
 
         // Build final ChatCompletionResponse
-        let response = response_formatting::build_chat_response(
-            choices,
-            &dispatch,
-            dispatch.model.clone(),
-            usage,
-        );
-
-        Ok(response)
+        Ok(
+            ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
+                .created(dispatch.created)
+                .choices(choices)
+                .usage(usage)
+                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .build(),
+        )
     }
 
     /// Parse tool calls using model-specific parser
@@ -372,11 +371,11 @@ impl ResponseProcessor {
 
         // Process each completion
         let mut result_array = Vec::new();
-        for mut complete in all_responses {
+        for complete in all_responses {
             stop_decoder.reset();
 
             // Process tokens through stop decoder
-            let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
+            let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
                 Ok(outputs) => outputs,
                 Err(e) => {
                     return Err(error::internal_error(format!(
@@ -405,15 +404,15 @@ impl ResponseProcessor {
                 decoded_text.push_str(&t);
             }
 
-            let output_ids = std::mem::take(&mut complete.output_ids);
-            let finish_reason_str = complete.finish_reason.to_string();
+            let output_ids = complete.output_ids().to_vec();
+            let finish_reason_str = complete.finish_reason();
 
             // Parse finish_reason from string to proper type
             let finish_reason =
-                utils::parse_finish_reason(&finish_reason_str, complete.completion_tokens);
+                utils::parse_finish_reason(finish_reason_str, complete.completion_tokens());
 
             // Handle matched_stop if present
-            let matched_stop = complete.matched_stop.take().map(|matched| match matched {
+            let matched_stop = complete.matched_stop().map(|matched| match matched {
                 MatchedStop::MatchedTokenId(id) => serde_json::json!(id),
                 MatchedStop::MatchedStopStr(s) => serde_json::json!(s),
             });
@@ -421,8 +420,7 @@ impl ResponseProcessor {
             // Extract logprobs if requested (convert proto types to Generate format)
             let input_token_logprobs = if request_logprobs {
                 complete
-                    .input_logprobs
-                    .as_ref()
+                    .input_logprobs()
                     .map(utils::convert_generate_input_logprobs)
             } else {
                 None
@@ -430,8 +428,7 @@ impl ResponseProcessor {
 
             let output_token_logprobs = if request_logprobs {
                 complete
-                    .output_logprobs
-                    .as_ref()
+                    .output_logprobs()
                     .map(utils::convert_generate_output_logprobs)
             } else {
                 None
@@ -441,15 +438,15 @@ impl ResponseProcessor {
             let meta_info = GenerateMetaInfo {
                 id: dispatch.request_id.clone(),
                 finish_reason,
-                prompt_tokens: complete.prompt_tokens as u32,
+                prompt_tokens: complete.prompt_tokens() as u32,
                 weight_version: dispatch
                     .weight_version
                     .clone()
                     .unwrap_or_else(|| "default".to_string()),
                 input_token_logprobs,
                 output_token_logprobs,
-                completion_tokens: complete.completion_tokens as u32,
-                cached_tokens: complete.cached_tokens as u32,
+                completion_tokens: complete.completion_tokens() as u32,
+                cached_tokens: complete.cached_tokens() as u32,
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
             };

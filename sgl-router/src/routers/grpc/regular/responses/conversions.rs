@@ -9,12 +9,15 @@
 
 use crate::{
     protocols::{
-        chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
-        common::{FunctionCallResponse, StreamOptions, ToolCall, ToolChoice, UsageInfo},
+        chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
+        common::{
+            FunctionCallResponse, JsonSchemaFormat, ResponseFormat, StreamOptions, ToolCall,
+            UsageInfo,
+        },
         responses::{
             ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
-            ResponsesResponse, ResponsesUsage, StringOrContentParts,
+            ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
         },
     },
     routers::grpc::common::responses::utils::extract_tools_from_response_tools,
@@ -35,7 +38,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     // 1. Add system message if instructions provided
     if let Some(instructions) = &req.instructions {
         messages.push(ChatMessage::System {
-            content: instructions.clone(),
+            content: MessageContent::Text(instructions.clone()),
             name: None,
         });
     }
@@ -45,7 +48,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         ResponseInput::Text(text) => {
             // Simple text input → user message
             messages.push(ChatMessage::User {
-                content: UserMessageContent::Text(text.clone()),
+                content: MessageContent::Text(text.clone()),
                 name: None,
             });
         }
@@ -108,7 +111,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                         // Add tool result message if output exists
                         if let Some(output_text) = output {
                             messages.push(ChatMessage::Tool {
-                                content: output_text.clone(),
+                                content: MessageContent::Text(output_text.clone()),
                                 tool_call_id: id.clone(),
                             });
                         }
@@ -137,7 +140,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                         // Note: The function name is looked up from prev_outputs in Harmony path
                         // For Chat path, we just use the call_id
                         messages.push(ChatMessage::Tool {
-                            content: output.clone(),
+                            content: MessageContent::Text(output.clone()),
                             tool_call_id: call_id.clone(),
                         });
                     }
@@ -188,6 +191,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         skip_special_tokens: true,
         tools,
         tool_choice: req.tool_choice.clone(),
+        response_format: map_text_to_response_format(&req.text),
         ..Default::default()
     })
 }
@@ -209,26 +213,52 @@ fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
 fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
     match role {
         "user" => ChatMessage::User {
-            content: UserMessageContent::Text(text),
+            content: MessageContent::Text(text),
             name: None,
         },
         "assistant" => ChatMessage::Assistant {
-            content: Some(text),
+            content: Some(MessageContent::Text(text)),
             name: None,
             tool_calls: None,
             reasoning_content: None,
         },
         "system" => ChatMessage::System {
-            content: text,
+            content: MessageContent::Text(text),
             name: None,
         },
         _ => {
             // Unknown role, treat as user message
             ChatMessage::User {
-                content: UserMessageContent::Text(text),
+                content: MessageContent::Text(text),
                 name: None,
             }
         }
+    }
+}
+
+/// Map TextConfig from Responses API to ResponseFormat for Chat API
+///
+/// Converts the structured output configuration from the Responses API format
+/// to the Chat API format for non-Harmony models.
+fn map_text_to_response_format(text: &Option<TextConfig>) -> Option<ResponseFormat> {
+    let text_config = text.as_ref()?;
+    let format = text_config.format.as_ref()?;
+
+    match format {
+        TextFormat::Text => Some(ResponseFormat::Text),
+        TextFormat::JsonObject => Some(ResponseFormat::JsonObject),
+        TextFormat::JsonSchema {
+            name,
+            schema,
+            description: _,
+            strict,
+        } => Some(ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaFormat {
+                name: name.clone(),
+                schema: schema.clone(),
+                strict: *strict,
+            },
+        }),
     }
 }
 
@@ -322,32 +352,15 @@ pub fn chat_to_responses(
     });
 
     // Generate response
-    Ok(ResponsesResponse {
-        id: response_id_override.unwrap_or_else(|| chat_resp.id.clone()),
-        object: "response".to_string(),
-        created_at: chat_resp.created as i64,
-        status,
-        error: None,
-        incomplete_details: None,
-        instructions: original_req.instructions.clone(),
-        max_output_tokens: original_req.max_output_tokens,
-        model: chat_resp.model.clone(),
-        output,
-        parallel_tool_calls: original_req.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: original_req.previous_response_id.clone(),
-        reasoning: None, // TODO: Map reasoning effort if needed
-        store: original_req.store.unwrap_or(true),
-        temperature: original_req.temperature,
-        text: None,
-        tool_choice: ToolChoice::serialize_to_string(&original_req.tool_choice),
-        tools: original_req.tools.clone().unwrap_or_default(),
-        top_p: original_req.top_p,
-        truncation: None,
-        usage,
-        user: None,
-        safety_identifier: original_req.user.clone(),
-        metadata: original_req.metadata.clone().unwrap_or_default(),
-    })
+    let response_id = response_id_override.unwrap_or_else(|| chat_resp.id.clone());
+    Ok(ResponsesResponse::builder(&response_id, &chat_resp.model)
+        .copy_from_request(original_req)
+        .created_at(chat_resp.created as i64)
+        .status(status)
+        .output(output)
+        .maybe_text(original_req.text.clone())
+        .maybe_usage(usage)
+        .build())
 }
 
 #[cfg(test)]

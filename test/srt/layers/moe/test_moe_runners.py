@@ -133,6 +133,28 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
+        "moe_runner_speculative": {
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "triton",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
+                "--speculative-moe-runner-backend",
+                "triton",
+                "--speculative-num-steps",
+                "2",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--attention-backend",
+                "torch_native",
+                "--sampling-backend",
+                "pytorch",
+            ],
+        },
     }
 
     def _run_config(self, config: dict) -> None:
