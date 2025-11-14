@@ -119,7 +119,6 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 out_indices,
                 num_new_pages,
             )
-            out_indices = out_indices.int()
 
         else:
             out_indices = torch.empty(
