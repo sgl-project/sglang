@@ -240,13 +240,42 @@ pub(super) async fn execute_tool_loop(
         server_label, max_tool_calls, MAX_ITERATIONS
     );
 
-    // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = ctx.mcp_manager.list_tools();
+    // Get static MCP tools from inventory
+    let mut mcp_tools = ctx.mcp_manager.list_tools();
+
+    // Extract all unique server URLs from request
+    let server_urls: Vec<String> = original_request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    if matches!(t.r#type, ResponseToolType::Mcp) {
+                        t.server_url.as_ref().cloned()
+                    } else {
+                        None
+                    }
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Map tool names to their server URLs for execution
+    let mut tool_to_server: HashMap<String, String> = HashMap::new();
+
+    // Get tools from all dynamic servers
+    for url in &server_urls {
+        let dynamic_tools = ctx.mcp_manager.list_dynamic_tools(url).await;
+        for tool in &dynamic_tools {
+            tool_to_server.insert(tool.name.to_string(), url.clone());
+        }
+        mcp_tools.extend(dynamic_tools);
+    }
+
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
-    debug!(
-        "Converted {} MCP tools to chat format",
-        mcp_chat_tools.len()
-    );
 
     loop {
         // Convert to chat request
@@ -364,31 +393,43 @@ pub(super) async fn execute_tool_loop(
 
             // Execute all MCP tools
             for (call_id, tool_name, args_json_str) in mcp_tool_calls {
-                debug!(
-                    "Calling MCP tool '{}' (call_id: {}) with args: {}",
-                    tool_name, call_id, args_json_str
-                );
+                let (output_str, success, error) = match tool_to_server.get(&tool_name) {
+                    Some(url) => {
+                        let args_map = match serde_json::from_str::<Value>(&args_json_str) {
+                            Ok(Value::Object(map)) => Some(map),
+                            _ => None,
+                        };
 
-                let (output_str, success, error) = match ctx
-                    .mcp_manager
-                    .call_tool(tool_name.as_str(), args_json_str.as_str())
-                    .await
-                {
-                    Ok(result) => match serde_json::to_string(&result) {
-                        Ok(output) => (output, true, None),
-                        Err(e) => {
-                            let err = format!("Failed to serialize tool result: {}", e);
-                            warn!("{}", err);
-                            let error_json = json!({ "error": &err }).to_string();
-                            (error_json, false, Some(err))
+                        match ctx
+                            .mcp_manager
+                            .call_dynamic_tool(
+                                url,
+                                rmcp::model::CallToolRequestParam {
+                                    name: std::borrow::Cow::Owned(tool_name.to_string()),
+                                    arguments: args_map,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(result) => match serde_json::to_string(&result) {
+                                Ok(output) => (output, true, None),
+                                Err(e) => {
+                                    let err = format!("Failed to serialize tool result: {}", e);
+                                    warn!("{}", err);
+                                    (json!({ "error": &err }).to_string(), false, Some(err))
+                                }
+                            },
+                            Err(e) => {
+                                let err_str = format!("Tool call failed: {}", e);
+                                warn!("{}", err_str);
+                                (json!({ "error": &err_str }).to_string(), false, Some(err_str))
+                            }
                         }
-                    },
-                    Err(err) => {
-                        let err_str = format!("tool call failed: {}", err);
-                        warn!("Tool execution failed: {}", err_str);
-                        // Return error as output, let model decide how to proceed
-                        let error_json = json!({ "error": &err_str }).to_string();
-                        (error_json, false, Some(err_str))
+                    }
+                    None => {
+                        let err_str = format!("No MCP server URL available for tool '{}'", tool_name);
+                        warn!("{}", err_str);
+                        (json!({ "error": &err_str }).to_string(), false, Some(err_str))
                     }
                 };
 

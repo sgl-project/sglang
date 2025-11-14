@@ -72,8 +72,8 @@ impl McpManager {
             match Self::connect_server(server_config, global_proxy).await {
                 Ok(client) => {
                     let client_arc = Arc::new(client);
-                    // Load inventory for this server
-                    Self::load_server_inventory(&inventory, &server_config.name, &client_arc).await;
+                    // Load static inventory for this config server
+                    Self::load_static_server_inventory(&inventory, &server_config.name, &client_arc).await;
                     static_clients.insert(server_config.name.clone(), client_arc);
                     info!("Connected to static server '{}'", server_config.name);
                 }
@@ -131,8 +131,8 @@ impl McpManager {
             )
             .await?;
 
-        self.inventory.clear_server_tools(&server_key);
-        Self::load_server_inventory(&self.inventory, &server_key, &client).await;
+        // Note: Dynamic client tools are NOT loaded into inventory
+        // Callers should call client.peer().list_all_tools() directly for request-scoped tools
         Ok(client)
     }
 
@@ -152,7 +152,8 @@ impl McpManager {
         info!("Registered static MCP server: {}", name);
     }
 
-    /// List all available tools from all servers
+    /// List all available static tools (from config servers only)
+    /// For dynamic MCP clients, call client.peer().list_all_tools() directly
     pub fn list_tools(&self) -> Vec<Tool> {
         self.inventory
             .list_tools()
@@ -161,16 +162,46 @@ impl McpManager {
             .collect()
     }
 
+    /// List tools from dynamic MCP server by URL
+    /// Returns empty Vec if client not found or listing fails
+    pub async fn list_dynamic_tools(&self, server_url: &str) -> Vec<Tool> {
+        match self.get_client(server_url).await {
+            Some(client) => client.peer().list_all_tools().await.ok().unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Call tool on dynamic MCP server by URL
+    /// Returns error if client not found or call fails
+    pub async fn call_dynamic_tool(
+        &self,
+        server_url: &str,
+        request: CallToolRequestParam,
+    ) -> McpResult<CallToolResult> {
+        let client = self
+            .get_client(server_url)
+            .await
+            .ok_or_else(|| McpError::ServerNotFound(server_url.to_string()))?;
+
+        client
+            .call_tool(request)
+            .await
+            .map_err(|e| McpError::ToolExecution(format!("Failed to call tool: {}", e)))
+    }
+
     /// Call a tool by name with automatic type coercion
     ///
     /// Accepts either JSON string or parsed Map as arguments.
     /// Automatically converts string numbers to actual numbers based on tool schema.
+    ///
+    /// Note: Only works for static tools (from config). For dynamic MCP clients,
+    /// call client.peer().call_tool() directly.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         args: impl Into<ToolArgs>,
     ) -> McpResult<CallToolResult> {
-        // Get tool info for schema and server
+        // Get tool info for schema and server (static tools only)
         let (server_name, tool_info) = self
             .inventory
             .get_tool(tool_name)
@@ -201,7 +232,8 @@ impl McpManager {
             .map_err(|e| McpError::ToolExecution(format!("Failed to call tool: {}", e)))
     }
 
-    /// Get a tool by name
+    /// Get a tool by name (static tools only)
+    /// For dynamic MCP clients, list tools directly from the client
     pub fn get_tool(&self, tool_name: &str) -> Option<Tool> {
         self.inventory
             .get_tool(tool_name)
@@ -334,7 +366,7 @@ impl McpManager {
         })
     }
 
-    /// Check if a tool exists
+    /// Check if a tool exists (static tools only)
     pub fn has_tool(&self, name: &str) -> bool {
         self.inventory.has_tool(name)
     }
@@ -466,59 +498,57 @@ impl McpManager {
     // Internal Helper Methods
     // ========================================================================
 
-    /// Static helper for loading inventory (for new())
-    /// Discover and cache tools/prompts/resources for a connected server
-    ///
-    /// This method is public to allow workflow-based inventory loading.
-    /// It discovers all tools, prompts, and resources from the client and caches them in the inventory.
-    pub async fn load_server_inventory(
+    /// Load inventory for STATIC servers (from config)
+    /// Discovers and caches tools/prompts/resources in static inventory
+    pub async fn load_static_server_inventory(
         inventory: &Arc<ToolInventory>,
-        server_key: &str,
+        server_name: &str,
         client: &Arc<McpClient>,
     ) {
-        // Tools
+        // Tools -> Static inventory
         match client.peer().list_all_tools().await {
             Ok(ts) => {
-                info!("Discovered {} tools from '{}'", ts.len(), server_key);
+                info!("Discovered {} tools from static server '{}'", ts.len(), server_name);
                 for t in ts {
-                    inventory.insert_tool(t.name.to_string(), server_key.to_string(), t);
+                    inventory.insert_static_tool(server_name.to_string(), t.name.to_string(), t);
                 }
             }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
+            Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
         }
 
         // Prompts
         match client.peer().list_all_prompts().await {
             Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_key);
+                info!("Discovered {} prompts from '{}'", ps.len(), server_name);
                 for p in ps {
-                    inventory.insert_prompt(p.name.clone(), server_key.to_string(), p);
+                    inventory.insert_prompt(p.name.clone(), server_name.to_string(), p);
                 }
             }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_key, e),
+            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
         }
 
         // Resources
         match client.peer().list_all_resources().await {
             Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_key);
+                info!("Discovered {} resources from '{}'", rs.len(), server_name);
                 for r in rs {
-                    inventory.insert_resource(r.uri.clone(), server_key.to_string(), r.raw);
+                    inventory.insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
                 }
             }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_key, e),
+            Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
         }
     }
 
     /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
+    /// Used for refreshing static servers
     async fn load_server_inventory_internal(&self, server_name: &str, client: &McpClient) {
-        // Tools
+        // Tools -> Static inventory (this is for refresh of config servers)
         match client.peer().list_all_tools().await {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_name);
                 for t in ts {
                     self.inventory
-                        .insert_tool(t.name.to_string(), server_name.to_string(), t);
+                        .insert_static_tool(server_name.to_string(), t.name.to_string(), t);
                 }
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),

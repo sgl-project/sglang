@@ -129,8 +129,8 @@ impl StepExecutor for DiscoverMcpInventoryStep {
 
         let inventory = mcp_manager.inventory();
 
-        // Use the public load_server_inventory method
-        McpManager::load_server_inventory(&inventory, &config_request.name, &mcp_client).await;
+        // Use the public load_static_server_inventory method
+        McpManager::load_static_server_inventory(&inventory, &config_request.name, &mcp_client).await;
 
         info!("Completed inventory discovery for {}", config_request.name);
 

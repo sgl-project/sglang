@@ -31,9 +31,14 @@ pub struct CachedResource {
 ///
 /// Provides thread-safe caching of MCP tools, prompts, and resources.
 /// Entries are refreshed periodically by background tasks.
+///
+/// Only caches tools from STATIC MCP servers (defined in mcp.yaml config).
+/// Dynamic MCP clients (from request server_url) should list tools directly
+/// from the client instead of using the inventory.
 pub struct ToolInventory {
-    /// Map of tool_name -> cached tool
-    tools: DashMap<String, CachedTool>,
+    /// Static tools: Map of (server_name, tool_name) -> cached tool
+    /// Only for MCP servers defined in config
+    static_tools: DashMap<(String, String), CachedTool>,
 
     /// Map of prompt_name -> cached prompt
     prompts: DashMap<String, CachedPrompt>,
@@ -46,7 +51,7 @@ impl ToolInventory {
     /// Create a new tool inventory
     pub fn new() -> Self {
         Self {
-            tools: DashMap::new(),
+            static_tools: DashMap::new(),
             prompts: DashMap::new(),
             resources: DashMap::new(),
         }
@@ -64,37 +69,43 @@ impl ToolInventory {
     // Tool Methods
     // ============================================================================
 
-    /// Get a tool if it exists
+    /// Insert a static tool (from config servers)
+    pub fn insert_static_tool(&self, server_name: String, tool_name: String, tool: Tool) {
+        self.static_tools.insert(
+            (server_name.clone(), tool_name),
+            CachedTool { server_name, tool },
+        );
+    }
+
+    /// Get a tool from static inventory
     pub fn get_tool(&self, tool_name: &str) -> Option<(String, Tool)> {
-        self.tools
-            .get(tool_name)
-            .map(|entry| (entry.server_name.clone(), entry.tool.clone()))
+        for entry in self.static_tools.iter() {
+            if entry.key().1 == tool_name {
+                return Some((entry.server_name.clone(), entry.tool.clone()));
+            }
+        }
+        None
     }
 
-    /// Check if tool exists
+    /// Check if tool exists in static inventory
     pub fn has_tool(&self, tool_name: &str) -> bool {
-        self.tools.contains_key(tool_name)
+        self.get_tool(tool_name).is_some()
     }
 
-    /// Insert or update a tool
-    pub fn insert_tool(&self, tool_name: String, server_name: String, tool: Tool) {
-        self.tools
-            .insert(tool_name, CachedTool { server_name, tool });
-    }
-
-    /// Get all tools
+    /// List all static tools
     pub fn list_tools(&self) -> Vec<(String, String, Tool)> {
-        self.tools
-            .iter()
-            .map(|entry| {
-                let (name, cached) = entry.pair();
-                (
-                    name.clone(),
-                    cached.server_name.clone(),
-                    cached.tool.clone(),
-                )
-            })
-            .collect()
+        let mut tools = Vec::new();
+
+        for entry in self.static_tools.iter() {
+            let ((server_name, tool_name), cached) = entry.pair();
+            tools.push((
+                tool_name.clone(),
+                server_name.clone(),
+                cached.tool.clone(),
+            ));
+        }
+
+        tools
     }
 
     // ============================================================================
@@ -192,22 +203,25 @@ impl ToolInventory {
 
     /// Clear all cached items for a specific server (called when LRU evicts client)
     pub fn clear_server_tools(&self, server_name: &str) {
-        self.tools
-            .retain(|_, cached| cached.server_name != server_name);
+        // Clear from static tools (where key is (server_name, tool_name))
+        self.static_tools
+            .retain(|key, _| key.0 != server_name);
+
+        // Clear prompts and resources
         self.prompts
             .retain(|_, cached| cached.server_name != server_name);
         self.resources
             .retain(|_, cached| cached.server_name != server_name);
     }
 
-    /// Get count of cached items
+    /// Get count of cached items (static tools, prompts, resources)
     pub fn counts(&self) -> (usize, usize, usize) {
-        (self.tools.len(), self.prompts.len(), self.resources.len())
+        (self.static_tools.len(), self.prompts.len(), self.resources.len())
     }
 
     /// Clear all cached items
     pub fn clear_all(&self) {
-        self.tools.clear();
+        self.static_tools.clear();
         self.prompts.clear();
         self.resources.clear();
     }
@@ -269,11 +283,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_insert_and_get() {
+    fn test_static_tool_insert_and_get() {
         let inventory = ToolInventory::new();
         let tool = create_test_tool("test_tool");
 
-        inventory.insert_tool("test_tool".to_string(), "server1".to_string(), tool.clone());
+        inventory.insert_static_tool("server1".to_string(), "test_tool".to_string(), tool.clone());
 
         let result = inventory.get_tool("test_tool");
         assert!(result.is_some());
@@ -290,7 +304,7 @@ mod tests {
 
         assert!(!inventory.has_tool("check_tool"));
 
-        inventory.insert_tool("check_tool".to_string(), "server1".to_string(), tool);
+        inventory.insert_static_tool("server1".to_string(), "check_tool".to_string(), tool);
 
         assert!(inventory.has_tool("check_tool"));
     }
@@ -299,38 +313,34 @@ mod tests {
     fn test_list_tools() {
         let inventory = ToolInventory::new();
 
-        inventory.insert_tool(
-            "tool1".to_string(),
+        inventory.insert_static_tool(
             "server1".to_string(),
+            "tool1".to_string(),
             create_test_tool("tool1"),
         );
-        inventory.insert_tool(
-            "tool2".to_string(),
+        inventory.insert_static_tool(
             "server1".to_string(),
+            "tool2".to_string(),
             create_test_tool("tool2"),
         );
-        inventory.insert_tool(
-            "tool3".to_string(),
-            "server2".to_string(),
-            create_test_tool("tool3"),
-        );
 
-        let tools = inventory.list_tools();
-        assert_eq!(tools.len(), 3);
+        // List all static tools
+        let static_tools = inventory.list_tools();
+        assert_eq!(static_tools.len(), 2);
     }
 
     #[test]
     fn test_clear_server_tools() {
         let inventory = ToolInventory::new();
 
-        inventory.insert_tool(
-            "tool1".to_string(),
+        inventory.insert_static_tool(
             "server1".to_string(),
+            "tool1".to_string(),
             create_test_tool("tool1"),
         );
-        inventory.insert_tool(
-            "tool2".to_string(),
+        inventory.insert_static_tool(
             "server2".to_string(),
+            "tool2".to_string(),
             create_test_tool("tool2"),
         );
 
@@ -397,7 +407,7 @@ mod tests {
             let inv = Arc::clone(&inventory);
             let handle = tokio::spawn(async move {
                 let tool = create_test_tool(&format!("tool_{}", i));
-                inv.insert_tool(format!("tool_{}", i), format!("server_{}", i % 3), tool);
+                inv.insert_static_tool(format!("server_{}", i % 3), format!("tool_{}", i), tool);
             });
             handles.push(handle);
         }
@@ -416,9 +426,9 @@ mod tests {
     fn test_clear_all() {
         let inventory = ToolInventory::new();
 
-        inventory.insert_tool(
-            "tool1".to_string(),
+        inventory.insert_static_tool(
             "server1".to_string(),
+            "tool1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_prompt(
