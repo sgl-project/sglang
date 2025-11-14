@@ -163,6 +163,7 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
         )
+        self.quant_config = getattr(self.model_runner.model, "quant_config", None)
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
@@ -182,6 +183,9 @@ class PiecewiseCudaGraphRunner:
         with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             self.out_cache_loc = torch.zeros(
+                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
+            )
+            self.out_cache_loc_swa = torch.zeros(
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
             self.positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
@@ -237,9 +241,13 @@ class PiecewiseCudaGraphRunner:
                 out_cache_loc=torch.zeros(
                     (num_tokens,), device=self.device, dtype=self._cache_loc_dtype()
                 ),
+                out_cache_loc_swa=torch.zeros(
+                    (num_tokens,), device=self.device, dtype=self._cache_loc_dtype()
+                ),
                 seq_lens_sum=num_tokens,
                 encoder_lens=None,
                 return_logprob=False,
+                extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
@@ -263,7 +271,9 @@ class PiecewiseCudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        with set_forward_context(forward_batch, self.attention_layers):
+        with set_forward_context(
+            forward_batch, self.attention_layers, self.quant_config
+        ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -331,6 +341,7 @@ class PiecewiseCudaGraphRunner:
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
         out_cache_loc = self.out_cache_loc[:num_tokens]
+        out_cache_loc_swa = self.out_cache_loc_swa[:num_tokens]
         positions = self.positions[:num_tokens]
 
         # pipeline parallelism
@@ -362,9 +373,11 @@ class PiecewiseCudaGraphRunner:
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
+                out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
                 encoder_lens=None,
                 return_logprob=False,
+                extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
@@ -405,7 +418,9 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
-            with set_forward_context(forward_batch, self.attention_layers):
+            with set_forward_context(
+                forward_batch, self.attention_layers, self.quant_config
+            ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
@@ -432,15 +447,23 @@ class PiecewiseCudaGraphRunner:
         self.raw_num_tokens = num_tokens
         if static_num_tokens != num_tokens:
             self.out_cache_loc.zero_()
+            self.out_cache_loc_swa.zero_()
         bs = forward_batch.batch_size
 
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-
+        if forward_batch.out_cache_loc_swa is not None:
+            self.out_cache_loc_swa[:num_tokens].copy_(forward_batch.out_cache_loc_swa)
         input_ids = self.input_ids[:static_num_tokens]
         positions = self.positions[:static_num_tokens]
         out_cache_loc = self.out_cache_loc[:static_num_tokens]
+
+        out_cache_loc_swa = (
+            self.out_cache_loc_swa[:static_num_tokens]
+            if forward_batch.out_cache_loc_swa is not None
+            else None
+        )
 
         next_token_logits_buffer = None
         mrope_positions = None
@@ -458,6 +481,7 @@ class PiecewiseCudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=forward_batch.seq_lens_sum,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=False,
@@ -503,7 +527,9 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
-            with set_forward_context(static_forward_batch, self.attention_layers):
+            with set_forward_context(
+                static_forward_batch, self.attention_layers, self.quant_config
+            ):
                 with set_compiled(True):
                     output = self.model_runner.model.forward(
                         static_forward_batch.input_ids,

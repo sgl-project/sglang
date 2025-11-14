@@ -6,7 +6,7 @@ that enables OpenAI-compatible LoRA adapter selection.
 """
 
 import unittest
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock
 
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.server_args import ServerArgs

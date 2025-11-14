@@ -25,11 +25,11 @@ from util import kill_process_tree
 
 
 class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
-    """End to end tests for gRPC backend (Regular backend with Llama)."""
+    """End to end tests for gRPC backend (Regular backend with Qwen2.5)."""
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "/home/ubuntu/models/meta-llama/Llama-3.1-8B-Instruct"
+        cls.model = "/home/ubuntu/models/Qwen/Qwen2.5-14B-Instruct"
         cls.base_url_port = "http://127.0.0.1:30030"
 
         cls.cluster = popen_launch_workers_and_router(
@@ -46,7 +46,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
                 "--history-backend",
                 "memory",
                 "--tool-call-parser",
-                "llama",
+                "qwen",
             ],
         )
 
@@ -58,19 +58,9 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
-    def test_previous_response_id_chaining(self):
-        super().test_previous_response_id_chaining()
-
     @unittest.skip("TODO: return 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
-
-    @unittest.skip("TODO: decode error message")
-    def test_mutually_exclusive_parameters(self):
-        super().test_mutually_exclusive_parameters()
-
-    def test_mcp_basic_tool_call_streaming(self):
-        return super().test_mcp_basic_tool_call_streaming()
 
     def test_structured_output_json_schema(self):
         """Override with simpler schema for Llama model (complex schemas not well supported)."""
@@ -170,15 +160,6 @@ class TestGrpcHarmonyBackend(
         kill_process_tree(cls.cluster["router"].pid)
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
-
-    def test_previous_response_id_chaining(self):
-        super().test_previous_response_id_chaining()
-
-    @unittest.skip(
-        "TODO: fix requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
-    )
-    def test_mutually_exclusive_parameters(self):
-        super().test_mutually_exclusive_parameters()
 
     @unittest.skip("TODO: 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):

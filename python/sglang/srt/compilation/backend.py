@@ -24,6 +24,16 @@ from sglang.srt.compilation.pass_manager import PostGradPassManager
 logger = logging.getLogger(__name__)
 
 
+SPLIT_OPS = [
+    "sglang.unified_attention_with_output",
+    "sglang.inplace_all_reduce",
+]
+
+
+def add_split_ops(ops):
+    SPLIT_OPS.extend(ops)
+
+
 def make_compiler(config: CompilationConfig):
     if config.compiler == "eager":
         return EagerAdapter()
@@ -392,9 +402,9 @@ class SGLangBackend:
         self.configure_post_pass()
 
         self.split_gm, self.piecewise_graphs = split_graph(
-            graph, ["sglang.unified_attention_with_output", "sglang.inplace_all_reduce"]
+            graph,
+            SPLIT_OPS,
         )
-
         from torch._dynamo.utils import lazy_format_graph_code
 
         # depyf will hook lazy_format_graph_code and dump the graph
