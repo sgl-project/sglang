@@ -45,8 +45,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_processor
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -455,15 +458,16 @@ class Qwen3VLMoeVisionModel(nn.Module):
         position_embeddings = (emb.cos(), emb.sin())
 
         # compute cu_seqlens
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0)
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
-                cu_seqlens.to(torch.int32),
-            ]
-        )
+        if not _use_aiter:
+            cu_seqlens = torch.cat(
+                [
+                    torch.tensor([0], device=grid_thw.device),
+                    (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
+                ]
+            )
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        else:
+            cu_seqlens = None
 
         x = x.unsqueeze(1)
 
@@ -674,6 +678,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        if _use_aiter:
+            for i, block in enumerate(self.visual.blocks):
+                if i == 0:
+                    vision_forward_metadata = block.attn.init_vision_forward_metadata(
+                        image_grid_thw, pixel_values
+                    )
+                else:
+                    block.attn.set_vision_forward_metadata(vision_forward_metadata)
+
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
@@ -685,6 +698,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        if _use_aiter:
+            for i, block in enumerate(self.visual.blocks):
+                if i == 0:
+                    vision_forward_metadata = block.attn.init_vision_forward_metadata(
+                        video_grid_thw, pixel_values
+                    )
+                else:
+                    block.attn.set_vision_forward_metadata(vision_forward_metadata)
+
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
