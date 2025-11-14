@@ -4,13 +4,15 @@ E2E test for TypeBasedDispatcher optimization.
 Tests real-world scenarios with actual request types.
 """
 
+import timeit
+import unittest
 from types import SimpleNamespace
 from typing import Dict
-import unittest
-import timeit
+
 from sglang.srt.managers.io_struct import SamplingParams
 from sglang.srt.utils.common import mark_start
 from sglang.utils import TypeBasedDispatcher
+
 
 class TestTypeBasedDispatcher(unittest.TestCase):
     """Unit tests for TypeBasedDispatcher e2e performance."""

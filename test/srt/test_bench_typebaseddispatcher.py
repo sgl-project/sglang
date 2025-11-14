@@ -3,6 +3,7 @@ from typing import Any, Callable, List, Tuple, Type
 
 from sglang.utils import TypeBasedDispatcher
 
+
 class TypeBasedDispatcherList:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
