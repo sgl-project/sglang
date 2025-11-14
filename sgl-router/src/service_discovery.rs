@@ -376,6 +376,7 @@ async fn handle_pod_event(
                 worker_type,
                 priority: None,
                 cost: None,
+                runtime: None,
                 labels: HashMap::new(),
                 bootstrap_port,
                 tokenizer_path: None,
