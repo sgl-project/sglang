@@ -606,6 +606,7 @@ class ServerArgs:
         self._handle_attention_backend_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
+        self._handle_ascend_npu_specifics()
         self._handle_grammar_backend()
 
         # Handle data parallelism.
@@ -1360,6 +1361,11 @@ class ServerArgs:
     def _handle_amd_specifics(self):
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+
+    def _handle_ascend_npu_specifics(self):
+        if is_npu():
+            # NPU does not support CustomAllReduce
+            self.disable_custom_all_reduce = True
 
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:

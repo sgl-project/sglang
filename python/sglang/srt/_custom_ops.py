@@ -8,15 +8,20 @@ from sglang.srt.utils import is_hip, is_hpu, is_npu
 
 logger = logging.getLogger(__name__)
 
+CUSTOM_ALLREDUCE_AVAILABLE = not (is_hpu() or is_npu())
 
-if not is_hpu():
+
+if CUSTOM_ALLREDUCE_AVAILABLE:
     try:
         import sgl_kernel
     except ImportError as e:
+        CUSTOM_ALLREDUCE_AVAILABLE = False
         logger.warning("Failed to import from custom_ar with %r", e)
 
 
-if not is_hip() and not is_npu():
+if not CUSTOM_ALLREDUCE_AVAILABLE:
+    pass
+elif not is_hip():
     custom_op = sgl_kernel.allreduce
 
     # custom allreduce
