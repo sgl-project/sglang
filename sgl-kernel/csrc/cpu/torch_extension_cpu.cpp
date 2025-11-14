@@ -229,6 +229,8 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox);
+std::tuple<at::Tensor, at::Tensor>
+apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
@@ -360,6 +362,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
+  m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+  m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
