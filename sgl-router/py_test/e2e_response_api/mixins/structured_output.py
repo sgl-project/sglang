@@ -6,7 +6,6 @@ Tests for text.format field with json_object and json_schema formats.
 
 import json
 import sys
-import unittest
 from pathlib import Path
 
 # Add current directory for local imports
@@ -18,7 +17,6 @@ from basic_crud import ResponseAPIBaseTest
 
 class StructuredOutputBaseTest(ResponseAPIBaseTest):
 
-    @unittest.skip("TODO: Add structured output feature")
     def test_structured_output_json_schema(self):
         """Test structured output with json_schema format."""
 
