@@ -210,6 +210,27 @@ class EAGLEWorker(TpModelWorker):
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
+        # Initialize a decoding backend for target model, only needed for cuda graph
+        if not self.server_args.disable_cuda_graph and not _is_npu and self.server_args.speculative_batch_size_threshold is not None:
+            from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+            # Modify args to disable specdecode and set it back
+            backup_speculative_algorithm = self.target_worker.model_runner.server_args.speculative_algorithm
+            backup_speculative_num_draft_tokens = self.target_worker.model_runner.server_args.speculative_num_draft_tokens
+            backup_speculative_eagle_topk = self.target_worker.model_runner.server_args.speculative_eagle_topk
+            self.target_worker.model_runner.server_args.speculative_algorithm = SpeculativeAlgorithm.NONE
+            self.target_worker.model_runner.server_args.speculative_num_draft_tokens = 0
+            self.target_worker.model_runner.server_args.speculative_eagle_topk = 0
+            self.target_decode_attn_backend = FlashAttentionBackend(
+                self.target_worker.model_runner,
+                skip_prefill=True,
+            )
+            self.target_worker.model_runner.server_args.speculative_algorithm = backup_speculative_algorithm
+            self.target_worker.model_runner.server_args.speculative_num_draft_tokens = backup_speculative_num_draft_tokens
+            self.target_worker.model_runner.server_args.speculative_eagle_topk = backup_speculative_eagle_topk
+            
+        else:
+            self.target_decode_attn_backend = None
+
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None

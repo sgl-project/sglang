@@ -87,6 +87,10 @@ class EAGLEDecodeCudaGraphRunner:
         self.target_model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
+        if self.eagle_worker.target_decode_attn_backend is not None:
+            self.eagle_worker.target_decode_attn_backend.init_cuda_graph_state(
+                self.max_bs, self.max_num_token
+            )
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -226,6 +230,7 @@ class EAGLEDecodeCudaGraphRunner:
         hidden_states = self.hidden_states[:num_tokens]
         draft_next_token_logits_buffer = self.draft_next_token_logits_buffer[:bs]
         target_next_token_logits_buffer = self.target_next_token_logits_buffer[:bs]
+        target_hidden_states = self.hidden_states[:bs]
 
         if self.require_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(
@@ -289,11 +294,9 @@ class EAGLEDecodeCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            attn_backend=self.target_model_runner.attn_backend,
+            attn_backend=self.eagle_worker.target_decode_attn_backend,
             padded_static_len=self.padded_static_len,
         )
-
-        print(f"Draft token to kv pool length: {len(self.model_runner.token_to_kv_pool.k_buffer)}")
 
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
@@ -319,16 +322,17 @@ class EAGLEDecodeCudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             padded_static_len=self.padded_static_len,
         )
-        draft_forward_batch.target_hidden_states = self.hidden_states
-        self.target_model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs=bs,
-            num_tokens=num_tokens,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=None,
-        )
+        draft_forward_batch.target_hidden_states = target_hidden_states
+        if self.eagle_worker.target_decode_attn_backend is not None:
+            self.eagle_worker.target_decode_attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs=bs,
+                num_tokens=num_tokens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+            )
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -361,13 +365,14 @@ class EAGLEDecodeCudaGraphRunner:
             #     kwargs["pp_proxy_tensors"] = PPProxyTensors(
             #         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
             #     )
-            target_ret = self.target_model_runner.model.forward(
-                target_forward_batch.input_ids,
-                target_forward_batch.positions,
+            # We are using a separate attn_backend to avoid changing target_model_runner
+            # original attn_backend.
+            target_ret = self.target_model_runner.forward_decode(
                 target_forward_batch,
-                **kwargs,
+                skip_attn_backend_init=True,
+                pp_proxy_tensors=None,
             )
-            draft_ret = self.model_runner.model.forward(
+            draft_ret =  self.model_runner.model.forward(
                 draft_forward_batch.input_ids,
                 draft_forward_batch.positions,
                 draft_forward_batch,

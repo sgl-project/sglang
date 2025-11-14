@@ -1508,7 +1508,10 @@ class FlashAttentionBackend(AttentionBackend):
 
         # metadata_expand is needed for Spec Decoding when top k > 1
         metadata_expand = FlashAttentionMetadata()
-
+        print("Init forward metadata capture cuda graph")
+        print(f"self.topk={self.topk}")
+        if spec_info is not None:
+            print(f"spec_info={spec_info}")
         device = seq_lens.device
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -1852,6 +1855,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
+                print(f"{self.target_verify_metadata_topk_normal=}")
                 metadata = self.target_verify_metadata_topk_normal[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
