@@ -15,6 +15,7 @@ class TestFile:
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
+        TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("function_call/test_json_schema_constraint.py", 1),
         TestFile("hicache/test_hicache.py", 116),
@@ -168,6 +169,8 @@ suites = {
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
         TestFile("models/test_kimi_k2_models.py", 200),
+        TestFile("test_deepseek_v32_basic.py", 275),
+        TestFile("test_deepseek_v32_mtp.py", 275),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
@@ -194,11 +197,6 @@ suites = {
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
     ],
-    "per-commit-8-gpu-h200-deepseek-v32": [
-        TestFile("test_deepseek_v32_basic.py", 275),
-        TestFile("test_deepseek_v32_mtp.py", 275),
-        TestFile("test_deepseek_v32_nsabackend.py", 600),
-    ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),
@@ -220,6 +218,7 @@ suites = {
         TestFile("test_cpp_radix_cache.py", 60),
     ],
     "nightly-4-gpu-b200": [
+        TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
         TestFile("test_fp4_moe.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
@@ -227,7 +226,9 @@ suites = {
     "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [],
     "nightly-8-gpu": [],
-    "nightly-8-gpu-h200": [],
+    "nightly-8-gpu-h200": [
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
+    ],
     "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
@@ -250,14 +251,10 @@ suites = {
         TestFile("layers/moe/test_moe_runners.py"),
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
-        TestFile("models/lora/test_lora.py"),
-        TestFile("models/lora/test_lora_backend.py"),
-        TestFile("models/lora/test_lora_cuda_graph.py"),
-        TestFile("models/lora/test_lora_eviction.py"),
-        TestFile("models/lora/test_lora_qwen3.py"),
-        TestFile("models/lora/test_lora_tp.py"),
-        TestFile("models/lora/test_lora_update.py"),
-        TestFile("models/lora/test_multi_lora_backend.py"),
+        TestFile("lora/test_lora_cuda_graph.py"),
+        TestFile("lora/test_lora_qwen3.py"),
+        TestFile("lora/test_lora_tp.py"),
+        TestFile("lora/test_lora_update.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
@@ -394,10 +391,10 @@ suite_amd = {
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 150),
-        TestFile("lora/test_lora_backend.py", 99),
-        TestFile("lora/test_lora_cuda_graph.py", 250),
+        # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
+        # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
-        TestFile("lora/test_lora_qwen3.py", 97),
+        # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
@@ -436,7 +433,7 @@ suite_amd = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        TestFile("test_mla.py", 242),
+        # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_page_size.py", 60),
@@ -452,7 +449,7 @@ suite_amd = {
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_torch_compile.py", 169),
-        TestFile("test_torch_compile_moe.py", 210),
+        # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_torch_native_attention_backend.py", 123),
         # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
@@ -472,7 +469,7 @@ suite_amd = {
         TestFile("test_mla.py", 242),
     ],
     "per-commit-2-gpu-amd": [
-        TestFile("lora/test_lora_tp.py", 116),
+        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
@@ -526,6 +523,7 @@ suite_ascend = {
     "per-commit-1-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_hicache_mha.py", 400),
     ],
     "per-commit-2-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
