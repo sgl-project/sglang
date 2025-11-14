@@ -672,7 +672,7 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(34)))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(11)).await;
         {
             let model_key = "default";
 
@@ -844,7 +844,7 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(26)))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
         // Verify boundaries adjusted to: [0, 20], [21, 26], [27, MAX]
         {
             let model_key = "default";
@@ -889,7 +889,7 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(57)))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
         // Verify boundaries adjusted to: [0, 40], [41, 57], [58, MAX]
         {
             let model_key = "default";
@@ -974,7 +974,7 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
         {
             let model_key = "default";
 
@@ -1001,7 +1001,7 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(7)))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
         {
             let model_key = "default";
 
@@ -1099,7 +1099,7 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(26)))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
         {
             let model_key = "default";
 
@@ -1141,7 +1141,7 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(55)))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
         {
             let model_key = "default";
 

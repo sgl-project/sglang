@@ -800,7 +800,7 @@ class ServerArgs:
 
     def check_server_sp_args(self):
 
-        if self.pipeline_config.is_image_gen:
+        if self.pipeline_config.task_type.is_image_task():
             if (
                 (self.sp_degree and self.sp_degree > 1)
                 or (self.ulysses_degree and self.ulysses_degree > 1)
