@@ -1762,13 +1762,18 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
-        if (
-            self.disaggregation_decode_enable_offload_kvcache
-            and self.disaggregation_mode != "decode"
-        ):
-            raise ValueError(
-                "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
-            )
+        if self.disaggregation_decode_enable_offload_kvcache:
+            if self.disaggregation_mode != "decode":
+                raise ValueError(
+                    "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
+                )
+            if (
+                self.disaggregation_mode == "decode"
+                and envs.SGLANG_ENABLE_SPEC_V2.get()
+            ):
+                raise ValueError(
+                    "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
+                )
 
     def _handle_metrics_labels(self):
         if (
