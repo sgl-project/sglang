@@ -158,6 +158,8 @@ class PiecewiseNpuGraphCompilerBackend(NpuGraphCompilerBackend):
         compilation_context: CompilationContext,
         page_size: int,
     ):
+        super().__init__(model_runner.model_config.dtype)
+
         self.model_runner = model_runner
         self.model_config = model_runner.model.config
 
