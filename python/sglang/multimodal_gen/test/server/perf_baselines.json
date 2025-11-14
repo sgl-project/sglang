@@ -27,7 +27,7 @@
   "scenarios": {
     "text_to_image": {
       "notes": "Single-image generation using the default prompt",
-      "expected_e2e_ms": 74500.,
+      "expected_e2e_ms": 74500.0,
       "expected_avg_denoise_ms": 422.42,
       "expected_median_denoise_ms": 410.62,
       "stages_ms": {
