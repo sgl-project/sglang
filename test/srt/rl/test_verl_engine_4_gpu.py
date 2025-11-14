@@ -19,7 +19,6 @@ from torch.distributed.fsdp.api import (
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.verl_engine import VerlEngine
-from sglang.srt.utils import is_port_available
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.runners import (
     HFRunner,
@@ -125,7 +124,7 @@ class TestVerlEngine(CustomTestCase):
         if is_in_ci():
             return
 
-        for index, model_info in enumerate(ALL_OTHER_MODELS):
+        for index, model_info in enumerate(ALL_MODELS):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
     # def test_adhoc(self):
