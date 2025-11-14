@@ -47,7 +47,9 @@ SGLang supports various environment variables that can be used to configure its 
 ## DeepEP Configuration
 
 | Environment Variable | Description | Default Value |
+| --- | --- | --- |
 | `SGLANG_DEEPEP_BF16_DISPATCH` | Use Bfloat16 for dispatch | `"false"` |
+| `SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH` | Use nvfp4 for dispatch | `"false"` |
 
 ## Memory Management
 
