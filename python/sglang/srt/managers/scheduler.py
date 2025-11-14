@@ -1239,6 +1239,12 @@ class Scheduler(
 
         return image_inputs
 
+    def _get_multimodal_inputs(self, mm_inputs_dict: dict):
+        if self.server_args.enable_optimized_mm_inputs_process:
+            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
+        else:
+            return MultimodalInputs.from_dict(mm_inputs_dict)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1320,7 +1326,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.mm_inputs)
+            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
@@ -1555,7 +1561,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.image_inputs)
+            image_inputs = self._get_multimodal_inputs(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
