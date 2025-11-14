@@ -61,11 +61,15 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
     bias_chunk[ii] = bias_thread_ptr[ii];
   }
 
+  __syncthreads();
+
   // Sigmoid activation
 #pragma unroll
   for (int ii = 0; ii < VPT; ++ii) {
     row_chunk[ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
   }
+  
+  __syncthreads();
 
   // Add bias
 #pragma unroll
