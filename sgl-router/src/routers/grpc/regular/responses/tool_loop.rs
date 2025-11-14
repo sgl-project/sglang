@@ -422,14 +422,23 @@ pub(super) async fn execute_tool_loop(
                             Err(e) => {
                                 let err_str = format!("Tool call failed: {}", e);
                                 warn!("{}", err_str);
-                                (json!({ "error": &err_str }).to_string(), false, Some(err_str))
+                                (
+                                    json!({ "error": &err_str }).to_string(),
+                                    false,
+                                    Some(err_str),
+                                )
                             }
                         }
                     }
                     None => {
-                        let err_str = format!("No MCP server URL available for tool '{}'", tool_name);
+                        let err_str =
+                            format!("No MCP server URL available for tool '{}'", tool_name);
                         warn!("{}", err_str);
-                        (json!({ "error": &err_str }).to_string(), false, Some(err_str))
+                        (
+                            json!({ "error": &err_str }).to_string(),
+                            false,
+                            Some(err_str),
+                        )
                     }
                 };
 

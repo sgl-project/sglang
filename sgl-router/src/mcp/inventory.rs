@@ -98,11 +98,7 @@ impl ToolInventory {
 
         for entry in self.static_tools.iter() {
             let ((server_name, tool_name), cached) = entry.pair();
-            tools.push((
-                tool_name.clone(),
-                server_name.clone(),
-                cached.tool.clone(),
-            ));
+            tools.push((tool_name.clone(), server_name.clone(), cached.tool.clone()));
         }
 
         tools
@@ -204,8 +200,7 @@ impl ToolInventory {
     /// Clear all cached items for a specific server (called when LRU evicts client)
     pub fn clear_server_tools(&self, server_name: &str) {
         // Clear from static tools (where key is (server_name, tool_name))
-        self.static_tools
-            .retain(|key, _| key.0 != server_name);
+        self.static_tools.retain(|key, _| key.0 != server_name);
 
         // Clear prompts and resources
         self.prompts
@@ -216,7 +211,11 @@ impl ToolInventory {
 
     /// Get count of cached items (static tools, prompts, resources)
     pub fn counts(&self) -> (usize, usize, usize) {
-        (self.static_tools.len(), self.prompts.len(), self.resources.len())
+        (
+            self.static_tools.len(),
+            self.prompts.len(),
+            self.resources.len(),
+        )
     }
 
     /// Clear all cached items

@@ -73,7 +73,12 @@ impl McpManager {
                 Ok(client) => {
                     let client_arc = Arc::new(client);
                     // Load static inventory for this config server
-                    Self::load_static_server_inventory(&inventory, &server_config.name, &client_arc).await;
+                    Self::load_static_server_inventory(
+                        &inventory,
+                        &server_config.name,
+                        &client_arc,
+                    )
+                    .await;
                     static_clients.insert(server_config.name.clone(), client_arc);
                     info!("Connected to static server '{}'", server_config.name);
                 }
@@ -166,7 +171,12 @@ impl McpManager {
     /// Returns empty Vec if client not found or listing fails
     pub async fn list_dynamic_tools(&self, server_url: &str) -> Vec<Tool> {
         match self.get_client(server_url).await {
-            Some(client) => client.peer().list_all_tools().await.ok().unwrap_or_default(),
+            Some(client) => client
+                .peer()
+                .list_all_tools()
+                .await
+                .ok()
+                .unwrap_or_default(),
             None => Vec::new(),
         }
     }
@@ -508,7 +518,11 @@ impl McpManager {
         // Tools -> Static inventory
         match client.peer().list_all_tools().await {
             Ok(ts) => {
-                info!("Discovered {} tools from static server '{}'", ts.len(), server_name);
+                info!(
+                    "Discovered {} tools from static server '{}'",
+                    ts.len(),
+                    server_name
+                );
                 for t in ts {
                     inventory.insert_static_tool(server_name.to_string(), t.name.to_string(), t);
                 }
@@ -547,8 +561,11 @@ impl McpManager {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_name);
                 for t in ts {
-                    self.inventory
-                        .insert_static_tool(server_name.to_string(), t.name.to_string(), t);
+                    self.inventory.insert_static_tool(
+                        server_name.to_string(),
+                        t.name.to_string(),
+                        t,
+                    );
                 }
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
