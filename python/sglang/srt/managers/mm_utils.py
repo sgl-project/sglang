@@ -398,6 +398,8 @@ def _get_chunked_prefill_embedding(
                 embedding_per_req = _get_single_image_embedding_and_combine(
                     embedding_items_per_req, data_embedding_func
                 )
+                if embedding_per_req is None:
+                    embedding_per_req = data_embedding_func(embedding_items_per_req)
             else:
                 embedding_per_req = data_embedding_func(embedding_items_per_req)
             if not embedding_cache.set(embedding_items_hash, embedding_per_req):
@@ -423,8 +425,13 @@ def _get_chunked_prefill_embedding(
 def _get_single_image_embedding_and_combine(
     embedding_items_per_req: List[MultimodalDataItem], embedder
 ):
+    """
+    This logic has been validated on the Qwen-VL and GLM-VL series; support for other models is not guaranteed.
+    """
     embedding_list = []
     for item in embedding_items_per_req:
+        if "image_grid_thw" not in item.model_specific_data:
+            return None
         img_grid_thws = item.model_specific_data["image_grid_thw"]
         img_token_id_offsets = item.offsets
         assert len(img_token_id_offsets) == img_grid_thws.shape[0]
