@@ -39,7 +39,7 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
 // Fixed constants common to both dynamic and static template versions:
 static constexpr int WARP_SIZE = 32;
 static constexpr int WARPS_PER_CTA = 6;
-static constexpr int MAX_VPT = 32;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
+static constexpr int MAX_VPT = 256;  // Increased from 32 to 256
 
 // Create an alias for Array using AlignedArray
 template <typename T, int N>
@@ -79,24 +79,33 @@ __device__ void moe_fused_gate_impl(
   int thread_group_idx = tidx % params.THREADS_PER_ROW;
   int first_elt_read_by_thread = thread_group_idx * params.VPT;
 
+
   // Create local arrays for the row chunk and bias chunk and then reinterpret the address of row_chunk as a pointer to
   // AccessType.
   T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
   Array<T, MAX_VPT> row_chunk;
-  AccessType<T> const* vec_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(thread_read_ptr);
-
+  
   T* bias_thread_read_ptr = bias_ptr + first_elt_read_by_thread;
   Array<T, MAX_VPT> bias_chunk;
-  AccessType<T> const* vec_bias_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(bias_thread_read_ptr);
 
-// QQ NOTE: doing the follow will be slower than loop assign and more importantly
-// have misaligned address issue when params.VPT < 8 and mismatch with MAX_VPT
-// AccessType<T>* row_chunk_vec_ptr = reinterpret_cast<AccessType<T>*>(&row_chunk);
-// row_chunk_vec_ptr[0] = vec_thread_read_ptr[0];
+  // For large VPT, we need to handle memory access more carefully
+  // We'll use vectorized loads when possible, but fall back to scalar loads for safety
+  if (params.VPT <= 8 && (reinterpret_cast<uintptr_t>(thread_read_ptr) % (sizeof(T) * params.VPT) == 0)) {
+    // Aligned vectorized load for small VPT
+    AccessType<T> const* vec_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(thread_read_ptr);
+    AccessType<T> const* vec_bias_thread_read_ptr = reinterpret_cast<AccessType<T> const*>(bias_thread_read_ptr);
 #pragma unroll
-  for (int ii = 0; ii < params.VPT; ++ii) {
-    row_chunk[ii] = vec_thread_read_ptr[0][ii];
-    bias_chunk[ii] = vec_bias_thread_read_ptr[0][ii];
+    for (int ii = 0; ii < params.VPT; ++ii) {
+      row_chunk[ii] = vec_thread_read_ptr[0][ii];
+      bias_chunk[ii] = vec_bias_thread_read_ptr[0][ii];
+    }
+  } else {
+    // Scalar load for large VPT or unaligned access
+#pragma unroll
+    for (int ii = 0; ii < params.VPT; ++ii) {
+      row_chunk[ii] = thread_read_ptr[ii];
+      bias_chunk[ii] = bias_thread_read_ptr[ii];
+    }
   }
 
   __syncthreads();
@@ -412,7 +421,7 @@ std::vector<at::Tensor> moe_fused_gate(
       num_expert_group);
 
   int computed_vpt = num_experts / num_expert_group;
-  // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=32. Maximum VPT indicate max value per
+  // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=256. Maximum VPT indicate max value per
   // threads we can process.
   TORCH_CHECK(
       computed_vpt <= MAX_VPT,
@@ -423,14 +432,21 @@ std::vector<at::Tensor> moe_fused_gate(
       ")");
 
   // Dispatch to templated kernel for known compile-time configurations.
-  // We currently only support for:
-  //   Case 1: 256 experts, with 8 or 16 groups.
-  //   Case 2: 128 experts, with 4 or 8 groups.
-  //   Case 3: other cases, require 8 <= num_experts / num_expert_group <= 32
+  // Extended support for larger VPT values:
+  //   Case 1: 256 experts, with 1 (VPT=256).
   bool dispatched = false;
   switch (num_experts) {
     case 256:
-      if (num_expert_group == 8)
+      if (num_expert_group == 1) {
+        // VPT = 256/1 = 256, ROWS_PER_WARP = 32/1 = 32, ROWS_PER_CTA = 6 * 32 = 192.
+        if (input.scalar_type() == at::kBFloat16) {
+          LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 1);
+        } else if (input.scalar_type() == at::kHalf) {
+          LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 1);
+        } else if (input.scalar_type() == at::kFloat) {
+          LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 1);
+        }
+      } else if (num_expert_group == 8) { 
         // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
         if (input.scalar_type() == at::kBFloat16) {
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 8);
@@ -447,17 +463,19 @@ std::vector<at::Tensor> moe_fused_gate(
           } else if (input.scalar_type() == at::kFloat) {
             LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 16);
           }
+      }
       break;
     case 128:
-      if (num_expert_group == 4)
-        // VPT = 128/4 = 32, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2 = 12.
+      if (num_expert_group == 4) {
+        // VPT = 128/4 = 32, ROWS_PER_WARP = 32/4 = 8, ROWS_PER_CTA = 6 * 8 = 48.
         if (input.scalar_type() == at::kBFloat16) {
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 4);
         } else if (input.scalar_type() == at::kHalf) {
           LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 4);
         } else if (input.scalar_type() == at::kFloat) {
           LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 4);
-        } else if (num_expert_group == 8)
+        }
+      } else if (num_expert_group == 8) {
           // VPT = 128/8 = 16, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
           if (input.scalar_type() == at::kBFloat16) {
             LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 8);
@@ -466,13 +484,15 @@ std::vector<at::Tensor> moe_fused_gate(
           } else if (input.scalar_type() == at::kFloat) {
             LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 8);
           }
+      }
       break;
     default:
       break;
   }
+  
   if (!dispatched) {
     // Fallback to the dynamic kernel if none of the supported combinations match.
-    // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
+    // Now supports VPT up to 256 for dynamic kernels
     if (input.scalar_type() == at::kBFloat16) {
       moe_fused_gate_kernel_dynamic<bfloat16_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),

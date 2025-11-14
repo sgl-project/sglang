@@ -175,6 +175,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler=-Wno-deprecated-declarations"
     "-Xcompiler=-Wno-terminate"
     "-Xcompiler=-Wfatal-errors"
+    "-maxrregcount=128"
     "-Xcompiler=-ftemplate-backtrace-limit=1"
     "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
     "-Xcudafe=--diag_suppress=2361"  # invalid narrowing conversion from "char" to "signed char"
