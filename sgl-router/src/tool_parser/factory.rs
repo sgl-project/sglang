@@ -10,7 +10,8 @@ use tokio::sync::Mutex;
 use crate::tool_parser::{
     parsers::{
         DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
-        MistralParser, PassthroughParser, PythonicParser, QwenParser, Step3Parser,
+        MistralParser, PassthroughParser, PythonicParser, QwenParser, QwenCoderParser,
+        Step3Parser,
     },
     traits::ToolParser,
 };
@@ -236,6 +237,7 @@ impl ParserFactory {
         registry.register_parser("json", || Box::new(JsonParser::new()));
         registry.register_parser("mistral", || Box::new(MistralParser::new()));
         registry.register_parser("qwen", || Box::new(QwenParser::new()));
+        registry.register_parser("qwen_coder", || Box::new(QwenCoderParser::new()));
         registry.register_parser("pythonic", || Box::new(PythonicParser::new()));
         registry.register_parser("llama", || Box::new(LlamaParser::new()));
         registry.register_parser("deepseek", || Box::new(DeepSeekParser::new()));
