@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::reasoning_parser::{
     parsers::{
-        BaseReasoningParser, DeepSeekR1Parser, Glm45Parser, KimiParser, Qwen3Parser,
+        BaseReasoningParser, DeepSeekR1Parser, Glm45Parser, KimiParser, MiniMaxParser, Qwen3Parser,
         QwenThinkingParser, Step3Parser,
     },
     traits::{ParseError, ParserConfig, ReasoningParser},
@@ -189,6 +189,9 @@ impl ParserFactory {
         // Register Step3 parser (same format as DeepSeek-R1 but separate for debugging)
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
 
+        // Register MiniMax parser (appends <think> token at the beginning)
+        registry.register_parser("minimax", || Box::new(MiniMaxParser::new()));
+
         // Register model patterns
         registry.register_pattern("deepseek-r1", "deepseek_r1");
         registry.register_pattern("qwen3-thinking", "qwen3_thinking");
@@ -198,6 +201,9 @@ impl ParserFactory {
         registry.register_pattern("glm45", "glm45");
         registry.register_pattern("kimi", "kimi");
         registry.register_pattern("step3", "step3");
+        registry.register_pattern("minimax", "minimax");
+        registry.register_pattern("minimax-m2", "minimax");
+        registry.register_pattern("mm-m2", "minimax");
 
         Self { registry }
     }
@@ -328,6 +334,17 @@ mod tests {
         let factory = ParserFactory::new();
         let glm45 = factory.create("glm45-v2").unwrap();
         assert_eq!(glm45.model_type(), "glm45");
+    }
+
+    #[test]
+    fn test_minimax_model() {
+        let factory = ParserFactory::new();
+        let minimax = factory.create("minimax-m2").unwrap();
+        assert_eq!(minimax.model_type(), "minimax");
+
+        // Also test alternate patterns
+        let mm = factory.create("mm-m2-chat").unwrap();
+        assert_eq!(mm.model_type(), "minimax");
     }
 
     #[tokio::test]

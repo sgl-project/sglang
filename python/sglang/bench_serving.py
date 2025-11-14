@@ -401,6 +401,7 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
+                                        output.text_chunks.append(content)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
@@ -1507,7 +1508,7 @@ def get_gen_prefix_cache_path(args, tokenizer):
 
     # Create a unique cache filename based on the generation parameters
     cache_key = (
-        f"gen_shared_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
+        f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
         f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
@@ -1753,6 +1754,8 @@ async def benchmark(
     max_concurrency: Optional[int],
     disable_tqdm: bool,
     lora_names: List[str],
+    lora_request_distribution: Optional[str],
+    lora_zipf_alpha: Optional[float],
     extra_request_body: Dict[str, Any],
     profile: bool,
     pd_separated: bool = False,
@@ -1893,11 +1896,30 @@ async def benchmark(
     else:
         request_generator = get_request(input_requests, request_rate)
 
+    # Prepare LoRA request distribution parameters
+    if lora_request_distribution == "distinct":
+        lora_idx = 0
+    elif lora_request_distribution == "skewed":
+        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
+        lora_probs = weights / np.sum(weights)
+    else:
+        lora_idx = None
+        lora_probs = None
+
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
-            idx = random.randint(0, len(lora_names) - 1)
-            lora_name = lora_names[idx]
+            if lora_request_distribution == "uniform":
+                lora_name = random.choice(lora_names)
+            elif lora_request_distribution == "distinct":
+                lora_name = lora_names[lora_idx]
+                lora_idx = (lora_idx + 1) % len(lora_names)
+            else:
+                assert (
+                    lora_request_distribution == "skewed"
+                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+
+                lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
             lora_name = None
 
@@ -2031,6 +2053,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+    print(
+        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
+    )
+    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
@@ -2071,6 +2099,7 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
+            "total_throughput": metrics.total_throughput,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
@@ -2289,6 +2318,15 @@ def run_benchmark(args_: argparse.Namespace):
             not args.tokenize_prompt
         ), "`--tokenize-prompt` not compatible with image dataset"
 
+    if args.lora_request_distribution in ["distinct", "skewed"]:
+        assert (
+            args.lora_name is not None and len(args.lora_name) > 1
+        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+
+    assert (
+        args.lora_zipf_alpha > 1
+    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+
     print(f"{args}\n")
 
     # Read dataset
@@ -2302,6 +2340,17 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
 
+    # Prepare LoRA arguments
+    lora_request_distribution = (
+        args.lora_request_distribution if args.lora_name is not None else None
+    )
+
+    lora_zipf_alpha = (
+        args.lora_zipf_alpha
+        if args.lora_name is not None and args.lora_request_distribution == "skewed"
+        else None
+    )
+
     return asyncio.run(
         benchmark(
             backend=backend,
@@ -2314,6 +2363,8 @@ def run_benchmark(args_: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             disable_tqdm=args.disable_tqdm,
             lora_names=args.lora_name,
+            lora_request_distribution=lora_request_distribution,
+            lora_zipf_alpha=lora_zipf_alpha,
             extra_request_body=extra_request_body,
             profile=args.profile,
             pd_separated=args.pd_separated,
@@ -2550,6 +2601,27 @@ if __name__ == "__main__":
         default=None,
         action=LoRAPathAction,
         help="The names of LoRA adapters. You can provide a list of names in the format {name} {name} {name}...",
+    )
+    parser.add_argument(
+        "--lora-request-distribution",
+        type=str,
+        default="uniform",
+        choices=[
+            "uniform",
+            "distinct",
+            "skewed",
+        ],
+        help="What distribution to sample the LoRA adapters specified in --lora-name. Borrowed from the Punica paper. "
+        "'distinct' distribution means selecting a new LoRA adapter for every request. "
+        "'skewed' distribution follows the Zipf distribution, where the number of requests "
+        "to model i specified in --lora-name is α times the number of requests for model i+1, "
+        "where α > 1.",
+    )
+    parser.add_argument(
+        "--lora-zipf-alpha",
+        type=float,
+        default=1.5,
+        help="The parameter to use for the Zipf distribution when --lora-request-distribution='skewed'.",
     )
     parser.add_argument(
         "--prompt-suffix",

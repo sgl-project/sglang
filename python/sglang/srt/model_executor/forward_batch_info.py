@@ -79,6 +79,10 @@ class ForwardMode(IntEnum):
 
     DRAFT_EXTEND_V2 = auto()
 
+    # Used in disaggregated decode worker
+    # Represent a batch of requests having their KV cache ready to start decoding
+    PREBUILT = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -141,6 +145,16 @@ class ForwardMode(IntEnum):
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
 
+    def is_extend_without_speculative(self):
+        return (
+            self.is_extend()
+            and not self.is_target_verify()
+            and not self.is_draft_extend()
+        )
+
+    def is_prebuilt(self):
+        return self == ForwardMode.PREBUILT
+
 
 @total_ordering
 class CaptureHiddenMode(IntEnum):
@@ -186,6 +200,10 @@ class ForwardBatch:
 
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+
+    # The indices of output tokens in the token_to_kv_pool_swa
+    # TODO(shiyang, biao): integrate out_cache_loc_swa into multiple attention backends
+    out_cache_loc_swa: Optional[torch.Tensor] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -719,7 +737,9 @@ class ForwardBatch:
             num_tokens = global_num_tokens[0]
 
         self.global_dp_buffer_len = buffer_len
-        set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
+        set_dp_buffer_len(
+            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+        )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size

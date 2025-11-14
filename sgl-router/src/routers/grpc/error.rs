@@ -9,7 +9,6 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use tracing::{error, warn};
 
 /// Create a 500 Internal Server Error response
 ///
@@ -21,7 +20,6 @@ use tracing::{error, warn};
 /// ```
 pub fn internal_error(message: impl Into<String>) -> Response {
     let msg = message.into();
-    error!("{}", msg);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({
@@ -45,7 +43,6 @@ pub fn internal_error(message: impl Into<String>) -> Response {
 /// ```
 pub fn bad_request(message: impl Into<String>) -> Response {
     let msg = message.into();
-    error!("{}", msg);
     (
         StatusCode::BAD_REQUEST,
         Json(json!({
@@ -69,7 +66,6 @@ pub fn bad_request(message: impl Into<String>) -> Response {
 /// ```
 pub fn not_found(message: impl Into<String>) -> Response {
     let msg = message.into();
-    warn!("{}", msg);
     (
         StatusCode::NOT_FOUND,
         Json(json!({
@@ -93,7 +89,6 @@ pub fn not_found(message: impl Into<String>) -> Response {
 /// ```
 pub fn service_unavailable(message: impl Into<String>) -> Response {
     let msg = message.into();
-    warn!("{}", msg);
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -101,6 +96,52 @@ pub fn service_unavailable(message: impl Into<String>) -> Response {
                 "message": msg,
                 "type": "service_unavailable",
                 "code": 503
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Create a 424 Failed Dependency response
+///
+/// Use this when an external dependency (like MCP server) fails.
+///
+/// # Example
+/// ```ignore
+/// return Err(failed_dependency("Failed to connect to MCP server"));
+/// ```
+pub fn failed_dependency(message: impl Into<String>) -> Response {
+    let msg = message.into();
+    (
+        StatusCode::FAILED_DEPENDENCY,
+        Json(json!({
+            "error": {
+                "message": msg,
+                "type": "external_connector_error",
+                "code": 424
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Create a 501 Not Implemented response
+///
+/// Use this for features that are not yet implemented or supported.
+///
+/// # Example
+/// ```ignore
+/// return Err(not_implemented("vLLM backend integration is in progress"));
+/// ```
+pub fn not_implemented(message: impl Into<String>) -> Response {
+    let msg = message.into();
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": {
+                "message": msg,
+                "type": "not_implemented_error",
+                "code": 501
             }
         })),
     )

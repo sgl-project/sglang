@@ -61,6 +61,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_pdmux = False
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -189,7 +190,7 @@ class EAGLEDraftExtendCudaGraphRunner:
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -294,7 +295,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+            )
             set_is_extend_in_batch(False)
 
             # Backup two fields, which will be modified in-place in `draft_forward`.

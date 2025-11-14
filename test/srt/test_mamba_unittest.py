@@ -1,4 +1,3 @@
-import inspect
 import os
 import unittest
 
@@ -42,7 +41,6 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
-            enable_memory_saver=False,
             mamba_pool=None,
         )
         assert pool._transfer_full_attention_id(global_interval - 1) == 0
@@ -175,7 +173,6 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
-            enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
         )
 
