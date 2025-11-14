@@ -35,7 +35,7 @@ suites = {
         TestFile("models/test_encoder_embedding_models.py", 460),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 160),
-        TestFile("models/test_qwen_models.py", 82),
+        TestFile("models/test_qwen_models.py", 150),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("models/test_vlm_models.py", 741),
@@ -69,11 +69,11 @@ suites = {
         TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
-        TestFile("test_deterministic.py", 320),
-        TestFile("test_eagle_infer_a.py", 370),
-        TestFile("test_eagle_infer_b.py", 500),
+        TestFile("test_deterministic.py", 400),
+        TestFile("test_eagle_infer_a.py", 750),
+        TestFile("test_eagle_infer_b.py", 750),
         TestFile("test_eagle_infer_beta.py", 90),
-        TestFile("test_constrained_decoding.py", 120),
+        TestFile("test_constrained_decoding.py", 150),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
@@ -103,6 +103,7 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
+        TestFile("test_piecewise_cuda_graph.py", 450),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -115,7 +116,7 @@ suites = {
         TestFile("test_speculative_registry.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_srt_engine.py", 261),
+        TestFile("test_srt_engine.py", 450),
         TestFile("test_standalone_speculative_decoding.py", 150),
         TestFile("test_start_profile.py", 60),
         TestFile("test_profile_merger.py", 60),
@@ -157,7 +158,6 @@ suites = {
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 291),
-        TestFile("test_disaggregation_dp_attention.py", 155),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
@@ -167,11 +167,15 @@ suites = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
+        TestFile("models/test_kimi_k2_models.py", 200),
+        TestFile("test_deepseek_v32_basic.py", 275),
+        TestFile("test_deepseek_v32_mtp.py", 275),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
+        TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
@@ -192,16 +196,11 @@ suites = {
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
     ],
-    "per-commit-8-gpu-h200-deepseek-v32": [
-        TestFile("test_deepseek_v32_basic.py", 275),
-        TestFile("test_deepseek_v32_mtp.py", 275),
-        TestFile("test_deepseek_v32_nsabackend.py", 600),
-    ],
-    "vllm_dependency_test": [
+    "quantization_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),
         TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_vllm_dependency.py", 185),
+        TestFile("test_quantization.py", 185),
         TestFile("test_gguf.py", 96),
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
@@ -215,13 +214,20 @@ suites = {
         TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("test_deepseek_v3_deterministic.py", 240),
+        TestFile("test_cpp_radix_cache.py", 60),
     ],
     "nightly-4-gpu-b200": [
+        TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
         TestFile("test_fp4_moe.py", 300),
+        TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
+        TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
     ],
+    "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [],
     "nightly-8-gpu": [],
-    "nightly-8-gpu-h200": [],
+    "nightly-8-gpu-h200": [
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
+    ],
     "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
@@ -244,14 +250,10 @@ suites = {
         TestFile("layers/moe/test_moe_runners.py"),
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
-        TestFile("models/lora/test_lora.py"),
-        TestFile("models/lora/test_lora_backend.py"),
-        TestFile("models/lora/test_lora_cuda_graph.py"),
-        TestFile("models/lora/test_lora_eviction.py"),
-        TestFile("models/lora/test_lora_qwen3.py"),
-        TestFile("models/lora/test_lora_tp.py"),
-        TestFile("models/lora/test_lora_update.py"),
-        TestFile("models/lora/test_multi_lora_backend.py"),
+        TestFile("lora/test_lora_cuda_graph.py"),
+        TestFile("lora/test_lora_qwen3.py"),
+        TestFile("lora/test_lora_tp.py"),
+        TestFile("lora/test_lora_update.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
@@ -332,11 +334,14 @@ suites = {
         TestFile("test_moe_ep.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_mscclpp.py"),
-        TestFile("test_nightly_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_perf.py"),
-        TestFile("test_nightly_vlms_mmmu_eval.py"),
-        TestFile("test_nightly_vlms_perf.py"),
+        TestFile("nightly/test_deepseek_v31_perf.py"),
+        TestFile("nightly/test_deepseek_v32_perf.py"),
+        TestFile("nightly/test_gpt_oss_4gpu_perf.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_text_models_gsm8k_eval.py"),
+        TestFile("nightly/test_text_models_perf.py"),
+        TestFile("nightly/test_vlms_mmmu_eval.py"),
+        TestFile("nightly/test_vlms_perf.py"),
         TestFile("test_openai_adapter.py"),
         TestFile("test_openai_function_calling.py"),
         TestFile("test_openai_server.py"),
@@ -385,10 +390,10 @@ suite_amd = {
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 150),
-        TestFile("lora/test_lora_backend.py", 99),
-        TestFile("lora/test_lora_cuda_graph.py", 250),
+        # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
+        # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
-        TestFile("lora/test_lora_qwen3.py", 97),
+        # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
@@ -413,6 +418,7 @@ suite_amd = {
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
+        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("test_abort.py", 51),
         TestFile("test_chunked_prefill.py", 410),
@@ -426,7 +432,7 @@ suite_amd = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        TestFile("test_mla.py", 242),
+        # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_page_size.py", 60),
@@ -442,7 +448,7 @@ suite_amd = {
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_torch_compile.py", 169),
-        TestFile("test_torch_compile_moe.py", 210),
+        # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_torch_native_attention_backend.py", 123),
         # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
@@ -462,7 +468,7 @@ suite_amd = {
         TestFile("test_mla.py", 242),
     ],
     "per-commit-2-gpu-amd": [
-        TestFile("lora/test_lora_tp.py", 116),
+        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
@@ -476,7 +482,7 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "nightly-amd": [
-        TestFile("test_nightly_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
     ],
 }
 
@@ -516,6 +522,7 @@ suite_ascend = {
     "per-commit-1-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_hicache_mha.py", 400),
     ],
     "per-commit-2-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
@@ -643,6 +650,12 @@ if __name__ == "__main__":
         type=int,
         help="Use auto load balancing. The number of parts.",
     )
+    arg_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (useful for nightly tests)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -660,5 +673,5 @@ if __name__ == "__main__":
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
