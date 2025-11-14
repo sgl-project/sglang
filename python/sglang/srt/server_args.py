@@ -1022,7 +1022,7 @@ class ServerArgs:
                 "triton",
                 "trtllm_mha",
                 "intel_xpu",
-            }, "fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model"
+            }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
             if is_sm100_supported() and self.attention_backend is None:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(
