@@ -96,6 +96,7 @@ class TestXaiBackend(StateManagementTests):
         )
 
         cls.base_url = cls.cluster["base_url"]
+        cls.client = openai.Client(api_key=cls.api_key, base_url=cls.base_url + "/v1")
 
     @classmethod
     def tearDownClass(cls):
