@@ -89,9 +89,14 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.elastic_allocator import ElasticSWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.elastic_memory_pool import ElasticSWAKVPool
-from sglang.srt.mem_cache.elasticmem_orchestrator import use_elasticmem
+from sglang.srt.mem_cache.elastic.elastic_allocator import (
+    ElasticSWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.elastic.elastic_memory_pool import ElasticSWAKVPool
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import (
+    ElasticMempoolOrchestrator,
+    use_elasticmem,
+)
 from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
@@ -1636,6 +1641,9 @@ class ModelRunner:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
+        if use_elasticmem:
+            self.emem_orch = ElasticMempoolOrchestrator()
+
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
@@ -1760,10 +1768,7 @@ class ModelRunner:
                 )
 
         # Initialize token_to_kv_pool_allocator
-        need_sort = (
-            self.server_args.disaggregation_mode in ("decode", "prefill")
-            or use_elasticmem
-        )
+        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
             if _is_npu and (
                 self.server_args.attention_backend == "ascend"
@@ -1780,11 +1785,11 @@ class ModelRunner:
             else:
                 if self.page_size == 1:
                     if self.is_hybrid:
-                        swa_allocator_class = (
-                            ElasticSWATokenToKVPoolAllocator
-                            if use_elasticmem
-                            else SWATokenToKVPoolAllocator
-                        )
+                        swa_allocator_class = SWATokenToKVPoolAllocator
+                        swa_kwargs = {}
+                        if use_elasticmem:
+                            swa_allocator_class = ElasticSWATokenToKVPoolAllocator
+                            swa_kwargs["emem_orch"] = self.emem_orch
                         self.token_to_kv_pool_allocator = swa_allocator_class(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
@@ -1792,6 +1797,7 @@ class ModelRunner:
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            **swa_kwargs,
                         )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(

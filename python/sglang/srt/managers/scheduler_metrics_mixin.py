@@ -10,7 +10,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
-from sglang.srt.mem_cache.elasticmem_orchestrator import use_elasticmem
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
 
@@ -77,25 +76,6 @@ class SchedulerMetricsMixin:
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
 
-    def swa_resize(self, full_token_usage: float, swa_token_usage: float):
-        if full_token_usage > swa_token_usage:
-            swa_evictable_size = self.tree_cache.swa_evictable_size()
-            self.tree_cache.evict(0, swa_evictable_size)
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-            transfer_token_num = swa_available_size // 2
-            swa_to_full = True
-        else:
-            full_evictable_size = self.tree_cache.full_evictable_size()
-            self.tree_cache.evict(full_evictable_size, 0)
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            transfer_token_num = full_available_size // 2
-            swa_to_full = False
-
-        self.token_to_kv_pool_allocator.transfer_token(transfer_token_num, swa_to_full)
-        self.swa_tokens_per_layer = self.token_to_kv_pool_allocator.size_swa
-        self.full_tokens_per_layer = self.token_to_kv_pool_allocator.size_full
-        logger.info(f"{(self.full_tokens_per_layer, self.swa_tokens_per_layer)=}")
-
     def log_prefill_stats(
         self: Scheduler,
         adder: PrefillAdder,
@@ -126,17 +106,6 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-
-            need_resize = (
-                use_elasticmem
-                and (full_token_usage > 0.9 or swa_token_usage > 0.9)
-                and abs(full_token_usage - swa_token_usage) > 0.1
-            )
-
-            if need_resize:
-                logger.info(f"{need_resize=}: {token_usage_msg}")
-                self.swa_resize(full_token_usage, swa_token_usage)
-
         elif self.is_hybrid_gdn:
             (
                 full_num_used,

@@ -1,3 +1,6 @@
+####################################################################################################
+# A10 dev
+
 sudo docker run -d -it \
     --ulimit memlock=-1  --ulimit stack=67108864  --ulimit core=-1 \
     --ipc=host --network=host --privileged \
@@ -68,8 +71,8 @@ tail -f nohup.out
 
 python3 -m sglang.bench_serving --backend sglang \
   --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 8192 --random-input 24576 --random-output 1024 --random-range-ratio 0.5 \
-  --max-concurrency 2048
+  --num-prompts 2048 --random-input 24576 --random-output 1024 --random-range-ratio 0.5 \
+  --max-concurrency 800
 
 curl -L -X POST 'http://127.0.0.1:30000/v1/chat/completions' \
 -H 'Content-Type: application/json' \
@@ -94,3 +97,31 @@ curl -X POST 127.0.0.1:30000/start_profile \
     "activities": ["MEM"],
     "merge_profiles": true
   }'
+
+####################################################################################################
+# h20 dev
+
+for _ in {1..2}; do
+  ps aux | grep "sglang.launch_server" | grep -v grep | awk '{print $2}' | xargs kill -9
+  ps aux | grep "sglang::" | grep -v grep | awk '{print $2}' | xargs kill -9
+  sleep 1
+done
+
+export SGLANG_ELASTIC_MEM_POOL=true
+export SGLANG_RATIO=1.0
+nohup python3 -m sglang.launch_server \
+  --log-level debug \
+  --model /home/t4/models/lvm-data/Llama-4-Scout-17B-16E-Instruct \
+  --tp 2 \
+  --attention-backend fa3 \
+  --hybrid-kvcache-ratio ${SGLANG_RATIO} \
+  --context-length 200000 \
+  > nohup.emem.${SGLANG_ELASTIC_MEM_POOL}.ratio.${SGLANG_RATIO}.out 2>&1 \
+  &
+
+nohup python3 -m sglang.bench_serving --backend sglang \
+  --dataset-name random --dataset-path /home/t4/models/lvm-data/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 1024 --random-input 1024 --random-output 1024 --random-range-ratio 1 \
+  --max-concurrency 128 \
+  > nohup.bench.${SGLANG_ELASTIC_MEM_POOL}.ratio.${SGLANG_RATIO}.out 2>&1 \
+  &

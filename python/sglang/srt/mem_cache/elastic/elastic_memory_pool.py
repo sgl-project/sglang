@@ -16,13 +16,13 @@ limitations under the License.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, override
 
 import torch
 
-from sglang.srt.mem_cache.elasticmem_orchestrator import (
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import (
     ElasticMempool,
-    ElasticMempoolOrchestrator,
+    cu_page_size,
     use_elasticmem,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, SWAKVPool
@@ -45,12 +45,16 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
         assert pool_name is not None
         self.pool_name = pool_name
         super().__init__(*args, **kwargs)
+        logger.info(f"{self.pool_name=} initialized")
 
     def _create_buffers(self):
         self.create_elastic_buffers()
 
+    @override
     def create_elastic_buffers(self):
         current_device_id = f"cuda:{torch.cuda.current_device()}"
+
+        free_memory, total_memory = torch.cuda.mem_get_info()
 
         assert self.size % self.page_size == 0
         self.esize = (
@@ -69,6 +73,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
                 state_shape,
                 dtype,
                 current_device_id,
+                free_memory,
             )
             for i in range(self.layer_num)
         ]
@@ -80,14 +85,16 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
                 state_shape,
                 dtype,
                 current_device_id,
+                free_memory,
             )
             for i in range(self.layer_num)
         ]
         self.k_buffer = [etensor.etensor for etensor in self.ek_buffer]
         self.v_buffer = [etensor.etensor for etensor in self.ev_buffer]
         self.state_memsize = self.ek_buffer[0].state_memsize
-        logger.info(f"{self.esize=}, {self.k_buffer[0].shape=}")
+        logger.debug(f"{self.esize=}, {self.k_buffer[0].shape=}")
 
+    @override
     def disable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
         total_unmap_num = 0
         for ek, ev in zip(self.ek_buffer, self.ev_buffer):
@@ -98,6 +105,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
         self.size -= len(proc_indices)
         return total_unmap_num, pass_indices, proc_indices
 
+    @override
     def enable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
         total_map_num = 0
         for ek, ev in zip(self.ek_buffer, self.ev_buffer):
@@ -108,6 +116,13 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
         self.size += len(proc_indices)
         return total_map_num, pass_indices, proc_indices
 
+    @override
+    def cu_page_to_token(self, cu_page_num: int) -> int:
+        cu_mem = cu_page_num * cu_page_size
+        cu_mem_per_kv_layer = cu_mem // 2 // self.layer_num
+        token_num = cu_mem_per_kv_layer // self.state_memsize
+        return token_num
+
 
 class ElasticSWAKVPool(SWAKVPool):
     def __init__(
@@ -115,10 +130,14 @@ class ElasticSWAKVPool(SWAKVPool):
         *args,
         **kwargs,
     ):
-        self.emem_orch = ElasticMempoolOrchestrator()
         super().__init__(*args, **kwargs)
+        logger.info(f"ElasticSWAKVPool initialized")
 
     def _create_buffers(self, token_to_kv_pool_class, **kwargs):
+        self.create_elastic_buffers(token_to_kv_pool_class, **kwargs)
+
+    @override
+    def create_elastic_buffers(self, token_to_kv_pool_class, **kwargs):
         token_to_kv_pool_class = ElasticMHATokenToKVPool
         self.swa_kv_pool = token_to_kv_pool_class(
             size=self.size_swa,
@@ -134,3 +153,15 @@ class ElasticSWAKVPool(SWAKVPool):
             pool_name="full",
             **kwargs,
         )
+
+    @override
+    def disable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+        raise NotImplementedError()
+
+    @override
+    def enable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+        raise NotImplementedError()
+
+    @override
+    def cu_page_to_token(self, cu_page_num: int) -> int:
+        raise NotImplementedError()
