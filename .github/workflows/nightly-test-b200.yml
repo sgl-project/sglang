@@ -18,7 +18,7 @@ jobs:
   nightly-test-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 4-gpu-b200
-    continue-on-error: true
+
     env:
       RUNNER_LABELS: 4-gpu-b200
     steps:
@@ -50,7 +50,6 @@ jobs:
   nightly-test-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-b200
-    continue-on-error: true
     env:
       RUNNER_LABELS: 8-gpu-b200
     steps:
@@ -96,3 +95,22 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v32
+
+  check-all-jobs:
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
+    needs:
+      - nightly-test-4-gpu-b200
+      - nightly-test-8-gpu-b200
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"
