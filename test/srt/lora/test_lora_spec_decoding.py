@@ -45,12 +45,20 @@ LORA_MODELS_QWEN3 = [
 class TestLoRASpecDecoding(CustomTestCase):
     def test_qwen(self):
         run_lora_multiple_batch_on_model_cases(
-            LORA_MODELS_QWEN3, use_spec_decoding=True
+            LORA_MODELS_QWEN3,
+            attention_backend="triton",
+            use_spec_decoding=True,
+            disable_cuda_graph=True,
+            enable_deterministic_inference=True,
         )
 
     def test_llama(self):
         run_lora_multiple_batch_on_model_cases(
-            CI_MULTI_LORA_MODELS, use_spec_decoding=True
+            CI_MULTI_LORA_MODELS,
+            attention_backend="triton",
+            use_spec_decoding=True,
+            disable_cuda_graph=True,
+            enable_deterministic_inference=True,
         )
 
 

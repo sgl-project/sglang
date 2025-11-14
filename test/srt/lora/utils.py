@@ -482,9 +482,9 @@ def create_multiple_batch_test_samples(
 def run_lora_multiple_batch_on_model_cases(
     model_cases: List[LoRAModelCase],
     use_spec_decoding: bool = False,
-    attention_backend: str = "triton",
+    attention_backend: str = "torch_native",
     disable_cuda_graph: bool = True,
-    enable_deterministic_inference: bool = True,
+    enable_deterministic_inference: bool = False,
 ):
     for model_case in model_cases:
         for torch_dtype in TORCH_DTYPES:
