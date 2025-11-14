@@ -493,11 +493,9 @@ class TypeBasedDispatcher:
 
     def __iadd__(self, other: "TypeBasedDispatcher"):
         self._mapping.extend(other._mapping)
-        self._type_dict = {}
 
-        for ty, fn in self._mapping:
-            if not isinstance(ty, tuple) and ty not in self._type_dict:
-                self._type_dict[ty] = fn
+        for ty, fn in other._type_dict.items():
+            self._type_dict.setdefault(ty, fn)
         return self
 
     def __call__(self, obj: Any):
