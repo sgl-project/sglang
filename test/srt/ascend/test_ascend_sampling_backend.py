@@ -3,10 +3,9 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import is_npu, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -17,11 +16,7 @@ from sglang.test.test_utils import (
 class TestAscendSamplingBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = (
-            "/root/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
-            if is_npu()
-            else DEFAULT_MODEL_NAME_FOR_TEST
-        )
+        cls.model = "Qwen/Qwen2.5-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
