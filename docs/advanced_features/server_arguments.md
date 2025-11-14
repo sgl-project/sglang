@@ -95,15 +95,19 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-multimodal` | Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen | `None` | bool flag (set to enable) |
 | `--revision` | The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
 | `--model-impl` | Which implementation of the model to use. * "auto" will try to use the SGLang implementation if it exists and fall back to the Transformers implementation if no SGLang implementation is available. * "sglang" will use the SGLang model implementation. * "transformers" will use the Transformers model implementation. | `auto` | Type: str |
+| `--decrypted-config-file` | Path to a decrypted config file for the main model. Used when model config.json is encrypted and needs to be loaded from an alternative location. | `None` | Type: str |
+| `--decrypted-draft-config-file` | Path to a decrypted config file for the draft model in speculative decoding. Used when draft model config.json is encrypted. | `None` | Type: str |
 
 ## HTTP server
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--host` | The host of the HTTP server. | `127.0.0.1` | Type: str |
 | `--port` | The port of the HTTP server. | `30000` | Type: int |
+| `--grpc-mode` | If set, use gRPC server instead of HTTP server. | `False` | bool flag (set to enable) |
 | `--skip-server-warmup` | If set, skip warmup. | `False` | bool flag (set to enable) |
 | `--warmups` | Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests | `None` | Type: str |
 | `--nccl-port` | The port for NCCL distributed environment setup. Defaults to a random port. | `None` | Type: int |
+| `--checkpoint-engine-wait-weights-before-ready` | If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests. | `False` | bool flag (set to enable) |
 
 ## Quantization and data type
 | Argument | Description | Defaults | Options |
@@ -114,6 +118,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--modelopt-quant` | The ModelOpt quantization configuration. Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt | `None` | Type: str |
 | `--modelopt-checkpoint-restore-path` | Path to restore a previously saved ModelOpt quantized checkpoint. If provided, the quantization process will be skipped and the model will be loaded from this checkpoint. | `None` | Type: str |
 | `--modelopt-checkpoint-save-path` | Path to save the ModelOpt quantized checkpoint after quantization. This allows reusing the quantized model in future runs. | `None` | Type: str |
+| `--modelopt-export-path` | Path to export the quantized model in HuggingFace format after ModelOpt quantization. The exported model can then be used directly with SGLang for inference. If not provided, the model will not be exported. | `None` | Type: str |
+| `--quantize-and-serve` | Quantize the model with ModelOpt and immediately serve it without exporting. This is useful for development and prototyping. For production, it's recommended to use separate quantization and deployment steps. | `False` | bool flag (set to enable) |
 | `--kv-cache-dtype` | Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+. | `auto` | `auto`, `fp8_e5m2`, `fp8_e4m3` |
 | `--enable-fp32-lm-head` | If set, the LM head outputs (logits) are in FP32. | `False` | bool flag (set to enable) |
 
@@ -131,6 +137,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--schedule-low-priority-values-first` | If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first. | `False` | bool flag (set to enable) |
 | `--priority-scheduling-preemption-threshold` | Minimum difference in priorities for an incoming request to have to preempt running request(s). | `10` | Type: int |
 | `--schedule-conservativeness` | How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently. | `1.0` | Type: float |
+| `--abort-on-priority-when-disabled` | If set, abort requests that specify a priority when priority scheduling is disabled. | `False` | bool flag (set to enable) |
 | `--page-size` | The number of tokens in a page. | `1` | Type: int |
 | `--hybrid-kvcache-ratio` | Mix ratio in [0,1] between uniform and hybrid kv buffers (0.0 = pure uniform: swa_size / full_size = 1)(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length) | `None` | Optional[float] |
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |
@@ -183,6 +190,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--kv-events-config` | Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. | `None` | Type: str |
 | `--enable-trace` | Enable opentelemetry trace | `False` | bool flag (set to enable) |
 | `--oltp-traces-endpoint` | Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port> | `localhost:4317` | Type: str |
+| `--otlp-traces-endpoint` | OpenTelemetry traces endpoint for distributed tracing. Used by the scheduler, data parallel controller, and HTTP server when --enable-trace is set. Format: <ip>:<port> | `localhost:4317` | Type: str |
+| `--export-metrics-to-file` | Enable exporting request metrics to file. Requires --export-metrics-to-file-dir to be set. | `False` | bool flag (set to enable) |
+| `--export-metrics-to-file-dir` | Directory path for writing performance metrics files. Required when --export-metrics-to-file is enabled. | `None` | Type: str |
 
 ## API related
 | Argument | Description | Defaults | Options |
@@ -244,6 +254,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--mm-attention-backend` | Set multimodal attention backend. | `None` | `sdpa`, `fa3`, `triton_attn`, `ascend_attn`, `aiter_attn` |
 | `--nsa-prefill` | Choose the NSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek NSA-style attention). | `flashmla_sparse` | `flashmla_sparse`, `flashmla_decode`, `fa3`, `tilelang`, `aiter` |
 | `--nsa-decode` | Choose the NSA backend for the decode stage when running DeepSeek NSA-style attention. Overrides `--attention-backend` for decoding. | `flashmla_kv` | `flashmla_prefill`, `flashmla_kv`, `fa3`, `tilelang`, `aiter` |
+| `--nsa-prefill-backend` | Alternative name for --nsa-prefill. Choose the NSA backend for the prefill stage when using Native Sparse Attention. | `flashmla_sparse` | `flashmla_sparse`, `flashmla_decode`, `fa3`, `tilelang`, `aiter` |
+| `--nsa-decode-backend` | Alternative name for --nsa-decode. Choose the NSA backend for the decode stage when using Native Sparse Attention. | `flashmla_kv` | `flashmla_prefill`, `flashmla_kv`, `fa3`, `tilelang`, `aiter` |
 
 ## Speculative decoding
 | Argument | Description | Defaults | Options |
@@ -251,6 +263,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-algorithm` | Speculative algorithm. | `None` | `EAGLE`, `EAGLE3`, `NEXTN`, `STANDALONE`, `NGRAM` |
 | `--speculative-draft-model-path`<br>`--speculative-draft-model` | The path of the draft model weights. This can be a local folder or a Hugging Face repo ID. | `None` | Type: str |
 | `--speculative-draft-model-revision` | The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
+| `--speculative-draft-load-format` | The format of the draft model weights to load. Same options as --load-format. | `None` | `auto`, `pt`, `safetensors`, `npcache`, `dummy`, `sharded_state`, `gguf`, `bitsandbytes`, `layered`, `remote`, `remote_instance` |
 | `--speculative-num-steps` | The number of steps sampled from draft model in Speculative Decoding. | `None` | Type: int |
 | `--speculative-eagle-topk` | The number of tokens sampled from the draft model in eagle2 each step. | `None` | Type: int |
 | `--speculative-num-draft-tokens` | The number of tokens sampled from the draft model in Speculative Decoding. | `None` | Type: int |
@@ -293,6 +306,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-expert-distribution-metrics` | Enable logging metrics for expert balancedness | `False` | bool flag (set to enable) |
 | `--deepep-config` | Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path. | `None` | Type: str |
 | `--moe-dense-tp-size` | TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports. | `None` | Type: int |
+| `--kt-weight-path` | Path to ktransformers weight files for CPU/GPU hybrid expert execution. When set, enables ktransformers for offloading MoE experts to CPU. | `None` | Type: str |
+| `--kt-method` | Ktransformers execution method for hybrid expert parallelism. | `None` | Type: str |
+| `--kt-cpuinfer` | Number of CPU inference threads for ktransformers. | `None` | Type: int |
+| `--kt-threadpool-count` | Number of thread pools for ktransformers CPU execution. | `None` | Type: int |
+| `--kt-num-gpu-experts` | Number of MoE experts to keep on GPU when using ktransformers (rest will be offloaded to CPU). | `None` | Type: int |
+| `--kt-max-deferred-experts-per-token` | Maximum number of deferred experts per token in ktransformers. Controls how many expert computations can be deferred for batching. | `None` | Type: int |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |
@@ -358,6 +377,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-symm-mem` | Enable NCCL symmetric memory for fast collectives. | `False` | bool flag (set to enable) |
 | `--disable-flashinfer-cutlass-moe-fp4-allgather` | Disables quantize before all-gather for flashinfer cutlass moe. | `False` | bool flag (set to enable) |
 | `--enable-tokenizer-batch-encode` | Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds. | `False` | bool flag (set to enable) |
+| `--disable-tokenizer-batch-decode` | Disable batch tokenizer decoding. When disabled, tokens are decoded one by one instead of in batches, which may reduce throughput but can be useful for debugging. | `False` | bool flag (set to enable) |
 | `--disable-outlines-disk-cache` | Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency. | `False` | bool flag (set to enable) |
 | `--disable-custom-all-reduce` | Disable the custom all-reduce kernel and fall back to NCCL. | `False` | bool flag (set to enable) |
 | `--enable-mscclpp` | Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL. | `False` | bool flag (set to enable) |
@@ -372,6 +392,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | `False` | bool flag (set to enable) |
 | `--enable-piecewise-cuda-graph` | Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature. | `False` | bool flag (set to enable) |
 | `--piecewise-cuda-graph-tokens` | Set the list of tokens when using piecewise cuda graph. | `None` | Type: JSON list |
+| `--piecewise-cuda-graph-compiler` | Compiler to use for piecewise CUDA graph. Options include 'dynamo' for torch.compile backend or other experimental compilers. | `None` | Type: str |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | `32` | Type: int |
 | `--piecewise-cuda-graph-max-tokens` | Set the maximum tokens when using piecewise cuda graph. | `4096` | Type: int |
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row | `` | Type: str |
@@ -391,14 +412,18 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-chunked-prefix-cache` | Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences. | `False` | bool flag (set to enable) |
 | `--disable-fast-image-processor` | Adopt base image processor instead of fast image processor. | `False` | bool flag (set to enable) |
 | `--keep-mm-feature-on-device` | Keep multimodal feature tensors on device after processing to save D2H copy. | `False` | bool flag (set to enable) |
+| `--mm-max-concurrent-calls` | Maximum number of concurrent calls for async multi-modal data processing. Controls parallelism when processing images and other multi-modal inputs. | `32` | Type: int |
+| `--mm-per-request-timeout` | Timeout in seconds for each multi-modal request processing. If processing takes longer than this, the request will timeout. | `10.0` | Type: float |
 | `--enable-return-hidden-states` | Enable returning hidden states with responses. | `False` | bool flag (set to enable) |
 | `--scheduler-recv-interval` | The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |
+| `--rl-on-policy-target` | Enable special handling for reinforcement learning on-policy target models. When set, forces certain layers (embedding, RMSNorm) to use float32 precision for numerical stability during RL training. | `None` | Type: str |
 
 ## Debug tensor dumps
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--debug-tensor-dump-output-folder` | The output folder for dumping tensors. | `None` | Type: str |
+| `--debug-tensor-dump-layers` | Specific layer indices to dump tensors from. If not specified (None), dumps tensors from all layers. Accepts a list of integers representing layer indices. | `None` | List[int] |
 | `--debug-tensor-dump-input-file` | The input filename for dumping tensors | `None` | Type: str |
 | `--debug-tensor-dump-inject` | Inject the outputs from jax as the input of every layer. | `False` | Type: str |
 | `--enable-dynamic-batch-tokenizer` | Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently. | `False` | bool flag (set to enable) |
