@@ -52,12 +52,8 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
   for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
     T input_val = input[row_idx * NUM_EXPERTS + expert];
     T bias_val = bias[expert];
-
     float sigmoid_val = 1.0f / (1.0f + expf(-static_cast<float>(input_val)));
     float biased_val = sigmoid_val + static_cast<float>(bias_val);
-    float sigmoid_val = 1.0f / (1.0f + expf(-static_cast<float>(input_val)));
-    float biased_val = sigmoid_val + static_cast<float>(bias_val);
-
     warp_scores[expert] = biased_val;
     warp_original_scores[expert] = sigmoid_val;
   }
