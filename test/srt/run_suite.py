@@ -605,7 +605,7 @@ def _sanity_check_suites(applied_suites):
         [test_file.name for _, suite in applied_suites.items() for test_file in suite]
     )
 
-    missing_files = sorted(list(disk_files - suite_files))
+    missing_files = sorted(list(suite_files - disk_files))
     missing_text = "\n".join(f'TestFile("{x}"),' for x in missing_files)
     assert len(missing_files) == 0, (
         f"Some test files are not in test suite. "
@@ -663,16 +663,12 @@ if __name__ == "__main__":
     applied_suites = suites if args.suite == "all" else suites_cuda
     if "cpu" in args.suite:
         applied_suites = suite_xeon
-        print("CPU")
     elif "xpu" in args.suite:
         applied_suites = suite_xpu
-        print("XPU")
     elif "ascend" in args.suite:
         applied_suites = suite_ascend
-        print("ASCEND")
     elif "amd" in args.suite:
         applied_suites = suite_amd
-        print("AMD")
     _sanity_check_suites(applied_suites)
 
     if args.suite == "all":
