@@ -6,8 +6,10 @@ on:
   push:
     branches:
       - main
+      - feat/nightly-test-naming-conventions  # TEMPORARY: for testing
     paths:
       - "python/sglang/version.py"
+      - ".github/workflows/nightly-test-*.yml"  # TEMPORARY: trigger on workflow changes
   workflow_dispatch:
 
 concurrency:
@@ -16,33 +18,33 @@ concurrency:
 
 jobs:
   # Text model accuracy tests
-  nightly-test-text-accuracy-2-gpu-h100:
+  nightly-test-text-accuracy-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
-    uses: ./.github/workflows/nightly-test-text-accuracy-2-gpu-h100.yml
+    uses: ./.github/workflows/nightly-test-text-accuracy-2-gpu-runner.yml
     secrets: inherit
 
   # Text model performance tests
-  nightly-test-text-perf-2-gpu-h100:
+  nightly-test-text-perf-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
-    uses: ./.github/workflows/nightly-test-text-perf-2-gpu-h100.yml
+    uses: ./.github/workflows/nightly-test-text-perf-2-gpu-runner.yml
     secrets: inherit
 
   # VLM accuracy tests
-  nightly-test-vlm-accuracy-2-gpu-h100:
+  nightly-test-vlm-accuracy-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
-    uses: ./.github/workflows/nightly-test-vlm-accuracy-2-gpu-h100.yml
+    uses: ./.github/workflows/nightly-test-vlm-accuracy-2-gpu-runner.yml
     secrets: inherit
 
   # VLM performance tests
-  nightly-test-vlm-perf-2-gpu-h100:
+  nightly-test-vlm-perf-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
-    uses: ./.github/workflows/nightly-test-vlm-perf-2-gpu-h100.yml
+    uses: ./.github/workflows/nightly-test-vlm-perf-2-gpu-runner.yml
     secrets: inherit
 
   # Single GPU tests
-  nightly-test-general-1-gpu-h100:
+  nightly-test-general-1-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
-    uses: ./.github/workflows/nightly-test-general-1-gpu-h100.yml
+    uses: ./.github/workflows/nightly-test-general-1-gpu-runner.yml
     secrets: inherit
 
   # 4 GPU tests
@@ -78,11 +80,11 @@ jobs:
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
-      - nightly-test-text-accuracy-2-gpu-h100
-      - nightly-test-text-perf-2-gpu-h100
-      - nightly-test-vlm-accuracy-2-gpu-h100
-      - nightly-test-vlm-perf-2-gpu-h100
-      - nightly-test-general-1-gpu-h100
+      - nightly-test-text-accuracy-2-gpu-runner
+      - nightly-test-text-perf-2-gpu-runner
+      - nightly-test-vlm-accuracy-2-gpu-runner
+      - nightly-test-vlm-perf-2-gpu-runner
+      - nightly-test-general-1-gpu-runner
       - nightly-test-general-4-gpu-h100
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-h20

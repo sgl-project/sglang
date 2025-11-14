@@ -1,4 +1,4 @@
-name: Nightly-test-general-1-gpu-h100
+name: Nightly-test-general-1-gpu-runner
 
 on:
   workflow_call:

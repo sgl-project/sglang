@@ -1,4 +1,4 @@
-name: Nightly-test-text-accuracy-2-gpu-h100
+name: Nightly-test-vlm-accuracy-2-gpu-runner
 
 on:
   workflow_call:
@@ -15,8 +15,8 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run eval test for text models
-        timeout-minutes: 120
+      - name: Run eval test for VLM models (fixed MMMU-100)
+        timeout-minutes: 240
         run: |
           cd test/srt
-          python3 nightly/test_text_models_gsm8k_eval.py
+          python3 nightly/test_vlms_mmmu_eval.py

@@ -6,8 +6,10 @@ on:
   push:
     branches:
       - main
+      - feat/nightly-test-naming-conventions  # TEMPORARY: for testing
     paths:
       - "python/sglang/version.py"
+      - ".github/workflows/nightly-test-*.yml"  # TEMPORARY: trigger on workflow changes
   workflow_dispatch:
 
 concurrency:
