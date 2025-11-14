@@ -10,8 +10,7 @@ use tokio::sync::Mutex;
 use crate::tool_parser::{
     parsers::{
         DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
-        MistralParser, PassthroughParser, PythonicParser, QwenParser, QwenCoderParser,
-        Step3Parser,
+        MistralParser, PassthroughParser, PythonicParser, QwenCoderParser, QwenParser, Step3Parser,
     },
     traits::ToolParser,
 };

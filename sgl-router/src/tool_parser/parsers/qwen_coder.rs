@@ -250,87 +250,88 @@ impl QwenCoderParser {
             }
         }
 
-            // Parse parameters incrementally
-            if self.current_tool_name_sent {
-                // First, try to find and parse any complete parameter blocks in the buffer
-                // This handles cases where parameters arrive in chunks but are complete
-                for cap in self.xml_param_pattern.captures_iter(&self.buffer) {
-                    if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
-                        let key = key_match.as_str().trim().to_string();
-                        let value = value_match.as_str().trim();
+        // Parse parameters incrementally
+        if self.current_tool_name_sent {
+            // First, try to find and parse any complete parameter blocks in the buffer
+            // This handles cases where parameters arrive in chunks but are complete
+            for cap in self.xml_param_pattern.captures_iter(&self.buffer) {
+                if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
+                    let key = key_match.as_str().trim().to_string();
+                    let value = value_match.as_str().trim();
 
-                        // Only process if we haven't already streamed this parameter
-                        if !self.xml_streamed_parameters.contains_key(&key) {
-                            // Try to parse value as JSON (similar to Python's _safe_val which tries json.loads)
-                            // This will parse numbers, booleans, null, objects, arrays, and strings
-                            let json_value = match serde_json::from_str::<Value>(value) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    // If JSON parsing fails, keep as string
-                                    Value::String(value.to_string())
-                                }
-                            };
-
-                            // Add to current parameters
-                            self.xml_current_parameters.insert(key.clone(), json_value.clone());
-
-                            // Stream the parameter update
-                            let value_json = serde_json::to_string(&json_value)
-                                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
-
-                            let json_fragment = if self.xml_streamed_parameters.is_empty() {
-                                format!("{{\"{}\": {}}}", key, value_json)
-                            } else {
-                                format!(", \"{}\": {}", key, value_json)
-                            };
-
-                            calls.push(ToolCallItem {
-                                tool_index: self.current_tool_id as usize,
-                                name: None,
-                                parameters: json_fragment.clone(),
-                            });
-
-                            // Update streamed args
-                            let current_args =
-                                &mut self.streamed_args_for_tool[self.current_tool_id as usize];
-                            if current_args.is_empty() {
-                                *current_args = format!("{{\"{}\": {}}}", key, value_json);
-                            } else {
-                                // Trim trailing whitespace before checking for closing brace
-                                let trimmed = current_args.trim_end();
-                                if let Some(stripped) = trimmed.strip_suffix('}') {
-                                    *current_args = format!("{}{}}}", stripped, json_fragment);
-                                } else {
-                                    *current_args = format!("{}{}", trimmed, json_fragment);
-                                }
+                    // Only process if we haven't already streamed this parameter
+                    if !self.xml_streamed_parameters.contains_key(&key) {
+                        // Try to parse value as JSON (similar to Python's _safe_val which tries json.loads)
+                        // This will parse numbers, booleans, null, objects, arrays, and strings
+                        let json_value = match serde_json::from_str::<Value>(value) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                // If JSON parsing fails, keep as string
+                                Value::String(value.to_string())
                             }
+                        };
 
-                            // Update streamed parameters
-                            self.xml_streamed_parameters.insert(key, json_value);
+                        // Add to current parameters
+                        self.xml_current_parameters
+                            .insert(key.clone(), json_value.clone());
+
+                        // Stream the parameter update
+                        let value_json = serde_json::to_string(&json_value)
+                            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
+
+                        let json_fragment = if self.xml_streamed_parameters.is_empty() {
+                            format!("{{\"{}\": {}}}", key, value_json)
+                        } else {
+                            format!(", \"{}\": {}", key, value_json)
+                        };
+
+                        calls.push(ToolCallItem {
+                            tool_index: self.current_tool_id as usize,
+                            name: None,
+                            parameters: json_fragment.clone(),
+                        });
+
+                        // Update streamed args
+                        let current_args =
+                            &mut self.streamed_args_for_tool[self.current_tool_id as usize];
+                        if current_args.is_empty() {
+                            *current_args = format!("{{\"{}\": {}}}", key, value_json);
+                        } else {
+                            // Trim trailing whitespace before checking for closing brace
+                            let trimmed = current_args.trim_end();
+                            if let Some(stripped) = trimmed.strip_suffix('}') {
+                                *current_args = format!("{}{}}}", stripped, json_fragment);
+                            } else {
+                                *current_args = format!("{}{}", trimmed, json_fragment);
+                            }
+                        }
+
+                        // Update streamed parameters
+                        self.xml_streamed_parameters.insert(key, json_value);
+                    }
+                }
+            }
+
+            // Use precompiled regex pattern
+            // Check if we're entering a new parameter
+            if !self.in_parameter {
+                if let Some(cap) = self.xml_param_start_pattern.captures(&self.buffer) {
+                    if let Some(key_match) = cap.get(1) {
+                        self.current_parameter_key = key_match.as_str().trim().to_string();
+                        self.current_parameter_value.clear();
+                        self.in_parameter = true;
+
+                        // Remove the opening tag from buffer
+                        if let Some(m) = cap.get(0) {
+                            self.buffer = self.buffer[m.end()..].to_string();
                         }
                     }
                 }
+            }
 
-                // Use precompiled regex pattern
-                // Check if we're entering a new parameter
-                if !self.in_parameter {
-                    if let Some(cap) = self.xml_param_start_pattern.captures(&self.buffer) {
-                        if let Some(key_match) = cap.get(1) {
-                            self.current_parameter_key = key_match.as_str().trim().to_string();
-                            self.current_parameter_value.clear();
-                            self.in_parameter = true;
-
-                            // Remove the opening tag from buffer
-                            if let Some(m) = cap.get(0) {
-                                self.buffer = self.buffer[m.end()..].to_string();
-                            }
-                        }
-                    }
-                }
-
-                // If we're in a parameter, accumulate value until we see </parameter>
-                if self.in_parameter {
-                    if let Some(end_pos) = self.buffer.find("</parameter>") {
+            // If we're in a parameter, accumulate value until we see </parameter>
+            if self.in_parameter {
+                if let Some(end_pos) = self.buffer.find("</parameter>") {
                     // Found complete parameter
                     let value = self.buffer[..end_pos].trim().to_string();
                     self.current_parameter_value.push_str(&value);

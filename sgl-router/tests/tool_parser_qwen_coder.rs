@@ -4,10 +4,7 @@
 //! <tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>
 
 use serde_json::json;
-use sglang_router_rs::tool_parser::{
-    parsers::QwenCoderParser,
-    traits::ToolParser,
-};
+use sglang_router_rs::tool_parser::{parsers::QwenCoderParser, traits::ToolParser};
 
 mod common;
 use common::{create_test_tools, streaming_helpers::*};
@@ -503,9 +500,9 @@ async fn test_qwen_coder_xml_tag_arrives_in_parts() {
     let mut parser = QwenCoderParser::new();
 
     let chunks = vec![
-        "<to", "ol_", "cal", "l>", "<fun", "cti", "on=", "get", "_we", "ath", "er>", "<par",
-        "ame", "ter=", "cit", "y>", "Tok", "yo", "</", "par", "ame", "ter>", "</", "func",
-        "tion>", "</", "too", "l_c", "all>",
+        "<to", "ol_", "cal", "l>", "<fun", "cti", "on=", "get", "_we", "ath", "er>", "<par", "ame",
+        "ter=", "cit", "y>", "Tok", "yo", "</", "par", "ame", "ter>", "</", "func", "tion>", "</",
+        "too", "l_c", "all>",
     ];
 
     let mut got_tool_name = false;
@@ -621,4 +618,3 @@ async fn test_qwen_coder_many_parameters() {
         assert_eq!(args[key], expected_value);
     }
 }
-
