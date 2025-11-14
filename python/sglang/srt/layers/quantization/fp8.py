@@ -1210,9 +1210,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else topk_config.correction_bias.to(x.dtype)
         )
 
-        routing_method_type = getattr(
-            layer, "routing_method_type", RoutingMethodType.DeepSeekV3
-        )
+        routing_method_type = getattr(layer, "routing_method_type")
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
