@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
 from json import dumps
-from typing import Any, Callable, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import pybase64
@@ -482,15 +482,29 @@ class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
         self._fallback_fn = None
+        self._type_dict: Dict[Type, Callable] = {}
+
+        for ty, fn in mapping:
+            if not isinstance(ty, tuple) and ty not in self._type_dict:
+                self._type_dict[ty] = fn
 
     def add_fallback_fn(self, fallback_fn: Callable):
         self._fallback_fn = fallback_fn
 
     def __iadd__(self, other: "TypeBasedDispatcher"):
         self._mapping.extend(other._mapping)
+        self._type_dict = {}
+
+        for ty, fn in self._mapping:
+            if not isinstance(ty, tuple) and ty not in self._type_dict:
+                self._type_dict[ty] = fn
         return self
 
     def __call__(self, obj: Any):
+        if fn := self._type_dict.get(type(obj)):
+            return fn(obj)
+
+        # Fallback: isinstance handles inheritance and tuple types automatically
         for ty, fn in self._mapping:
             if isinstance(obj, ty):
                 return fn(obj)
