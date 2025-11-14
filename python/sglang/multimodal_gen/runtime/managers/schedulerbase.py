@@ -6,8 +6,8 @@ from typing import TypeVar
 
 import zmq
 
-from sglang.multimodal_gen.runtime.pipelines_general import Req
-from sglang.multimodal_gen.runtime.pipelines_general.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import init_logger
 

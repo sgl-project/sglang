@@ -24,11 +24,11 @@ from sglang.multimodal_gen.runtime.models.encoders.bert import (
     HunyuanClip,  # type: ignore
 )
 from sglang.multimodal_gen.runtime.models.encoders.stepllm import STEP1TextEncoder
-from sglang.multimodal_gen.runtime.pipelines_general.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.lora_pipeline import LoRAPipeline
-from sglang.multimodal_gen.runtime.pipelines_general.stages import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
     DenoisingStage,
     InputValidationStage,

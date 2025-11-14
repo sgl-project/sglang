@@ -9,12 +9,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sglang.multimodal_gen.runtime.pipelines_general import Req
-from sglang.multimodal_gen.runtime.pipelines_general.executors.pipeline_executor import (
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
     Timer,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.stages.base import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )

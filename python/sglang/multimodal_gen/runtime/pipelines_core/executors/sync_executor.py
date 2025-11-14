@@ -6,13 +6,13 @@ Synchronous pipeline executor implementation.
 """
 from typing import List
 
-from sglang.multimodal_gen.runtime.pipelines_general.executors.pipeline_executor import (
+from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
     Timer,
     logger,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_general.stages import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 

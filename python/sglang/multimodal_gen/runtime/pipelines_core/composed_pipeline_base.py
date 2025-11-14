@@ -19,11 +19,11 @@ from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
 from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.executors.pipeline_executor import (
+from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_general.stages import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
@@ -90,7 +90,7 @@ class ComposedPipelineBase(ABC):
 
     def build_executor(self, server_args: ServerArgs):
         # TODO
-        from sglang.multimodal_gen.runtime.pipelines_general.executors.parallel_executor import (
+        from sglang.multimodal_gen.runtime.pipelines_core.executors.parallel_executor import (
             ParallelExecutor,
         )
 
