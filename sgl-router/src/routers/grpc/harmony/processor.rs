@@ -3,12 +3,11 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
 use tracing::error;
 
 use super::HarmonyParserAdapter;
 use crate::{
-    grpc_client::proto,
+    grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{ToolCall, Usage},
@@ -53,7 +52,7 @@ impl HarmonyResponseProcessor {
         let mut choices: Vec<ChatChoice> = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {
             // Convert matched_stop from proto to JSON
-            let matched_stop = complete.matched_stop.as_ref().map(|m| match m {
+            let matched_stop = complete.matched_stop().map(|m| match m {
                 MatchedTokenId(id) => {
                     serde_json::json!(id)
                 }
@@ -75,8 +74,8 @@ impl HarmonyResponseProcessor {
             // Parse Harmony channels with finish_reason and matched_stop
             let parsed = parser
                 .parse_complete(
-                    &complete.output_ids,
-                    complete.finish_reason.clone(),
+                    complete.output_ids(),
+                    complete.finish_reason().to_string(),
                     matched_stop.clone(),
                 )
                 .map_err(|e| {
@@ -193,7 +192,7 @@ impl HarmonyResponseProcessor {
         })?;
 
         // Convert matched_stop from proto to JSON
-        let matched_stop = complete.matched_stop.as_ref().map(|m| match m {
+        let matched_stop = complete.matched_stop().map(|m| match m {
             MatchedTokenId(id) => {
                 serde_json::json!(id)
             }
@@ -204,8 +203,8 @@ impl HarmonyResponseProcessor {
 
         let parsed = parser
             .parse_complete(
-                &complete.output_ids,
-                complete.finish_reason.clone(),
+                complete.output_ids(),
+                complete.finish_reason().to_string(),
                 matched_stop,
             )
             .map_err(|e| {

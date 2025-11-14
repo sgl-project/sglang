@@ -653,5 +653,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             expert_map=torch.empty(1, device=x.device),
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
         return StandardCombineInput(hidden_states=output)

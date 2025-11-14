@@ -677,12 +677,9 @@ class RouterArgs:
     def _validate_router_args(self):
         # Validate configuration based on mode
         if self.pd_disaggregation:
-            # Validate PD configuration - skip URL requirements if using service discovery
-            if not self.service_discovery:
-                if not self.prefill_urls:
-                    raise ValueError("PD disaggregation mode requires --prefill")
-                if not self.decode_urls:
-                    raise ValueError("PD disaggregation mode requires --decode")
+            # Allow empty URLs even without service discovery to support dynamic worker addition
+            # URLs will be validated separately if provided
+            pass
 
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:

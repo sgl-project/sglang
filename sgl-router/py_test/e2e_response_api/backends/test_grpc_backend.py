@@ -58,19 +58,9 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
 
-    def test_previous_response_id_chaining(self):
-        super().test_previous_response_id_chaining()
-
     @unittest.skip("TODO: return 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):
         super().test_conversation_with_multiple_turns()
-
-    @unittest.skip("TODO: decode error message")
-    def test_mutually_exclusive_parameters(self):
-        super().test_mutually_exclusive_parameters()
-
-    def test_mcp_basic_tool_call_streaming(self):
-        return super().test_mcp_basic_tool_call_streaming()
 
     def test_structured_output_json_schema(self):
         """Override with simpler schema for Llama model (complex schemas not well supported)."""
@@ -152,7 +142,7 @@ class TestGrpcHarmonyBackend(
             cls.base_url_port,
             timeout=90,
             num_workers=1,
-            tp_size=4,
+            tp_size=2,
             policy="round_robin",
             worker_args=[
                 "--reasoning-parser=gpt-oss",
@@ -170,15 +160,6 @@ class TestGrpcHarmonyBackend(
         kill_process_tree(cls.cluster["router"].pid)
         for worker in cls.cluster.get("workers", []):
             kill_process_tree(worker.pid)
-
-    def test_previous_response_id_chaining(self):
-        super().test_previous_response_id_chaining()
-
-    @unittest.skip(
-        "TODO: fix requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
-    )
-    def test_mutually_exclusive_parameters(self):
-        super().test_mutually_exclusive_parameters()
 
     @unittest.skip("TODO: 501 Not Implemented")
     def test_conversation_with_multiple_turns(self):

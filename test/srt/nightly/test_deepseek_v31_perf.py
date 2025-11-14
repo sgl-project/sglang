@@ -27,7 +27,6 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
                     "8",
                     "--dp",
                     "8",
-                    "--enable-dp-attention",
                 ],
             },
             {
@@ -38,7 +37,6 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
                     "8",
                     "--dp",
                     "8",
-                    "--enable-dp-attention",
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-num-steps",

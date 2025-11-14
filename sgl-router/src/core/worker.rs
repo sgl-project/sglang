@@ -15,9 +15,9 @@ use tokio::{sync::RwLock, time};
 use super::{CircuitBreaker, WorkerError, WorkerResult};
 use crate::{
     core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
-    grpc_client::SglangSchedulerClient,
     metrics::RouterMetrics,
     protocols::worker_spec::WorkerInfo,
+    routers::grpc::client::GrpcClient,
 };
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -229,7 +229,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get or create a gRPC client for this worker
     /// Returns None for HTTP workers, Some(client) for gRPC workers
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>>;
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>>;
 
     /// Reset the gRPC client connection (for reconnection scenarios)
     /// No-op for HTTP workers
@@ -278,6 +278,38 @@ impl fmt::Display for ConnectionMode {
                 Some(p) => write!(f, "gRPC(port:{})", p),
                 None => write!(f, "gRPC"),
             },
+        }
+    }
+}
+
+/// Runtime implementation type for gRPC workers
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeType {
+    /// SGLang runtime (default)
+    #[default]
+    Sglang,
+    /// vLLM runtime
+    Vllm,
+}
+
+impl fmt::Display for RuntimeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuntimeType::Sglang => write!(f, "sglang"),
+            RuntimeType::Vllm => write!(f, "vllm"),
+        }
+    }
+}
+
+impl std::str::FromStr for RuntimeType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sglang" => Ok(RuntimeType::Sglang),
+            "vllm" => Ok(RuntimeType::Vllm),
+            _ => Err(format!("Unknown runtime type: {}", s)),
         }
     }
 }
@@ -345,6 +377,8 @@ pub struct WorkerMetadata {
     pub worker_type: WorkerType,
     /// Connection mode
     pub connection_mode: ConnectionMode,
+    /// Runtime type (for gRPC workers)
+    pub runtime_type: RuntimeType,
     /// Additional labels/tags
     pub labels: std::collections::HashMap<String, String>,
     /// Health check configuration
@@ -368,7 +402,7 @@ pub struct BasicWorker {
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
     /// Lazily initialized gRPC client for gRPC workers
-    pub grpc_client: Arc<RwLock<Option<Arc<SglangSchedulerClient>>>>,
+    pub grpc_client: Arc<RwLock<Option<Arc<GrpcClient>>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -506,7 +540,7 @@ impl Worker for BasicWorker {
         &self.circuit_breaker
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>> {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
@@ -523,16 +557,19 @@ impl Worker for BasicWorker {
                     return Ok(Some(client.clone()));
                 }
 
+                let runtime_str = self.metadata.runtime_type.to_string();
                 tracing::info!(
-                    "Lazily initializing gRPC client for worker: {}",
+                    "Lazily initializing gRPC client ({}) for worker: {}",
+                    runtime_str,
                     self.metadata.url
                 );
-                match SglangSchedulerClient::connect(&self.metadata.url).await {
+                match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
                     Ok(client) => {
                         let client_arc = Arc::new(client);
                         *client_guard = Some(client_arc.clone());
                         tracing::info!(
-                            "Successfully connected gRPC client for worker: {}",
+                            "Successfully connected gRPC client ({}) for worker: {}",
+                            runtime_str,
                             self.metadata.url
                         );
                         Ok(Some(client_arc))
@@ -749,7 +786,7 @@ impl Worker for DPAwareWorker {
         format!("{}{}", self.base_url, route)
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>> {
         self.base_worker.get_grpc_client().await
     }
 
@@ -927,6 +964,11 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         _ => None,
     };
 
+    let runtime_type = match worker.connection_mode() {
+        ConnectionMode::Grpc { .. } => Some(worker.metadata().runtime_type.to_string()),
+        ConnectionMode::Http => None,
+    };
+
     WorkerInfo {
         id: worker.url().to_string(),
         url: worker.url().to_string(),
@@ -937,6 +979,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         is_healthy: worker.is_healthy(),
         load: worker.load(),
         connection_mode: format!("{:?}", worker.connection_mode()),
+        runtime_type,
         tokenizer_path: worker.tokenizer_path().map(String::from),
         reasoning_parser: worker.reasoning_parser().map(String::from),
         tool_parser: worker.tool_parser().map(String::from),

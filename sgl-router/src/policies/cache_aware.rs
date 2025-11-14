@@ -65,8 +65,8 @@ use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics, tree::Tree};
+use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
+use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Cache-aware routing policy
 ///
@@ -346,30 +346,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
     }
 
-    fn name(&self) -> &'static str {
-        "cache_aware"
-    }
-
-    fn needs_request_text(&self) -> bool {
-        true // Cache-aware policy needs request text for cache affinity
-    }
-
-    fn on_request_complete(&self, worker_url: &str, success: bool) {
-        // Could track success rates per worker for more intelligent routing
-        if !success {
-            // Optionally reduce affinity for failed requests
-            tracing::debug!(
-                "Request to {} completed with success={}",
-                worker_url,
-                success
-            );
-        }
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn select_worker_pair(
         &self,
         prefill_workers: &[Arc<dyn Worker>],
@@ -399,6 +375,30 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             .copied()?;
 
         Some((prefill_idx, decode_idx))
+    }
+
+    fn on_request_complete(&self, worker_url: &str, success: bool) {
+        // Could track success rates per worker for more intelligent routing
+        if !success {
+            // Optionally reduce affinity for failed requests
+            tracing::debug!(
+                "Request to {} completed with success={}",
+                worker_url,
+                success
+            );
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "cache_aware"
+    }
+
+    fn needs_request_text(&self) -> bool {
+        true // Cache-aware policy needs request text for cache affinity
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

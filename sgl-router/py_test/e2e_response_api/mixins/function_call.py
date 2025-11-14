@@ -171,9 +171,6 @@ class FunctionCallingBaseTest(ResponseAPIBaseTest):
                 "input": input_list,
             },
         )
-
-        self.assertEqual(resp2.status_code, 200)
-
         data2 = resp2.json()
         self.assertEqual(data2["status"], "completed")
 

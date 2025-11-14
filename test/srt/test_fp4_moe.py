@@ -3,9 +3,9 @@ from typing import Callable
 
 import pytest
 import torch
-from flashinfer import fp4_quantize
+from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-from sgl_kernel import scaled_fp4_grouped_quant, scaled_fp4_quant, silu_and_mul
+from sgl_kernel import scaled_fp4_quant
 from torch.nn import functional as F
 
 from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
@@ -190,16 +190,16 @@ def flashinfer_cutedsl_grouped_gemm_nt_masked(
 
     # hidden_states: [l, m, k]
     # weights: [l, n, k]
-    aq, aq_sf = scaled_fp4_grouped_quant(
+    aq, aq_sf = scaled_fp4_grouped_quantize(
         hidden_states,
-        input_global_scale,
         masked_m.to(hidden_states.device),
+        input_global_scale,
     )
     num_experts, n, k = weights.shape
-    bq, bq_sf = scaled_fp4_grouped_quant(
+    bq, bq_sf = scaled_fp4_grouped_quantize(
         weights,
-        w_global_scale,
         torch.ones(num_experts, device=weights.device, dtype=torch.int32) * n,
+        w_global_scale,
     )
 
     out = torch.zeros(

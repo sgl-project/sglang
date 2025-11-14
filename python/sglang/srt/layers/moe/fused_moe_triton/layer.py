@@ -36,6 +36,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -56,7 +57,7 @@ from sglang.srt.utils import (
 )
 
 if is_flashinfer_available():
-    from flashinfer import RoutingMethodType, fp4_quantize
+    from flashinfer import fp4_quantize
 
 # Try to import FP4 TRTLLM function if flashinfer is available
 trtllm_fp4_block_scale_moe = None
@@ -69,6 +70,7 @@ if get_moe_runner_backend().is_flashinfer_trtllm():
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +146,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_clamp_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
+        routing_method_type: Optional[RoutingMethodType] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -166,8 +169,12 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
-        assert num_experts % self.moe_ep_size == 0
-        self.num_local_experts = num_experts // self.moe_ep_size
+        assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
+        self.num_local_experts = (
+            num_experts - num_fused_shared_experts
+        ) // self.moe_ep_size + num_fused_shared_experts
+
+        self.expert_mask_gpu = None
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -243,6 +250,8 @@ class FusedMoE(torch.nn.Module):
             isinstance(self.quant_method, Fp8MoEMethod)
             and get_moe_runner_backend().is_cutlass()
         )
+
+        self.routing_method_type = routing_method_type
 
     def _load_per_tensor_weight_scale(
         self,
@@ -469,10 +478,18 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        start_idx = self.moe_ep_rank * self.num_local_experts
-        end_idx = (self.moe_ep_rank + 1) * self.num_local_experts
+        num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
+        num_local_routed_experts = (
+            self.num_local_experts - self.num_fused_shared_experts
+        )
+        start_idx = self.moe_ep_rank * num_local_routed_experts
+        end_idx = (self.moe_ep_rank + 1) * num_local_routed_experts
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
+        elif (
+            self.num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts
+        ):
+            return expert_id - num_global_routed_experts + num_local_routed_experts
         else:
             return -1
 
@@ -517,9 +534,12 @@ class FusedMoE(torch.nn.Module):
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:
+            require_global_experts = getattr(
+                param, "_sglang_require_global_experts", False
+            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
-                    self.layer_id, expert_id
+                    self.layer_id, expert_id, require_global_experts
                 )
             )
 
@@ -543,7 +563,7 @@ class FusedMoE(torch.nn.Module):
         # WARN: This makes the `expert_id` mean "local" and "global" in different cases
         if not getattr(param, "_sglang_require_global_experts", False):
             expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-            if expert_id == -1:
+            if expert_id < 0 or expert_id >= self.num_local_experts:
                 return
 
         if isinstance(
@@ -841,6 +861,15 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        if _use_aiter and self.dispatcher.local_expert_mapping is not None:
+            self.expert_mask_gpu = (
+                (
+                    (self.dispatcher.local_expert_mapping >= 0)
+                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
+                )
+                .to(torch.int32)
+                .to(device="cuda")
+            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,

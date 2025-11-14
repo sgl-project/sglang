@@ -125,6 +125,29 @@ pub fn failed_dependency(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// Create a 501 Not Implemented response
+///
+/// Use this for features that are not yet implemented or supported.
+///
+/// # Example
+/// ```ignore
+/// return Err(not_implemented("vLLM backend integration is in progress"));
+/// ```
+pub fn not_implemented(message: impl Into<String>) -> Response {
+    let msg = message.into();
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": {
+                "message": msg,
+                "type": "not_implemented_error",
+                "code": 501
+            }
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
