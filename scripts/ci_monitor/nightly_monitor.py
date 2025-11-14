@@ -263,6 +263,76 @@ class NightlyTestMonitor:
 
         return sorted(historical_metrics, key=lambda x: x["timestamp"])
 
+    def compare_with_historical(
+        self, current_metrics: Dict[str, List[Dict]], days: int = 7
+    ) -> Dict[str, Dict]:
+        """
+        Compare current metrics with historical data to detect changes.
+
+        Args:
+            current_metrics: Dictionary of metric_name -> list of metric data points
+            days: Number of days to look back for comparison
+
+        Returns:
+            Dictionary with comparison results including percentage changes
+        """
+        comparisons = {}
+
+        for metric_name, current_data in current_metrics.items():
+            if not current_data:
+                continue
+
+            # Calculate current average
+            current_values = [d["value"] for d in current_data]
+            current_avg = sum(current_values) / len(current_values)
+
+            # Get the job name from the first data point
+            # (assumes all data points are from the same job)
+            job_name = current_data[0].get("job_name", "unknown")
+
+            # Fetch historical data
+            historical_data = self.get_recent_historical_metrics(
+                job_name, metric_name, days
+            )
+
+            if not historical_data:
+                comparisons[metric_name] = {
+                    "current_avg": current_avg,
+                    "historical_avg": None,
+                    "percent_change": None,
+                    "status": "no_history",
+                }
+                continue
+
+            # Calculate historical average
+            historical_values = [d["value"] for d in historical_data]
+            historical_avg = sum(historical_values) / len(historical_values)
+
+            # Calculate percentage change
+            if historical_avg > 0:
+                percent_change = ((current_avg - historical_avg) / historical_avg) * 100
+            else:
+                percent_change = 0
+
+            # Determine status based on change
+            if abs(percent_change) < 5:
+                status = "stable"
+            elif abs(percent_change) < 10:
+                status = "minor_change"
+            else:
+                status = "significant_change"
+
+            comparisons[metric_name] = {
+                "current_avg": current_avg,
+                "historical_avg": historical_avg,
+                "percent_change": percent_change,
+                "status": status,
+                "current_count": len(current_values),
+                "historical_count": len(historical_values),
+            }
+
+        return comparisons
+
     def analyze_nightly_tests(self, runs: List[Dict]) -> Dict:
         """Analyze nightly test runs for failures and performance"""
         print("Analyzing nightly test data...")
@@ -339,7 +409,7 @@ class NightlyTestMonitor:
                         logs = self.get_job_logs(job_id)
                         if logs:
                             metrics = self.parse_metrics_from_logs(logs, job_name)
-                            # Store metrics with timestamp
+                            # Store metrics with timestamp and job name
                             for metric_name, values in metrics.items():
                                 if values:  # Only store if we found values
                                     job_stat["performance_metrics"][metric_name].extend(
@@ -348,6 +418,7 @@ class NightlyTestMonitor:
                                                 "value": v,
                                                 "timestamp": created_at,
                                                 "run_id": run_id,
+                                                "job_name": job_name,
                                             }
                                             for v in values
                                         ]
@@ -447,17 +518,37 @@ class NightlyTestMonitor:
                 f"{success_rate:>6.1f}% {avg_duration:>7.1f}m"
             )
 
-            # Show performance metrics if available
+            # Show performance metrics with day-to-day comparison if available
             if job_stat.get("performance_metrics"):
                 perf_metrics = job_stat["performance_metrics"]
-                print(f"  Performance metrics collected:")
+                print(f"  Performance metrics:")
+
+                # Compare with historical data
+                comparisons = self.compare_with_historical(perf_metrics, days=7)
+
                 for metric_name, metric_data in perf_metrics.items():
                     if metric_data:
                         values = [m["value"] for m in metric_data]
                         avg_value = sum(values) / len(values)
-                        print(
-                            f"    - {metric_name}: {avg_value:.2f} (avg, n={len(values)})"
-                        )
+
+                        # Get comparison data
+                        comparison = comparisons.get(metric_name, {})
+                        percent_change = comparison.get("percent_change")
+
+                        if percent_change is not None:
+                            change_indicator = "📈" if percent_change > 0 else "📉"
+                            if abs(percent_change) < 1:
+                                change_indicator = "➡️"
+
+                            print(
+                                f"    - {metric_name}: {avg_value:.2f} "
+                                f"(n={len(values)}) {change_indicator} "
+                                f"{percent_change:+.1f}% vs 7d avg"
+                            )
+                        else:
+                            print(
+                                f"    - {metric_name}: {avg_value:.2f} (n={len(values)}) [no history]"
+                            )
 
             # Show recent failures
             if job_stat["recent_failures"]:
