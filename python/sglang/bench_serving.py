@@ -1462,7 +1462,11 @@ def sample_image_requests(
     total_image_bytes = 0
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+        text_prompt = gen_mm_prompt(
+            processor.tokenizer,
+            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            int(input_lens[i]),
+        )
 
         # Generate image list
         images, images_base64, images_bytes = zip(
@@ -1498,6 +1502,15 @@ def get_available_tokens(tokenizer):
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    if image_pad_id:
+        all_available_tokens.remove(image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
