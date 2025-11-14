@@ -2,7 +2,7 @@
 # Automatically adds labels to PRs based on the files changed
 
 # Router specific (Rust code in sgl-router)
-router:
+model-gateway:
   - changed-files:
     - any-glob-to-any-file: 'sgl-router/**/*'
 

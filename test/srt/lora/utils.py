@@ -14,7 +14,7 @@
 
 import dataclasses
 import random
-from typing import List, Optional
+from typing import List
 
 import torch
 
