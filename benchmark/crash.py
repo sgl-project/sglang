@@ -63,10 +63,11 @@ class HicacheBenchArgs(NamedTuple):
 def perf(f: Callable[[], Any], loop: int = 100) -> float:
     tic = torch.cuda.Event(enable_timing=True)
     toc = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
     # warm up
     f()
+    torch.cuda._sleep(10**8)
     tic.record()
-    torch.cuda.synchronize()
     for _ in range(loop):
         f()
     toc.record()
@@ -99,18 +100,53 @@ def test_hicache_kernel(args: HicacheBenchArgs) -> None:
     ITEM_BYTES = cuda_cache.element_size() * CACHE_ITEM_SIZE
 
     def _gen_indices(size: int, bs: int) -> torch.Tensor:
-        return (
-            (torch.randperm(size, dtype=torch.int64, device="cuda")[:bs] - 1)
-            .sort()
-            .values
+        assert bs <= size
+        result = (
+            (torch.randperm(size, dtype=torch.int64, device="cuda")[:bs]).sort().values
         )
+        if not (torch.all(result >= 0) and torch.all(result < size)):
+            where = (result < 0) | (result >= size)
+            place = where.nonzero(as_tuple=False)
+            print("Invalid indices at positions:", place)
+            print("Invalid indices values:", result[place])
+            raise ValueError("Generated invalid indices")
+        return result
 
     def _calc_tput(dur: float) -> float:
         return (MEM / (1024**3)) / (dur / 1000)  # GB/s
 
-    print(f"{CACHE_ITEM_SIZE = }, {DTYPE = }, {BLOCK_QUOTA = }, {ITEM_BYTES = } bytes")
+    def _gain_str(aot_dur: float, jit_dur: float) -> str:
+        gain = 100 * (aot_dur / jit_dur - 1)
+        if gain >= 0:
+            return f"+{gain:>6.2f}%"
+        else:
+            return f"-{-gain:>6.2f}%"
 
-    print("Start HiCache kernel performance test...")
+    print(f"{CACHE_ITEM_SIZE = }, {DTYPE = }, {BLOCK_QUOTA = }")
+
+    def _fast_test_correctness(bs: int):
+        src_indices = _gen_indices(CUDA_CACHE_SIZE, bs)
+        dst_indices = _gen_indices(HOST_CACHE_SIZE, bs)
+        # load from cuda to host
+        jit_hicache_impl(
+            k_cache_dst=host_cache[0],
+            v_cache_dst=host_cache[1],
+            indices_dst=dst_indices,
+            k_cache_src=cuda_cache[0],
+            v_cache_src=cuda_cache[1],
+            indices_src=src_indices,
+            item_bytes=ITEM_BYTES,
+            block_quota=BLOCK_QUOTA,
+        )
+        dst_indices = dst_indices.cpu()
+        assert torch.all(
+            host_cache[0][dst_indices].cuda() == cuda_cache[0][src_indices]
+        )
+
+    _fast_test_correctness(bs=1024)
+
+    print("Correctness passed! Start HiCache kernel performance test...")
+    print("=" * 70)
 
     BS_RANGE = [2**n for n in range(8, 18)]
     for bs in BS_RANGE:
@@ -130,13 +166,16 @@ def test_hicache_kernel(args: HicacheBenchArgs) -> None:
                 block_quota=BLOCK_QUOTA,
             )
 
-        ref_h2d_dur = perf(lambda: _run_kernel_h2d(ref_hicache_impl))
         our_h2d_dur = perf(lambda: _run_kernel_h2d(jit_hicache_impl))
+        ref_h2d_dur = perf(lambda: _run_kernel_h2d(ref_hicache_impl))
         print(
             f"{bs = :6d}, H->D",
             f"| aot {_calc_tput(ref_h2d_dur):<6.2f} GB/s",
             f"| jit {_calc_tput(our_h2d_dur):<6.2f} GB/s",
+            f"| {_gain_str(ref_h2d_dur, our_h2d_dur)}",
         )
+
+    print("=" * 70)
 
     for bs in BS_RANGE:
         indices_dst = _gen_indices(HOST_CACHE_SIZE, bs)
@@ -155,17 +194,20 @@ def test_hicache_kernel(args: HicacheBenchArgs) -> None:
                 block_quota=BLOCK_QUOTA,
             )
 
-        ref_d2h_dur = perf(lambda: _run_kernel_d2h(ref_hicache_impl))
         our_d2h_dur = perf(lambda: _run_kernel_d2h(jit_hicache_impl))
+        ref_d2h_dur = perf(lambda: _run_kernel_d2h(ref_hicache_impl))
         print(
             f"{bs = :6d}, D->H",
             f"| aot {_calc_tput(ref_d2h_dur):<6.2f} GB/s",
             f"| jit {_calc_tput(our_d2h_dur):<6.2f} GB/s",
+            f"| {_gain_str(ref_d2h_dur, our_d2h_dur)}",
         )
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    for block_quota in [2, 3, 4]:
+    for block_quota in [1, 2, 3, 4]:
         for cache_item_size in [128, 256, 512, 1024]:
             args = HicacheBenchArgs(
                 cache_item_size=cache_item_size,
