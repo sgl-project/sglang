@@ -89,6 +89,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    ENABLE_FLASHINFER_FP8_GEMM,
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
@@ -96,7 +97,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
     transform_scale_ue8m0_inplace,
-    ENABLE_FLASHINFER_FP8_GEMM,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
