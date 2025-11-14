@@ -63,7 +63,7 @@ class TestDeepseekV32NasBackend_flashmla(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f"### test_gsm8k (deepseek-v3 flashmla)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -115,7 +115,7 @@ class TestDeepseekV32NasBackend_fa3(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f"### test_gsm8k (deepseek-v3 fa3)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -165,7 +165,7 @@ class TestDeepseekV32NasBackend_fp8kvcache(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f"### test_gsm8k (deepseek-v3 fp8kvcache)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
