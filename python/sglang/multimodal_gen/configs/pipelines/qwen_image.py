@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
-from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_dimensions
 
+from sglang.multimodal_gen.utils import calculate_dimensions
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
