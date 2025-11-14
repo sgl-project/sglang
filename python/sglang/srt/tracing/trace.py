@@ -30,10 +30,14 @@ from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Req
+from typing import Any, Dict, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
 tracing_enabled = False
+_trace_context_propagator = None
+
+TRACE_HEADERS = ["traceparent", "tracestate"]
 
 try:
     from opentelemetry import context, propagate, trace
@@ -49,6 +53,11 @@ try:
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider, id_generator
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.trace.propagation.tracecontext import (
+        TraceContextTextMapPropagator,
+    )
+
+    _trace_context_propagator = TraceContextTextMapPropagator()
 
     opentelemetry_imported = True
 except ImportError:
@@ -57,7 +66,15 @@ except ImportError:
         class IdGenerator:
             pass
 
-    logger.info("opentelemetry package is not installed, tracing disabled")
+    logger.debug("opentelemetry package is not installed, tracing disabled")
+
+
+def is_tracing_enabled() -> bool:
+    return tracing_enabled
+
+
+def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
+    return {h: headers[h] for h in TRACE_HEADERS if h in headers}
 
 
 @dataclass
@@ -418,6 +435,7 @@ def trace_req_start(
     bootstrap_room: Optional[int] = None,
     ts: Optional[int] = None,
     role: Optional[str] = "null",
+    external_trace_header: Optional[Dict[str, str]] = None,
 ):
     if not tracing_enabled:
         return
@@ -444,10 +462,14 @@ def trace_req_start(
     tracer = threads_info[pid].tracer
     if str(bootstrap_room) not in remote_trace_contexts:
         attrs = {"bootstrap_room": str(hex(bootstrap_room))}
+        external_trace_context = _trace_context_propagator.extract(
+            external_trace_header
+        )
         bootstrap_room_span = tracer.start_span(
             name=f"Bootstrap Room {hex(bootstrap_room)}",
             start_time=ts,
             attributes=attrs,
+            context=external_trace_context,
         )
         reqs_context[rid].bootstrap_room_span = bootstrap_room_span
         bootstrap_room_span_context = trace.set_span_in_context(bootstrap_room_span)
