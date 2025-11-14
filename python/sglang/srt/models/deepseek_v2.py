@@ -36,6 +36,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_nsa,
 )
 from sglang.srt.distributed import (
+    divide,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -81,9 +82,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    CompressedTensorsWNA16MoEMethod,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -596,6 +594,7 @@ class DeepseekV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -627,6 +626,14 @@ class DeepseekV2MoE(nn.Module):
             is_nextn=is_nextn,
         )
 
+        # scaling factor for fused shared experts on AMD-platform.
+        fused_shared_experts_scaling_factor = None
+        if self.moe_ep_size > 1 and self.num_fused_shared_experts > 0:
+            # if enable_ep_moe tp_szie == ep_size, every gpu get shared experts gemm output
+            # so we scale with 1 / self.moe_ep_size in ep mode which will make it equalation as in tp mode
+            # with fused_shared_experts
+            fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
+
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
@@ -652,6 +659,7 @@ class DeepseekV2MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
@@ -783,13 +791,7 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if (
-                not _is_cuda
-                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-                or isinstance(
-                    self.experts.quant_method, CompressedTensorsWNA16MoEMethod
-                )
-            ):
+            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
@@ -852,7 +854,6 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-            or isinstance(self.experts.quant_method, CompressedTensorsWNA16MoEMethod)
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
@@ -2988,9 +2989,14 @@ class DeepseekV2Model(nn.Module):
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    allocate_size = self.layers[
-                        i
-                    ].mlp.shared_experts.gate_up_proj.output_size_per_partition
+                    tp_size = get_tensor_model_parallel_world_size()
+                    intermediate_size = (
+                        config.moe_intermediate_size * config.n_shared_experts
+                    )
+                    share_expert_output_size_per_partition = divide(
+                        intermediate_size * 2, tp_size
+                    )
+                    allocate_size = share_expert_output_size_per_partition
                     break
 
             self.gemm_output_zero_allocator_size = (
@@ -3168,15 +3174,24 @@ class DeepseekV2ForCausalLM(nn.Module):
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
         disable_reason = None
         if (
-            not _is_cuda
-            or torch.cuda.get_device_capability("cuda") < (8, 0)
-            or self.config.architectures[0] != architecture
+            self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
-        elif get_moe_expert_parallel_world_size() > 1:
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
+            disable_reason = "Config not support fused shared expert(s)."
+        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
+            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        ):
+            disable_reason = (
+                "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
+                "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
+            )
+        elif get_moe_expert_parallel_world_size() > 1 and (
+            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        ):
+            disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
+        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
+            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
@@ -3593,8 +3608,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
-        fuse_wk_and_weights_proj = is_nsa_indexer_wk_and_weights_proj_fused(
-            self.config, self.quant_config
+        # Fuse wk and weights_proj when NSA Indexer is enabled and quant_config is FP4. For nextn, fp4 is disabled so we cannot fuse.
+        fuse_wk_and_weights_proj = (
+            is_nsa_indexer_wk_and_weights_proj_fused(self.config, self.quant_config)
+            and not is_nextn
         )
         cached_wk_and_weights_proj = {} if fuse_wk_and_weights_proj else None
 
