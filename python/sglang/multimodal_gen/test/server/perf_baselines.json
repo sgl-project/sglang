@@ -57,7 +57,7 @@
       "expected_avg_denoise_ms": 720.0,
       "expected_median_denoise_ms": 718.0,
       "stages_ms": {
-        "InputValidationStage": 9.5,
+        "InputValidationStage": 14,
         "ImageEncodingStage": 990.0,
         "ImageVAEEncodingStage": 252.76,
         "ConditioningStage": 0.13,
