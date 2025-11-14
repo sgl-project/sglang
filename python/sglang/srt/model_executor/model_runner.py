@@ -96,10 +96,7 @@ from sglang.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
-    AscendMLAPagedTokenToKVPool,
-    AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -1702,6 +1699,10 @@ class ModelRunner:
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
+                from sglang.srt.hardware_backend.ascend_npu.mem_cache.memory_pool import (
+                    AscendMLAPagedTokenToKVPool,
+                )
+
                 self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1716,6 +1717,10 @@ class ModelRunner:
                     end_layer=self.end_layer,
                 )
             else:
+                from sglang.srt.hardware_backend.ascend_npu.mem_cache.memory_pool import (
+                    AscendTokenToKVPool,
+                )
+
                 self.token_to_kv_pool = AscendTokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1839,6 +1844,10 @@ class ModelRunner:
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
             ):
+                from sglang.srt.hardware_backend.ascend_npu.mem_cache.allocator import (
+                    AscendPagedTokenToKVPoolAllocator,
+                )
+
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,

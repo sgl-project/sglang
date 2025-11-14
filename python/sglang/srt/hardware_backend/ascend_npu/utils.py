@@ -29,6 +29,7 @@ def init_ascend_npu_backend():
         is_npu()
     ), "This function should only be called within Ascend NPU environment."
 
+    import sgl_kernel_npu  # noqa: F401
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
