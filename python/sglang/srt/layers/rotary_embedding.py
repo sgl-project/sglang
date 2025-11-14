@@ -1301,7 +1301,7 @@ def triton_mrope(
     return q, k
 
 
-@torch._dynamo.disable()
+# @torch._dynamo.disable()
 def triton_mrope_wrapper(
     query,
     key,
