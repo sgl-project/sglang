@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
 from sglang.srt.distributed.parallel_state import P2PWork
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -50,9 +50,9 @@ class SchedulerPPMixin:
             )
         return p2p_work
 
-    def recv_pyobj_from_prev_stage(self: Scheduler):
+    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0:
-            dp_offset = self.dp_rank * self.attn_tp_size
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
                 [],
                 self.pp_rank * self.tp_size + dp_offset,
@@ -241,6 +241,21 @@ class SchedulerPPMixin:
                     )
         return result, event
 
+    def get_rids(self: Scheduler, req_queue: List[Req], *poll_statuses):
+        """
+        Used by PP, get the transferred rids but **do not pop**
+        """
+        polls = poll_and_all_reduce(
+            [req.disagg_kv_sender for req in req_queue],
+            self.tp_worker.get_attention_tp_cpu_group(),
+        )
+        rids: List = []
+        for poll_status in poll_statuses:
+            rids.append(
+                [req.rid for req, poll in zip(req_queue, polls) if poll in poll_status]
+            )
+        return tuple(rids) if len(rids) > 1 else rids[0]
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -373,10 +388,15 @@ class SchedulerPPMixin:
     ):
         # finished consensus bootstrapped reqs and prepare the waiting queue
         if bootstrapped_rids is not None:
+            (
+                good_consensus_bootstrapped_rids,
+                bad_consensus_bootstrapped_rids,
+            ) = bootstrapped_rids
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=bootstrapped_rids,
+                    rids_to_check=good_consensus_bootstrapped_rids
+                    + bad_consensus_bootstrapped_rids,
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -387,36 +407,47 @@ class SchedulerPPMixin:
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
-            bootstrapped_reqs, failed_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                    return_failed_reqs=True
-                )
+            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
+                self.disagg_prefill_bootstrap_queue.queue,
+                [KVPoll.WaitingForInput],
+                [KVPoll.Failed],
             )
-            bootstrapped_rids = [req.rid for req in bootstrapped_reqs] + [
-                req.rid for req in failed_reqs
-            ]
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            bootstrapped_rids = self.recv_pyobj_from_prev_stage()
-            bootstrapped_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                    rids_to_check=bootstrapped_rids
-                )
+            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
+                prev_bootstrapped_rids
             )
-        self.waiting_queue.extend(bootstrapped_reqs)
-        return bootstrapped_rids
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
+                self.disagg_prefill_bootstrap_queue.queue,
+                [KVPoll.WaitingForInput],
+                [KVPoll.Failed],
+            )
+            good_bootstrapped_rids = list(
+                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            )
+            bad_bootstrapped_rids = list(
+                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+            )
+        return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_transferred_ids(self: Scheduler):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_transferred_rids()
+            transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                [KVPoll.Success, KVPoll.Failed],
+            )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self.recv_pyobj_from_prev_stage()
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_transferred_rids()
+            curr_transferred_rids = self.get_rids(
+                self.disagg_prefill_inflight_queue,
+                [KVPoll.Success, KVPoll.Failed],
+            )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
@@ -616,13 +647,15 @@ class SchedulerPPMixin:
                 )
 
                 if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
+                    next_consensus_bootstrapped_rids = (
+                        self._pp_recv_pyobj_from_prev_stage()
+                    )
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
                     )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
-                    next_release_rids = self.recv_pyobj_from_prev_stage()
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if mbs[next_mb_id] is not None:
@@ -652,9 +685,9 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
 
-                #if self.delayed_weight_sync_fn:
-                    #self.delayed_weight_sync_fn()
-                    #self.delayed_weight_sync_fn = None
+                if hasattr(self, "delayed_weight_sync_fn"):
+                    self.delayed_weight_sync_fn()
+                    self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
