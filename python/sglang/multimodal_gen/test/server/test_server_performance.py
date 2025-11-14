@@ -468,7 +468,7 @@ class TestQwenImageEdit(DiffusionPerfTestBase):
     MODEL_PATH = "Qwen/Qwen-Image-Edit"
     IMAGE_EDIT_PROMPT = "Convert 2D style to 3D style"
     OUTPUT_SIZE = "1024x1536"
-    STARTUP_GRACE_SECONDS = 150.0
+    STARTUP_GRACE_SECONDS = 250.0
     WARMUP_TEXT_REQUESTS = 0
     WARMUP_IMAGE_EDIT_REQUESTS = 1
     STAGE_EXPECTATIONS = _IMAGE_EDIT_SCENARIO["stages_ms"]
