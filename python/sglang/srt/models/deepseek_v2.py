@@ -89,6 +89,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    ENABLE_FLASHINFER_FP8_GEMM,
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
@@ -3420,7 +3421,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = True
 
         if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            not ENABLE_FLASHINFER_FP8_GEMM
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             and hasattr(self.quant_config, "weight_block_size")
             and self.quant_config.weight_block_size is not None
