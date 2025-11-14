@@ -459,7 +459,7 @@ class DeepEPMoE(FusedMoE):
                 # act_fn: swiglu
                 hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
                     x=hidden_states,
-                    weight_scale=self.w13_weight_scale.to(torch.float32),
+                    weight_scale=self.w13_weight_scale,
                     activation_scale=hidden_states_scale,
                     bias=None,
                     quant_scale=None,

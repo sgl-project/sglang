@@ -1009,7 +1009,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
         )
         layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+            layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32), requires_grad=False
         )
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
