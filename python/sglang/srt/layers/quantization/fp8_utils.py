@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -128,7 +129,7 @@ def cutlass_block_fp8_supported() -> bool:
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
 ENABLE_FLASHINFER_FP8_GEMM = (
-    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_FP8_GEMM")
+    envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.value
     and is_blackwell_supported()
     and is_flashinfer_available()
 )
