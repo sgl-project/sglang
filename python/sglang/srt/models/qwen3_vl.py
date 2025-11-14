@@ -542,16 +542,16 @@ class Qwen3LLMModel(Qwen3Model):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-            residual = None
+        # if self.pp_group.is_first_rank:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
         else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = forward_batch.input_embeds
+        residual = None
+        # else:
+        #     assert pp_proxy_tensors is not None
+        #     hidden_states = pp_proxy_tensors["hidden_states"]
+        #     residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
@@ -726,8 +726,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
             new_embeddings.append(embedding)
 
-        forward_batch.input_deepstack_embeds = input_deepstack_embeds
-        return new_embeddings, forward_batch
+        # forward_batch.input_deepstack_embeds = input_deepstack_embeds
+        return new_embeddings, input_deepstack_embeds
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

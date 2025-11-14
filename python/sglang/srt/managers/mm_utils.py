@@ -596,9 +596,11 @@ def embed_mm_inputs(
         else:
             indices.append(None)
 
+    input_deepstack_embeds = None
+
     # only for qwen3vl right now,  replace the original use_deepstack with this method.
     if hasattr(multimodal_model, "post_process"):
-        embeddings, forward_batch = multimodal_model.post_process(
+        embeddings, input_deepstack_embeds = multimodal_model.post_process(
             inputs_embeds, modalities, embeddings, indices, forward_batch
         )
 
@@ -611,7 +613,7 @@ def embed_mm_inputs(
         # in-place update
         inputs_embeds[index] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
 
-    return inputs_embeds, forward_batch
+    return inputs_embeds, input_deepstack_embeds
 
 
 def general_mm_embed_routine(
@@ -658,7 +660,7 @@ def general_mm_embed_routine(
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
-        inputs_embeds, forward_batch = embed_mm_inputs(
+        inputs_embeds, input_deepstack_embeds = embed_mm_inputs(
             forward_batch=forward_batch,
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
@@ -793,6 +795,7 @@ def hash_feature(f):
         return tensor_hash([reconstruct_t])
     return data_hash(f)
 
+
 def multimodal_preprocess_routine(
     forward_batch: ForwardBatch,
     multimodal_model: Optional[nn.Module] = None,
@@ -836,7 +839,7 @@ def multimodal_preprocess_routine(
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
-        inputs_embeds, forward_batch = embed_mm_inputs(
+        inputs_embeds, input_deepstack_embeds = embed_mm_inputs(
             forward_batch=forward_batch,
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
@@ -849,14 +852,22 @@ def multimodal_preprocess_routine(
         # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
         # just being defensive here
         forward_batch.mm_inputs = None
+        inputs_embeds = inputs_embeds.contiguous()
+        forward_batch.input_embeds = inputs_embeds
+        forward_batch.input_deepstack_embeds = input_deepstack_embeds.contiguous()
+        print(f"853 {inputs_embeds.dtype=}")
     else:
-        # NOTE: This may reduce the performance for only-text inputs. 
+        # NOTE: This may reduce the performance for only-text inputs.
         # Using a fixed-address buffer might be better, though it could be a bit dirty.
         inputs_embeds = embed_tokens(input_ids)
         # only for qwen3vl
         if getattr(multimodal_model, "use_deepstack", False):
             forward_batch.input_deepstack_embeds = torch.zeros(
-                (len(input_ids), multimodal_model.config.hidden_size * len(multimodal_model.deepstack_visual_indexes)),
+                (
+                    len(input_ids),
+                    multimodal_model.config.hidden_size
+                    * len(multimodal_model.deepstack_visual_indexes),
+                ),
                 device=inputs_embeds.device,
                 dtype=inputs_embeds.dtype,
             )

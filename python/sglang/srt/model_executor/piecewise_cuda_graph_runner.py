@@ -306,6 +306,7 @@ class PiecewiseCudaGraphRunner:
             )
 
         # Attention backend
+        assert forward_batch.input_ids is None
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         with set_forward_context(
@@ -453,6 +454,7 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        assert forward_batch.input_ids is None
 
         # Run and capture
         def run_once():
@@ -610,6 +612,7 @@ class PiecewiseCudaGraphRunner:
             top_p=forward_batch.top_p,
             # input_deepstack_embeds=input_deepstack_embeds,
         )
+        assert static_forward_batch.input_ids is None
 
         return static_forward_batch
 
@@ -626,6 +629,17 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
+            import time
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            # save_path = f"/sgl-workspace/static_forward_batch.input_embeds_{timestamp}.pt"
+            # torch.save(static_forward_batch.input_embeds, save_path)
+            print(f"{static_forward_batch.input_embeds.shape=}", flush=True)
+            if static_forward_batch.input_embeds.shape[0] > 100:
+                print(f"631 {static_forward_batch.input_embeds.shape=}", flush=True)
+                static_forward_batch.input_embeds = torch.load(
+                    "/sgl-workspace/static_forward_batch.input_embeds_20251114_050248.pt"
+                )
             # print(f"{static_forward_batch.input_embeds.reshape(-1)[:10]=}")
             # print(f"{static_forward_batch.input_deepstack_embeds.reshape(-1)[:10]=}")
             with set_forward_context(
