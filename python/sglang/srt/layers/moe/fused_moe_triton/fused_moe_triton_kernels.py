@@ -871,20 +871,14 @@ def _moe_sum_reduce_kernel(
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
     output_stride_0 = tl.cast(output_stride_0, dtype=tl.int64)
-
     token_block_id = tl.program_id(0)
     dim_block_id = tl.program_id(1)
-
     offs_token = token_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_dim = dim_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
-
     mask_token = offs_token < token_num
     mask_dim = offs_dim < hidden_dim
-
     base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
-
     accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
-
     for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
         tile = tl.load(
             base_ptrs + i * input_stride_1,
@@ -894,7 +888,6 @@ def _moe_sum_reduce_kernel(
         )
         accumulator += tile.to(tl.float32)
     accumulator *= routed_scaling_factor
-
     # -------- Write back --------
     store_ptrs = output_ptr + offs_token[:, None] * output_stride_0 + offs_dim[None, :]
     tl.store(
