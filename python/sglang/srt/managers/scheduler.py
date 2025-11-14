@@ -1806,7 +1806,7 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
-            running_bs = len(self.running_batch.reqs) - len(adder.preempt_list)
+            running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:

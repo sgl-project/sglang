@@ -202,6 +202,8 @@ jobs:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -231,6 +233,8 @@ jobs:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -262,6 +266,7 @@ jobs:
     runs-on: 1-gpu-runner
     env:
       CI: true
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -364,6 +369,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -391,8 +398,11 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
@@ -422,6 +432,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
+    env:
+      RUNNER_LABELS: 2-gpu-runner
     strategy:
       fail-fast: false
       matrix:
@@ -453,6 +465,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-h100
+    env:
+      RUNNER_LABELS: 4-gpu-h100
     strategy:
       fail-fast: false
       matrix:
@@ -519,6 +533,7 @@ jobs:
     runs-on: 8-gpu-h20
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+      RUNNER_LABELS: 8-gpu-h20
     strategy:
       fail-fast: false
       matrix:
@@ -550,6 +565,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -609,6 +626,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -660,6 +679,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -693,6 +714,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
+    env:
+      RUNNER_LABELS: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -750,6 +773,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -780,6 +805,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
+    env:
+      RUNNER_LABELS: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -810,6 +837,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-h100
+    env:
+      RUNNER_LABELS: 4-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -866,6 +895,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-b200
+    env:
+      RUNNER_LABELS: 4-gpu-b200
     strategy:
       fail-fast: false
     steps:
@@ -874,7 +905,7 @@ jobs:
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
@@ -895,6 +926,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-gb200
+    env:
+      RUNNER_LABELS: 4-gpu-gb200
     strategy:
       fail-fast: false
     steps:

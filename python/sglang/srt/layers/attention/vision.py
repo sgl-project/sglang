@@ -32,6 +32,8 @@ if _is_cuda:
 if _is_npu:
     import torch_npu
 
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -54,10 +56,6 @@ from sglang.srt.utils import add_prefix
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
-
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
-    from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
 
 
 @dataclasses.dataclass
@@ -348,8 +346,16 @@ class VisionAiterAttention(nn.Module):
         self,
         **kwargs,
     ):
-        if not _use_aiter:
+        if not _is_hip:
             raise Exception("aiter_attn is only available for AMD")
+        try:
+            from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
+        except ImportError as e:
+            raise ImportError(
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+            ) from e
+
+        self.flash_attn_varlen_func = aiter_flash_attn_varlen_func
         super().__init__()
 
     def forward(
@@ -375,7 +381,7 @@ class VisionAiterAttention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-        return aiter_flash_attn_varlen_func(
+        return self.flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -590,11 +596,11 @@ class VisionAttention(nn.Module):
                 backend = "fa3"
             else:
                 backend = "triton_attn"
-        elif _use_aiter:
-            if get_device_capability() < (9, 4):
-                backend = "triton_attn"
-            else:
+        elif _is_hip:
+            if get_device_capability() >= (9, 4) and _use_aiter:
                 backend = "aiter_attn"
+            else:
+                backend = "triton_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell():
