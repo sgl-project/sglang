@@ -9,6 +9,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.managers.io_struct import UpdateWeightFromDiskReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -140,33 +141,8 @@ class EAGLEWorker(TpModelWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-
-        if self.speculative_algorithm.is_eagle3():
-            # most cases EAGLE3 models don't share lm_head
-            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
-                and self.draft_model_runner.model.load_lm_head_from_target
-            ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
-            else:
-                self.draft_model_runner.model.set_embed(embed)
-
-            # grab hot token ids
-            if self.draft_model_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
-                    embed.device
-                )
-
-        else:
-            if self.hot_token_id is not None:
-                head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
-
-            # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
+        # Set embedding and lm_haad of draft model
+        self.set_embed_and_head()
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
@@ -242,9 +218,59 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
+    def set_embed_and_head(self):
+        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+
+        if self.speculative_algorithm.is_eagle3():
+            # most cases EAGLE3 models don't share lm_head
+            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+            if (
+                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                and self.draft_model_runner.model.load_lm_head_from_target
+            ):
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            else:
+                self.draft_model_runner.model.set_embed(embed)
+
+            # grab hot token ids
+            if self.draft_model_runner.model.hot_token_id is not None:
+                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+                    embed.device
+                )
+
+        else:
+            if self.hot_token_id is not None:
+                head = head.clone()
+                self.hot_token_id = self.hot_token_id.to(head.device)
+                head.data = head.data[self.hot_token_id]
+
+            # Share the embedding and lm_head
+            self.draft_model_runner.model.set_embed_and_head(embed, head)
+
     @property
     def draft_model_runner(self):
         return self.model_runner
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        """
+        In-place update of the draft model weights from disk.
+        """
+        logger.info(
+            f"Draft model updating weights from disk: {recv_req.model_path}, format: {recv_req.load_format}"
+        )
+        success, message = self.draft_model_runner.update_weights_from_disk(
+            recv_req.model_path,
+            recv_req.load_format,
+            is_draft_model=recv_req.is_draft_model,
+        )
+
+        self.set_embed_and_head()
+
+        with self.draft_tp_context(self.draft_model_runner.tp_group):
+            self.init_attention_backend()
+            self.init_cuda_graphs()
+
+        return success, message
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.

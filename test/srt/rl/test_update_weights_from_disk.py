@@ -9,6 +9,8 @@ import requests
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
+    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -150,6 +152,187 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
         updated_model_path = self.get_model_info()
         print(f"[Server Mode] updated_model_path: {updated_model_path}")
         self.assertEqual(updated_model_path, origin_model_path)
+
+        updated_response = self.run_decode()
+        self.assertEqual(origin_response[:32], updated_response[:32])
+
+
+###############################################################################
+# Engine Mode Tests (Single-configuration)
+###############################################################################
+class TestEngineUpdateDraftWeightsFromDisk(CustomTestCase):
+    def setUp(self):
+        self.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3
+        self.draft_model = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3
+        # Initialize the engine in offline (direct) mode.
+        self.engine = sgl.Engine(
+            model_path=self.model,
+            tp_size=4,
+            mem_fraction_static=0.7,
+            cuda_graph_max_bs=8,
+            context_length=2048,
+            dtype="float16",
+            speculative_draft_model_path=self.draft_model,
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+            speculative_algorithm="EAGLE3",
+        )
+
+    def tearDown(self):
+        self.engine.shutdown()
+
+    def run_decode(self):
+        prompts = ["The capital of France is"]
+        sampling_params = {"temperature": 0, "max_new_tokens": 32}
+        outputs = self.engine.generate(prompts, sampling_params)
+        print("=" * 100)
+        print(
+            f"[Engine Mode] Prompt: {prompts[0]}\nGenerated text: {outputs[0]['text']}"
+        )
+        return outputs[0]["text"]
+
+    def run_update_draft_weights(self, model_path):
+        ret = self.engine.update_weights_from_disk(model_path, is_draft_model=True)
+        print(json.dumps(ret))
+        return ret
+
+    def test_update_draft_weights(self):
+        origin_response = self.run_decode()
+        # Update weights: use new model
+        new_model_path = self.draft_model.replace("lmsys", "qywu").replace(
+            "LLaMA3.1", "Llama-3.1"
+        )
+        ret = self.run_update_draft_weights(new_model_path)
+        self.assertTrue(ret[0])  # ret is a tuple; index 0 holds the success flag
+
+        updated_response = self.run_decode()
+        self.assertEqual(origin_response[:32], updated_response[:32])
+
+        # Revert back to original weights
+        ret = self.run_update_draft_weights(self.draft_model)
+        self.assertTrue(ret[0])
+        reverted_response = self.run_decode()
+        self.assertEqual(origin_response[:32], reverted_response[:32])
+
+    def test_update_weights_unexist_model(self):
+        origin_response = self.run_decode()
+        new_model_path = self.draft_model.replace("-Instruct", "wrong")
+        ret = self.run_update_draft_weights(new_model_path)
+        self.assertFalse(ret[0])
+        updated_response = self.run_decode()
+        self.assertEqual(origin_response[:32], updated_response[:32])
+
+
+# ###############################################################################
+# # HTTP Server Mode Tests (Single-configuration)
+# ###############################################################################
+class TestServerUpdateDraftWeightsFromDisk(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3
+        cls.draft_model = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size",
+                "4",
+                "--mem-fraction-static",
+                "0.7",
+                "--cuda-graph-max-bs",
+                "8",
+                "--context-length",
+                "2048",
+                "--dtype",
+                "float16",
+                "--speculative-draft-model-path",
+                cls.draft_model,
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--speculative-algorithm",
+                "EAGLE3",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def run_decode(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+            },
+        )
+        print("=" * 100)
+        print(f"[Server Mode] Generated text: {response.json()['text']}")
+        return response.json()["text"]
+
+    def get_draft_model_info(self):
+        response = requests.get(self.base_url + "/get_server_info")
+        model_path = response.json()["speculative_draft_model_path"]
+        print(json.dumps(response.json()))
+        return model_path
+
+    def run_update_draft_weights(self, model_path):
+        response = requests.post(
+            self.base_url + "/update_weights_from_disk",
+            json={"model_path": model_path, "is_draft_model": True},
+        )
+        ret = response.json()
+        print(json.dumps(ret))
+        return ret
+
+    def test_update_draft_weights(self):
+        origin_draft_model_path = self.get_draft_model_info()
+        print(f"[Server Mode] origin_draft_model_path: {origin_draft_model_path}")
+        origin_response = self.run_decode()
+
+        new_model_path = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3.replace(
+            "lmsys", "qywu"
+        ).replace("LLaMA3.1", "Llama-3.1")
+        ret = self.run_update_draft_weights(new_model_path)
+        self.assertTrue(ret["success"])
+
+        updated_draft_model_path = self.get_draft_model_info()
+        print(f"[Server Mode] updated_draft_model_path: {updated_draft_model_path}")
+        self.assertEqual(updated_draft_model_path, new_model_path)
+        self.assertNotEqual(updated_draft_model_path, origin_draft_model_path)
+
+        updated_response = self.run_decode()
+        self.assertEqual(origin_response[:32], updated_response[:32])
+
+        ret = self.run_update_draft_weights(origin_draft_model_path)
+        self.assertTrue(ret["success"])
+        updated_draft_model_path = self.get_draft_model_info()
+        self.assertEqual(updated_draft_model_path, origin_draft_model_path)
+
+        updated_response = self.run_decode()
+        self.assertEqual(origin_response[:32], updated_response[:32])
+
+    def test_update_draft_weights_unexist_model(self):
+        origin_draft_model_path = self.get_draft_model_info()
+        print(f"[Server Mode] origin_draft_model_path: {origin_draft_model_path}")
+        origin_response = self.run_decode()
+
+        new_model_path = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3.replace(
+            "-Instruct", "wrong"
+        )
+        ret = self.run_update_draft_weights(new_model_path)
+        self.assertFalse(ret["success"])
+
+        updated_draft_model_path = self.get_draft_model_info()
+        print(f"[Server Mode] updated_draft_model_path: {updated_draft_model_path}")
+        self.assertEqual(updated_draft_model_path, origin_draft_model_path)
 
         updated_response = self.run_decode()
         self.assertEqual(origin_response[:32], updated_response[:32])

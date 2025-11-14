@@ -1234,10 +1234,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
             if result.success:
-                self.served_model_name = obj.model_path
-                self.server_args.model_path = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
+                if obj.is_draft_model:
+                    self.server_args.speculative_draft_model_path = obj.model_path
+                    self.server_args.speculative_draft_model_load_format = (
+                        obj.load_format
+                    )
+                else:
+                    self.served_model_name = obj.model_path
+                    self.server_args.model_path = obj.model_path
+                    self.server_args.load_format = obj.load_format
+                    self.model_path = obj.model_path
             return result.success, result.message, result.num_paused_requests
         else:  # self.server_args.dp_size > 1
             self.model_update_tmp = []
@@ -1245,9 +1251,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             all_success = all([r.success for r in result])
             if all_success is True:
-                self.server_args.model_path = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
+                if obj.is_draft_model:
+                    self.server_args.speculative_draft_model_path = obj.model_path
+                    self.server_args.speculative_draft_model_load_format = (
+                        obj.load_format
+                    )
+                else:
+                    self.server_args.model_path = obj.model_path
+                    self.server_args.load_format = obj.load_format
+                    self.model_path = obj.model_path
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]

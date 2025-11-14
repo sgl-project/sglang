@@ -42,7 +42,13 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
-        success, message = self.tp_worker.update_weights_from_disk(recv_req)
+        if self.draft_worker is not None and recv_req.is_draft_model:
+            logger.info("Updating draft model weights from disk")
+            success, message = self.draft_worker.update_weights_from_disk(recv_req)
+        else:
+            logger.info("Updating target model weights from disk")
+            success, message = self.tp_worker.update_weights_from_disk(recv_req)
+
         if success:
             flush_cache_success = self.flush_cache()
             assert flush_cache_success, "Cache flush failed after updating weights"
