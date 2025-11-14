@@ -59,6 +59,8 @@ if _is_npu:
     else:
         useMindIETurbo = True
 
+    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
+
 
 # func refers to RMSNorm.__init__
 def npu_wrapper_rmsnorm_init(func):
@@ -81,10 +83,17 @@ def npu_wrapper_rmsnorm_forward(func):
         if not x.is_contiguous():
             x = x.contiguous()
         if residual is not None:
-            out, _, residual_out = torch_npu.npu_add_rms_norm(
-                residual, x, self.weight.data, self.variance_epsilon
+            out, residual_out = add_rmsnorm_bias(
+                x,
+                residual,
+                self.weight.data,
+                self.bias,
+                self.variance_epsilon,
             )
-            out = out + self.bias
+            # out, _, residual_out = torch_npu.npu_add_rms_norm(
+            #     residual, x, self.weight.data, self.variance_epsilon
+            # )
+            # out = out + self.bias
             return out.to(x.dtype), residual_out
 
         out = torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
