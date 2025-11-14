@@ -117,11 +117,11 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
       indices_ptr[idx] = static_cast<int32_t>(expert);
     }
 
+    __syncthreads();
+
     if (tidx == 0) {
       output_sum += output_ptr[idx];
     }
-
-    __syncthreads();
   }
 
   // Normalize weights
