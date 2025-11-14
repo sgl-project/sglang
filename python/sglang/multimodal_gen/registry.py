@@ -55,7 +55,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (

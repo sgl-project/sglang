@@ -1,11 +1,11 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from sglang.multimodal_gen.runtime.pipelines_general.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_general.stages import (
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     ConditioningStage,
     DecodingStage,
     DenoisingStage,

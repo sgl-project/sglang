@@ -22,9 +22,9 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
     FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
-from sglang.multimodal_gen.runtime.pipelines_general.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_general.stages import DenoisingStage
-from sglang.multimodal_gen.runtime.pipelines_general.stages.denoising import (
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     st_attn_available,
     vsa_available,
 )

@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     replace_submodule,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
-from sglang.multimodal_gen.runtime.pipelines_general.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

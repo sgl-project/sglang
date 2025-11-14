@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
-from sglang.multimodal_gen.runtime.pipelines_general.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_general.stages import (
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
     DenoisingStage,
     ImageEncodingStage,
@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.pipelines_general.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_general.stages.conditioning import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
     ConditioningStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
