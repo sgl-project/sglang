@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -15,11 +16,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 USE_FULL_MASK = True
 
@@ -216,7 +215,7 @@ class NGRAMWorker:
         # acceptance indices are the indices in a "flattened" batch.
         # dividing it to num_draft_tokens will yield the actual batch index.
         temperatures = temperatures[accepted_indices // num_draft_tokens]
-        if RETURN_ORIGINAL_LOGPROB:
+        if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
             logprobs = torch.nn.functional.log_softmax(
                 logits_output.next_token_logits, dim=-1
             )

@@ -10,7 +10,7 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.3.17
-ARG SGL_VERSION=0.5.5.post1
+ARG SGL_VERSION=0.5.5.post2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
@@ -40,7 +40,10 @@ RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y &
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
  && update-alternatives --set python3 /usr/bin/python3.12 \
  && wget https://bootstrap.pypa.io/get-pip.py \
- && python3 get-pip.py
+ && python3 get-pip.py \
+ # Fix for `apt-add-repository`
+ && cd /usr/lib/python3/dist-packages/ \
+ && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
 # Set timezone and install all packages
 RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -301,7 +304,8 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && cd /sgl-workspace/sglang/sgl-router \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
-    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo
+    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
+    && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
 
 # Add yank script
