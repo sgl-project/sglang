@@ -58,7 +58,6 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           working-directory: bindings/python
-          manifest-path: ../../Cargo.toml
           args: --release --out dist --features vendored-openssl
           rust-toolchain: stable
           sccache: true
@@ -170,7 +169,7 @@ jobs:
           cd sgl-router/bindings/python
           python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router
-          maturin build --manifest-path ../../Cargo.toml --profile ci --features vendored-openssl --out dist
+          maturin build --profile ci --features vendored-openssl --out dist
           pip install dist/*.whl
 
       - name: Run Python unit tests
@@ -279,7 +278,7 @@ jobs:
           cd sgl-router/bindings/python
           python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router
-          maturin build --manifest-path ../../Cargo.toml --profile ci --features vendored-openssl --out dist
+          maturin build --profile ci --features vendored-openssl --out dist
           pip install dist/*.whl
 
       - name: Run Python E2E response API tests

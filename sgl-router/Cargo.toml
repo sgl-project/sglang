@@ -14,9 +14,8 @@ unused_qualifications = "warn"
 
 [lib]
 name = "sglang_router_rs"
-# Pure Rust library: Just omit crate-type (defaults to rlib)
-# Python/C binding + Rust library: Use ["cdylib", "rlib"]
-crate-type = ["cdylib", "rlib"]
+# Pure Rust library (rlib for the binary and other Rust dependents)
+crate-type = ["rlib"]
 
 [[bin]]
 name = "sglang-router"

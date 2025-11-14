@@ -89,11 +89,11 @@ sccache-stop: ## Stop the sccache server
 # Python bindings (maturin) targets
 python-dev: ## Build Python bindings in development mode (fast, debug build)
 	@echo "Building Python bindings in development mode..."
-	@cd $(PYTHON_DIR) && maturin develop --manifest-path ../../Cargo.toml
+	@cd $(PYTHON_DIR) && maturin develop
 
 python-build: ## Build Python wheel (release mode with vendored OpenSSL)
 	@echo "Building Python wheel (release, vendored OpenSSL)..."
-	@cd $(PYTHON_DIR) && maturin build --manifest-path ../../Cargo.toml --release --out dist --features vendored-openssl
+	@cd $(PYTHON_DIR) && maturin build --release --out dist --features vendored-openssl
 
 python-build-release: python-build ## Alias for python-build
 
@@ -118,7 +118,7 @@ python-test: ## Run Python tests
 
 python-check: ## Check Python package with twine
 	@echo "Checking Python package..."
-	@cd $(PYTHON_DIR) && maturin build --manifest-path ../../Cargo.toml --release --out dist --features vendored-openssl
+	@cd $(PYTHON_DIR) && maturin build --release --out dist --features vendored-openssl
 	@pip install twine 2>/dev/null || true
 	@twine check $(PYTHON_DIR)/dist/*
 	@echo "Python package check passed!"

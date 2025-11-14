@@ -71,22 +71,22 @@ pip install maturin
 # Fast development mode (debug build, no wheel, instant)
 # Uses system OpenSSL (requires libssl-dev/openssl-devel)
 cd bindings/python
-maturin develop --manifest-path ../../Cargo.toml
+maturin develop
 
 # Production build (optimized, creates wheel)
 # Uses vendored OpenSSL (cross-platform compatibility)
 cd bindings/python
-maturin build --manifest-path ../../Cargo.toml --release --out dist --features vendored-openssl
+maturin build --release --out dist --features vendored-openssl
 pip install --force-reinstall dist/*.whl
 
 # Development build with system OpenSSL (faster)
 # Requires: apt install libssl-dev pkg-config (Ubuntu/Debian)
 #       or: yum install openssl-devel (RHEL/CentOS)
 cd bindings/python
-maturin build --manifest-path ../../Cargo.toml --release --out dist
+maturin build --release --out dist
 pip install --force-reinstall dist/*.whl
 ```
-> **Note:** Python bindings are located in `bindings/python/`. The `--manifest-path ../../Cargo.toml` flag tells maturin where to find the Rust project. Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
+> **Note:** Python bindings are located in `bindings/python/` with their own Cargo.toml. Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
 ## Quick Start
 ### Regular HTTP Routing
@@ -584,7 +584,7 @@ maturin develop --manifest-path ../../Cargo.toml
 cd ../..  # Back to sgl-router root
 pytest py_test/
 ```
-For production builds, use `maturin build --manifest-path ../../Cargo.toml --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
 
 ---
 

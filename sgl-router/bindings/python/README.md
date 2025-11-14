@@ -31,7 +31,7 @@ pip install maturin
 
 # Build and install in development mode
 cd sgl-router/bindings/python
-maturin develop --manifest-path ../../Cargo.toml --features vendored-openssl
+maturin develop --features vendored-openssl
 ```
 
 ### Production Build
@@ -39,7 +39,7 @@ maturin develop --manifest-path ../../Cargo.toml --features vendored-openssl
 ```bash
 # Build wheel
 cd sgl-router/bindings/python
-maturin build --manifest-path ../../Cargo.toml --release --out dist --features vendored-openssl
+maturin build --release --out dist --features vendored-openssl
 
 # Install the built wheel
 pip install dist/sglang_router-*.whl
