@@ -29,7 +29,7 @@ pub enum HistoryBackendType {
     Postgres,
 }
 
-#[pyclass(name = "OracleConfig")]
+#[pyclass]
 #[derive(Clone, PartialEq)]
 pub struct PyOracleConfig {
     #[pyo3(get, set)]
@@ -120,7 +120,7 @@ impl PyOracleConfig {
     }
 }
 
-#[pyclass(name = "PostgresConfig")]
+#[pyclass]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PyPostgresConfig {
     #[pyo3(get, set)]
@@ -148,9 +148,9 @@ impl PyPostgresConfig {
     }
 }
 
-#[pyclass(name = "Router")]
+#[pyclass]
 #[derive(Debug, Clone, PartialEq)]
-struct PyRouter {
+struct Router {
     host: String,
     port: u16,
     worker_urls: Vec<String>,
@@ -226,7 +226,7 @@ struct PyRouter {
     ca_cert_paths: Vec<String>,
 }
 
-impl PyRouter {
+impl Router {
     fn determine_connection_mode(worker_urls: &[String]) -> core::ConnectionMode {
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
@@ -402,7 +402,7 @@ impl PyRouter {
 }
 
 #[pymethods]
-impl PyRouter {
+impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
@@ -567,7 +567,7 @@ impl PyRouter {
 
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
-        Ok(PyRouter {
+        Ok(Router {
             host,
             port,
             worker_urls,
@@ -711,6 +711,6 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HistoryBackendType>()?;
     m.add_class::<PyOracleConfig>()?;
     m.add_class::<PyPostgresConfig>()?;
-    m.add_class::<PyRouter>()?;
+    m.add_class::<Router>()?;
     Ok(())
 }
