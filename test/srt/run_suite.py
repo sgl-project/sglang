@@ -663,12 +663,16 @@ if __name__ == "__main__":
     applied_suites = suites if args.suite == "all" else suites_cuda
     if "cpu" in args.suite:
         applied_suites = suite_xeon
+        print("CPU")
     elif "xpu" in args.suite:
         applied_suites = suite_xpu
+        print("XPU")
     elif "ascend" in args.suite:
         applied_suites = suite_ascend
+        print("ASCEND")
     elif "amd" in args.suite:
         applied_suites = suite_amd
+        print("AMD")
     _sanity_check_suites(applied_suites)
 
     if args.suite == "all":
