@@ -77,6 +77,7 @@ suites = {
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
+        TestFile("test_fp8_utils.py", 5),
         TestFile("rotary_embedding/test_mrope.py", 10),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 80),
