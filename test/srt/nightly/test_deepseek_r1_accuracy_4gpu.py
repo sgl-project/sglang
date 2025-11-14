@@ -2,7 +2,6 @@ import os
 import unittest
 from types import SimpleNamespace
 
-import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -14,6 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
     try_cached_model,
 )
+
 
 class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
     @classmethod
