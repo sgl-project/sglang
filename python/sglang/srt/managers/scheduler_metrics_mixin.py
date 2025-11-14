@@ -274,9 +274,12 @@ class SchedulerMetricsMixin:
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
-            total_draft_tokens = self.spec_num_forward_ct * (
-                (self.server_args.speculative_num_steps or 0) + 1
+            draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
+            num_draft_tokens = (
+                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
             )
+            total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
+
             spec_accept_rate = (
                 self.spec_num_accepted_tokens / total_draft_tokens
                 if total_draft_tokens > 0

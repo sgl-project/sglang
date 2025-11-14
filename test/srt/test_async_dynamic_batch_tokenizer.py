@@ -8,7 +8,7 @@ including batch efficiency, timeout handling, and error cases.
 import asyncio
 import logging
 import time
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock
 
 import pytest
 from transformers import AutoTokenizer
