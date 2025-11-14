@@ -1887,7 +1887,7 @@ def get_npu_compiler_config():
     return config
 
 
-def get_compiler_backend() -> str:
+def get_compiler_backend(mode=None) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
@@ -1902,10 +1902,8 @@ def get_compiler_backend() -> str:
                 "Please install torchair for torch.compile support on NPU."
             )
         compiler_config = CompilerConfig()
-        predefined_config = get_npu_compiler_config()
-        for k, v in predefined_config.items():
-            setattr(compiler_config.experimental_config, k, v)
-
+        # TODO(iforgetmyname): Change this default value once torch_npu version 7.2.0
+        compiler_config.mode = "max-autotune" if mode is None else mode
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
