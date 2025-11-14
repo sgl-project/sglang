@@ -677,8 +677,6 @@ class Scheduler(
                 dp_rank=dp_rank,
             )
 
-            self.last_step_in_spec_mode = False
-
         elif self.spec_algorithm.is_standalone():
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
@@ -705,6 +703,14 @@ class Scheduler(
             )
         else:
             self.draft_worker = None
+        
+        # Initialize dynamic spec tracking variable for all spec algorithms
+        # This tracks whether we're currently in spec mode (for dynamic spec switching)
+        if not self.spec_algorithm.is_none():
+            self.last_step_in_spec_mode = False
+        else:
+            # For non-spec mode, set to None to catch usage errors
+            self.last_step_in_spec_mode = None
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -1908,7 +1914,40 @@ class Scheduler(
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+                    # 🔧 RADICAL FIX: When running_batch has spec state but last_batch doesn't
+                    # we must retract ALL running requests to avoid state corruption!
+                    # This is the ONLY reliable way to ensure clean state transition.
+                    if (
+                        self.running_batch.spec_info is not None
+                        and self.last_batch.spec_info is None
+                    ):
+
+                        # Retract all running requests - they will be rescheduled with clean state
+                        retracted_reqs = []
+                        for req in self.running_batch.reqs:
+                            self.tree_cache.cache_finished_req(req, is_insert=False)
+                            req.reset_for_retract()
+                            retracted_reqs.append(req)
+                        
+                        # Clear running_batch completely
+                        self.running_batch = ScheduleBatch(
+                            reqs=[], batch_is_full=False
+                        )
+                        
+                        # Set running_batch = last_batch (clean prefill batch)
+                        self.running_batch = self.last_batch
+                        
+                        # Re-add retracted requests to queue
+                        for req in retracted_reqs:
+                            self._add_request_to_queue(req, is_retracted=True)
+                        
+                        logger.info(
+                            f"get_next_batch_to_run: Retracted {len(retracted_reqs)} requests, "
+                            f"running_batch now has {self.running_batch.batch_size()} reqs from last_batch"
+                        )
+                    else:
+                        # Normal merge
+                        self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
 
@@ -2276,6 +2315,21 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
+        # 🔧 CRITICAL PRE-CHECK: Validate spec state consistency BEFORE any forward
+        # This catches any spec state that slipped through earlier cleanup stages
+        if batch.spec_info is not None:
+            # Check if we should be using spec based on decision
+            should_use_spec = self.should_use_speculative_decoding(batch)
+            if not should_use_spec:
+                # Only log when we actually need to clean (error case)
+                logger.error(
+                    f"run_batch PRE-CHECK: batch has spec_info but should NOT use spec! "
+                    f"batch_size={batch.batch_size()}, forward_mode={batch.forward_mode.name}, "
+                    f"out_cache_loc size={len(batch.out_cache_loc) if batch.out_cache_loc is not None else 0}. "
+                    f"Force cleaning now to prevent crash."
+                )
+                self.cleanup_speculative_state(batch)
+
         use_spec_decoding = False
 
         # Run forward
@@ -2331,20 +2385,11 @@ class Scheduler(
             else:
                 use_spec_decoding = self.should_use_speculative_decoding(batch)
                 
-                # Debug logging for mode switching (only log when mode changes)
+                # Only log when switching modes to reduce log spam
                 batch_size = batch.batch_size()
                 threshold = self.server_args.speculative_batch_size_threshold
                 
-                # 🔍 DEBUG: 强制打印每次决策（用于调试threshold问题）
-                if batch.forward_mode.is_decode():
-                    logger.info(
-                        f"🔍 [DEBUG] Decode batch decision: batch_size={batch_size}, "
-                        f"threshold={threshold}, use_spec={use_spec_decoding}, "
-                        f"is_extend={batch.forward_mode.is_extend()}"
-                    )
-                
-                # Only log when switching modes to reduce log spam
-                if use_spec_decoding != self.last_step_in_spec_mode:
+                if self.last_step_in_spec_mode is not None and use_spec_decoding != self.last_step_in_spec_mode:
                     logger.info(
                         f"Dynamic spec decision: batch_size={batch_size}, "
                         f"threshold={threshold}, use_spec={use_spec_decoding}"
@@ -2357,8 +2402,15 @@ class Scheduler(
                     # Handle spec -> non-spec transition
                     if self.last_step_in_spec_mode:
                         logger.info(f"Switching from spec to non-spec mode (batch_size={batch_size})")
-                        self.cleanup_speculative_state(batch)
                         self.last_step_in_spec_mode = False
+                    
+                    # 🔧 CRITICAL FIX: ALWAYS clean batch's spec_info when in non-spec mode!
+                    # This handles cases where batch inherited spec_info from merge
+                    # but last_step_in_spec_mode was already False
+                    if batch.spec_info is not None:
+                        # Log at debug to reduce overhead
+                        logger.debug(f"Cleaning residual spec_info (batch_size={batch_size})")
+                        self.cleanup_speculative_state(batch)
 
                     # 🔑 使用 tp_worker (target-only)，而不是 model_worker (EAGLEWorker)
                     # 当动态禁用 spec decode 时，应该直接运行 target model

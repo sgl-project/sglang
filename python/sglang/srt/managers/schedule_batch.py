@@ -1018,7 +1018,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
-    spec_info: Optional[SpecInput] = None
+    spec_info: Optional[SpecInput] = None   # EagleDraftInput 或 EagleVerifyInput
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1665,6 +1665,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
         # 1) current batch is always prefill, whose seq_lens and allocate_lens are not a future
         # 2) other batch is always decode, which is finished in previous step
+
+        if self.spec_info is None and other.spec_info is not None:
+            other.out_cache_loc = None
+            
+            # Clear other's spec state
+            other.spec_info = None
+            other.spec_algorithm = SpeculativeAlgorithm.NONE
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
