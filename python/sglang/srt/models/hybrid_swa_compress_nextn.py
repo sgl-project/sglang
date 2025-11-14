@@ -49,19 +49,18 @@ class HybridSWACompressedMTPLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
 
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
-        self.layer_id = layer_id
         self.self_attn = HybridSWACompressedAttention(
             hidden_size=self.hidden_size,
             num_heads=config.compression_softmax_num_q_heads,
             num_kv_heads=config.compression_softmax_num_kv_heads,
             head_dim=config.compression_softmax_qk_head_dim,
             v_head_dim=getattr(config, "compression_softmax_v_head_dim", None),
-            v_scale=getattr(config, "attention_value_scale", None),
             sliding_window_size=config.sliding_window_size,
             attention_bias=config.attention_bias,
             add_swa_attention_sink_bias=getattr(
@@ -223,6 +222,7 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        self.v_scale = getattr(config, "attention_value_scale", None)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
@@ -293,6 +293,14 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
+                if (
+                    weight_name == "v_proj"
+                    and self.v_scale is not None
+                    and self.v_scale != 1.0
+                ):
+                    loaded_weight *= self.v_scale
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
