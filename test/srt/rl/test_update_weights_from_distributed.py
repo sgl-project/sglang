@@ -22,7 +22,6 @@ import unittest
 import numpy as np
 import requests
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
