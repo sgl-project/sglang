@@ -9,11 +9,12 @@ Analyzes metrics from GitHub summaries and tracks trends over time.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -44,6 +45,21 @@ class NightlyTestMonitor:
             "nightly-test-4-gpu-b200",
             "nightly-test-8-gpu-b200",
         ]
+
+        # Performance metric patterns for parsing logs
+        self.perf_patterns = {
+            "output_throughput": re.compile(
+                r"Output token throughput \(tok/s\):\s*([\d.]+)"
+            ),
+            "input_throughput": re.compile(
+                r"Input token throughput \(tok/s\):\s*([\d.]+)"
+            ),
+            "latency": re.compile(r"Median E2E Latency \(ms\):\s*([\d.]+)"),
+            "ttft": re.compile(r"Median TTFT \(ms\):\s*([\d.]+)"),
+            "accept_length": re.compile(r"Accept length:\s*([\d.]+)"),
+            "accuracy": re.compile(r"Accuracy:\s*([\d.]+)"),
+            "gsm8k_score": re.compile(r"GSM8K Score:\s*([\d.]+)"),
+        }
 
     def get_nightly_runs(self, days: int = 7) -> List[Dict]:
         """Get nightly test workflow runs from the last N days"""
@@ -99,15 +115,45 @@ class NightlyTestMonitor:
         except:
             return []
 
-    def parse_metrics_from_summary(self, run_id: int, job_id: int) -> List[Dict]:
+    def get_job_logs(self, job_id: int) -> Optional[str]:
+        """Get logs for a specific job"""
+        url = f"{self.base_url}/repos/{self.repo}/actions/jobs/{job_id}/logs"
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.RequestException as e:
+            print(f"  Warning: Could not fetch logs for job {job_id}: {e}")
+            return None
+
+    def parse_metrics_from_logs(self, logs: str, job_name: str) -> Dict[str, List[float]]:
         """
-        Parse metrics from GitHub step summary.
-        This would ideally download the summary artifact and parse JSON metrics.
-        For now, we'll track basic job success/failure and timing.
+        Parse performance metrics from job logs.
+
+        Args:
+            logs: Raw log text from the job
+            job_name: Name of the job (to determine which metrics to look for)
+
+        Returns:
+            Dictionary mapping metric names to lists of values found
         """
-        # TODO: Implement actual metric parsing from step summary artifacts
-        # This would use the MetricReport JSON format we set up
-        return []
+        metrics = defaultdict(list)
+
+        if not logs:
+            return metrics
+
+        # Parse each line for matching patterns
+        for line in logs.split("\n"):
+            for metric_name, pattern in self.perf_patterns.items():
+                match = pattern.search(line)
+                if match:
+                    try:
+                        value = float(match.group(1))
+                        metrics[metric_name].append(value)
+                    except (ValueError, IndexError):
+                        continue
+
+        return dict(metrics)
 
     def analyze_nightly_tests(self, runs: List[Dict]) -> Dict:
         """Analyze nightly test runs for failures and performance"""
@@ -126,6 +172,7 @@ class NightlyTestMonitor:
                     "recent_failures": [],
                     "avg_duration_minutes": 0,
                     "durations": [],
+                    "performance_metrics": defaultdict(list),  # New: track perf metrics
                 }
             ),
             "daily_stats": defaultdict(
@@ -165,6 +212,7 @@ class NightlyTestMonitor:
             for job in jobs:
                 job_name = job.get("name", "Unknown")
                 job_conclusion = job.get("conclusion", "unknown")
+                job_id = job.get("id")
                 started_at = job.get("started_at")
                 completed_at = job.get("completed_at")
 
@@ -177,6 +225,26 @@ class NightlyTestMonitor:
 
                 if job_conclusion == "success":
                     job_stat["success"] += 1
+
+                    # For successful performance jobs, fetch metrics
+                    if "perf" in job_name.lower() or "eval" in job_name.lower():
+                        logs = self.get_job_logs(job_id)
+                        if logs:
+                            metrics = self.parse_metrics_from_logs(logs, job_name)
+                            # Store metrics with timestamp
+                            for metric_name, values in metrics.items():
+                                if values:  # Only store if we found values
+                                    job_stat["performance_metrics"][metric_name].extend(
+                                        [
+                                            {
+                                                "value": v,
+                                                "timestamp": created_at,
+                                                "run_id": run_id,
+                                            }
+                                            for v in values
+                                        ]
+                                    )
+
                 elif job_conclusion == "failure":
                     job_stat["failure"] += 1
 
@@ -270,6 +338,16 @@ class NightlyTestMonitor:
                 f"{job_name:<40} {total:<8} {success:<8} {failure:<8} "
                 f"{success_rate:>6.1f}% {avg_duration:>7.1f}m"
             )
+
+            # Show performance metrics if available
+            if job_stat.get("performance_metrics"):
+                perf_metrics = job_stat["performance_metrics"]
+                print(f"  Performance metrics collected:")
+                for metric_name, metric_data in perf_metrics.items():
+                    if metric_data:
+                        values = [m["value"] for m in metric_data]
+                        avg_value = sum(values) / len(values)
+                        print(f"    - {metric_name}: {avg_value:.2f} (avg, n={len(values)})")
 
             # Show recent failures
             if job_stat["recent_failures"]:
