@@ -180,6 +180,14 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
+        # TODO: requires further polishing
+        self.is_image_understandable_model = enable_multimodal and hasattr(
+            self.hf_config, "vision_config"
+        )
+        self.is_audio_understandable_model = enable_multimodal and hasattr(
+            self.hf_config, "audio_config"
+        )
+
         self.is_multimodal_chunked_prefill_supported = (
             enable_multimodal
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
@@ -655,6 +663,7 @@ class ModelConfig:
             "qoq",
             "w4afp8",
             "petit_nvfp4",
+            "quark",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
