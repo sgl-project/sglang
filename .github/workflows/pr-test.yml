@@ -325,6 +325,11 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
+      - name: Clean Corrupted Hugging Face Model Cache
+        run: |
+          echo "Deleting potentially corrupted Qwen/Qwen-Image cache to ensure a fresh download."
+          rm -rf /hf_home/hub/models--Qwen--Qwen-Image
+      
       - name: Run diffusion server tests
         timeout-minutes: 60
         run: |
