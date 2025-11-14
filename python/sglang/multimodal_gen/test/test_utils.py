@@ -14,6 +14,7 @@ from typing import Optional, Sequence
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -52,6 +53,27 @@ def probe_port(host="127.0.0.1", port=30010, timeout=2.0) -> bool:
             return True
         except OSError:
             return False
+
+
+def is_in_ci() -> bool:
+    return get_bool_env_var("SGLANG_IS_IN_CI")
+
+
+def get_dynamic_server_port() -> int:
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    if not cuda_devices:
+        cuda_devices = "0"
+    try:
+        first_device_id = int(cuda_devices.split(",")[0].strip()[0])
+    except (ValueError, IndexError):
+        first_device_id = 0
+
+    if is_in_ci():
+        base_port = 10000 + first_device_id * 2000
+    else:
+        base_port = 20000 + first_device_id * 1000
+
+    return base_port + 1000
 
 
 def is_mp4(data):

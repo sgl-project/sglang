@@ -21,14 +21,15 @@ from openai import OpenAI
 
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
 from sglang.multimodal_gen.test.test_utils import (
+    get_dynamic_server_port,
     is_jpeg,
     is_png,
     prepare_perf_log,
     read_perf_records,
     sample_step_indices,
     wait_for_perf_record,
-    wait_for_port,
     wait_for_stage_metrics,
 )
 
@@ -52,9 +53,6 @@ _DEFAULT_WARMUP_TEXT = int(_WARMUP_DEFAULTS.get("text", 1))
 _DEFAULT_WARMUP_EDIT = int(_WARMUP_DEFAULTS.get("image_edit", 0))
 
 _TOLERANCES = _BASELINE_CONFIG["tolerances"]
-
-# A global list to store results from all test classes
-_GLOBAL_PERF_RESULTS = []
 
 
 def _tolerance_from_env(var_name: str, default: float) -> float:
@@ -142,11 +140,10 @@ def diffusion_server(request):
 
     log_dir, perf_log_path = prepare_perf_log(Path(__file__))
 
-    port = getattr(
-        cls,
-        "SERVER_PORT",
-        int(os.environ.get("SGLANG_TEST_SERVER_PORT", "30100")),
-    )
+    default_port = get_dynamic_server_port()
+    port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
+    port = getattr(cls, "SERVER_PORT", port)
+
     model = getattr(cls, "MODEL_PATH")
     wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
     serve_extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
@@ -190,7 +187,9 @@ def diffusion_server(request):
     )
 
     start = time.time()
-    last_size = 0
+    server_ready_message = "Application startup complete."
+    server_ready = False
+
     while time.time() - start < wait_deadline:
         if process.poll() is not None:
             tail = ""
@@ -205,22 +204,24 @@ def diffusion_server(request):
             raise RuntimeError(
                 f"Server exited early (code {process.returncode}). Last logs:\n{tail}"
             )
-        try:
-            if wait_for_port(host="127.0.0.1", port=port, deadline=1.5, interval=0.3):
-                break
-        except Exception:
-            pass
-        if time.time() - start > 10:
-            size = stdout_path.stat().st_size
-            if size != last_size:
-                logger.info(
-                    "[server-test] Waiting for port %s... log size=%s bytes, elapsed=%ss",
-                    port,
-                    size,
-                    int(time.time() - start),
-                )
-                last_size = size
-    else:
+
+        if stdout_path.exists():
+            try:
+                log_content = stdout_path.read_text(encoding="utf-8", errors="ignore")
+                if server_ready_message in log_content:
+                    logger.info("[server-test] Server is fully loaded and ready.")
+                    server_ready = True
+                    break
+            except Exception as e:
+                logger.debug("Could not read server log file yet: %s", e)
+
+        logger.info(
+            "[server-test] Waiting for server to initialize... elapsed=%ss",
+            int(time.time() - start),
+        )
+        time.sleep(5)
+
+    if not server_ready:
         tail = ""
         try:
             tail = "\n".join(
@@ -231,7 +232,7 @@ def diffusion_server(request):
         except Exception:
             pass
         raise TimeoutError(
-            f"Port 127.0.0.1:{port} not ready within {wait_deadline}s.\nLast logs:\n{tail}"
+            f"Server did not become ready within {wait_deadline}s. Last logs:\n{tail}"
         )
 
     ctx = {
@@ -276,7 +277,7 @@ def diffusion_server(request):
 @pytest.mark.usefixtures("diffusion_server")
 class DiffusionPerfTestBase:
     MODEL_PATH: str
-    SERVER_PORT = int(os.environ.get("SGLANG_TEST_SERVER_PORT", "30100"))
+    # SERVER_PORT = int(os.environ.get("SGLANG_TEST_SERVER_PORT", "30100"))
     PROMPT = "A Logo With Bold Large Text: SGL Diffusion"
     IMAGE_EDIT_PROMPT: str | None = None
     IMAGE_EDIT_PATH = Path(__file__).resolve().parents[1] / "test_files" / "girl.jpg"
@@ -446,7 +447,7 @@ class TestQwenImageGeneration(DiffusionPerfTestBase):
     """Performance tests for the Qwen/Qwen-image model."""
 
     MODEL_PATH = "Qwen/Qwen-Image"
-    STARTUP_GRACE_SECONDS = 45.0
+    STARTUP_GRACE_SECONDS = 10.0
     WARMUP_IMAGE_EDIT_REQUESTS = 0
     STAGE_EXPECTATIONS = _TEXT_SCENARIO["stages_ms"]
     STEP_EXPECTATIONS = {
@@ -468,7 +469,7 @@ class TestQwenImageEdit(DiffusionPerfTestBase):
     MODEL_PATH = "Qwen/Qwen-Image-Edit"
     IMAGE_EDIT_PROMPT = "Convert 2D style to 3D style"
     OUTPUT_SIZE = "1024x1536"
-    STARTUP_GRACE_SECONDS = 350.0
+    STARTUP_GRACE_SECONDS = 10.0
     WARMUP_TEXT_REQUESTS = 0
     WARMUP_IMAGE_EDIT_REQUESTS = 1
     STAGE_EXPECTATIONS = _IMAGE_EDIT_SCENARIO["stages_ms"]
@@ -487,55 +488,3 @@ class TestQwenImageEdit(DiffusionPerfTestBase):
         )
         summary = self._assert_metrics(perf_record, stage_metrics)
         self._record_result("image_edit", summary)
-
-
-def pytest_sessionfinish(session):
-    """
-    This hook is called by pytest at the end of the entire test session.
-    It prints a consolidated summary of all performance results.
-    """
-    if not _GLOBAL_PERF_RESULTS:
-        return
-
-    print("\n\n" + "=" * 35 + " Performance Summary " + "=" * 35)
-    print(
-        f"{'Test Suite':<30} | {'Test Name':<20} | {'E2E (ms)':>12} | {'Avg Denoise (ms)':>18} | {'Median Denoise (ms)':>20}"
-    )
-    print(
-        "-" * 30
-        + "-+-"
-        + "-" * 20
-        + "-+-"
-        + "-" * 12
-        + "-+-"
-        + "-" * 18
-        + "-+-"
-        + "-" * 20
-    )
-
-    for entry in sorted(_GLOBAL_PERF_RESULTS, key=lambda x: x["class_name"]):
-        print(
-            f"{entry['class_name']:<30} | {entry['test_name']:<20} | {entry['e2e_ms']:>12.2f} | "
-            f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f}"
-        )
-
-    print("=" * 91)
-
-    print("\n\n" + "=" * 36 + " Detailed Reports " + "=" * 37)
-    for entry in sorted(_GLOBAL_PERF_RESULTS, key=lambda x: x["class_name"]):
-        print(f"\n--- Details for {entry['class_name']} / {entry['test_name']} ---")
-        stage_report = ", ".join(
-            f"{name}:{duration:.2f}ms"
-            for name, duration in entry.get("stage_metrics", {}).items()
-        )
-        if stage_report:
-            print(f"    Stages: {stage_report}")
-
-        sampled_steps = entry.get("sampled_steps") or {}
-        if sampled_steps:
-            step_report = ", ".join(
-                f"{idx}:{duration:.2f}ms"
-                for idx, duration in sorted(sampled_steps.items())
-            )
-            print(f"    Sampled Steps: {step_report}")
-    print("=" * 91)
