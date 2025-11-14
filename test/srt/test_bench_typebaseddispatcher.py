@@ -1,22 +1,28 @@
 import timeit
 from typing import Any, Callable, List, Tuple, Type
 
-from sglang.srt.utils import TypeBasedDispatcher
-
+from sglang.utils import TypeBasedDispatcher
 
 class TypeBasedDispatcherList:
-    """origin implementation of TypeBasedDispatcher"""
-
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
         self._fallback_fn = None
+
+    def add_fallback_fn(self, fallback_fn: Callable):
+        self._fallback_fn = fallback_fn
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        self._mapping.extend(other._mapping)
+        return self
 
     def __call__(self, obj: Any):
         for ty, fn in self._mapping:
             if isinstance(obj, ty):
                 return fn(obj)
-        raise ValueError(f"Invalid object: {obj}")
 
+        if self._fallback_fn is not None:
+            return self._fallback_fn(obj)
+        raise ValueError(f"Invalid object: {obj}")
 
 def create_test_mapping(num_types=30):
     types = [type(f"RequestType{i}", (), {}) for i in range(num_types)]

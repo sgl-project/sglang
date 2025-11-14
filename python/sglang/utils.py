@@ -18,7 +18,7 @@ from functools import wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
-
+from collections import OrderedDict
 import numpy as np
 import pybase64
 import requests
@@ -480,8 +480,9 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
-        # Use dictionary for fast exact type matching
-        self._mapping = {ty: fn for ty, fn in mapping}
+        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
+        # to maintains registration order
+        self._mapping = OrderedDict(mapping)
         # MRO cache for inheritance-based matching
         self._mro_cache = {}
         self._fallback_fn = None
@@ -499,7 +500,6 @@ class TypeBasedDispatcher:
 
     def __call__(self, obj: Any):
         obj_type = type(obj)
-
         # 1. First try exact match(o(1))
         fn = self._mapping.get(obj_type)
         if fn is not None:
@@ -510,10 +510,9 @@ class TypeBasedDispatcher:
         if cached_fn is not None:
             return cached_fn(obj)
 
-        # 3. If ont in cache, traverse MRO to find compatible type
-        for base in obj_type.__mro__:
-            fn = self._mapping.get(base)
-            if fn is not None:
+        # 3.search in registration order for compatible type(maintains origin behavior)
+        for ty, fn in self._mapping.items():
+            if isinstance(obj, ty):
                 self._mro_cache[obj_type] = fn
                 return fn(obj)
 
