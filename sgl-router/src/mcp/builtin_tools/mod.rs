@@ -11,13 +11,6 @@
 //! 2. **Converter**: Maps built-in tool types to static MCP servers
 //! 3. **MCP Handler**: Executes tools via MCP (existing infrastructure)
 //! 4. **Formatter**: Transforms MCP results into built-in tool output
-//!
-//! ## Important Constraints
-//!
-//! - Built-in tools ONLY work with static MCP servers (configured in mcp.yaml)
-//! - Each tool type has ONE fixed label (e.g., "web_search")
-//! - Built-in tools HIDE all MCP implementation details from users
-//! - No dynamic server URLs or custom labels are supported
 
 pub mod converter;
 pub mod detector;

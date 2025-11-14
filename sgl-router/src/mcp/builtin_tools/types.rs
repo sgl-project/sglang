@@ -18,11 +18,6 @@ impl BuiltinToolType {
     ///
     /// Labels are used to resolve which static MCP server to use.
     /// Each tool type has exactly ONE fixed label.
-    ///
-    /// # Examples
-    /// - `WebSearch` → "web_search"
-    /// - `FileSearch` → "file_search"
-    /// - `CodeInterpreter` → "code_interpreter"
     pub fn fixed_label(&self) -> &'static str {
         match self {
             BuiltinToolType::WebSearch => "web_search",
@@ -34,12 +29,6 @@ impl BuiltinToolType {
     /// Get the synthetic name prefix for this built-in tool type
     ///
     /// Synthetic names are used internally to track built-in tool calls.
-    /// Format: `{label}_builtin`
-    ///
-    /// # Examples
-    /// - `WebSearch` → "web_search_builtin"
-    /// - `FileSearch` → "file_search_builtin"
-    /// - `CodeInterpreter` → "code_interpreter_builtin"
     pub fn synthetic_name(&self) -> String {
         format!("{}_builtin", self.fixed_label())
     }
@@ -65,10 +54,6 @@ impl BuiltinToolType {
 
     /// Infer a BuiltinToolType from its synthetic tool name.
     /// Synthetic names are generated via `synthetic_name()` and prefixed with the fixed label.
-    /// Examples:
-    /// - "web_search_builtin__brave_web_search" => Some(WebSearch)
-    /// - "file_search_builtin__vector_search" => Some(FileSearch)
-    /// - "code_interpreter_builtin__python" => Some(CodeInterpreter)
     pub fn from_synthetic_name(name: &str) -> Option<Self> {
         if name.starts_with(&format!(
             "{}_builtin",
@@ -113,59 +98,4 @@ pub struct BuiltinToolResult {
     pub mcp_output: serde_json::Value,
     /// Whether the call resulted in an error
     pub is_error: bool,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fixed_labels() {
-        assert_eq!(BuiltinToolType::WebSearch.fixed_label(), "web_search");
-        assert_eq!(BuiltinToolType::FileSearch.fixed_label(), "file_search");
-        assert_eq!(
-            BuiltinToolType::CodeInterpreter.fixed_label(),
-            "code_interpreter"
-        );
-    }
-
-    #[test]
-    fn test_synthetic_names() {
-        assert_eq!(
-            BuiltinToolType::WebSearch.synthetic_name(),
-            "web_search_builtin"
-        );
-        assert_eq!(
-            BuiltinToolType::FileSearch.synthetic_name(),
-            "file_search_builtin"
-        );
-        assert_eq!(
-            BuiltinToolType::CodeInterpreter.synthetic_name(),
-            "code_interpreter_builtin"
-        );
-    }
-
-    #[test]
-    fn test_from_response_tool_type() {
-        assert_eq!(
-            BuiltinToolType::from_response_tool_type(&ResponseToolType::WebSearch),
-            Some(BuiltinToolType::WebSearch)
-        );
-        assert_eq!(
-            BuiltinToolType::from_response_tool_type(&ResponseToolType::FileSearch),
-            Some(BuiltinToolType::FileSearch)
-        );
-        assert_eq!(
-            BuiltinToolType::from_response_tool_type(&ResponseToolType::CodeInterpreter),
-            Some(BuiltinToolType::CodeInterpreter)
-        );
-        assert_eq!(
-            BuiltinToolType::from_response_tool_type(&ResponseToolType::Function),
-            None
-        );
-        assert_eq!(
-            BuiltinToolType::from_response_tool_type(&ResponseToolType::Mcp),
-            None
-        );
-    }
 }

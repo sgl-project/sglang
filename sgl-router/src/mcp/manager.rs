@@ -155,12 +155,6 @@ impl McpManager {
     ///
     /// This is used for dynamic MCP clients from request server_url that should
     /// not persist across requests. The client will be dropped when the request completes.
-    ///
-    /// # Arguments
-    /// * `server_config` - Server configuration
-    ///
-    /// # Returns
-    /// Arc to the newly created MCP client (not cached in the pool)
     pub async fn create_uncached_client(
         &self,
         server_config: McpServerConfig,
@@ -172,7 +166,9 @@ impl McpManager {
         }
 
         // Create new connection without caching
-        let client = Self::connect_server(&server_config, self.connection_pool.global_proxy.as_ref()).await?;
+        let client =
+            Self::connect_server(&server_config, self.connection_pool.global_proxy.as_ref())
+                .await?;
         Ok(Arc::new(client))
     }
 

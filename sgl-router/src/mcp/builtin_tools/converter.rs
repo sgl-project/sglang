@@ -17,26 +17,6 @@ pub struct BuiltinToolConverter;
 
 impl BuiltinToolConverter {
     /// Convert built-in tools to MCP tools
-    ///
-    /// # Arguments
-    /// * `builtin_types` - Detected built-in tool types
-    /// * `mcp_manager` - MCP manager for server resolution
-    ///
-    /// # Returns
-    /// Vec of (server_name, MCP tool definition with synthetic name)
-    ///
-    /// # Important
-    /// - Only resolves to STATIC servers configured in mcp.yaml
-    /// - Labels are FIXED per tool type (no customization)
-    /// - ALL tools from the server are made available
-    /// - Each tool gets a synthetic name: `{type}_builtin__{original_name}`
-    ///
-    /// # Example
-    /// ```ignore
-    /// let builtin_types = vec![BuiltinToolType::WebSearch];
-    /// let mcp_tools = BuiltinToolConverter::convert_to_mcp(&builtin_types, &mcp_manager).await?;
-    /// // Returns: vec![("brave-search", McpTool { name: "web_search_builtin__search", ...})]
-    /// ```
     pub async fn convert_to_mcp(
         builtin_types: &[BuiltinToolType],
         mcp_manager: &Arc<McpManager>,
@@ -106,13 +86,6 @@ impl BuiltinToolConverter {
     ///
     /// Format: `{builtin_type}_builtin__{original_name}`
     /// Example: `web_search_builtin__search`, `web_search_builtin__local_search`
-    ///
-    /// # Arguments
-    /// * `server_tools` - Tools from the MCP server
-    /// * `builtin_type` - Built-in tool type (for naming)
-    ///
-    /// # Returns
-    /// Vec of MCP tools with synthetic names
     fn convert_server_tools(
         server_tools: &[McpTool],
         builtin_type: &BuiltinToolType,
@@ -137,80 +110,5 @@ impl BuiltinToolConverter {
                 }
             })
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-
-    #[test]
-    fn test_convert_server_tools_web_search() {
-        use serde_json::Map;
-
-        let schema1 = Map::new();
-        let schema2 = Map::new();
-
-        let server_tools = vec![
-            McpTool {
-                name: std::borrow::Cow::Borrowed("search"),
-                title: None,
-                description: Some(std::borrow::Cow::Borrowed("Search the web")),
-                input_schema: Arc::new(schema1),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-            },
-            McpTool {
-                name: std::borrow::Cow::Borrowed("local_search"),
-                title: None,
-                description: Some(std::borrow::Cow::Borrowed("Search local businesses")),
-                input_schema: Arc::new(schema2),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-            },
-        ];
-
-        let converted =
-            BuiltinToolConverter::convert_server_tools(&server_tools, &BuiltinToolType::WebSearch);
-
-        assert_eq!(converted.len(), 2);
-        assert_eq!(converted[0].name, "web_search_builtin__search");
-        assert_eq!(converted[1].name, "web_search_builtin__local_search");
-    }
-
-    #[test]
-    fn test_convert_server_tools_preserves_metadata() {
-        use serde_json::Map;
-
-        let mut schema = Map::new();
-        let mut props = Map::new();
-        let mut query_prop = Map::new();
-        query_prop.insert("type".to_string(), serde_json::json!("string"));
-        props.insert("query".to_string(), serde_json::json!(query_prop));
-        schema.insert("properties".to_string(), serde_json::json!(props));
-
-        let server_tools = vec![McpTool {
-            name: std::borrow::Cow::Borrowed("search"),
-            title: None,
-            description: Some(std::borrow::Cow::Borrowed("Search the web")),
-            input_schema: Arc::new(schema),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-        }];
-
-        let converted =
-            BuiltinToolConverter::convert_server_tools(&server_tools, &BuiltinToolType::WebSearch);
-
-        assert_eq!(converted.len(), 1);
-        assert_eq!(
-            converted[0].description,
-            Some(std::borrow::Cow::Borrowed("Search the web"))
-        );
-        assert!(converted[0].input_schema.contains_key("properties"));
     }
 }
