@@ -21,7 +21,6 @@ jobs:
   nightly-test-text-accuracy-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,7 +39,6 @@ jobs:
   nightly-test-text-perf-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,7 +70,6 @@ jobs:
   nightly-test-vlm-accuracy-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -91,7 +88,6 @@ jobs:
   nightly-test-vlm-perf-2-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -123,7 +119,6 @@ jobs:
   nightly-test-general-1-gpu-runner:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 1-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -142,7 +137,6 @@ jobs:
   nightly-test-general-4-gpu-h100:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 4-gpu-h100
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -161,7 +155,6 @@ jobs:
   nightly-test-general-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-h200
-    continue-on-error: true
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
@@ -184,7 +177,6 @@ jobs:
   nightly-test-general-8-gpu-h20:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-h20
-    continue-on-error: true
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
     steps:
@@ -207,7 +199,6 @@ jobs:
   nightly-test-perf-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 4-gpu-b200
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -225,7 +216,6 @@ jobs:
   nightly-test-perf-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-b200
-    continue-on-error: true
     env:
       RUNNER_LABELS: 8-gpu-b200
     steps:

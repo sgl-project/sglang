@@ -6,7 +6,6 @@ on:
 jobs:
   test:
     runs-on: 1-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

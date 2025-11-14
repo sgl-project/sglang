@@ -6,7 +6,6 @@ on:
 jobs:
   test:
     runs-on: 8-gpu-h200
-    continue-on-error: true
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
