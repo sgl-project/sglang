@@ -18,7 +18,6 @@ jobs:
   nightly-test-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 4-gpu-b200
-    continue-on-error: true
     env:
       RUNNER_LABELS: 4-gpu-b200
     steps:
@@ -50,7 +49,6 @@ jobs:
   nightly-test-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-b200
-    continue-on-error: true
     env:
       RUNNER_LABELS: 8-gpu-b200
     steps:
