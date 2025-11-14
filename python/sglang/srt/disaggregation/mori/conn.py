@@ -1,0 +1,964 @@
+from __future__ import annotations
+
+import ctypes
+import dataclasses
+import logging
+import os
+import threading
+import time
+from collections import defaultdict
+from typing import Dict, List, Optional, Set, Tuple
+
+import msgpack
+import numpy as np
+import numpy.typing as npt
+from mori.io import (
+    BackendType,
+    EngineDesc,
+    IOEngine,
+    IOEngineConfig,
+    MemoryDesc,
+    MemoryLocationType,
+    PollCqMode,
+    RdmaBackendConfig,
+)
+
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    CommonKVReceiver,
+    CommonKVSender,
+)
+from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import (
+    format_tcp_address,
+    get_free_port,
+    get_int_env_var,
+    get_local_ip_auto,
+    is_valid_ipv6_address,
+)
+
+logger = logging.getLogger(__name__)
+MORI_GUARD = b"MoriMsgGuard"
+
+
+def _pack_mem_desc_list(mems: List[MemoryDesc]) -> bytes:
+    if not mems:
+        return b""
+    packed_descs = [mem.pack() for mem in mems]
+    return msgpack.packb(packed_descs, use_bin_type=True)
+
+
+def _unpack_mem_desc_list(blob: bytes) -> List[MemoryDesc]:
+    if not blob:
+        return []
+    desc_blobs = msgpack.unpackb(blob, raw=False)
+    return [MemoryDesc.unpack(b) for b in desc_blobs]
+
+
+@dataclasses.dataclass
+class TransferInfo:
+    room: int
+    endpoint: str
+    dst_port: int
+    engine_key: str
+    dst_kv_indices: npt.NDArray[np.int32]
+    dst_aux_index: int
+    dst_state_indices: List[int]
+    required_dst_info_num: int
+    is_dummy: bool
+
+    @classmethod
+    def from_zmq(cls, payload: List[bytes]) -> "TransferInfo":
+        room = int(payload[0].decode("ascii"))
+        endpoint = payload[1].decode("ascii")
+        dst_port = int(payload[2].decode("ascii"))
+        engine_key = payload[3].decode("ascii")
+
+        if payload[4]:
+            dst_kv_indices = np.frombuffer(payload[4], dtype=np.int32)
+        else:
+            dst_kv_indices = np.array([], dtype=np.int32)
+
+        if payload[5]:
+            dst_aux_index = int(payload[5].decode("ascii"))
+        else:
+            dst_aux_index = -1
+
+        dst_state_indices: List[int] = []
+        if len(payload) > 6 and payload[6]:
+            dst_state_indices = list(np.frombuffer(payload[6], dtype=np.int32))
+
+        required_dst_info_num = (
+            int(payload[7].decode("ascii")) if len(payload) > 7 else 1
+        )
+        is_dummy = dst_kv_indices.size == 0 and dst_aux_index < 0
+        return cls(
+            room=room,
+            endpoint=endpoint,
+            dst_port=dst_port,
+            engine_key=engine_key,
+            dst_kv_indices=dst_kv_indices,
+            dst_aux_index=dst_aux_index,
+            dst_state_indices=dst_state_indices,
+            required_dst_info_num=required_dst_info_num,
+            is_dummy=is_dummy,
+        )
+
+
+@dataclasses.dataclass
+class KVArgsRegisterInfo:
+    endpoint: str
+    dst_port: int
+    engine_desc: EngineDesc
+    dst_kv_mem_descs: List[MemoryDesc]
+    dst_aux_mem_descs: List[MemoryDesc]
+    dst_state_mem_descs: List[MemoryDesc]
+    gpu_id: int
+    decode_tp_size: int
+    decode_tp_rank: int
+    dst_kv_item_len: int
+
+    @property
+    def engine_key(self) -> str:
+        return self.engine_desc.key
+
+    @classmethod
+    def from_zmq(cls, payload: List[bytes]) -> "KVArgsRegisterInfo":
+        endpoint = payload[1].decode("ascii")
+        dst_port = int(payload[2].decode("ascii"))
+        engine_desc = EngineDesc.unpack(payload[3])
+        dst_kv_mem_descs = _unpack_mem_desc_list(payload[4])
+        dst_aux_mem_descs = _unpack_mem_desc_list(payload[5])
+        dst_state_mem_descs = _unpack_mem_desc_list(payload[6])
+        gpu_id = int(payload[7].decode("ascii"))
+        decode_tp_size = int(payload[8].decode("ascii"))
+        decode_tp_rank = int(payload[9].decode("ascii"))
+        dst_kv_item_len = int(payload[10].decode("ascii"))
+        return cls(
+            endpoint=endpoint,
+            dst_port=dst_port,
+            engine_desc=engine_desc,
+            dst_kv_mem_descs=dst_kv_mem_descs,
+            dst_aux_mem_descs=dst_aux_mem_descs,
+            dst_state_mem_descs=dst_state_mem_descs,
+            gpu_id=gpu_id,
+            decode_tp_size=decode_tp_size,
+            decode_tp_rank=decode_tp_rank,
+            dst_kv_item_len=dst_kv_item_len,
+        )
+
+
+class MoriKVManager(CommonKVManager):
+    def __init__(
+        self,
+        args: KVArgs,
+        disaggregation_mode: DisaggregationMode,
+        server_args: ServerArgs,
+        is_mla_backend: Optional[bool] = False,
+    ):
+        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.engine = self._init_engine()
+        self.engine_desc = self.engine.get_engine_desc()
+        self.kv_mem_descs: List[MemoryDesc] = []
+        self.aux_mem_descs: List[MemoryDesc] = []
+        self.state_mem_descs: List[MemoryDesc] = []
+        self.failure_records: Dict[int, str] = {}
+        self.failure_lock = threading.Lock()
+        self.transfer_lock = threading.Lock()
+        self._register_local_buffers()
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.bootstrap_timeout = get_int_env_var(
+                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
+            )
+            self._start_bootstrap_thread()
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.waiting_timeout = get_int_env_var(
+                "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
+            )
+            self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            self.addr_to_rooms_tracker = defaultdict(set)
+            self.room_to_bootstrap_addr: Dict[int, str] = {}
+            self._start_decode_thread()
+
+    def _init_engine(self) -> IOEngine:
+        engine_key = (
+            f"mori-{self.disaggregation_mode.value}-"
+            f"dp{self.system_dp_rank}-tp{self.attn_tp_rank}-"
+            f"pp{self.pp_rank}-pid{os.getpid()}"
+        )
+
+        port = get_free_port()
+        self.local_ip = get_local_ip_auto()
+        config = IOEngineConfig(host=self.local_ip, port=port)
+
+        engine = IOEngine(engine_key, config)
+        poll_mode = PollCqMode.POLLING
+        qp_per_transfer = get_int_env_var("SGLANG_MORI_QP_PER_TRANSFER", 1)
+        post_batch_size = get_int_env_var("SGLANG_MORI_POST_BATCH_SIZE", -1)
+        num_worker_threads = get_int_env_var("SGLANG_MORI_NUM_WORKERS", 1)
+
+        rdma_cfg = RdmaBackendConfig(
+            qp_per_transfer,
+            post_batch_size,
+            num_worker_threads,
+            poll_mode,
+        )
+        engine.create_backend(BackendType.RDMA, rdma_cfg)
+        logger.debug(
+            "Initialized Mori IOEngine %s at %s:%s (qp_per_transfer=%s, workers=%s, poll_mode=%s)",
+            engine_key,
+            self.local_ip,
+            port,
+            qp_per_transfer,
+            num_worker_threads,
+            poll_mode.name,
+        )
+        return engine
+
+    def _register_pointer(
+        self,
+        ptr: int,
+        length: int,
+        device_id: int,
+        location: MemoryLocationType,
+    ) -> MemoryDesc:
+        capsule = ctypes.pythonapi.PyCapsule_New(ctypes.c_void_p(ptr), None, None)
+        return self.engine._engine.RegisterMemory(capsule, length, device_id, location)  # type: ignore[attr-defined]
+
+    def _register_local_buffers(self) -> None:
+        for ptr, length in zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens):
+            mem_desc = self._register_pointer(
+                ptr,
+                length,
+                self.kv_args.gpu_id,
+                MemoryLocationType.GPU,
+            )
+            self.kv_mem_descs.append(mem_desc)
+        for ptr, length in zip(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens):
+            desc = self._register_pointer(
+                ptr,
+                length,
+                -1,
+                MemoryLocationType.CPU,
+            )
+            self.aux_mem_descs.append(desc)
+        for ptr, length in zip(
+            self.kv_args.state_data_ptrs, getattr(self.kv_args, "state_data_lens", [])
+        ):
+            desc = self._register_pointer(
+                ptr,
+                length,
+                self.kv_args.gpu_id,
+                MemoryLocationType.GPU,
+            )
+            self.state_mem_descs.append(desc)
+
+    def check_status(self, bootstrap_room: int):
+        return self.request_status[bootstrap_room]
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        if bootstrap_room not in self.request_status:
+            self.request_status[bootstrap_room] = status
+        else:
+            if status == KVPoll.Failed:
+                self.request_status[bootstrap_room] = KVPoll.Failed
+            else:
+                self.request_status[bootstrap_room] = max(
+                    self.request_status[bootstrap_room], status
+                )
+
+    def record_failure(self, bootstrap_room: int, failure_reason: str) -> None:
+        with self.failure_lock:
+            self.failure_records[bootstrap_room] = failure_reason
+
+    def _start_bootstrap_thread(self) -> None:
+        def bootstrap_worker():
+            while True:
+                try:
+                    waiting_req_bytes = self.server_socket.recv_multipart()
+                    if not waiting_req_bytes:
+                        continue
+                    if waiting_req_bytes[0] != MORI_GUARD:
+                        logger.warning(
+                            "Received malformed bootstrap message (guard=%s)",
+                            waiting_req_bytes[0],
+                        )
+                        continue
+                    payload = waiting_req_bytes[1:]
+                    if not payload:
+                        continue
+                    room = payload[0].decode("ascii")
+                    if room == "None":
+                        try:
+                            register_info = KVArgsRegisterInfo.from_zmq(payload)
+                            self._add_remote_peer(register_info)
+                        except Exception:
+                            logger.exception("Failed to register remote peer")
+                        continue
+
+                    try:
+                        transfer_info = TransferInfo.from_zmq(payload)
+                    except Exception:
+                        logger.exception("Failed to parse transfer info message")
+                        continue
+
+                    infos = self.transfer_infos.setdefault(transfer_info.room, {})
+                    infos[transfer_info.engine_key] = transfer_info
+                    if len(infos) >= transfer_info.required_dst_info_num:
+                        logger.debug(
+                            "Bootstrap room %s got enough transfer info (%s)",
+                            transfer_info.room,
+                            len(infos),
+                        )
+                        self.update_status(transfer_info.room, KVPoll.WaitingForInput)
+                except Exception:
+                    logger.exception("Bootstrap worker failed")
+
+        threading.Thread(target=bootstrap_worker, daemon=True).start()
+
+    def _cleanup_room_tracking(self, bootstrap_room: int) -> None:
+        bootstrap_addr = self.room_to_bootstrap_addr.pop(bootstrap_room, None)
+        if bootstrap_addr is not None and hasattr(self, "addr_to_rooms_tracker"):
+            rooms = self.addr_to_rooms_tracker.get(bootstrap_addr)
+            if rooms is not None:
+                rooms.discard(bootstrap_room)
+                if not rooms:
+                    self.addr_to_rooms_tracker.pop(bootstrap_addr, None)
+
+    def _start_decode_thread(self) -> None:
+        def decode_worker():
+            while True:
+                try:
+                    msg = self.server_socket.recv_multipart()
+                    if not msg or msg[0] != MORI_GUARD:
+                        logger.warning(
+                            "Received malformed status message on decode worker"
+                        )
+                        continue
+                    payload = msg[1:]
+                    if len(payload) < 3:
+                        logger.warning("Incomplete status payload received")
+                        continue
+                    bootstrap_room = int(payload[0].decode("ascii"))
+                    status_code = int(payload[1].decode("ascii"))
+                    prefill_rank = int(payload[2].decode("ascii"))
+                    failure_reason = (
+                        payload[3].decode("utf-8")
+                        if len(payload) > 3 and payload[3]
+                        else None
+                    )
+
+                    if status_code == KVPoll.Success:
+                        tracker = self.prefill_response_tracker[bootstrap_room]
+                        tracker.add(prefill_rank)
+                        expected = self.required_prefill_response_num_table.get(
+                            bootstrap_room, 1
+                        )
+                        if len(tracker) >= expected:
+                            self.prefill_response_tracker.pop(bootstrap_room, None)
+                            self.update_status(bootstrap_room, KVPoll.Success)
+                            self._cleanup_room_tracking(bootstrap_room)
+                    elif status_code == KVPoll.Failed:
+                        if failure_reason:
+                            self.record_failure(bootstrap_room, failure_reason)
+                        self.prefill_response_tracker.pop(bootstrap_room, None)
+                        self.update_status(bootstrap_room, KVPoll.Failed)
+                        self._cleanup_room_tracking(bootstrap_room)
+                    else:
+                        logger.warning(
+                            "Unknown status code %s received for room %s",
+                            status_code,
+                            bootstrap_room,
+                        )
+                except Exception:
+                    logger.exception("Decode status worker failed")
+
+        threading.Thread(target=decode_worker, daemon=True).start()
+
+    def notify_decode_status(
+        self,
+        infos: List[TransferInfo],
+        bootstrap_room: int,
+        status: KVPoll,
+        failure_reason: Optional[str] = None,
+    ) -> None:
+        if not infos:
+            return
+        payload = [
+            MORI_GUARD,
+            str(bootstrap_room).encode("ascii"),
+            str(int(status)).encode("ascii"),
+            str(self.attn_tp_rank * self.pp_size + self.pp_rank).encode("ascii"),
+            failure_reason.encode("utf-8") if failure_reason else b"",
+        ]
+        for info in infos:
+            try:
+                endpoint = format_tcp_address(info.endpoint, info.dst_port)
+                socket = self._connect(
+                    endpoint, is_ipv6=is_valid_ipv6_address(info.endpoint)
+                )
+                socket.send_multipart(payload)
+            except Exception:
+                logger.exception(
+                    "Failed to sync status %s to decode endpoint %s:%s for room %s",
+                    status,
+                    info.endpoint,
+                    info.dst_port,
+                    bootstrap_room,
+                )
+
+    def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
+        engine_key = register_info.engine_key
+        if engine_key in self.decode_kv_args_table:
+            logger.debug("Remote peer %s already registered. Skipping.", engine_key)
+            return
+        self.engine.register_remote_engine(register_info.engine_desc)
+        self.decode_kv_args_table[engine_key] = register_info
+        logger.debug(
+            "Registered decode peer %s (%s:%s)",
+            engine_key,
+            register_info.endpoint,
+            register_info.dst_port,
+        )
+
+    def _get_mha_mem_desc_slices(
+        self, dst_mem_descs: List[MemoryDesc]
+    ) -> tuple[
+        List[MemoryDesc], List[MemoryDesc], List[MemoryDesc], List[MemoryDesc], int
+    ]:
+        src_descs = self.kv_mem_descs
+        if not src_descs:
+            raise RuntimeError("KV memory descriptors are empty on prefill side")
+
+        num_local_layers = len(src_descs) // 2
+        src_k_descs = src_descs[:num_local_layers]
+        src_v_descs = src_descs[num_local_layers:]
+
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = start_layer + num_local_layers
+        dst_total_layers = len(dst_mem_descs) // 2
+        if (
+            len(dst_mem_descs) < 2
+            or end_layer > dst_total_layers
+            or (dst_total_layers + end_layer) > len(dst_mem_descs)
+        ):
+            raise ValueError(
+                "Destination KV descriptors do not match prefill pp configuration"
+            )
+        dst_k_descs = dst_mem_descs[start_layer:end_layer]
+        dst_v_descs = dst_mem_descs[
+            dst_total_layers + start_layer : dst_total_layers + end_layer
+        ]
+        return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
+
+    def _get_mla_mem_desc_slices(
+        self, dst_mem_descs: List[MemoryDesc]
+    ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
+        src_descs = self.kv_mem_descs
+        num_local_layers = len(src_descs)
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = start_layer + num_local_layers
+        if end_layer > len(dst_mem_descs):
+            raise ValueError(
+                "Destination MLA KV descriptors do not match prefill pp configuration"
+            )
+        dst_slice = dst_mem_descs[start_layer:end_layer]
+        return src_descs, dst_slice, num_local_layers
+
+    def _issue_layer_transfers(
+        self,
+        src_desc: MemoryDesc,
+        dst_desc: MemoryDesc,
+        kv_item_len: int,
+        src_groups: List[List[int]],
+        dst_groups: List[List[int]],
+    ) -> List["mori_cpp.TransferStatus"]:
+        statuses = []
+        for src_group, dst_group in zip(src_groups, dst_groups):
+            local_offset = int(src_group[0]) * kv_item_len
+            remote_offset = int(dst_group[0]) * kv_item_len
+            size = len(src_group) * kv_item_len
+            transfer_uid = self.engine.allocate_transfer_uid()
+            status = self.engine.write(
+                src_desc,
+                local_offset,
+                dst_desc,
+                remote_offset,
+                size,
+                transfer_uid,
+            )
+            statuses.append(status)
+        return statuses
+
+    def send_kvcache(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+    ) -> List["mori_cpp.TransferStatus"]:
+        src_groups, dst_groups = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
+        statuses = []
+        kv_item_len = self.kv_args.kv_item_lens[0]
+        if self.is_mla_backend:
+            (
+                src_descs,
+                dst_descs,
+                layers_current_pp_stage,
+            ) = self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
+            for layer_id in range(layers_current_pp_stage):
+                statuses.extend(
+                    self._issue_layer_transfers(
+                        src_descs[layer_id],
+                        dst_descs[layer_id],
+                        kv_item_len,
+                        src_groups,
+                        dst_groups,
+                    )
+                )
+        else:
+            (
+                src_k_descs,
+                src_v_descs,
+                dst_k_descs,
+                dst_v_descs,
+                layers_current_pp_stage,
+            ) = self._get_mha_mem_desc_slices(peer_info.dst_kv_mem_descs)
+            for layer_id in range(layers_current_pp_stage):
+                statuses.extend(
+                    self._issue_layer_transfers(
+                        src_k_descs[layer_id],
+                        dst_k_descs[layer_id],
+                        kv_item_len,
+                        src_groups,
+                        dst_groups,
+                    )
+                )
+            for layer_id in range(layers_current_pp_stage):
+                statuses.extend(
+                    self._issue_layer_transfers(
+                        src_v_descs[layer_id],
+                        dst_v_descs[layer_id],
+                        kv_item_len,
+                        src_groups,
+                        dst_groups,
+                    )
+                )
+        return statuses
+
+    def send_aux(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        prefill_aux_index: int,
+        dst_aux_index: int,
+    ) -> List["mori_cpp.TransferStatus"]:
+        statuses = []
+        for src_desc, dst_desc, length in zip(
+            self.aux_mem_descs,
+            peer_info.dst_aux_mem_descs,
+            self.kv_args.aux_item_lens,
+        ):
+            local_offset = prefill_aux_index * length
+            remote_offset = dst_aux_index * length
+            transfer_uid = self.engine.allocate_transfer_uid()
+            status = self.engine.write(
+                src_desc,
+                local_offset,
+                dst_desc,
+                remote_offset,
+                length,
+                transfer_uid,
+            )
+            statuses.append(status)
+        return statuses
+
+    def send_state(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        prefill_state_indices: Optional[npt.NDArray[np.int32]],
+        dst_state_indices: Optional[List[int]],
+    ) -> List["mori_cpp.TransferStatus"]:
+        if (
+            prefill_state_indices is None
+            or dst_state_indices is None
+            or not len(dst_state_indices)
+            or not self.state_mem_descs
+            or not peer_info.dst_state_mem_descs
+        ):
+            return []
+
+        src_indices = np.asarray(prefill_state_indices, dtype=np.int32).flatten()
+        dst_indices = np.asarray(dst_state_indices, dtype=np.int32).flatten()
+        if src_indices.size != dst_indices.size:
+            raise ValueError("State indices from prefill and decode must match in size")
+
+        statuses: List["mori_cpp.TransferStatus"] = []
+        for src_desc, dst_desc, length in zip(
+            self.state_mem_descs,
+            peer_info.dst_state_mem_descs,
+            self.kv_args.state_item_lens,
+        ):
+            for src_idx, dst_idx in zip(src_indices, dst_indices):
+                local_offset = int(src_idx) * length
+                remote_offset = int(dst_idx) * length
+                transfer_uid = self.engine.allocate_transfer_uid()
+                status = self.engine.write(
+                    src_desc,
+                    local_offset,
+                    dst_desc,
+                    remote_offset,
+                    length,
+                    transfer_uid,
+                )
+                statuses.append(status)
+        return statuses
+
+    def add_transfer_request(
+        self,
+        bootstrap_room: int,
+        kv_indices: npt.NDArray[np.int32],
+        index_slice: slice,
+        is_last: bool,
+        aux_index: Optional[int] = None,
+        state_indices: Optional[npt.NDArray[np.int32]] = None,
+    ) -> Tuple[List["mori_cpp.TransferStatus"], Optional[List[TransferInfo]]]:
+        assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        transfer_infos = self.transfer_infos.get(bootstrap_room)
+        if not transfer_infos:
+            raise RuntimeError(
+                f"No transfer info found for bootstrap_room={bootstrap_room}"
+            )
+        result_statuses = []
+        target_infos_snapshot: Optional[List[TransferInfo]] = None
+        with self.transfer_lock:
+            self.update_status(bootstrap_room, KVPoll.Transferring)
+            for info in transfer_infos.values():
+                peer_info = self.decode_kv_args_table.get(info.engine_key)
+                if not peer_info:
+                    self.record_failure(
+                        bootstrap_room,
+                        f"Peer info missing for engine {info.engine_key}",
+                    )
+                    raise RuntimeError(
+                        f"Missing decode peer info for {info.engine_key}"
+                    )
+                if not info.is_dummy:
+                    dst_indices_chunk = info.dst_kv_indices[index_slice]
+                    statuses = self.send_kvcache(
+                        peer_info, kv_indices, dst_indices_chunk
+                    )
+                    result_statuses.extend(statuses)
+                    if (
+                        is_last
+                        and state_indices is not None
+                        and info.dst_state_indices
+                        and self.pp_group.is_last_rank
+                    ):
+                        result_statuses.extend(
+                            self.send_state(
+                                peer_info, state_indices, info.dst_state_indices
+                            )
+                        )
+                if (
+                    is_last
+                    and aux_index is not None
+                    and info.dst_aux_index >= 0
+                    and self.pp_group.is_last_rank
+                ):
+                    result_statuses.extend(
+                        self.send_aux(peer_info, aux_index, info.dst_aux_index)
+                    )
+            if is_last:
+                self.update_status(bootstrap_room, KVPoll.Success)
+                target_infos_snapshot = list(transfer_infos.values())
+                self.transfer_infos.pop(bootstrap_room, None)
+        return result_statuses, target_infos_snapshot
+
+
+class MoriKVSender(CommonKVSender):
+    def __init__(
+        self,
+        mgr: MoriKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
+    ):
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        self.transfer_statuses: List["mori_cpp.TransferStatus"] = []
+        self.pending_infos: Optional[List[TransferInfo]] = None
+        self.sent_last_chunk = False
+        self.conclude_state: Optional[KVPoll] = None
+        self.status_notified = False
+        self.init_time = time.time()
+
+    def send(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]] = None,
+    ):
+        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        self.curr_idx += len(kv_indices)
+        is_last = self.curr_idx == self.num_kv_indices
+        state_array = (
+            np.asarray(state_indices, dtype=np.int32)
+            if state_indices is not None
+            else None
+        )
+        statuses, infos = self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            kv_indices,
+            index_slice,
+            is_last,
+            aux_index=self.aux_index if is_last else None,
+            state_indices=state_array,
+        )
+        self.transfer_statuses.extend(statuses)
+        if infos is not None:
+            self.pending_infos = infos
+            self.sent_last_chunk = True
+
+    def poll(self) -> KVPoll:
+        if self.conclude_state is not None:
+            return self.conclude_state
+
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Bootstrapping:
+            if self.init_time is not None:
+                elapsed = time.time() - self.init_time
+                if elapsed >= getattr(self.kv_mgr, "bootstrap_timeout", 300):
+                    reason = (
+                        f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+                        "waiting for decode handshake"
+                    )
+                    self.kv_mgr.record_failure(self.bootstrap_room, reason)
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    self._finalize_failure(reason)
+                    return KVPoll.Failed
+            return status
+
+        if status == KVPoll.Failed:
+            self._finalize_failure()
+            return KVPoll.Failed
+
+        transfers_done = self._all_transfers_finished()
+        if transfers_done:
+            if self._has_transfer_error():
+                reason = self._collect_failure_reason()
+                self.kv_mgr.record_failure(self.bootstrap_room, reason)
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self._finalize_failure(reason)
+                return KVPoll.Failed
+            self._notify_decode(KVPoll.Success)
+            self.conclude_state = KVPoll.Success
+            return KVPoll.Success
+
+        return KVPoll.Transferring if status == KVPoll.Success else status
+
+    def _all_transfers_finished(self) -> bool:
+        if not self.sent_last_chunk:
+            return False
+        if not self.transfer_statuses:
+            return True
+        return all(not status.InProgress() for status in self.transfer_statuses)
+
+    def _has_transfer_error(self) -> bool:
+        return any(status.Failed() for status in self.transfer_statuses)
+
+    def _collect_failure_reason(self) -> str:
+        for status in self.transfer_statuses:
+            if status.Failed():
+                return f"KV transfer failed: {status.Message()}"
+        return "KV transfer failed due to unknown reason"
+
+    def _notify_decode(
+        self, status: KVPoll, failure_reason: Optional[str] = None
+    ) -> None:
+        if self.status_notified:
+            return
+        if self.pending_infos:
+            self.kv_mgr.notify_decode_status(
+                self.pending_infos, self.bootstrap_room, status, failure_reason
+            )
+        self.status_notified = True
+
+    def _finalize_failure(self, failure_reason: Optional[str] = None) -> None:
+        if self.conclude_state == KVPoll.Failed:
+            return
+        if failure_reason is None:
+            failure_reason = self.kv_mgr.failure_records.get(
+                self.bootstrap_room, "KV transfer failed"
+            )
+        self._notify_decode(KVPoll.Failed, failure_reason)
+        self.conclude_state = KVPoll.Failed
+
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+
+    def failure_exception(self):
+        if self.conclude_state is None:
+            self._finalize_failure()
+        self.clear()
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(
+                self.bootstrap_room, "KV transfer failed"
+            )
+        raise RuntimeError(failure_reason)
+
+    def abort(self):
+        reason = "Aborted by AbortReq."
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        self._notify_decode(KVPoll.Failed, reason)
+        self.conclude_state = KVPoll.Failed
+
+
+class MoriKVReceiver(CommonKVReceiver):
+
+    def __init__(
+        self,
+        mgr: MoriKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: Optional[int] = None,
+        prefill_dp_rank: Optional[int] = None,
+    ):
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
+        self.conclude_state: Optional[KVPoll] = None
+        self.init_time: Optional[float] = None
+        if self.bootstrap_room is None or self.bootstrap_infos is None:
+            return
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
+        if hasattr(self.kv_mgr, "room_to_bootstrap_addr"):
+            self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = (
+                self.bootstrap_addr
+            )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        self._register_kv_args()
+
+    def _register_kv_args(self):
+        if self.bootstrap_infos is None:
+            return
+        engine_desc_blob = self.kv_mgr.engine_desc.pack()
+        packed_kv_descs = _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
+        packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
+        packed_state_descs = _pack_mem_desc_list(self.kv_mgr.state_mem_descs)
+        gpu_id = str(self.kv_mgr.kv_args.gpu_id).encode("ascii")
+        decode_tp_size = str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii")
+        decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
+        kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
+
+        for bootstrap_info in self.bootstrap_infos:
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            with lock:
+                sock.send_multipart(
+                    [
+                        MORI_GUARD,
+                        "None".encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        engine_desc_blob,
+                        packed_kv_descs,
+                        packed_aux_descs,
+                        packed_state_descs,
+                        gpu_id,
+                        decode_tp_size,
+                        decode_tp_rank,
+                        kv_item_len,
+                    ]
+                )
+
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List[int]] = None,
+    ):
+        if self.bootstrap_infos is None or self.bootstrap_room is None:
+            return
+
+        kv_indices_bytes = (
+            np.asarray(kv_indices, dtype=np.int32).tobytes() if kv_indices.size else b""
+        )
+        aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
+        state_bytes = (
+            np.asarray(state_indices, dtype=np.int32).tobytes()
+            if state_indices is not None
+            else b""
+        )
+
+        for bootstrap_info in self.bootstrap_infos:
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            is_dummy = bootstrap_info.get("is_dummy", False)
+            with lock:
+                sock.send_multipart(
+                    [
+                        MORI_GUARD,
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.kv_mgr.engine_desc.key.encode("ascii"),
+                        kv_indices_bytes if not is_dummy else b"",
+                        aux_bytes if not is_dummy else b"",
+                        state_bytes if (state_bytes and not is_dummy) else b"",
+                        str(self.required_dst_info_num).encode("ascii"),
+                    ]
+                )
+        self.init_time = time.time()
+
+    def poll(self) -> KVPoll:
+        if self.conclude_state is not None:
+            return self.conclude_state
+
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self.conclude_state = status
+            return status
+
+        if status == KVPoll.WaitingForInput and self.init_time is not None:
+            elapsed = time.time() - self.init_time
+            if elapsed >= getattr(self.kv_mgr, "waiting_timeout", 300):
+                reason = f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s waiting for KV transfer"
+                self.kv_mgr.record_failure(self.bootstrap_room, reason)
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return KVPoll.Failed
+
+        return status
+
+    def clear(self) -> None:
+        if self.bootstrap_room is None:
+            return
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "prefill_response_tracker"):
+            self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "_cleanup_room_tracking"):
+            self.kv_mgr._cleanup_room_tracking(self.bootstrap_room)
+
+    def failure_exception(self):
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+
+        self.clear()
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(
+                self.bootstrap_room, "KV transfer failed"
+            )
+        raise RuntimeError(failure_reason)
+
+    def abort(self):
+        if self.bootstrap_room is None:
+            return
+        reason = "Aborted by AbortReq."
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.conclude_state = KVPoll.Failed
+        self.clear()
+
+
+class MoriKVBootstrapServer(CommonKVBootstrapServer):
+    pass
