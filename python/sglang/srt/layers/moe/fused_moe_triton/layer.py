@@ -36,6 +36,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -56,7 +57,7 @@ from sglang.srt.utils import (
 )
 
 if is_flashinfer_available():
-    from flashinfer import RoutingMethodType, fp4_quantize
+    from flashinfer import fp4_quantize
 
 # Try to import FP4 TRTLLM function if flashinfer is available
 trtllm_fp4_block_scale_moe = None
@@ -145,6 +146,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_clamp_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
+        routing_method_type: Optional[RoutingMethodType] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -248,6 +250,8 @@ class FusedMoE(torch.nn.Module):
             isinstance(self.quant_method, Fp8MoEMethod)
             and get_moe_runner_backend().is_cutlass()
         )
+
+        self.routing_method_type = routing_method_type
 
     def _load_per_tensor_weight_scale(
         self,
