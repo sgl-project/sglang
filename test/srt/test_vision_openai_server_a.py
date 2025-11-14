@@ -137,7 +137,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
 
 
 @unittest.skip(
-    "Temporarily disabling this test to fix CI. It should be re-enabled when #11800 is done."
+    "Disabling this test to speed up CI. Prefer to test it within nightly test."
 )
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"

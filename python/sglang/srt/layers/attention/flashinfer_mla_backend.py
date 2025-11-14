@@ -22,6 +22,9 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
@@ -322,6 +325,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             use_ragged = (
                 not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
+                # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
+                and not is_in_piecewise_cuda_graph()
             )
 
             self.indices_updater_prefill.update(

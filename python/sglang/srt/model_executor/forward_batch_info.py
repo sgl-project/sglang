@@ -81,7 +81,7 @@ class ForwardMode(IntEnum):
 
     # Used in disaggregated decode worker
     # Represent a batch of requests having their KV cache ready to start decoding
-    PREBUILT_EXTEND = auto()
+    PREBUILT = auto()
 
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
@@ -152,8 +152,8 @@ class ForwardMode(IntEnum):
             and not self.is_draft_extend()
         )
 
-    def is_prebuilt_extend(self):
-        return self == ForwardMode.PREBUILT_EXTEND
+    def is_prebuilt(self):
+        return self == ForwardMode.PREBUILT
 
 
 @total_ordering
@@ -200,6 +200,10 @@ class ForwardBatch:
 
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+
+    # The indices of output tokens in the token_to_kv_pool_swa
+    # TODO(shiyang, biao): integrate out_cache_loc_swa into multiple attention backends
+    out_cache_loc_swa: Optional[torch.Tensor] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
