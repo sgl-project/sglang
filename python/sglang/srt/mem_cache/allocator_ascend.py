@@ -1,6 +1,10 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import KVCache
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_num_new_pages
