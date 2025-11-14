@@ -30,6 +30,7 @@ class ResponseAPIBaseTest(CustomTestCase):
     base_url: str = None
     api_key: str = None
     model: str = None
+    client: openai.OpenAI = None
 
     def create_response(
         self,
@@ -91,32 +92,27 @@ class ResponseAPIBaseTest(CustomTestCase):
         if background:
             params["background"] = background
 
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.responses.create(**params)
+        return self.client.responses.create(**params)
 
     def get_response(
         self, response_id: str
     ) -> responses.Response | openai.Stream[responses.ResponseStreamEvent]:
         """Get response by ID via GET /v1/responses/{response_id}."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.responses.retrieve(response_id=response_id)
+        return self.client.responses.retrieve(response_id=response_id)
 
     def delete_response(self, response_id: str) -> None:
         """Delete response by ID via DELETE /v1/responses/{response_id}."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.responses.delete(response_id=response_id)
+        return self.client.responses.delete(response_id=response_id)
 
     def cancel_response(self, response_id: str) -> responses.Response:
         """Cancel response by ID via POST /v1/responses/{response_id}/cancel."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.responses.cancel(response_id=response_id)
+        return self.client.responses.cancel(response_id=response_id)
 
     def get_response_input_items(
         self, response_id: str
     ) -> openai.pagination.SyncCursorPage[responses.ResponseItem]:
         """Get response input items via GET /v1/responses/{response_id}/input_items."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.responses.input_items.list(response_id=response_id)
+        return self.client.responses.input_items.list(response_id=response_id)
 
     def create_conversation(
         self, metadata: Optional[dict] = None
@@ -125,20 +121,17 @@ class ResponseAPIBaseTest(CustomTestCase):
         params = {}
         if metadata:
             params["metadata"] = metadata
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.conversations.create(**params)
+        return self.client.conversations.create(**params)
 
     def get_conversation(self, conversation_id: str) -> conversations.Conversation:
         """Get conversation by ID via GET /v1/conversations/{conversation_id}."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.conversations.retrieve(conversation_id=conversation_id)
+        return self.client.conversations.retrieve(conversation_id=conversation_id)
 
     def update_conversation(
         self, conversation_id: str, metadata: dict
     ) -> conversations.Conversation:
         """Update conversation via POST /v1/conversations/{conversation_id}."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.conversations.update(
+        return self.client.conversations.update(
             conversation_id=conversation_id, metadata=metadata
         )
 
@@ -146,8 +139,7 @@ class ResponseAPIBaseTest(CustomTestCase):
         self, conversation_id: str
     ) -> conversations.ConversationDeletedResource:
         """Delete conversation via DELETE /v1/conversations/{conversation_id}."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.conversations.delete(conversation_id=conversation_id)
+        return self.client.conversations.delete(conversation_id=conversation_id)
 
     def list_conversation_items(
         self,
@@ -162,15 +154,13 @@ class ResponseAPIBaseTest(CustomTestCase):
             params["limit"] = limit
         if after:
             params["after"] = after
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.conversations.items.list(**params)
+        return self.client.conversations.items.list(**params)
 
     def create_conversation_items(
         self, conversation_id: str, items: list
     ) -> conversations.ConversationItemList:
         """Create conversation items via POST /v1/conversations/{conversation_id}/items."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.conversations.items.create(
+        return self.client.conversations.items.create(
             conversation_id=conversation_id, items=items
         )
 
@@ -178,8 +168,7 @@ class ResponseAPIBaseTest(CustomTestCase):
         self, conversation_id: str, item_id: str
     ) -> conversations.ConversationItem:
         """Get conversation item via GET /v1/conversations/{conversation_id}/items/{item_id}."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.conversations.items.retrieve(
+        return self.client.conversations.items.retrieve(
             conversation_id=conversation_id, item_id=item_id
         )
 
@@ -187,8 +176,7 @@ class ResponseAPIBaseTest(CustomTestCase):
         self, conversation_id: str, item_id: str
     ) -> conversations.Conversation:
         """Delete conversation item via DELETE /v1/conversations/{conversation_id}/items/{item_id}."""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url + "/v1")
-        return client.conversations.items.delete(
+        return self.client.conversations.items.delete(
             conversation_id=conversation_id, item_id=item_id
         )
 
@@ -281,9 +269,9 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
 
         # Get response
         get_resp = self.get_response(response_id)
-        self.assertIsNone(create_resp.error)
-        self.assertEqual(create_resp.id, response_id)
-        self.assertEqual(create_resp.status, "completed")
+        self.assertIsNone(get_resp.error)
+        self.assertEqual(get_resp.id, response_id)
+        self.assertEqual(get_resp.status, "completed")
 
         input_resp = self.get_response_input_items(get_resp.id)
         self.assertIsNotNone(input_resp.data)
