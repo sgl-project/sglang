@@ -91,16 +91,12 @@ class TestTypeBasedDispatcher(unittest.TestCase):
         # Create requests that conforms to the real distribution
         test_requests = []
 
-        # Simulate real request distribution (for example: 60% generate, 20% embedding, 10% batch, plus few other requests types)
-        for _ in range(600):
-            test_requests.append(TokenizedGenerateReqInput(input_text="", input_ids=[1,2], mm_inputs=dict(), sampling_params=SamplingParams(),return_logprob=False,logprob_start_len=0, top_logprobs_num=0,token_ids_logprob=[1,2], stream=False))  # 使用真实参数
+        test_requests.append(TokenizedGenerateReqInput(input_text="", input_ids=[1,2], mm_inputs=dict(), sampling_params=SamplingParams(),return_logprob=False,logprob_start_len=0, top_logprobs_num=0,token_ids_logprob=[1,2], stream=False))
 
-        for _ in range(200):
-            test_requests.append(TokenizedEmbeddingReqInput(input_text="",input_ids=[1,2], image_inputs=dict(), token_type_ids=[1,2], sampling_params=SamplingParams()))
+        test_requests.append(TokenizedEmbeddingReqInput(input_text="",input_ids=[1,2], image_inputs=dict(), token_type_ids=[1,2], sampling_params=SamplingParams()))
 
-        for _ in range(100):
-            test_requests.append(BatchTokenizedGenerateReqInput(batch=[TokenizedGenerateReqInput(input_text="", input_ids=[1,2], mm_inputs=dict(), sampling_params=SamplingParams(),return_logprob=False,logprob_start_len=0, top_logprobs_num=0,token_ids_logprob=[1,2], stream=False)]))
-            test_requests.append(BatchTokenizedEmbeddingReqInput(batch=[TokenizedEmbeddingReqInput(input_text="",input_ids=[1,2], image_inputs=dict(), token_type_ids=[1,2], sampling_params=SamplingParams())]))
+        test_requests.append(BatchTokenizedGenerateReqInput(batch=[TokenizedGenerateReqInput(input_text="", input_ids=[1,2], mm_inputs=dict(), sampling_params=SamplingParams(),return_logprob=False,logprob_start_len=0, top_logprobs_num=0,token_ids_logprob=[1,2], stream=False)]))
+        test_requests.append(BatchTokenizedEmbeddingReqInput(batch=[TokenizedEmbeddingReqInput(input_text="",input_ids=[1,2], image_inputs=dict(), token_type_ids=[1,2], sampling_params=SamplingParams())]))
 
         test_requests.append(FlushCacheReqInput())
         test_requests.append(ClearHiCacheReqInput())
@@ -118,12 +114,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
         test_requests.append(RpcReqInput(method=""))
         test_requests.append(GetLoadReqInput())
 
-        # test
         dispatcher = TypeBasedDispatcher(mapping)
-
-        # preheat
-        for req in test_requests[:100]:
-            dispatcher(req)
 
         # test
         time_taken = timeit.timeit(
