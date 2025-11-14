@@ -1,4 +1,3 @@
-import json
 import unittest
 
 from sglang import LiteLLM, set_default_backend

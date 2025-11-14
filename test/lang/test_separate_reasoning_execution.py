@@ -6,11 +6,9 @@ python3 -m unittest test/lang/test_separate_reasoning_execution.py
 """
 
 import threading
-import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang import assistant, gen, separate_reasoning, user
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglGen, SglSeparateReasoning
 from sglang.test.test_utils import CustomTestCase

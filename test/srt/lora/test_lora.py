@@ -18,7 +18,6 @@ import random
 import unittest
 from typing import List
 
-import torch
 from utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
