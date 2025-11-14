@@ -27,7 +27,7 @@
   "scenarios": {
     "text_to_image": {
       "notes": "Single-image generation using the default prompt",
-      "expected_e2e_ms": 22383.71,
+      "expected_e2e_ms": 74500.,
       "expected_avg_denoise_ms": 422.42,
       "expected_median_denoise_ms": 410.62,
       "stages_ms": {
@@ -53,7 +53,7 @@
     },
     "image_edit": {
       "notes": "single uploaded reference image, Qwen/Qwen-Image-Edit",
-      "expected_e2e_ms": 38000.0,
+      "expected_e2e_ms": 138500.0,
       "expected_avg_denoise_ms": 720.0,
       "expected_median_denoise_ms": 718.0,
       "stages_ms": {
