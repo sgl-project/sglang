@@ -12,7 +12,6 @@ python3 -m unittest test_tokenizer_manager.TestTokenizerManagerIntegration
 """
 
 import unittest
-from typing import List, Optional, Union
 from unittest.mock import Mock, patch
 
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
