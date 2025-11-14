@@ -324,9 +324,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             self.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
         )
-        if self.moe_runner_config.routed_scaling_factor is not None:
-            output *= self.moe_runner_config.routed_scaling_factor
         return StandardCombineInput(hidden_states=output)
 
     def apply_deepep_ll(
