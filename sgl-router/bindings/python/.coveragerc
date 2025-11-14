@@ -2,8 +2,12 @@
 source = sglang_router
 omit =
     */sglang_router/mini_lb.py
+    **/sglang_router/mini_lb.py
+    sglang_router/mini_lb.py
 
 [report]
 fail_under = 80
 omit =
     */sglang_router/mini_lb.py
+    **/sglang_router/mini_lb.py
+    sglang_router/mini_lb.py
