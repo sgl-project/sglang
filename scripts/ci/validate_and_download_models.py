@@ -60,6 +60,9 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "2-gpu-runner": [
         "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+        "Qwen/Qwen2-57B-A14B-Instruct",
+        "neuralmagic/Qwen2-72B-Instruct-FP8",
+        "zai-org/GLM-4.5-Air-FP8",
     ],
     "8-gpu-h200": [
         "deepseek-ai/DeepSeek-V3-0324",
@@ -202,22 +205,33 @@ def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str], List[P
     )
 
     if not shard_files:
-        # No sharded files - check for single model file
-        single_files = list(model_path.glob("model.safetensors")) or list(
-            model_path.glob("pytorch_model.bin")
-        )
+        # No sharded files - check for any safetensors or bin files
+        # Exclude non-model files like tokenizer, config, optimizer, etc.
+        all_safetensors = list(model_path.glob("*.safetensors"))
+        all_bins = list(model_path.glob("*.bin"))
+
+        # Filter out non-model files
+        excluded_prefixes = ["tokenizer", "optimizer", "training_", "config"]
+        single_files = [
+            f
+            for f in (all_safetensors or all_bins)
+            if not any(f.name.startswith(prefix) for prefix in excluded_prefixes)
+            and not f.name.endswith(".index.json")
+        ]
+
         if single_files:
-            # Validate the single safetensors file if it exists
-            if single_files[0].suffix == ".safetensors":
-                is_valid, error_msg = validate_safetensors_file(single_files[0])
-                if not is_valid:
-                    return (
-                        False,
-                        f"Corrupted file {single_files[0].name}: {error_msg}",
-                        [single_files[0]],
-                    )
+            # Validate all safetensors files, not just the first one
+            for model_file in single_files:
+                if model_file.suffix == ".safetensors":
+                    is_valid, error_msg = validate_safetensors_file(model_file)
+                    if not is_valid:
+                        return (
+                            False,
+                            f"Corrupted file {model_file.name}: {error_msg}",
+                            [model_file],
+                        )
             return True, None, []
-        return False, "No model files found (safetensors or bin)", []
+        return False, "No model weight files found (safetensors or bin)", []
 
     # Extract total shard count from any shard filename
     total_shards = None
