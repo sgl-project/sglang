@@ -203,6 +203,8 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN=EnvBool(False)
+    SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2=EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -287,6 +289,10 @@ class Envs:
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+
+    # DeepEP
+    SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH = EnvBool(False)
+    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=EnvInt(128)
 
     # fmt: on
 
