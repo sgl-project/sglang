@@ -43,7 +43,19 @@ def kimi_k2_biased_topk_fused_kernel(scores, bias, topk, routed_scaling_factor):
 if IS_CI:
     seq_length_range = [5000]  # Only test one sequence length in CI
 else:
-    seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+    seq_length_range = [
+        512,
+        1024,
+        2048,
+        4096,
+        10000,
+        15000,
+        20000,
+        25000,
+        30000,
+        35000,
+        40000,
+    ]
 
 configs = [(sq,) for sq in seq_length_range]
 
