@@ -2,6 +2,7 @@ import random
 import unittest
 
 import torch
+from typing import List, Optional
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     decode_attention_fwd_grouped as triton_decode_attention_fwd_grouped,
@@ -95,10 +96,6 @@ class TestWaveAttention(unittest.TestCase):
                 (b_seq_len_extend[i], H_Q, D), dtype=dtype, device="cuda"
             ).normal_(mean=0.1, std=0.2)
 
-        o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
-        o_extend_mask = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
-        )
         o_redundant = torch.empty(
             (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
         )
@@ -125,23 +122,6 @@ class TestWaveAttention(unittest.TestCase):
 
         is_causal = True
 
-        o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
-        extend_attention_fwd(
-            q_extend,
-            k_extend,
-            v_extend,
-            o_extend,
-            k_buffer,
-            v_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            custom_mask,
-            is_causal,
-            mask_indptr,
-            max_len_extend,
-        )
-
         o_wave = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
         extend_attention_wave(
             q_extend,
@@ -159,7 +139,6 @@ class TestWaveAttention(unittest.TestCase):
             is_causal=is_causal,
         )
 
-        self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2))
         self.assertTrue(torch.allclose(o_wave, o_redundant, rtol=1e-2))
 
     def test_extend_attention(self):
@@ -170,6 +149,65 @@ class TestWaveAttention(unittest.TestCase):
         # Loop through the values and call the method
         for value in attention_values:
             self._test_extend_attention_once(32, 16384, 6, 1, value)
+
+    def paged_decode_torch_reference(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        query_lens: List[int],
+        request_indices: List[int],
+        block_tables: torch.Tensor,
+        scale: float,
+        causal: Optional[bool] = False,
+        sliding_window: Optional[int] = None,
+        soft_cap: Optional[float] = None,
+    ) -> torch.Tensor:
+        num_seqs = len(query_lens)
+        block_tables = block_tables.cpu().numpy()
+        _, num_kv_heads, head_size_qk = key_cache.shape
+        _, _, head_size_v = value_cache.shape
+
+        outputs: List[torch.Tensor] = []
+        start_idx = 0
+        for i in range(num_seqs):
+            query_len = query_lens[i]
+            kv_start_idx = request_indices[i]
+            kv_len = request_indices[i + 1] - kv_start_idx
+            q = query[start_idx : start_idx + query_len]
+            q *= scale
+
+            block_indices = block_tables[kv_start_idx : kv_start_idx + kv_len]
+
+            k = key_cache[block_indices].view(-1, num_kv_heads, head_size_qk)
+            v = value_cache[block_indices].view(-1, num_kv_heads, head_size_v)
+
+            if q.shape[1] != k.shape[1]:
+                k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
+                v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+            attn = torch.einsum("qhd,khd->hqk", q, k).float()
+            empty_mask = torch.ones(query_len, kv_len)
+            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+            if sliding_window is not None:
+                sliding_window_mask = (
+                    torch.triu(
+                        empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
+                    )
+                    .bool()
+                    .logical_not()
+                )
+                mask |= sliding_window_mask
+            if soft_cap is not None and soft_cap > 0:
+                attn = soft_cap * torch.tanh(attn / soft_cap)
+            if causal:
+                attn.masked_fill_(mask, float("-inf"))
+            attn = torch.softmax(attn, dim=-1).to(v.dtype)
+            out = torch.einsum("hqk,khd->qhd", attn, v)
+
+            outputs.append(out)
+            start_idx += query_len
+
+        return torch.cat(outputs, dim=0)
 
     def _test_grouped_decode_attention_once(self, B, S, H_Q, H_KV, D, D_V):
         dtype = torch.float16
@@ -187,7 +225,6 @@ class TestWaveAttention(unittest.TestCase):
         v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device="cuda")
 
         # o will have the same shape as q
-        o_triton = torch.zeros(B, H_Q, D_V, dtype=dtype, device="cuda")
         o = torch.zeros(B, H_Q, D_V, dtype=dtype, device="cuda")
 
         req_to_token = torch.arange(total_tokens, device="cuda", dtype=torch.int32)
@@ -205,39 +242,36 @@ class TestWaveAttention(unittest.TestCase):
             dtype=torch.float32,
             device="cuda",
         )
-
-        logit_cap = 0.0
-        triton_decode_attention_fwd_grouped(
-            q,
-            k_buffer,
-            v_buffer,
-            o_triton,
-            b_req_idx,
-            req_to_token,
-            attn_logits,
-            attn_lse,
-            num_kv_splits,
-            max_kv_splits,
-            sm_scale,
-            logit_cap,
-        )
-
         attn_logits_shape, attn_logits_max_shape = (
             decode_attention_intermediate_arrays_shapes(B, D_V, H_Q, max_kv_splits)
         )
-
         attn_logits = torch.empty(
             attn_logits_shape,
             dtype=torch.float32,
             device="cuda",
         )
-
         attn_logits_max = torch.empty(
             attn_logits_max_shape,
             dtype=torch.float32,
             device="cuda",
         )
+        logit_cap = 0.0
 
+        # PyTorch reference implementation
+        torch_ref = self.paged_decode_torch_reference(
+            query=q.to(torch.float32),
+            key_cache=k_buffer.to(torch.float32),
+            value_cache=v_buffer.to(torch.float32),
+            query_lens=torch.ones(q.shape[0], dtype=torch.int32),
+            request_indices=b_req_idx,
+            block_tables=req_to_token,
+            scale=sm_scale,
+            causal=False,
+            sliding_window=None,
+            soft_cap=logit_cap,
+        )
+
+        # Wave implementation
         decode_attention_wave(
             q,
             k_buffer,
@@ -254,11 +288,10 @@ class TestWaveAttention(unittest.TestCase):
         )
 
         cos_sim = torch.nn.functional.cosine_similarity(
-            o.flatten(), o_triton.flatten(), dim=0
+            o.flatten(), torch_ref.flatten(), dim=0
         )
-        print(cos_sim.item())
         self.assertTrue(cos_sim.item() > 0.99)
-        self.assertTrue(torch.allclose(o, o_triton, atol=3e-2))
+        self.assertTrue(torch.allclose(o.to(torch.float32), torch_ref, atol=1e-3))
 
     def test_grouped_decode_attention(self):
         seq_lens = [5, 100, 128, 500]

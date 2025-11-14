@@ -65,7 +65,6 @@ def get_wave_kernel(
         canonicalize=True,
         run_bench=False,
         use_buffer_ops=True,
-        waves_per_eu=2,
         dynamic_symbols=dynamic_symbols_0,
         wave_runtime=True,
     )
@@ -77,7 +76,6 @@ def get_wave_kernel(
         canonicalize=True,
         run_bench=False,
         use_buffer_ops=False,
-        waves_per_eu=4,
         dynamic_symbols=dynamic_symbols_1,
         wave_runtime=True,
     )
