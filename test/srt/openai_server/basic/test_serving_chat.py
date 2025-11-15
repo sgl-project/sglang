@@ -621,6 +621,50 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(result.choices[0].message.tool_calls), 1)
         self.assertEqual(result.choices[0].finish_reason, "tool_calls")
 
+    def test_gpt_oss_reasoning_and_tool_call_in_analysis_channel(self):
+        """Ensure a GPT OSS style response with both reasoning and tool_call is handled correctly."""
+
+        self.chat.tool_call_parser = "gpt-oss"
+        self.chat.tokenizer_manager.server_args.reasoning_parser = "gpt-oss"
+
+        # Prepare request with tools
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=False,
+        )
+
+        ret = [
+            {
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "prompt_tokens": 100,
+                    "completion_tokens": 42,
+                    "weight_version": "1.0",
+                },
+                "text": (
+                    "<|channel|>analysis<|message|>Need to use function get_weather.<|end|>"
+                    "<|start|>assistant<|channel|>"
+                    'analysis to=functions.get_weather<|constrain|>json<|message|>{"location": "SF"}<|return|>'
+                ),
+            }
+        ]
+
+        result = self.chat._build_chat_response(req, ret, 0)
+
+        self.assertIsInstance(result, ChatCompletionResponse)
+        self.assertEqual(len(result.choices), 1)
+        self.assertEqual(result.choices[0].message.role, "assistant")
+        self.assertIsNone(result.choices[0].message.content)
+        self.assertEqual(
+            result.choices[0].message.reasoning_content,
+            "Need to use function get_weather.",
+        )
+        self.assertEqual(len(result.choices[0].message.tool_calls), 1)
+        self.assertEqual(result.choices[0].finish_reason, "tool_calls")
+
     def test_gpt_oss_reasoning_no_tool_call(self):
         """Ensure a GPT OSS style response with reasoning and no tool_call is handled correctly."""
 

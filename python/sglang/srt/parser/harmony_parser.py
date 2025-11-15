@@ -134,7 +134,7 @@ class CanonicalStrategy:
             "<|return|>",
         ]
         self.tool_extract_pattern = re.compile(
-            r"commentary to=([a-zA-Z_][a-zA-Z0-9_.]*)\s*(<\|constrain\|>json)?$",
+            r"(analysis|commentary) to=([a-zA-Z_][a-zA-Z0-9_.]*)\s*(<\|constrain\|>json)?$",
             re.DOTALL,
         )
 
@@ -349,7 +349,7 @@ class CanonicalStrategy:
 
         # Create event based on channel and end token
         if channel_type == "analysis":
-            if end_token.type == "CALL":
+            if self.tool_extract_pattern.match(channel_header):
                 # Built-in tools (browser, python) use analysis channel with <|call|>
                 raw_text = text[tokens[start_pos].start : end_token.end]
                 return Event("tool_call", content.strip(), raw_text), end_pos + 1
