@@ -2,7 +2,7 @@ import functools
 from typing import Optional
 
 import torch
-from sgl_kernel import silu_and_mul
+from sgl_kernel.elementwise import silu_and_mul
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -13,6 +13,60 @@ def get_scalar_type(num_bits: int, has_zp: bool):
         return scalar_types.uint4
     else:
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+
+
+def moe_wna16_marlin_gemm(
+    a: torch.Tensor,
+    c_or_none: Optional[torch.Tensor],
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_zeros_or_none: Optional[torch.Tensor],
+    g_idx_or_none: Optional[torch.Tensor],
+    perm_or_none: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    moe_block_size: int,
+    top_k: int,
+    mul_topk_weights: bool,
+    is_ep: bool,
+    b_q_type_id: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    is_k_full: bool,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+    is_zp_float: bool,
+):
+    return torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+        a,
+        c_or_none,
+        b_q_weight,
+        b_scales,
+        b_zeros_or_none,
+        g_idx_or_none,
+        perm_or_none,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=moe_block_size,
+        top_k=top_k,
+        mul_topk_weights=mul_topk_weights,
+        is_ep=is_ep,
+        b_q_type_id=b_q_type_id,
+        size_m=size_m,
+        size_n=size_n,
+        size_k=size_k,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=use_fp32_reduce,
+        is_zp_float=is_zp_float,
+    )
 
 
 def fused_marlin_moe(
@@ -36,6 +90,7 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -80,6 +135,12 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+    assert (
+        hidden_states.dtype == w1_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
+    assert (
+        hidden_states.dtype == w2_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape
@@ -199,9 +260,10 @@ def fused_marlin_moe(
     ).view(-1, topk, K)
 
     output = hidden_states if inplace else torch.empty_like(hidden_states)
-    return torch.sum(
-        intermediate_cache3.view(*intermediate_cache3.shape), dim=1, out=output
-    )
+    torch.sum(intermediate_cache3.view(*intermediate_cache3.shape), dim=1, out=output)
+    if routed_scaling_factor is not None:
+        output *= routed_scaling_factor
+    return output
 
 
 def fused_marlin_moe_fake(
@@ -221,5 +283,7 @@ def fused_marlin_moe_fake(
     w2_zeros: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
+    inplace: bool = False,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)

@@ -16,12 +16,13 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -37,8 +38,15 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import replace_submodule
+from sglang.srt.utils import is_npu, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+if is_npu():
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it to True
+    torch.cuda.is_available = lambda: False
+
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +75,9 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+
+        # Store eviction policy from server args
+        self.eviction_policy = server_args.lora_eviction_policy
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -131,6 +142,16 @@ class LoRAManager:
             lora_ref.lora_id not in self.loras
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
+        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
+            return self.create_lora_update_result(
+                success=False,
+                error_message=(
+                    f"Already have {self.num_pinned_loras} pinned adapters, "
+                    f"max allowed is {self.max_loras_per_batch - 1} (reserving 1 slot for dynamic use). "
+                    f"Please unpin some adapters or increase max_loras_per_batch."
+                ),
+            )
+
         try:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
@@ -155,6 +176,15 @@ class LoRAManager:
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
+
+        # Check if this LoRA adapter is already loaded
+        if any(
+            lora_ref.lora_name == existing_lora_ref.lora_name
+            for existing_lora_ref in self.lora_refs.values()
+        ):
+            raise ValueError(
+                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+            )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
@@ -411,16 +441,13 @@ class LoRAManager:
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
+            eviction_policy=self.eviction_policy,
         )
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
-
-    def should_skip_lora_for_vision_model(self, module_name):
-        # TODO: support different vision models
-        return module_name.find("vision_model.model") != -1
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
@@ -437,10 +464,6 @@ class LoRAManager:
             if getattr(
                 self.base_model, "should_apply_lora", None
             ) and not self.base_model.should_apply_lora(module_name):
-                continue
-
-            # Skip vision model
-            if self.should_skip_lora_for_vision_model(module_name):
                 continue
 
             # The module should be converted if it is included in target_names

@@ -43,10 +43,8 @@
 
 import copy
 import logging
-import math
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -56,10 +54,6 @@ from sglang.srt.configs import KimiVLConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig

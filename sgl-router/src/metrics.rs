@@ -1,7 +1,10 @@
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
+
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -69,6 +72,31 @@ pub fn init_metrics() {
     describe_counter!(
         "sgl_router_processed_requests_total",
         "Total requests processed by each worker"
+    );
+
+    describe_gauge!(
+        "sgl_router_job_queue_depth",
+        "Current number of pending jobs in the queue"
+    );
+    describe_histogram!(
+        "sgl_router_job_duration_seconds",
+        "Job processing duration in seconds by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_success_total",
+        "Total successful job completions by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_failure_total",
+        "Total failed job completions by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_queue_full_total",
+        "Total number of jobs rejected due to queue full"
+    );
+    describe_counter!(
+        "sgl_router_job_shutdown_rejected_total",
+        "Total number of jobs rejected due to shutdown"
     );
 
     describe_counter!(
@@ -452,6 +480,26 @@ impl RouterMetrics {
         gauge!("sgl_router_embeddings_queue_size").set(size as f64);
     }
 
+    pub fn record_classify_request() {
+        counter!("sgl_router_classify_total").increment(1);
+    }
+
+    pub fn record_classify_duration(duration: Duration) {
+        histogram!("sgl_router_classify_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    pub fn record_classify_error(error_type: &str) {
+        counter!(
+            "sgl_router_classify_errors_total",
+            "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn set_classify_queue_size(size: usize) {
+        gauge!("sgl_router_classify_queue_size").set(size as f64);
+    }
+
     pub fn set_running_requests(worker: &str, count: usize) {
         gauge!("sgl_router_running_requests",
             "worker" => worker.to_string()
@@ -481,6 +529,39 @@ impl RouterMetrics {
             "outcome" => outcome.to_string()
         )
         .increment(1);
+    }
+
+    pub fn set_job_queue_depth(depth: usize) {
+        gauge!("sgl_router_job_queue_depth").set(depth as f64);
+    }
+
+    pub fn record_job_duration(job_type: &str, duration: Duration) {
+        histogram!("sgl_router_job_duration_seconds",
+            "job_type" => job_type.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_job_success(job_type: &str) {
+        counter!("sgl_router_job_success_total",
+            "job_type" => job_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_job_failure(job_type: &str) {
+        counter!("sgl_router_job_failure_total",
+            "job_type" => job_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_job_queue_full() {
+        counter!("sgl_router_job_queue_full_total").increment(1);
+    }
+
+    pub fn record_job_shutdown_rejected() {
+        counter!("sgl_router_job_shutdown_rejected_total").increment(1);
     }
 }
 
@@ -595,8 +676,9 @@ impl TokenizerMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::TcpListener;
+
+    use super::*;
 
     #[test]
     fn test_prometheus_config_default() {
@@ -887,9 +969,13 @@ mod tests {
 
     #[test]
     fn test_concurrent_metric_updates() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use std::thread;
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            thread,
+        };
 
         let done = Arc::new(AtomicBool::new(false));
         let mut handles = vec![];

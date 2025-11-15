@@ -4,7 +4,6 @@ import unittest
 
 import requests
 
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -406,7 +405,7 @@ class TestBenchServing(CustomTestCase):
             request_rate=float("inf"),
             random_input_len=1,
             random_output_len=1024,
-            other_server_args=["--pp", "2"],
+            other_server_args=["--pp-size", "2"],
             need_warmup=True,
             seed=42,
         )
@@ -429,8 +428,8 @@ class TestBenchServing(CustomTestCase):
             other_server_args=[
                 "--quantization",
                 "fp8",
-                "--pp",
-                2,
+                "--pp-size",
+                "2",
             ],
             need_warmup=False,
             seed=42,

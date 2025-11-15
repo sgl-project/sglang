@@ -117,35 +117,13 @@ fn test_glm4_format_detection() {
     let parser = Glm4MoeParser::new();
 
     // Should detect GLM-4 format
-    assert!(parser.detect_format("<tool_call>"));
-    assert!(parser.detect_format("text with <tool_call> marker"));
+    assert!(parser.has_tool_markers("<tool_call>"));
+    assert!(parser.has_tool_markers("text with <tool_call> marker"));
 
     // Should not detect other formats
-    assert!(!parser.detect_format("[TOOL_CALLS]"));
-    assert!(!parser.detect_format("<｜tool▁calls▁begin｜>"));
-    assert!(!parser.detect_format("plain text"));
-}
-
-#[tokio::test]
-async fn test_glm4_python_literal_values() {
-    let parser = Glm4MoeParser::new();
-
-    let input = r#"<tool_call>config
-<arg_key>debug</arg_key>
-<arg_value>True</arg_value>
-<arg_key>verbose</arg_key>
-<arg_value>False</arg_value>
-<arg_key>optional</arg_key>
-<arg_value>None</arg_value>
-</tool_call>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-
-    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
-    assert_eq!(args["debug"], true);
-    assert_eq!(args["verbose"], false);
-    assert_eq!(args["optional"], serde_json::Value::Null);
+    assert!(!parser.has_tool_markers("[TOOL_CALLS]"));
+    assert!(!parser.has_tool_markers("<｜tool▁calls▁begin｜>"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]
@@ -172,7 +150,7 @@ async fn test_python_literals() {
 }
 
 #[tokio::test]
-async fn test_nested_values() {
+async fn test_glm4_nested_json_in_arg_values() {
     let parser = Glm4MoeParser::new();
 
     let input = r#"<tool_call>process

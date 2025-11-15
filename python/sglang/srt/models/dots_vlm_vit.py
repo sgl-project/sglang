@@ -310,6 +310,7 @@ class DotsVisionTransformer(PreTrainedModel):
     def forward(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, bf16=True
     ) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.device)
         if bf16:
             hidden_states = hidden_states.bfloat16()
         hidden_states = self.patch_embed(hidden_states, grid_thw)
@@ -323,7 +324,7 @@ class DotsVisionTransformer(PreTrainedModel):
             dim=0,
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         for blk in self.blocks:
             hidden_states = blk(

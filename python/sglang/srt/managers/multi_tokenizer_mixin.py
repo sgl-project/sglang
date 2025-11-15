@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Mixin class and utils for multi-http-worker mode"""
+
+"""
+Mixin classes and utils for multi-http-worker mode
+This file uses multiple processes to handle requests and tokenization, reducing the overhead of python and http server.
+"""
+
 import asyncio
 import logging
 import multiprocessing as multiprocessing
@@ -21,7 +28,7 @@ import sys
 import threading
 from functools import partialmethod
 from multiprocessing import shared_memory
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Union
 
 import setproctitle
 import zmq
@@ -30,18 +37,21 @@ import zmq.asyncio
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
+    BaseBatchReq,
+    BaseReq,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
-    MultiTokenizerRegisterReq,
-    MultiTokenizerWrapper,
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,29 +66,49 @@ class SocketMapping:
             socket.close()
         self._mapping.clear()
 
-    def register_ipc_mapping(
-        self, recv_obj: MultiTokenizerRegisterReq, worker_id: str, is_tokenizer: bool
-    ):
+    def _register_ipc_mapping(self, ipc_name: str, is_tokenizer: bool):
         type_str = "tokenizer" if is_tokenizer else "detokenizer"
-        if worker_id in self._mapping:
-            logger.warning(
-                f"{type_str} already registered with worker {worker_id}, skipping..."
-            )
+        if ipc_name in self._mapping:
+            logger.warning(f"{type_str} already registered {ipc_name=}, skipping...")
             return
-        logger.info(
-            f"{type_str} not registered with worker {worker_id}, registering..."
-        )
-        socket = get_zmq_socket(self._zmq_context, zmq.PUSH, recv_obj.ipc_name, False)
-        self._mapping[worker_id] = socket
-        self._mapping[worker_id].send_pyobj(recv_obj)
+        logger.info(f"Registering {type_str} {ipc_name=} in SocketMapping...")
+        socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
+        self._mapping[ipc_name] = socket
 
-    def send_output(self, worker_id: str, output: Any):
-        if worker_id not in self._mapping:
-            logger.error(
-                f"worker ID {worker_id} not registered. Check if the server Process is alive"
-            )
+    def send_output(self, ipc_name: str, output: Any):
+        if ipc_name is None:
+            # Some unhandled cases
+            logger.warning(f"IPC name is None, output type={type(output)}, skipping...")
             return
-        self._mapping[worker_id].send_pyobj(output)
+
+        if ipc_name not in self._mapping:
+            self._register_ipc_mapping(ipc_name, is_tokenizer=False)
+        self._mapping[ipc_name].send_pyobj(output)
+
+
+def _extract_field_by_index(
+    output: Any, field_name: str, index: int, check_length: bool = True
+) -> Any:
+    """Extract a field value from output by index, handling None and length checks.
+
+    Args:
+        output: The output object containing the field
+        field_name: The name of the field to extract
+        index: The index to access in the field list
+        check_length: If True, check both field existence and length. If False, only check field existence.
+
+    Returns:
+        A list containing the field value at index, or None if not available.
+    """
+    field = getattr(output, field_name, None)
+    if field is None:
+        return None
+
+    if check_length:
+        if len(field) <= index:
+            return None
+
+    return [field[index]]
 
 
 def _handle_output_by_index(output, i):
@@ -86,254 +116,169 @@ def _handle_output_by_index(output, i):
     if isinstance(output, BatchTokenIDOutput):
         new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
-            finished_reasons=(
-                [output.finished_reasons[i]]
-                if len(output.finished_reasons) > i
-                else None
+            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
+            spec_accepted_tokens=_extract_field_by_index(
+                output, "spec_accepted_tokens", i
             ),
-            decoded_texts=(
-                [output.decoded_texts[i]] if len(output.decoded_texts) > i else None
+            queue_time=_extract_field_by_index(output, "queue_time", i),
+            forward_entry_time=_extract_field_by_index(output, "forward_entry_time", i),
+            prefill_launch_delay=_extract_field_by_index(
+                output, "prefill_launch_delay", i
             ),
-            decode_ids=([output.decode_ids[i]] if len(output.decode_ids) > i else None),
-            read_offsets=(
-                [output.read_offsets[i]] if len(output.read_offsets) > i else None
+            prefill_launch_latency=_extract_field_by_index(
+                output, "prefill_launch_latency", i
             ),
-            output_ids=(
-                [output.output_ids[i]]
-                if output.output_ids and len(output.output_ids) > i
-                else None
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
+            decode_ids=_extract_field_by_index(output, "decode_ids", i),
+            read_offsets=_extract_field_by_index(output, "read_offsets", i),
+            output_ids=_extract_field_by_index(output, "output_ids", i),
+            skip_special_tokens=_extract_field_by_index(
+                output, "skip_special_tokens", i
             ),
-            skip_special_tokens=(
-                [output.skip_special_tokens[i]]
-                if len(output.skip_special_tokens) > i
-                else None
+            spaces_between_special_tokens=_extract_field_by_index(
+                output, "spaces_between_special_tokens", i
             ),
-            spaces_between_special_tokens=(
-                [output.spaces_between_special_tokens[i]]
-                if len(output.spaces_between_special_tokens) > i
-                else None
+            no_stop_trim=_extract_field_by_index(output, "no_stop_trim", i),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            input_token_logprobs_val=_extract_field_by_index(
+                output, "input_token_logprobs_val", i, check_length=False
             ),
-            no_stop_trim=(
-                [output.no_stop_trim[i]] if len(output.no_stop_trim) > i else None
+            input_token_logprobs_idx=_extract_field_by_index(
+                output, "input_token_logprobs_idx", i, check_length=False
             ),
-            prompt_tokens=(
-                [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
+            output_token_logprobs_val=_extract_field_by_index(
+                output, "output_token_logprobs_val", i, check_length=False
             ),
-            completion_tokens=(
-                [output.completion_tokens[i]]
-                if len(output.completion_tokens) > i
-                else None
+            output_token_logprobs_idx=_extract_field_by_index(
+                output, "output_token_logprobs_idx", i, check_length=False
             ),
-            cached_tokens=(
-                [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+            input_top_logprobs_val=_extract_field_by_index(
+                output, "input_top_logprobs_val", i, check_length=False
             ),
-            spec_verify_ct=(
-                [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
+            input_top_logprobs_idx=_extract_field_by_index(
+                output, "input_top_logprobs_idx", i, check_length=False
             ),
-            input_token_logprobs_val=(
-                [output.input_token_logprobs_val[i]]
-                if output.input_token_logprobs_val
-                else None
+            output_top_logprobs_val=_extract_field_by_index(
+                output, "output_top_logprobs_val", i, check_length=False
             ),
-            input_token_logprobs_idx=(
-                [output.input_token_logprobs_idx[i]]
-                if output.input_token_logprobs_idx
-                else None
+            output_top_logprobs_idx=_extract_field_by_index(
+                output, "output_top_logprobs_idx", i, check_length=False
             ),
-            output_token_logprobs_val=(
-                [output.output_token_logprobs_val[i]]
-                if output.output_token_logprobs_val
-                else None
+            input_token_ids_logprobs_val=_extract_field_by_index(
+                output, "input_token_ids_logprobs_val", i, check_length=False
             ),
-            output_token_logprobs_idx=(
-                [output.output_token_logprobs_idx[i]]
-                if output.output_token_logprobs_idx
-                else None
+            input_token_ids_logprobs_idx=_extract_field_by_index(
+                output, "input_token_ids_logprobs_idx", i, check_length=False
             ),
-            input_top_logprobs_val=(
-                [output.input_top_logprobs_val[i]]
-                if output.input_top_logprobs_val
-                else None
+            output_token_ids_logprobs_val=_extract_field_by_index(
+                output, "output_token_ids_logprobs_val", i, check_length=False
             ),
-            input_top_logprobs_idx=(
-                [output.input_top_logprobs_idx[i]]
-                if output.input_top_logprobs_idx
-                else None
+            output_token_ids_logprobs_idx=_extract_field_by_index(
+                output, "output_token_ids_logprobs_idx", i, check_length=False
             ),
-            output_top_logprobs_val=(
-                [output.output_top_logprobs_val[i]]
-                if output.output_top_logprobs_val
-                else None
+            output_token_entropy_val=_extract_field_by_index(
+                output, "output_token_entropy_val", i, check_length=False
             ),
-            output_top_logprobs_idx=(
-                [output.output_top_logprobs_idx[i]]
-                if output.output_top_logprobs_idx
-                else None
-            ),
-            input_token_ids_logprobs_val=(
-                [output.input_token_ids_logprobs_val[i]]
-                if output.input_token_ids_logprobs_val
-                else None
-            ),
-            input_token_ids_logprobs_idx=(
-                [output.input_token_ids_logprobs_idx[i]]
-                if output.input_token_ids_logprobs_idx
-                else None
-            ),
-            output_token_ids_logprobs_val=(
-                [output.output_token_ids_logprobs_val[i]]
-                if output.output_token_ids_logprobs_val
-                else None
-            ),
-            output_token_ids_logprobs_idx=(
-                [output.output_token_ids_logprobs_idx[i]]
-                if output.output_token_ids_logprobs_idx
-                else None
-            ),
-            output_hidden_states=(
-                [output.output_hidden_states[i]]
-                if output.output_hidden_states
-                else None
+            output_hidden_states=_extract_field_by_index(
+                output, "output_hidden_states", i, check_length=False
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            token_steps=_extract_field_by_index(
+                output, "token_steps", i, check_length=False
+            ),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
             rids=[output.rids[i]],
-            finished_reasons=(
-                [output.finished_reasons[i]]
-                if len(output.finished_reasons) > i
-                else None
-            ),
-            embeddings=([output.embeddings[i]] if len(output.embeddings) > i else None),
-            prompt_tokens=(
-                [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
-            ),
-            cached_tokens=(
-                [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-            ),
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            embeddings=_extract_field_by_index(output, "embeddings", i),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
-            finished_reasons=(
-                [output.finished_reasons[i]]
-                if len(output.finished_reasons) > i
-                else None
+            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
+            spec_accepted_tokens=_extract_field_by_index(
+                output, "spec_accepted_tokens", i
             ),
-            output_strs=(
-                [output.output_strs[i]] if len(output.output_strs) > i else None
+            queue_time=_extract_field_by_index(output, "queue_time", i),
+            forward_entry_time=_extract_field_by_index(output, "forward_entry_time", i),
+            prefill_launch_delay=_extract_field_by_index(
+                output, "prefill_launch_delay", i
             ),
-            output_ids=(
-                [output.output_ids[i]]
-                if output.output_ids and len(output.output_ids) > i
-                else None
+            prefill_launch_latency=_extract_field_by_index(
+                output, "prefill_launch_latency", i
             ),
-            prompt_tokens=(
-                [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            output_strs=_extract_field_by_index(output, "output_strs", i),
+            output_ids=_extract_field_by_index(output, "output_ids", i),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            input_token_logprobs_val=_extract_field_by_index(
+                output, "input_token_logprobs_val", i, check_length=False
             ),
-            completion_tokens=(
-                [output.completion_tokens[i]]
-                if len(output.completion_tokens) > i
-                else None
+            input_token_logprobs_idx=_extract_field_by_index(
+                output, "input_token_logprobs_idx", i, check_length=False
             ),
-            cached_tokens=(
-                [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+            output_token_logprobs_val=_extract_field_by_index(
+                output, "output_token_logprobs_val", i, check_length=False
             ),
-            spec_verify_ct=(
-                [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
+            output_token_logprobs_idx=_extract_field_by_index(
+                output, "output_token_logprobs_idx", i, check_length=False
             ),
-            input_token_logprobs_val=(
-                [output.input_token_logprobs_val[i]]
-                if output.input_token_logprobs_val
-                else None
+            input_top_logprobs_val=_extract_field_by_index(
+                output, "input_top_logprobs_val", i, check_length=False
             ),
-            input_token_logprobs_idx=(
-                [output.input_token_logprobs_idx[i]]
-                if output.input_token_logprobs_idx
-                else None
+            input_top_logprobs_idx=_extract_field_by_index(
+                output, "input_top_logprobs_idx", i, check_length=False
             ),
-            output_token_logprobs_val=(
-                [output.output_token_logprobs_val[i]]
-                if output.output_token_logprobs_val
-                else None
+            output_top_logprobs_val=_extract_field_by_index(
+                output, "output_top_logprobs_val", i, check_length=False
             ),
-            output_token_logprobs_idx=(
-                [output.output_token_logprobs_idx[i]]
-                if output.output_token_logprobs_idx
-                else None
+            output_top_logprobs_idx=_extract_field_by_index(
+                output, "output_top_logprobs_idx", i, check_length=False
             ),
-            input_top_logprobs_val=(
-                [output.input_top_logprobs_val[i]]
-                if output.input_top_logprobs_val
-                else None
+            input_token_ids_logprobs_val=_extract_field_by_index(
+                output, "input_token_ids_logprobs_val", i, check_length=False
             ),
-            input_top_logprobs_idx=(
-                [output.input_top_logprobs_idx[i]]
-                if output.input_top_logprobs_idx
-                else None
+            input_token_ids_logprobs_idx=_extract_field_by_index(
+                output, "input_token_ids_logprobs_idx", i, check_length=False
             ),
-            output_top_logprobs_val=(
-                [output.output_top_logprobs_val[i]]
-                if output.output_top_logprobs_val
-                else None
+            output_token_ids_logprobs_val=_extract_field_by_index(
+                output, "output_token_ids_logprobs_val", i, check_length=False
             ),
-            output_top_logprobs_idx=(
-                [output.output_top_logprobs_idx[i]]
-                if output.output_top_logprobs_idx
-                else None
+            output_token_ids_logprobs_idx=_extract_field_by_index(
+                output, "output_token_ids_logprobs_idx", i, check_length=False
             ),
-            input_token_ids_logprobs_val=(
-                [output.input_token_ids_logprobs_val[i]]
-                if output.input_token_ids_logprobs_val
-                else None
+            output_token_entropy_val=_extract_field_by_index(
+                output, "output_token_entropy_val", i, check_length=False
             ),
-            input_token_ids_logprobs_idx=(
-                [output.input_token_ids_logprobs_idx[i]]
-                if output.input_token_ids_logprobs_idx
-                else None
-            ),
-            output_token_ids_logprobs_val=(
-                [output.output_token_ids_logprobs_val[i]]
-                if output.output_token_ids_logprobs_val
-                else None
-            ),
-            output_token_ids_logprobs_idx=(
-                [output.output_token_ids_logprobs_idx[i]]
-                if output.output_token_ids_logprobs_idx
-                else None
-            ),
-            output_hidden_states=(
-                [output.output_hidden_states[i]]
-                if output.output_hidden_states
-                else None
+            output_hidden_states=_extract_field_by_index(
+                output, "output_hidden_states", i, check_length=False
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            token_steps=_extract_field_by_index(
+                output, "token_steps", i, check_length=False
+            ),
         )
     elif isinstance(output, BatchMultimodalOutput):
         new_output = BatchMultimodalOutput(
             rids=[output.rids[i]],
-            finished_reasons=(
-                [output.finished_reasons[i]]
-                if len(output.finished_reasons) > i
-                else None
-            ),
-            outputs=([output.outputs[i]] if len(output.outputs) > i else None),
-            prompt_tokens=(
-                [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
-            ),
-            completion_tokens=(
-                [output.completion_tokens[i]]
-                if len(output.completion_tokens) > i
-                else None
-            ),
-            cached_tokens=(
-                [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-            ),
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            outputs=_extract_field_by_index(output, "outputs", i),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
@@ -345,20 +290,11 @@ def _handle_output_by_index(output, i):
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
 
-    def get_worker_ids_from_req_rids(self, rids):
-        if isinstance(rids, list):
-            worker_ids = [int(rid.split("_")[0]) for rid in rids]
-        elif isinstance(rids, str):
-            worker_ids = [int(rids.split("_")[0])]
-        else:
-            worker_ids = []
-        return worker_ids
-
-    def maybe_clear_socket_mapping(self):
+    def maybe_clear_socket_mapping(self: DetokenizerManager):
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
 
-    def multi_http_worker_event_loop(self):
+    def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
@@ -366,23 +302,15 @@ class MultiHttpWorkerDetokenizerMixin:
             output = self._request_dispatcher(recv_obj)
             if output is None:
                 continue
-            # Extract worker_id from rid
-            if isinstance(recv_obj.rids, list):
-                worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
-            else:
-                raise RuntimeError(
-                    f"for tokenizer_worker_num > 1, recv_obj.rids must be a list"
-                )
+
+            assert isinstance(
+                recv_obj, BaseBatchReq
+            ), "for multi-http-worker, recv_obj must be BaseBatchReq"
 
             # Send data using the corresponding socket
-            for i, worker_id in enumerate(worker_ids):
-                if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                    self.socket_mapping.register_ipc_mapping(
-                        recv_obj, worker_id, is_tokenizer=False
-                    )
-                else:
-                    new_output = _handle_output_by_index(output, i)
-                    self.socket_mapping.send_output(worker_id, new_output)
+            for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                new_output = _handle_output_by_index(output, i)
+                self.socket_mapping.send_output(ipc_name, new_output)
 
 
 class MultiTokenizerRouter:
@@ -432,26 +360,17 @@ class MultiTokenizerRouter:
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
-        """Distribute result to corresponding workers based on rid"""
-        if isinstance(recv_obj, MultiTokenizerWrapper):
-            worker_ids = [recv_obj.worker_id]
-            recv_obj = recv_obj.obj
-        else:
-            worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
-
-        if len(worker_ids) == 0:
-            logger.error(f"Cannot find worker_id from rids {recv_obj.rids}")
-            return
-
         # Distribute result to each worker
-        for i, worker_id in enumerate(worker_ids):
-            if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                self.socket_mapping.register_ipc_mapping(
-                    recv_obj, worker_id, is_tokenizer=True
-                )
-            else:
-                new_recv_obj = _handle_output_by_index(recv_obj, i)
-                self.socket_mapping.send_output(worker_id, new_recv_obj)
+        if isinstance(recv_obj, BaseReq):
+            ipc_names = [recv_obj.http_worker_ipc]
+        elif isinstance(recv_obj, BaseBatchReq):
+            ipc_names = recv_obj.http_worker_ipcs
+        else:
+            raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")
+
+        for i, ipc_name in enumerate(ipc_names):
+            new_recv_obj = _handle_output_by_index(recv_obj, i)
+            self.socket_mapping.send_output(ipc_name, new_recv_obj)
 
 
 class TokenizerWorker(TokenizerManager):
@@ -483,21 +402,15 @@ class TokenizerWorker(TokenizerManager):
         self.register_multi_tokenizer_communicator = _Communicator(
             self.send_to_scheduler, 2
         )
-        self._result_dispatcher._mapping.append(
-            (
-                MultiTokenizerRegisterReq,
-                self.register_multi_tokenizer_communicator.handle_recv,
-            )
-        )
 
-    async def register_to_main_tokenizer_manager(self):
-        """Register this worker to the main TokenizerManager"""
-        # create a handle loop to receive messages from the main TokenizerManager
-        self.auto_create_handle_loop()
-        req = MultiTokenizerRegisterReq(rids=[f"{self.worker_id}_register"])
-        req.ipc_name = self.tokenizer_ipc_name
-        _Communicator.enable_multi_tokenizer = True
-        await self.register_multi_tokenizer_communicator(req)
+    def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
+
+        if isinstance(req, BaseReq):
+            req.http_worker_ipc = self.tokenizer_ipc_name
+        elif isinstance(req, BaseBatchReq):
+            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
+        else:
+            raise ValueError(f"Unknown req type: {type(req)}")
 
 
 async def print_exception_wrapper(func):
@@ -581,3 +494,14 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
         logger.warning(
             "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
         )
+
+
+class SenderWrapper:
+    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
+        self.port_args = port_args
+        self.send_to_scheduler = send_to_scheduler
+
+    def send_pyobj(self, obj):
+        if isinstance(obj, BaseReq):
+            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+        self.send_to_scheduler.send_pyobj(obj)

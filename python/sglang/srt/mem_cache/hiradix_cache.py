@@ -84,12 +84,14 @@ class HiRadixCache(RadixCache):
             prefetch_threshold,
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
+            hicache_storage_pass_prefix_keys,
         ) = self._parse_storage_backend_extra_config(storage_backend_extra_config)
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = (
             page_size / 1024 * prefetch_timeout_per_ki_token
         )
+        self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
@@ -115,7 +117,7 @@ class HiRadixCache(RadixCache):
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,
             }
-            self.metrics_collector = StorageMetricsCollector(labels=labels)
+            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -137,6 +139,7 @@ class HiRadixCache(RadixCache):
             disable=False,
             eviction_policy=eviction_policy,
             is_eagle=is_eagle,
+            enable_metrics=enable_metrics,
         )
 
     def _parse_storage_backend_extra_config(
@@ -149,7 +152,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config: JSON string containing extra configuration
 
         Returns:
-            tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token)
+            tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token, hicache_storage_pass_prefix_keys)
         """
         # Parse extra config JSON if provided
         extra_config = {}
@@ -165,6 +168,9 @@ class HiRadixCache(RadixCache):
         prefetch_timeout_per_ki_token = extra_config.pop(
             "prefetch_timeout_per_ki_token", 0.25
         )  # seconds per 1024 tokens
+        hicache_storage_pass_prefix_keys = extra_config.pop(
+            "hicache_storage_pass_prefix_keys", False
+        )
 
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
@@ -184,6 +190,7 @@ class HiRadixCache(RadixCache):
             prefetch_threshold,
             float(prefetch_timeout_base),
             float(prefetch_timeout_per_ki_token),
+            hicache_storage_pass_prefix_keys,
         )
 
     def reset(self):
@@ -245,8 +252,14 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
+        prefix_keys = (
+            node.get_prefix_hash_values(node.parent)
+            if self.hicache_storage_pass_prefix_keys
+            else None
+        )
+
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value
+            node.host_value, node.key, node.hash_value, prefix_keys
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -322,6 +335,7 @@ class HiRadixCache(RadixCache):
         return self.evictable_size_
 
     def evict(self, num_tokens: int):
+        start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -361,6 +375,8 @@ class HiRadixCache(RadixCache):
             for node in write_back_nodes:
                 assert node.backuped
                 self._evict_backuped(node)
+
+        self.update_eviction_metrics(num_evicted, start_time)
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -413,6 +429,7 @@ class HiRadixCache(RadixCache):
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
 
+        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -457,6 +474,12 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_load_back_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+
         return device_indices
 
     def init_load_back(
@@ -495,7 +518,7 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
-            self.metrics_collector.log_storage_metrics(
+            self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
 
@@ -539,7 +562,9 @@ class HiRadixCache(RadixCache):
             if entry is not None:
                 entry.release_host()
             if self.enable_storage_metrics:
-                self.metrics_collector.log_backuped_tokens(operation.completed_tokens)
+                self.storage_metrics_collector.log_backuped_tokens(
+                    operation.completed_tokens
+                )
 
         # release host memory
         host_indices_list = []
@@ -652,7 +677,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
         if self.enable_storage_metrics:
-            self.metrics_collector.log_prefetched_tokens(
+            self.storage_metrics_collector.log_prefetched_tokens(
                 min_completed_tokens - matched_length
             )
 
@@ -700,6 +725,7 @@ class HiRadixCache(RadixCache):
         last_host_node: TreeNode,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
     ):
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
@@ -723,7 +749,7 @@ class HiRadixCache(RadixCache):
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash
+            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,

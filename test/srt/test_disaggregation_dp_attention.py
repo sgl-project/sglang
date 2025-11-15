@@ -1,37 +1,28 @@
-import os
-import time
 import unittest
 from types import SimpleNamespace
-from urllib.parse import urlparse
 
+from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     popen_launch_pd_server,
+    try_cached_model,
 )
 
 
 class TestDisaggregationDPAttention(TestDisaggregationBase):
+    PREFILL_DP_SIZE = 4
+    DECODE_DP_SIZE = 4
+
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -50,13 +41,12 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            str(cls.PREFILL_DP_SIZE),
             "--dp",
-            "2",
+            str(cls.PREFILL_DP_SIZE),
             "--enable-dp-attention",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -71,15 +61,15 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            str(cls.DECODE_DP_SIZE),
             "--dp",
-            "2",
+            str(cls.DECODE_DP_SIZE),
             "--enable-dp-attention",
             "--base-gpu-id",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            str(cls.PREFILL_DP_SIZE),
+            "--prefill-round-robin-balance",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -91,7 +81,7 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1400,
             max_new_tokens=512,
             parallel=128,
             host=f"http://{self.base_host}",

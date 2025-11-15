@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -32,6 +33,10 @@ class TestDeepseekV3FP4(CustomTestCase):
             "flashinfer_trtllm",
             "--quantization",
             "modelopt_fp4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -81,6 +86,7 @@ class TestDeepseekV3FP4(CustomTestCase):
 class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -100,6 +106,10 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -111,6 +121,8 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
+            del os.environ["SGLANG_ENABLE_SPEC_V2"]
 
     def test_a_gsm8k(
         self,
@@ -176,6 +188,8 @@ class TestDeepseekV3FP4CutlassMoE(CustomTestCase):
             "flashinfer_cutlass",
             "--quantization",
             "modelopt_fp4",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
         ]
         cls.process = popen_launch_server(
             cls.model,

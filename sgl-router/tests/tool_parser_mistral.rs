@@ -96,10 +96,10 @@ async fn test_mistral_with_brackets_in_strings() {
 async fn test_mistral_format_detection() {
     let parser = MistralParser::new();
 
-    assert!(parser.detect_format("[TOOL_CALLS] ["));
-    assert!(parser.detect_format("Some text [TOOL_CALLS] ["));
-    assert!(!parser.detect_format("Just plain text"));
-    assert!(!parser.detect_format("[{\"name\": \"test\"}]")); // JSON array without TOOL_CALLS
+    assert!(parser.has_tool_markers("[TOOL_CALLS] ["));
+    assert!(parser.has_tool_markers("Some text [TOOL_CALLS] ["));
+    assert!(!parser.has_tool_markers("Just plain text"));
+    assert!(!parser.has_tool_markers("[{\"name\": \"test\"}]")); // JSON array without TOOL_CALLS
 }
 
 #[tokio::test]
@@ -154,4 +154,121 @@ Let me execute these searches for you."#;
     assert_eq!(normal_text, "I'll search for information about Rust programming and check the weather in San Francisco.\n\n");
     assert_eq!(tools[0].function.name, "web_search");
     assert_eq!(tools[1].function.name, "get_weather");
+}
+
+#[tokio::test]
+async fn test_mistral_streaming_closing_bracket() {
+    use sglang_router_rs::protocols::common::Tool;
+
+    // Test that closing ] is stripped for Mistral array format
+    let mut parser = MistralParser::new();
+
+    let tools = vec![Tool {
+        tool_type: "function".to_string(),
+        function: sglang_router_rs::protocols::common::Function {
+            name: "get_weather".to_string(),
+            description: Some("Get weather".to_string()),
+            parameters: json!({}),
+            strict: None,
+        },
+    }];
+
+    let chunks = vec![
+        "[TOOL_CALLS] ",
+        "[{",
+        "\"",
+        "name",
+        "\":",
+        "\"",
+        "get",
+        "_weather",
+        "\",",
+        "\"",
+        "arguments",
+        "\":",
+        "{",
+        "\"",
+        "city",
+        "\":",
+        "\"",
+        "Paris",
+        "\"",
+        "}",
+        "}",
+        "]",
+        " Here's",
+        " the weather",
+        " info",
+    ];
+
+    let mut all_normal_text = String::new();
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        all_normal_text.push_str(&result.normal_text);
+    }
+
+    // Should emit only the third chunk as normal text, NOT the ]
+    assert_eq!(
+        all_normal_text, " Here's the weather info",
+        "Should not emit ] for Mistral array format, got: '{}'",
+        all_normal_text
+    );
+}
+
+#[tokio::test]
+async fn test_mistral_streaming_bracket_in_text_after_tools() {
+    use sglang_router_rs::protocols::common::Tool;
+
+    // Test that ] in normal text AFTER tool calls is preserved
+    let mut parser = MistralParser::new();
+
+    let tools = vec![Tool {
+        tool_type: "function".to_string(),
+        function: sglang_router_rs::protocols::common::Function {
+            name: "get_weather".to_string(),
+            description: Some("Get weather".to_string()),
+            parameters: json!({}),
+            strict: None,
+        },
+    }];
+
+    let chunks = vec![
+        "[TOOL_CALLS] ",
+        "[",
+        "{",
+        "\"name",
+        "\":",
+        "\"get_weather",
+        "\",",
+        "\"arguments",
+        "\":",
+        "{\"",
+        "city",
+        "\":",
+        "\"Paris",
+        "\"}",
+        "}",
+        "]",
+        " Array",
+        " notation:",
+        " arr",
+        "[",
+        "0",
+        "]",
+    ];
+
+    let mut all_normal_text = String::new();
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        all_normal_text.push_str(&result.normal_text);
+    }
+
+    // Should preserve ] in normal text after tools complete
+    assert_eq!(
+        all_normal_text, " Array notation: arr[0]",
+        "Should preserve ] in normal text after tools, got: '{}'",
+        all_normal_text
+    );
 }

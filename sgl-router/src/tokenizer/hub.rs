@@ -1,6 +1,9 @@
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
+
 use hf_hub::api::tokio::ApiBuilder;
-use std::env;
-use std::path::{Path, PathBuf};
 
 const IGNORED: [&str; 5] = [
     ".gitattributes",

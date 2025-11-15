@@ -28,27 +28,20 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
     CompressedTensorsMoEMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
+    CompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-
-try:
-    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
-        WNA16_SUPPORTED_BITS,
-        CompressedTensorsWNA16,
-    )
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +69,6 @@ class DeviceCapability(NamedTuple):
 
 
 class CompressedTensorsConfig(QuantizationConfig):
-
     def __init__(
         self,
         target_scheme_map: Dict[str, Any],
@@ -86,7 +78,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_ignore_list: List[str],
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
-        packed_modules_mapping: Dict[str, List[str]] = {},
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        linear_fp8_config: Optional[Any] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -97,7 +90,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_scheme_map = sparsity_scheme_map
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping or {}
+        # FP8 config for linear layers, compressed tensor currently does not support block fp8, this is used for ktransformers
+        self.linear_fp8_config = linear_fp8_config
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
@@ -127,8 +122,15 @@ class CompressedTensorsConfig(QuantizationConfig):
         if should_ignore_layer(
             prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
-            return UnquantizedLinearMethod()
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            return None
+
         if isinstance(layer, LinearBase):
+            # If linear_fp8_config is set, use FP8 for linear layers
+            # This allows mixed quantization: experts with int4, linear layers with fp8
+            if self.linear_fp8_config is not None:
+                return Fp8LinearMethod(self.linear_fp8_config)
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
@@ -137,7 +139,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return CompressedTensorsMoEMethod.get_moe_method(self)
+            return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
     @classmethod
@@ -150,6 +152,23 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         packed_modules_mapping = config.get("packed_modules_mapping", {})
 
+        # Parse linear_fp8_config if present (for mixed quantization scenarios)
+        # Format: {"activation_scheme": "dynamic", "fmt": "e4m3",
+        #          "quant_method": "fp8", "weight_block_size": [128, 128]}
+        linear_fp8_config = None
+        if "linear_fp8_config" in config:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            fp8_cfg = config["linear_fp8_config"]
+            # Check if it's fp8 format based on quant_method field
+            is_fp8 = fp8_cfg.get("quant_method") == "fp8"
+            linear_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=is_fp8,
+                activation_scheme=fp8_cfg.get("activation_scheme", "dynamic"),
+                ignored_layers=fp8_cfg.get("ignored_layers"),
+                weight_block_size=fp8_cfg.get("weight_block_size"),
+            )
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -158,6 +177,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_ignore_list=sparsity_ignore_list,
             config=config,
             packed_modules_mapping=packed_modules_mapping,
+            linear_fp8_config=linear_fp8_config,
         )
 
     @classmethod
@@ -364,19 +384,6 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
-            if not VLLM_AVAILABLE:
-                raise ImportError(
-                    "vllm is not installed, to use CompressedTensorsW4A16Sparse24 and CompressedTensorsWNA16, please install vllm"
-                )
-            if (
-                self.quant_format == CompressionFormat.marlin_24.value
-                and weight_quant.num_bits in W4A16SPARSE24_SUPPORTED_BITS
-            ):
-                return CompressedTensorsW4A16Sparse24(
-                    strategy=weight_quant.strategy,
-                    num_bits=weight_quant.num_bits,
-                    group_size=weight_quant.group_size,
-                )
             if (
                 self.quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
@@ -386,6 +393,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
                     actorder=weight_quant.actorder,
+                )
+            else:
+                raise ImportError(
+                    "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
                 )
 
         if is_activation_quantization_format(self.quant_format):
@@ -410,10 +421,6 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             # note: input_quant can be None
             if self._is_fp8_w8a16(weight_quant, input_quant):
-                if not VLLM_AVAILABLE:
-                    raise ImportError(
-                        "vllm is not installed, to use CompressedTensorsW8A16Fp8, please install vllm"
-                    )
                 is_static_input_scheme = input_quant and not input_quant.dynamic
                 return CompressedTensorsW8A16Fp8(
                     strategy=weight_quant.strategy,
@@ -454,7 +461,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Find the "target" in the compressed-tensors config
         # that our layer conforms to.
-        # TODO (@robertgshaw): add compressed-tensors as dep
+        # TODO : add compressed-tensors as dep
         # so we do not have to re-write these functions
         # need to make accelerate optional in ct to do this
 
@@ -492,24 +499,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             input_quant=input_quant,
             sparsity_scheme=sparsity_scheme,
         ):
-            if not VLLM_AVAILABLE:
-                raise ImportError(
-                    "vllm is not installed, to use CompressedTensors24, please install vllm"
-                )
-            # Have a valid sparsity scheme
-            # Validate layer is supported by Cutlass 2:4 Kernel
-            model_compression_config = (
-                None
-                if sparsity_scheme is None or sparsity_scheme.format == "dense"
-                else self.config
-            )
-
-            scheme = CompressedTensors24(
-                quantized=weight_quant is not None or input_quant is not None,
-                weight_quant=weight_quant,
-                input_quant=input_quant,
-                model_compression_config=model_compression_config,
-            )
+            raise ImportError("CompressedTensors24 is not supported now")
         elif weight_quant is None:
             logger.warning_once(
                 "Acceleration for non-quantized schemes is "
