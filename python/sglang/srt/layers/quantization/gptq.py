@@ -35,7 +35,10 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_sort_g_idx,
     marlin_zero_points,
     verify_marlin_supported,
+    unpack_quantized_values_into_int32,
+    pack_quantized_values_into_int32,
 )
+from sgl_kernel.gemm import machete_mm
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
@@ -55,7 +58,7 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle
+    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle, permute_cols
 
 
 logger = logging.getLogger(__name__)
@@ -685,32 +688,27 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         layer.register_parameter("qzeros", qzeros)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        device = getattr(layer, "qweight").device
         c = self.kernel_config
 
-        check_marlin_supports_shape(
-            c.partition_weight_shape[1],  # out_features
-            c.partition_weight_shape[0],  # in_features
-            c.full_weight_shape[0],  # in_features
-            c.group_size,
-        )
-
-        row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
-        self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
-
-        # Allocate marlin workspace.
-        self.workspace = marlin_make_workspace(device)
-
-        # Default names since marlin requires empty parameters for these,
-        # TODO: remove this requirement from marlin (allow optional tensors)
         self.w_q_name = "qweight"
         self.w_s_name = "scales"
         self.w_zp_name = "qzeros"
         self.w_gidx_name = "g_idx"
 
-        def _transform_param(
-            layer: torch.nn.Module, name: Optional[str], fn: Callable
-        ) -> None:
+        if c.has_g_idx:
+            assert self.w_gidx_name is not None
+            perm = torch.argsort(getattr(layer, self.w_gidx_name))\
+                .to(torch.int)
+
+            self.act_perm = lambda x: x[:, perm]
+            # use `ops.permute_cols` if possible
+            if c.act_type in [torch.float16, torch.bfloat16] \
+                and c.partition_weight_shape[0] % 8 == 0:
+                self.act_perm = lambda x: permute_cols(x, perm=perm)
+
+
+        def _transform_param(layer: torch.nn.Module, name: Optional[str],
+                         fn: Callable) -> None:
             if name is not None and getattr(layer, name, None) is not None:
 
                 old_param = getattr(layer, name)
@@ -718,65 +716,48 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 # replace the parameter with torch.nn.Parameter for TorchDynamo
                 # compatibility
                 replace_parameter(
-                    layer, name, torch.nn.Parameter(new_param.data, requires_grad=False)
-                )
+                    layer, name,
+                    torch.nn.Parameter(new_param.data, requires_grad=False))
 
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x.data = gptq_marlin_repack(
-                x.data.contiguous(),
-                perm=layer.g_idx_sort_indices,
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                num_bits=c.weight_type.size_bits,
-            )
+            if c.has_g_idx:
+                x_unpacked = unpack_quantized_values_into_int32(x.data,
+                                                                c.weight_type,
+                                                                packed_dim=0)
+                x_perm = x_unpacked[perm, :]
+                x.data = pack_quantized_values_into_int32(x_perm,
+                                                          c.weight_type,
+                                                          packed_dim=0)
+            x.data = torch.ops.sgl_kernel.machete_prepack_B(x.data.t().contiguous().t(),
+                                           a_type=c.act_type,
+                                           b_type=c.weight_type.id,
+                                           group_scales_type=c.act_type)
             return x
 
         def transform_w_s(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
-            x.data = marlin_permute_scales(
-                x.data.contiguous(),
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                group_size=c.group_size,
-            )
+            x.data = x.data.contiguous()
             return x
 
-        if c.has_g_idx:
-            g_idx, g_idx_sort_indices = marlin_sort_g_idx(
-                getattr(layer, self.w_gidx_name)
-            )
-            _transform_param(layer, self.w_gidx_name, lambda _: g_idx)
-            layer.g_idx_sort_indices = g_idx_sort_indices
-        else:
-            setattr(layer, self.w_gidx_name, marlin_make_empty_g_idx(device))
-            layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
+        def transform_w_zp(x):
+            assert isinstance(x, BasevLLMParameter)
+            permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=1)
+            x_unpacked = unpack_quantized_values_into_int32(x.data,
+                                                            c.weight_type,
+                                                            packed_dim=1)
+            w_s = getattr(layer, self.w_s_name).data
+            # pre-apply scales to zero-points
+            x.data = (-1.0 * w_s * (x_unpacked.to(w_s.dtype))).contiguous()
+            return x
 
-        if c.zero_points:
-            grouped_k = (
-                c.partition_weight_shape[0] // c.group_size if c.group_size != -1 else 1
-            )
-            _transform_param(
-                layer,
-                self.w_zp_name,
-                lambda x: marlin_zero_points(
-                    unpack_cols(
-                        x.t(),
-                        c.weight_type.size_bits,
-                        grouped_k,
-                        c.partition_weight_shape[1],
-                    ),
-                    size_k=grouped_k,
-                    size_n=c.partition_weight_shape[1],
-                    num_bits=c.weight_type.size_bits,
-                ),
-            )
-        else:
-            setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
+        # Repack weights and scales for Machete
         _transform_param(layer, self.w_q_name, transform_w_q)
         _transform_param(layer, self.w_s_name, transform_w_s)
+        if c.zero_points:
+            _transform_param(layer, self.w_zp_name, transform_w_zp)
 
     def apply(
         self,
@@ -801,24 +782,29 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 getattr(layer, self.w_gidx_name or "", None),
             )
 
-        w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
+        w_q, w_s, w_zp, _ = _get_weight_params(layer)
+        x_2d = x.reshape(-1, x.shape[-1])
+        out_shape = x.shape[:-1] + (c.partition_weight_shape[1], )
 
-        # `process_weights_after_loading` will ensure w_zp and w_gidx are not
-        #  None for marlin
-        return apply_gptq_marlin_linear(
-            input=x,
-            weight=w_q,
-            weight_scale=w_s,
-            weight_zp=w_zp,  # type: ignore
-            g_idx=w_gidx,  # type: ignore
-            g_idx_sort_indices=layer.g_idx_sort_indices,
-            workspace=self.workspace,
-            wtype=c.weight_type,
-            input_size_per_partition=c.partition_weight_shape[0],
-            output_size_per_partition=c.partition_weight_shape[1],
-            is_k_full=self.is_k_full,
-            bias=bias,
-        )
+        if c.has_g_idx:
+            x_2d = self.act_perm(x_2d)
+
+        if c.zero_points:
+            assert w_zp is not None
+        else:
+            w_zp = None
+
+        output = machete_mm(a=x_2d,
+                                b_q=w_q,
+                                b_type=c.weight_type,
+                                b_group_zeros=w_zp,
+                                b_group_scales=w_s,
+                                b_group_size=c.group_size)
+
+        if bias is not None:
+            output.add_(bias)  # In-place add
+
+        return output.reshape(out_shape)
 
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
