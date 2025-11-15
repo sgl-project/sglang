@@ -35,13 +35,18 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
-from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
+from sglang.srt.utils import (
+    find_local_repo_dir,
+    is_cpu,
+    log_info_on_rank0,
+    print_warning_once,
+)
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -855,10 +860,23 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         tp_rank = get_attention_tp_rank()
+        tp_size = get_attention_tp_size()
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+        if is_cpu() and loaded_weight.size(0) % tp_size != 0:
+            param.data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param.data,
+                loaded_weight,
+                0,  # param_data_start
+                start_idx,
+                shard_axis,
+                shard_size,
+            )
+            if loaded_weight.size(0) == 32:
+                print(loaded_weight)
+        else:
+            loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
 
         return default_weight_loader(param, loaded_weight)
 
