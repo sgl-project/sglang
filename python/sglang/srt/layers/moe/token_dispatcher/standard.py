@@ -103,6 +103,7 @@ class StandardDispatcher(BaseDispatcher):
 
             global_scale = self.quant_config.get("input_global_scale", None)
             assert global_scale is not None, "input_global_scale is not set"
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             # Quantize before comm, swizzle after.
             with use_symmetric_memory(
@@ -181,7 +182,9 @@ class StandardDispatcher(BaseDispatcher):
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
             get_tp_group().reduce_scatterv(
-                global_hidden_states, output=hidden_states, sizes=get_dp_global_num_tokens()
+                global_hidden_states,
+                output=hidden_states,
+                sizes=get_dp_global_num_tokens(),
             )
         return hidden_states
 

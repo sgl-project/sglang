@@ -822,7 +822,9 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         if hidden_states.shape[0] > 0:
-            if not self._fuse_shared_experts_inside_sbo:  # TODO: check if it supports mtp
+            if (
+                not self._fuse_shared_experts_inside_sbo
+            ):  # TODO: check if it supports mtp
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
@@ -839,24 +841,27 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-                
+
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self._forward_shared_experts(hidden_states)
 
                 pre_combine_hook_handle.remove()
-            
+
             def _post_combine_hook(
                 dispatcher: BaseDispatcher, hidden_states: torch.Tensor
             ):
                 nonlocal shared_output
                 torch.cuda.current_stream().wait_stream(self.alt_stream)
                 post_combine_hook_handle.remove()
-            
-            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(_pre_combine_hook)
-            post_combine_hook_handle = self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
 
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
 
         final_hidden_states = self.experts(
             hidden_states,
@@ -968,7 +973,7 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-                
+
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -980,13 +985,13 @@ class DeepseekV2MoE(nn.Module):
                     down_gemm_overlap_args=down_gemm_overlap_args,
                     meta_overlap_args=meta_overlap_args,
                 )
-                
+
                 post_dispatch_hook_handle.remove()
 
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-                
+
                 nonlocal shared_output
 
                 if (
@@ -1001,17 +1006,23 @@ class DeepseekV2MoE(nn.Module):
                     shared_output = self._forward_shared_experts(hidden_states)
 
                 pre_combine_hook_handle.remove()
-            
+
             def _post_combine_hook(
                 dispatcher: BaseDispatcher, hidden_states: torch.Tensor
             ):
                 dispatcher.clear_overlap_args()
                 self.experts.clear_overlap_args()
                 post_combine_hook_handle.remove()
-            
-            post_dispatch_hook_handle = self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
-            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(_pre_combine_hook)
-            post_combine_hook_handle = self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,

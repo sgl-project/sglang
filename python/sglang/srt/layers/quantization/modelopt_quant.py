@@ -12,17 +12,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_dp_global_num_tokens,
-    get_local_dp_buffer,
-    is_allocation_symmetric,
-)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
     get_moe_runner_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -69,7 +64,6 @@ try:
     else:
         from sgl_kernel import scaled_fp4_quant as fp4_quantize
 
-    from flashinfer import fp4_quantize as fp4_quantize_flashinfer
 except ImportError:
     fp4_quantize = None
 

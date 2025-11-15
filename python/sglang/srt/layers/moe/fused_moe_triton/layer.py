@@ -1004,7 +1004,7 @@ class FusedMoE(torch.nn.Module):
     ):
         self.down_gemm_overlap_args = down_gemm_overlap_args
         self.meta_overlap_args = meta_overlap_args
-    
+
     def clear_overlap_args(self) -> None:
         self.down_gemm_overlap_args = None
         self.meta_overlap_args = None

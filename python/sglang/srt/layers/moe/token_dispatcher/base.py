@@ -268,7 +268,9 @@ class BaseDispatcher(ABC):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
         if self._pre_dispatch_hooks is not None:
-            hidden_states, topk_output = self._pre_dispatch_hooks(self, hidden_states, topk_output)
+            hidden_states, topk_output = self._pre_dispatch_hooks(
+                self, hidden_states, topk_output
+            )
         dispatch_output = self._original_dispatch_func(hidden_states, topk_output)
         if self._post_dispatch_hooks is not None:
             dispatch_output = self._post_dispatch_hooks(self, dispatch_output)
@@ -290,7 +292,7 @@ class BaseDispatcher(ABC):
         if self._post_combine_hooks is not None:
             hidden_states = self._post_combine_hooks(self, hidden_states)
         return hidden_states
-    
+
     def _override_combine_func(self) -> None:
         if self._original_combine_func is None:
             self._original_combine_func = self.combine
@@ -308,7 +310,6 @@ class BaseDispatcher(ABC):
             self._override_dispatch_func()
         handle = self._pre_dispatch_hooks.register_hook(hook)
         return handle
-
 
     def register_post_dispatch_hook(
         self, hook: Callable[[BaseDispatcher, DispatchOutput], Optional[DispatchOutput]]
@@ -342,7 +343,7 @@ class BaseDispatcher(ABC):
     ) -> None:
         self.overlap_args = combine_overlap_args
         self.meta_overlap_args = meta_overlap_args
-    
+
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
