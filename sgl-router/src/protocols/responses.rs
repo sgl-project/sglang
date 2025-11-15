@@ -12,6 +12,7 @@ use super::common::{
     default_model, default_true, ChatLogProbs, Function, GenerationRequest, PromptTokenUsageInfo,
     StringOrArray, ToolChoice, UsageInfo,
 };
+use crate::protocols::builders::ResponsesResponseBuilder;
 
 // ============================================================================
 // Response Tools (MCP and others)
@@ -273,7 +274,7 @@ pub enum Truncation {
     Disabled,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
     Queued,
@@ -291,15 +292,36 @@ pub struct ReasoningInfo {
     pub summary: Option<String>,
 }
 
+// ============================================================================
+// Text Format (structured outputs)
+// ============================================================================
+
+/// Text configuration for structured output requests
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResponseTextFormat {
-    pub format: TextFormatType,
+pub struct TextConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<TextFormat>,
 }
 
+/// Text format: text (default), json_object (legacy), or json_schema (recommended)
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TextFormatType {
-    #[serde(rename = "type")]
-    pub format_type: String,
+#[serde(tag = "type")]
+pub enum TextFormat {
+    #[serde(rename = "text")]
+    Text,
+
+    #[serde(rename = "json_object")]
+    JsonObject,
+
+    #[serde(rename = "json_schema")]
+    JsonSchema {
+        name: String,
+        schema: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -539,6 +561,10 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Truncation>,
 
+    /// Text format for structured outputs (text, json_object, json_schema)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextConfig>,
+
     /// User identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -607,6 +633,7 @@ impl Default for ResponsesRequest {
             top_logprobs: None,
             top_p: None,
             truncation: None,
+            text: None,
             user: None,
             request_id: None,
             priority: 0,
@@ -906,7 +933,7 @@ pub struct ResponsesResponse {
 
     /// Text format settings
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextFormat>,
+    pub text: Option<TextConfig>,
 
     /// Tool choice setting
     #[serde(default = "default_tool_choice")]
@@ -950,6 +977,11 @@ fn default_tool_choice() -> String {
 }
 
 impl ResponsesResponse {
+    /// Create a builder for constructing a ResponsesResponse
+    pub fn builder(id: impl Into<String>, model: impl Into<String>) -> ResponsesResponseBuilder {
+        ResponsesResponseBuilder::new(id, model)
+    }
+
     /// Check if the response is complete
     pub fn is_complete(&self) -> bool {
         matches!(self.status, ResponseStatus::Completed)

@@ -1,5 +1,6 @@
 import io
 import os
+import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -36,6 +37,10 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        if not hasattr(cls, "model") or not cls.model:
+            raise unittest.SkipTest(
+                f"Skip mixin/base class without `model`: {cls.__name__}"
+            )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -215,7 +220,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
         # `driver` is for gemma-3-it
         assert (
-            "man" in text or "person" or "driver" in text
+            "man" in text or "person" in text or "driver" in text
         ), f"text: {text}, should contain man, person or driver"
         assert (
             "cab" in text

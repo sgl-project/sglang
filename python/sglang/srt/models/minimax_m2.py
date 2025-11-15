@@ -706,6 +706,9 @@ class MiniMaxM2Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -716,7 +719,7 @@ class MiniMaxM2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+    ) -> Union[torch.Tensor, PPProxyTensors, Tuple[torch.Tensor, list[torch.Tensor]]]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.get_input_embeddings(input_ids)
@@ -728,6 +731,7 @@ class MiniMaxM2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
@@ -741,6 +745,8 @@ class MiniMaxM2Model(nn.Module):
         else:
             for i in range(self.start_layer, self.end_layer):
                 with get_global_expert_distribution_recorder().with_current_layer(i):
+                    if i in self.layers_to_capture:
+                        aux_hidden_states.append(hidden_states + residual)
                     layer = self.layers[i]
                     hidden_states, residual = layer(
                         positions=positions,
@@ -759,7 +765,9 @@ class MiniMaxM2Model(nn.Module):
         else:
             hidden_states = self.norm(hidden_states)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class MiniMaxM2ForCausalLM(nn.Module):
@@ -792,8 +800,26 @@ class MiniMaxM2ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
+        # For EAGLE3
+        self.capture_aux_hidden_states = False
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not get_pp_group().is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @torch.no_grad()
     def forward(
@@ -805,8 +831,13 @@ class MiniMaxM2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         # _print_tensor_info(input_ids, "input_ids")
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

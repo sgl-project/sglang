@@ -12,11 +12,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-)
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import (
     get_bool_env_var,
     is_npu,
@@ -38,7 +34,7 @@ SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
-    # input_text with all multimodality placeholder token expanded
+    # input_text, with each frame of video/image represented with a image_token
     input_text: str
 
     # frames loaded from image, in given order
@@ -333,16 +329,11 @@ class BaseMultimodalProcessor(ABC):
         """
         Load a single multimodal data.
 
-        If data is processor_output or precomputed embedding, return directly.
+        If data is precomputed, returns directly.
 
         Static method that can be pickled for multiprocessing"""
         if isinstance(data, dict):
-            data_format = data.get("format")
-            if (
-                data_format == "processor_output"
-                or data_format == "precomputed_embedding"
-            ):
-                return data
+            return data
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data)
@@ -384,10 +375,9 @@ class BaseMultimodalProcessor(ABC):
                 try:
                     data = next(data_iterator)
                 except StopIteration:
-                    logger.warning(
-                        f"Mismatch: More '{modality}' tokens found than corresponding data provided."
+                    raise ValueError(
+                        f"Mismatch: More '{text_part}' tokens found than corresponding data items provided."
                     )
-                    return futures, task_info
 
                 frame_count_limit = None
                 if modality == Modality.IMAGE and image_estimated_frames_iter:
@@ -429,51 +419,6 @@ class BaseMultimodalProcessor(ABC):
 
         return futures, task_info
 
-    @staticmethod
-    def _validate_one_modality(modality: Modality, data_list: Optional[list]):
-        if data_list is None:
-            return
-        if not isinstance(data_list, list):
-            raise TypeError(f"{modality} must be a list or None, got {type(data_list)}")
-
-        formatted_indices = []
-        for idx, item in enumerate(data_list):
-            if isinstance(item, dict):
-                fmt = item.get("format")
-                if fmt in {"processor_output", "precomputed_embedding"}:
-                    formatted_indices.append(idx)
-
-        if formatted_indices:
-            if len(data_list) != 1:
-                raise ValueError(
-                    f"For {modality}, when providing a 'processor_output' or "
-                    f"'precomputed_embedding', you must pass exactly one item; "
-                    f"received {len(data_list)} items (formatted at indices {formatted_indices})."
-                )
-
-    @staticmethod
-    def validate_mm_data(
-        self,
-        image_data: Optional[list] = None,
-        video_data: Optional[list] = None,
-        audio_data: Optional[list] = None,
-    ):
-        """
-        Validate multimodal input lists per modality.
-
-        Rule per modality (image/video/audio):
-        - Either the list has exactly one item and that single item is a dict with
-          format in {"processor_output", "precomputed_embedding"};
-        - Or, the list contains only "normal" items (i.e., does not include any
-          item whose format is one of the two above).
-
-        Empty or None lists are considered valid.
-        """
-
-        BaseMultimodalProcessor._validate_one_modality(Modality.IMAGE, image_data)
-        BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
-        BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
-
     def load_mm_data(
         self,
         prompt: str,
@@ -494,10 +439,8 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
-
-        BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
-
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
+
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt = self._processor.tokenizer.decode(prompt)
@@ -507,6 +450,7 @@ class BaseMultimodalProcessor(ABC):
         assert isinstance(prompt, str)
         # split text into list of normal text and special tokens
         text_parts = re.split(multimodal_tokens_pattern, prompt)
+
         # collect all data
         data_iterators = {}
         if multimodal_tokens.image_token and image_data:
@@ -531,20 +475,16 @@ class BaseMultimodalProcessor(ABC):
         # Process results
         images, videos, audios = [], [], []
         new_text_parts = []
-        has_precomputed_input = False
         for text_part in text_parts:
             try:
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
-                    is_precomputed = isinstance(raw_data, dict) and (
-                        raw_data.get("format") == "processor_output"
-                        or raw_data.get("format") == "precomputed_embedding"
-                    )
-                    has_precomputed_input |= is_precomputed
+                    is_precomputed = isinstance(raw_data, dict)
                     result = next(futures_iter).result()
+
                     if modality == Modality.IMAGE:
-                        # If data is already processed or embedded, it will be a
-                        # dictionary(processed, or precomputed). In this case we want to keep the
+                        # If data is already processed it will be a
+                        # dictionary(precomputed). In this case we want to keep the
                         # expanded tokens in text_part. Otherwise, we will
                         # call the processor code, so keep only a single image
                         # token.
@@ -580,14 +520,6 @@ class BaseMultimodalProcessor(ABC):
                     # normal text
                     new_text_parts += [text_part]
 
-            except StopIteration as e:
-                # when precomputed_input is presented with multi-images, StopIteration is expected
-                if has_precomputed_input:
-                    new_text_parts += [text_part]
-                    continue
-                raise RuntimeError(
-                    f"An exception occurred while loading multimodal data: {e}"
-                )
             except Exception as e:
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
@@ -613,6 +545,7 @@ class BaseMultimodalProcessor(ABC):
         mask = input_ids == mm_token_id
         start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
         end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
+
         return list(zip(start_positions.tolist(), end_positions.tolist()))
 
     @staticmethod
@@ -625,21 +558,16 @@ class BaseMultimodalProcessor(ABC):
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
     def collect_mm_items_from_processor_output(
-        self, data_dict: dict, modality: Modality = None
+        self, data_dict: dict
     ) -> List[MultimodalDataItem]:
-        """
-        Create mm_items directly from processor output, with one item for each modality
-
-        Note that the data_dict can be passed via offline engine api
-        """
-
+        """Create mm_items directly from processor output."""
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
                 continue
 
             # Get modality for this attribute
-            modality = modality or self.ATTR_NAME_TO_MODALITY.get(attr_name)
+            modality = self.ATTR_NAME_TO_MODALITY.get(attr_name)
 
             if attr_name == "precomputed_embeddings":
                 modality_str = data_dict.get("modality")
@@ -694,9 +622,9 @@ class BaseMultimodalProcessor(ABC):
             Tuple of (list of mm_items, input_ids)
         """
         # Collect all items and categorize them
-        all_loaded_data = base_output.organize_results()
+        all_items = base_output.organize_results()
         # Handle text-only case
-        if not all_loaded_data:
+        if not all_items:
             input_ids = self._processor.tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
@@ -705,9 +633,9 @@ class BaseMultimodalProcessor(ABC):
             return [], input_ids, {}
 
         dict_items, raw_images, raw_audios, raw_videos = [], [], [], []
-        for modality, item in all_loaded_data:
+        for modality, item in all_items:
             if isinstance(item, dict):
-                dict_items.append((modality, item))
+                dict_items.append(item)
             elif modality == Modality.IMAGE:
                 raw_images.append(item)
             elif modality == Modality.AUDIO:
@@ -733,25 +661,12 @@ class BaseMultimodalProcessor(ABC):
         else:
             ret = None
 
-        # Handle dict items (processed or precomputed)
-        for modality, dict_item in dict_items:
-            input_format = dict_item.get("format", None)
-            if input_format == "processor_output":
-                items = self.collect_mm_items_from_processor_output(dict_item)
-                for item in items:
-                    item.format = MultimodalInputFormat.PROCESSOR_OUTPUT
-                all_collected_items.extend(items)
-            elif input_format == "precomputed_embedding":
-                feature = dict_item["feature"]
-                del dict_item["feature"]
-                all_collected_items.append(
-                    MultimodalDataItem(
-                        modality=modality,
-                        feature=feature,
-                        format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
-                        model_specific_data=dict_item,
-                    )
-                )
+        # Handle dict items (already processed)
+        for dict_item in dict_items:
+            all_collected_items.extend(
+                self.collect_mm_items_from_processor_output(dict_item)
+            )
+
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
             input_ids = self._processor.tokenizer(

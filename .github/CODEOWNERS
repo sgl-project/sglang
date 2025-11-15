@@ -3,6 +3,7 @@
 /docker/npu.Dockerfile @ping1jing2
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/* @merrymercy @Ying1123 @Fridge003 @ispobock @hnyls2002
+/python/sglang/multimodal_gen @mickqian
 /python/sglang/srt/constrained @hnyls2002
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002
 /python/sglang/srt/disaggregation/mooncake @ShangmingCai

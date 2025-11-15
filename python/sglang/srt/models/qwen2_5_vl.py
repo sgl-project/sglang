@@ -23,7 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from functools import lru_cache, partial
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
 import torch
@@ -61,7 +61,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import permute_inv
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +116,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         rms_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
         self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
 
@@ -458,9 +455,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return x
 
 
-cached_get_processor = lru_cache(get_processor)
-
-
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -526,15 +520,46 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        """
+        支持三种输入：
+        1) 预计算：item.precomputed_embeddings 为 [Ti, D]
+        2) 像素：   item.feature 为像素/patch输入（老路径）
+        3) 混合：   同时存在时优先走预计算
+        返回：
+        [sum(Ti), D]
+        """
 
-        assert pixel_values.dim() == 2, pixel_values.dim()
+        # -------- 优先使用预计算特征 ----------
+        if all(getattr(it, "precomputed_embeddings", None) is not None for it in items):
+            feats = []
+            for it in items:
+                f = it.precomputed_embeddings
+                assert isinstance(
+                    f, torch.Tensor
+                ), "precomputed_embeddings must be Tensor"
+                assert f.dim() == 2, f"precomputed_embeddings dim={f.dim()} expected 2"
+                feats.append(f.to(self.visual.dtype))
+            return torch.cat(feats, dim=0)
+
+        # -------- 回退到像素路径（兼容旧用法） ----------
+        pixel_values = []
+        image_grid_thw = []
+        for it in items:
+            if it.feature is None:
+                raise AssertionError(
+                    "[pixel path] got None feature; if you meant precomputed embeddings, "
+                    "please put them in `precomputed_embeddings`"
+                )
+            pixel_values.append(it.feature)
+            image_grid_thw.append(it.image_grid_thw)
+        pixel_values = torch.cat(pixel_values, dim=0).type(self.visual.dtype)
+        image_grid_thw = torch.concat(image_grid_thw, dim=0)
+        assert pixel_values.dim() == 2 or pixel_values.dim() == 5, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        # 统一为 [sum(Ti), D]
+        if image_embeds.dim() > 2:
+            image_embeds = image_embeds.view(image_embeds.shape[0], -1)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

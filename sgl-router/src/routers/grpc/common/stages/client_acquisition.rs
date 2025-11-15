@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 
 use super::PipelineStage;
 use crate::routers::grpc::{
@@ -15,11 +16,13 @@ pub struct ClientAcquisitionStage;
 #[async_trait]
 impl PipelineStage for ClientAcquisitionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let workers = ctx
-            .state
-            .workers
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Worker selection not completed"))?;
+        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
+            error!(
+                function = "ClientAcquisitionStage::execute",
+                "Worker selection stage not completed"
+            );
+            error::internal_error("Worker selection not completed")
+        })?;
 
         let clients = match workers {
             WorkerSelection::Single { worker } => {
