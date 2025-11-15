@@ -1,0 +1,5 @@
+# Python dependencies needed when enabling the `python-mm` Cargo feature.
+pillow
+transformers
+torch
+numpy

@@ -1,65 +1,37 @@
-"""Python shim that mirrors vLLM's HuggingFace processor invocation.
-
-The shim keeps Python-specific logic encapsulated and returns JSON that maps
-onto the Rust `MultiModalInputs` structure.
-"""
+"""Python shim that mirrors vLLM's HuggingFace processor invocation."""
 
 from __future__ import annotations
 
 import base64
-import importlib.metadata
-import importlib.util
 import json
 import os
-import sys
 from functools import lru_cache
-from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import torch
-
-
-def _ensure_pillow_stub() -> None:
-    """Ensure that the Pillow dependency (or our lightweight stub) is importable."""
-
-    if importlib.util.find_spec("PIL") is not None:
-        return
-
-    stub_dir = Path(__file__).resolve().with_name("pillow_stub")
-    if not stub_dir.exists():  # pragma: no cover - defensive guard
-        raise RuntimeError(
-            "Neither Pillow nor the bundled stub is available; install Pillow or "
-            f"provide {stub_dir}.")
-
-    if str(stub_dir) not in sys.path:
-        sys.path.insert(0, str(stub_dir))
-
-
-_ensure_pillow_stub()
-
-try:  # pragma: no cover - exercised in integration tests
-    import PIL  # noqa: F401  # pylint: disable=unused-import
-except Exception as exc:  # pragma: no cover
-    raise RuntimeError(f"Pillow stub failed to import: {exc}") from exc
-
-try:  # pragma: no cover - exercised in integration tests
-    importlib.metadata.version("Pillow")
-except importlib.metadata.PackageNotFoundError as exc:  # pragma: no cover
-    raise RuntimeError("Pillow stub metadata not found") from exc
-
-try:  # pragma: no cover - runtime dependency
-    from transformers import AutoProcessor
-except Exception as exc:  # pragma: no cover - runtime dependency
-    AutoProcessor = None
-    IMPORT_ERROR = exc
-else:
-    IMPORT_ERROR = None
+from PIL import Image
+from transformers import AutoProcessor
 
 
 def _ensure_imports() -> None:
-    if AutoProcessor is None:  # pragma: no cover - defensive guard
-        raise RuntimeError(f"transformers not available in Python environment: {IMPORT_ERROR}")
+    missing: list[str] = []
+    try:
+        import transformers  # noqa: F401  # pylint: disable=import-outside-toplevel
+    except Exception:  # pragma: no cover - defensive guard
+        missing.append("transformers")
+
+    try:
+        import PIL  # noqa: F401  # pylint: disable=import-outside-toplevel
+    except Exception:  # pragma: no cover
+        missing.append("Pillow")
+
+    if missing:
+        raise RuntimeError(
+            "Missing Python packages for multimodal processing: "
+            + ", ".join(missing)
+            + ". Install them via `pip install -r python/requirements-mm.txt`."
+        )
 
 
 @lru_cache(maxsize=8)
@@ -133,10 +105,11 @@ def _extract_mm_kwargs(outputs: dict[str, Any]) -> dict[str, list[dict[str, Any]
     return mm_kwargs
 
 
-def _decode_images(mm_data: dict[str, Any]) -> list[np.ndarray]:
+def _decode_images(mm_data: dict[str, Any]) -> list[Image.Image]:
     images = []
     for item in mm_data.get("image", []):
-        images.append(_decode_image(item))
+        array = _decode_image(item)
+        images.append(Image.fromarray(array).convert("RGB"))
     return images
 
 
