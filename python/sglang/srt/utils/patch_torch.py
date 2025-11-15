@@ -17,7 +17,7 @@ import torch
 from packaging import version
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
 
