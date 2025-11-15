@@ -1018,10 +1018,10 @@ class SWARadixCache(BasePrefixCache):
             node.swa_tombstone
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
         self.full_evictable_size_ -= len(node.key)
 
     def _collect_leaves(self) -> List[TreeNode]:
