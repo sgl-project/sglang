@@ -15,7 +15,6 @@ class TestFile:
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
-        TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("function_call/test_json_schema_constraint.py", 1),
         TestFile("hicache/test_hicache.py", 116),
@@ -233,6 +232,7 @@ suites = {
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
+        TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py"),
         TestFile("entrypoints/http_server/test_abort_request.py"),
         TestFile("ep/test_deepep_internode.py"),
