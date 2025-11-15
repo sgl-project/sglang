@@ -128,8 +128,8 @@ __global__ void timestep_embedding_kernel(
     int d_end = d_start + BLOCK_SIZE_DIM;
 
     for (int d_idx = d_start + tid; d_idx < min(d_end, half); d_idx += num_threads) {
-        // TODO: remove debug assert later
-        assert(d_idx < half);
+        // // TODO: remove debug assert later
+        // assert(d_idx < half);
         float angles = calculate_frequency_and_angle(t_val, d_idx % half, half, max_period);
         int out_idx_first = pid_b * stride_out_b + d_idx * stride_out_d;
         output_ptr[out_idx_first] = cast_to<O>(cosf(angles));
@@ -140,6 +140,10 @@ __global__ void timestep_embedding_kernel(
     // TODO: review, assert output buffer is zero init?
     // if dim % 2:
     //     embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    if (dim % 2 != 0) {
+        int out_idx_pad = pid_b * stride_out_b + (dim-1) * stride_out_d;
+        output_ptr[out_idx_pad] = 0.;
+    }
 }
 
 // NOTE: output always be float32 now. According to python code: timestep_embedding
@@ -162,8 +166,8 @@ torch::Tensor timestep_embedding_kernel_cuda(
     TORCH_CHECK(t.device() == output.device(), "t and output must be on the same device");
 
     // TODO: review
-    // assert int for now
-    TORCH_CHECK(t.scalar_type() == at::ScalarType::Int, "Dtype of t tensor was expected to be int.");
+    // To align with timestep_embedding python code.
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Float, "Output buffer should be float32.");
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -179,9 +183,9 @@ torch::Tensor timestep_embedding_kernel_cuda(
     int stride_out_b = output.stride(0);
     int stride_out_d = output.stride(1);
 
-    DISPATCH_FLOAT_TYPES(output.scalar_type(), "timestep_embedding_kernel", [&] {
-      using t_type = int;
-      using o_type = scalar_t;
+    DISPATCH_FLOAT_TYPES(t.scalar_type(), "timestep_embedding_kernel", [&] {
+      using t_type = scalar_t;
+      using o_type = float;
       timestep_embedding_kernel<t_type, o_type><<<grid_size, block_size, 0, stream>>>(
           static_cast<t_type*>(t.data_ptr()),
           static_cast<o_type*>(output.data_ptr()),
