@@ -899,10 +899,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
                     # Create a ToolCallItem from the JSON data
+                    # Support both "arguments" (OpenAI standard) and "parameters"
+                    params = tool.get("arguments") or tool.get("parameters")
+                    if params is None:
+                        raise ValueError(
+                            f"Tool call missing both 'arguments' and 'parameters': {tool}"
+                        )
+
                     call_info = ToolCallItem(
                         tool_index=i,  # Use the loop index as tool_index
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=json.dumps(params, ensure_ascii=False),
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -913,9 +920,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=json.dumps(params, ensure_ascii=False),
                             ),
                         )
                     )
