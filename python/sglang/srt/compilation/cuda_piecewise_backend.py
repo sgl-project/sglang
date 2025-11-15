@@ -40,7 +40,27 @@ class ConcreteSizeEntry:
 
     compiled: bool = False
     runnable: Callable = None  # type: ignore
-    num_finished_warmup: int = 0
+
+    # This change is for supporting piecewise CUDA graph in VLM.
+    # During the initialization phase, we already run 3 forward passes per
+    # capture shape as warmup. Only after that do we start using the piecewise
+    # backend / cudagraph to serve real requests.
+    # If we then add an extra warmup inside CUDAPiecewiseBackend.__call__ on
+    # the real user request, that effectively becomes a duplicate warmup—and
+    # it’s using the real forward_batch state for warmup, which is quite
+    # dangerous, because:
+    # At runtime, PiecewiseCudaGraphRunner uses replay_prepare() to stuff
+    # the user batch into several persistent buffers.
+    # With the combination of buffers / mm_inputs / mrope,
+    # if we call entry.runnable() one more time without any
+    # reset / truncation / correction, some of these buffers can easily
+    # end up in a state that doesn’t match our expectations.
+    # The second request happens to be exactly at the point of
+    # “the first time we ever hit this shape and it triggers warmup again”.
+    # This change is effectively equivalent to disabling the extra warmup
+    # on real requests, and only keeping the 3 warmup runs done during
+    # initialization.
+    num_finished_warmup: int = 1
     cudagraph: Optional[torch.cuda.CUDAGraph] = None
     output: Optional[Any] = None
 
@@ -123,7 +143,17 @@ class CUDAPiecewiseBackend:
             self.first_run_finished = True
             self.check_for_ending_compilation()
             return self.compiled_graph_for_general_shape(*args)
+
+        if not self.sym_shape_indices:
+            # GraphModule no sym shape indices, don't do piecewise
+            return self.compiled_graph_for_general_shape(*args)
+
         runtime_shape = args[self.sym_shape_indices[0]]
+        if isinstance(runtime_shape, torch.Tensor):
+            runtime_shape = int(runtime_shape.item())
+        else:
+            runtime_shape = int(runtime_shape)
+
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
             return self.compiled_graph_for_general_shape(*args)
