@@ -57,7 +57,7 @@
       "expected_avg_denoise_ms": 720.0,
       "expected_median_denoise_ms": 718.0,
       "stages_ms": {
-        "InputValidationStage": 14,
+        "InputValidationStage": 23,
         "ImageEncodingStage": 990.0,
         "ImageVAEEncodingStage": 252.76,
         "ConditioningStage": 0.13,
@@ -95,7 +95,7 @@
       },
 
       "denoise_step_ms": {
-        "0": 2350.0, "10": 1800.0, "20": 1800.0, "29": 1800.0, "39": 1800.0, "49": 1800.0
+        "0": 3500.0, "10": 1800.0, "20": 1800.0, "29": 1800.0, "39": 1800.0, "49": 1800.0
       },
       "frames_per_second": 0.51,
       "total_frames": 49,
@@ -118,7 +118,7 @@
       "expected_avg_denoise_ms": 3250.0,
       "expected_median_denoise_ms": 3260.0,
       "stages_ms": {
-        "InputValidationStage": 35.0,
+        "InputValidationStage": 80.0,
         "TextEncodingStage": 2000.0,
         "ConditioningStage": 1.0,
         "TimestepPreparationStage": 2.0,
@@ -140,3 +140,4 @@
     }
   }
 }
+
