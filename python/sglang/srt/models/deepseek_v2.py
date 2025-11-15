@@ -845,7 +845,7 @@ class DeepseekV2MoE(nn.Module):
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output = self._forward_shared_experts(hidden_states, gemm_output_zero_allocator)
 
                 pre_combine_hook_handle.remove()
 
