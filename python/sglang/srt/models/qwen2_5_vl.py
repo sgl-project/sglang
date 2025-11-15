@@ -558,6 +558,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
@@ -586,11 +587,18 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        hidden_states = general_mm_embed_routine(
+        # hidden_states = general_mm_embed_routine(
+        #     input_ids=input_ids,
+        #     forward_batch=forward_batch,
+        #     language_model=self.model,
+        #     multimodal_model=self,
+        #     positions=positions,
+        # )
+
+        hidden_states = self.model.forward(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
+            input_embeds=input_embeds,
             positions=positions,
             pp_proxy_tensors=pp_proxy_tensors,
         )

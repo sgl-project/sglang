@@ -497,10 +497,10 @@ class PiecewiseCudaGraphRunner:
         **kwargs,
     ):
         # assert forward_batch.input_embeds.shape[0] == forward_batch.input_deepstack_embeds.shape[0]
-        print(f"{self.use_deepstack=}")
+        # print(f"{self.use_deepstack=}")
         if self.use_input_embeds:
             num_tokens = forward_batch.input_embeds.shape[0]
-            print(f"zero_")
+            # print(f"zero_")
             self.input_embeds.zero_()
         else:
             num_tokens = len(forward_batch.input_ids)
@@ -634,12 +634,7 @@ class PiecewiseCudaGraphRunner:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             # save_path = f"/sgl-workspace/static_forward_batch.input_embeds_{timestamp}.pt"
             # torch.save(static_forward_batch.input_embeds, save_path)
-            print(f"{static_forward_batch.input_embeds.shape=}", flush=True)
-            if static_forward_batch.input_embeds.shape[0] > 100:
-                print(f"631 {static_forward_batch.input_embeds.shape=}", flush=True)
-                static_forward_batch.input_embeds = torch.load(
-                    "/sgl-workspace/static_forward_batch.input_embeds_20251114_050248.pt"
-                )
+            # print(f"{static_forward_batch.input_embeds.shape=}", flush=True)
             # print(f"{static_forward_batch.input_embeds.reshape(-1)[:10]=}")
             # print(f"{static_forward_batch.input_deepstack_embeds.reshape(-1)[:10]=}")
             with set_forward_context(
@@ -652,7 +647,7 @@ class PiecewiseCudaGraphRunner:
                         static_forward_batch,
                         **kwargs,
                     )
-                print(f"{output.next_token_logits.reshape(-1)[:10]=}", flush=True)
+                # print(f"{output.next_token_logits.reshape(-1)[:10]=}", flush=True)
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[

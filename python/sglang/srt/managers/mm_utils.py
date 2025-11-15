@@ -852,9 +852,9 @@ def multimodal_preprocess_routine(
         # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
         # just being defensive here
         forward_batch.mm_inputs = None
-        inputs_embeds = inputs_embeds.contiguous()
-        forward_batch.input_embeds = inputs_embeds
-        forward_batch.input_deepstack_embeds = input_deepstack_embeds.contiguous()
+        # inputs_embeds = inputs_embeds.contiguous()
+        # forward_batch.input_embeds = inputs_embeds
+        # forward_batch.input_deepstack_embeds = input_deepstack_embeds.contiguous()
         print(f"853 {inputs_embeds.dtype=}")
     else:
         # NOTE: This may reduce the performance for only-text inputs.

@@ -698,11 +698,11 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        print(f"flashinfer forward_extend in layer {layer.layer_id}", flush=True)
-        print(f"{q.reshape(-1)[:10]=}", flush=True)
-        print(f"{k.reshape(-1)[:10]=}", flush=True)
-        print(f"{v.reshape(-1)[:10]=}", flush=True)
-        print(f"{forward_batch=}", flush=True)
+        # print(f"flashinfer forward_extend in layer {layer.layer_id}", flush=True)
+        # print(f"{q.reshape(-1)[:10]=}", flush=True)
+        # print(f"{k.reshape(-1)[:10]=}", flush=True)
+        # print(f"{v.reshape(-1)[:10]=}", flush=True)
+        # print(f"{forward_batch=}", flush=True)
         # torch.save(forward.input_deepstack_embeds)
         import traceback
 
@@ -797,7 +797,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-        print(f"{o.reshape(-1)[:10]=}", flush=True)
+        # print(f"{o.reshape(-1)[:10]=}", flush=True)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(

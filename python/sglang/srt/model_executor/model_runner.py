@@ -2114,8 +2114,8 @@ class ModelRunner:
                 multimodal_model=self.model,
             )
             assert forward_batch.input_embeds is not None, "input_embeds is required"
-            print(f"{forward_batch.input_embeds.shape=}")
-            print(f"{forward_batch.input_deepstack_embeds.shape=}")
+            # print(f"{forward_batch.input_embeds.shape=}")
+            # print(f"{forward_batch.input_deepstack_embeds.shape=}")
             print(f"right!!!!!!", flush=True)
 
         kwargs = {}
