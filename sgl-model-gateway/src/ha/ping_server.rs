@@ -359,8 +359,11 @@ impl Gossip for GossipService {
                                                     >(
                                                         &state_update.value
                                                     ) {
+                                                        // Extract actor from StateUpdate
+                                                        let actor = Some(state_update.actor.clone());
                                                         sync_manager.apply_remote_worker_state(
                                                             worker_state,
+                                                            actor,
                                                         );
                                                     }
                                                 }
@@ -371,8 +374,11 @@ impl Gossip for GossipService {
                                                     >(
                                                         &state_update.value
                                                     ) {
+                                                        // Extract actor from StateUpdate
+                                                        let actor = Some(state_update.actor.clone());
                                                         sync_manager.apply_remote_policy_state(
                                                             policy_state,
+                                                            actor,
                                                         );
                                                     }
                                                 }
@@ -548,7 +554,7 @@ impl Gossip for GossipService {
                                                                     stores.worker.insert(key, worker_state.clone(), entry.actor.clone());
                                                                     // Also update sync manager if available
                                                                     if let Some(ref sync_manager) = sync_manager {
-                                                                        sync_manager.apply_remote_worker_state(worker_state);
+                                                                        sync_manager.apply_remote_worker_state(worker_state, Some(entry.actor.clone()));
                                                                     }
                                                                 }
                                                             }
@@ -557,7 +563,7 @@ impl Gossip for GossipService {
                                                                     stores.policy.insert(key, policy_state.clone(), entry.actor.clone());
                                                                     // Also update sync manager if available
                                                                     if let Some(ref sync_manager) = sync_manager {
-                                                                        sync_manager.apply_remote_policy_state(policy_state);
+                                                                        sync_manager.apply_remote_policy_state(policy_state, Some(entry.actor.clone()));
                                                                     }
                                                                 }
                                                             }

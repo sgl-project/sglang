@@ -737,9 +737,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             ha_server_config.init_peer
         );
 
-        // Create HA sync manager if stores are available
-        // TODO: Get stores from HA server if available
-        let sync_manager = None; // Will be set up when stores are integrated
+        // Create HA sync manager with stores
+        use crate::ha::stores::StateStores;
+        let stores = Arc::new(StateStores::new());
+        let sync_manager = Some(Arc::new(HASyncManager::new(
+            stores,
+            ha_server_config.self_name.clone(),
+        )));
 
         (Some(Arc::new(handler)), sync_manager)
     } else {

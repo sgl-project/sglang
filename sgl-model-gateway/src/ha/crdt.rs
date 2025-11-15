@@ -123,8 +123,20 @@ impl<T: Clone + Serialize + DeserializeOwned> CRDTMap<T> {
     }
 
     pub fn insert(&mut self, key: SKey, value: T, actor: String) {
-        let reg = LWWRegister::new(value, actor);
-        self.inner.insert(key, reg);
+        // Check if key already exists to preserve version
+        if let Some(existing_reg) = self.inner.get_mut(&key) {
+            // Update existing register, which will increment version
+            existing_reg.write(value, actor);
+        } else {
+            // New entry, start with version 1
+            let reg = LWWRegister::new(value, actor);
+            self.inner.insert(key, reg);
+        }
+    }
+    
+    /// Get the version and actor for a key
+    pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
+        self.inner.get(key).map(|reg| (reg.version, reg.actor.clone()))
     }
 
     pub fn remove(&mut self, key: &SKey) {
@@ -252,6 +264,11 @@ impl<T: Clone + Serialize + DeserializeOwned> SyncCRDTMap<T> {
 
     pub fn insert(&self, key: SKey, value: T, actor: String) {
         self.inner.write().insert(key, value, actor);
+    }
+    
+    /// Get the version and actor for a key
+    pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
+        self.inner.read().get_metadata(key)
     }
 
     pub fn remove(&self, key: &SKey) {
