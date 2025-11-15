@@ -2298,6 +2298,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         return llm_pos_ids
 
 
+# Adapted from https://github.com/vllm-project/vllm/blob/3779eb8c81449b924a23457fc77e45a0e6171178/vllm/model_executor/layers/rotary_embedding.py#L554
 class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
     """MRoPE-enabled rotary embedding with YaRN context scaling."""
 
