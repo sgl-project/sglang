@@ -419,6 +419,9 @@ class ServerArgs:
     mamba_ssm_dtype: str = "float32"
     mamba_full_memory_ratio: float = 0.9
 
+    # Sequence parallelism
+    enable_sp: bool = False
+
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
@@ -2974,6 +2977,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="The ratio of mamba state memory to full kv cache memory.",
+        )
+
+        # Sequence parallelism
+        parser.add_argument(
+            "--enable-sp",
+            action="store_true",
+            help="Enable sequence parallelism.",
         )
 
         # Hierarchical cache

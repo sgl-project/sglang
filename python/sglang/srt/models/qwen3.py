@@ -9,9 +9,18 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    sp_tensor_model_parallel_all_gather,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -118,6 +127,7 @@ class Qwen3Attention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            tp_group=get_attention_tp_group() if attn_tp_size > 1 else None,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -180,7 +190,11 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output,
+            enable_sp=get_global_server_args().enable_sp
+            and forward_batch.forward_mode.is_extend(),
+        )
         return output
 
 
@@ -251,6 +265,28 @@ class Qwen3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        self.enable_sp = get_global_server_args().enable_sp
+        if self.enable_sp:
+            self.layer_scatter_modes_sp = LayerScatterModes.init_new(
+                enable_sp=True,
+                layer_id=layer_id,
+                num_layers=config.num_hidden_layers,
+                is_layer_sparse=False,
+                is_previous_layer_sparse=False,
+            )
+            self.layer_communicator_sp = LayerCommunicator(
+                layer_scatter_modes=self.layer_scatter_modes_sp,
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+            )
+
+    def get_layer_communicator(self, is_extend: bool = False):
+        return (
+            self.layer_communicator_sp
+            if self.enable_sp and is_extend
+            else self.layer_communicator
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -259,10 +295,20 @@ class Qwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
+        layer_communicator = self.get_layer_communicator(
+            forward_batch.forward_mode.is_extend()
+        )
+
+        hidden_states, residual = layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
         if hidden_states.shape[0] != 0:
+            if (
+                self.enable_sp
+                and forward_batch.forward_mode.is_extend()
+                and self.layer_scatter_modes_sp.attn_mode == ScatterMode.SCATTERED
+            ):
+                hidden_states = sp_tensor_model_parallel_all_gather(hidden_states)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -270,7 +316,7 @@ class Qwen3DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = layer_communicator.prepare_mlp(
             hidden_states,
             residual,
             forward_batch,
@@ -280,10 +326,13 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            enable_sp=self.enable_sp and forward_batch.forward_mode.is_extend(),
+        )
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
+        hidden_states, residual = layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
         return hidden_states, residual

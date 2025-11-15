@@ -318,6 +318,9 @@ class ForwardBatch:
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
+    # For sp
+    enable_sp: Optional[bool] = False
+
     @classmethod
     def init_new(
         cls,
@@ -682,7 +685,10 @@ class ForwardBatch:
                 dim=0,
             )
 
-    def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+    def prepare_mlp_sync_batch(
+        self, model_runner: ModelRunner, enable_sp: bool = False
+    ):
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -698,7 +704,9 @@ class ForwardBatch:
             ) * attn_tp_size
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
-            self.is_extend_in_batch, global_num_tokens
+            self.is_extend_in_batch,
+            global_num_tokens,
+            enable_sp,
         )
         self.dp_padding_mode = dp_padding_mode
 

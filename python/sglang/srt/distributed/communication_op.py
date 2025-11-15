@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed
 
-from .parallel_state import get_tp_group
+from .parallel_state import get_tensor_model_parallel_world_size, get_tp_group
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -33,3 +33,14 @@ def broadcast_tensor_dict(
     if not torch.distributed.is_initialized():
         return tensor_dict
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
+
+
+def sp_tensor_model_parallel_all_gather(
+    input_: torch.Tensor,
+) -> torch.Tensor:
+    """All-gather the input tensor across model parallel group at dim0 for sp"""
+    allgather_size = list(input_.size())
+    allgather_size[0] = allgather_size[0] * get_tensor_model_parallel_world_size()
+    output_ = torch.empty(allgather_size, dtype=input_.dtype, device=input_.device)
+    get_tp_group().all_gather_into_tensor(output_, input_.contiguous())
+    return output_
