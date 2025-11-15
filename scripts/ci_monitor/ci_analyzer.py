@@ -101,6 +101,7 @@ class SGLangCIAnalyzer:
                 "per-commit-8-gpu-h20",
             ],
             "nightly": [
+                # Old job names (nightly-test.yml)
                 "nightly-test-perf-text-models",
                 "nightly-test-eval-text-models",
                 "nightly-test-1-gpu",
@@ -109,6 +110,19 @@ class SGLangCIAnalyzer:
                 "nightly-test-8-gpu-h20",
                 "nightly-test-4-gpu-b200",
                 "nightly-test-8-gpu-b200",
+                # New NVIDIA job names (nightly-test-nvidia.yml)
+                "nightly-test-general-1-gpu-runner",
+                "nightly-test-general-4-gpu-h100",
+                "nightly-test-general-8-gpu-h200",
+                "nightly-test-general-8-gpu-h20",
+                "nightly-test-text-accuracy-2-gpu-runner",
+                "nightly-test-text-perf-2-gpu-runner",
+                "nightly-test-vlm-accuracy-2-gpu-runner",
+                "nightly-test-vlm-perf-2-gpu-runner",
+                "nightly-test-perf-4-gpu-b200",
+                "nightly-test-perf-8-gpu-b200",
+                # AMD job names (nightly-test-amd.yml)
+                "nightly-test",  # AMD uses this generic name with matrix
             ],
             "integration": [
                 "run-all-notebooks",
@@ -191,6 +205,7 @@ class SGLangCIAnalyzer:
                     "unit-test-backend-4-gpu-b200",
                     "unit-test-backend-4-gpu-gb200",
                     "quantization-test",
+                    # Old nightly job names (nightly-test.yml)
                     "nightly-test-eval-text-models",
                     "nightly-test-perf-text-models",
                     "nightly-test-eval-vlms",
@@ -201,6 +216,19 @@ class SGLangCIAnalyzer:
                     "nightly-test-8-gpu-h20",
                     "nightly-test-4-gpu-b200",
                     "nightly-test-8-gpu-b200",
+                    # New NVIDIA job names (nightly-test-nvidia.yml)
+                    "nightly-test-general-1-gpu-runner",
+                    "nightly-test-general-4-gpu-h100",
+                    "nightly-test-general-8-gpu-h200",
+                    "nightly-test-general-8-gpu-h20",
+                    "nightly-test-text-accuracy-2-gpu-runner",
+                    "nightly-test-text-perf-2-gpu-runner",
+                    "nightly-test-vlm-accuracy-2-gpu-runner",
+                    "nightly-test-vlm-perf-2-gpu-runner",
+                    "nightly-test-perf-4-gpu-b200",
+                    "nightly-test-perf-8-gpu-b200",
+                    # AMD job names (nightly-test-amd.yml)
+                    "nightly-test",
                 ]
 
                 if job_name in target_jobs:

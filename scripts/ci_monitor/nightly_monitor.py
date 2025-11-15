@@ -35,6 +35,7 @@ class NightlyTestMonitor:
 
         # Nightly test jobs to monitor
         self.nightly_jobs = [
+            # Old job names (nightly-test.yml)
             "nightly-test-eval-text-models",
             "nightly-test-perf-text-models",
             "nightly-test-eval-vlms",
@@ -45,6 +46,27 @@ class NightlyTestMonitor:
             "nightly-test-8-gpu-h20",
             "nightly-test-4-gpu-b200",
             "nightly-test-8-gpu-b200",
+            # New NVIDIA job names (nightly-test-nvidia.yml)
+            "nightly-test-general-1-gpu-runner",
+            "nightly-test-general-4-gpu-h100",
+            "nightly-test-general-8-gpu-h200",
+            "nightly-test-general-8-gpu-h20",
+            "nightly-test-text-accuracy-2-gpu-runner",
+            "nightly-test-text-perf-2-gpu-runner",
+            "nightly-test-vlm-accuracy-2-gpu-runner",
+            "nightly-test-vlm-perf-2-gpu-runner",
+            "nightly-test-perf-4-gpu-b200",
+            "nightly-test-perf-8-gpu-b200",
+            # AMD job names (nightly-test-amd.yml)
+            "nightly-test",
+        ]
+
+        # Nightly workflow files to monitor
+        self.nightly_workflows = [
+            "nightly-test.yml",
+            "nightly-test-nvidia.yml",
+            "nightly-test-amd.yml",
+            "nightly-test-intel.yml",
         ]
 
         # Performance metric patterns for parsing logs
@@ -67,45 +89,52 @@ class NightlyTestMonitor:
         self.data_branch = "main"
 
     def get_nightly_runs(self, days: int = 7) -> List[Dict]:
-        """Get nightly test workflow runs from the last N days"""
+        """Get nightly test workflow runs from the last N days from multiple workflows"""
         print(f"Fetching nightly test runs from the last {days} days...")
 
         since_date = (datetime.now() - timedelta(days=days)).isoformat()
 
         all_runs = []
-        page = 1
-        per_page = 100
 
-        while True:
-            url = f"{self.base_url}/repos/{self.repo}/actions/runs"
-            params = {
-                "workflow_id": "nightly-test.yml",
-                "per_page": per_page,
-                "page": page,
-                "created": f">={since_date}",
-            }
+        # Fetch runs from each nightly workflow
+        for workflow_file in self.nightly_workflows:
+            print(f"  Fetching from {workflow_file}...")
+            page = 1
+            per_page = 100
+            workflow_runs = []
 
-            try:
-                response = self.session.get(url, params=params)
-                response.raise_for_status()
-                data = response.json()
+            while True:
+                url = f"{self.base_url}/repos/{self.repo}/actions/runs"
+                params = {
+                    "workflow_id": workflow_file,
+                    "per_page": per_page,
+                    "page": page,
+                    "created": f">={since_date}",
+                }
 
-                if not data.get("workflow_runs"):
+                try:
+                    response = self.session.get(url, params=params)
+                    response.raise_for_status()
+                    data = response.json()
+
+                    if not data.get("workflow_runs"):
+                        break
+
+                    runs = data["workflow_runs"]
+                    workflow_runs.extend(runs)
+
+                    if len(runs) < per_page:
+                        break
+
+                    page += 1
+                    time.sleep(0.1)
+
+                except requests.exceptions.RequestException as e:
+                    print(f"    Warning: Error fetching from {workflow_file}: {e}")
                     break
 
-                runs = data["workflow_runs"]
-                all_runs.extend(runs)
-                print(f"Fetched {len(all_runs)} nightly runs so far...")
-
-                if len(runs) < per_page:
-                    break
-
-                page += 1
-                time.sleep(0.1)
-
-            except requests.exceptions.RequestException as e:
-                print(f"Error fetching nightly test data: {e}")
-                break
+            print(f"    Fetched {len(workflow_runs)} runs from {workflow_file}")
+            all_runs.extend(workflow_runs)
 
         print(f"Total nightly runs fetched: {len(all_runs)}")
         return all_runs
