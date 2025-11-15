@@ -137,6 +137,10 @@ impl MembershipStore {
     pub fn all(&self) -> BTreeMap<SKey, MembershipState> {
         self.inner.snapshot().to_map()
     }
+    
+    pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
+        self.inner.get_metadata(key)
+    }
 }
 
 impl Default for MembershipStore {
@@ -184,6 +188,10 @@ impl AppStore {
 
     pub fn all(&self) -> BTreeMap<SKey, AppState> {
         self.inner.snapshot().to_map()
+    }
+    
+    pub fn get_metadata(&self, key: &SKey) -> Option<(u64, String)> {
+        self.inner.get_metadata(key)
     }
 }
 

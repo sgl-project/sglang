@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Instant};
+use std::{net::SocketAddr, pin::Pin, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::Result;
 use futures::Stream;
@@ -16,6 +16,7 @@ use super::{
         GossipMessage, IncrementalUpdate, NodeState, NodeStatus, NodeUpdate, PingReq,
         SnapshotChunk, SnapshotRequest, StateUpdate, StreamAck, StreamMessage, StreamMessageType,
     },
+    incremental::IncrementalUpdateCollector,
     metrics::{
         record_ack, record_batch_received, record_batch_sent, record_nack, record_peer_reconnect,
         record_snapshot_bytes, record_snapshot_duration, record_snapshot_trigger,
@@ -128,10 +129,18 @@ impl GossipService {
             let state_updates: Vec<StateUpdate> = chunk_entries
                 .iter()
                 .map(|(key, value)| {
+                    // Get actual version from CRDT metadata
+                    let version = match store_type {
+                        LocalStoreType::Membership => stores.membership.get_metadata(key).map(|(v, _)| v).unwrap_or(1),
+                        LocalStoreType::App => stores.app.get_metadata(key).map(|(v, _)| v).unwrap_or(1),
+                        LocalStoreType::Worker => stores.worker.get_metadata(key).map(|(v, _)| v).unwrap_or(1),
+                        LocalStoreType::Policy => stores.policy.get_metadata(key).map(|(v, _)| v).unwrap_or(1),
+                    };
+                    
                     StateUpdate {
                         key: key.as_str().to_string(),
                         value: value.clone(),
-                        version: 1, // TODO: Get actual version from CRDT
+                        version,
                         actor: self.self_name.clone(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -276,6 +285,73 @@ impl Gossip for GossipService {
 
         // Create output stream
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamMessage, Status>>(128);
+
+        // Create incremental update collector if stores are available
+        let collector = if let Some(stores) = &stores {
+            Some(Arc::new(IncrementalUpdateCollector::new(
+                Arc::new(stores.clone()),
+                self_name.clone(),
+            )))
+        } else {
+            None
+        };
+
+        // Spawn task to periodically send incremental updates
+        if let Some(collector) = collector {
+            let tx_incremental = tx.clone();
+            let self_name_incremental = self_name.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5)); // Send every 5 seconds
+                let mut sequence_counter: u64 = 0;
+                
+                loop {
+                    interval.tick().await;
+                    
+                    // Collect all incremental updates
+                    let all_updates = collector.collect_all_updates();
+                    
+                    if !all_updates.is_empty() {
+                        for (store_type, updates) in all_updates {
+                            let proto_store_type = match store_type {
+                                LocalStoreType::Membership => super::gossip::StoreType::Membership as i32,
+                                LocalStoreType::App => super::gossip::StoreType::App as i32,
+                                LocalStoreType::Worker => super::gossip::StoreType::Worker as i32,
+                                LocalStoreType::Policy => super::gossip::StoreType::Policy as i32,
+                            };
+                            
+                            sequence_counter += 1;
+                            let batch_size: usize = updates.iter().map(|u| u.value.len()).sum();
+                            
+                            let incremental_update = StreamMessage {
+                                message_type: StreamMessageType::IncrementalUpdate as i32,
+                                payload: Some(super::gossip::stream_message::Payload::Incremental(
+                                    IncrementalUpdate {
+                                        store: proto_store_type,
+                                        updates: updates.clone(),
+                                        version: 0, // Version is tracked per key in StateUpdate
+                                    },
+                                )),
+                                sequence: sequence_counter,
+                                peer_id: self_name_incremental.clone(),
+                            };
+                            
+                            // Record metrics
+                            record_batch_sent(&self_name_incremental, batch_size);
+                            
+                            // Mark as sent after successful transmission
+                            collector.mark_sent(store_type, &updates);
+                            
+                            if tx_incremental.send(Ok(incremental_update)).await.is_err() {
+                                log::warn!("Failed to send incremental update, stream closed");
+                                break;
+                            }
+                            
+                            log::debug!("Sent incremental update: store={:?}, {} updates", store_type, updates.len());
+                        }
+                    }
+                }
+            });
+        }
 
         // Spawn task to handle incoming messages
         let mut sequence: u64 = 0;
