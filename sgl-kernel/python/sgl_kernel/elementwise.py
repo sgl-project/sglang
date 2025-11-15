@@ -424,7 +424,7 @@ def mla_rope_quantize_fp8_fused(
         kv_buffer: Optional KV cache buffer for direct write
         kv_cache_loc: Optional cache locations for KV buffer write
     """
-    torch.ops.sgl_kernel.mla_rope_quantize_fp8_fused(
+    torch.ops.sgl_kernel.mla_rope_quantize_fp8_fused.default(
         q_nope,
         q_rope,
         k_nope,
