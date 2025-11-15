@@ -149,13 +149,13 @@ from sglang.srt.utils import (
     slow_rank_detector,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
     set_offloader,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.utils.pytorch_hooks import PytHooks
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
