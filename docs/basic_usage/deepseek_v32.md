@@ -142,3 +142,23 @@ The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in offi
 Repeat: 8, mean: 0.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
+
+
+## DSA long sequence context parallel optimization(experimental)
+
+Accuracy benchmark on long context can be tested on GPQA-diamond dataset with long output tokens and thinking enabled:
+
+Example usage:
+```bash
+# Launch with EP + DP
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --max-running-requests 32
+```
+### Context-parallel Tips
+`CP_size` reuses `atten_tp_size`, which is equal to `TP_size` / `DP_size`.
+Some features are still not supported at present.
+- **Multi-batch prefill**: Currently, only single-request processing is supported during the prefill process.
+- **disaggregation**: P/D disaggregation.
+- **Cross-machine support**: - Currently only tested on a single machine (TP=8,EP=8).
+- **Other Args**: Currently only supports moe_dense_tp_size=1, kv_cache_dtype = "bf16", moe_a2a_backend = "deepep",
+- **DP_size**: `CP_size` reuses `atten_tp_size`, which is equal to `TP_size` / `DP_size`. For the cp function to work correctly, `TP_size` must be divisible by `DP_size`, and TP_size / DP_size > 1 (to ensure CP_size > 1).
+- **Detailed design reference**: https://github.com/sgl-project/sglang/pull/12065
