@@ -13,7 +13,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{from_str, json, to_string, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::conversions;
 use crate::{
-    mcp::{self, McpManager},
+    mcp::{self, error::McpError, McpManager},
     protocols::{
         chat::{
             ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -409,39 +409,48 @@ pub(super) async fn execute_tool_loop(
                     };
 
                 // Look up tool in map and execute
-                let (output_str, success, error) =
-                    match tools_map.get(&(server_label.clone(), original_tool_name.clone())) {
-                        Some((_tool, server_url)) => {
-                            let args_map = match serde_json::from_str::<Value>(&args_json_str) {
-                                Ok(Value::Object(map)) => Some(map),
-                                _ => None,
-                            };
+                let (output_str, success, error) = match tools_map
+                    .get(&(server_label.clone(), original_tool_name.clone()))
+                {
+                    Some((_tool, server_url)) => {
+                        let args_map = match from_str::<Value>(&args_json_str) {
+                            Ok(Value::Object(map)) => Some(map),
+                            _ => None,
+                        };
 
-                            // Call tool via manager
-                            match ctx
-                                .mcp_manager
-                                .call_tool_by_url(server_url, &original_tool_name, args_map)
-                                .await
-                            {
+                        // Call tool via manager
+                        match ctx
+                            .mcp_manager
+                            .call_tool_by_url(server_url, &original_tool_name, args_map)
+                            .await
+                        {
+                            Ok(result) => match to_string(&result) {
                                 Ok(output) => (output, true, None),
                                 Err(e) => {
-                                    let err_msg = e.to_string();
-                                    warn!("MCP tool execution failed: {}", err_msg);
+                                    let err_msg = format!("Failed to serialize tool result: {}", e);
+                                    warn!("{}", err_msg);
                                     let error_json = json!({ "error": &err_msg }).to_string();
                                     (error_json, false, Some(err_msg))
                                 }
+                            },
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                warn!("MCP tool execution failed: {}", err_msg);
+                                let error_json = json!({ "error": &err_msg }).to_string();
+                                (error_json, false, Some(err_msg))
                             }
                         }
-                        None => {
-                            let err_str = format!(
-                                "Tool '{}' (server: {}, tool: {}) not found in tool map",
-                                formatted_tool_name, server_label, original_tool_name
-                            );
-                            warn!("{}", err_str);
-                            let error_json = json!({ "error": &err_str }).to_string();
-                            (error_json, false, Some(err_str))
-                        }
-                    };
+                    }
+                    None => {
+                        let err_str = format!(
+                            "Tool '{}' (server: {}, tool: {}) not found in tool map",
+                            formatted_tool_name, server_label, original_tool_name
+                        );
+                        warn!("{}", err_str);
+                        let error_json = json!({ "error": &err_str }).to_string();
+                        (error_json, false, Some(err_str))
+                    }
+                };
 
                 // Record the call in state
                 state.record_call(
@@ -892,38 +901,44 @@ async fn execute_tool_loop_streaming_internal(
                 );
 
                 // Look up tool in map
-                let call_result =
-                    match tools_map.get(&(server_label.clone(), original_tool_name.clone())) {
-                        Some((_tool, server_url)) => {
-                            let args_map = match serde_json::from_str::<Value>(&args_json_str) {
-                                Ok(Value::Object(map)) => Some(map),
-                                _ => None,
-                            };
+                let call_result = match tools_map
+                    .get(&(server_label.clone(), original_tool_name.clone()))
+                {
+                    Some((_tool, server_url)) => {
+                        let args_map = match from_str::<Value>(&args_json_str) {
+                            Ok(Value::Object(map)) => Some(map),
+                            _ => None,
+                        };
 
-                            // Call tool via manager using server URL
-                            ctx.mcp_manager
-                                .call_tool_by_url(server_url, &original_tool_name, args_map)
-                                .await
-                                .map_err(|e| {
-                                    warn!("MCP tool execution failed: {}", e);
-                                    e.to_string()
+                        // Call tool via manager using server URL
+                        ctx.mcp_manager
+                            .call_tool_by_url(server_url, &original_tool_name, args_map)
+                            .await
+                            .and_then(|result| {
+                                to_string(&result).map_err(|e| {
+                                    let err_msg = format!("Failed to serialize tool result: {}", e);
+                                    warn!("{}", err_msg);
+                                    McpError::ToolExecution(err_msg)
                                 })
-                        }
-                        None => {
-                            let err_str = format!(
-                                "Tool '{}' (server: {}, tool: {}) not found in tool map",
-                                formatted_tool_name, server_label, original_tool_name
-                            );
-                            warn!("{}", err_str);
-                            Err(err_str)
-                        }
-                    };
+                            })
+                            .map_err(|e| {
+                                warn!("MCP tool execution failed: {}", e);
+                                e.to_string()
+                            })
+                    }
+                    None => {
+                        let err_str = format!(
+                            "Tool '{}' (server: {}, tool: {}) not found in tool map",
+                            formatted_tool_name, server_label, original_tool_name
+                        );
+                        warn!("{}", err_str);
+                        Err(err_str)
+                    }
+                };
 
                 let (output_str, success, error) = match call_result {
                     Ok(result) => {
-                        let output = serde_json::to_string(&result).unwrap_or_else(|_| {
-                            json!({"error": "Failed to serialize result"}).to_string()
-                        });
+                        let output = result;
 
                         // Emit mcp_call.completed
                         let event = emitter.emit_mcp_call_completed(output_index, &item_id);
@@ -1176,7 +1191,7 @@ async fn convert_and_accumulate_stream(
 
         if let Some(json_str) = event.strip_prefix("data: ") {
             let json_str = json_str.trim();
-            if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
+            if let Ok(chat_chunk) = from_str::<ChatCompletionStreamResponse>(json_str) {
                 // Convert chat chunk to Responses API events and emit
                 emitter.process_chunk(&chat_chunk, tx)?;
 

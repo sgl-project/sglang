@@ -37,7 +37,7 @@ use std::{
 
 use axum::response::Response;
 use bytes::Bytes;
-use serde_json::{from_str, from_value, json, to_string, Value};
+use serde_json::{from_str, from_value, json, to_string, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -1259,14 +1259,14 @@ async fn execute_mcp_tools(
                         .call_tool_by_url(server_url, &original_tool_name, args_map)
                         .await
                     {
-                        Ok(output_str) => {
-                            // Parse the output string back to Value
-                            match from_str::<Value>(&output_str) {
+                        Ok(result) => {
+                            // Convert CallToolResult to Value
+                            match to_value(&result) {
                                 Ok(output_value) => (output_value, false),
                                 Err(e) => {
-                                    warn!("Failed to parse tool output: {}", e);
+                                    warn!("Failed to serialize tool result: {}", e);
                                     (
-                                        json!({"error": format!("Failed to parse output: {}", e)}),
+                                        json!({"error": format!("Failed to serialize: {}", e)}),
                                         true,
                                     )
                                 }
