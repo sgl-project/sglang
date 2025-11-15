@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -127,17 +128,17 @@ def cutlass_block_fp8_supported() -> bool:
 
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
-ENABLE_FLASHINFER_GEMM = (
-    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
+ENABLE_FLASHINFER_FP8_GEMM = (
+    envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
     and is_blackwell_supported()
     and is_flashinfer_available()
 )
-if ENABLE_FLASHINFER_GEMM:
+if ENABLE_FLASHINFER_FP8_GEMM:
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
-    if ENABLE_FLASHINFER_GEMM:
+    if ENABLE_FLASHINFER_FP8_GEMM:
         return flashinfer_gemm_w8a8_block_fp8_linear
     elif CUTLASS_BLOCK_FP8_SUPPORTED:
         return cutlass_w8a8_block_fp8_linear_with_fallback

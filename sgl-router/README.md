@@ -382,9 +382,6 @@ Use upstream SGLang binaries to start dedicated worker processes.
 | `GET`    | `/workers`       | List workers with health, load, policy metadata, and queued job status.                                                                                   |
 | `GET`    | `/workers/{url}` | Inspect a specific worker or job queue entry.                                                                                                             |
 | `DELETE` | `/workers/{url}` | Queue worker removal.                                                                                                                                     |
-| `POST`   | `/add_worker`    | Legacy immediate worker registration using query params. Returns synchronously. **Deprecated soon**—use `POST /workers` instead.                          |
-| `POST`   | `/remove_worker` | Legacy immediate removal. **Deprecated soon**—use `DELETE /workers/{url}` instead.                                                                        |
-| `GET`    | `/list_workers`  | Legacy list of worker URLs. **Deprecated soon**—use `GET /workers` instead.                                                                               |
 | `POST`   | `/flush_cache`   | Trigger cache flush across HTTP workers with success/failure breakdown.                                                                                   |
 | `GET`    | `/get_loads`     | Sample current load reported by each worker.                                                                                                              |
 
