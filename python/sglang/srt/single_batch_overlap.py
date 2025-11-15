@@ -19,11 +19,11 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import is_sbo_enabled
-from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -120,7 +120,7 @@ def _compute_overlap_args(dispatch_output, alt_stream, disable_sbo):
     total_num_sms = torch.cuda.get_device_properties(
         device="cuda"
     ).multi_processor_count
-    communicate_num_sms = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
+    communicate_num_sms = envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.get()
     compute_num_sms = total_num_sms - communicate_num_sms
 
     assert alt_stream is not None
