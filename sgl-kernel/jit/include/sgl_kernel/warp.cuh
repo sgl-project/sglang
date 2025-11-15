@@ -1,7 +1,8 @@
 #pragma once
+#include <sgl_kernel/utils.cuh>
+
 #include <cstddef>
 #include <cstdint>
-#include <sgl_kernel/utils.cuh>
 #include <type_traits>
 
 namespace device::warp {

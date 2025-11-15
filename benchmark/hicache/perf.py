@@ -79,9 +79,6 @@ def perf(f: Callable[[], Any], loop: int = 100) -> float:
 def test_hicache_kernel(args: HicacheBenchArgs) -> None:
     CACHE_ITEM_SIZE, DTYPE, BLOCK_QUOTA = args
 
-    stream = torch.cuda.Stream()
-    torch.cuda.set_stream(stream)
-
     CUDA_CACHE_SIZE = 1024 * 1024
     HOST_CACHE_SIZE = CUDA_CACHE_SIZE * 2
 
@@ -143,12 +140,13 @@ def test_hicache_kernel(args: HicacheBenchArgs) -> None:
             host_cache[0][dst_indices].cuda() == cuda_cache[0][src_indices]
         )
 
-    _fast_test_correctness(bs=1024)
+    BS_RANGE = [2**n for n in range(8, 18)]
+    for bs in BS_RANGE:
+        _fast_test_correctness(bs)
 
     print("Correctness passed! Start HiCache kernel performance test...")
     print("=" * 70)
 
-    BS_RANGE = [2**n for n in range(8, 18)]
     for bs in BS_RANGE:
         indices_dst = _gen_indices(CUDA_CACHE_SIZE, bs)
         indices_src = _gen_indices(HOST_CACHE_SIZE, bs)
@@ -206,7 +204,32 @@ def test_hicache_kernel(args: HicacheBenchArgs) -> None:
     print("=" * 70)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    torch.cuda.set_device(0)
+    stream = torch.cuda.Stream()
+
+    tic = torch.cuda.Event(enable_timing=True)
+    toc = torch.cuda.Event(enable_timing=True)
+
+    BUF_SIZE = 1024 * 1024 * 1024
+    cuda_mem = torch.empty(BUF_SIZE, dtype=torch.uint8, device="cuda")
+    host_mem = torch.empty(BUF_SIZE, dtype=torch.uint8, device="cpu", pin_memory=True)
+
+    # test peak bandwidth
+    tic.record()
+    host_mem.copy_(cuda_mem, non_blocking=True)
+    toc.record()
+    toc.synchronize()
+    dur = tic.elapsed_time(toc)
+    print(f"Peak H->D Bandwidth: {(BUF_SIZE / (1024**3)) / (dur / 1000):.2f} GB/s")
+
+    tic.record()
+    cuda_mem.copy_(host_mem, non_blocking=True)
+    toc.record()
+    toc.synchronize()
+    dur = tic.elapsed_time(toc)
+    print(f"Peak D->H Bandwidth: {(BUF_SIZE / (1024**3)) / (dur / 1000):.2f} GB/s")
+
     for block_quota in [1, 2, 3, 4]:
         for cache_item_size in [128, 256, 512, 1024]:
             args = HicacheBenchArgs(
@@ -215,3 +238,7 @@ if __name__ == "__main__":
                 block_quota=block_quota,
             )
             test_hicache_kernel(args)
+
+
+if __name__ == "__main__":
+    main()
