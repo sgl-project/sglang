@@ -285,6 +285,9 @@ class Envs:
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
+    # Memory cache
+    SGLANG_SWA_EVICT_LENGTH_PER_STEP = EnvInt(128)
+
     # fmt: on
 
 
