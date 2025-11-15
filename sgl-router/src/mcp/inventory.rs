@@ -77,19 +77,26 @@ impl ToolInventory {
         );
     }
 
-    /// Get a tool from static inventory
-    pub fn get_tool(&self, tool_name: &str) -> Option<(String, Tool)> {
-        for entry in self.static_tools.iter() {
-            if entry.key().1 == tool_name {
-                return Some((entry.server_name.clone(), entry.tool.clone()));
-            }
-        }
-        None
+    /// Get a tool from static inventory by server name and tool name (O(1))
+    pub fn get_tool(&self, server_name: &str, tool_name: &str) -> Option<Tool> {
+        self.static_tools
+            .get(&(server_name.to_string(), tool_name.to_string()))
+            .map(|cached| cached.tool.clone())
     }
 
-    /// Check if tool exists in static inventory
+    /// Find a tool by name across all servers (O(N))
+    /// Returns (server_name, tool). If multiple servers have the same tool, returns first match.
+    /// Prefer get_tool() if you know the server name.
+    pub fn find_tool_by_name(&self, tool_name: &str) -> Option<(String, Tool)> {
+        self.static_tools
+            .iter()
+            .find(|entry| entry.key().1 == tool_name)
+            .map(|entry| (entry.value().server_name.clone(), entry.value().tool.clone()))
+    }
+
+    /// Check if tool exists in static inventory (searches all servers)
     pub fn has_tool(&self, tool_name: &str) -> bool {
-        self.get_tool(tool_name).is_some()
+        self.find_tool_by_name(tool_name).is_some()
     }
 
     /// List all static tools
@@ -285,9 +292,14 @@ mod tests {
 
         inventory.insert_static_tool("server1".to_string(), "test_tool".to_string(), tool.clone());
 
-        let result = inventory.get_tool("test_tool");
+        // Test O(1) get_tool with server name
+        let result = inventory.get_tool("server1", "test_tool");
         assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "test_tool");
 
+        // Test O(N) find_tool_by_name
+        let result = inventory.find_tool_by_name("test_tool");
+        assert!(result.is_some());
         let (server_name, retrieved_tool) = result.unwrap();
         assert_eq!(server_name, "server1");
         assert_eq!(retrieved_tool.name, "test_tool");

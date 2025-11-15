@@ -214,7 +214,7 @@ impl McpManager {
         // Get tool info for schema and server (static tools only)
         let (server_name, tool_info) = self
             .inventory
-            .get_tool(tool_name)
+            .find_tool_by_name(tool_name)
             .ok_or_else(|| McpError::ToolNotFound(tool_name.to_string()))?;
 
         // Convert args with type coercion based on schema
@@ -246,7 +246,7 @@ impl McpManager {
     /// For dynamic MCP clients, list tools directly from the client
     pub fn get_tool(&self, tool_name: &str) -> Option<Tool> {
         self.inventory
-            .get_tool(tool_name)
+            .find_tool_by_name(tool_name)
             .map(|(_server_name, tool_info)| tool_info)
     }
 
