@@ -394,6 +394,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-return-hidden-states` | Enable returning hidden states with responses. | `False` | bool flag (set to enable) |
 | `--scheduler-recv-interval` | The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |
+| `--enable-layerwise-nvtx-marker` | Enable layerwise NVTX profiling annotations for the model. This adds NVTX markers to every layer for detailed per-layer performance analysis with Nsight Systems. | `False` | bool flag (set to enable) |
 
 ## Debug tensor dumps
 | Argument | Description | Defaults | Options |
