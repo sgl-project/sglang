@@ -17,7 +17,7 @@ def fused_moe_forward_native(
     dispatch_output: StandardDispatchOutput,
 ) -> torch.Tensor:
 
-    x, topk_output = dispatch_output
+    x, x_scale, topk_output = dispatch_output
     moe_runner_config = layer.moe_runner_config
 
     if moe_runner_config.apply_router_weight_on_input:
