@@ -1,7 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
-use image::{codecs::png::PngEncoder, ColorType, ImageEncoder, Rgba, RgbaImage};
 use reqwest::Client;
 use sglang_router_rs::multimodal::{
     AsyncMultiModalTracker, ChatContentPart, ConversationSegment, ImageFetchConfig, ImageSource,
@@ -9,18 +8,13 @@ use sglang_router_rs::multimodal::{
 };
 use tempfile::tempdir;
 
+const TINY_PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+
 fn tiny_png_bytes() -> Vec<u8> {
-    let mut buf = Vec::new();
-    let image = RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255]));
-    PngEncoder::new(&mut buf)
-        .write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            ColorType::Rgba8.into(),
-        )
-        .expect("encode png");
-    buf
+    BASE64_STANDARD
+        .decode(TINY_PNG_BASE64)
+        .expect("decode tiny png fixture")
 }
 
 fn test_connector(allowed_path: Option<PathBuf>) -> MediaConnector {
@@ -76,10 +70,11 @@ async fn fetch_image_from_data_url() {
 #[tokio::test]
 async fn fetch_image_from_file() {
     let tmp = tempdir().expect("tempdir");
-    let file_path = tmp.path().join("tiny.png");
+    let allowed_root = std::fs::canonicalize(tmp.path()).expect("canonical tmp path");
+    let file_path = allowed_root.join("tiny.png");
     std::fs::write(&file_path, tiny_png_bytes()).expect("write png");
 
-    let connector = test_connector(Some(tmp.path().to_path_buf()));
+    let connector = test_connector(Some(allowed_root));
     let frame = connector
         .fetch_image(
             MediaSource::File(file_path.clone()),
