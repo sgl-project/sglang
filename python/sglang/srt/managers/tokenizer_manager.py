@@ -815,6 +815,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
+                decode_dp_rank=obj.decode_dp_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
             )

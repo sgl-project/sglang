@@ -3,7 +3,9 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, sync::RwLock};
+use std::collections::{HashMap};
+use tracing::{debug};
 
 use crate::core::Worker;
 
@@ -74,8 +76,20 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
-    fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
+    fn update_loads(&self, _loads: &HashMap<String, isize>) {
         // Default: no-op for policies that don't use load information
+    }
+
+    fn update_dp_loads(&self, _loads: &HashMap<String, HashMap<isize, isize>>) {
+        // Default: no-op for policies that don't use load information
+    }
+
+    fn get_lowest_dp_load(&self, _worker: &dyn Worker) -> Option<isize> {
+        None
+    }
+
+    fn load_increment(&self, _worker: &dyn Worker, _dp_rank: isize, _tokens: isize) {
+        // Default
     }
 
     /// Reset any internal state
@@ -124,6 +138,50 @@ impl Default for BucketConfig {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.0001,
             bucket_adjust_interval_secs: 5,
+        }
+    }
+}
+
+/// Configuration for cache-aware policy
+#[derive(Debug, Default)]
+pub struct DPLoadManager {
+    dp_cached_loads: RwLock<HashMap<String, HashMap<isize, isize>>>,
+}
+
+impl DPLoadManager {
+    pub fn new() -> Self {
+        Self {
+            dp_cached_loads: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
+        debug!("RoundRobinPolicy update_dp_loads map:{:?}", loads);
+        if let Ok(mut cached) = self.dp_cached_loads.write() {
+            *cached = loads.clone();
+        }
+    }
+
+    pub fn get_lowest_dp_load(&self, worker: &dyn Worker) -> Option<isize> {
+        if let Ok(cached_loads) = self.dp_cached_loads.read() {
+            if let Some(loads) = cached_loads.get(worker.url()) {
+                return loads.iter()
+                    .min_by_key(|&(_, load)| load)
+                    .map(|(&rand_id, _)| rand_id);
+            }
+        }
+        None
+    }
+
+    pub fn load_increment(&self, worker: &dyn Worker, dp_rank: isize, increment: isize) {
+        // Add an increment to the load of dp group,
+        // to prevent all request from being scheduled to the same DP group during the interval between two load reports.
+        if let Ok(mut cached_loads) = self.dp_cached_loads.write() {
+            if let Some(loads) = cached_loads.get_mut(worker.url()) {
+                if let Some(dp_load) = loads.get_mut(&dp_rank) {
+                    *dp_load += increment;
+                }
+            }
         }
     }
 }

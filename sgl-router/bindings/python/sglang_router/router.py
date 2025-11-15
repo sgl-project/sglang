@@ -76,6 +76,7 @@ class Router:
         port: Port number to bind the router server. Default: 3001
         worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
         worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
+        worker_load_check_interval: Interval in seconds between get loads for worker initialization. Default: 10
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker
             if the match rate exceeds threshold, otherwise routes to the worker with the smallest
             tree. Default: 0.5
@@ -88,6 +89,7 @@ class Router:
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         dp_aware: Enable data parallelism aware schedule. Default: False
+        dp_minimum_tokens_scheduler: Enable minimum tokens scheduler for data parallel group. Default: False
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
             the router can manage multiple models simultaneously with per-model load balancing
             policies. Default: False

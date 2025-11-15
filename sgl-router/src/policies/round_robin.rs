@@ -4,8 +4,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::collections::{HashMap};
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, DPLoadManager};
 use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Round-robin selection policy
@@ -14,12 +15,14 @@ use crate::{core::Worker, metrics::RouterMetrics};
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
     counter: AtomicUsize,
+    dp_load_manager: DPLoadManager,
 }
 
 impl RoundRobinPolicy {
     pub fn new() -> Self {
         Self {
             counter: AtomicUsize::new(0),
+            dp_load_manager: DPLoadManager::new(),
         }
     }
 }
@@ -56,6 +59,18 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
+        return self.dp_load_manager.update_dp_loads(loads);
+    }
+
+    fn get_lowest_dp_load(&self, worker: &dyn Worker) -> Option<isize> {
+        return self.dp_load_manager.get_lowest_dp_load(worker);
+    }
+
+    fn load_increment(&self, worker: &dyn Worker, dp_rank: isize, tokens: isize) {
+        return self.dp_load_manager.load_increment(worker, dp_rank, tokens);
     }
 }
 

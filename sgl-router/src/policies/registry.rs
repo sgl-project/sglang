@@ -1,6 +1,10 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc,
+        RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use tracing::{debug, info, warn};
@@ -34,6 +38,9 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode
     decode_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
+
+    /// Enable minimum tokens scheduler for dp group
+    dp_minimum_tokens_scheduler: Arc<AtomicBool>,
 }
 
 impl PolicyRegistry {
@@ -47,7 +54,16 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
+            dp_minimum_tokens_scheduler: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn enable_dp_minimum_tokens_scheduler(&self) {
+        self.dp_minimum_tokens_scheduler.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_dp_minimum_tokens_scheduler_enabled(&self) -> bool {
+        self.dp_minimum_tokens_scheduler.load(Ordering::Relaxed)
     }
 
     /// Called when a worker is added
@@ -312,6 +328,41 @@ impl PolicyRegistry {
         }
 
         power_of_two_policies
+    }
+
+    pub fn get_all_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        let mut all_policies = Vec::new();
+
+        all_policies.push(Arc::clone(&self.default_policy));
+
+        if let Some(ref policy) = *self.prefill_policy.read().unwrap() {
+            if !Arc::ptr_eq(policy, &self.default_policy) {
+                all_policies.push(Arc::clone(policy));
+            }
+        }
+
+        if let Some(ref policy) = *self.decode_policy.read().unwrap() {
+            if !Arc::ptr_eq(policy, &self.default_policy)
+                && !self
+                    .prefill_policy
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(p, policy))
+            {
+                all_policies.push(Arc::clone(policy));
+            }
+        }
+
+        let model_policies = self.model_policies.read().unwrap();
+        for policy in model_policies.values() {
+            let already_added = all_policies.iter().any(|p| Arc::ptr_eq(p, policy));
+            if !already_added {
+                all_policies.push(Arc::clone(policy));
+            }
+        }
+
+        all_policies
     }
 
     /// Initialize cache-aware policy with workers if applicable
