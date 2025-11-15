@@ -201,11 +201,7 @@ torch::Tensor timestep_embedding_kernel_cuda(
 
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "Error in timestep_embedding_forward: %s\n", cudaGetErrorString(err));
-        exit(-1);
-    }
-
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
     return output;
 }
 
