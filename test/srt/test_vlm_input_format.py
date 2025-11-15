@@ -1,390 +1,927 @@
-import json
-import unittest
-from io import BytesIO
-from typing import Optional
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""
+The entry point of inference server. (SRT = SGLang Runtime)
 
-import requests
+This file implements python APIs for the inference engine.
+"""
+
+import asyncio
+import atexit
+import dataclasses
+import logging
+import multiprocessing as mp
+import os
+import random
+import signal
+import threading
+import time
+from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+
+import zmq
+
+# Fix a bug of Python threading
+setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+
 import torch
-from PIL import Image
-from transformers import (
-    AutoModel,
-    AutoProcessor,
-    Gemma3ForConditionalGeneration,
-    Qwen2_5_VLForConditionalGeneration,
+import uvloop
+
+from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
 )
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
+    EmbeddingReqInput,
+    GenerateReqInput,
+    GetWeightsByNameReqInput,
+    InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
+    MultimodalDataInputFormat,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+    RpcReqInput,
+    RpcReqOutput,
+    UnloadLoRAAdapterReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
+from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    assert_pkg_version,
+    configure_logger,
+    get_bool_env_var,
+    get_zmq_socket,
+    is_cuda,
+    kill_process_tree,
+    launch_dummy_health_check_server,
+    maybe_reindex_device_id,
+    prepare_model_and_tokenizer,
+    set_prometheus_multiproc_dir,
+    set_ulimit,
+)
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.version import __version__
 
-from sglang import Engine
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.parser.conversation import generate_chat_conv
+logger = logging.getLogger(__name__)
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
-IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
+_is_cuda = is_cuda()
 
 
-class VLMInputTestBase:
-    model_path = None
-    chat_template = None
-    processor = None
-    visual = None  # Should be a callable for precomputed embeddings
+class Engine(EngineBase):
+    """
+    The entry point to the inference engine.
 
-    @classmethod
-    def setUpClass(cls):
-        assert cls.model_path is not None, "Set model_path in subclass"
-        assert cls.chat_template is not None, "Set chat_template in subclass"
-        cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cls.main_image = []
-        for image_url in cls.image_urls:
-            response = requests.get(image_url)
-            cls.main_image.append(Image.open(BytesIO(response.content)))
-        cls.processor = AutoProcessor.from_pretrained(
-            cls.model_path, trust_remote_code=True, use_fast=True
+    - The engine consists of three components:
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+
+    Note:
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
+    """
+
+    def __init__(self, **kwargs):
+        """
+        The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
+        Please refer to `ServerArgs` for the documentation.
+        """
+
+        # Parse server_args
+        if "server_args" in kwargs:
+            # Directly load server_args
+            server_args = kwargs["server_args"]
+        else:
+            # Construct server_args from kwargs
+            if "log_level" not in kwargs:
+                # Do not print logs by default
+                kwargs["log_level"] = "error"
+            server_args = ServerArgs(**kwargs)
+        self.server_args = server_args
+        logger.info(f"{server_args=}")
+
+        # Shutdown the subprocesses automatically when the program exits
+        atexit.register(self.shutdown)
+
+        # Launch subprocesses
+        tokenizer_manager, template_manager, scheduler_info, port_args = (
+            _launch_subprocesses(server_args=server_args)
         )
-        cls._init_visual()
+        self.tokenizer_manager = tokenizer_manager
+        self.template_manager = template_manager
+        self.scheduler_info = scheduler_info
+        self.port_args = port_args
 
-    @classmethod
-    def _init_visual(cls):
-        """Override in subclass to set up cls.visual as a callable for precomputed embeddings."""
-        raise NotImplementedError
-
-    def setUp(self):
-        self.engine = Engine(
-            model_path=self.model_path,
-            chat_template=self.chat_template,
-            device=self.device.type,
-            mem_fraction_static=0.8,
-            enable_multimodal=True,
-            disable_cuda_graph=True,
-            trust_remote_code=True,
+        # Initialize ZMQ sockets
+        context = zmq.Context(2)
+        self.send_to_rpc = get_zmq_socket(
+            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
 
-    def tearDown(self):
-        self.engine.shutdown()
+        # Enable tracing
+        if server_args.enable_trace:
+            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+            thread_label = "Tokenizer"
+            if server_args.disaggregation_mode == "prefill":
+                thread_label = "Prefill Tokenizer"
+            elif server_args.disaggregation_mode == "decode":
+                thread_label = "Decode Tokenizer"
+            trace_set_thread_info(thread_label)
 
-    def verify_response(self, output):
-        # The goal is to check that the model roughly understands:
-        #   - image 1: taxi / car scene
-        #   - image 2: SGL logo / company
-        # We intentionally keep the check keyword-based and loose to avoid
-        # overfitting to a specific phrasing.
-        out_text = output["text"].lower()
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
 
-<<<<<<< HEAD
-        car_keywords = ("taxi", "cab", "car", "vehicle", "suv", "van", "truck", "auto")
-        assert any(w in out_text for w in car_keywords), out_text
-=======
-        assert any(w in out_text for w in ("taxi", "cab", "car")), out_text
->>>>>>> 23ed88531 (test: relax VLM input format assertions for image understanding (#12755))
-
-        has_sg_or_logo_side = any(
-            kw in out_text
-            for kw in (
-                "sg ",
-                "sgl",
-                " sgl",
-                "logo",
-                "software guidance",
-                "labs",
-                "laborator",
-                "company",
-                " text",
-<<<<<<< HEAD
-                "letters",
-                "icon",
-                "sgi",  # 容忍一次错拼
-=======
->>>>>>> 23ed88531 (test: relax VLM input format assertions for image understanding (#12755))
-            )
-        )
-        assert has_sg_or_logo_side, out_text
-
-    def get_completion_request(self) -> ChatCompletionRequest:
-        json_structure = {
-            "model": self.model_path,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": self.image_urls[0]}},
-                        {"type": "image_url", "image_url": {"url": self.image_urls[1]}},
-                        {
-                            "type": "text",
-                            "text": "There are two pictures. First describe picture 1, then picture 2. What are in these pictures?",
-                        },
-                    ],
-                }
-            ],
-        }
-        json_str = json.dumps(json_structure)
-        return ChatCompletionRequest.model_validate_json(json_str)
-
-    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None):
-        if req is None:
-            req = self.get_completion_request()
-        conv = generate_chat_conv(req, template_name=self.chat_template)
-        text = conv.get_prompt()
-
-        # Process inputs using processor
-        inputs = self.processor(
-            text=[text],
-            images=self.main_image,
-            return_tensors="pt",
-        ).to(self.device)
-
-        return inputs, text
-
-    async def test_accepts_image(self):
-        req = self.get_completion_request()
-        conv = generate_chat_conv(req, template_name=self.chat_template)
-        text = conv.get_prompt()
-        output = await self.engine.async_generate(
-            prompt=text,
-            image_data=self.main_image,
-            sampling_params=dict(temperature=0.0),
-        )
-        self.verify_response(output)
-
-    async def test_accepts_precomputed_embeddings(self):
-        req = self.get_completion_request()
-        processor_output, _ = self.get_processor_output(req=req)
-        with torch.inference_mode():
-            precomputed_embeddings = self.__class__.visual(processor_output)
-        conv = generate_chat_conv(req, template_name=self.chat_template)
-        text = conv.get_prompt()
-        output = await self.engine.async_generate(
-            prompt=text,
-            image_data=self._precomputed_image_data(
-                processor_output, precomputed_embeddings
-            ),
-            sampling_params=dict(temperature=0.0),
-        )
-        self.verify_response(output)
-
-    async def test_accepts_processor_output(self):
-        req = self.get_completion_request()
-        processor_output, prompt = self.get_processor_output(req=req)
-        output = await self.engine.async_generate(
-            input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
-            image_data=[dict(processor_output, format="processor_output")],
-            sampling_params=dict(temperature=0.0),
-        )
-        self.verify_response(output)
-
-    def _processor_output_image_data(self, processor_output):
-        return [dict(processor_output, format="processor_output")]
-
-    def _precomputed_image_data(self, processor_output, precomputed_embeddings):
-        # Qwen2.5-VL：自己用视觉塔把每图算到“已 merge 的特征”，并逐图返回
-        if "image_grid_thw" in processor_output:
-            g = processor_output["image_grid_thw"]  # [N,3]
-            pv = processor_output["pixel_values"]  # [N,T,D] 或 [sum_T,D]
-            assert g.dim() == 2 and g.shape[1] == 3
-            N = int(g.shape[0])
-
-            visual = self.__class__.visual_model
-            projector = getattr(self.__class__, "mm_projector", None)
-            per_img_pv = []
-            if pv.dim() == 3:
-                assert pv.shape[0] == N
-                for i in range(N):
-                    per_img_pv.append(pv[i : i + 1])
-            else:
-                st = 0
-                for i in range(N):
-                    T = int((g[i, 0] * g[i, 1] * g[i, 2]).item())
-                    ed = st + T
-                    per_img_pv.append(pv[st:ed])
-                    st = ed
-
-            items = []
-            with torch.inference_mode():
-                for i in range(N):
-                    v = visual(per_img_pv[i], grid_thw=g[i : i + 1])  # [Li, Dv]
-                    feat_i = (
-                        projector(v) if projector is not None else v
-                    )  # [Li, Dh] 供 LLM
-                    items.append(
-                        {
-                            "format": "precomputed_embedding",
-                            "precomputed_embeddings": feat_i.detach().cpu(),
-                            "num_vision_tokens": int(
-                                feat_i.shape[0]
-                            ),  # 仅提示注入长度，避免误路由
-                        }
-                    )
-            assert len(items) == N
-            return items
-
-        # Gemma-3：同理
-        pv = processor_output["pixel_values"]
-        vt = self.__class__.vision_tower
-        mp = self.__class__.mm_projector
-        items = []
-        with torch.inference_mode():
-            for i in range(pv.shape[0]):
-                feat_i = mp(vt(pixel_values=pv[i : i + 1]).last_hidden_state)  # [Li, D]
-                items.append(
-                    {
-                        "format": "precomputed_embedding",
-                        "precomputed_embeddings": feat_i.detach().cpu(),
-                        "num_vision_tokens": int(feat_i.shape[0]),
-                    }
+    def generate(
+        self,
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
+        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+        # Can be formatted as:
+        # - Single image for a single request
+        # - List of images (one per request in a batch)
+        # - List of lists of images (multiple images per request)
+        # See also python/sglang/srt/utils.py:load_image for more details.
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: bool = False,
+        stream: bool = False,
+        bootstrap_host: Optional[Union[List[str], str]] = None,
+        bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_room: Optional[Union[List[int], int]] = None,
+        data_parallel_rank: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
+    ) -> Union[Dict, Iterator[Dict]]:
+        """
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
+        Please refer to `GenerateReqInput` for the documentation.
+        """
+        if self.server_args.enable_dp_attention:
+            if data_parallel_rank is None:
+                logger.debug("data_parallel_rank not provided, using default dispatch")
+            elif data_parallel_rank < 0:
+                raise ValueError("data_parallel_rank must be non-negative")
+            elif data_parallel_rank >= self.server_args.dp_size:
+                raise ValueError(
+                    f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}"
                 )
-        return items
+
+        obj = GenerateReqInput(
+            text=prompt,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
+            lora_path=lora_path,
+            custom_logit_processor=custom_logit_processor,
+            return_hidden_states=return_hidden_states,
+            stream=stream,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
+            data_parallel_rank=data_parallel_rank,
+            rid=rid,
+        )
+        generator = self.tokenizer_manager.generate_request(obj, None)
+
+        if stream:
+
+            def generator_wrapper():
+                while True:
+                    try:
+                        chunk = self.loop.run_until_complete(generator.__anext__())
+                        yield chunk
+                    except StopAsyncIteration:
+                        break
+
+            return generator_wrapper()
+        else:
+            ret = self.loop.run_until_complete(generator.__anext__())
+            return ret
+
+    async def async_generate(
+        self,
+        # The input prompt. It can be a single prompt or a batch of prompts.
+        prompt: Optional[Union[List[str], str]] = None,
+        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        # The token ids for text; one can either specify text or input_ids.
+        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+        # Can be formatted as:
+        # - Single image for a single request
+        # - List of images (one per request in a batch)
+        # - List of lists of images (multiple images per request)
+        # See also python/sglang/srt/utils.py:load_image for more details.
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
+        return_logprob: Optional[Union[List[bool], bool]] = False,
+        logprob_start_len: Optional[Union[List[int], int]] = None,
+        top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+        lora_path: Optional[List[Optional[str]]] = None,
+        custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: bool = False,
+        stream: bool = False,
+        bootstrap_host: Optional[Union[List[str], str]] = None,
+        bootstrap_port: Optional[Union[List[int], int]] = None,
+        bootstrap_room: Optional[Union[List[int], int]] = None,
+        data_parallel_rank: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
+    ) -> Union[Dict, AsyncIterator[Dict]]:
+        """
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
+        Please refer to `GenerateReqInput` for the documentation.
+        """
+
+        if self.server_args.enable_dp_attention:
+            if data_parallel_rank is None:
+                logger.debug("data_parallel_rank not provided, using default dispatch")
+            elif data_parallel_rank < 0:
+                raise ValueError("data_parallel_rank must be non-negative")
+            elif data_parallel_rank >= self.server_args.dp_size:
+                raise ValueError(
+                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
+                )
+
+        logger.debug(f"data_parallel_rank: {data_parallel_rank}")
+        obj = GenerateReqInput(
+            text=prompt,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
+            lora_path=lora_path,
+            return_hidden_states=return_hidden_states,
+            stream=stream,
+            custom_logit_processor=custom_logit_processor,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
+            data_parallel_rank=data_parallel_rank,
+            rid=rid,
+        )
+        generator = self.tokenizer_manager.generate_request(obj, None)
+
+        if stream is True:
+            return generator
+        else:
+            return await generator.__anext__()
+
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
+        dimensions: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
+    ) -> Dict:
+        """
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(
+            text=prompt,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+            dimensions=dimensions,
+            rid=rid,
+        )
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        ret = self.loop.run_until_complete(generator.__anext__())
+        return ret
+
+    async def async_encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        image_data: Optional[MultimodalDataInputFormat] = None,
+        audio_data: Optional[MultimodalDataInputFormat] = None,
+        video_data: Optional[MultimodalDataInputFormat] = None,
+        dimensions: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
+    ) -> Dict:
+        """
+        Asynchronous version of encode method.
+
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(
+            text=prompt,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+            dimensions=dimensions,
+            rid=rid,
+        )
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        return await generator.__anext__()
+
+    def rerank(
+        self,
+        prompt: Union[List[List[str]]],
+    ) -> Dict:
+        """
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(text=prompt, is_cross_encoder_request=True)
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        ret = self.loop.run_until_complete(generator.__anext__())
+        return ret
+
+    def shutdown(self):
+        """Shutdown the engine"""
+        kill_process_tree(os.getpid(), include_parent=False)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+        return False
+
+    def flush_cache(self):
+        return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
+    def start_profile(self, **kwargs):
+        self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
+
+    def stop_profile(self):
+        self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
+
+    def start_expert_distribution_record(self):
+        self.loop.run_until_complete(
+            self.tokenizer_manager.start_expert_distribution_record()
+        )
+
+    def stop_expert_distribution_record(self):
+        self.loop.run_until_complete(
+            self.tokenizer_manager.stop_expert_distribution_record()
+        )
+
+    def dump_expert_distribution_record(self):
+        self.loop.run_until_complete(
+            self.tokenizer_manager.dump_expert_distribution_record()
+        )
+
+    def get_server_info(self):
+        internal_states = self.loop.run_until_complete(
+            self.tokenizer_manager.get_internal_state()
+        )
+        return {
+            **dataclasses.asdict(self.tokenizer_manager.server_args),
+            **self.scheduler_info,
+            "internal_states": internal_states,
+            "version": __version__,
+        }
+
+    def init_weights_update_group(
+        self,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+        backend: str = "nccl",
+    ):
+        """Initialize parameter update group."""
+        obj = InitWeightsUpdateGroupReqInput(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.init_weights_update_group(obj, None)
+        )
+
+    def destroy_weights_update_group(
+        self,
+        group_name: str,
+    ):
+        """Destroy parameter update group."""
+        obj = DestroyWeightsUpdateGroupReqInput(
+            group_name=group_name,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
+    def update_weights_from_distributed(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
+    ):
+        """Update weights from distributed source."""
+        obj = UpdateWeightsFromDistributedReqInput(
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            flush_cache=flush_cache,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_distributed(obj, None)
+        )
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+    ):
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
+        to avoid duplicated cache cleaning operation."""
+        if load_format == "flattened_bucket":
+            serialized_named_tensors = named_tensors
+        else:
+            serialized_named_tensors = [
+                MultiprocessingSerializer.serialize(named_tensors)
+                for _ in range(self.server_args.tp_size)
+            ]
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=serialized_named_tensors,
+            load_format=load_format,
+            flush_cache=flush_cache,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_tensor(obj, None)
+        )
+
+    def update_weights_from_disk(
+        self,
+        model_path: str,
+        load_format: Optional[str] = None,
+    ):
+        """Update the weights from disk inplace without re-launching the engine.
+
+        This method allows updating the model weights from disk without restarting
+        the engine. It can be used to load a different model or update weights with
+        new training.
+        """
+        obj = UpdateWeightFromDiskReqInput(
+            model_path=model_path,
+            load_format=load_format,
+        )
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_disk(obj, None)
+        )
+
+    def update_weights_from_ipc(
+        self,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ):
+        """Update weights from IPC for checkpoint-engine integration."""
+        obj = UpdateWeightsFromIPCReqInput(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_ipc(obj, None)
+        )
+
+    def get_weights_by_name(self, name: str, truncate_size: int = 100):
+        """Get weights by parameter name."""
+        obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+        """Load a new LoRA adapter without re-launching the engine."""
+
+        obj = LoadLoRAAdapterReqInput(
+            lora_name=lora_name,
+            lora_path=lora_path,
+            pinned=pinned,
+        )
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter(obj, None)
+        )
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a LoRA adapter without re-launching the engine."""
+
+        obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.unload_lora_adapter(obj, None)
+        )
+
+    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        obj = ReleaseMemoryOccupationReqInput(tags=tags)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.release_memory_occupation(obj, None)
+        )
+
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        obj = ResumeMemoryOccupationReqInput(tags=tags)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.resume_memory_occupation(obj, None)
+        )
+
+    def freeze_gc(self):
+        """
+        To maintain a high performance server with low latency, we want to reduce the
+        stalls caused by the garbage collector scanning through a large number of objects.
+
+        It is usually helpful to start the server and warm it up with real requests to
+        initialize many of the long-lived objects that do not need to be garbage collected.
+
+        After sufficient warmup, we can call this function to freeze the garbage collector
+        so that all objects created before this point are considered out of scope for garbage
+        collection.
+        """
+
+        self.loop.run_until_complete(self.tokenizer_manager.freeze_gc())
+
+    """
+    Execute an RPC call on all scheduler processes.
+    """
+
+    def collective_rpc(self, method: str, **kwargs):
+        obj = RpcReqInput(method=method, parameters=kwargs)
+        self.send_to_rpc.send_pyobj(obj)
+        recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
+        assert isinstance(recv_req, RpcReqOutput)
+        assert recv_req.success, recv_req.message
+
+    def save_remote_model(self, **kwargs):
+        self.collective_rpc("save_remote_model", **kwargs)
+
+    def save_sharded_model(self, **kwargs):
+        self.collective_rpc("save_sharded_model", **kwargs)
+
+    def score(
+        self,
+        query: Optional[Union[str, List[int]]] = None,
+        items: Optional[Union[str, List[str], List[List[int]]]] = None,
+        label_token_ids: Optional[List[int]] = None,
+        apply_softmax: bool = False,
+        item_first: bool = False,
+    ) -> List[List[float]]:
+        """
+        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
+        query = "<|user|>Is the following city the capital of France? "
+        items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
+        label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
+        item_first = False
+
+        This would pass the following prompts to the model:
+        "<|user|>Is the following city the capital of France? Paris <|assistant|>"
+        "<|user|>Is the following city the capital of France? London <|assistant|>"
+        "<|user|>Is the following city the capital of France? Berlin <|assistant|>"
+        The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
+        The output would look like:
+        [[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]]
 
 
-class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
-    model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
-    chat_template = "qwen2-vl"
+        Args:
+            query: The query text or pre-tokenized query token IDs. Must be provided.
+            items: The item text(s) or pre-tokenized item token IDs. Must be provided.
+            label_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
+            apply_softmax: Whether to normalize probabilities using softmax.
+            item_first: If True, prepend items to query. Otherwise append items to query.
 
-    @classmethod
-    def _init_visual(cls):
-        m = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                cls.model_path, torch_dtype=torch.bfloat16
+        Returns:
+            List of dictionaries mapping token IDs to their probabilities for each item.
+            Each dictionary in the list corresponds to one item input.
+
+        Raises:
+            ValueError: If query is not provided, or if items is not provided,
+                      or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
+        """
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.score_request(
+                query=query,
+                items=items,
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+                item_first=item_first,
+                request=None,
             )
-            .eval()
-            .to(cls.device)
         )
 
-        # 视觉塔优先从 m.model.visual 取；若透传也支持 m.visual
-        cls.visual_model = getattr(m.model, "visual", None) or getattr(
-            m, "visual", None
+    async def async_score(
+        self,
+        query: Optional[Union[str, List[int]]] = None,
+        items: Optional[Union[str, List[str], List[List[int]]]] = None,
+        label_token_ids: Optional[List[int]] = None,
+        apply_softmax: bool = False,
+        item_first: bool = False,
+    ) -> List[List[float]]:
+        """
+        Asynchronous version of score method.
+
+        See score() for detailed documentation.
+        """
+        return await self.tokenizer_manager.score_request(
+            query=query,
+            items=items,
+            label_token_ids=label_token_ids,
+            apply_softmax=apply_softmax,
+            item_first=item_first,
+            request=None,
         )
-        assert (
-            cls.visual_model is not None
-        ), "visual tower not found on Qwen2.5-VL model"
 
-        # 投影层常见命名与挂载位置做兜底匹配
-        cand_names = [
-            "multi_modal_projector",
-            "mm_projector",
-            "vision_projector",
-            "visual_projector",
-            "multi_modal_resampler",
-            "perceiver_resampler",
-        ]
-        proj = None
-        for name in cand_names:
-            proj = getattr(m.model, name, None) or getattr(m, name, None)
-            if proj is not None:
-                break
-        cls.mm_projector = proj  # 可能为 None（有的权重视觉塔直接输出 Dh）
 
-        # 供 test 中的 self.__class__.visual(...) 直接用
-        def _qwen_visual(po):
-            v = cls.visual_model(
-                po["pixel_values"], po["image_grid_thw"]
-            )  # [L_i, Dv or Dh]
-            return cls.mm_projector(v) if cls.mm_projector is not None else v
+def _set_envs_and_config(server_args: ServerArgs):
+    # Set global environments
+    if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    if (
+        "NCCL_NVLS_ENABLE" not in os.environ
+        or server_args.enable_nccl_nvls
+        or server_args.enable_symm_mem
+    ):
+        os.environ["NCCL_NVLS_ENABLE"] = str(
+            int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
+        )
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
-        cls.visual = _qwen_visual
+    if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
+        # flashinfer uses this environment variable for various kernels from MoE to quant kernels
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
-    def _processor_output_image_data(self, processor_output):
-        pv = processor_output["pixel_values"]
-        gthw = processor_output["image_grid_thw"]
-        num_images = pv.shape[0]
-        items = []
-        for i in range(num_images):
-            items.append(
-                {
-                    "format": "processor_output",
-                    "pixel_values": pv[i : i + 1],
-                    "image_grid_thw": gthw[i : i + 1],
-                }
+    if os.environ.get("CUTE_DSL_LOG_LEVEL") is None:
+        # Default to warning level, to avoid too many logs
+        os.environ["CUTE_DSL_LOG_LEVEL"] = "30"
+
+    if os.environ.get("CUTE_DSL_LOG_TO_CONSOLE") is None:
+        # Need to set log to console, otherwise the log level won't take effect
+        os.environ["CUTE_DSL_LOG_TO_CONSOLE"] = "1"
+
+    # Can also be passed as argument
+    os.environ["SGLANG_RUN_ID"] = (
+        f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    )
+
+    # Set prometheus env vars
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+
+    # Set ulimit
+    set_ulimit()
+
+    # Check flashinfer version
+    if server_args.attention_backend == "flashinfer":
+        assert_pkg_version(
+            "flashinfer_python",
+            "0.5.2",
+            "Please uninstall the old version and "
+            "reinstall the latest version by following the instructions "
+            "at https://docs.flashinfer.ai/installation.html.",
+        )
+    if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
+        assert_pkg_version(
+            "sgl-kernel",
+            "0.3.17.post1",
+            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+        )
+
+    if True:  # Keep this check for internal code compatibility
+        # Register the signal handler.
+        # The child processes will send SIGQUIT to this process when any error happens
+        # This process then clean up the whole process tree
+        # Note: This sigquit handler is used in the launch phase, and may be replaced by
+        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+        def launch_phase_sigquit_handler(signum, frame):
+            logger.error(
+                "Received sigquit from a child process. It usually means the child failed."
             )
-        return items
+            kill_process_tree(os.getpid())
+
+        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+
+    # Set mp start method
+    mp.set_start_method("spawn", force=True)
 
 
-class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
-    # model_path = "google/gemma-3-4b-it"
-    model_path = "/root/.cache/modelscope/hub/models/LLM-Research/gemma-3-4b-it"
-    chat_template = "gemma-it"
+def _init_tokenizer_manager(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    TokenizerManagerClass: Optional[TokenizerManager] = None,
+) -> TokenizerManager:
+    # Launch tokenizer process
+    TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
+    tokenizer_manager = TokenizerManagerClass(server_args, port_args)
 
-    @classmethod
-    def _init_visual(cls):
-        model = Gemma3ForConditionalGeneration.from_pretrained(
-            cls.model_path, torch_dtype=torch.bfloat16
+    # Initialize templates
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
+
+    return tokenizer_manager, template_manager
+
+
+def _launch_subprocesses(
+    server_args: ServerArgs, port_args: Optional[PortArgs] = None
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    """
+    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    """
+    # Configure global environment
+    configure_logger(server_args)
+    server_args.check_server_args()
+    _set_envs_and_config(server_args)
+
+    # Allocate ports for inter-process communications
+    if port_args is None:
+        port_args = PortArgs.init_new(server_args)
+        logger.info(f"{server_args=}")
+
+    # If using model from www.modelscope.cn, first download the model.
+    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
+        server_args.model_path, server_args.tokenizer_path
+    )
+
+    scheduler_procs = []
+    if server_args.dp_size == 1:
+        # Launch tensor parallel scheduler processes
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
         )
-        cls.vision_tower = model.vision_tower.eval().to(cls.device)
-        cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
-        cls.visual = lambda processor_output: cls.mm_projector(
-            cls.vision_tower(
-                pixel_values=processor_output["pixel_values"]
-            ).last_hidden_state
+        scheduler_pipe_readers = []
+
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
         )
 
-    # Temporarily skip Kimi-VL for CI test due to issue in transformers=4.57.0
-    # class TestKimiVLImageUnderstandsImage(
-    #     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
-    # ):
-    #     model_path = "moonshotai/Kimi-VL-A3B-Instruct"
-    #     chat_template = "kimi-vl"
+        nnodes_per_tp_group = nnodes_per_pp_rank
+        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+        tp_rank_range = range(
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        )
 
-    #     @classmethod
-    #     def _init_visual(cls):
-    #         model = AutoModel.from_pretrained(cls.model_path, trust_remote_code=True)
-    #         cls.vision_tower = model.vision_tower.eval().to(cls.device)
-    #         cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-    #         cls.visual = lambda tokenizer_output: cls.mm_projector(
-    #             cls.vision_tower(
-    #                 pixel_values=tokenizer_output["pixel_values"],
-    #                 grid_hws=tokenizer_output["image_grid_hws"],
-    #             )
-    #         )
+                with maybe_reindex_device_id(gpu_id) as gpu_id:
+                    proc = mp.Process(
+                        target=run_scheduler_process,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
 
-    def _processor_output_image_data(self, processor_output):
-        pv = processor_output["pixel_values"]
-        num_images = pv.shape[0]
-        items = []
-        for i in range(num_images):
-            items.append(
-                {
-                    "format": "processor_output",
-                    "pixel_values": pv[i : i + 1],
-                }
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
+    else:
+        # Launch the data parallel controller
+        reader, writer = mp.Pipe(duplex=False)
+        scheduler_pipe_readers = [reader]
+        proc = mp.Process(
+            target=run_data_parallel_controller_process,
+            args=(server_args, port_args, writer),
+        )
+        proc.start()
+        scheduler_procs.append(proc)
+
+    if server_args.node_rank >= 1:
+        # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
+        # so they can just wait here.
+
+        for reader in scheduler_pipe_readers:
+            data = reader.recv()
+            assert data["status"] == "ready"
+
+        if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+            # When using `Engine` as a Python API, we don't want to block here.
+            return None, None, None, port_args
+
+        launch_dummy_health_check_server(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
+
+        for proc in scheduler_procs:
+            proc.join()
+            logger.error(
+                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return items
+        return None, None, None, port_args
 
+    # Launch detokenizer process
+    detoken_proc = mp.Process(
+        target=run_detokenizer_process,
+        args=(
+            server_args,
+            port_args,
+        ),
+    )
+    detoken_proc.start()
 
-# not for CI: too large
-# class TestLlama4ImageUnderstandsImage(
-#     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
-# ):
-#     model_path = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-#     chat_template = "llama_4_vision"
+    # Init tokenizer manager first, as the bootstrap server is initialized here
+    if server_args.tokenizer_worker_num == 1:
+        tokenizer_manager, template_manager = _init_tokenizer_manager(
+            server_args, port_args
+        )
+    else:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+        template_manager = None
 
-#     def setUp(self):
-#         self.engine = Engine(
-#             model_path=self.model_path,
-#             trust_remote_code=True,
-#             chat_template=self.chat_template,
-#             enable_multimodal=True,
-#             mem_fraction_static=0.8,
-#             tp_size=4,
-#             attention_backend="fa3",
-#             context_length=65536,
-#         )
+    # Wait for the model to finish loading
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError:
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
 
-#     @classmethod
-#     def _init_visual(cls):
-#         model = AutoModel.from_pretrained(cls.model_path, trust_remote_code=True, torch_dtype="auto")
-#         cls.vision_tower = model.vision_model.eval().to(cls.device)
-#         cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
 
-#         cls.visual = lambda tokenizer_output: cls.mm_projector(
-#             cls.vision_tower(
-#                 pixel_values=tokenizer_output["pixel_values"],
-#             ).last_hidden_state.flatten(0, -2)
-#         )
+    # Assume all schedulers have the same scheduler_info
+    scheduler_info = scheduler_infos[0]
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
-#     def _pixel_values_image_data(self, processor_output):
-#         return dict(
-#             modality="IMAGE",
-#             pixel_values=processor_output["pixel_values"],
-#         )
-
-
-if __name__ == "__main__":
-    unittest.main()
+    return tokenizer_manager, template_manager, scheduler_info, port_args

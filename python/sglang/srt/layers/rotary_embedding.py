@@ -1556,6 +1556,27 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        def _safe_read_thw(
+            grid: torch.Tensor, idx: int
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """
+            允许 grid 形状:
+            - [3] / [1,3] / [B,3]
+            对 idx 超界做 clamp（使用最后一行），返回 0-dim tensor（后续 .item()）
+            """
+            if grid is None:
+                raise ValueError("image/video_grid_thw is required for visual tokens.")
+            if grid.dim() == 1:
+                g = grid  # [3]
+            elif grid.dim() == 2 and grid.shape[-1] == 3:
+                j = int(min(max(idx, 0), grid.shape[0] - 1))
+                g = grid[j]
+            else:
+                raise ValueError(
+                    f"Unexpected grid shape: {tuple(grid.shape)} (expect [3] or [B,3])."
+                )
+            return g[0], g[1], g[2]
+
         if model_type == "qwen3_omni_moe":
             # For qwen3-omni
             return MRotaryEmbedding.get_rope_index_qwen3_omni(
@@ -1612,22 +1633,15 @@ class MRotaryEmbedding(RotaryEmbedding):
                         ed_video = input_tokens.index(video_token_id, st)
                     else:
                         ed_video = len(input_tokens) + 1
+
                     if ed_image < ed_video:
-                        t, h, w = (
-                            image_grid_thw[image_index][0],
-                            image_grid_thw[image_index][1],
-                            image_grid_thw[image_index][2],
-                        )
+                        t, h, w = _safe_read_thw(image_grid_thw, image_index)
                         second_per_grid_t = 0
                         image_index += 1
                         remain_images -= 1
                         ed = ed_image
                     else:
-                        t, h, w = (
-                            video_grid_thw[video_index][0],
-                            video_grid_thw[video_index][1],
-                            video_grid_thw[video_index][2],
-                        )
+                        t, h, w = _safe_read_thw(video_grid_thw, video_index)
                         if second_per_grid_ts is not None:
                             second_per_grid_t = second_per_grid_ts[video_index]
                         else:
@@ -1635,6 +1649,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                         video_index += 1
                         remain_videos -= 1
                         ed = ed_video
+
                     llm_grid_t, llm_grid_h, llm_grid_w = (
                         t.item(),
                         h.item() // spatial_merge_size,
@@ -1779,7 +1794,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                         else (vision_tokens == video_token_id).sum()
                     )
 
-                
                 if has_audio:
                     audio_nums = (current_input_ids == audio_start_token_id).sum()
                 else:
@@ -1817,7 +1831,11 @@ class MRotaryEmbedding(RotaryEmbedding):
                     )
                     ed_audio_start = (
                         input_tokens.index(audio_start_token_id, st)
-                        if (has_audio and audio_token_id in input_tokens and remain_audios > 0)
+                        if (
+                            has_audio
+                            and audio_token_id in input_tokens
+                            and remain_audios > 0
+                        )
                         else len(input_tokens) + 1
                     )
                     min_ed = min(ed_vision_start, ed_audio_start)
@@ -1950,14 +1968,16 @@ class MRotaryEmbedding(RotaryEmbedding):
                             * second_per_grids[video_idx].cpu().float()
                             * position_id_per_seconds
                         ).float()
-                        video_llm_pos_ids = MRotaryEmbedding._get_llm_pos_ids_for_vision(
-                            st_idx,
-                            video_idx,
-                            spatial_merge_size,
-                            t_index,
-                            grid_hs,
-                            grid_ws,
-                            input_ids.device,
+                        video_llm_pos_ids = (
+                            MRotaryEmbedding._get_llm_pos_ids_for_vision(
+                                st_idx,
+                                video_idx,
+                                spatial_merge_size,
+                                t_index,
+                                grid_hs,
+                                grid_ws,
+                                input_ids.device,
+                            )
                         )
                         video_data_index, audio_data_index = 0, 0
                         while (
@@ -2055,7 +2075,6 @@ class MRotaryEmbedding(RotaryEmbedding):
             mrope_position_deltas = max_position_ids + 1 - s
 
             return position_ids, mrope_position_deltas
-
 
     # Adapted from https://github.com/vllm-project/vllm/blob/3779eb8c81449b924a23457fc77e45a0e6171178/vllm/model_executor/layers/rotary_embedding.py#L1120
     @staticmethod

@@ -13,14 +13,12 @@ from torch import nn
 
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
-    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
 
@@ -422,11 +420,9 @@ def _adjust_embedding_length(
     num_mm_tokens_in_input_ids = int(special_multimodal_mask.sum().item())
     num_mm_tokens_in_embedding = int(embedding.size(0))
 
-    
     if num_mm_tokens_in_embedding == num_mm_tokens_in_input_ids:
         return embedding
 
-    
     if num_mm_tokens_in_embedding < num_mm_tokens_in_input_ids:
         logger.warning(
             "Multimodal embedding shorter than expected: "
@@ -439,11 +435,8 @@ def _adjust_embedding_length(
 
         hidden_size = embedding.size(-1)
 
-        
         if num_mm_tokens_in_embedding == 0:
-            return embedding.new_zeros(
-                num_mm_tokens_in_input_ids, hidden_size
-            )
+            return embedding.new_zeros(num_mm_tokens_in_input_ids, hidden_size)
 
         pad = embedding.new_zeros(
             num_mm_tokens_in_input_ids - num_mm_tokens_in_embedding,
@@ -451,7 +444,6 @@ def _adjust_embedding_length(
         )
         return torch.cat([embedding, pad], dim=0)
 
-    
     logger.warning(
         "Multimodal embedding longer than expected: "
         "num_mm_tokens_in_input_ids=%d vs num_mm_tokens_in_embedding=%d. "
@@ -529,124 +521,247 @@ def embed_mm_inputs(
     """
     Embed multimodal inputs and integrate them with text token embeddings.
 
-    Args:
-        mm_inputs_list: List of multimodal inputs to process
-        extend_prefix_lens: Prefix lengths for each request
-        extend_seq_lens: Sequence lengths for each request
-        input_ids: Input token IDs tensor
-        input_embedding: Embedding layer for text tokens
-        placeholder_tokens: Token IDs for multimodal placeholders (uses pad_values if None)
-
     Returns:
-        Combined embedding tensor with multimodal content integrated
+        (inputs_embeds, other_info)
     """
     other_info = {}
     if mm_inputs_list is None:
         return None
 
-    # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
-    # we assume that multimodal data are represented with its pad_values in input_ids
+    # 1) 扁平化所有 mm items
     item_flatten_list = []
     for mm_inputs in mm_inputs_list:
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
 
-    # deepstack_embeddings: per-modality
-    modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
+    modalities: List[Modality] = []
+    embeddings: List[Optional[torch.Tensor]] = []
+    masks: List[Optional[torch.Tensor]] = []
+    deepstack_embeddings: List[torch.Tensor] = []
 
-    # 2. Get multimodal embedding separately
-    # Try get mm embedding if any
-    for modality in Modality.all():
-        items = [
-            item for item in item_flatten_list if item.is_modality(modality=modality)
+    target_hidden = input_embedding.embedding_dim
+
+    # —— helper: 仅在必要时做 projector（先 deepstack，再 projector）
+    def _maybe_project_feature(modality_str: str, feat: torch.Tensor) -> torch.Tensor:
+        if feat is None:
+            return None
+        if feat.shape[-1] == target_hidden:
+            return feat  # 已经对齐
+
+        # 候选 projector 名称（尽量覆盖常见实现与别名）
+        candidates = [
+            f"project_{modality_str}_feature",
+            f"{modality_str}_proj",
+            f"{modality_str}_projector",
+            "project_mm_feature",
+            "project_feature",
+            "mm_projector",
+            "mm_proj",
+            "vision_proj" if modality_str == "image" else None,
+            "visual_proj" if modality_str == "image" else None,
+            "visual_projector" if modality_str == "image" else None,
+            "visual_mlp" if modality_str == "image" else None,
+            "audio_proj" if modality_str == "audio" else None,
+            "audio_projector" if modality_str == "audio" else None,
         ]
-        embedder = (
-            None
-            if data_embedding_func_mapping is None
-            else data_embedding_func_mapping.get(modality, None)
+        candidates = [c for c in candidates if c]
+
+        projector = None
+
+        # 直接在 multimodal_model 上找
+        for name in candidates:
+            if hasattr(multimodal_model, name):
+                projector = getattr(multimodal_model, name)
+                break
+
+        # 常见的嵌套路径再探测一轮
+        if projector is None:
+            nest_paths = [
+                "model",
+                "language_model",
+                "vision_model",
+                "vision_tower",
+                "mm",
+                "modules",
+            ]
+            for p in nest_paths:
+                cur = getattr(multimodal_model, p, None)
+                if cur is None:
+                    continue
+                for name in candidates:
+                    if hasattr(cur, name):
+                        projector = getattr(cur, name)
+                        break
+                if projector is not None:
+                    break
+
+        if projector is not None:
+            out = projector(feat)
+            if out.shape[-1] != target_hidden:
+                raise RuntimeError(
+                    f"[embed_mm_inputs] projector `{projector.__class__.__name__}` "
+                    f"outputs dim={out.shape[-1]} but hidden={target_hidden}."
+                )
+            return out
+
+        # 没 projector 就显式报错（避免静默降级为随机线性层）
+        raise RuntimeError(
+            "[embed_mm_inputs] Found multimodal feature dim "
+            f"{feat.shape[-1]} but hidden size is {target_hidden}; no projector found. "
+            "Expose a projector on the model or make `get_*_feature` return aligned features."
         )
-        if embedder is None:
-            # "image", "video", etc
+
+    # 2) 逐模态取特征与 mask
+    for modality in Modality.all():
+        items = [it for it in item_flatten_list if it.is_modality(modality=modality)]
+
+        if len(items) == 0:
+            continue
+
+        # 选择 embedder
+        embedder = None
+        if data_embedding_func_mapping is not None:
+            embedder = data_embedding_func_mapping.get(modality, None)
+        if embedder is None and multimodal_model is not None:
             modality_id = modality.name.lower()
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
-        if len(items) != 0:
-            assert embedder is not None, f"no embedding method found for {modality}"
-            placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
-                device=input_ids.device,
-            )
-            # calculate per request items length offset
-            items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
-            items_offsets = []
-            for i, mm_inputs in enumerate(mm_inputs_list):
-                mm_items = [
-                    item
-                    for item in mm_inputs.mm_items
-                    if item.is_modality(modality=modality)
-                ]
-                items_size[i + 1] = len(mm_items)
-                items_offsets.append(
-                    flatten_nested_list([item.offsets for item in mm_items])
-                )
-            items_size = torch.cumsum(items_size, dim=0).tolist()
 
-            embedding, mask = get_embedding_and_mask(
-                data_embedding_func=embedder,
-                embedding_items=items,
-                placeholder_tensor=placeholder_tensor,
-                input_ids=input_ids,
-                items_size=items_size,
-                prefix_length=extend_prefix_lens,
-                extend_length=extend_seq_lens,
-                items_offset_list=items_offsets,
-            )
+        assert embedder is not None, f"no embedding method found for {modality}"
 
-            if use_deepstack.get(modality, None) and embedding is not None:
-                embedding, deepstack_embedding = (
-                    multimodal_model.separate_deepstack_embeds(embedding)
-                )
-                deepstack_embeddings += [deepstack_embedding]
-            modalities += [modality]
-            embeddings += [embedding]
-            masks += [mask]
+        placeholder_tensor = torch.as_tensor(
+            [item.pad_value for item in items],
+            device=input_ids.device,
+        )
 
-    # 3. Get input embeddings
+        # per-request offsets/lengths
+        items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
+        items_offsets = []
+        for i, mm_inputs in enumerate(mm_inputs_list):
+            mm_items = [
+                it for it in mm_inputs.mm_items if it.is_modality(modality=modality)
+            ]
+            items_size[i + 1] = len(mm_items)
+            items_offsets.append(flatten_nested_list([it.offsets for it in mm_items]))
+        items_size = torch.cumsum(items_size, dim=0).tolist()
+
+        embedding, mask = get_embedding_and_mask(
+            data_embedding_func=embedder,
+            embedding_items=items,
+            placeholder_tensor=placeholder_tensor,
+            input_ids=input_ids,
+            items_size=items_size,
+            prefix_length=extend_prefix_lens,
+            extend_length=extend_seq_lens,
+            items_offset_list=items_offsets,
+        )
+
+        if embedding is not None and mask is not None:
+            modality_str = modality.name.lower()
+
+            # ✅ 先做 deepstack 拆分（Qwen3-Omni: 8192=4×2048 等典型情况）
+            if use_deepstack.get(modality, False) and hasattr(
+                multimodal_model, "separate_deepstack_embeds"
+            ):
+                # 如果最后一维是 hidden 的整数倍且不等于 hidden，优先拆分
+                if (
+                    embedding.shape[-1] % target_hidden == 0
+                    and embedding.shape[-1] != target_hidden
+                ):
+                    embedding, deep = multimodal_model.separate_deepstack_embeds(
+                        embedding
+                    )
+                    if deep is not None:
+                        # 校验 deep 的维度符合 k×hidden
+                        if deep.shape[-1] % target_hidden != 0:
+                            raise RuntimeError(
+                                f"[embed_mm_inputs] deepstack last dim {deep.shape[-1]} "
+                                f"is not multiple of hidden {target_hidden}."
+                            )
+                        deepstack_embeddings.append(deep)
+
+            # deepstack 后如仍未对齐，再尝试 projector
+            if embedding.shape[-1] != target_hidden:
+                embedding = _maybe_project_feature(modality_str, embedding)
+
+            modalities.append(modality)
+            embeddings.append(embedding)
+            masks.append(mask)
+        else:
+            modalities.append(modality)
+            embeddings.append(None)
+            masks.append(None)
+
+    # 3) 计算 text embedding
     vocab_size = input_embedding.num_embeddings
-    # Important: clamp after getting original multimodal regions
-    # Clamp input ids. This is because the input_ids for the multimodal tokens are
-    # filled with the hash values of the multimodal for the prefix matching in the radix attention.
-    # There values are useless because their embeddings will be replaced by vision embeddings anyway.
     input_ids.clamp_(min=0, max=vocab_size - 1)
     inputs_embeds = input_embedding(input_ids)
 
-    # deepstack embedding
-    if use_deepstack:
-        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
-
-        deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
-            inputs_embeds.shape[-1] * num_deepstack_embeddings,
+    # 为 deepstack 预分配容器（仅在任一模态启用时）
+    input_deepstack_embeds = None
+    if any(use_deepstack.values()):
+        # 兼容：没有暴露 deepstack_visual_indexes 时按 1 处理
+        idxs = getattr(multimodal_model, "deepstack_visual_indexes", None)
+        if idxs is None:
+            num_deep = 1
+        else:
+            num_deep = idxs if isinstance(idxs, int) else len(idxs)
+        deepstack_shape = inputs_embeds.shape[:-1] + (
+            inputs_embeds.shape[-1] * num_deep,
         )
-        # a zero-filled embedding, with the same length of inputs_embeds, but different hidden_size
         input_deepstack_embeds = torch.zeros(
-            deepstack_embedding_shape,
-            device=inputs_embeds.device,
-            dtype=inputs_embeds.dtype,
+            deepstack_shape, device=inputs_embeds.device, dtype=inputs_embeds.dtype
         )
-
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
-    # 4. scatter embeddings into input embedding
-    for i, modality, embedding, mask in zip(
-        range(len(embeddings)), modalities, embeddings, masks
-    ):
-        if embedding is None or mask is None:
+    # 4) scatter 到 text embedding（以及 deepstack 同步）
+    for i in range(len(embeddings)):
+        emb = embeddings[i]
+        msk = masks[i]
+        modality = modalities[i] if i < len(modalities) else None
+
+        if emb is None or msk is None:
             continue
-        # in-place update
-        indices = torch.where(mask.squeeze(dim=-1))[0]
-        inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
-        if use_deepstack.get(modality, None):
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                inputs_embeds.device, inputs_embeds.dtype
+
+        # mask 形状健壮化
+        if msk.dim() == 2 and msk.shape[-1] == 1:
+            mflat = msk.squeeze(-1)
+        else:
+            mflat = msk
+        if mflat.dim() != 1:
+            mflat = mflat.view(-1)
+
+        indices = torch.where(mflat.to(dtype=torch.bool))[0]
+
+        if emb.shape[-1] != target_hidden:
+            raise RuntimeError(
+                f"[embed_mm_inputs] Embedding dim mismatch after alignment: "
+                f"{emb.shape[-1]} vs hidden {target_hidden} (modality={modality})."
             )
+        if emb.shape[0] != indices.shape[0]:
+            # 与上游 zero padding 行为对齐，裁到最短
+            min_len = min(emb.shape[0], indices.shape[0])
+            emb = emb[:min_len]
+            indices = indices[:min_len]
+
+        inputs_embeds[indices] = emb.to(inputs_embeds.device, inputs_embeds.dtype)
+
+        # deepstack 同步（仅当该模态启用）
+        if input_deepstack_embeds is not None and use_deepstack.get(modality, False):
+            deep = (
+                deepstack_embeddings.pop(0) if len(deepstack_embeddings) > 0 else None
+            )
+            if deep is not None:
+                if deep.shape[0] != len(indices):
+                    min_len = min(deep.shape[0], len(indices))
+                    deep = deep[:min_len]
+                    indices = indices[:min_len]
+                if deep.shape[-1] % target_hidden != 0:
+                    raise RuntimeError(
+                        f"[embed_mm_inputs] deepstack last dim {deep.shape[-1]} "
+                        f"is not multiple of hidden {target_hidden}."
+                    )
+                input_deepstack_embeds[indices] = deep.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
 
     return inputs_embeds, other_info
 
@@ -790,9 +905,34 @@ def get_multimodal_data_bounds(
     return valid_pairs_tensor
 
 
-def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+def data_hash(data: Any) -> int:
+    """
+    Robust hashing that returns an int (as previously expected by callers).
+    - bytes/bytearray/memoryview: use directly
+    - torch.Tensor: detach+cpu+contiguous, then view as uint8 to read raw bytes
+    - np.ndarray: ascontiguousarray + view uint8 to read raw bytes
+    - others: pickle.dumps fallback
+    Finally: sha256(...).digest()[:8] interpreted as little-endian integer.
+    """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        buf = bytes(data)
+    elif torch.is_tensor(data):
+        t = data.detach().cpu().contiguous()
+        # reinterpret as raw bytes regardless of dtype (supports bfloat16, float16, etc.)
+        buf = t.view(torch.uint8).numpy().tobytes()
+    elif isinstance(data, np.ndarray):
+        arr = np.ascontiguousarray(data)
+        buf = arr.view(np.uint8).tobytes()
+    else:
+        buf = pickle.dumps(data, protocol=4)
+
+    digest8 = hashlib.sha256(buf).digest()[:8]
+    return int.from_bytes(digest8, byteorder="little", signed=False)
+
+
+def hash_feature(feature: Any) -> int:
+    # keep API identical to before
+    return data_hash(feature)
 
 
 def tensor_hash(tensor_list) -> int:
@@ -819,20 +959,3 @@ def tensor_hash(tensor_list) -> int:
 
     mv = memoryview(tensor_cpu.numpy())
     return data_hash(mv.tobytes())
-
-
-def hash_feature(f):
-    if isinstance(f, list):
-        if isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
-    elif isinstance(f, np.ndarray):
-        arr = np.ascontiguousarray(f)
-        arr_bytes = arr.tobytes()
-        return data_hash(arr_bytes)
-    elif isinstance(f, torch.Tensor):
-        return tensor_hash([f])
-    elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
-        return tensor_hash([reconstruct_t])
-    return data_hash(f)

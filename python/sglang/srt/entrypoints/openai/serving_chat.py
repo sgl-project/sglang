@@ -274,7 +274,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 message.content = ""
             msg_dict = message.model_dump()
 
-            # Process content based on detected template format
+            # 只用官方工具做解析 + 侧写（往 image_data/audio_data/modalities 里加）
             processed_msg = process_content_for_template_format(
                 msg_dict,
                 template_content_format,
@@ -284,36 +284,33 @@ class OpenAIServingChat(OpenAIServingBase):
                 modalities,
             )
 
-            # per the Transformers docs & maintainers, tool call arguments in
-            # assistant-role messages with tool_calls need to be dicts not JSON str -
-            # this is how tool-use chat templates will expect them moving forwards
-            # so, for messages that have tool_calls, parse the string (which we get
-            # from openAI format) to dict
+            # 工具调用参数转成 dict（保持你的原逻辑）
             if (
-                processed_msg["role"] == "assistant"
+                processed_msg.get("role") == "assistant"
                 and "tool_calls" in processed_msg
                 and isinstance(processed_msg["tool_calls"], list)
             ):
                 for item in processed_msg["tool_calls"]:
-                    if "arguments" in item["function"] and isinstance(
-                        item["function"]["arguments"], str
-                    ):
-                        item["function"]["arguments"] = orjson.loads(
-                            item["function"]["arguments"]
-                        )
+                    fn = item.get("function")
+                    if fn and isinstance(fn.get("arguments"), str):
+                        try:
+                            fn["arguments"] = orjson.loads(fn["arguments"])
+                        except Exception:
+                            pass
 
             openai_compatible_messages.append(processed_msg)
 
-        # Handle assistant prefix for continue_final_message
+        # assistant 前缀（续写）保持原逻辑
         assistant_prefix = None
         if (
             openai_compatible_messages
             and openai_compatible_messages[-1]["role"] == "assistant"
+            and request.continue_final_message
         ):
-            if request.continue_final_message:
-                assistant_prefix = openai_compatible_messages[-1]["content"]
-                openai_compatible_messages = openai_compatible_messages[:-1]
+            assistant_prefix = openai_compatible_messages[-1]["content"]
+            openai_compatible_messages = openai_compatible_messages[:-1]
 
+        # 交给 tokenizer.apply_chat_template 处理占位符与工具格式
         try:
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
@@ -321,16 +318,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
+                **(request.chat_template_kwargs or {}),
             )
         except Exception:
-            # This except branch will be triggered when the chosen model
-            # has a different tools input format that is not compatible
-            # with openAI's apply_chat_template tool_call format, like Mistral.
             tools = (
-                [t if "function" in t else {"function": t} for t in tools]
+                [t if "function" in t else {"function": t} for t in (tools or [])]
                 if tools
                 else None
             )
@@ -340,9 +332,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
+                **(request.chat_template_kwargs or {}),
             )
 
         if assistant_prefix:
@@ -355,17 +345,13 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
-        image_data = image_data if image_data else None
-        audio_data = audio_data if audio_data else None
-        video_data = video_data if video_data else None
-        modalities = modalities if modalities else []
         return MessageProcessingResult(
             prompt=prompt,
             prompt_ids=prompt_ids,
-            image_data=image_data,
-            video_data=video_data,
-            audio_data=audio_data,
-            modalities=modalities,
+            image_data=(image_data or None),
+            video_data=(video_data or None),
+            audio_data=(audio_data or None),
+            modalities=(modalities or []),
             stop=stop,
         )
 
