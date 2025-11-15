@@ -1849,3 +1849,7 @@ if _is_cuda:
             input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         ):
             return
+
+    @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
+    def _(input, output_q, output_s):
+        return
