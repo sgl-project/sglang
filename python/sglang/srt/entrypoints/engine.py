@@ -755,10 +755,13 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 
 def _init_tokenizer_manager(
-    server_args: ServerArgs, port_args: PortArgs
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> TokenizerManager:
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
+    tokenizer_manager = TokenizerManagerClass(server_args, port_args)
 
     # Initialize templates
     template_manager = TemplateManager()
