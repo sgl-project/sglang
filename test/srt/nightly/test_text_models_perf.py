@@ -27,7 +27,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 16, 64]
-        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
+        # Test both 4k and 32k input lengths
+        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096,32768"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
         cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
         cls.runner.setup_profile_directory()
