@@ -25,11 +25,14 @@ from .base_grammar_backend import (
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(self, grammar: BaseGrammarObject, think_end_id):
+    def __init__(self, grammar: BaseGrammarObject, think_end_id: int):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
-        self.is_in_reasoning = True
+        self.is_in_reasoning: bool = False
+
+    def maybe_init_reasoning(self, reasoning: bool):
+        self.is_in_reasoning = reasoning
 
     def accept_token(self, token: int):
         if token == self.think_end_id:
@@ -85,9 +88,13 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
 
-    def _init_value_dispatch(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
-        ret = self.grammar_backend._init_value_dispatch(key)
+    def _init_value_dispatch(
+        self, key: Tuple[str, str], reasoning: bool
+    ) -> Optional[BaseGrammarObject]:
+        ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         # avoid wrapping invalid grammar, so that the scheduler can detect it
         if ret is None or ret is INVALID_GRAMMAR_OBJ:
             return ret
-        return ReasonerGrammarObject(ret, self.think_end_id)
+        obj = ReasonerGrammarObject(ret, self.think_end_id)
+        obj.maybe_init_reasoning(reasoning)
+        return obj
