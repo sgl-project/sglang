@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     path::PathBuf,
     sync::{Arc, LazyLock},
@@ -7,6 +7,7 @@ use std::{
 
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Supported multimodal modalities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -73,7 +74,7 @@ pub enum ChatContentPart {
         detail: Option<ImageDetail>,
     },
     ImageEmbeds {
-        payload: serde_json::Value,
+        payload: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
     },
@@ -154,6 +155,10 @@ impl ImageFrame {
     pub fn source(&self) -> &ImageSource {
         &self.source
     }
+
+    pub fn size(&self) -> ImageSize {
+        ImageSize::new(self.image.width(), self.image.height())
+    }
 }
 
 /// Container for all supported multimodal media objects.
@@ -168,3 +173,118 @@ pub enum TrackedMedia {
 
 pub type MultiModalData = HashMap<Modality, Vec<TrackedMedia>>;
 pub type MultiModalUUIDs = HashMap<Modality, Vec<Option<String>>>;
+
+pub type TokenId = i32;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ImageSize {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlaceholderRange {
+    pub offset: usize,
+    pub length: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiModalTensor {
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MultiModalValue {
+    Tensor(MultiModalTensor),
+    Json(Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MultiModalInputs {
+    pub prompt_token_ids: Vec<u32>,
+    #[serde(default)]
+    pub mm_kwargs: BTreeMap<String, Vec<MultiModalValue>>,
+    #[serde(default)]
+    pub mm_hashes: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub mm_placeholders: BTreeMap<String, Vec<PlaceholderRange>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_salt: Option<String>,
+}
+
+impl MultiModalInputs {
+    pub fn new(prompt_token_ids: Vec<u32>) -> Self {
+        Self {
+            prompt_token_ids,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptReplacement {
+    pub modality: Modality,
+    pub placeholder_token: String,
+    pub tokens: Vec<TokenId>,
+}
+
+impl PromptReplacement {
+    pub fn repeated(
+        modality: Modality,
+        placeholder_token: &str,
+        token_id: TokenId,
+        count: usize,
+    ) -> Self {
+        Self {
+            modality,
+            placeholder_token: placeholder_token.to_string(),
+            tokens: vec![token_id; count],
+        }
+    }
+
+    pub fn sequence(modality: Modality, placeholder_token: &str, sequence: Vec<TokenId>) -> Self {
+        Self {
+            modality,
+            placeholder_token: placeholder_token.to_string(),
+            tokens: sequence,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multimodal_inputs_defaults() {
+        let inputs = MultiModalInputs::new(vec![1, 2, 3]);
+        assert_eq!(inputs.prompt_token_ids, vec![1, 2, 3]);
+        assert!(inputs.mm_kwargs.is_empty());
+    }
+
+    #[test]
+    fn placeholder_range_serializes() {
+        let range = PlaceholderRange {
+            offset: 10,
+            length: 4,
+        };
+        let json = serde_json::to_string(&range).unwrap();
+        assert!(json.contains("offset"));
+    }
+
+    #[test]
+    fn prompt_replacement_builders() {
+        let rep = PromptReplacement::repeated(Modality::Image, "<image>", 100, 3);
+        assert_eq!(rep.tokens, vec![100, 100, 100]);
+    }
+}
