@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cassert>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <math.h>
@@ -30,15 +31,6 @@ limitations under the License.
 // }
 // # TODO: namespace
 // REGISTER_EXTENSION(common_ops)
-
-
-// TODO: template review
-// assert operations is float??
-__device__ float calculate_frequency_and_angle(float t_val, int freq_idx, int half, int max_period) {
-    float log_max_period = logf(static_cast<float>(max_period));
-    float freqs = expf(-log_max_period * static_cast<float>(freq_idx) / static_cast<float>(half));
-    return t_val * freqs;
-}
 
 // TODO: hard code for now.
 // at::vec::convert_to_float instead later
@@ -96,6 +88,15 @@ __device__ O cast_to(T x) {
 }
 
 
+// TODO: template review
+// assert operations is float??
+__device__ float calculate_frequency_and_angle(float t_val, int freq_idx, int half, int max_period) {
+    float log_max_period = logf(static_cast<float>(max_period));
+    float freqs = expf(-log_max_period * static_cast<float>(freq_idx) / static_cast<float>(half));
+    return t_val * freqs;
+}
+
+
 
 template<typename T, typename O>
 __global__ void timestep_embedding_kernel(
@@ -109,9 +110,11 @@ __global__ void timestep_embedding_kernel(
     int stride_out_d,
     int BLOCK_SIZE_DIM
 ) {
-    // 2D grid: [B, ceil(dim/BLOCK_SIZE_DIM)]
+    // TODO: add comments
     int pid_b = blockIdx.x;
     int pid_d = blockIdx.y;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
 
     // Get the timestep for this batch
     // TODO: vect
@@ -122,21 +125,16 @@ __global__ void timestep_embedding_kernel(
 
     // Create range of indices for this block
     int d_start = pid_d * BLOCK_SIZE_DIM;
-    int d_end = min(d_start + BLOCK_SIZE_DIM, dim);
+    int d_end = d_start + BLOCK_SIZE_DIM;
 
-    // Two phase process to void warp divergence
-    // First half for cos
-    for (int d_idx = d_start + threadIdx.x; d_idx < min(d_end, half); d_idx += blockDim.x) {
-        float angles = calculate_frequency_and_angle(t_val, d_idx, half, max_period);
-        int out_idx = pid_b * stride_out_b + d_idx * stride_out_d;
-        output_ptr[out_idx] = cast_to<O>(cosf(angles));
-    }
-
-    // Second half for sin
-    for (int d_idx = max(d_start, half) + threadIdx.x; d_idx < min(d_end, 2 * half); d_idx += blockDim.x) {
-        float angles = calculate_frequency_and_angle(t_val, d_idx - half, half, max_period);
-        int out_idx = pid_b * stride_out_b + d_idx * stride_out_d;
-        output_ptr[out_idx] = cast_to<O>(sinf(angles));
+    for (int d_idx = d_start + tid; d_idx < min(d_end, half); d_idx += num_threads) {
+        // TODO: remove debug assert later
+        assert(d_idx < half);
+        float angles = calculate_frequency_and_angle(t_val, d_idx % half, half, max_period);
+        int out_idx_first = pid_b * stride_out_b + d_idx * stride_out_d;
+        output_ptr[out_idx_first] = cast_to<O>(cosf(angles));
+        int out_idx_second = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
+        output_ptr[out_idx_second] = cast_to<O>(sinf(angles));
     }
 
     // TODO: review, assert output buffer is zero init?
@@ -169,10 +167,12 @@ torch::Tensor timestep_embedding_kernel_cuda(
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
+    // TODO: tuning
     int BLOCK_SIZE_DIM = 256;
     const int num_threads = 256;
+    const int half = dim / 2;
 
-    const dim3 grid_size(B, (dim + BLOCK_SIZE_DIM - 1) / BLOCK_SIZE_DIM);
+    const dim3 grid_size(B, (half + BLOCK_SIZE_DIM - 1) / BLOCK_SIZE_DIM);
     const dim3 block_size(num_threads);
 
     int stride_t_b = t.stride(0);

@@ -97,8 +97,8 @@ class TestTimestepEmbed(unittest.TestCase):
                 floatfmt=(".0f", ".0f", ".6f", ".6f", ".5f"),
             )
         )
-        print(f"Averate Speedup triton: {np.mean(triton_speedups):.4f}")
-        print(f"Averate Speedup cuda: {np.mean(cuda_speedups):.4f}")
+        print(f"Average Speedup(triton): {np.mean(triton_speedups):.4f}")
+        print(f"Average Speedup(cuda): {np.mean(cuda_speedups):.4f}")
 
 
 if __name__ == "__main__":
