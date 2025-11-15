@@ -105,6 +105,7 @@ test = [
   "matplotlib",
   "pandas",
   "peft",
+  "polars",
   "pytest",
   "sentence_transformers",
   "tabulate",
