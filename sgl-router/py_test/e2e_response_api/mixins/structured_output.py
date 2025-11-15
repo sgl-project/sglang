@@ -12,42 +12,16 @@ from pathlib import Path
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR))
 
-from util import CustomTestCase
+from basic_crud import ResponseAPIBaseTest
 
 
-class StructuredOutputBaseTest(CustomTestCase):
-    """Base class for structured output tests with common utilities."""
-
-    # To be set by subclasses
-    base_url: str = None
-    api_key: str = None
-    model: str = None
-
-    def make_request(self, endpoint, method="GET", data=None):
-        """Make HTTP request to the API."""
-        url = f"{self.base_url}{endpoint}"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
-
-        if method == "GET":
-            response = self.session.get(url, headers=headers)
-        elif method == "POST":
-            response = self.session.post(url, headers=headers, json=data)
-        elif method == "DELETE":
-            response = self.session.delete(url, headers=headers)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-
-        return response
+class StructuredOutputBaseTest(ResponseAPIBaseTest):
 
     def test_structured_output_json_schema(self):
         """Test structured output with json_schema format."""
 
         # Create response with structured output
-        data = {
-            "model": self.model,
+        params = {
             "input": [
                 {
                     "role": "system",
@@ -84,29 +58,27 @@ class StructuredOutputBaseTest(CustomTestCase):
             },
         }
 
-        create_resp = self.make_request("/v1/responses", "POST", data)
-        self.assertEqual(create_resp.status_code, 200)
-
-        create_data = create_resp.json()
-        self.assertIn("id", create_data)
-        self.assertIn("output", create_data)
-        self.assertIn("text", create_data)
+        create_resp = self.create_response(**params)
+        self.assertIsNone(create_resp.error)
+        self.assertIsNotNone(create_resp.id)
+        self.assertIsNotNone(create_resp.output)
+        self.assertIsNotNone(create_resp.text)
 
         # Verify text format was echoed back correctly
-        self.assertIn("format", create_data["text"])
-        self.assertEqual(create_data["text"]["format"]["type"], "json_schema")
-        self.assertEqual(create_data["text"]["format"]["name"], "math_reasoning")
-        self.assertIn("schema", create_data["text"]["format"])
-        self.assertEqual(create_data["text"]["format"]["strict"], True)
+        self.assertIsNotNone(create_resp.text.format)
+        self.assertEqual(create_resp.text.format.type, "json_schema")
+        self.assertEqual(create_resp.text.format.name, "math_reasoning")
+        self.assertIsNotNone(create_resp.text.format.schema_)
+        self.assertEqual(create_resp.text.format.strict, True)
 
         # Find the message output (output[0] may be reasoning, output[1] is message)
         output_text = next(
             (
-                content.get("text", "")
-                for item in create_data.get("output", [])
-                if item.get("type") == "message"
-                for content in item.get("content", [])
-                if content.get("type") == "output_text"
+                content.text
+                for item in create_resp.output
+                if item.type == "message"
+                for content in item.content
+                if content.type == "output_text"
             ),
             None,
         )
