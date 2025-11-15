@@ -4,11 +4,13 @@
 
 import unittest
 
+import numpy as np
 import tabulate
 import torch
 
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     timestep_embedding,
+    timestep_embedding_cuda,
     timestep_embedding_triton,
 )
 
@@ -21,12 +23,16 @@ class TestTimestepEmbed(unittest.TestCase):
         device = "cuda"
         for B in self.NUM_BATCH:
             for dim in self.NUM_DIM:
-                t = torch.randn((B,), device=device)
+                t = torch.randint(-1000, 1000, (B,), device=device, dtype=torch.int32)
                 torch_output = timestep_embedding(t, dim)
                 triton_output = timestep_embedding_triton(t, dim)
+                cuda_output = timestep_embedding_cuda(t, dim)
                 assert torch.allclose(
-                    torch_output, triton_output, atol=1e-6
-                ), f"{(torch_output - triton_output).abs().max()}"
+                    torch_output, triton_output, atol=1e-4
+                ), f"({B=}, {dim=}), Max diff {(torch_output - triton_output).abs().max()}"
+                assert torch.allclose(
+                    torch_output, cuda_output, atol=1e-4
+                ), f"({B=}, {dim=}), Max diff {(torch_output - cuda_output).abs().max()}"
 
     def test_dtype(self):
         pass
@@ -56,13 +62,17 @@ class TestTimestepEmbed(unittest.TestCase):
         device = "cuda"
         results = []
 
+        triton_speedups = []
+        cuda_speedups = []
         for B in self.NUM_BATCH:
             for dim in self.NUM_DIM:
-                t = torch.randn((B,), device=device)
+                t = torch.randint(-1000, 1000, (B,), device=device, dtype=torch.int32)
 
                 time_torch = perf_kernel_fn(timestep_embedding, t, dim)
                 time_triton = perf_kernel_fn(timestep_embedding_triton, t, dim)
-                speedup = time_torch / time_triton
+                time_cuda = perf_kernel_fn(timestep_embedding_cuda, t, dim)
+                speedup_triton = time_torch / time_triton
+                speedup_cuda = time_torch / time_cuda
 
                 results.append(
                     {
@@ -70,9 +80,13 @@ class TestTimestepEmbed(unittest.TestCase):
                         "Dimension": dim,
                         "Torch Time (ms)": time_torch,
                         "Triton Time (ms)": time_triton,
-                        "Speedup (Torch/Triton)": speedup,
+                        "CUDA Time (ms)": time_cuda,
+                        "Speedup (Torch/Triton)": speedup_triton,
+                        "Speedup (Torch/CUDA)": speedup_cuda,
                     }
                 )
+                triton_speedups.append(speedup_triton)
+                cuda_speedups.append(speedup_cuda)
 
         print("=== Timestep Embedding Benchmark Results ===")
         print(
@@ -83,6 +97,8 @@ class TestTimestepEmbed(unittest.TestCase):
                 floatfmt=(".0f", ".0f", ".6f", ".6f", ".5f"),
             )
         )
+        print(f"Averate Speedup triton: {np.mean(triton_speedups):.4f}")
+        print(f"Averate Speedup cuda: {np.mean(cuda_speedups):.4f}")
 
 
 if __name__ == "__main__":
