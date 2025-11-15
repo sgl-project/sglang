@@ -1190,7 +1190,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def pause_generation(self):
         async with self.is_pause_cond:
             self.is_pause = True
-            self.abort_request(abort_all=True)
+            while self.model_update_lock.is_locked():
+                self.abort_request(abort_all=True)
+                await asyncio.sleep(1.0)
 
     async def continue_generation(self):
         async with self.is_pause_cond:
