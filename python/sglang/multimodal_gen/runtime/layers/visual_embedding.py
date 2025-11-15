@@ -115,9 +115,11 @@ class TimestepEmbedder(nn.Module):
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE_DIM": 32}, num_warps=2),
+        triton.Config({"BLOCK_SIZE_DIM": 32}, num_warps=1),
         triton.Config({"BLOCK_SIZE_DIM": 64}, num_warps=2),
+        triton.Config({"BLOCK_SIZE_DIM": 128}, num_warps=2),
         triton.Config({"BLOCK_SIZE_DIM": 128}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_DIM": 256}, num_warps=2),
         triton.Config({"BLOCK_SIZE_DIM": 256}, num_warps=4),
     ],
     key=["dim"],
@@ -134,7 +136,6 @@ def _timestep_embedding_triton_kernel(
     BLOCK_SIZE_DIM: tl.constexpr,
 ):
     # block tiling: [1, BLOCK_SIZE_DIM] for each thread block
-    # 2D grid: [B, ceil(dim/BLOCK_SIZE_DIM)]
     pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)
 
@@ -143,10 +144,6 @@ def _timestep_embedding_triton_kernel(
 
     half = dim // 2
     d_offsets = pid_d * BLOCK_SIZE_DIM + tl.arange(0, BLOCK_SIZE_DIM)
-
-    # Calculate which dimensions are in first half (cosine) and second half (sine)
-    is_first_half = d_offsets < half
-    is_second_half = (d_offsets >= half) & (d_offsets < 2 * half)
 
     # Prepare fetch index
     freq_indices = d_offsets % half
@@ -157,15 +154,15 @@ def _timestep_embedding_triton_kernel(
     freqs = tl.exp(-log_max_period * freq_indices / half)
     angles = t_val.to(tl.float32) * freqs
 
-    # TODO: review
-    embedding = tl.where(
-        is_first_half, tl.cos(angles), tl.where(is_second_half, tl.sin(angles), 0.0)
-    ).to(dtype)
+    embedding_0 = tl.cos(angles).to(dtype)
+    embedding_1 = tl.sin(angles).to(dtype)
 
     # Store results
-    out_ptrs = output_ptr + pid_b * stride_out_b + d_offsets * stride_out_d
-    mask = d_offsets < dim
-    tl.store(out_ptrs, embedding, mask=mask)
+    out_ptrs_0 = output_ptr + pid_b * stride_out_b + d_offsets * stride_out_d
+    out_ptrs_1 = output_ptr + pid_b * stride_out_b + (half + d_offsets) * stride_out_d
+    mask = d_offsets < half
+    tl.store(out_ptrs_0, embedding_0, mask=mask)
+    tl.store(out_ptrs_1, embedding_1, mask=mask)
 
 
 def timestep_embedding_triton(
@@ -190,9 +187,11 @@ def timestep_embedding_triton(
 
     # TODO: output dtype always be float32. According to python code: timestep_embedding
     dtype = torch.float32
-    output = torch.empty((B, dim), dtype=dtype, device="cuda")
+    half = dim // 2
+    # NOTE: zero init to avoid padding
+    output = torch.zeros((B, dim), dtype=dtype, device="cuda")
 
-    grid = lambda META: (B, triton.cdiv(dim, META["BLOCK_SIZE_DIM"]))
+    grid = lambda META: (B, triton.cdiv(half, META["BLOCK_SIZE_DIM"]))
 
     # TODO: review
     # a badcase if dim < 2. like dim = 1
