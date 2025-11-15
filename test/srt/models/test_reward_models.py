@@ -68,7 +68,9 @@ class TestRewardModels(CustomTestCase):
             torch_dtype=torch_dtype,
             model_type="reward",
         ) as srt_runner:
-            prompts = srt_runner.tokenizer.apply_chat_template(convs, tokenize=False)
+            prompts = srt_runner.tokenizer.apply_chat_template(
+                convs, tokenize=False, return_dict=False
+            )
             srt_outputs = srt_runner.forward(prompts)
 
         hf_scores = torch.tensor(hf_outputs.scores)
