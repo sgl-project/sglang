@@ -468,7 +468,7 @@ def select_top_k_tokens(
 
         if hidden_states.shape[0] > 0:
             selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device="cuda"
+                0, hidden_states.shape[0], step=topk, device=topk_index.device
             ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index, :]
 
