@@ -3,7 +3,6 @@ from typing import Optional
 
 import torch
 from sgl_kernel.elementwise import silu_and_mul
-from sgl_kernel.moe import moe_sum_reduce
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -206,15 +205,10 @@ def fused_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
-    if routed_scaling_factor is None:
-        routed_scaling_factor = 1.0
-
     output = hidden_states if inplace else torch.empty_like(hidden_states)
-    moe_sum_reduce(
-        intermediate_cache3,
-        output,
-        routed_scaling_factor,
-    )
+    torch.sum(intermediate_cache3.view(*intermediate_cache3.shape), dim=1, out=output)
+    if routed_scaling_factor is not None:
+        output *= routed_scaling_factor
     return output
 
 
