@@ -4,8 +4,6 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from sglang.test.test_utils import CustomTestCase
-
 logger = logging.getLogger(__name__)
 
 
@@ -116,6 +114,9 @@ class TestCaseVisitor(ast.NodeVisitor):
                     self.ut_registries.append(hw_config)
 
         self.generic_visit(node)
+
+
+CustomTestCase = object
 
 
 @register_cuda_ci(esimation_time=300, ci_stage="1-gpu")
