@@ -101,7 +101,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | --- | --- | --- | --- |
 | `--host` | The host of the HTTP server. | `127.0.0.1` | Type: str |
 | `--port` | The port of the HTTP server. | `30000` | Type: int |
-| `--grpc-mode` | If set, use gRPC server instead of HTTP server. | `False` | bool flag (set to enable) |
+| `--grpc-mode` | If set, use gRPC server instead of HTTP server. For use with router / model gateway | `False` | bool flag (set to enable) |
 | `--skip-server-warmup` | If set, skip warmup. | `False` | bool flag (set to enable) |
 | `--warmups` | Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests | `None` | Type: str |
 | `--nccl-port` | The port for NCCL distributed environment setup. Defaults to a random port. | `None` | Type: int |
@@ -409,7 +409,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-return-hidden-states` | Enable returning hidden states with responses. | `False` | bool flag (set to enable) |
 | `--scheduler-recv-interval` | The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |
-| `--rl-on-policy-target` | Enable special handling for reinforcement learning on-policy target models. When set, forces certain layers (embedding, RMSNorm) to use float32 precision for numerical stability during RL training. | `None` | Type: str |
 
 ## Debug tensor dumps
 | Argument | Description | Defaults | Options |
