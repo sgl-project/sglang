@@ -1,6 +1,6 @@
 [package]
-name = "sglang_router_rs"
-version = "0.0.0"
+name = "sglang-router"
+version = "0.2.2"
 edition = "2021"
 
 [features]
@@ -14,9 +14,8 @@ unused_qualifications = "warn"
 
 [lib]
 name = "sglang_router_rs"
-# Pure Rust library: Just omit crate-type (defaults to rlib)
-# Python/C binding + Rust library: Use ["cdylib", "rlib"]
-crate-type = ["cdylib", "rlib"]
+# Pure Rust library (rlib for the binary and other Rust dependents)
+crate-type = ["rlib"]
 
 [[bin]]
 name = "sglang-router"
@@ -37,7 +36,6 @@ rand = "0.9.2"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json", "rustls-tls"], default-features = false }
 futures-util = "0.3"
 futures = "0.3"
-pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py38"] }
 dashmap = "6.1.0"
 lru = "0.16.2"
 blake3 = "1.5"
