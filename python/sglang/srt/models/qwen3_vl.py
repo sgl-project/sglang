@@ -28,11 +28,13 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -610,6 +612,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
 
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
@@ -632,15 +635,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("model", prefix),
         )
 
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
         else:
-            self.lm_head = ParallelLMHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+            # ranks other than the last rank will have a placeholder layer
+            self.lm_head = PPMissingLayer()
+
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(self.config)
@@ -705,6 +713,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         """Run forward pass for Qwen3-VL.
 
@@ -738,14 +747,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             multimodal_model=self,
             positions=positions,
             use_deepstack=self.use_deepstack,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
         else:
-            return self.pooler(hidden_states, forward_batch)
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -762,6 +778,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
+            layer_id = get_layer_id(name)
+
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -787,7 +814,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    param = params_dict[name]
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                    else:
+                        continue
                 except KeyError:
                     print(params_dict.keys())
                     raise
