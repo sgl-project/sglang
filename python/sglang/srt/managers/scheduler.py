@@ -1240,7 +1240,7 @@ class Scheduler(
         return image_inputs
 
     def _get_multimodal_inputs(self, mm_inputs_dict: dict):
-        if self.server_args.enable_optimized_mm_inputs_process:
+        if self.server_args.enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
