@@ -920,10 +920,9 @@ class MambaRadixCache(BasePrefixCache):
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = self.get_child_key_fn(node.key)
-        v = node.parent.children.get(key, None)
+        v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
-        del node.parent.children[key]
         self.full_evictable_size_ -= len(node.key)
         self.mamba_evictable_size_ -= len(node.mamba_value)
 
