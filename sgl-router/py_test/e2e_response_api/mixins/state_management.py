@@ -7,6 +7,7 @@ These tests should work across all backends (OpenAI, XAI, gRPC).
 
 import unittest
 
+import openai
 from basic_crud import ResponseAPIBaseTest
 
 
@@ -19,57 +20,59 @@ class StateManagementTests(ResponseAPIBaseTest):
         resp1 = self.create_response(
             "My name is Alice and my friend is Bob. Remember it."
         )
-        self.assertEqual(resp1.status_code, 200)
-        response1_id = resp1.json()["id"]
+        self.assertIsNone(resp1.error)
+        self.assertEqual(resp1.status, "completed")
+        response1_id = resp1.id
 
         # Second response referencing first
         resp2 = self.create_response(
             "What is my name", previous_response_id=response1_id
         )
-        self.assertEqual(resp2.status_code, 200)
-        response2_data = resp2.json()
+        self.assertIsNone(resp2.error)
+        self.assertEqual(resp2.status, "completed")
 
         # The model should remember the name from previous response
-        output_text = self._extract_output_text(response2_data)
-        self.assertIn("Alice", output_text)
+        self.assertIn("Alice", resp2.output_text)
 
         # Third response referencing second
         resp3 = self.create_response(
             "What is my friend name?",
-            previous_response_id=response2_data["id"],
+            previous_response_id=resp2.id,
         )
-        response3_data = resp3.json()
-        output_text = self._extract_output_text(response3_data)
-        self.assertEqual(resp3.status_code, 200)
-        self.assertIn("Bob", output_text)
+        self.assertIsNone(resp3.error)
+        self.assertEqual(resp3.status, "completed")
+        self.assertIn("Bob", resp3.output_text)
 
     @unittest.skip("TODO: Add the invalid previous_response_id check")
     def test_previous_response_id_invalid(self):
         """Test using invalid previous_response_id."""
-        resp = self.create_response(
-            "Test", previous_response_id="resp_invalid123", max_output_tokens=50
-        )
-        self.assertIn(resp.status_code, [400, 404])
+        with self.assertRaises(openai.BadRequestError):
+            self.create_response(
+                "Test", previous_response_id="resp_invalid123", max_output_tokens=50
+            )
 
     def test_conversation_with_multiple_turns(self):
         """Test state management using conversation ID."""
         # Create conversation
         conv_resp = self.create_conversation(metadata={"topic": "math"})
-        self.assertEqual(conv_resp.status_code, 200)
+        self.assertIsNotNone(conv_resp.id)
+        self.assertIsNotNone(conv_resp.created_at)
 
-        conversation_id = conv_resp.json()["id"]
+        conversation_id = conv_resp.id
 
         # First response in conversation
         resp1 = self.create_response("I have 5 apples.", conversation=conversation_id)
-        self.assertEqual(resp1.status_code, 200)
+        self.assertIsNone(resp1.error)
+        self.assertEqual(resp1.status, "completed")
 
         # Second response in same conversation
         resp2 = self.create_response(
             "How many apples do I have?",
             conversation=conversation_id,
         )
-        self.assertEqual(resp2.status_code, 200)
-        output_text = self._extract_output_text(resp2.json())
+        self.assertIsNone(resp2.error)
+        self.assertEqual(resp2.status, "completed")
+        output_text = resp2.output_text
 
         # Should remember "5 apples"
         self.assertTrue("5" in output_text or "five" in output_text.lower())
@@ -79,14 +82,15 @@ class StateManagementTests(ResponseAPIBaseTest):
             "If I get 3 more, how many total?",
             conversation=conversation_id,
         )
-        self.assertEqual(resp3.status_code, 200)
-        output_text = self._extract_output_text(resp3.json())
+        self.assertIsNone(resp3.error)
+        self.assertEqual(resp3.status, "completed")
+        output_text = resp3.output_text
 
         # Should calculate 5 + 3 = 8
         self.assertTrue("8" in output_text or "eight" in output_text.lower())
         list_resp = self.list_conversation_items(conversation_id)
-        self.assertEqual(list_resp.status_code, 200)
-        items = list_resp.json()["data"]
+        self.assertIsNotNone(list_resp.data)
+        items = list_resp.data
         # Should have at least 6 items (3 inputs + 3 outputs)
         self.assertGreaterEqual(len(items), 6)
 
@@ -96,20 +100,15 @@ class StateManagementTests(ResponseAPIBaseTest):
         conversation_id = "conv_123"
 
         resp1 = self.create_response("Test")
-        response1_id = resp1.json()["id"]
+        response1_id = resp1.id
 
         # Try to use both parameters
-        resp = self.create_response(
-            "This should fail",
-            previous_response_id=response1_id,
-            conversation=conversation_id,
-        )
-
-        # Should return 400 Bad Request
-        self.assertEqual(resp.status_code, 400)
-        error_data = resp.json()
-        self.assertIn("error", error_data)
-        self.assertIn("mutually exclusive", error_data["error"]["message"].lower())
+        with self.assertRaises(openai.BadRequestError):
+            self.create_response(
+                "This should fail",
+                previous_response_id=response1_id,
+                conversation=conversation_id,
+            )
 
     # Helper methods
 
