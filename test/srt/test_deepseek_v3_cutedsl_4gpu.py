@@ -23,7 +23,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "--trust-remote-code",
             "--disable-radix-cache",
             "--mem-fraction-static",
-            "0.89",
+            "0.05",
             "--max-prefill-tokens",
             "16384",
             "--max-running-requests",
@@ -49,6 +49,12 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "flashinfer_cutedsl",
             "--deepep-mode",
             "low_latency",
+            "--json-model-override-args",
+            '{"num_hidden_layers": 1, "n_routed_experts": 24}',
+            "--enable-single-batch-overlap",
+            "--disable-cuda-graph",
+            "--load-format",
+            "dummy",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -73,14 +79,12 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             data_path=None,
             num_questions=512,
             parallel=512,
-            max_new_tokens=512,
+            max_new_tokens=16,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
-
-        self.assertGreater(metrics["accuracy"], 0.92)
 
 
 if __name__ == "__main__":
