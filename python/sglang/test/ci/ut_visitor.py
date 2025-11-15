@@ -1,6 +1,7 @@
 import argparse
 import ast
 import logging
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from sglang.test.test_utils import CustomTestCase
@@ -12,6 +13,20 @@ class HWBackend(Enum):
     SKIP = auto()
     CUDA = auto()
     AMD = auto()
+
+
+@dataclass
+class HWConfig:
+    backend: HWBackend
+    estimation_time: float
+    stage: str
+
+
+@dataclass
+class CITest:
+    filename: str
+    testname: str
+    hw_configs: list[HWConfig] = field(default_factory=list)
 
 
 REGISTER_MAPPING = {
@@ -40,18 +55,6 @@ def register_amd_ci(esimation_time: float, ci_stage: str):
         return fn
 
     return wrapper
-
-
-class HWConfig:
-    backend: HWBackend
-    estimation_time: float
-    stage: str
-
-
-class CITest:
-    filename: str
-    testname: str
-    hw_configs: list[HWConfig]
 
 
 class TestCaseVisitor(ast.NodeVisitor):
@@ -115,6 +118,7 @@ class TestCaseVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+@register_cuda_ci(esimation_time=300, ci_stage="1-gpu")
 class TestGGUF(CustomTestCase):
     def test_models(self):
         pass
