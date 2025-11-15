@@ -54,7 +54,13 @@ from sglang.multimodal_gen.runtime.utils.common import add_prefix
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from typing import Callable, Iterable, Optional, Tuple, Union, Unpack
+from typing import Callable, Iterable, Optional, Tuple, Union
+
+try:
+    from typing import Unpack  # type: ignore[attr-defined]
+except ImportError:
+    # Python 3.10 and below
+    from typing_extensions import Unpack
 
 import torch
 import torch.nn as nn
