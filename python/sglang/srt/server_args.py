@@ -3478,7 +3478,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-attn-tp-input-scattered",
             action="store_true",
-            help="Enable input of attention to be scattered when only tensor parallelism is used.",
+            help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         )
 
         # Dynamic batch tokenizer
