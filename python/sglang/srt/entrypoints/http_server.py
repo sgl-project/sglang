@@ -420,7 +420,10 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
-    if not envs.SGLANG_ENABLE_GENERATION_HEALTHCHECK and request.url.path == "/health":
+    if (
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
+        and request.url.path == "/health"
+    ):
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
