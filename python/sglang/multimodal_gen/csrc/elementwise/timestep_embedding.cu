@@ -15,8 +15,8 @@ limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cassert>
-#include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <math.h>
 #include <torch/extension.h>
 
@@ -36,8 +36,7 @@ using namespace flashinfer;
 
 // TODO: hard code for now.
 // at::vec::convert_to_float instead later
-template <typename T>
-__device__ float convert_to_float(T x) {
+template <typename T> __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
   } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -50,8 +49,7 @@ __device__ float convert_to_float(T x) {
   }
 }
 
-template <typename T>
-__device__ __nv_bfloat16 convert_to_bfloat16(T x) {
+template <typename T> __device__ __nv_bfloat16 convert_to_bfloat16(T x) {
   if constexpr (std::is_same_v<T, __nv_bfloat16>) {
     return x;
   } else if constexpr (std::is_same_v<T, __half>) {
@@ -63,8 +61,7 @@ __device__ __nv_bfloat16 convert_to_bfloat16(T x) {
   }
 }
 
-template <typename T>
-__device__ __half convert_to_float16(T x) {
+template <typename T> __device__ __half convert_to_float16(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return x;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -76,8 +73,7 @@ __device__ __half convert_to_float16(T x) {
   }
 }
 
-template <typename O, typename T>
-__device__ O cast_to(T x) {
+template <typename O, typename T> __device__ O cast_to(T x) {
   if constexpr (std::is_same_v<O, float>) {
     return convert_to_float(x);
   } else if constexpr (std::is_same_v<O, __half>) {
@@ -89,142 +85,130 @@ __device__ O cast_to(T x) {
   }
 }
 
-
 // TODO: template review
 // assert operations is float??
-__device__ float calculate_frequency_and_angle(float t_val, int freq_idx, int half, int max_period) {
-    float log_max_period = logf(static_cast<float>(max_period));
-    float freqs = expf(-log_max_period * static_cast<float>(freq_idx) / static_cast<float>(half));
-    return t_val * freqs;
+__device__ float calculate_frequency_and_angle(float t_val, int freq_idx,
+                                               int half, int max_period) {
+  float log_max_period = logf(static_cast<float>(max_period));
+  float freqs = expf(-log_max_period * static_cast<float>(freq_idx) /
+                     static_cast<float>(half));
+  return t_val * freqs;
 }
-
-
 
 // TODO: tune vec_size?
-template<typename T, typename O, uint32_t vec_size=8>
-__global__ void timestep_embedding_kernel(
-    T* t_ptr,
-    O* output_ptr,
-    int B,
-    int dim,
-    int max_period,
-    int stride_t_b,
-    int stride_out_b,
-    int stride_out_d,
-    int BLOCK_SIZE_DIM
-) {
-    // TODO: add comments
-    int pid_b = blockIdx.x;
-    int pid_d = blockIdx.y;
-    int tid = threadIdx.x;
-    int num_threads = blockDim.x;
+template <typename T, typename O, uint32_t vec_size = 8>
+__global__ void
+timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
+                          int max_period, int stride_t_b, int stride_out_b,
+                          int stride_out_d, int BLOCK_SIZE_DIM) {
+  // TODO: add comments
+  int pid_b = blockIdx.x;
+  int pid_d = blockIdx.y;
+  int tid = threadIdx.x;
+  int num_threads = blockDim.x;
 
-    // Get the timestep for this batch
-    float t_val = cast_to<float>(t_ptr[pid_b * stride_t_b]);
+  // Get the timestep for this batch
+  float t_val = cast_to<float>(t_ptr[pid_b * stride_t_b]);
 
-    // Calculate half dimension
-    int half = dim / 2;
+  // Calculate half dimension
+  int half = dim / 2;
 
-    // Create range of indices for this block
-    int d_start = pid_d * BLOCK_SIZE_DIM;
-    int d_end = d_start + BLOCK_SIZE_DIM;
+  // Create range of indices for this block
+  int d_start = pid_d * BLOCK_SIZE_DIM;
+  int d_end = d_start + BLOCK_SIZE_DIM;
 
-    vec_t<O, vec_size> o_vec_cos;
-    vec_t<O, vec_size> o_vec_sin;
+  vec_t<O, vec_size> o_vec_cos;
+  vec_t<O, vec_size> o_vec_sin;
 
-    int end = min(d_end, half);
+  int end = min(d_end, half);
 
-    for (int d_idx = d_start + tid * vec_size; d_idx < end; d_idx += num_threads * vec_size) {
+  for (int d_idx = d_start + tid * vec_size; d_idx < end;
+       d_idx += num_threads * vec_size) {
 
 #pragma unroll
-        for (int i = d_idx; i < min(end, d_idx + vec_size); i++) {
-            float angles = calculate_frequency_and_angle(t_val, i % half, half, max_period);
-            o_vec_cos[i - d_idx] = cast_to<O>(cosf(angles));
-            o_vec_sin[i - d_idx] = cast_to<O>(sinf(angles));
-        }
-
-        int out_idx_cos = pid_b * stride_out_b + d_idx * stride_out_d;
-        int out_idx_sin = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
-        if (d_idx + vec_size <= end) {
-            o_vec_cos.store(output_ptr + out_idx_cos);
-            o_vec_sin.store(output_ptr + out_idx_sin);
-        } else {
-            for (int i = d_idx; i < end; i++) {
-                output_ptr[out_idx_cos + i] = o_vec_cos[i];
-                output_ptr[out_idx_sin + i] = o_vec_sin[i];
-            }
-        }
+    for (int i = d_idx; i < min(end, d_idx + vec_size); i++) {
+      float angles = calculate_frequency_and_angle(t_val, i % half, half, max_period);
+      o_vec_cos[i - d_idx] = cast_to<O>(cosf(angles));
+      o_vec_sin[i - d_idx] = cast_to<O>(sinf(angles));
     }
 
-    // TODO: review, assert output buffer is zero init?
-    // if dim % 2:
-    //     embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    if (dim % 2 != 0) {
-        int out_idx_pad = pid_b * stride_out_b + (dim - 1) * stride_out_d;
-        output_ptr[out_idx_pad] = 0.;
+    int out_idx_cos = pid_b * stride_out_b + d_idx * stride_out_d;
+    int out_idx_sin = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
+    if (d_idx + vec_size <= end) {
+      o_vec_cos.store(output_ptr + out_idx_cos);
+      o_vec_sin.store(output_ptr + out_idx_sin);
+    } else {
+      for (int i = d_idx; i < end; i++) {
+        output_ptr[out_idx_cos + i] = o_vec_cos[i];
+        output_ptr[out_idx_sin + i] = o_vec_sin[i];
+      }
     }
+  }
+
+  // TODO: review, assert output buffer is zero init?
+  // if dim % 2:
+  //     embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])],
+  //     dim=-1)
+  if (dim % 2 != 0) {
+    int out_idx_pad = pid_b * stride_out_b + (dim - 1) * stride_out_d;
+    output_ptr[out_idx_pad] = 0.;
+  }
 }
 
-// NOTE: output always be float32 now. According to python code: timestep_embedding
-torch::Tensor timestep_embedding_kernel_cuda(
-    torch::Tensor &t,
-    torch::Tensor &output,
-    int dim,
-    int max_period
-    )
-{
-    TORCH_CHECK(t.dim() == 1, "t should be 1D");
-    TORCH_CHECK(output.dim() == 2, "output should be 2D");
+// NOTE: output always be float32 now. According to python code:
+// timestep_embedding
+torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
+                                             torch::Tensor &output, int dim,
+                                             int max_period) {
+  TORCH_CHECK(t.dim() == 1, "t should be 1D");
+  TORCH_CHECK(output.dim() == 2, "output should be 2D");
 
-    const int B = t.size(0);
-    TORCH_CHECK(output.size(0) == B, "Output batch size doesn't match t");
-    TORCH_CHECK(output.size(1) == dim, "Output feature size doesn't match dim");
+  const int B = t.size(0);
+  TORCH_CHECK(output.size(0) == B, "Output batch size doesn't match t");
+  TORCH_CHECK(output.size(1) == dim, "Output feature size doesn't match dim");
 
-    TORCH_CHECK(t.device().is_cuda(), "t must be a CUDA tensor");
-    TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
-    TORCH_CHECK(t.device() == output.device(), "t and output must be on the same device");
+  TORCH_CHECK(t.device().is_cuda(), "t must be a CUDA tensor");
+  TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
+  TORCH_CHECK(t.device() == output.device(),
+              "t and output must be on the same device");
 
-    // TODO: review
-    // To align with timestep_embedding python code.
-    TORCH_CHECK(output.scalar_type() == at::ScalarType::Float, "Output buffer should be float32.");
+  // TODO: review
+  // To align with timestep_embedding python code.
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float,
+              "Output buffer should be float32.");
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = at::cuda::getCurrentCUDAStream();
 
-    // TODO: tuning
-    int BLOCK_SIZE_DIM = 256;
-    const int num_threads = 256;
-    const int half = dim / 2;
+  // TODO: tuning
+  int BLOCK_SIZE_DIM = 256;
+  const int num_threads = 256;
+  const int half = dim / 2;
 
-    const dim3 grid_size(B, (half + BLOCK_SIZE_DIM - 1) / BLOCK_SIZE_DIM);
-    const dim3 block_size(num_threads);
+  const dim3 grid_size(B, (half + BLOCK_SIZE_DIM - 1) / BLOCK_SIZE_DIM);
+  const dim3 block_size(num_threads);
 
-    int stride_t_b = t.stride(0);
-    int stride_out_b = output.stride(0);
-    int stride_out_d = output.stride(1);
+  int stride_t_b = t.stride(0);
+  int stride_out_b = output.stride(0);
+  int stride_out_d = output.stride(1);
 
-    DISPATCH_FLOAT_TYPES(t.scalar_type(), "timestep_embedding_kernel", [&] {
-      using t_type = scalar_t;
-      using o_type = float;
-      timestep_embedding_kernel<t_type, o_type><<<grid_size, block_size, 0, stream>>>(
-          static_cast<t_type*>(t.data_ptr()),
-          static_cast<o_type*>(output.data_ptr()),
-          B,
-          dim,
-          max_period,
-          stride_t_b,
-          stride_out_b,
-          stride_out_d,
-          BLOCK_SIZE_DIM
-      );
-    });
+  DISPATCH_FLOAT_TYPES(t.scalar_type(), "timestep_embedding_kernel", [&] {
+    using t_type = scalar_t;
+    using o_type = float;
+    timestep_embedding_kernel<t_type, o_type>
+        <<<grid_size, block_size, 0, stream>>>(
+            static_cast<t_type *>(t.data_ptr()),
+            static_cast<o_type *>(output.data_ptr()), B, dim, max_period,
+            stride_t_b, stride_out_b, stride_out_d, BLOCK_SIZE_DIM);
+  });
 
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
-    return output;
+  cudaDeviceSynchronize();
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+              "CUDA kernel launch failed: ", cudaGetErrorString(err));
+  return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("timestep_embedding_kernel_cuda", &timestep_embedding_kernel_cuda, "timestep_embedding_kernel_cuda");
+  m.def("timestep_embedding_kernel_cuda", &timestep_embedding_kernel_cuda,
+        "timestep_embedding_kernel_cuda");
 }
-
