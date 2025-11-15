@@ -119,7 +119,7 @@
       "expected_median_denoise_ms": 3260.0,
       "stages_ms": {
         "InputValidationStage": 80.0,
-        "TextEncodingStage": 2000.0,
+        "TextEncodingStage": 3000.0,
         "ConditioningStage": 1.0,
         "TimestepPreparationStage": 2.0,
         "LatentPreparationStage": 30.0,
