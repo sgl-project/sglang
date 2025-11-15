@@ -156,9 +156,9 @@ class Qwen3_VisionBlock(nn.Module):
             softmax_in_single_precision = False
             qkv_backend = "fa3"
             flatten_batch = True
-        else:  # attn_implementation is None, use safe default
+        else:  # attn_implementation is None, let VisionAttention decide
             softmax_in_single_precision = False
-            qkv_backend = "sdpa"
+            qkv_backend = None
             flatten_batch = True
 
         self.attn = VisionAttention(

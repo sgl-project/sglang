@@ -592,7 +592,7 @@ class VisionAttention(nn.Module):
             backend = passed_backend
         elif is_cuda():
             major, minor = get_device_capability()
-            if major == 9:
+            if major == 9 and not is_blackwell():
                 backend = "fa3"
             else:
                 backend = "triton_attn"
