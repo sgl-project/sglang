@@ -226,6 +226,8 @@ class VisionSdpaAttention(nn.Module):
             del attn_weights, v
         else:
             # SDPA
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.squeeze(0)  # [s, s]
             # [b, h, s, head_size]
             output = F.scaled_dot_product_attention(
                 q,
@@ -472,6 +474,7 @@ class VisionAttention(nn.Module):
         num_heads: int,
         projection_size: int,
         use_qkv_parallel: bool,
+        head_size: Optional[int] = None,
         qkv_backend: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         dropout: float = 0.0,
@@ -494,7 +497,10 @@ class VisionAttention(nn.Module):
         self.tp_size = attn_tp_size
         self.tp_rank = attn_tp_rank
         self.dropout = dropout
-        self.head_size = embed_dim // num_heads
+        if head_size is not None:
+            self.head_size = head_size
+        else:
+            self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )

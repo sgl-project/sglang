@@ -46,13 +46,14 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 
 # === Vision Encoder === #
+_is_cpu = is_cpu()
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -127,6 +128,7 @@ class Qwen3_VisionBlock(nn.Module):
         self,
         dim: int,
         num_heads: int,
+        head_size: int,
         intermediate_dim: int,
         hidden_act="silu",
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
@@ -160,6 +162,7 @@ class Qwen3_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
+            head_size=head_size,
             projection_size=dim,
             use_qkv_parallel=True,
             rotary_embed="normal",
@@ -272,7 +275,10 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
+            head_dim = self.hidden_size // vision_config.original_num_heads
+        else:
+            head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
         self.blocks = nn.ModuleList(
@@ -280,10 +286,11 @@ class Qwen3VLMoeVisionModel(nn.Module):
                 Qwen3_VisionBlock(
                     dim=self.hidden_size,
                     num_heads=self.num_heads,
+                    head_size=head_dim,
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_3",
+                    attn_implementation="flash_attention_3" if not _is_cpu else "sdpa",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                 )
