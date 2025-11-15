@@ -30,7 +30,7 @@ DEFAULT_SERVER_ARGS = [
     "--speculative-num-steps",
     "4",
     "--speculative-eagle-topk",
-    "2",
+    "1",
     "--speculative-num-draft-tokens",
     "7",
     "--mem-fraction-static",
@@ -38,7 +38,7 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
-class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
+class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
 
     model = DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST
     draft_model = DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST
@@ -57,7 +57,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
+        envs.SGLANG_ENABLE_SPEC_V2.set(True)  # Enable Speculative Decoding V2
         model = cls.model
         cls.process = popen_launch_server(
             model,
@@ -97,15 +97,15 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
 
-class TestStandaloneSpeculativeDecodingTriton(TestStandaloneSpeculativeDecodingBase):
+class TestStandaloneV2SpeculativeDecodingTriton(TestStandaloneV2SpeculativeDecodingBase):
 
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS + ["--attention-backend", "triton"]
 
 
-class TestStandaloneSpeculativeDecodingFlashinfer(
-    TestStandaloneSpeculativeDecodingBase
+class TestStandaloneV2SpeculativeDecodingFlashinfer(
+    TestStandaloneV2SpeculativeDecodingBase
 ):
     @classmethod
     def get_server_args(cls):
