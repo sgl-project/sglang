@@ -4,9 +4,45 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_hip, is_hpu, is_npu
+from sglang.srt.utils import direct_register_custom_op, is_hip, is_hpu, is_npu
 
 logger = logging.getLogger(__name__)
+
+
+import sglang.srt.utils
+
+
+@torch.library.custom_op("sglang::wait_cmo_stream", mutates_args=())
+def wait_cmo_stream() -> None:
+    if sglang.srt.utils.get_cmo_stream():
+        sglang.srt.utils.wait_cmo_stream()
+
+
+@wait_cmo_stream.register_fake
+def wait_cmo_stream_fake() -> None:
+    pass
+
+
+def get_cmo_stream() -> bool:
+    return True
+
+
+def prepare_weight_cache(handle: torch.Tensor, cache: List[torch.Tensor]) -> None:
+    sglang.srt.utils.prepare_weight_cache(handle, cache)
+
+
+def prepare_weight_cache_register_fake(
+    handle: torch.Tensor, cache: List[torch.Tensor]
+) -> None:
+    pass
+
+
+direct_register_custom_op(
+    op_name="prepare_weight_cache",
+    op_func=prepare_weight_cache,
+    mutates_args=["handle"],
+    fake_impl=prepare_weight_cache_register_fake,
+)
 
 
 if not is_hpu():
