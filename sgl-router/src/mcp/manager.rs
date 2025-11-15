@@ -130,9 +130,6 @@ impl McpManager {
                 },
             )
             .await?;
-
-        self.inventory.clear_server_tools(&server_key);
-        Self::load_server_inventory(&self.inventory, &server_key, &client).await;
         Ok(client)
     }
 
@@ -159,6 +156,54 @@ impl McpManager {
             .into_iter()
             .map(|(_tool_name, _server_name, tool_info)| tool_info)
             .collect()
+    }
+
+    /// List all tools for a request with server labels
+    ///
+    /// Returns a HashMap mapping (server_label, tool_name) -> (Tool, server_url)
+    /// Includes both static tools (from config) and dynamic tools (from request servers)
+    pub async fn list_tools_for_request(
+        &self,
+        dynamic_servers: &[(String, String)],
+    ) -> std::collections::HashMap<(String, String), (Tool, String)> {
+        use std::collections::HashMap;
+
+        let mut result = HashMap::new();
+
+        // Add static tools from config
+        for (tool_name, server_name, tool) in self.inventory.list_tools() {
+            result.insert((server_name.clone(), tool_name), (tool, server_name));
+        }
+
+        // Add dynamic tools from request servers
+        for (server_label, server_url) in dynamic_servers {
+            if let Some(client) = self.get_client(server_url).await {
+                match client.peer().list_all_tools().await {
+                    Ok(tools) => {
+                        for tool in tools {
+                            let tool_name = tool.name.to_string();
+                            result.insert(
+                                (server_label.clone(), tool_name),
+                                (tool, server_url.clone()),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to list tools from server '{}': {:?}",
+                            server_label, e
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "No client found for dynamic server '{}' at URL '{}'",
+                    server_label, server_url
+                );
+            }
+        }
+
+        result
     }
 
     /// Call a tool by name with automatic type coercion
@@ -199,6 +244,36 @@ impl McpManager {
             .call_tool(request)
             .await
             .map_err(|e| McpError::ToolExecution(format!("Failed to call tool: {}", e)))
+    }
+
+    /// Call a tool on a specific server by URL
+    ///
+    /// This method is used for dynamic MCP servers where the tool is identified
+    /// by both server_url and tool_name (rather than from the static inventory).
+    pub async fn call_tool_by_url(
+        &self,
+        server_url: &str,
+        tool_name: &str,
+        args_map: Option<Map<String, serde_json::Value>>,
+    ) -> McpResult<String> {
+        // Get client for this server
+        let client = self
+            .get_client(server_url)
+            .await
+            .ok_or_else(|| McpError::ServerNotFound(server_url.to_string()))?;
+
+        // Call the tool
+        let result = client
+            .call_tool(CallToolRequestParam {
+                name: Cow::Owned(tool_name.to_string()),
+                arguments: args_map,
+            })
+            .await
+            .map_err(|e| McpError::ToolExecution(format!("Failed to call tool: {}", e)))?;
+
+        // Serialize result
+        serde_json::to_string(&result)
+            .map_err(|e| McpError::ToolExecution(format!("Failed to serialize tool result: {}", e)))
     }
 
     /// Get a tool by name

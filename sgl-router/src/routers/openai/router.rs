@@ -53,7 +53,7 @@ use crate::{
         rerank::RerankRequest,
         responses::{
             generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-            ResponsesGetParams, ResponsesRequest,
+            ResponseToolType, ResponsesGetParams, ResponsesRequest,
         },
     },
     routers::header_utils::apply_request_headers,
@@ -256,20 +256,44 @@ impl OpenAIRouter {
         }
 
         // Use the tool loop if the manager has any tools available (static or dynamic).
-        let active_mcp = if self.mcp_manager.list_tools().is_empty() {
-            None
-        } else {
+        // Check both inventory (static) and request tools (dynamic MCP)
+        let has_static_tools = !self.mcp_manager.list_tools().is_empty();
+        let has_dynamic_mcp = original_body
+            .tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+            })
+            .unwrap_or(false);
+
+        let active_mcp = if has_static_tools || has_dynamic_mcp {
             Some(&self.mcp_manager)
+        } else {
+            None
         };
 
         let mut response_json: Value;
 
         // If MCP is active, execute tool loop
         if let Some(mcp) = active_mcp {
+            use crate::routers::openai::mcp::extract_dynamic_mcp_servers;
+
             let config = McpLoopConfig::default();
 
-            // Transform MCP tools to function tools
-            prepare_mcp_payload_for_streaming(&mut payload, mcp);
+            // Extract all dynamic MCP servers from request
+            let dynamic_servers: Vec<(String, String)> = original_body
+                .tools
+                .as_ref()
+                .map(|tools| extract_dynamic_mcp_servers(tools))
+                .unwrap_or_default();
+
+            // Build tools map with (server_label, tool_name) -> (Tool, server_url)
+            let tools_map = mcp.list_tools_for_request(&dynamic_servers).await;
+
+            // Transform MCP tools to function tools with formatted names
+            prepare_mcp_payload_for_streaming(&mut payload, &tools_map);
 
             match execute_tool_loop(
                 &self.client,
@@ -279,6 +303,7 @@ impl OpenAIRouter {
                 original_body,
                 mcp,
                 &config,
+                &tools_map,
             )
             .await
             {

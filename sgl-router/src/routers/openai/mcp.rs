@@ -132,6 +132,49 @@ impl FunctionCallInProgress {
 
 /// Ensure a dynamic MCP client exists for request-scoped tools.
 ///
+/// Extract all dynamic MCP servers from request tools
+///
+/// Returns a deduplicated list of (server_label, server_url) pairs for all MCP tools
+/// with valid server URLs in the request.
+///
+/// # Arguments
+/// * `tools` - Request tools to extract MCP servers from
+///
+/// # Returns
+/// Vec of (server_label, server_url) tuples, deduplicated by server_label
+pub fn extract_dynamic_mcp_servers(tools: &[ResponseTool]) -> Vec<(String, String)> {
+    use std::collections::HashMap;
+
+    tools
+        .iter()
+        .filter_map(|t| {
+            if matches!(t.r#type, ResponseToolType::Mcp) {
+                let url = t.server_url.as_ref()?.trim().to_string();
+
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    warn!("Ignoring MCP server_url with unsupported scheme: {}", url);
+                    return None;
+                }
+
+                let label = t.server_label.clone().unwrap_or_else(|| {
+                    format!(
+                        "mcp_{}",
+                        url.chars()
+                            .filter(|c| c.is_alphanumeric())
+                            .take(8)
+                            .collect::<String>()
+                    )
+                });
+                Some((label, url))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<String, String>>() // Dedupe by label
+        .into_iter()
+        .collect()
+}
+
 /// This function parses request tools to extract MCP server configuration,
 /// then ensures a dynamic client exists in the McpManager via `get_or_create_client()`.
 /// The McpManager itself is returned (cloned Arc) for convenience, though the main
@@ -202,6 +245,7 @@ pub(super) async fn execute_streaming_tool_calls(
     state: &mut ToolLoopState,
     server_label: &str,
     sequence_number: &mut u64,
+    tools_map: &std::collections::HashMap<(String, String), (mcp::Tool, String)>,
 ) -> bool {
     // Execute all pending tool calls (sequential, as PR3 is skipped)
     for call in pending_calls {
@@ -214,9 +258,25 @@ pub(super) async fn execute_streaming_tool_calls(
             continue;
         }
 
+        // Parse formatted name: server_label__tool_name (double underscore separator)
+        let formatted_tool_name = &call.name;
+        let (call_server_label, original_tool_name) =
+            if let Some(sep_pos) = formatted_tool_name.find("__") {
+                let label = &formatted_tool_name[..sep_pos];
+                let tool = &formatted_tool_name[sep_pos + 2..]; // +2 to skip "__"
+                (label.to_string(), tool.to_string())
+            } else {
+                // Fallback: treat entire name as tool name (shouldn't happen with new format)
+                warn!(
+                    "Tool name '{}' not in expected format 'server_label__tool_name'",
+                    formatted_tool_name
+                );
+                ("unknown".to_string(), formatted_tool_name.clone())
+            };
+
         info!(
-            "Executing tool call during streaming: {} ({})",
-            call.name, call.call_id
+            "Executing tool call during streaming: {} (server: {}, tool: {}, id: {})",
+            formatted_tool_name, call_server_label, original_tool_name, call.call_id
         );
 
         // Use empty JSON object if arguments_buffer is empty
@@ -226,28 +286,44 @@ pub(super) async fn execute_streaming_tool_calls(
             &call.arguments_buffer
         };
 
-        // Call tool directly - manager handles parsing and type coercion
-        debug!("Calling MCP tool '{}' with args: {}", call.name, args_str);
-        let call_result = active_mcp.call_tool(&call.name, args_str).await;
-        let (output_str, success, error_msg) = match call_result {
-            Ok(result) => match serde_json::to_string(&result) {
-                Ok(output) => (output, true, None),
-                Err(e) => {
-                    let err = format!("Failed to serialize tool result: {}", e);
-                    warn!("{}", err);
-                    (json!({ "error": &err }).to_string(), false, Some(err))
-                }
-            },
-            Err(err) => {
-                let err_str = format!("tool call failed: {}", err);
-                warn!("Tool execution failed during streaming: {}", err_str);
-                (
-                    json!({ "error": &err_str }).to_string(),
-                    false,
-                    Some(err_str),
-                )
-            }
+        // Parse arguments
+        let args_map = match serde_json::from_str::<Value>(args_str) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
         };
+
+        // Look up tool in map and execute
+        let (output_str, success, error_msg) =
+            match tools_map.get(&(call_server_label.clone(), original_tool_name.clone())) {
+                Some((_tool, server_url)) => {
+                    // Call tool via manager using server URL
+                    debug!(
+                        "Calling MCP tool '{}' with args: {}",
+                        formatted_tool_name, args_str
+                    );
+                    match active_mcp
+                        .call_tool_by_url(server_url, &original_tool_name, args_map)
+                        .await
+                    {
+                        Ok(output) => (output, true, None),
+                        Err(e) => {
+                            let err_msg = e.to_string();
+                            warn!("MCP tool execution failed: {}", err_msg);
+                            let error_json = json!({ "error": &err_msg }).to_string();
+                            (error_json, false, Some(err_msg))
+                        }
+                    }
+                }
+                None => {
+                    let err_str = format!(
+                        "Tool '{}' (server: {}, tool: {}) not found in tool map",
+                        formatted_tool_name, call_server_label, original_tool_name
+                    );
+                    warn!("{}", err_str);
+                    let error_json = json!({ "error": &err_str }).to_string();
+                    (error_json, false, Some(err_str))
+                }
+            };
 
         // Send mcp_call completion event to client
         if !send_mcp_call_completion_events_with_error(
@@ -263,8 +339,13 @@ pub(super) async fn execute_streaming_tool_calls(
             return false;
         }
 
-        // Record the call
-        state.record_call(call.call_id, call.name, call.arguments_buffer, output_str);
+        // Record the call with formatted name
+        state.record_call(
+            call.call_id,
+            formatted_tool_name.clone(),
+            call.arguments_buffer,
+            output_str,
+        );
     }
     true
 }
@@ -274,36 +355,47 @@ pub(super) async fn execute_streaming_tool_calls(
 // ============================================================================
 
 /// Transform payload to replace MCP tools with function tools for streaming
+///
+/// Formats tool names as `server_label__tool_name` to support multiple MCP servers.
 pub(super) fn prepare_mcp_payload_for_streaming(
     payload: &mut Value,
-    active_mcp: &Arc<mcp::McpManager>,
+    tools_map: &std::collections::HashMap<(String, String), (mcp::Tool, String)>,
 ) {
     if let Some(obj) = payload.as_object_mut() {
-        // Remove any non-function tools from outgoing payload
+        // Remove any non-function tools from outgoing payload (keeps existing function tools)
+        let mut existing_function_tools = Vec::new();
         if let Some(v) = obj.get_mut("tools") {
             if let Some(arr) = v.as_array_mut() {
                 arr.retain(|item| {
-                    item.get("type")
+                    let is_function = item
+                        .get("type")
                         .and_then(|v| v.as_str())
                         .map(|s| s == event_types::ITEM_TYPE_FUNCTION)
-                        .unwrap_or(false)
+                        .unwrap_or(false);
+                    if is_function {
+                        existing_function_tools.push(item.clone());
+                    }
+                    false // Remove all items, we'll rebuild the array
                 });
             }
         }
 
-        // Build function tools for all discovered MCP tools
-        let mut tools_json = Vec::new();
-        let tools = active_mcp.list_tools();
-        for t in tools {
-            let parameters = Value::Object((*t.input_schema).clone());
-            let tool = serde_json::json!({
+        // Start with existing function tools
+        let mut tools_json = existing_function_tools;
+
+        // Add MCP tools with formatted names (server_label__tool_name)
+        for ((server_label, tool_name), (tool, _server_url)) in tools_map {
+            let formatted_name = format!("{}__{}", server_label, tool_name);
+            let parameters = Value::Object((*tool.input_schema).clone());
+            let tool_json = serde_json::json!({
                 "type": event_types::ITEM_TYPE_FUNCTION,
-                "name": t.name,
-                "description": t.description,
+                "name": formatted_name,
+                "description": tool.description,
                 "parameters": parameters
             });
-            tools_json.push(tool);
+            tools_json.push(tool_json);
         }
+
         if !tools_json.is_empty() {
             obj.insert("tools".to_string(), Value::Array(tools_json));
             obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
@@ -477,9 +569,16 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 ) -> bool {
     let effective_output_index = call.effective_output_index();
 
-    // Build mcp_call item (reuse existing function)
+    // Strip server_label__ prefix from formatted name
+    let original_tool_name = if let Some(sep_pos) = call.name.find("__") {
+        &call.name[sep_pos + 2..]
+    } else {
+        &call.name
+    };
+
+    // Build mcp_call item
     let mcp_call_item = build_mcp_call_item(
-        &call.name,
+        original_tool_name,
         &call.arguments_buffer,
         output,
         server_label,
@@ -570,6 +669,7 @@ pub(super) fn inject_mcp_metadata_streaming(
 // ============================================================================
 
 /// Execute the tool calling loop
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_tool_loop(
     client: &reqwest::Client,
     url: &str,
@@ -578,6 +678,7 @@ pub(super) async fn execute_tool_loop(
     original_body: &ResponsesRequest,
     active_mcp: &Arc<mcp::McpManager>,
     config: &McpLoopConfig,
+    tools_map: &std::collections::HashMap<(String, String), (mcp::Tool, String)>,
 ) -> Result<Value, String> {
     let mut state = ToolLoopState::new(original_body.input.clone());
 
@@ -661,32 +762,66 @@ pub(super) async fn execute_tool_loop(
                 );
             }
 
-            // Execute tool - manager handles parsing and type coercion
-            debug!(
-                "Calling MCP tool '{}' with args: {}",
-                tool_name, args_json_str
-            );
-            let call_result = active_mcp
-                .call_tool(&tool_name, args_json_str.as_str())
-                .await;
+            // Parse formatted name: server_label__tool_name (double underscore separator)
+            let formatted_tool_name = &tool_name;
+            let (server_label_parsed, original_tool_name) =
+                if let Some(sep_pos) = formatted_tool_name.find("__") {
+                    let label = &formatted_tool_name[..sep_pos];
+                    let tool = &formatted_tool_name[sep_pos + 2..]; // +2 to skip "__"
+                    (label.to_string(), tool.to_string())
+                } else {
+                    // Fallback: treat entire name as tool name
+                    warn!(
+                        "Tool name '{}' not in expected format 'server_label__tool_name'",
+                        formatted_tool_name
+                    );
+                    ("unknown".to_string(), formatted_tool_name.clone())
+                };
 
-            let output_str = match call_result {
-                Ok(result) => match serde_json::to_string(&result) {
-                    Ok(output) => output,
-                    Err(e) => {
-                        warn!("Failed to serialize tool result: {}", e);
-                        json!({ "error": format!("Serialization error: {}", e) }).to_string()
-                    }
-                },
-                Err(err) => {
-                    warn!("Tool execution failed: {}", err);
-                    // Return error as output, let model decide how to proceed
-                    json!({ "error": format!("tool call failed: {}", err) }).to_string()
-                }
+            debug!(
+                "Calling MCP tool '{}' (server: {}, tool: {}) with args: {}",
+                formatted_tool_name, server_label_parsed, original_tool_name, args_json_str
+            );
+
+            // Parse arguments
+            let args_map = match serde_json::from_str::<Value>(&args_json_str) {
+                Ok(Value::Object(map)) => Some(map),
+                _ => None,
             };
 
-            // Record the call
-            state.record_call(call_id, tool_name, args_json_str, output_str);
+            // Look up tool in map and execute
+            let output_str =
+                match tools_map.get(&(server_label_parsed.clone(), original_tool_name.clone())) {
+                    Some((_tool, server_url)) => {
+                        // Call tool via manager using server URL
+                        match active_mcp
+                            .call_tool_by_url(server_url, &original_tool_name, args_map)
+                            .await
+                        {
+                            Ok(output) => output,
+                            Err(e) => {
+                                warn!("MCP tool execution failed: {}", e);
+                                json!({ "error": e.to_string() }).to_string()
+                            }
+                        }
+                    }
+                    None => {
+                        let err_str = format!(
+                            "Tool '{}' (server: {}, tool: {}) not found in tool map",
+                            formatted_tool_name, server_label_parsed, original_tool_name
+                        );
+                        warn!("{}", err_str);
+                        json!({ "error": err_str }).to_string()
+                    }
+                };
+
+            // Record the call with formatted name
+            state.record_call(
+                call_id,
+                formatted_tool_name.clone(),
+                args_json_str,
+                output_str,
+            );
 
             // Build resume payload
             current_payload = build_resume_payload(
@@ -791,9 +926,16 @@ pub(super) fn build_incomplete_response(
                     .and_then(|v| v.as_str())
                     .unwrap_or("{}");
 
+                // Strip server_label__ prefix from formatted name
+                let original_tool_name = if let Some(sep_pos) = tool_name.find("__") {
+                    &tool_name[sep_pos + 2..]
+                } else {
+                    tool_name
+                };
+
                 // Mark as incomplete - not executed
                 let mcp_call_item = build_mcp_call_item(
-                    tool_name,
+                    original_tool_name,
                     args,
                     "", // No output - wasn't executed
                     server_label,
@@ -956,8 +1098,12 @@ pub(super) fn build_executed_mcp_call_items(
 pub(super) fn extract_function_call(resp: &Value) -> Option<(String, String, String)> {
     let output = resp.get("output")?.as_array()?;
     for item in output {
-        let obj = item.as_object()?;
-        let t = obj.get("type")?.as_str()?;
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let Some(t) = obj.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
         if t == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
             || t == event_types::ITEM_TYPE_FUNCTION_CALL
         {
@@ -970,9 +1116,13 @@ pub(super) fn extract_function_call(resp: &Value) -> Option<(String, String, Str
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                 })?;
-            let name = obj.get("name")?.as_str()?.to_string();
-            let arguments = obj.get("arguments")?.as_str()?.to_string();
-            return Some((call_id, name, arguments));
+            let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(arguments) = obj.get("arguments").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            return Some((call_id, name.to_string(), arguments.to_string()));
         }
     }
     None
