@@ -3424,9 +3424,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if (
-            not ENABLE_FLASHINFER_FP8_GEMM
-            and should_deepgemm_weight_requant_ue8m0(weight_block_size=getattr(self.quant_config, "weight_block_size", None))
+        if not ENABLE_FLASHINFER_FP8_GEMM and should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=getattr(self.quant_config, "weight_block_size", None)
         ):
             self._weight_requant_ue8m0(is_nextn)
 
