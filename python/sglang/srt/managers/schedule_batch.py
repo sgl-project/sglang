@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+from typing import Dict
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -249,18 +250,29 @@ class MultimodalDataItem:
 
     def set_pad_value(self):
         """
-        Set the pad value after first hashing the data
+        选择“用于哈希”的源（优先级：预计算 → 像素 → 特征），得到 stable hash，算出 pad_value。
         """
-        from sglang.srt.managers.mm_utils import hash_feature
+        from .mm_utils import data_hash  # 按你的项目真实位置导入
 
-        if self.hash is None:
-            if self.feature is not None:
-                hashed_feature = self.feature
-            else:
-                hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
-        assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+        src = (
+            self.precomputed_embeddings
+            if self.precomputed_embeddings is not None
+            else (self.pixel_values if self.pixel_values is not None else self.feature)
+        )
+        if src is None:
+            # 允许延后填充？通常这里应该报错更安全
+            raise AssertionError(
+                "Both precomputed_embeddings and pixel/feature are None"
+            )
+
+        # data_hash 内部要能接收 torch.Tensor；若不支持，你可做以下转换：
+        #   buf = src.detach().contiguous().cpu().numpy().tobytes()
+        #   h = hashlib.sha256(buf).digest()[:8]
+        #   self.hash = int.from_bytes(h, "little")
+        h = data_hash(src)
+        self.hash = h
+        # pad_value 需要是 int（避免之前的 bytes 格式化报错）
+        self.pad_value = int(self.hash % (1 << 30))
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -285,14 +297,43 @@ class MultimodalDataItem:
         return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
 
     @staticmethod
-    def from_dict(obj: dict):
-        kwargs = dict(obj)
-        modality = kwargs.pop("modality")
-        if isinstance(modality, str):
-            modality = Modality[modality]
-        ret = MultimodalDataItem(modality=modality, **kwargs)
-        ret.validate()
-        return ret
+    def from_dict(cls, d: Dict[str, Any]) -> "MultimodalDataItem":
+        it = cls()
+        it.modality = Modality.IMAGE
+        it.format = cls._to_format(d.get("format", "normal"))
+
+        # 携带的模型特定数据
+        msd = {}
+        if "image_grid_thw" in d and d["image_grid_thw"] is not None:
+            msd["image_grid_thw"] = d["image_grid_thw"]
+        if "spatial_merge_size" in d and d["spatial_merge_size"] is not None:
+            msd["spatial_merge_size"] = int(d["spatial_merge_size"])
+        it.model_specific_data = msd
+
+        if it.format == MultimodalInputFormat.PRECOMPUTED:
+            # 兼容两种键名：优先 precomputed_embeddings，其次 feature（旧语义）
+            pre = d.get("precomputed_embeddings", None)
+            if pre is None:
+                pre = d.get("feature", None)
+            it.precomputed_embeddings = pre
+            # 严格校验，报错早一点
+            if it.precomputed_embeddings is None:
+                raise AssertionError(
+                    "format=precomputed_embedding 但未提供 precomputed_embeddings/feature 张量"
+                )
+            # 像素字段禁止混用，保持 None
+            it.pixel_values = None
+            it.feature = None
+        elif it.format == MultimodalInputFormat.PROCESSOR_OUTPUT:
+            # 直接把 processor 的打包结果塞进来（项目里已有逻辑可复用）
+            it.feature = d.get("pixel_values", None)  # 有的实现用 feature 承载像素
+            it.pixel_values = d.get("pixel_values", None)
+        else:
+            # NORMAL：像素路径，接受 pixel_values 或 feature（二者择一）
+            it.pixel_values = d.get("pixel_values", None)
+            it.feature = d.get("feature", None)
+
+        return it
 
     def merge(self, other):
         self.feature += other.feature

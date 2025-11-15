@@ -13,14 +13,12 @@ from torch import nn
 
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
-    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
 
@@ -426,11 +424,9 @@ def _adjust_embedding_length(
     num_mm_tokens_in_input_ids = int(special_multimodal_mask.sum().item())
     num_mm_tokens_in_embedding = int(embedding.size(0))
 
-    
     if num_mm_tokens_in_embedding == num_mm_tokens_in_input_ids:
         return embedding
 
-    
     if num_mm_tokens_in_embedding < num_mm_tokens_in_input_ids:
         logger.warning(
             "Multimodal embedding shorter than expected: "
@@ -443,11 +439,8 @@ def _adjust_embedding_length(
 
         hidden_size = embedding.size(-1)
 
-        
         if num_mm_tokens_in_embedding == 0:
-            return embedding.new_zeros(
-                num_mm_tokens_in_input_ids, hidden_size
-            )
+            return embedding.new_zeros(num_mm_tokens_in_input_ids, hidden_size)
 
         pad = embedding.new_zeros(
             num_mm_tokens_in_input_ids - num_mm_tokens_in_embedding,
@@ -455,7 +448,6 @@ def _adjust_embedding_length(
         )
         return torch.cat([embedding, pad], dim=0)
 
-    
     logger.warning(
         "Multimodal embedding longer than expected: "
         "num_mm_tokens_in_input_ids=%d vs num_mm_tokens_in_embedding=%d. "
@@ -795,9 +787,34 @@ def get_multimodal_data_bounds(
     return valid_pairs_tensor
 
 
-def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+def data_hash(data: Any) -> int:
+    """
+    Robust hashing that returns an int (as previously expected by callers).
+    - bytes/bytearray/memoryview: use directly
+    - torch.Tensor: detach+cpu+contiguous, then view as uint8 to read raw bytes
+    - np.ndarray: ascontiguousarray + view uint8 to read raw bytes
+    - others: pickle.dumps fallback
+    Finally: sha256(...).digest()[:8] interpreted as little-endian integer.
+    """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        buf = bytes(data)
+    elif torch.is_tensor(data):
+        t = data.detach().cpu().contiguous()
+        # reinterpret as raw bytes regardless of dtype (supports bfloat16, float16, etc.)
+        buf = t.view(torch.uint8).numpy().tobytes()
+    elif isinstance(data, np.ndarray):
+        arr = np.ascontiguousarray(data)
+        buf = arr.view(np.uint8).tobytes()
+    else:
+        buf = pickle.dumps(data, protocol=4)
+
+    digest8 = hashlib.sha256(buf).digest()[:8]
+    return int.from_bytes(digest8, byteorder="little", signed=False)
+
+
+def hash_feature(feature: Any) -> int:
+    # keep API identical to before
+    return data_hash(feature)
 
 
 def tensor_hash(tensor_list) -> int:
@@ -824,20 +841,3 @@ def tensor_hash(tensor_list) -> int:
 
     mv = memoryview(tensor_cpu.numpy())
     return data_hash(mv.tobytes())
-
-
-def hash_feature(f):
-    if isinstance(f, list):
-        if isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
-    elif isinstance(f, np.ndarray):
-        arr = np.ascontiguousarray(f)
-        arr_bytes = arr.tobytes()
-        return data_hash(arr_bytes)
-    elif isinstance(f, torch.Tensor):
-        return tensor_hash([f])
-    elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
-        return tensor_hash([reconstruct_t])
-    return data_hash(f)
