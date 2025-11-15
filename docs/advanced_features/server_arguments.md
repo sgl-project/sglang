@@ -95,8 +95,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-multimodal` | Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen | `None` | bool flag (set to enable) |
 | `--revision` | The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
 | `--model-impl` | Which implementation of the model to use. * "auto" will try to use the SGLang implementation if it exists and fall back to the Transformers implementation if no SGLang implementation is available. * "sglang" will use the SGLang model implementation. * "transformers" will use the Transformers model implementation. | `auto` | Type: str |
-| `--decrypted-config-file` | Path to a decrypted config file for the main model. Used when model config.json is encrypted and needs to be loaded from an alternative location. | `None` | Type: str |
-| `--decrypted-draft-config-file` | Path to a decrypted config file for the draft model in speculative decoding. Used when draft model config.json is encrypted. | `None` | Type: str |
 
 ## HTTP server
 | Argument | Description | Defaults | Options |
@@ -137,7 +135,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--schedule-low-priority-values-first` | If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first. | `False` | bool flag (set to enable) |
 | `--priority-scheduling-preemption-threshold` | Minimum difference in priorities for an incoming request to have to preempt running request(s). | `10` | Type: int |
 | `--schedule-conservativeness` | How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently. | `1.0` | Type: float |
-| `--abort-on-priority-when-disabled` | If set, abort requests that specify a priority when priority scheduling is disabled. | `False` | bool flag (set to enable) |
+| `--abort-on-priority-when-disabled` | Aborts all requests that specify a priority, when priority scheduling is disabled. No requests with priority set will be served | `False` | bool flag (set to enable) |
 | `--page-size` | The number of tokens in a page. | `1` | Type: int |
 | `--hybrid-kvcache-ratio` | Mix ratio in [0,1] between uniform and hybrid kv buffers (0.0 = pure uniform: swa_size / full_size = 1)(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length) | `None` | Optional[float] |
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |
@@ -263,7 +261,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-algorithm` | Speculative algorithm. | `None` | `EAGLE`, `EAGLE3`, `NEXTN`, `STANDALONE`, `NGRAM` |
 | `--speculative-draft-model-path`<br>`--speculative-draft-model` | The path of the draft model weights. This can be a local folder or a Hugging Face repo ID. | `None` | Type: str |
 | `--speculative-draft-model-revision` | The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
-| `--speculative-draft-load-format` | The format of the draft model weights to load. Same options as --load-format. | `None` | `auto`, `pt`, `safetensors`, `npcache`, `dummy`, `sharded_state`, `gguf`, `bitsandbytes`, `layered`, `remote`, `remote_instance` |
+| `--speculative-draft-load-format` | The format of the draft model weights to load. Works the same as --load-format. | `None` | `auto`, `pt`, `safetensors`, `npcache`, `dummy`, `sharded_state`, `gguf`, `bitsandbytes`, `layered`, `remote`, `remote_instance` |
 | `--speculative-num-steps` | The number of steps sampled from draft model in Speculative Decoding. | `None` | Type: int |
 | `--speculative-eagle-topk` | The number of tokens sampled from the draft model in eagle2 each step. | `None` | Type: int |
 | `--speculative-num-draft-tokens` | The number of tokens sampled from the draft model in Speculative Decoding. | `None` | Type: int |
@@ -306,12 +304,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-expert-distribution-metrics` | Enable logging metrics for expert balancedness | `False` | bool flag (set to enable) |
 | `--deepep-config` | Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path. | `None` | Type: str |
 | `--moe-dense-tp-size` | TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports. | `None` | Type: int |
-| `--kt-weight-path` | Path to ktransformers weight files for CPU/GPU hybrid expert execution. When set, enables ktransformers for offloading MoE experts to CPU. | `None` | Type: str |
-| `--kt-method` | Ktransformers execution method for hybrid expert parallelism. | `None` | Type: str |
-| `--kt-cpuinfer` | Number of CPU inference threads for ktransformers. | `None` | Type: int |
-| `--kt-threadpool-count` | Number of thread pools for ktransformers CPU execution. | `None` | Type: int |
-| `--kt-num-gpu-experts` | Number of MoE experts to keep on GPU when using ktransformers (rest will be offloaded to CPU). | `None` | Type: int |
-| `--kt-max-deferred-experts-per-token` | Maximum number of deferred experts per token in ktransformers. Controls how many expert computations can be deferred for batching. | `None` | Type: int |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |
@@ -377,7 +369,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-symm-mem` | Enable NCCL symmetric memory for fast collectives. | `False` | bool flag (set to enable) |
 | `--disable-flashinfer-cutlass-moe-fp4-allgather` | Disables quantize before all-gather for flashinfer cutlass moe. | `False` | bool flag (set to enable) |
 | `--enable-tokenizer-batch-encode` | Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds. | `False` | bool flag (set to enable) |
-| `--disable-tokenizer-batch-decode` | Disable batch tokenizer decoding. When disabled, tokens are decoded one by one instead of in batches, which may reduce throughput but can be useful for debugging. | `False` | bool flag (set to enable) |
+| `--disable-tokenizer-batch-decode` | Disable batch tokenizer decoding. When disabled, tokens are decoded one by one instead of in batches, which may reduce the throughput | `False` | bool flag (set to enable) |
 | `--disable-outlines-disk-cache` | Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency. | `False` | bool flag (set to enable) |
 | `--disable-custom-all-reduce` | Disable the custom all-reduce kernel and fall back to NCCL. | `False` | bool flag (set to enable) |
 | `--enable-mscclpp` | Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL. | `False` | bool flag (set to enable) |
@@ -392,7 +384,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | `False` | bool flag (set to enable) |
 | `--enable-piecewise-cuda-graph` | Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature. | `False` | bool flag (set to enable) |
 | `--piecewise-cuda-graph-tokens` | Set the list of tokens when using piecewise cuda graph. | `None` | Type: JSON list |
-| `--piecewise-cuda-graph-compiler` | Compiler to use for piecewise CUDA graph. Options include 'dynamo' for torch.compile backend or other experimental compilers. | `None` | Type: str |
+| `--piecewise-cuda-graph-compiler` | Compiler to use for piecewise CUDA graph. Can choose 'dynamo' for torch.compile backend or 'eager' (default) | `None` | Type: str |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | `32` | Type: int |
 | `--piecewise-cuda-graph-max-tokens` | Set the maximum tokens when using piecewise cuda graph. | `4096` | Type: int |
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row | `` | Type: str |
