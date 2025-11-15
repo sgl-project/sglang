@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -970,8 +971,9 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
 # -------------------------------- Utilities and wrappers ---------------------------------------
 
 
-class MaybeTboDeepEPDispatcher:
+class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def __init__(self, **kwargs):
+        super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
             self._inners = [
