@@ -321,6 +321,10 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
+        # Check if image splitting is enabled
+        if not envs.SGLANG_ENABLE_IMAGE_SPLITTING.get():
+            return MultimodalInputs(mm_items=obj["mm_items"])
+
         original_mm_items = obj["mm_items"]
         expanded_mm_items = []
         for item in original_mm_items:

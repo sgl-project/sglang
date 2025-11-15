@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
@@ -264,46 +265,67 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
             return input_ids
 
         input_ids_tensor = torch.as_tensor(input_ids)
-        items_by_modality = defaultdict(list)
-        for item in mm_inputs.mm_items:
-            items_by_modality[item.modality].append(item)
 
-        token_id_map = {
-            Modality.IMAGE: mm_inputs.im_token_id,
-            Modality.MULTI_IMAGES: mm_inputs.im_token_id,
-            Modality.AUDIO: mm_inputs.audio_token_id,
-            Modality.VIDEO: mm_inputs.video_token_id,
-        }
+        # Check if image splitting is enabled
+        if envs.SGLANG_ENABLE_IMAGE_SPLITTING.get():
+            items_by_modality = defaultdict(list)
+            for item in mm_inputs.mm_items:
+                items_by_modality[item.modality].append(item)
 
-        for modality, items in items_by_modality.items():
-            token_id = token_id_map.get(modality)
+            token_id_map = {
+                Modality.IMAGE: mm_inputs.im_token_id,
+                Modality.MULTI_IMAGES: mm_inputs.im_token_id,
+                Modality.AUDIO: mm_inputs.audio_token_id,
+                Modality.VIDEO: mm_inputs.video_token_id,
+            }
 
-            if not items or token_id is None:
-                continue
+            for modality, items in items_by_modality.items():
+                token_id = token_id_map.get(modality)
 
-            indices = (input_ids_tensor == token_id).nonzero(as_tuple=True)[0]
-            num_placeholders = len(indices)
-            num_items = len(items)
+                if not items or token_id is None:
+                    continue
 
-            if num_placeholders == 0:
-                continue
+                indices = (input_ids_tensor == token_id).nonzero(as_tuple=True)[0]
+                num_placeholders = len(indices)
+                num_items = len(items)
 
-            if num_placeholders % num_items != 0:
-                raise ValueError(
-                    f"Mismatch for modality {modality.name}: "
-                    f"Found {num_placeholders} placeholder tokens (ID: {token_id}), "
-                    f"which is not divisible by the number of multimodal items ({num_items})."
-                )
+                if num_placeholders == 0:
+                    continue
 
-            tokens_per_item = num_placeholders // num_items
+                if num_placeholders % num_items != 0:
+                    raise ValueError(
+                        f"Mismatch for modality {modality.name}: "
+                        f"Found {num_placeholders} placeholder tokens (ID: {token_id}), "
+                        f"which is not divisible by the number of multimodal items ({num_items})."
+                    )
 
-            for i, item in enumerate(items):
-                start_index = i * tokens_per_item
-                end_index = (i + 1) * tokens_per_item
+                tokens_per_item = num_placeholders // num_items
 
-                indices_for_this_item = indices[start_index:end_index]
+                for i, item in enumerate(items):
+                    start_index = i * tokens_per_item
+                    end_index = (i + 1) * tokens_per_item
 
-                input_ids_tensor[indices_for_this_item] = item.pad_value
+                    indices_for_this_item = indices[start_index:end_index]
+
+                    input_ids_tensor[indices_for_this_item] = item.pad_value
+        else:
+            # Create mapping of token_ids to pad_values for each modality
+            token_to_pad_mapping = {}
+            for item in mm_inputs.mm_items:
+                if item.is_image() and mm_inputs.im_token_id is not None:
+                    token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
+                elif item.is_audio() and mm_inputs.audio_token_id is not None:
+                    token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
+                elif item.is_video() and mm_inputs.video_token_id is not None:
+                    token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
+                else:
+                    raise ValueError(
+                        f"No multimodal token id provided for {item.modality}"
+                    )
+
+            # Apply replacements for all tokens at once
+            for token_id, pad_value in token_to_pad_mapping.items():
+                input_ids_tensor[input_ids_tensor == token_id] = pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
