@@ -450,8 +450,8 @@ def import_pynvml():
     status without initializing CUDA context in the current process.
     Historically, there are two packages that provide pynvml:
     - `nvidia-ml-py` (https://pypi.org/project/nvidia-ml-py/): The official
-        wrapper. It is a dependency of sgl-diffusion, and is installed when users
-        install sgl-diffusion. It provides a Python module named `pynvml`.
+        wrapper. It is a dependency of sglang-diffusion, and is installed when users
+        install sglang-diffusion. It provides a Python module named `pynvml`.
     - `pynvml` (https://pypi.org/project/pynvml/): An unofficial wrapper.
         Prior to version 12.0, it also provides a Python module `pynvml`,
         and therefore conflicts with the official one which is a standalone Python file.
