@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import bisect
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, List, Union
+
 
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    set_dp_buffer_len,
+)
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -25,9 +31,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    enable_num_token_non_padded,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -36,6 +41,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
 
@@ -63,8 +69,13 @@ class EAGLEDecodeCudaGraphRunner:
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
         self.tp_size = self.model_runner.tp_size
         self.dp_size = model_runner.server_args.dp_size
+        self.enable_two_batch_overlap = (
+            model_runner.server_args.enable_two_batch_overlap
+        )
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -82,11 +93,6 @@ class EAGLEDecodeCudaGraphRunner:
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
-        # TODO: Check if we can reuse any cuda graph from target verify
-        # and treat this as one instance of verify-extend step
-        self.target_model_runner.attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
-        )
         if self.eagle_worker.target_decode_attn_backend is not None:
             self.eagle_worker.target_decode_attn_backend.init_cuda_graph_state(
                 self.max_bs, self.max_num_token
@@ -98,9 +104,6 @@ class EAGLEDecodeCudaGraphRunner:
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
-        
-        if self.target_model_runner.server_args.enable_lora:
-            self.target_model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -141,6 +144,7 @@ class EAGLEDecodeCudaGraphRunner:
 
             self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -192,11 +196,7 @@ class EAGLEDecodeCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                else max(forward_batch.global_num_tokens_cpu)
-            )
+            cuda_graph_bs = max(forward_batch.global_num_tokens_cpu)
         else:
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
@@ -270,9 +270,6 @@ class EAGLEDecodeCudaGraphRunner:
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
         # Forward batch for target
-        print(f"Target spec algorithm: {self.target_model_runner.spec_algorithm}")
-        print(f"Target token to kv pool length: {len(self.target_model_runner.token_to_kv_pool.k_buffer)}")
-        
         target_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
             batch_size=bs,
@@ -372,18 +369,19 @@ class EAGLEDecodeCudaGraphRunner:
                 skip_attn_backend_init=True,
                 pp_proxy_tensors=None,
             )
+            self.hidden_states[:num_tokens].copy_(target_ret.hidden_states)
             draft_ret =  self.model_runner.model.forward(
                 draft_forward_batch.input_ids,
                 draft_forward_batch.positions,
                 draft_forward_batch,
                 **kwargs,
             )
-            
+
             # We intentionally skip topk_index and topk_p capturing and put it outside
             # of the cuda graph to be able to skip it unless needed.
             # TODO: evaluate if we should either: 1. always run topk and include in cuda graph
             # 2. only run when turning spec decode back on but has kernel launch overhead.
-            return target_ret
+            return (target_ret, draft_ret)
 
         for _ in range(2):
             torch.cuda.synchronize()
@@ -399,82 +397,135 @@ class EAGLEDecodeCudaGraphRunner:
         )
         return graph, out
 
-    def replay(self, forward_batch: ForwardBatch):
-        assert forward_batch.out_cache_loc is not None
-        self.deepep_adapter.replay()
+    def replay_prepare(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        # TODO: Check if recapture is needed
+        # self.recapture_if_needed(forward_batch)
 
-        # batch_size and num_seqs can be different in case there are finished examples
-        # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
-        num_tokens = forward_batch.input_ids.shape[0]
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+
+        # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = (
-                max_num_tokens // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                else max_num_tokens
-            )
+            max_batch_size = max_num_tokens
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
-
         bs = self.capture_bs[index]
-        if bs * self.num_tokens_per_bs != num_tokens:
+        if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
-            self.positions.zero_()
 
         # Common inputs
-        self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        self.positions[:num_tokens].copy_(forward_batch.positions)
-        if (
-            forward_batch.spec_info.hidden_states.shape[1]
-            == self.hidden_states.shape[1]
-        ):
-            self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
+        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+        self.positions[:raw_num_token].copy_(forward_batch.positions)
 
-        # TODO(ch-wan): support num_token_non_padded
-        if self.require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs)
-
+        seq_lens_cpu = None
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            seq_lens_cpu = self.seq_lens_cpu[:bs]
 
-        if bs != raw_bs:
-            forward_batch.spec_info.positions = self.positions[:num_tokens]
-            forward_batch.spec_info.accept_length = self.accept_length[:bs]
+        # if pp_proxy_tensors:
+        #     for key in self.pp_proxy_tensors.keys():
+        #         dim = pp_proxy_tensors[key].shape[0]
+        #         self.pp_proxy_tensors[key][:dim].copy_(pp_proxy_tensors[key])
 
+        if forward_batch.mrope_positions is not None:
+            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
+        if self.require_gathered_buffer:
+            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
+            self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
+        if enable_num_token_non_padded(self.model_runner.server_args):
+            num_token_non_padded = forward_batch.num_token_non_padded
+            if self.require_gathered_buffer:
+                tokens_per_rank = bs // self.attn_tp_size * self.num_tokens_per_bs
+                num_local_token_non_padded = torch.clamp(
+                    num_token_non_padded - tokens_per_rank * self.attn_tp_rank,
+                    min=0,
+                    max=tokens_per_rank,
+                )
+                self.num_token_non_padded.copy_(num_local_token_non_padded)
+            else:
+                self.num_token_non_padded.copy_(num_token_non_padded)
+        if self.enable_two_batch_overlap:
+            raise NotImplementedError("Two batch overlap is not supported yet")
+        if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
+            forward_batch.spec_info.custom_mask = self.custom_mask
+        # Target Attention Backend
+        if self.eagle_worker.target_decode_attn_backend is not None:
+            self.eagle_worker.target_decode_attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                self.req_pool_indices[:bs],
+                self.seq_lens[:bs],
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=seq_lens_cpu,
+            )
+        
+        # Draft Attention backend
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=self.req_pool_indices,
-            seq_lens=self.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=self.seq_lens_cpu,
+            bs,
+            self.req_pool_indices[:bs],
+            self.seq_lens[:bs],
+            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            None,
+            self.capture_forward_mode,
+            forward_batch.spec_info,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
+        # Store fields
+        self.raw_bs = raw_bs
+        self.raw_num_token = raw_num_token
+        self.bs = bs
+
+    def replay(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+    ) -> List[Union[LogitsProcessorOutput, PPProxyTensors]]:
+        self.deepep_adapter.replay()
+
+        if not skip_attn_backend_init:
+            self.replay_prepare(forward_batch)
+        else:
+            # In speculative decoding, these two fields are still needed.
+            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+
         # Replay
-        self.graphs[bs].replay()
-        out = self.output_buffers[bs]
-        if bs != raw_bs:
-            forward_batch.spec_info.accept_length = self.accept_length[:raw_bs]
-            out_copy = out
-            out = LogitsProcessorOutput(
-                next_token_logits=out.next_token_logits[:raw_bs],
-                hidden_states=out.hidden_states[:raw_bs],
-            )
-            out.topk_p = out_copy.topk_p[:raw_bs]
-            out.topk_index = out_copy.topk_index[:raw_bs]
-        return out
+        self.graphs[self.bs].replay()
+
+        # TODO: Support PP
+        output = self.output_buffers[self.bs]
+
+        target_output, draft_output = output
+
+        return LogitsProcessorOutput(
+            next_token_logits=target_output.next_token_logits[: self.raw_num_token],
+            hidden_states=(
+                target_output.hidden_states[: self.raw_num_token]
+                if target_output.hidden_states is not None
+                else None
+            ),
+        ), LogitsProcessorOutput(
+            next_token_logits=draft_output.next_token_logits[: self.raw_num_token],
+            hidden_states=(
+                draft_output.hidden_states[: self.raw_num_token]
+                if draft_output.hidden_states is not None
+                else None
+            ),
+        )
 
     def _cache_loc_dtype(self):
         return torch.int64

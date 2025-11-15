@@ -213,6 +213,7 @@ class EAGLEWorker(TpModelWorker):
         # Initialize a decoding backend for target model, only needed for cuda graph
         if not self.server_args.disable_cuda_graph and not _is_npu and self.server_args.speculative_batch_size_threshold is not None:
             from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+            # TODO: Refactor attention backend to allow setting topk instead of reading from server_args
             # Modify args to disable specdecode and set it back
             backup_speculative_algorithm = self.target_worker.model_runner.server_args.speculative_algorithm
             backup_speculative_num_draft_tokens = self.target_worker.model_runner.server_args.speculative_num_draft_tokens
@@ -315,17 +316,7 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         elif batch.forward_mode.is_decode() and not batch.is_spec_enabled_for_batch:
-            if batch.seq_lens_cpu is not None:
-                batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
-            else:
-                batch.seq_lens_sum = batch.seq_lens.sum().item()
-            model_worker_batch = batch.get_model_worker_batch()
-            model_worker_batch.spec_info = None
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            generation_batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-            self.forward_draft_extend_after_target_decode(
-                batch, generation_batch_result.logits_output.hidden_states,
-            )
+            generation_batch_result = self.forward_no_spec_decode(batch)
             return generation_batch_result
         else:
             with self.draft_tp_context(
@@ -375,52 +366,77 @@ class EAGLEWorker(TpModelWorker):
         need_forward = global_need_forward_cnt > 0
         return need_forward
 
-    def forward_draft_extend_after_target_decode(self, batch: ScheduleBatch, target_hidden_states: torch.Tensor):
+    def forward_no_spec_decode(self, batch: ScheduleBatch):
         """
-        Running a simple decoding step for draft model to fill the KV
-        cache for each target decode step when spec decode is turned off.
+        Running a simple decoding step for target and draft model when spec decode is turned off.
         """
-        return_logprob_backup = batch.return_logprob
-        batch.return_logprob = False
-        # TODO: Handle idle
-        batch.spec_info.num_tokens_per_batch = 1
-        # batch.spec_info.num_tokens_for_logprob_per_batch = 1 ?
-        # When merge in a new batch, it has verified id, need to merge with 
-        # the verified_id collected
-        batch.spec_info.verified_id = batch.input_ids
-        batch.return_hidden_states = False
-        spec_info_backup = batch.spec_info
-        # Set to none to trigger regular decode
-        batch.spec_info = None
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        else:
+            batch.seq_lens_sum = batch.seq_lens.sum().item()
         batch.forward_mode = (
             ForwardMode.DECODE
             if not batch.forward_mode.is_idle()
             else ForwardMode.IDLE
         )
-        # token_to_kv_pool_allocator is shared between target and draft
-        # reuse the out_cache_loc from target model
+        batch.spec_info.num_tokens_per_batch = 1
+        # When merge in a new batch, it has verified id, need to merge with 
+        # the verified_id collected
+        batch.spec_info.verified_id = batch.input_ids
+        # batch.spec_info.num_tokens_for_logprob_per_batch = 1 ?
+        # spec_info_backup = batch.spec_info
+
         model_worker_batch = batch.get_model_worker_batch()
-        # TODO: only turn on after specdecode enabled
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.spec_info = None
+        
+
+        # Handle spec info first, we set it to None and restore later
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        
         forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
+            model_worker_batch, self.target_worker.model_runner
         )
-        forward_batch.target_hidden_states = target_hidden_states
-        forward_batch.can_run_dp_cuda_graph = False
-        if not forward_batch.forward_mode.is_idle():
-            self.draft_extend_attn_backend.init_forward_metadata(forward_batch)
-        # To use regular decoding with triton, we need to switch to draft_extend_backend
-        # For FA3, it is the same.
-        forward_batch.attn_backend = self.draft_extend_attn_backend
-        logits_output, _ = self.draft_model_runner.forward(forward_batch, skip_attn_backend_init=True)
-        input_is_idle = batch.forward_mode.is_idle()
-        batch.spec_info = spec_info_backup
+        can_cuda_graph = self.cuda_graph_runner_for_decode and self.cuda_graph_runner_for_decode.can_run(
+            forward_batch
+        )
+        if can_cuda_graph:
+            # TODO: handle next_token_logprobs
+            target_logits_output, draft_logits_output = self.cuda_graph_runner_for_decode.replay(forward_batch)
+            next_token_ids = self.target_worker.model_runner.sample(
+                target_logits_output, forward_batch
+            )
+            generation_batch_result = GenerationBatchResult(
+                logits_output=target_logits_output,
+                next_token_ids=next_token_ids,
+                can_run_cuda_graph=can_cuda_graph,
+            )
+        else:
+            generation_batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+            target_hidden_states = generation_batch_result.logits_output.hidden_states
+            # model_worker_batch = batch.get_model_worker_batch() Hope this is not needed
+            # TODO: only turn on after specdecode enabled
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.draft_model_runner
+            )
+            forward_batch.target_hidden_states = target_hidden_states
+            if not forward_batch.forward_mode.is_idle():
+                self.draft_extend_attn_backend.init_forward_metadata(forward_batch)
+            # To use draft decoding with triton, we need to switch to draft_extend_backend
+            # because prefill and decode uses different backend. For FA3, it is the same.
+            forward_batch.attn_backend = self.draft_extend_attn_backend
+            draft_logits_output, _ = self.draft_model_runner.forward(forward_batch, skip_attn_backend_init=True)
+
+        # Restore backups
+        # batch.spec_info = spec_info_backup
         # TODO: Only turn on after specdecode enabled
-        self.capture_for_decode(logits_output, batch.spec_info)
+        self.capture_for_decode(draft_logits_output, batch.spec_info)
+        input_is_idle = batch.forward_mode.is_idle()
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
-        batch.return_logprob = return_logprob_backup
+        return generation_batch_result
 
     
     def forward_target_extend(

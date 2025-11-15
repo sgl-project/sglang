@@ -224,7 +224,7 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_eagle_topk": 3,
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 2,
+        "cuda_graph_max_bs": 4,
         "dtype": "float16",
         "disable_cuda_graph": False,
         "attention_backend": "fa3",
