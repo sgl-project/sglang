@@ -133,9 +133,10 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
       python3 -m pip uninstall -y torch torchaudio torchvision ; \
       python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
+      python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+      pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     else \
       echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
     fi \
