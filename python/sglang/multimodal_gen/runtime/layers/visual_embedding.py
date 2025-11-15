@@ -229,7 +229,8 @@ def timestep_embedding_cuda(
     dtype = torch.float32
 
     B = t.shape[0]
-    output = torch.empty((B, dim), dtype=dtype, device=t.device)
+    # NOTE: assert output is zero init. So that no epilogue in cuda code.
+    output = torch.zeros((B, dim), dtype=dtype, device=t.device)
     output = cuda_module.timestep_embedding_kernel_cuda(t, output, dim, max_period)
     return output
 
