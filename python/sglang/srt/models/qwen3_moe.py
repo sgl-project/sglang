@@ -68,9 +68,9 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
-    is_npu,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
+    is_npu,
 )
 
 Qwen3MoeConfig = None
@@ -144,7 +144,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
-        if not get_moe_a2a_backend().is_deepep() and not get_moe_a2a_backend().is_ascend_fuseep():
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             return self.forward_normal(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
@@ -442,7 +445,7 @@ class Qwen3MoeAttention(nn.Module):
                     forward_batch=forward_batch,
                 )
                 if enable_fused_set_kv_buffer(forward_batch)
-                   and self.compatible_with_fused_kv_buffer
+                and self.compatible_with_fused_kv_buffer
                 else None
             ),
         )

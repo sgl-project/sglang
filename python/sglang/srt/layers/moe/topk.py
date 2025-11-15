@@ -106,7 +106,6 @@ if _use_aiter:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 if _is_npu:
     import torch_npu
-
     from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 # -------------------------------- TopKConfig ---------------------------------------

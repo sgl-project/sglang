@@ -95,6 +95,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     elif a2a_backend.is_ascend_fuseep():
         from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
+
         return NpuFuseEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,

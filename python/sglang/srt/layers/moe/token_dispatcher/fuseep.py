@@ -1,39 +1,23 @@
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
-from typing import NamedTuple, Optional
+import torch
 
-# from sglang.srt.layers.quantization import QuantizationConfig
-# from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
-    BaseDispatcherConfig,
     CombineInput,
     CombineInputFormat,
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import (
-    DeepEPMode,
-    get_deepep_config,
-    get_moe_runner_backend,
-    is_tbo_enabled,
-)
-
-from sglang.srt.utils import (
-    get_int_env_var,
-    is_npu,
-)
-
-_is_npu = is_npu()
-
-import torch
+from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
-
 
 
 class FuseEPDispatchOutput(NamedTuple):

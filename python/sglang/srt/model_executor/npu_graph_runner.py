@@ -19,7 +19,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Dict, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -85,7 +85,9 @@ class NPUGraphRunner(CudaGraphRunner):
         if isinstance(self.update_attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
 
-        self.graphs[self.bs].update(cpu_update_input=[{self.update_attr_name: seq_lens}])
+        self.graphs[self.bs].update(
+            cpu_update_input=[{self.update_attr_name: seq_lens}]
+        )
 
     def _cache_loc_dtype(self):
         return torch.int32
@@ -140,9 +142,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
-            thread = threading.Thread(
-                target=self._update_inputs, args=(seq_lens,)
-            )
+            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
             thread.start()
             self.graphs[self.bs].replay()
             thread.join()
