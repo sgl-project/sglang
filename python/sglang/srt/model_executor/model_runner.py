@@ -2117,7 +2117,10 @@ class ModelRunner:
             # print(f"{forward_batch.input_embeds.shape=}")
             # print(f"{forward_batch.input_deepstack_embeds.shape=}")
             print(f"right!!!!!!", flush=True)
-
+        if forward_batch.positions is not None:
+            print(f"position.shape={forward_batch.positions.shape}")
+        if forward_batch.mrope_positions is not None:
+            print(f"mrope_positions.shape={forward_batch.mrope_positions.shape}")
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
