@@ -62,7 +62,7 @@
         "ImageVAEEncodingStage": 252.76,
         "ConditioningStage": 0.13,
         "TimestepPreparationStage": 13.78,
-        "LatentPreparationStage": 9.18,
+        "LatentPreparationStage": 10.0,
         "DenoisingStage": 36000.0,
         "DecodingStage": 645
       },
@@ -89,7 +89,7 @@
         "TextEncodingStage": 3450.0,
         "ConditioningStage": 1.0,
         "TimestepPreparationStage": 2.0,
-        "LatentPreparationStage": 8.0,
+        "LatentPreparationStage": 15.0,
         "DenoisingStage": 90100.0,
         "DecodingStage": 3650.0
       },
