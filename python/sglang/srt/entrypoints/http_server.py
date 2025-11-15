@@ -413,6 +413,12 @@ async def health_generate(request: Request) -> Response:
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
     """
 
+    if (
+        get_bool_env_var("SGLANG_DISABLE_GENERATION_HEALTHCHECK")
+        and request.url.path == "/health"
+    ):
+        return Response(status_code=200)
+
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
