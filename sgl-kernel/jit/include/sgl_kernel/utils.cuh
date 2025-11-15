@@ -1,7 +1,8 @@
 #pragma once
 
-#include <dlpack/dlpack.h>
 #include <sgl_kernel/utils.h>
+
+#include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
 #include <concepts>

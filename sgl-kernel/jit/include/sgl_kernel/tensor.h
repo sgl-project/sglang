@@ -1,6 +1,7 @@
 #pragma once
-#include <dlpack/dlpack.h>
 #include <sgl_kernel/utils.h>
+
+#include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/dtype.h>
 

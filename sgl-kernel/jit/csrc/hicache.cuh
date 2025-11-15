@@ -1,13 +1,14 @@
-#include <dlpack/dlpack.h>
 #include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
+#include <sgl_kernel/warp.cuh>
+
+#include <dlpack/dlpack.h>
 
 #include <algorithm>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/warp.cuh>
 #include <type_traits>
 
 namespace {
