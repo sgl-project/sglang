@@ -102,9 +102,6 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
-            is_in_piecewise_cuda_graph,
-        )
 
         if k is not None:
             # For cross-layer sharing, kv can be None

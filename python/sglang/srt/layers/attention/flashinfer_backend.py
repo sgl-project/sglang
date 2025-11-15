@@ -697,9 +697,9 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-    ):
+    ):  
         # print(f"flashinfer forward_extend in layer {layer.layer_id}", flush=True)
-        # print(f"{q.reshape(-1)[:10]=}", flush=True)
+        print(f"{q.reshape(-1)[:10]=}", flush=True)
         # print(f"{k.reshape(-1)[:10]=}", flush=True)
         # print(f"{v.reshape(-1)[:10]=}", flush=True)
         # print(f"{forward_batch=}", flush=True)
