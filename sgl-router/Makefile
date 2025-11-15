@@ -4,6 +4,11 @@
 # Python bindings directory
 PYTHON_DIR := bindings/python
 
+# Auto-detect CPU cores and cap at reasonable limit to avoid thread exhaustion
+# Can be overridden: make python-dev JOBS=4
+NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
+JOBS ?= $(shell echo $$(($(NPROC) > 16 ? 16 : $(NPROC))))
+
 # Check if sccache is available and set RUSTC_WRAPPER accordingly
 SCCACHE := $(shell which sccache 2>/dev/null)
 ifdef SCCACHE
@@ -88,12 +93,12 @@ sccache-stop: ## Stop the sccache server
 
 # Python bindings (maturin) targets
 python-dev: ## Build Python bindings in development mode (fast, debug build)
-	@echo "Building Python bindings in development mode..."
-	@cd $(PYTHON_DIR) && maturin develop
+	@echo "Building Python bindings in development mode (using $(JOBS) parallel jobs with sccache)..."
+	@cd $(PYTHON_DIR) && CARGO_BUILD_JOBS=$(JOBS) maturin develop
 
 python-build: ## Build Python wheel (release mode with vendored OpenSSL)
-	@echo "Building Python wheel (release, vendored OpenSSL)..."
-	@cd $(PYTHON_DIR) && maturin build --release --out dist --features vendored-openssl
+	@echo "Building Python wheel (release, vendored OpenSSL, using $(JOBS) parallel jobs with sccache)..."
+	@cd $(PYTHON_DIR) && CARGO_BUILD_JOBS=$(JOBS) maturin build --release --out dist --features vendored-openssl
 
 python-build-release: python-build ## Alias for python-build
 
@@ -118,7 +123,7 @@ python-test: ## Run Python tests
 
 python-check: ## Check Python package with twine
 	@echo "Checking Python package..."
-	@cd $(PYTHON_DIR) && maturin build --release --out dist --features vendored-openssl
+	@cd $(PYTHON_DIR) && CARGO_BUILD_JOBS=$(JOBS) maturin build --release --out dist --features vendored-openssl
 	@pip install twine 2>/dev/null || true
 	@twine check $(PYTHON_DIR)/dist/*
 	@echo "Python package check passed!"
