@@ -31,7 +31,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM, Ernie4DecoderLayer
+from sglang.srt.models.ernie4 import Ernie4_5ForCausalLM, Ernie4DecoderLayer
 from sglang.srt.utils import add_prefix
 
 
@@ -163,7 +163,7 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
                 param_name,
                 weight_name,
                 shard_id,
-            ) in Ernie4_5_ForCausalLM.stacked_params_mapping:
+            ) in Ernie4_5ForCausalLM.stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
