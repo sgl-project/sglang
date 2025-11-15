@@ -6,7 +6,7 @@
 
 #ifndef USE_ROCM
 #define WARP_SIZE 32
-#include "pytorch_extension_utils.h"
+#include "utils.h"
 #else
 #include "pytorch_extension_utils_rocm.h"
 #include "utils.h"  // WARP_SIZE

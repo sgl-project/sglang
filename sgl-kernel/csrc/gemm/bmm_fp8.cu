@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 #include <driver_types.h>
 
 #include <flashinfer/gemm/bmm_fp8.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "utils.h"
 
 void bmm_fp8(
     at::Tensor A,

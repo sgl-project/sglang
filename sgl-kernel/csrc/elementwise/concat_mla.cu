@@ -2,8 +2,8 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <cuda_runtime.h>
 
-#include "pytorch_extension_utils.h"
 #include "utils.cuh"
+#include "utils.h"
 
 constexpr int NUM_LOCAL_HEADS = 128;
 constexpr int QK_NOPE_HEAD_DIM = 128;

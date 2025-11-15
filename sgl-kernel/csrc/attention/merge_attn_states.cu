@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <optional>
 
-#include "pytorch_extension_utils.h"
+#include "utils.h"
 
 // Helper functions to convert between different data types
 // (float, half, bfloat16) for the merge attention states kernel.

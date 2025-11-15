@@ -1,4 +1,7 @@
-#include "pytorch_extension_utils.h"
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+#include "utils.h"
 
 template <typename T>
 struct ConvertToFP8 {

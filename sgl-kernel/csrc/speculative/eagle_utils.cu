@@ -18,7 +18,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #ifndef USE_ROCM
-#include "pytorch_extension_utils.h"
+#include "utils.h"
 #else
 #include "pytorch_extension_utils_rocm.h"
 #endif
