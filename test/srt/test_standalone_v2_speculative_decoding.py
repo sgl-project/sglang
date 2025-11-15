@@ -7,8 +7,8 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_STANDALONE,
-    DEFAULT_TARGET_MODEL_STANDALONE,
+    DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST,
+    DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -26,11 +26,11 @@ DEFAULT_SERVER_ARGS = [
     "--speculative-algorithm",
     "STANDALONE",
     "--speculative-draft-model-path",
-    DEFAULT_DRAFT_MODEL_STANDALONE,
+    DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST,
     "--speculative-num-steps",
     "4",
     "--speculative-eagle-topk",
-    "2",
+    "1",
     "--speculative-num-draft-tokens",
     "7",
     "--mem-fraction-static",
@@ -38,10 +38,10 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
-class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
+class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
 
-    model = DEFAULT_TARGET_MODEL_STANDALONE
-    draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
+    model = DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST
+    draft_model = DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
     accuracy_threshold = 0.7  # derived tests need to override this
     spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
@@ -57,7 +57,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
+        envs.SGLANG_ENABLE_SPEC_V2.set(True)  # Enable Speculative Decoding V2
         model = cls.model
         cls.process = popen_launch_server(
             model,
@@ -97,15 +97,15 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
 
-class TestStandaloneSpeculativeDecodingTriton(TestStandaloneSpeculativeDecodingBase):
+class TestStandaloneV2SpeculativeDecodingTriton(TestStandaloneV2SpeculativeDecodingBase):
 
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS + ["--attention-backend", "triton"]
 
 
-class TestStandaloneSpeculativeDecodingFlashinfer(
-    TestStandaloneSpeculativeDecodingBase
+class TestStandaloneV2SpeculativeDecodingFlashinfer(
+    TestStandaloneV2SpeculativeDecodingBase
 ):
     @classmethod
     def get_server_args(cls):
