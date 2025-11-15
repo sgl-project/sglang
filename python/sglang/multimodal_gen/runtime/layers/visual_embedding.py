@@ -153,14 +153,14 @@ def _timestep_embedding_triton_kernel(
 
     # Calculate freqs and angles
     dtype = output_ptr.dtype.element_ty
-    log_max_period = tl.log(max_period.to(dtype))
+    log_max_period = tl.log(max_period.to(tl.float32))
     freqs = tl.exp(-log_max_period * freq_indices / half)
     angles = t_val.to(tl.float32) * freqs
 
     # TODO: review
     embedding = tl.where(
         is_first_half, tl.cos(angles), tl.where(is_second_half, tl.sin(angles), 0.0)
-    )
+    ).to(dtype)
 
     # Store results
     out_ptrs = output_ptr + pid_b * stride_out_b + d_offsets * stride_out_d
@@ -188,6 +188,8 @@ def timestep_embedding_triton(
     B = t.shape[0]
     assert t.is_cuda, "t should be a CUDA tensor"
 
+    # TODO: output dtype always be float32. According to python code: timestep_embedding
+    dtype = torch.float32
     output = torch.empty((B, dim), dtype=dtype, device="cuda")
 
     grid = lambda META: (B, triton.cdiv(dim, META["BLOCK_SIZE_DIM"]))
@@ -205,6 +207,30 @@ def timestep_embedding_triton(
         output.stride(1),
     )
 
+    return output
+
+
+# TODO: minimum unit test for now. delete later
+from torch.utils.cpp_extension import load
+
+cuda_module = load(
+    "timestep_embedding_kernel_cuda",
+    sources=["./csrc/elementwise/timestep_embedding.cu"],
+)
+
+
+def timestep_embedding_cuda(
+    t: torch.Tensor,
+    dim: int,
+    max_period: int = 10000,
+    dtype: torch.dtype = torch.float32,
+):
+    # NOTE: output dtype always be float32. According to python code: timestep_embedding
+    dtype = torch.float32
+
+    B = t.shape[0]
+    output = torch.empty((B, dim), dtype=dtype, device=t.device)
+    output = cuda_module.timestep_embedding_kernel_cuda(t, output, dim, max_period)
     return output
 
 
