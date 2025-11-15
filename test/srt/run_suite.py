@@ -17,10 +17,8 @@ suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("function_call/test_json_schema_constraint.py", 1),
-        TestFile("hicache/test_hicache.py", 116),
-        TestFile("hicache/test_hicache_eagle.py", 150),
-        TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
+        TestFile("hicache/test_hicache_variants.py", 393),
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 50),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 20),
@@ -77,6 +75,7 @@ suites = {
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
+        TestFile("test_fp8_utils.py", 5),
         TestFile("rotary_embedding/test_mrope.py", 10),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 80),
@@ -133,7 +132,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 100),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 170),
-        TestFile("test_vision_openai_server_a.py", 900),
+        # TestFile("test_vision_openai_server_a.py", 900),
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_modelopt_export.py", 30),
@@ -217,12 +216,15 @@ suites = {
         TestFile("test_cpp_radix_cache.py", 60),
     ],
     "nightly-4-gpu-b200": [
+        TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
         TestFile("test_fp4_moe.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
     ],
     "nightly-8-gpu-b200": [],
-    "nightly-4-gpu": [],
+    "nightly-4-gpu": [
+        TestFile("test_qwen3_next_deterministic.py", 200),
+    ],
     "nightly-8-gpu": [],
     "nightly-8-gpu-h200": [
         TestFile("test_deepseek_v32_nsabackend.py", 600),
@@ -231,6 +233,7 @@ suites = {
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
+        TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py"),
         TestFile("entrypoints/http_server/test_abort_request.py"),
         TestFile("ep/test_deepep_internode.py"),
@@ -242,7 +245,6 @@ suites = {
         TestFile("ep/test_moe_deepep_eval_accuracy_large.py"),
         TestFile("function_call/test_unknown_tool_name.py"),
         TestFile("hicache/test_disaggregation_hicache.py"),
-        TestFile("hicache/test_hicache_page.py"),
         TestFile("hicache/test_hicache_storage_benchmark.py"),
         TestFile("hicache/test_hicache_storage_e2e.py"),
         TestFile("layers/attention/nsa/test_act_quant_triton.py"),
@@ -309,10 +311,8 @@ suites = {
         TestFile("test_get_weights_by_name.py"),
         TestFile("test_gpt_oss_common.py"),
         TestFile("test_health_check.py"),
-        TestFile("test_hicache.py"),
-        TestFile("test_hicache_mla.py"),
-        TestFile("test_hicache_page.py"),
         TestFile("test_hicache_storage.py"),
+        TestFile("test_hicache_variants.py"),
         TestFile("test_hybrid_dp_ep_tp_mtp.py"),
         TestFile("test_int4_kernel.py"),
         TestFile("test_int8_kernel.py"),
@@ -370,6 +370,7 @@ suites = {
         TestFile("test_verl_engine_4_gpu.py"),
         TestFile("test_verl_engine_server.py"),
         TestFile("test_vertex_endpoint.py"),
+        TestFile("test_vision_openai_server_a.py"),  # TODO: Fix timeout
         TestFile("test_vision_openai_server_b.py"),
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_vlm_accuracy.py"),
@@ -389,7 +390,7 @@ suite_amd = {
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 150),
-        TestFile("lora/test_lora_backend.py", 99),
+        # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107

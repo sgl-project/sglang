@@ -9,8 +9,8 @@ use tokio::sync::Mutex;
 
 use crate::tool_parser::{
     parsers::{
-        DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MistralParser,
-        PassthroughParser, PythonicParser, QwenParser, Step3Parser,
+        DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
+        MistralParser, PassthroughParser, PythonicParser, QwenParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -242,6 +242,7 @@ impl ParserFactory {
         registry.register_parser("glm4_moe", || Box::new(Glm4MoeParser::new()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
         registry.register_parser("kimik2", || Box::new(KimiK2Parser::new()));
+        registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
 
         // Register default model mappings
         Self::register_default_mappings(&registry);
@@ -292,6 +293,10 @@ impl ParserFactory {
         registry.map_model("kimi-k2*", "kimik2");
         registry.map_model("Kimi-K2*", "kimik2");
         registry.map_model("moonshot*/Kimi-K2*", "kimik2");
+
+        // MiniMax models
+        registry.map_model("minimax*", "minimax_m2");
+        registry.map_model("MiniMax*", "minimax_m2");
 
         // Other models
         registry.map_model("gemini-*", "json");

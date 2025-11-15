@@ -2,7 +2,6 @@ import json
 import os
 import unittest
 import warnings
-from datetime import datetime
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
