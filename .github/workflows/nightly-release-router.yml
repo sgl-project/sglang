@@ -66,16 +66,16 @@ jobs:
       - name: Modify version for nightly release
         run: |
           # Get current version from pyproject.toml
-          CURRENT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])" 2>/dev/null || python -c "import tomli; print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          CURRENT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])" 2>/dev/null || python -c "import tomli; print(tomli.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])")
           # Create nightly version with date: e.g., 0.2.1.dev20250128
           NIGHTLY_VERSION="${CURRENT_VERSION}.dev$(date +%Y%m%d)"
           echo "Nightly version: $NIGHTLY_VERSION"
 
           # Update pyproject.toml with nightly version (temporary, not committed)
-          sed -i.bak "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
+          sed -i.bak "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" bindings/python/pyproject.toml
 
           # Verify the change
-          cat pyproject.toml | grep "^version"
+          cat bindings/python/pyproject.toml | grep "^version"
         shell: bash
 
       - name: Install twine and tomli
@@ -92,6 +92,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: bindings/python
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
@@ -151,20 +152,21 @@ jobs:
       - name: Modify version for nightly release
         run: |
           # Get current version from pyproject.toml
-          CURRENT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])" 2>/dev/null || python -c "import tomli; print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          CURRENT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])" 2>/dev/null || python -c "import tomli; print(tomli.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])")
           # Create nightly version with date: e.g., 0.2.1.dev20250128
           NIGHTLY_VERSION="${CURRENT_VERSION}.dev$(date +%Y%m%d)"
           echo "Nightly version: $NIGHTLY_VERSION"
 
           # Update pyproject.toml with nightly version (temporary, not committed)
-          sed -i "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
+          sed -i "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" bindings/python/pyproject.toml
 
           # Verify the change
-          cat pyproject.toml | grep "^version"
+          cat bindings/python/pyproject.toml | grep "^version"
 
       - name: Build SDist
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: bindings/python
           command: sdist
           args: --out dist
           rust-toolchain: stable
