@@ -79,6 +79,10 @@ def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
     if target starts with 're:' to any target in list.
     """
     for target in targets:
+        if "visual" in target:
+            # adapt to VisionAttention
+            target = target.replace(r"attn.qkv", r"attn.qkv_proj")
+            target = target.replace(r"model.visual.", r"visual.")
         if _is_equal_or_regex_match(layer_name, target):
             return True
     return False
