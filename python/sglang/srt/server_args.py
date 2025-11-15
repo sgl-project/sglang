@@ -570,6 +570,9 @@ class ServerArgs:
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
 
+    # encoder mode
+    mm_enable_dp_encoder: bool = False
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3664,6 +3667,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
+        )
+        parser.add_argument(
+            "--mm-enable-dp-encoder",
+            action="store_true",
+            default=ServerArgs.mm_enable_dp_encoder,
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         )
 
     @classmethod
