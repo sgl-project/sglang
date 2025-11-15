@@ -62,7 +62,6 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
@@ -116,8 +115,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
-from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.request_types import FINISH_ABORT, RequestStage
 from sglang.srt.managers.schedule_batch import (
     ModelWorkerBatch,
@@ -704,6 +701,8 @@ class Scheduler(
             )[0]
 
     def init_cache_with_memory_pool(self):
+        from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+
         server_args = self.server_args
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -922,6 +921,8 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
 
     def init_overlap(self):
+        from sglang.srt.managers.overlap_utils import FutureMap
+
         self.future_map = None
 
         if not self.enable_overlap:
@@ -2476,6 +2477,10 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
