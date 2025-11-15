@@ -12,7 +12,7 @@ use std::{io, sync::Arc};
 
 use axum::http::HeaderMap;
 use bytes::Bytes;
-use serde_json::{json, to_value, Value};
+use serde_json::{from_str, json, to_string, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -287,7 +287,7 @@ pub(super) async fn execute_streaming_tool_calls(
         };
 
         // Parse arguments
-        let args_map = match serde_json::from_str::<Value>(args_str) {
+        let args_map = match from_str::<Value>(args_str) {
             Ok(Value::Object(map)) => Some(map),
             _ => None,
         };
@@ -305,7 +305,15 @@ pub(super) async fn execute_streaming_tool_calls(
                         .call_tool_by_url(server_url, &original_tool_name, args_map)
                         .await
                     {
-                        Ok(output) => (output, true, None),
+                        Ok(result) => match to_string(&result) {
+                            Ok(output) => (output, true, None),
+                            Err(e) => {
+                                let err_msg = format!("Failed to serialize tool result: {}", e);
+                                warn!("{}", err_msg);
+                                let error_json = json!({ "error": &err_msg }).to_string();
+                                (error_json, false, Some(err_msg))
+                            }
+                        },
                         Err(e) => {
                             let err_msg = e.to_string();
                             warn!("MCP tool execution failed: {}", err_msg);
@@ -784,7 +792,7 @@ pub(super) async fn execute_tool_loop(
             );
 
             // Parse arguments
-            let args_map = match serde_json::from_str::<Value>(&args_json_str) {
+            let args_map = match from_str::<Value>(&args_json_str) {
                 Ok(Value::Object(map)) => Some(map),
                 _ => None,
             };
@@ -798,7 +806,14 @@ pub(super) async fn execute_tool_loop(
                             .call_tool_by_url(server_url, &original_tool_name, args_map)
                             .await
                         {
-                            Ok(output) => output,
+                            Ok(result) => match to_string(&result) {
+                                Ok(output) => output,
+                                Err(e) => {
+                                    warn!("Failed to serialize tool result: {}", e);
+                                    json!({ "error": format!("Failed to serialize: {}", e) })
+                                        .to_string()
+                                }
+                            },
                             Err(e) => {
                                 warn!("MCP tool execution failed: {}", e);
                                 json!({ "error": e.to_string() }).to_string()
@@ -1067,7 +1082,7 @@ pub(super) fn build_executed_mcp_call_items(
                 .unwrap_or("{}");
 
             // Check if output contains error by parsing JSON
-            let is_error = serde_json::from_str::<Value>(output_str)
+            let is_error = from_str::<Value>(output_str)
                 .map(|v| v.get("error").is_some())
                 .unwrap_or(false);
 

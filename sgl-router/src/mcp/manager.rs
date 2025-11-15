@@ -255,7 +255,7 @@ impl McpManager {
         server_url: &str,
         tool_name: &str,
         args_map: Option<Map<String, serde_json::Value>>,
-    ) -> McpResult<String> {
+    ) -> McpResult<CallToolResult> {
         // Get client for this server
         let client = self
             .get_client(server_url)
@@ -263,17 +263,13 @@ impl McpManager {
             .ok_or_else(|| McpError::ServerNotFound(server_url.to_string()))?;
 
         // Call the tool
-        let result = client
+        client
             .call_tool(CallToolRequestParam {
                 name: Cow::Owned(tool_name.to_string()),
                 arguments: args_map,
             })
             .await
-            .map_err(|e| McpError::ToolExecution(format!("Failed to call tool: {}", e)))?;
-
-        // Serialize result
-        serde_json::to_string(&result)
-            .map_err(|e| McpError::ToolExecution(format!("Failed to serialize tool result: {}", e)))
+            .map_err(|e| McpError::ToolExecution(format!("Failed to call tool: {}", e)))
     }
 
     /// Get a tool by name
