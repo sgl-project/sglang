@@ -86,6 +86,8 @@ oracle = { version = "0.6.3", features = ["chrono"] }
 subtle = "2.6"
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
+image = { version = "0.25.4", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
+base64 = "0.22"
 openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 openmetrics-parser = "0.4.4"
 
