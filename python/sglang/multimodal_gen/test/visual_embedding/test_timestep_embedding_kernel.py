@@ -29,10 +29,10 @@ class TestTimestepEmbed(unittest.TestCase):
                 cuda_output = timestep_embedding_cuda(t, dim)
                 assert torch.allclose(
                     torch_output, triton_output, atol=1e-4
-                ), f"({B=}, {dim=}), Max diff {(torch_output - triton_output).abs().max()}"
+                ), f"triton ({B=}, {dim=}), Max diff {(torch_output - triton_output).abs().max()}"
                 assert torch.allclose(
                     torch_output, cuda_output, atol=1e-4
-                ), f"({B=}, {dim=}), Max diff {(torch_output - cuda_output).abs().max()}"
+                ), f"cuda ({B=}, {dim=}), Max diff {(torch_output - cuda_output).abs().max()}"
 
     def test_dtype(self):
         pass
