@@ -699,7 +699,12 @@ class Indexer(CustomOp):
         enable_index_cp = (
             get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA") and layer_id >= 4
         )
-        is_prefill = forward_batch.forward_mode.is_extend()
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend()
+        )
 
         attention_tp_rank = get_attention_tp_rank()
         attention_tp_size = get_attention_tp_size()
@@ -790,9 +795,27 @@ class Indexer(CustomOp):
 
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
-                actual_seq_lengths_q = torch.tensor(
-                    [1 + i * 1 for i in range(bs)], dtype=torch.int32, device=k.device
-                )
+                if (
+                    forward_batch.forward_mode.is_draft_extend_v2()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend()
+                ):
+                    num_draft_tokens = (
+                        forward_batch.attn_backend.speculative_num_draft_tokens
+                    )
+                    actual_seq_lengths_q = torch.arange(
+                        num_draft_tokens,
+                        num_draft_tokens + bs,
+                        num_draft_tokens,
+                        dtype=torch.int32,
+                        device=k.device,
+                    )
+                else:
+                    actual_seq_lengths_q = torch.tensor(
+                        [1 + i * 1 for i in range(bs)],
+                        dtype=torch.int32,
+                        device=k.device,
+                    )
             else:
                 actual_seq_lengths_q = (
                     forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q
