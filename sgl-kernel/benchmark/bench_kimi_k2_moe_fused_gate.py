@@ -44,6 +44,13 @@ if IS_CI:
     seq_length_range = [5000]  # Only test one sequence length in CI
 else:
     seq_length_range = [
+        1,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
         512,
         1024,
         2048,
