@@ -6,11 +6,16 @@ import os
 import subprocess
 import time
 from datetime import datetime
+from typing import Any
 
 from dateutil.tz import UTC
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
-LOG_DIR = os.path.join(project_root, "logs")
+LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
+if LOG_DIR:
+    LOG_DIR = os.path.abspath(LOG_DIR)
+else:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+    LOG_DIR = os.path.join(project_root, "logs")
 
 # Configure a specific logger for performance metrics
 perf_logger = logging.getLogger("performance")
@@ -72,5 +77,61 @@ class PerformanceLogger:
             "tag": tag,
             "total_duration_ms": total_duration * 1000,
             "steps": self.step_timings,
+        }
+        perf_logger.info(json.dumps(log_entry))
+
+    def log_stage_metric(self, stage_name: str, duration_ms: float):
+        """Logs a single pipeline stage timing entry."""
+        log_entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "request_id": self.request_id,
+            "commit_hash": self.commit_hash,
+            "tag": "pipeline_stage_metric",
+            "stage": stage_name,
+            "duration_ms": duration_ms,
+        }
+        perf_logger.info(json.dumps(log_entry))
+
+    def log_stage_metrics(self, stages: Any):
+        """
+        Persist per-stage execution stats to performance.log.
+
+        Args:
+            stages: Either a PipelineLoggingInfo instance or any object exposing
+                a mapping of stage metadata via a `stages` attribute/dict.
+        """
+        if stages is None:
+            return
+
+        if hasattr(stages, "stages"):
+            stage_items = getattr(stages, "stages", {}).items()
+        elif isinstance(stages, dict):
+            stage_items = stages.items()
+        else:
+            return
+
+        formatted_stages: list[dict[str, Any]] = []
+        for name, info in stage_items:
+            if not info:
+                continue
+            entry = {"name": name}
+            execution_time = info.get("execution_time")
+            if execution_time is not None:
+                entry["execution_time_ms"] = execution_time * 1000
+            for key, value in info.items():
+                if key == "execution_time":
+                    continue
+                entry[key] = value
+            formatted_stages.append(entry)
+
+        if not formatted_stages:
+            return
+
+        log_entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "request_id": self.request_id,
+            "commit_hash": self.commit_hash,
+            "tag": "pipeline_stage_metrics",
+            "stages": formatted_stages,
         }
         perf_logger.info(json.dumps(log_entry))

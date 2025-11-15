@@ -11,6 +11,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import openai
+
 # Add e2e_response_api directory for imports
 _TEST_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_TEST_DIR))
@@ -51,6 +53,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
         )
 
         cls.base_url = cls.cluster["base_url"]
+        cls.client = openai.Client(api_key=cls.api_key, base_url=cls.base_url + "/v1")
 
     @classmethod
     def tearDownClass(cls):
@@ -64,8 +67,7 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
 
     def test_structured_output_json_schema(self):
         """Override with simpler schema for Llama model (complex schemas not well supported)."""
-        data = {
-            "model": self.model,
+        params = {
             "input": [
                 {
                     "role": "system",
@@ -89,28 +91,26 @@ class TestGrpcBackend(StateManagementTests, MCPTests, StructuredOutputBaseTest):
             },
         }
 
-        create_resp = self.make_request("/v1/responses", "POST", data)
-        self.assertEqual(create_resp.status_code, 200)
-
-        create_data = create_resp.json()
-        self.assertIn("id", create_data)
-        self.assertIn("output", create_data)
-        self.assertIn("text", create_data)
+        create_resp = self.create_response(**params)
+        self.assertIsNone(create_resp.error)
+        self.assertIsNotNone(create_resp.id)
+        self.assertIsNotNone(create_resp.output)
+        self.assertIsNotNone(create_resp.text)
 
         # Verify text format was echoed back correctly
-        self.assertIn("format", create_data["text"])
-        self.assertEqual(create_data["text"]["format"]["type"], "json_schema")
-        self.assertEqual(create_data["text"]["format"]["name"], "math_answer")
-        self.assertIn("schema", create_data["text"]["format"])
+        self.assertIsNotNone(create_resp.text.format)
+        self.assertEqual(create_resp.text.format.type, "json_schema")
+        self.assertEqual(create_resp.text.format.name, "math_answer")
+        self.assertIsNotNone(create_resp.text.format.schema_)
 
         # Find the message output
         output_text = next(
             (
-                content.get("text", "")
-                for item in create_data.get("output", [])
-                if item.get("type") == "message"
-                for content in item.get("content", [])
-                if content.get("type") == "output_text"
+                content.text
+                for item in create_resp.output
+                if item.type == "message"
+                for content in item.content
+                if content.type == "output_text"
             ),
             None,
         )
@@ -154,6 +154,7 @@ class TestGrpcHarmonyBackend(
         )
 
         cls.base_url = cls.cluster["base_url"]
+        cls.client = openai.Client(api_key=cls.api_key, base_url=cls.base_url + "/v1")
 
     @classmethod
     def tearDownClass(cls):

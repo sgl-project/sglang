@@ -4,7 +4,6 @@ Test script to verify SGLang config file integration.
 
 import os
 import tempfile
-from pathlib import Path
 
 import pytest
 import yaml
