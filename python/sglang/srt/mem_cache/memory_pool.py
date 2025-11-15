@@ -140,8 +140,16 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: Union[torch.Tensor, List[torch.Tensor]]
-        intermediate_conv_window: torch.Tensor
+        last_steps: torch.Tensor
+
+        def at_layer_idx(self, layer: int):
+            # do NOT slice last_steps b/c it does not have layer dimension
+            return type(self)(
+                **{
+                    k: (v if k == "last_steps" else v[layer])
+                    for k, v in vars(self).items()
+                }
+            )
 
     def __init__(
         self,
@@ -171,32 +179,40 @@ class MambaPool:
             if self.enable_custom_mem_pool
             else nullcontext()
         ):
-            if self.is_kda_cache:
-                conv_state = [
-                    torch.zeros(
-                        size=(num_mamba_layers, size + 1) + conv_shape,
+            if speculative_num_draft_tokens is None:
+                if self.is_kda_cache:
+                    conv_state = [
+                        torch.zeros(
+                            size=(num_mamba_layers, size + 1) + conv_shape,
+                            dtype=conv_dtype,
+                            device=device,
+                        )
+                        for conv_shape in conv_state_shape
+                    ]
+                else:
+                    # assume conv_state = (dim, state_len)
+                    assert conv_state_shape[0] > conv_state_shape[1]
+                    conv_state = torch.zeros(
+                        size=(num_mamba_layers, size + 1) + conv_state_shape,
                         dtype=conv_dtype,
                         device=device,
                     )
-                    for conv_shape in conv_state_shape
-                ]
-            else:
-                # assume conv_state = (dim, state_len)
-                assert conv_state_shape[0] > conv_state_shape[1]
-                conv_state = torch.zeros(
-                    size=(num_mamba_layers, size + 1) + conv_state_shape,
-                    dtype=conv_dtype,
+                temporal_state = torch.zeros(
+                    size=(num_mamba_layers, size + 1) + temporal_state_shape,
+                    dtype=ssm_dtype,
                     device=device,
                 )
-            temporal_state = torch.zeros(
-                size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                dtype=ssm_dtype,
-                device=device,
-            )
-            if speculative_num_draft_tokens is not None:
+                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                logger.info(
+                    f"Mamba Cache is allocated. "
+                    f"max_mamba_cache_size: {size}, "
+                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                )
+            else:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
+                temporal_state = torch.zeros(
                     size=(
                         num_mamba_layers,
                         size + 1,
@@ -208,11 +224,18 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
+                # Last step indices for spec decoding:
+                # - each seq has a last step index, and the last step index is the index of the last verified/accepted step of that seq
+                # - for each round of target verify for the same seq, it needs to use the last step index of the previous round to calculate the next temporal state and conv state:
+                #  - conv_state[last_step_index] (previous round's last verified/accepted conv state) -> conv_state[0:draft_token_num] (current round's conv state)
+                #  - temporal_state[last_step_index] (previous round's last verified/accepted temporal state) -> temporal_state[0:draft_token_num] (current round's temporal state)
+                # - for example, for a batch size of 3 and draft token num of 8, the last steps tensor might be [0, 4, 6]: meaning the last step index of the first seq is 0, the last step index of the second seq is 4, and the last step index of the third seq is 6
+                last_steps = torch.zeros((size + 1), dtype=torch.int32, device="cuda")
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
 
                 if self.is_kda_cache:
-                    intermediate_conv_window_cache = [
+                    conv_state = [
                         torch.zeros(
                             size=(
                                 num_mamba_layers,
@@ -227,7 +250,7 @@ class MambaPool:
                         for conv_shape in conv_state_shape
                     ]
                 else:
-                    intermediate_conv_window_cache = torch.zeros(
+                    conv_state = torch.zeros(
                         size=(
                             num_mamba_layers,
                             size + 1,
@@ -241,24 +264,14 @@ class MambaPool:
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
-                    intermediate_ssm=intermediate_ssm_state_cache,
-                    intermediate_conv_window=intermediate_conv_window_cache,
+                    last_steps=last_steps,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                )
-            else:
-                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
-                logger.info(
-                    f"Mamba Cache is allocated. "
-                    f"max_mamba_cache_size: {size}, "
-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                    f"last_steps size: {get_tensor_size_bytes(last_steps) / GB:.2f}GB "
                 )
             self.free_slots = torch.arange(
                 self.size, dtype=torch.int64, device=self.device
@@ -295,6 +308,8 @@ class MambaPool:
         else:
             self.mamba_cache.conv[:, free_index] = 0
         self.mamba_cache.temporal[:, free_index] = 0
+        if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+            self.mamba_cache.last_steps[free_index] = 0
 
     def clear(self):
         # Zero the entire mamba cache before resetting free_slots
@@ -320,6 +335,11 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
             :, src_index
         ]
+        if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+            # For radix cache: last_steps is required to be copied because it is used to calculate the correct conv state and ssm state in the spec decoding kernel
+            self.mamba_cache.last_steps[dst_index] = self.mamba_cache.last_steps[
+                src_index
+            ]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
