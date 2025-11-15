@@ -525,7 +525,9 @@ class NpuFuseEPMoE(DeepEPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        self.quant_method.process_weights_after_loading = self._process_weights_after_loading
+        self.quant_method.process_weights_after_loading = (
+            self._process_weights_after_loading
+        )
 
     def forward(
         self,
@@ -551,26 +553,45 @@ class NpuFuseEPMoE(DeepEPMoE):
         origin_weight.untyped_storage().resize_(0)
         return new_weight
 
-    def permute_weight(self, w: torch.Tensor, tile_n: int):
-        *dims, n = w.shape
-        order = list(range(len(dims))) + [-2, -3, -1]
-        return (
-            w.reshape(*dims, 2, n // tile_n, tile_n // 2).permute(order).reshape(*dims, n).contiguous()
-        )
+    def permute_w13_weight_scale(self, w: torch.Tensor, tile_n: int):
+        if tile_n % 2 != 0:
+            raise ValueError(f"tile_n must be even, got {tile_n}")
 
-    def reshape_w13_weight(self, weight: torch.Tensor, dim: int):
+        *dims, n = w.shape
+        if n % tile_n != 0:
+            raise ValueError(f"Last dimension {n} must be divisible by tile_n {tile_n}")
+
+        w_reshaped = w.reshape(*dims, 2, n // tile_n, tile_n // 2)
+
+        # Permute the last two dimensions.
+        perm_order = list(range(len(dims))) + [-2, -3, -1]
+        w_permuted = w_reshaped.permute(perm_order)
+
+        return w_permuted.reshape(*dims, n)
+
+    def reshape_w13_weight(self, weight: torch.Tensor, dim: int, chunk_size: int = 64):
         # Achieving greater computing power through reshape on Ascend.
         original_shape = weight.shape
         if dim < 0:
             dim += len(original_shape)
 
-        weight = weight.view(
-            *original_shape[:dim], 2, -1, 64, *original_shape[dim + 1:]
-        )
-        weight = weight.transpose(dim, dim + 1).contiguous()
-        weight = weight.view(*original_shape[:dim], -1, *original_shape[dim + 1:])
+        if original_shape[dim] % (2 * chunk_size) != 0:
+            raise ValueError(
+                f"Dimension {dim} size {original_shape[dim]} must be divisible by {2 * chunk_size}"
+            )
 
-        return weight.contiguous()
+        new_shape = (
+            *original_shape[:dim],
+            2,
+            original_shape[dim] // (2 * chunk_size),
+            chunk_size,
+            *original_shape[dim + 1 :],
+        )
+
+        weight = weight.view(new_shape)
+        weight = weight.transpose(dim, dim + 1).contiguous()
+
+        return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
 
     def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13 = self.release_weight_cache(layer.w13_weight)
@@ -584,11 +605,15 @@ class NpuFuseEPMoE(DeepEPMoE):
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
 
         w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
-        w13_scale = self.permute_weight(w13_scale, 128)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale.to(torch.float32), requires_grad=False)
+        w13_scale = self.permute_w13_weight_scale(w13_scale, 128)
+        layer.w13_weight_scale = torch.nn.Parameter(
+            w13_scale.to(torch.float32), requires_grad=False
+        )
 
         w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale.to(torch.float32), requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(
+            w2_scale.to(torch.float32), requires_grad=False
+        )
 
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(

@@ -8,7 +8,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig, get_moe_a2a_backend
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
@@ -90,10 +90,6 @@ def npu_wrapper_rmsnorm_forward(func):
                 self.bias,
                 self.variance_epsilon,
             )
-            # out, _, residual_out = torch_npu.npu_add_rms_norm(
-            #     residual, x, self.weight.data, self.variance_epsilon
-            # )
-            # out = out + self.bias
             return out.to(x.dtype), residual_out
 
         out = torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
@@ -128,9 +124,9 @@ def npu_fused_experts(
     row_idx_len = num_tokens * top_k
     row_idx = (
         torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-            .view(top_k, -1)
-            .permute(1, 0)
-            .contiguous()
+        .view(top_k, -1)
+        .permute(1, 0)
+        .contiguous()
     )
     hidden_states, expanded_row_idx, expanded_expert_idx = (
         torch_npu.npu_moe_init_routing(
@@ -1018,35 +1014,6 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         origin_weight.untyped_storage().resize_(0)
         return new_weight
 
-    def process_weight_with_fused_deepep(self, layer: torch.nn.Module) -> None:
-        w13 = self.release_weight_cache(layer.w13_weight)
-        torch_npu.npu_format_cast_(w13, 2)
-        cpu_w13 = w13.cpu()
-        w13 = self.reshape_w13_weight(cpu_w13, -1).npu()
-        torch_npu.npu_format_cast_(w13, 29)
-        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
-
-        w2 = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
-        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
-
-        w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
-        w13_scale = self.permute_weight(w13_scale, 128)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale.to(torch.float32), requires_grad=False)
-
-        w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale.to(torch.float32), requires_grad=False)
-
-        if hasattr(layer, "w13_weight_offset"):
-            layer.w13_weight_offset = torch.nn.Parameter(
-                layer.w13_weight_offset.data.squeeze(-1).contiguous(),
-                requires_grad=False,
-            )
-        if hasattr(layer, "w2_weight_offset"):
-            layer.w2_weight_offset = torch.nn.Parameter(
-                layer.w2_weight_offset.data.squeeze(-1).contiguous(),
-                requires_grad=False,
-            )
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_data = self.release_weight_cache(layer.w13_weight.data)
         layer.w13_weight = Parameter(weight_data, requires_grad=False)
@@ -1055,7 +1022,8 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight = Parameter(weight_data, requires_grad=False)
 
         layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32), requires_grad=False
+            layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32),
+            requires_grad=False,
         )
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
@@ -1068,12 +1036,8 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         )
 
         if get_bool_env_var("ENABLE_ASCEND_MOE_NZ"):
-            layer.w13_weight.data = torch_npu.npu_format_cast(
-                layer.w13_weight.data, 29
-            )
-            layer.w2_weight.data = torch_npu.npu_format_cast(
-                layer.w2_weight.data, 29
-            )
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29)
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
