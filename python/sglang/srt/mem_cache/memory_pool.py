@@ -149,12 +149,19 @@ class MambaPool:
         size: int,
         cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
         device: str,
+        enable_memory_saver: bool,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
+        self.size = size
+        self.device = device
+        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
         num_mamba_layers = len(cache_params.layers)
 
         self.size = size
@@ -166,7 +173,7 @@ class MambaPool:
         )
 
         self.is_kda_cache = isinstance(cache_params, KimiLinearCacheParams)
-        with (
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.enable_custom_mem_pool
             else nullcontext()
@@ -366,6 +373,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+        self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size=mamba_size,
             cache_params=cache_params,
@@ -384,6 +392,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             size=size,
             cache_params=cache_params,
             device=device,
+            enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
@@ -947,6 +956,7 @@ class HybridLinearKVPool(KVCache):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
+        enable_memory_saver: bool,
         mamba_pool: MambaPool,
         # TODO: refactor mla related args
         use_mla: bool = False,
@@ -979,7 +989,7 @@ class HybridLinearKVPool(KVCache):
                 head_dim=head_dim,
                 layer_num=self.full_layer_nums,
                 device=device,
-                enable_memory_saver=False,
+                enable_memory_saver=enable_memory_saver,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
