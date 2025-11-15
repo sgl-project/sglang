@@ -283,7 +283,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_3",
+                    attn_implementation=None,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                 )
