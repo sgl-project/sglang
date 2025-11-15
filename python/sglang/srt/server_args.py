@@ -998,7 +998,12 @@ class ServerArgs:
                 self.dtype = "bfloat16"
 
             if self.moe_runner_backend == "auto":
-                if is_blackwell_supported() and is_mxfp4_quant_format:
+                if self.enable_piecewise_cuda_graph:
+                    self.moe_runner_backend = "auto"
+                    logger.warning(
+                        "Enable piecewise CUDA graph, enabling auto MOE kernel."
+                    )
+                elif is_blackwell_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
                     logger.warning(
                         "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
@@ -1022,7 +1027,7 @@ class ServerArgs:
                 "triton",
                 "trtllm_mha",
                 "intel_xpu",
-            }, "fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model"
+            }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
             if is_sm100_supported() and self.attention_backend is None:
                 self.attention_backend = "trtllm_mha"
                 logger.warning(

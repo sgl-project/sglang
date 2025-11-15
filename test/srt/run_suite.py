@@ -223,7 +223,9 @@ suites_cuda = {
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
     ],
     "nightly-8-gpu-b200": [],
-    "nightly-4-gpu": [],
+    "nightly-4-gpu": [
+        TestFile("test_qwen3_next_deterministic.py", 200),
+    ],
     "nightly-8-gpu": [],
     "nightly-8-gpu-h200": [
         TestFile("test_deepseek_v32_nsabackend.py", 600),
@@ -232,6 +234,7 @@ suites_cuda = {
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
+        TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py"),
         TestFile("entrypoints/http_server/test_abort_request.py"),
         TestFile("ep/test_deepep_internode.py"),
