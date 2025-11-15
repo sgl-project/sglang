@@ -594,6 +594,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         #     multimodal_model=self,
         #     positions=positions,
         # )
+        input_embeds = forward_batch.input_embeds
 
         hidden_states = self.model.forward(
             input_ids=input_ids,

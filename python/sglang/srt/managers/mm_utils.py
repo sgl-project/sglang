@@ -600,7 +600,7 @@ def embed_mm_inputs(
 
     # only for qwen3vl right now,  replace the original use_deepstack with this method.
     if hasattr(multimodal_model, "post_process"):
-        embeddings, input_deepstack_embeds = multimodal_model.post_process(
+        embeddings, forward_batch = multimodal_model.post_process(
             inputs_embeds, modalities, embeddings, indices, forward_batch
         )
 
@@ -613,7 +613,7 @@ def embed_mm_inputs(
         # in-place update
         inputs_embeds[index] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
 
-    return inputs_embeds, input_deepstack_embeds
+    return inputs_embeds, forward_batch
 
 
 def general_mm_embed_routine(
@@ -839,7 +839,7 @@ def multimodal_preprocess_routine(
             for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
             if forward_batch.mm_inputs[i] is not None
         ]
-        inputs_embeds, input_deepstack_embeds = embed_mm_inputs(
+        inputs_embeds, forward_batch = embed_mm_inputs(
             forward_batch=forward_batch,
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,

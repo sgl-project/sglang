@@ -571,12 +571,12 @@ class Qwen3LLMModel(Qwen3Model):
             )
 
             # process deepstack
-            # if (
-            #     input_deepstack_embeds is not None
-            #     and layer_idx in self.deepstack_embed_to_decoder_layer
-            # ):
-            #     sep = self.hidden_size * layer_idx
-            #     hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
+            if (
+                input_deepstack_embeds is not None
+                and layer_idx in self.deepstack_embed_to_decoder_layer
+            ):
+                sep = self.hidden_size * layer_idx
+                hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -726,8 +726,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
             new_embeddings.append(embedding)
 
-        # forward_batch.input_deepstack_embeds = input_deepstack_embeds
-        return new_embeddings, input_deepstack_embeds
+        forward_batch.input_deepstack_embeds = input_deepstack_embeds
+        return new_embeddings, forward_batch
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -774,7 +774,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         #             f"(3, seq_len) positions, but got {positions.size()}"
         #         )
 
-        input_embeds = forward_batch.input_embeds
         # It may seem strange to assign input_embeds again even after passing it as an argument.
         # This is for compatibility considerations.
         # In the 'extend' scenario, this forward function is called from two places:
@@ -784,13 +783,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # Currently,
         # In 'extend', input_embeds is passed in.
         # In 'decode', input_ids is passed in.
+        input_embeds = forward_batch.input_embeds
+        input_deepstack_embeds = forward_batch.input_deepstack_embeds
 
-        hidden_states = self.model(
+        hidden_states = self.model.forward(
             input_ids=input_ids,
             forward_batch=forward_batch,
             input_embeds=input_embeds,
             positions=positions,
-            input_deepstack_embeds=forward_batch.input_deepstack_embeds,
+            input_deepstack_embeds=input_deepstack_embeds,
         )
 
         if not get_embedding:

@@ -1526,7 +1526,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return query, key 
+        # return query, key 
         """Forward pass with optional Triton kernel acceleration.
         Args:
             positions:
