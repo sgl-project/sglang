@@ -10,6 +10,7 @@ import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
+    GroupCoordinator,
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -1233,6 +1234,7 @@ class RowParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        tp_group: Optional[GroupCoordinator] = None,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1247,7 +1249,9 @@ class RowParallelLinear(LinearBase):
             tp_rank = get_tensor_model_parallel_rank()
         if tp_size is None:
             tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank, self.tp_size = tp_rank, tp_size
+        if tp_group is None:
+            tp_group = get_tp_group()
+        self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
@@ -1360,7 +1364,7 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False):
+    def forward(self, input_, skip_all_reduce=False, enable_sp: bool = False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1378,11 +1382,18 @@ class RowParallelLinear(LinearBase):
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
-
-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+        if not enable_sp:
+            if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+                output = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output = output_parallel
         else:
-            output = output_parallel
+            dim_size = list(output_parallel.size())
+            dim_size[0] = dim_size[0] // self.tp_size
+            output = torch.empty(
+                dim_size, dtype=output_parallel.dtype, device=output_parallel.device
+            )
+            self.tp_group.reduce_scatter_tensor(output, output_parallel.contiguous())
 
         output_bias = self.bias if self.skip_bias_add else None
 

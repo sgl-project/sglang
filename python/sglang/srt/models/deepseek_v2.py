@@ -57,9 +57,12 @@ from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -288,7 +291,7 @@ def handle_attention_ascend(attn, forward_batch):
         and not forward_batch.forward_mode.is_target_verify()
         and not forward_batch.forward_mode.is_draft_extend()
         and not forward_batch.forward_mode.is_draft_extend_v2()
-    ):
+    ) or (forward_batch.enable_sp and forward_batch.forward_mode.is_idle()):
         if hasattr(attn, "indexer"):
             return AttnForwardMethod.NPU_MLA_SPARSE
         else:
@@ -495,6 +498,7 @@ class DeepseekV2MLP(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
+        enable_sp: bool = False,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
@@ -514,6 +518,7 @@ class DeepseekV2MLP(nn.Module):
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            enable_sp=enable_sp,
         )
         return x
 
@@ -1113,6 +1118,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
+        self.dense_layer_num = config.first_k_dense_replace
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -1121,6 +1127,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.kv_lora_rank = kv_lora_rank
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        self.atten_tp_size = attn_tp_size
+        self.atten_tp_group = get_attention_tp_group()
 
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
@@ -1213,6 +1221,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            tp_group=self.atten_tp_group,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -1390,12 +1399,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes,
     ):
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            layer_scatter_modes=layer_scatter_modes,
         )
         return self.forward_core(s)
 
@@ -1405,6 +1416,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes = None,
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1426,7 +1438,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
@@ -1462,7 +1478,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 inner_state = (*inner_state, None)  # add a position for topk_indices
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
             inner_state = self.forward_npu_sparse_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
@@ -1500,18 +1520,46 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             raise NotImplementedError
 
+    def scattered_to_tp_attn_full(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        hidden_states, local_hidden_states = (
+            torch.empty(
+                (forward_batch.input_ids.shape[0], hidden_states.shape[1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            ),
+            hidden_states,
+        )
+        attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
+        return hidden_states
+
     def forward_normal_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes,
     ):
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q_lora = self.q_a_layernorm(q)
+            if forward_batch.enable_sp and (
+                (0 < self.layer_id < self.dense_layer_num)
+                or (
+                    layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                    and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+                )
+            ):
+                q_lora = self.scattered_to_tp_attn_full(q_lora, forward_batch)
+                latent_cache = self.scattered_to_tp_attn_full(
+                    latent_cache, forward_batch
+                )
             q = self.q_b_proj(q_lora)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
@@ -1531,6 +1579,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 -1, self.num_local_heads, self.qk_head_dim
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            if forward_batch.enable_sp and (0 < self.layer_id < self.dense_layer_num):
+                q = self.scattered_to_tp_attn_full(q, forward_batch)
+                latent_cache = self.scattered_to_tp_attn_full(
+                    latent_cache, forward_batch
+                )
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -1560,7 +1613,11 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_normal_core(self, q, k, v, forward_batch):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output,
+            enable_sp=forward_batch.enable_sp
+            and (self.layer_id < self.dense_layer_num),
+        )
         return output
 
     def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
@@ -1870,10 +1927,18 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes,
     ):
         """
         Reuse `self.q_lora_rank is not None` branch from forward_absorb_prepare
         """
+        need_all_gather = forward_batch.enable_sp and (
+            (0 < self.layer_id < self.dense_layer_num)
+            or (
+                layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+            )
+        )
         if self.is_mla_preprocess_enabled and forward_batch.forward_mode.is_decode():
             if self.mla_preprocess is None:
                 self.mla_preprocess = NPUFusedMLAPreprocess(
@@ -1918,11 +1983,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
             else:
                 fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+                if need_all_gather:
+                    fused_qkv_a_proj_out = self.scattered_to_tp_attn_full(
+                        fused_qkv_a_proj_out, forward_batch
+                    )
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
-
+            # overlap all gather
+            if need_all_gather:
+                with torch.npu.stream(self.alt_stream):
+                    gathered_hidden_states = self.scattered_to_tp_attn_full(
+                        hidden_states, forward_batch
+                    )
             # overlap qk norm
             if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
@@ -2012,6 +2086,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
+        if need_all_gather:
+            torch.npu.current_stream().wait_stream(self.alt_stream)
+            hidden_states = gathered_hidden_states
         # TODO: multi-stream indexer
         topk_indices = self.indexer(
             hidden_states, q_lora, positions, forward_batch, self.layer_id
@@ -2076,7 +2153,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             -1, self.num_local_heads * self.v_head_dim
         )
 
-        output, _ = self.o_proj(attn_bmm_output)
+        output, _ = self.o_proj(
+            attn_bmm_output,
+            enable_sp=forward_batch.enable_sp
+            and (self.layer_id < self.dense_layer_num),
+        )
         return output
 
     def forward_absorb_fused_mla_rope_prepare(
@@ -2581,6 +2662,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.layer_id = layer_id
         self.is_nextn = is_nextn
+        self.enable_sp = get_global_server_args().enable_sp
+        self.tp_size, self.tp_rank, self.tp_group = (
+            get_attention_tp_size(),
+            get_attention_tp_rank(),
+            get_attention_tp_group(),
+        )
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -2650,6 +2737,50 @@ class DeepseekV2DecoderLayer(nn.Module):
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
         )
+        if self.enable_sp:
+            num_layers = (
+                1
+                if is_nextn
+                else (
+                    config.num_hidden_layers
+                    if self.is_layer_sparse
+                    else config.first_k_dense_replace
+                )
+            )
+
+            is_last_layer = is_nextn or (
+                self.layer_id
+                == (
+                    config.num_hidden_layers - 1
+                    if self.is_layer_sparse
+                    else config.first_k_dense_replace - 1
+                )
+            )
+
+            self.layer_scatter_modes_sp = LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=num_layers,
+                is_layer_sparse=self.is_layer_sparse,
+                is_previous_layer_sparse=(
+                    is_previous_layer_sparse if self.is_layer_sparse else False
+                ),
+                enable_sp=True,
+            )
+
+            self.layer_communicator_sp = LayerCommunicator(
+                layer_scatter_modes=self.layer_scatter_modes_sp,
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+                is_last_layer=is_last_layer,
+                enable_sp=True,
+            )
+
+    def get_layer_communicator(self, is_extend: bool = False):
+        if not self.enable_sp or not is_extend:
+            return self.layer_communicator
+
+        return self.layer_communicator_sp
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -2667,6 +2798,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
+        enable_sp = self.enable_sp and (
+            forward_batch.forward_mode.is_extend() or forward_batch.is_extend_in_batch
+        )
+        forward_batch.enable_sp = enable_sp
+        layer_communicator = self.get_layer_communicator(
+            forward_batch.forward_mode.is_extend() or forward_batch.is_extend_in_batch
+        )
         quant_format = (
             "mxfp4"
             if _is_gfx95_supported
@@ -2677,7 +2815,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else ""
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
+        hidden_states, residual = layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
@@ -2689,39 +2827,46 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            layer_scatter_modes=layer_communicator.layer_scatter_modes,
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
 
         should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
+            layer_communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        use_reduce_scatter = layer_communicator.should_use_reduce_scatter(forward_batch)
 
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-            gemm_output_zero_allocator,
-        )
+        if self.is_layer_sparse:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
+        else:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+                enable_sp=enable_sp,
+            )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
         if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual = layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
 
@@ -2822,7 +2967,12 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        if _is_cuda:
+            self.alt_stream = torch.cuda.Stream()
+        elif _is_npu:
+            self.alt_stream = torch.npu.Stream()
+        else:
+            self.alt_stream = None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
