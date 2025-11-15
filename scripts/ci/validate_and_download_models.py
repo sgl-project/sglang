@@ -56,6 +56,7 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "Qwen/Qwen3-8B",
         "Qwen/Qwen3-Coder-30B-A3B-Instruct",
         "Qwen/QwQ-32B-AWQ",
+        "Qwen/Qwen3-30B-A3B",
     ],
     "2-gpu-runner": [
         "mistralai/Mixtral-8x7B-Instruct-v0.1",
