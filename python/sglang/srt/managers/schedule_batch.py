@@ -1845,6 +1845,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_ids=[req.lora_id for req in self.reqs],
+            rids=[req.rid for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
@@ -1919,6 +1920,8 @@ class ModelWorkerBatch:
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int
+    # The request ids
+    rids: Optional[List[str]]
 
     # For logprob
     return_logprob: bool
