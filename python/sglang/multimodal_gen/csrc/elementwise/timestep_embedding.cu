@@ -85,6 +85,26 @@ template <typename O, typename T> __device__ O cast_to(T x) {
   }
 }
 
+#define DIM_SWITCH(COND, CONST_NAME, BAD_CASE, ...)                            \
+  [&] {                                                                        \
+    if (COND == 512) {                                                         \
+      constexpr static int CONST_NAME = 512;                                   \
+      return __VA_ARGS__();                                                    \
+    } else if (COND == 1024) {                                                 \
+      constexpr static int CONST_NAME = 1024;                                  \
+      return __VA_ARGS__();                                                    \
+    } else if (COND == 2048) {                                                 \
+      constexpr static int CONST_NAME = 2048;                                  \
+      return __VA_ARGS__();                                                    \
+    } else if (COND == 4096) {                                                 \
+      constexpr static int CONST_NAME = 4096;                                  \
+      return __VA_ARGS__();                                                    \
+    } else {                                                                   \
+      constexpr static int CONST_NAME = BAD_CASE;                              \
+      return __VA_ARGS__();                                                    \
+    }                                                                          \
+  }()
+
 // TODO: template review
 // assert operations is float??
 __device__ float calculate_frequency_and_angle(float t_val, int freq_idx,
@@ -127,7 +147,8 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
 
 #pragma unroll
     for (int i = d_idx; i < min(end, d_idx + vec_size); i++) {
-      float angles = calculate_frequency_and_angle(t_val, i % half, half, max_period);
+      float angles =
+          calculate_frequency_and_angle(t_val, i % half, half, max_period);
       o_vec_cos[i - d_idx] = cast_to<O>(cosf(angles));
       o_vec_sin[i - d_idx] = cast_to<O>(sinf(angles));
     }
@@ -179,26 +200,34 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  // TODO: tuning
-  int BLOCK_SIZE_DIM = 256;
-  const int num_threads = 256;
-  const int half = dim / 2;
+  // Heuristics tuning
+  // WARN: which will generate a lot template function:
+  //  (DIM_SWITCH * DISPATCH_FLOAT_TYPES).
+  DIM_SWITCH(dim, kDim, /* bad case */ 1, [&] {
+    // if dim not in [512, 1024, 2048, 4096]:
+    //    vec_size = 1
+    constexpr int vec_size = (kDim % 8 == 0) ? 8 : 1;
+    constexpr int num_threads = 512 / vec_size;
+    constexpr int BLOCK_SIZE_DIM = vec_size * num_threads;
+    // TODO: low sm usage, like 512 / 8 / 2 = 32
+    const int half = dim / 2;
 
-  const dim3 grid_size(B, (half + BLOCK_SIZE_DIM - 1) / BLOCK_SIZE_DIM);
-  const dim3 block_size(num_threads);
+    const dim3 grid_size(B, (half + BLOCK_SIZE_DIM - 1) / BLOCK_SIZE_DIM);
+    const dim3 block_size(num_threads);
 
-  int stride_t_b = t.stride(0);
-  int stride_out_b = output.stride(0);
-  int stride_out_d = output.stride(1);
+    int stride_t_b = t.stride(0);
+    int stride_out_b = output.stride(0);
+    int stride_out_d = output.stride(1);
 
-  DISPATCH_FLOAT_TYPES(t.scalar_type(), "timestep_embedding_kernel", [&] {
-    using t_type = scalar_t;
-    using o_type = float;
-    timestep_embedding_kernel<t_type, o_type>
-        <<<grid_size, block_size, 0, stream>>>(
-            static_cast<t_type *>(t.data_ptr()),
-            static_cast<o_type *>(output.data_ptr()), B, dim, max_period,
-            stride_t_b, stride_out_b, stride_out_d, BLOCK_SIZE_DIM);
+    DISPATCH_FLOAT_TYPES(t.scalar_type(), "timestep_embedding_kernel", [&] {
+      using t_type = scalar_t;
+      using o_type = float;
+      timestep_embedding_kernel<t_type, o_type, vec_size>
+          <<<grid_size, block_size, 0, stream>>>(
+              static_cast<t_type *>(t.data_ptr()),
+              static_cast<o_type *>(output.data_ptr()), B, dim, max_period,
+              stride_t_b, stride_out_b, stride_out_d, BLOCK_SIZE_DIM);
+    });
   });
 
   cudaDeviceSynchronize();
