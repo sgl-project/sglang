@@ -49,6 +49,7 @@ from sglang.srt.configs import (
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
+    NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Olmo3Config,
     Qwen3NextConfig,
@@ -76,6 +77,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     FalconH1Config,
     DotsVLMConfig,
     DotsOCRConfig,
+    NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     DeepseekVLV2Config,
     JetNemotronConfig,
@@ -142,6 +144,8 @@ def get_hf_text_config(config: PretrainedConfig):
             )
             return thinker_config.text_config
         return thinker_config
+    if hasattr(config, "llm_config"):
+        return config.llm_config
     else:
         return config
 

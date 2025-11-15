@@ -1,24 +1,9 @@
 # copy from https://huggingface.co/OpenGVLab/InternVL3-1B
+
 import torch
 import torchvision.transforms as T
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-def build_transform(input_size):
-    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-    transform = T.Compose(
-        [
-            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(mean=MEAN, std=STD),
-        ]
-    )
-    return transform
 
 
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
@@ -38,8 +23,13 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
 
 
 def dynamic_preprocess(
-    image, min_num=1, max_num=12, image_size=448, use_thumbnail=False
-):
+    image: Image.Image,
+    *,
+    min_num: int,
+    max_num: int,
+    image_size: int,
+    use_thumbnail: bool,
+) -> list[Image.Image]:
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
 
@@ -83,11 +73,34 @@ def dynamic_preprocess(
     return processed_images
 
 
-def load_image(image_file, input_size=448, max_num=12):
-    image = Image.open(image_file).convert("RGB")
-    transform = build_transform(input_size=input_size)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def image_to_pixel_values(
+    image: Image.Image,
+    *,
+    input_size: int,
+    min_num_tiles: int = 1,
+    max_num_tiles: int,
+    use_thumbnail: bool,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
+) -> torch.Tensor:
     images = dynamic_preprocess(
-        image, image_size=input_size, use_thumbnail=True, max_num=max_num
+        image,
+        min_num=min_num_tiles,
+        max_num=max_num_tiles,
+        image_size=input_size,
+        use_thumbnail=use_thumbnail,
+    )
+    transform = T.Compose(
+        [
+            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+        ]
     )
     pixel_values = [transform(image) for image in images]
     pixel_values = torch.stack(pixel_values)
