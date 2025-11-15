@@ -422,6 +422,7 @@ suite_amd = {
         TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("test_abort.py", 51),
+        TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_eval_fp8_accuracy.py", 303),
@@ -454,6 +455,7 @@ suite_amd = {
         # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_sliding_window.py", 250),
+        TestFile("test_type_based_dispatcher.py", 10),
         TestFile("test_wave_attention_kernels.py", 2),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
