@@ -270,7 +270,19 @@ pub(super) async fn execute_tool_loop(
     for url in &server_urls {
         let dynamic_tools = ctx.mcp_manager.list_dynamic_tools(url).await;
         for tool in &dynamic_tools {
-            tool_to_server.insert(tool.name.to_string(), url.clone());
+            let tool_name = tool.name.to_string();
+
+            // Warn if this tool name already exists from a different server
+            if let Some(existing_url) = tool_to_server.get(&tool_name) {
+                if existing_url != url {
+                    warn!(
+                        "Tool name collision: '{}' exists in both '{}' and '{}'. Using '{}'",
+                        tool_name, existing_url, url, url
+                    );
+                }
+            }
+
+            tool_to_server.insert(tool_name, url.clone());
         }
         mcp_tools.extend(dynamic_tools);
     }

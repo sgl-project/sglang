@@ -91,7 +91,12 @@ impl ToolInventory {
         self.static_tools
             .iter()
             .find(|entry| entry.key().1 == tool_name)
-            .map(|entry| (entry.value().server_name.clone(), entry.value().tool.clone()))
+            .map(|entry| {
+                (
+                    entry.value().server_name.clone(),
+                    entry.value().tool.clone(),
+                )
+            })
     }
 
     /// Check if tool exists in static inventory (searches all servers)
