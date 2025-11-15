@@ -37,7 +37,7 @@ use std::{
 
 use axum::response::Response;
 use bytes::Bytes;
-use serde_json::{from_str, from_value, json, to_string, to_value, Value};
+use serde_json::{from_str, from_value, json, to_string, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -294,28 +294,45 @@ async fn execute_with_mcp_loop(
     ctx: &HarmonyResponsesContext,
     mut current_request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
+    use crate::routers::grpc::common::responses::utils::extract_dynamic_mcp_servers;
+
     let mut iteration_count = 0;
 
-    // Extract server_label from request tools
-    let server_label = extract_mcp_server_label(current_request.tools.as_deref());
+    // Extract all dynamic MCP servers from request
+    let dynamic_servers: Vec<(String, String)> = current_request
+        .tools
+        .as_ref()
+        .map(|tools| extract_dynamic_mcp_servers(tools))
+        .unwrap_or_default();
+
+    // Build tools map with (server_label, tool_name) -> (Tool, server_url)
+    let tools_map = ctx
+        .mcp_manager
+        .list_tools_for_request(&dynamic_servers)
+        .await;
+
+    // Use first server label for backward compatibility with tracking
+    let server_label = dynamic_servers
+        .first()
+        .map(|(label, _)| label.clone())
+        .unwrap_or_else(|| "sglang-mcp".to_string());
     let mut mcp_tracking = McpCallTracking::new(server_label.clone());
 
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
-    // Add static MCP tools from inventory to the request
-    let mcp_tools = ctx.mcp_manager.list_tools();
-    if !mcp_tools.is_empty() {
-        let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
+    // Add MCP tools with formatted names (server_label/tool_name) to the request
+    if !tools_map.is_empty() {
+        let mcp_response_tools = convert_mcp_tools_map_to_response_tools(&tools_map);
 
         let mut all_tools = current_request.tools.clone().unwrap_or_default();
         all_tools.extend(mcp_response_tools);
         current_request.tools = Some(all_tools);
 
         debug!(
-            mcp_tool_count = mcp_tools.len(),
+            mcp_tool_count = tools_map.len(),
             total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            "MCP client available - added static MCP tools to Harmony Responses request"
+            "MCP client available - added MCP tools with server_label/tool_name format to Harmony Responses request"
         );
     }
 
@@ -432,7 +449,13 @@ async fn execute_with_mcp_loop(
 
                 // Execute MCP tools (if any)
                 let mcp_results = if !mcp_tool_calls.is_empty() {
-                    execute_mcp_tools(&ctx.mcp_manager, &mcp_tool_calls, &mut mcp_tracking).await?
+                    execute_mcp_tools(
+                        &ctx.mcp_manager,
+                        &mcp_tool_calls,
+                        &mut mcp_tracking,
+                        &tools_map,
+                    )
+                    .await?
                 } else {
                     Vec::new()
                 };
@@ -645,8 +668,26 @@ async fn execute_mcp_tool_loop_streaming(
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) {
-    // Extract server_label from request tools
-    let server_label = extract_mcp_server_label(current_request.tools.as_deref());
+    use crate::routers::grpc::common::responses::utils::extract_dynamic_mcp_servers;
+
+    // Extract all dynamic MCP servers from request
+    let dynamic_servers: Vec<(String, String)> = current_request
+        .tools
+        .as_ref()
+        .map(|tools| extract_dynamic_mcp_servers(tools))
+        .unwrap_or_default();
+
+    // Build tools map with (server_label, tool_name) -> (Tool, server_url)
+    let tools_map = ctx
+        .mcp_manager
+        .list_tools_for_request(&dynamic_servers)
+        .await;
+
+    // Use first server label for backward compatibility
+    let server_label = dynamic_servers
+        .first()
+        .map(|(label, _)| label.clone())
+        .unwrap_or_else(|| "sglang-mcp".to_string());
 
     // Set server label in emitter for MCP call items
     emitter.set_mcp_server_label(server_label.clone());
@@ -657,16 +698,15 @@ async fn execute_mcp_tool_loop_streaming(
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
-    // Add static MCP tools from inventory
-    let mcp_tools = ctx.mcp_manager.list_tools();
-    if !mcp_tools.is_empty() {
-        let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
+    // Add MCP tools with formatted names (server_label/tool_name) to the request
+    if !tools_map.is_empty() {
+        let mcp_response_tools = convert_mcp_tools_map_to_response_tools(&tools_map);
         let mut all_tools = current_request.tools.clone().unwrap_or_default();
         all_tools.extend(mcp_response_tools);
         current_request.tools = Some(all_tools);
 
         debug!(
-            mcp_tool_count = mcp_tools.len(),
+            mcp_tool_count = tools_map.len(),
             total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
             "MCP client available - added static MCP tools to Harmony Responses streaming request"
         );
@@ -689,14 +729,16 @@ async fn execute_mcp_tool_loop_streaming(
     // Emit mcp_list_tools on first iteration
     let (output_index, item_id) = emitter.allocate_output_index(OutputItemType::McpListTools);
 
-    // Build tools list for item structure
-    let tool_items: Vec<_> = mcp_tools
+    // Build tools list for item structure from tools_map
+    let tool_items: Vec<_> = tools_map
         .iter()
-        .map(|t| {
+        .map(|((server_label, tool_name), (tool, _server_url))| {
+            // Use formatted name server_label__tool_name (double underscore separator)
+            let formatted_name = format!("{}__{}", server_label, tool_name);
             json!({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": Value::Object((*t.input_schema).clone())
+                "name": formatted_name,
+                "description": tool.description,
+                "input_schema": Value::Object((*tool.input_schema).clone())
             })
         })
         .collect();
@@ -735,8 +777,9 @@ async fn execute_mcp_tool_loop_streaming(
         return;
     }
 
-    // Emit mcp_list_tools.completed
-    let event = emitter.emit_mcp_list_tools_completed(output_index, &mcp_tools);
+    // Emit mcp_list_tools.completed (convert tools_map to Vec<mcp::Tool> for emitter)
+    let tools_for_event: Vec<_> = tools_map.values().map(|(tool, _)| tool.clone()).collect();
+    let event = emitter.emit_mcp_list_tools_completed(output_index, &tools_for_event);
     if emitter.send_event(&event, tx).is_err() {
         return;
     }
@@ -748,7 +791,7 @@ async fn execute_mcp_tool_loop_streaming(
     }
 
     debug!(
-        tool_count = mcp_tools.len(),
+        tool_count = tools_map.len(),
         "Emitted mcp_list_tools on first iteration"
     );
 
@@ -867,8 +910,13 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // Execute MCP tools (if any)
                 let mcp_results = if !mcp_tool_calls.is_empty() {
-                    match execute_mcp_tools(&ctx.mcp_manager, &mcp_tool_calls, &mut mcp_tracking)
-                        .await
+                    match execute_mcp_tools(
+                        &ctx.mcp_manager,
+                        &mcp_tool_calls,
+                        &mut mcp_tracking,
+                        &tools_map,
+                    )
+                    .await
                     {
                         Ok(results) => results,
                         Err(err_response) => {
@@ -1150,12 +1198,31 @@ async fn execute_mcp_tools(
     mcp_manager: &Arc<McpManager>,
     tool_calls: &[ToolCall],
     tracking: &mut McpCallTracking,
+    tools_map: &std::collections::HashMap<(String, String), (mcp::Tool, String)>,
 ) -> Result<Vec<ToolResult>, Response> {
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
+        // Parse formatted name: server_label__tool_name (double underscore separator)
+        let formatted_tool_name = &tool_call.function.name;
+        let (server_label, original_tool_name) =
+            if let Some(sep_pos) = formatted_tool_name.find("__") {
+                let server_label = &formatted_tool_name[..sep_pos];
+                let tool_name = &formatted_tool_name[sep_pos + 2..]; // +2 to skip "__"
+                (server_label.to_string(), tool_name.to_string())
+            } else {
+                // Fallback: treat entire name as tool name (shouldn't happen with new format)
+                warn!(
+                    "Tool name '{}' not in expected format 'server_label__tool_name'",
+                    formatted_tool_name
+                );
+                ("unknown".to_string(), formatted_tool_name.clone())
+            };
+
         debug!(
-            tool_name = %tool_call.function.name,
+            formatted_tool_name = %formatted_tool_name,
+            server_label = %server_label,
+            original_tool_name = %original_tool_name,
             call_id = %tool_call.id,
             "Executing MCP tool"
         );
@@ -1165,14 +1232,14 @@ async fn execute_mcp_tools(
         let args: Value = from_str(args_str).map_err(|e| {
             error!(
                 function = "execute_mcp_tools",
-                tool_name = %tool_call.function.name,
+                tool_name = %formatted_tool_name,
                 call_id = %tool_call.id,
                 error = %e,
                 "Failed to parse tool arguments JSON"
             );
             error::internal_error(format!(
                 "Invalid tool arguments JSON for tool '{}': {}",
-                tool_call.function.name, e
+                formatted_tool_name, e
             ))
         })?;
 
@@ -1183,85 +1250,67 @@ async fn execute_mcp_tools(
             None
         };
 
-        match mcp_manager
-            .call_tool(&tool_call.function.name, args_map)
-            .await
-        {
-            Ok(mcp_result) => {
-                debug!(
-                    tool_name = %tool_call.function.name,
-                    call_id = %tool_call.id,
-                    "Tool execution succeeded"
-                );
+        // Look up tool in map and execute
+        let (output, is_error) =
+            match tools_map.get(&(server_label.clone(), original_tool_name.clone())) {
+                Some((_tool, server_url)) => {
+                    // Call tool via manager using server URL
+                    match mcp_manager
+                        .call_tool_by_url(server_url, &original_tool_name, args_map)
+                        .await
+                    {
+                        Ok(output_str) => {
+                            // Parse the output string back to Value
+                            match from_str::<Value>(&output_str) {
+                                Ok(output_value) => (output_value, false),
+                                Err(e) => {
+                                    warn!("Failed to parse tool output: {}", e);
+                                    (
+                                        json!({"error": format!("Failed to parse output: {}", e)}),
+                                        true,
+                                    )
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("MCP tool execution failed: {}", e);
+                            (json!({"error": e.to_string()}), true)
+                        }
+                    }
+                }
+                None => {
+                    let error_msg = format!(
+                        "Tool '{}' (server: {}, tool: {}) not found in tool map",
+                        formatted_tool_name, server_label, original_tool_name
+                    );
+                    warn!("{}", error_msg);
+                    (json!({"error": error_msg}), true)
+                }
+            };
 
-                // Extract content from MCP result
-                let output = if let Some(content) = mcp_result.content.first() {
-                    // Serialize the entire content item
-                    to_value(content)
-                        .unwrap_or_else(|_| json!({"error": "Failed to serialize tool result"}))
-                } else {
-                    json!({"result": "success"})
-                };
+        let output_str = to_string(&output)
+            .unwrap_or_else(|_| r#"{"error": "Failed to serialize output"}"#.to_string());
 
-                let is_error = mcp_result.is_error.unwrap_or(false);
-                let output_str = to_string(&output)
-                    .unwrap_or_else(|_| r#"{"error": "Failed to serialize output"}"#.to_string());
+        // Record this call in tracking
+        tracking.record_call(
+            tool_call.id.clone(),
+            original_tool_name.clone(),
+            args_str.to_string(),
+            output_str.clone(),
+            !is_error,
+            if is_error {
+                Some(output_str.clone())
+            } else {
+                None
+            },
+        );
 
-                // Record this call in tracking
-                tracking.record_call(
-                    tool_call.id.clone(),
-                    tool_call.function.name.clone(),
-                    args_str.to_string(),
-                    output_str.clone(),
-                    !is_error,
-                    if is_error {
-                        Some(output_str.clone())
-                    } else {
-                        None
-                    },
-                );
-
-                results.push(ToolResult {
-                    call_id: tool_call.id.clone(),
-                    tool_name: tool_call.function.name.clone(),
-                    output,
-                    is_error,
-                });
-            }
-            Err(e) => {
-                warn!(
-                    tool_name = %tool_call.function.name,
-                    call_id = %tool_call.id,
-                    error = %e,
-                    "Tool execution failed"
-                );
-
-                let error_msg = format!("Tool execution failed: {}", e);
-                let error_output = json!({
-                    "error": error_msg.clone()
-                });
-                let error_output_str = to_string(&error_output)
-                    .unwrap_or_else(|_| format!(r#"{{"error": "{}"}}"#, error_msg));
-
-                // Record failed call in tracking
-                tracking.record_call(
-                    tool_call.id.clone(),
-                    tool_call.function.name.clone(),
-                    args_str.to_string(),
-                    error_output_str.clone(),
-                    false,
-                    Some(error_msg),
-                );
-
-                // Return error result to model (let it handle gracefully)
-                results.push(ToolResult {
-                    call_id: tool_call.id.clone(),
-                    tool_name: tool_call.function.name.clone(),
-                    output: error_output,
-                    is_error: true,
-                });
-            }
-        }
+        results.push(ToolResult {
+            call_id: tool_call.id.clone(),
+            tool_name: formatted_tool_name.clone(),
+            output,
+            is_error,
+        });
     }
 
     Ok(results)
@@ -1418,6 +1467,38 @@ pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<Respo
         .collect()
 }
 
+/// Convert tools map to ResponseTools with formatted names (server_label__tool_name)
+///
+/// This function formats tool names as `server_label__tool_name` to prevent name collisions
+/// across multiple MCP servers and enable server-specific tool routing.
+fn convert_mcp_tools_map_to_response_tools(
+    tools_map: &std::collections::HashMap<(String, String), (mcp::Tool, String)>,
+) -> Vec<ResponseTool> {
+    tools_map
+        .iter()
+        .map(|((server_label, tool_name), (tool_info, _server_url))| {
+            // Format tool name as server_label__tool_name (double underscore separator)
+            let formatted_name = format!("{}__{}", server_label, tool_name);
+
+            ResponseTool {
+                r#type: ResponseToolType::Mcp,
+                function: Some(Function {
+                    name: formatted_name,
+                    description: tool_info.description.as_ref().map(|d| d.to_string()),
+                    parameters: Value::Object((*tool_info.input_schema).clone()),
+                    strict: None,
+                }),
+                server_url: None,
+                authorization: None,
+                server_label: Some(server_label.clone()),
+                server_description: tool_info.description.as_ref().map(|d| d.to_string()),
+                require_approval: None,
+                allowed_tools: None,
+            }
+        })
+        .collect()
+}
+
 /// Inject MCP metadata into final response
 ///
 /// Adds mcp_list_tools and mcp_call output items to the response output array.
@@ -1482,24 +1563,6 @@ fn inject_mcp_metadata(
 
     // 2. Append all mcp_call items at the end
     response.output.extend(mcp_call_items);
-}
-
-/// Extract MCP server label from request tools
-///
-/// Searches for the first MCP tool in the tools array and returns its server_label.
-/// Falls back to "sglang-mcp" if no MCP tool with server_label is found.
-fn extract_mcp_server_label(tools: Option<&[ResponseTool]>) -> String {
-    tools
-        .and_then(|tools| {
-            tools.iter().find_map(|tool| {
-                if matches!(tool.r#type, ResponseToolType::Mcp) {
-                    tool.server_label.clone()
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or_else(|| "sglang-mcp".to_string())
 }
 
 /// Load previous conversation messages from storage
