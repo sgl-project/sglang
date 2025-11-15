@@ -15,13 +15,10 @@ class TestFile:
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
-        TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("function_call/test_json_schema_constraint.py", 1),
-        TestFile("hicache/test_hicache.py", 116),
-        TestFile("hicache/test_hicache_eagle.py", 150),
-        TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
+        TestFile("hicache/test_hicache_variants.py", 393),
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 50),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 20),
@@ -224,7 +221,9 @@ suites = {
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
     ],
     "nightly-8-gpu-b200": [],
-    "nightly-4-gpu": [],
+    "nightly-4-gpu": [
+        TestFile("test_qwen3_next_deterministic.py", 200),
+    ],
     "nightly-8-gpu": [],
     "nightly-8-gpu-h200": [
         TestFile("test_deepseek_v32_nsabackend.py", 600),
@@ -233,6 +232,7 @@ suites = {
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
+        TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py"),
         TestFile("entrypoints/http_server/test_abort_request.py"),
         TestFile("ep/test_deepep_internode.py"),
@@ -244,7 +244,6 @@ suites = {
         TestFile("ep/test_moe_deepep_eval_accuracy_large.py"),
         TestFile("function_call/test_unknown_tool_name.py"),
         TestFile("hicache/test_disaggregation_hicache.py"),
-        TestFile("hicache/test_hicache_page.py"),
         TestFile("hicache/test_hicache_storage_benchmark.py"),
         TestFile("hicache/test_hicache_storage_e2e.py"),
         TestFile("layers/attention/nsa/test_act_quant_triton.py"),
@@ -311,10 +310,8 @@ suites = {
         TestFile("test_get_weights_by_name.py"),
         TestFile("test_gpt_oss_common.py"),
         TestFile("test_health_check.py"),
-        TestFile("test_hicache.py"),
-        TestFile("test_hicache_mla.py"),
-        TestFile("test_hicache_page.py"),
         TestFile("test_hicache_storage.py"),
+        TestFile("test_hicache_variants.py"),
         TestFile("test_hybrid_dp_ep_tp_mtp.py"),
         TestFile("test_int4_kernel.py"),
         TestFile("test_int8_kernel.py"),

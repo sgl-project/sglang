@@ -565,6 +565,7 @@ class ServerArgs:
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
+    enable_broadcast_mm_inputs_process: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -998,7 +999,12 @@ class ServerArgs:
                 self.dtype = "bfloat16"
 
             if self.moe_runner_backend == "auto":
-                if is_blackwell_supported() and is_mxfp4_quant_format:
+                if self.enable_piecewise_cuda_graph:
+                    self.moe_runner_backend = "auto"
+                    logger.warning(
+                        "Enable piecewise CUDA graph, enabling auto MOE kernel."
+                    )
+                elif is_blackwell_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
                     logger.warning(
                         "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
@@ -3650,6 +3656,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mm_per_request_timeout,
             help="The timeout for each multi-modal request in seconds.",
+        )
+        parser.add_argument(
+            "--enable-broadcast-mm-inputs-process",
+            action="store_true",
+            default=ServerArgs.enable_broadcast_mm_inputs_process,
+            help="Enable broadcast mm-inputs process in scheduler.",
         )
 
         # For checkpoint decryption
