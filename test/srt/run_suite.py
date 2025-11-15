@@ -184,6 +184,9 @@ suites = {
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
     ],
+    "per-commit-8-gpu-b200": [
+        TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
+    ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
@@ -229,9 +232,6 @@ suites = {
     "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [],
     "nightly-8-gpu": [],
-    "nightly-8-gpu-h200": [
-        TestFile("test_deepseek_v32_nsabackend.py", 600),
-    ],
     "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),

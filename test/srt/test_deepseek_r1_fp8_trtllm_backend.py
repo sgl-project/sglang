@@ -37,7 +37,7 @@ class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
             "--quantization",
             "fp8",
             "--tensor-parallel-size",
-            "4",
+            "8",
             "--data-parallel-size",
             "1",
             "--expert-parallel-size",
@@ -59,7 +59,7 @@ class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
             other_args=other_args,
             env={
                 **os.environ,
-                "SGLANG_ENABLE_FLASHINFER_GEMM": "1",
+                "SGLANG_ENABLE_FLASHINFER_FP8_GEMM": "1",
             },
         )
 
