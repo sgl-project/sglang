@@ -8,10 +8,13 @@ downloaded (emitting a warning annotation if repairs were needed), and exits
 with code 1 only if download attempts fail.
 """
 
+import fcntl
 import os
 import re
 import shutil
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,6 +36,33 @@ except ImportError:
     print("Warning: safetensors not available. Install with: pip install safetensors")
     SAFETENSORS_AVAILABLE = False
 
+
+# Timeout for acquiring download lock (seconds)
+# Different timeout values based on expected model download time
+# Small models (<10GB): 5 minutes
+# Medium models (10-50GB): 20 minutes
+# Large models (>50GB): 60 minutes
+LOCK_TIMEOUT_SMALL = 300  # 5 minutes
+LOCK_TIMEOUT_MEDIUM = 1200  # 20 minutes
+LOCK_TIMEOUT_LARGE = 3600  # 60 minutes
+
+# Models known to be very large and require extended download time
+LARGE_MODELS = {
+    "deepseek-ai/DeepSeek-V3-0324",
+    "deepseek-ai/DeepSeek-V3.1",
+    "deepseek-ai/DeepSeek-V3.2-Exp",
+    "moonshotai/Kimi-K2-Thinking",
+    "neuralmagic/Qwen2-72B-Instruct-FP8",
+}
+
+# Models that are medium-sized
+MEDIUM_MODELS = {
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+    "Qwen/Qwen2-57B-A14B-Instruct",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "Qwen/QwQ-32B-AWQ",
+}
 
 # Mapping of runner labels to their required models
 # Add new runner labels and models here as needed
@@ -74,6 +104,106 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "4-gpu-gb200": ["nvidia/DeepSeek-V3-0324-FP4"],
     "4-gpu-h100": ["lmsys/sglang-ci-dsv3-test", "lmsys/sglang-ci-dsv3-test-NextN"],
 }
+
+
+def get_lock_timeout_for_model(model_id: str) -> int:
+    """
+    Get appropriate lock timeout based on model size.
+
+    Args:
+        model_id: Model identifier
+
+    Returns:
+        Timeout in seconds
+    """
+    if model_id in LARGE_MODELS:
+        return LOCK_TIMEOUT_LARGE
+    elif model_id in MEDIUM_MODELS:
+        return LOCK_TIMEOUT_MEDIUM
+    else:
+        return LOCK_TIMEOUT_SMALL
+
+
+@contextmanager
+def acquire_download_lock(model_id: str, cache_dir: str, timeout: Optional[int] = None):
+    """
+    Acquire an exclusive lock for downloading a specific model.
+
+    Uses file-based locking to prevent multiple workers from downloading the same model
+    concurrently, which can cause race conditions and file corruption.
+
+    Args:
+        model_id: Model identifier
+        cache_dir: HuggingFace cache directory
+        timeout: Maximum time to wait for lock acquisition (seconds).
+                If None, uses dynamic timeout based on model size.
+
+    Yields:
+        True if lock was acquired, False if timeout occurred
+
+    Example:
+        with acquire_download_lock(model_id, cache_dir) as acquired:
+            if acquired:
+                # Perform download
+                pass
+            else:
+                # Another worker is downloading, skip
+                pass
+    """
+    # Use dynamic timeout based on model size if not specified
+    if timeout is None:
+        timeout = get_lock_timeout_for_model(model_id)
+
+    cache_model_name = "models--" + model_id.replace("/", "--")
+    lock_file_path = Path(cache_dir) / f"{cache_model_name}.lock"
+
+    # Ensure parent directory exists
+    lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_file = None
+    acquired = False
+
+    try:
+        # Open lock file
+        lock_file = open(lock_file_path, "w")
+
+        # Try to acquire lock with timeout
+        start_time = time.time()
+        while True:
+            try:
+                # Non-blocking lock attempt
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                # Lock is held by another process - this is expected
+                elapsed = time.time() - start_time
+                if elapsed >= timeout:
+                    # Timeout reached
+                    break
+                # Wait a bit before retry
+                time.sleep(0.5)
+            except (IOError, OSError) as e:
+                # Unexpected filesystem error (permissions, disk full, etc.)
+                print(f"    ⚠ Unexpected error acquiring lock: {e}")
+                break
+
+        yield acquired
+
+    finally:
+        # Release lock and clean up
+        if lock_file:
+            try:
+                if acquired:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+            except Exception:
+                pass  # Best effort cleanup
+
+        # NOTE: We intentionally do NOT delete the lock file here to avoid race conditions.
+        # Lock files are small and their accumulation is acceptable. Deleting the lock file
+        # after releasing the lock can cause race conditions where another process acquires
+        # the lock before deletion, then loses it when the file is deleted.
 
 
 def get_hf_cache_dir() -> str:
@@ -333,9 +463,10 @@ def validate_model(
 
 def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -> bool:
     """
-    Download a model from HuggingFace.
+    Download a model from HuggingFace with file-based locking.
 
-    Completely removes the model cache directory before downloading to ensure a clean download.
+    Uses a lock file to ensure only one worker downloads a model at a time,
+    preventing race conditions when multiple workers share the same cache.
 
     Args:
         model_id: Model identifier
@@ -343,7 +474,7 @@ def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -
         corrupted_files: List of specific file paths that are corrupted (unused, kept for compatibility)
 
     Returns:
-        True if download succeeded, False otherwise
+        True if download succeeded or another worker is handling it, False on failure
     """
     if not HF_HUB_AVAILABLE:
         print(f"ERROR: Cannot download model - huggingface_hub not available")
@@ -360,59 +491,89 @@ def download_model(model_id: str, cache_dir: str, corrupted_files: List[Path]) -
         print(f"  ✗ Failed to create cache directory: {e}")
         return False
 
-    # Completely remove the model directory from cache
-    cache_model_name = "models--" + model_id.replace("/", "--")
-    model_cache_path = cache_path / cache_model_name
-
-    if model_cache_path.exists():
-        print(f"  Removing entire model directory: {model_cache_path}")
-        try:
-            shutil.rmtree(model_cache_path)
-            print(f"    ✓ Successfully removed model directory")
-        except Exception as e:
-            print(f"    ✗ Failed to remove model directory: {e}")
-            print(f"    Attempting download anyway...")
-    else:
-        print(f"  Model directory not found in cache (will download fresh)")
-
-    print(f"  Downloading from HuggingFace (this may take a while for large models)...")
-
-    # Retry download up to 3 times to handle transient failures
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            if attempt > 1:
-                print(f"  Retry attempt {attempt}/{max_retries}...")
-
-            snapshot_download(
-                repo_id=model_id,
-                allow_patterns=["*.safetensors", "*.bin", "*.json", "*.txt", "*.model"],
-                ignore_patterns=["*.msgpack", "*.h5", "*.ot"],  # codespell:ignore ot
+    # Try to acquire download lock with dynamic timeout based on model size
+    lock_timeout = get_lock_timeout_for_model(model_id)
+    with acquire_download_lock(model_id, cache_dir) as acquired:
+        if not acquired:
+            # Another worker is downloading this model
+            print(
+                f"  ⏭ Another worker is downloading {model_id} (lock timeout after {lock_timeout}s)"
             )
-            print(f"  ✓ Download completed: {model_id}")
+            print(
+                f"  Trusting other worker to complete download. This worker will skip."
+            )
+            # Return True to indicate we trust the other worker will handle it
+            # The validation phase will catch it if the download actually failed
             return True
-        except Exception as e:
-            if attempt < max_retries:
-                print(f"  ✗ Download attempt {attempt} failed: {e}")
-                print(f"  Cleaning up partial download before retry...")
-                # Clean up partial download to ensure fresh retry
-                if model_cache_path.exists():
-                    try:
-                        shutil.rmtree(model_cache_path)
-                        print(f"    ✓ Cleaned up partial download")
-                    except Exception as cleanup_error:
-                        print(f"    ⚠ Failed to clean up: {cleanup_error}")
-                print(f"  Retrying...")
-            else:
-                print(f"  ✗ Download failed after {max_retries} attempts: {e}")
-                # Clean up failed download
-                if model_cache_path.exists():
-                    try:
-                        shutil.rmtree(model_cache_path)
-                        print(f"    ✓ Cleaned up failed download")
-                    except Exception as cleanup_error:
-                        print(f"    ⚠ Failed to clean up: {cleanup_error}")
-                return False
+
+        # We have the lock - proceed with download
+        print(f"  ✓ Acquired download lock for {model_id}")
+
+        # Completely remove the model directory from cache
+        cache_model_name = "models--" + model_id.replace("/", "--")
+        model_cache_path = cache_path / cache_model_name
+
+        if model_cache_path.exists():
+            print(f"  Removing entire model directory: {model_cache_path}")
+            try:
+                shutil.rmtree(model_cache_path)
+                print(f"    ✓ Successfully removed model directory")
+            except Exception as e:
+                print(f"    ✗ Failed to remove model directory: {e}")
+                print(f"    Attempting download anyway...")
+        else:
+            print(f"  Model directory not found in cache (will download fresh)")
+
+        print(
+            f"  Downloading from HuggingFace (this may take a while for large models)..."
+        )
+
+        # Retry download up to 3 times to handle transient failures
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                if attempt > 1:
+                    print(f"  Retry attempt {attempt}/{max_retries}...")
+
+                snapshot_download(
+                    repo_id=model_id,
+                    allow_patterns=[
+                        "*.safetensors",
+                        "*.bin",
+                        "*.json",
+                        "*.txt",
+                        "*.model",
+                    ],
+                    ignore_patterns=[
+                        "*.msgpack",
+                        "*.h5",
+                        "*.ot",  # codespell:ignore
+                    ],
+                )
+                print(f"  ✓ Download completed: {model_id}")
+                return True
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"  ✗ Download attempt {attempt} failed: {e}")
+                    print(f"  Cleaning up partial download before retry...")
+                    # Clean up partial download to ensure fresh retry
+                    if model_cache_path.exists():
+                        try:
+                            shutil.rmtree(model_cache_path)
+                            print(f"    ✓ Cleaned up partial download")
+                        except Exception as cleanup_error:
+                            print(f"    ⚠ Failed to clean up: {cleanup_error}")
+                    print(f"  Retrying...")
+                else:
+                    print(f"  ✗ Download failed after {max_retries} attempts: {e}")
+                    # Clean up failed download
+                    if model_cache_path.exists():
+                        try:
+                            shutil.rmtree(model_cache_path)
+                            print(f"    ✓ Cleaned up failed download")
+                        except Exception as cleanup_error:
+                            print(f"    ⚠ Failed to clean up: {cleanup_error}")
+                    return False
 
 
 def get_runner_labels() -> List[str]:
