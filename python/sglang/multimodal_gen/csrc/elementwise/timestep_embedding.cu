@@ -22,6 +22,8 @@ limitations under the License.
 
 // TODO: temp include for debug
 #include "utils.h"
+#include "vec_dtypes.cuh" // #include <flashinfer/vec_dtypes.cuh>
+using namespace flashinfer;
 
 // // TODO:
 // #include "sgl_kernel_ops.h"
@@ -98,7 +100,8 @@ __device__ float calculate_frequency_and_angle(float t_val, int freq_idx, int ha
 
 
 
-template<typename T, typename O>
+// TODO: tune vec_size?
+template<typename T, typename O, uint32_t vec_size=8>
 __global__ void timestep_embedding_kernel(
     T* t_ptr,
     O* output_ptr,
@@ -117,7 +120,6 @@ __global__ void timestep_embedding_kernel(
     int num_threads = blockDim.x;
 
     // Get the timestep for this batch
-    // TODO: vect
     float t_val = cast_to<float>(t_ptr[pid_b * stride_t_b]);
 
     // Calculate half dimension
@@ -127,21 +129,38 @@ __global__ void timestep_embedding_kernel(
     int d_start = pid_d * BLOCK_SIZE_DIM;
     int d_end = d_start + BLOCK_SIZE_DIM;
 
-    for (int d_idx = d_start + tid; d_idx < min(d_end, half); d_idx += num_threads) {
-        // // TODO: remove debug assert later
-        // assert(d_idx < half);
-        float angles = calculate_frequency_and_angle(t_val, d_idx % half, half, max_period);
-        int out_idx_first = pid_b * stride_out_b + d_idx * stride_out_d;
-        output_ptr[out_idx_first] = cast_to<O>(cosf(angles));
-        int out_idx_second = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
-        output_ptr[out_idx_second] = cast_to<O>(sinf(angles));
+    vec_t<O, vec_size> o_vec_cos;
+    vec_t<O, vec_size> o_vec_sin;
+
+    int end = min(d_end, half);
+
+    for (int d_idx = d_start + tid * vec_size; d_idx < end; d_idx += num_threads * vec_size) {
+
+#pragma unroll
+        for (int i = d_idx; i < min(end, d_idx + vec_size); i++) {
+            float angles = calculate_frequency_and_angle(t_val, i % half, half, max_period);
+            o_vec_cos[i - d_idx] = cast_to<O>(cosf(angles));
+            o_vec_sin[i - d_idx] = cast_to<O>(sinf(angles));
+        }
+
+        int out_idx_cos = pid_b * stride_out_b + d_idx * stride_out_d;
+        int out_idx_sin = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
+        if (d_idx + vec_size <= end) {
+            o_vec_cos.store(output_ptr + out_idx_cos);
+            o_vec_sin.store(output_ptr + out_idx_sin);
+        } else {
+            for (int i = d_idx; i < end; i++) {
+                output_ptr[out_idx_cos + i] = o_vec_cos[i];
+                output_ptr[out_idx_sin + i] = o_vec_sin[i];
+            }
+        }
     }
 
     // TODO: review, assert output buffer is zero init?
     // if dim % 2:
     //     embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     if (dim % 2 != 0) {
-        int out_idx_pad = pid_b * stride_out_b + (dim-1) * stride_out_d;
+        int out_idx_pad = pid_b * stride_out_b + (dim - 1) * stride_out_d;
         output_ptr[out_idx_pad] = 0.;
     }
 }
