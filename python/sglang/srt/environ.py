@@ -75,6 +75,11 @@ class EnvField:
         return self.get()
 
 
+class EnvTuple(EnvField):
+    def parse(self, value: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip())
+
+
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
         return value
@@ -125,6 +130,7 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -162,6 +168,9 @@ class Envs:
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
@@ -197,7 +206,7 @@ class Envs:
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
-    SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    SGLANG_ENABLE_FLASHINFER_FP8_GEMM = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
@@ -266,16 +275,6 @@ class Envs:
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
-    # Ktransformers
-    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
-    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
-    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
-    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
-    SGLANG_KT_AMX_METHOD = EnvStr(None)
-    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
-    SGLANG_KT_MOE_MAX_DEFERRED_EXPERTS_PER_TOKEN = EnvInt(None)
-    SGLANG_KT_MOE_TOTAL_LAYERS = EnvInt(None)
-
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
@@ -285,6 +284,12 @@ class Envs:
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+
+    # Ngram
+    SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+
+    # Warmup
+    SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
 
     # fmt: on
 
@@ -302,6 +307,9 @@ def _print_deprecated_env(new_name: str, old_name: str):
 
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
+    _print_deprecated_env(
+        "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
+    )
 
     for key, value in os.environ.items():
         if key.startswith("SGL_"):

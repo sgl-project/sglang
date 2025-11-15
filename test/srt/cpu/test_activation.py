@@ -1,9 +1,7 @@
 import itertools
 import unittest
 
-import sgl_kernel
 import torch
-import torch.nn.functional as F
 from utils import GeluAndMul, SiluAndMul, precision
 
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
