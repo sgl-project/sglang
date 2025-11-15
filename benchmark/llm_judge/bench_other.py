@@ -114,9 +114,8 @@ def main(args):
         for i in range(0, len(lines), args.parallel):
             batches.append(list(range(i, min(i + args.parallel, len(lines)))))
 
-        loop = asyncio.get_event_loop()
         for bt in tqdm(batches):
-            loop.run_until_complete(
+            asyncio.run(
                 asyncio.gather(*[get_one_answer_async(i) for i in bt])
             )
 

@@ -110,10 +110,9 @@ class TestSRTEngine(CustomTestCase):
             print()
 
         if True:
-            loop = asyncio.get_event_loop()
             # 3. async + non_streaming
             print("\n\n==== 3. async + non streaming ====")
-            output = loop.run_until_complete(
+            output = llm.loop.run_until_complete(
                 llm.async_generate(prompt, sampling_params)
             )
             print(output["text"])
@@ -131,7 +130,7 @@ class TestSRTEngine(CustomTestCase):
                 print()
 
             print("\n\n==== 4. async + streaming ====")
-            loop.run_until_complete(async_streaming(llm))
+            llm.loop.run_until_complete(async_streaming(llm))
 
         llm.shutdown()
 
@@ -198,9 +197,8 @@ class TestSRTEngine(CustomTestCase):
 
         # Get sync and async embeddings
         out1 = torch.tensor(engine.encode(prompt)["embedding"])
-        loop = asyncio.get_event_loop()
         out2 = torch.tensor(
-            loop.run_until_complete(engine.async_encode(prompt))["embedding"]
+            engine.loop.run_until_complete(engine.async_encode(prompt))["embedding"]
         )
 
         engine.shutdown()

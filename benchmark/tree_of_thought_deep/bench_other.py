@@ -172,10 +172,9 @@ def main(args):
         for i in range(len(questions)):
             batches[i // args.parallel].append(i)
 
-        loop = asyncio.get_event_loop()
         for bt in tqdm(batches):
             tasks = [get_one_answer_async(k) for k in bt]
-            loop.run_until_complete(asyncio.gather(*tasks))
+            asyncio.run(asyncio.gather(*tasks))
 
     latency = time.perf_counter() - tic
 
