@@ -62,6 +62,8 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "moonshotai/Kimi-Linear-48B-A3B-Instruct",
         "Qwen/Qwen2-57B-A14B-Instruct",
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+        "Qwen/Qwen3-VL-30B-A3B-Instruct",
         "neuralmagic/Qwen2-72B-Instruct-FP8",
         "zai-org/GLM-4.5-Air-FP8",
     ],
