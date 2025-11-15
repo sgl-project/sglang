@@ -319,6 +319,10 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         with_stack = False if with_stack is False or env_with_stack is False else True
+        env_record_shapes: bool = get_bool_env_var(
+            "SGLANG_PROFILE_RECORD_SHAPES", "true"
+        )
+        record_shapes = (record_shapes is not False) and env_record_shapes
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -402,7 +406,13 @@ class TokenizerCommunicatorMixin:
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
             results = await self.update_weights_from_distributed_communicator(obj)
-            return _Communicator.merge_results(results)
+            success, message = _Communicator.merge_results(results)
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
 
     async def init_weights_send_group_for_remote_instance(
         self,
@@ -449,7 +459,13 @@ class TokenizerCommunicatorMixin:
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
             result = (await self.update_weights_from_tensor_communicator(obj))[0]
-            return result.success, result.message
+            success, message = result.success, result.message
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
 
     async def update_weights_from_ipc(
         self,
@@ -467,11 +483,17 @@ class TokenizerCommunicatorMixin:
             # This means that weight sync cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
                 result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                return result.success, result.message
+                success, message = result.success, result.message
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
-            return False, error_msg
+            success, message = False, error_msg
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
 
     async def load_lora_adapter(
         self: TokenizerManager,
@@ -689,3 +711,8 @@ class TokenizerCommunicatorMixin:
                     f"Invalid --log-requests-level: {self.log_requests_level=}"
                 )
         return max_length, skip_names, out_skip_names
+
+    def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
+        """Update weight version if provided."""
+        if weight_version is not None:
+            self.server_args.weight_version = weight_version

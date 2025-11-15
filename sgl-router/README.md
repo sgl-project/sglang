@@ -43,7 +43,6 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
 ## Installation
-
 ### Prerequisites
 - **Rust and Cargo**
   ```bash
@@ -71,20 +70,23 @@ pip install maturin
 
 # Fast development mode (debug build, no wheel, instant)
 # Uses system OpenSSL (requires libssl-dev/openssl-devel)
+cd bindings/python
 maturin develop
 
 # Production build (optimized, creates wheel)
 # Uses vendored OpenSSL (cross-platform compatibility)
-maturin build --release --features vendored-openssl
+cd bindings/python
+maturin build --release --out dist --features vendored-openssl
 pip install --force-reinstall dist/*.whl
 
 # Development build with system OpenSSL (faster)
 # Requires: apt install libssl-dev pkg-config (Ubuntu/Debian)
 #       or: yum install openssl-devel (RHEL/CentOS)
-maturin build --release
+cd bindings/python
+maturin build --release --out dist
 pip install --force-reinstall dist/*.whl
 ```
-> **Note:** Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
+> **Note:** Python bindings are located in `bindings/python/` with their own Cargo.toml. Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
 ## Quick Start
 ### Regular HTTP Routing
@@ -383,9 +385,6 @@ Use upstream SGLang binaries to start dedicated worker processes.
 | `GET`    | `/workers`       | List workers with health, load, policy metadata, and queued job status.                                                                                   |
 | `GET`    | `/workers/{url}` | Inspect a specific worker or job queue entry.                                                                                                             |
 | `DELETE` | `/workers/{url}` | Queue worker removal.                                                                                                                                     |
-| `POST`   | `/add_worker`    | Legacy immediate worker registration using query params. Returns synchronously. **Deprecated soon**—use `POST /workers` instead.                          |
-| `POST`   | `/remove_worker` | Legacy immediate removal. **Deprecated soon**—use `DELETE /workers/{url}` instead.                                                                        |
-| `GET`    | `/list_workers`  | Legacy list of worker URLs. **Deprecated soon**—use `GET /workers` instead.                                                                               |
 | `POST`   | `/flush_cache`   | Trigger cache flush across HTTP workers with success/failure breakdown.                                                                                   |
 | `GET`    | `/get_loads`     | Sample current load reported by each worker.                                                                                                              |
 
@@ -578,12 +577,13 @@ cargo build
 cargo test
 
 # Fast Python development (rebuilds and installs in debug mode)
-maturin develop
+cd bindings/python && maturin develop
 
 # Run Python tests
-pytest
+cd ../..  # Back to sgl-router root
+pytest py_test/
 ```
-For production builds, use `maturin build --release` to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
 
 ---
 

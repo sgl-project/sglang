@@ -12,8 +12,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
+from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
     from sgl_kernel import (
@@ -23,6 +24,8 @@ if is_cuda():
         top_p_renorm_prob,
     )
 
+if is_npu():
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +105,7 @@ class Sampler(nn.Module):
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
-            if get_global_server_args().rl_on_policy_target == "fsdp":
+            if get_global_server_args().rl_on_policy_target is not None:
                 logits_div_temperature = (
                     logits.bfloat16().div(sampling_info.temperatures).bfloat16()
                 )
@@ -112,7 +115,11 @@ class Sampler(nn.Module):
 
             # Post process logits
             logits.div_(sampling_info.temperatures)
-            logits[:] = torch.softmax(logits, dim=-1)
+            # For ascend backend, softmax is not needed before sampling
+            if not get_global_server_args().sampling_backend == "ascend" or (
+                return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB
+            ):
+                logits[:] = torch.softmax(logits, dim=-1)
             probs = logits
             del logits
 
@@ -150,13 +157,21 @@ class Sampler(nn.Module):
                         sampling_info.sampling_seed,
                         positions,
                     )
+                elif get_global_server_args().sampling_backend == "ascend":
+                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_ascend(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
+                    )
                 else:
                     raise ValueError(
                         f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
                     )
 
             if return_logprob:
-                if get_global_server_args().rl_on_policy_target == "fsdp":
+                if get_global_server_args().rl_on_policy_target is not None:
                     logprobs = logprobs_via_logsoftmax_kernel
                     del logprobs_via_logsoftmax_kernel
                 # clamp to avoid -inf
@@ -286,6 +301,55 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def top_k_top_p_min_p_sampling_from_probs_ascend(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+):
+    """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface."""
+    # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
+    if hasattr(torch_npu, "npu_top_k_top_p") and torch.all(
+        (top_ks <= 1024) & (top_ks >= 1)
+    ):
+        logits_top_k_top_p = torch_npu.npu_top_k_top_p(probs, top_ps, top_ks)
+        probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
+
+        if need_min_p_sampling:
+            min_p_thresholds = probs_top_k_top_p.max(dim=-1) * min_ps
+            min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
+            probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
+
+        batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
+    else:
+        probs = torch.softmax(probs, dim=-1)
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+
+        # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
+        topk_all_mask = top_ks == TOP_K_ALL
+        top_ks.masked_fill_(topk_all_mask, probs.shape[1])
+        top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
+            1, -1
+        ) >= top_ks.view(-1, 1)
+        probs_sort.masked_fill_(top_k_mask, 0.0)
+
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        top_p_mask = probs_sum - probs_sort > top_ps.view(-1, 1)
+        probs_sort.masked_fill_(top_p_mask, 0.0)
+
+        if need_min_p_sampling:
+            min_p_thresholds = probs_sort[:, 0] * min_ps
+            min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
+            probs_sort.masked_fill_(min_p_mask, 0.0)
+
+        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        probs_idx = probs_idx.to(torch.int32)
+        batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
+
+    return batch_next_token_ids.view(-1)
 
 
 def multinomial_with_seed(

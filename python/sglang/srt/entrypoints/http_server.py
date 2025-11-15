@@ -72,6 +72,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -419,6 +420,12 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    if (
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
+        and request.url.path == "/health"
+    ):
+        return Response(status_code=200)
+
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
 
@@ -483,6 +490,8 @@ async def get_model_info():
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understandable_model,
+        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understandable_model,
     }
     return result
 
@@ -715,11 +724,6 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {
         "success": success,
         "message": message,
@@ -813,11 +817,6 @@ async def update_weights_from_tensor(
         obj, request
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -835,11 +834,6 @@ async def update_weights_from_distributed(
         )
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -853,11 +847,6 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
         obj, request
     )
-
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
 
     content = {"success": success, "message": message}
     if success:
@@ -1322,12 +1311,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
-def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
-    """Update weight version if provided."""
-    if weight_version is not None:
-        _global_state.tokenizer_manager.server_args.weight_version = weight_version
-
-
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
@@ -1429,6 +1412,10 @@ def launch_server(
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
+# Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+
+
 def _execute_server_warmup(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
@@ -1460,8 +1447,16 @@ def _execute_server_warmup(
 
     model_info = res.json()
 
+    is_vlm = bool(model_info.get("has_image_understanding", False))
+
     # Send a warmup request
-    request_name = "/generate" if model_info["is_generation"] else "/encode"
+    if model_info["is_generation"]:
+        if is_vlm and not server_args.skip_tokenizer_init:
+            request_name = "/v1/chat/completions"
+        else:
+            request_name = "/generate"
+    else:
+        request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
@@ -1474,6 +1469,31 @@ def _execute_server_warmup(
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
+    elif is_vlm and server_args.disaggregation_mode == "null":
+        # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
+        json_data = {
+            "model": _global_state.tokenizer_manager.served_model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image.",
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": max_new_tokens,
+            "stream": False,
+            "temperature": 0.0,
+        }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
@@ -1489,14 +1509,16 @@ def _execute_server_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
+        warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
         if server_args.disaggregation_mode == "null":
+            logger.info(f"Start of co-locate warmup ...")
             res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=600,
+                timeout=warmup_timeout if warmup_timeout > 0 else 600,
             )
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
@@ -1520,7 +1542,9 @@ def _execute_server_warmup(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=1800,  # because of deep gemm precache is very long if not precache.
+                timeout=(
+                    warmup_timeout if warmup_timeout > 0 else 1800
+                ),  # because of deep gemm precache is very long if not precache.
             )
             if res.status_code == 200:
                 logger.info(
