@@ -16,30 +16,16 @@ use crate::{
 
 /// MiniMax M2 format parser for tool calls
 ///
-/// Implements the MiniMax-M2 model's XML-based tool calling format as specified in the
-/// official chat template. The M2 model uses a structured XML format for function invocations
-/// to ensure reliable parsing and execution.
+/// Handles the MiniMax M2 specific format:
+/// `<minimax:tool_call><invoke name="func"><parameter name="key">value</parameter></invoke></minimax:tool_call>`
 ///
-/// ## Format Reference
-/// - HuggingFace Model: https://huggingface.co/MiniMaxAI/MiniMax-M2
-/// - Chat Template: https://huggingface.co/MiniMaxAI/MiniMax-M2?chat_template=default
+/// Features:
+/// - Namespaced XML tags (`minimax:tool_call`)
+/// - Function wrapped in `<invoke name="...">` tags
+/// - Parameters as `<parameter name="key">value</parameter>`
+/// - Incremental JSON streaming for parameters
 ///
-/// ## Tool Call Structure
-/// ```xml
-/// <minimax:tool_call>
-///   <invoke name="function_name">
-///     <parameter name="param1">value1</parameter>
-///     <parameter name="param2">value2</parameter>
-///   </invoke>
-/// </minimax:tool_call>
-/// ```
-///
-/// ## Key Features
-/// - **Namespaced XML tags**: Uses `minimax:` namespace to avoid conflicts
-/// - **Structured invocation**: Functions wrapped in `<invoke name="...">` tags
-/// - **Named parameters**: Each parameter uses `<parameter name="key">value</parameter>`
-/// - **Incremental streaming**: Converts XML to JSON progressively during streaming
-/// - **XML entity decoding**: Handles encoded entities (`&lt;`, `&gt;`, etc.) in parameter values
+/// Reference: https://huggingface.co/MiniMaxAI/MiniMax-M2?chat_template=default
 pub struct MinimaxM2Parser {
     // Regex patterns
     tool_call_extractor: Regex,

@@ -1,0 +1,82 @@
+{
+  "metadata": {
+    "model": "Qwen/Qwen-Image",
+    "hardware": "CI H100 80GB pool",
+    "description": "Reference numbers captured from the CI diffusion server baseline run"
+  },
+  "tolerances": {
+    "e2e": 0.25,
+    "stage": 0.3,
+    "denoise_step": 0.1,
+    "denoise_agg": 0.1
+  },
+  "sampling": {
+    "step_fractions": [
+      0.0,
+      0.2,
+      0.4,
+      0.6,
+      0.8,
+      1.0
+    ],
+    "warmup_requests": {
+      "text": 1,
+      "image_edit": 0
+    }
+  },
+  "scenarios": {
+    "text_to_image": {
+      "notes": "Single-image generation using the default prompt",
+      "expected_e2e_ms": 74500.0,
+      "expected_avg_denoise_ms": 422.42,
+      "expected_median_denoise_ms": 410.62,
+      "stages_ms": {
+        "InputValidationStage": 0.1,
+        "TextEncodingStage": 834.2,
+        "ConditioningStage": 0.1,
+        "TimestepPreparationStage": 10.6,
+        "LatentPreparationStage": 5.2,
+        "DenoisingStage": 21202.6,
+        "DecodingStage": 476.12
+      },
+      "denoise_step_ms": {
+        "0": 1077.77, "1": 345.13, "2": 413.8, "3": 405.49, "4": 408.14, "5": 409.06,
+        "6": 408.85, "7": 410.53, "8": 407.51, "9": 409.44, "10": 408.65, "11": 410.14,
+        "12": 411.74, "13": 409.59, "14": 409.17, "15": 410.78, "16": 410.66, "17": 410.58,
+        "18": 411.27, "19": 410.51, "20": 409.03, "21": 410.16, "22": 409.42, "23": 411.03,
+        "24": 410.18, "25": 409.72, "26": 410.26, "27": 410.21, "28": 410.71, "29": 410.76,
+        "30": 411.06, "31": 410.1, "32": 410.55, "33": 410.77, "34": 410.74, "35": 411.75,
+        "36": 410.78, "37": 411.56, "38": 410.85, "39": 411.08, "40": 411.12, "41": 411.1,
+        "42": 411.09, "43": 410.87, "44": 411.37, "45": 411.68, "46": 411.0, "47": 410.09,
+        "48": 412.72, "49": 410.42
+      }
+    },
+    "image_edit": {
+      "notes": "single uploaded reference image, Qwen/Qwen-Image-Edit",
+      "expected_e2e_ms": 138500.0,
+      "expected_avg_denoise_ms": 720.0,
+      "expected_median_denoise_ms": 718.0,
+      "stages_ms": {
+        "InputValidationStage": 14,
+        "ImageEncodingStage": 990.0,
+        "ImageVAEEncodingStage": 252.76,
+        "ConditioningStage": 0.13,
+        "TimestepPreparationStage": 13.78,
+        "LatentPreparationStage": 9.18,
+        "DenoisingStage": 36000.0,
+        "DecodingStage": 645
+      },
+      "denoise_step_ms": {
+        "0": 720.0, "1": 720.0, "2": 720.0, "3": 720.0, "4": 720.0, "5": 720.0,
+        "6": 720.0, "7": 720.0, "8": 720.0, "9": 720.0, "10": 720.0, "11": 720.0,
+        "12": 720.0, "13": 720.0, "14": 720.0, "15": 720.0, "16": 720.0, "17": 720.0,
+        "18": 720.0, "19": 720.0, "20": 720.0, "21": 720.0, "22": 720.0, "23": 720.0,
+        "24": 720.0, "25": 720.0, "26": 720.0, "27": 720.0, "28": 720.0, "29": 720.0,
+        "30": 720.0, "31": 720.0, "32": 720.0, "33": 720.0, "34": 720.0, "35": 720.0,
+        "36": 720.0, "37": 720.0, "38": 720.0, "39": 720.0, "40": 720.0, "41": 720.0,
+        "42": 720.0, "43": 720.0, "44": 720.0, "45": 720.0, "46": 720.0, "47": 720.0,
+        "48": 720.0, "49": 720.0
+      }
+    }
+  }
+}

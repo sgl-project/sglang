@@ -1,0 +1,292 @@
+name: Nightly Test (Nvidia)
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-test-nvidia-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # General tests - 1 GPU
+  nightly-test-general-1-gpu-runner:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-1-gpu --continue-on-error
+
+  # General tests - 4 GPU H100
+  nightly-test-general-4-gpu-h100:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 4-gpu-h100
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-4-gpu --continue-on-error
+
+  # General tests - 8 GPU H200
+  nightly-test-general-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          GPU_CONFIG: "8-gpu-h200"
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-h200 --continue-on-error
+
+  # General tests - 8 GPU H20
+  nightly-test-general-8-gpu-h20:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h20
+    env:
+      SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          GPU_CONFIG: "8-gpu-h20"
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
+
+  # Text model accuracy tests
+  nightly-test-text-accuracy-2-gpu-runner:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run eval test for text models
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 nightly/test_text_models_gsm8k_eval.py
+
+  # Text model performance tests
+  nightly-test-text-perf-2-gpu-runner:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run performance test for text models
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "2-gpu-runner"
+        run: |
+          cd test/srt
+          rm -rf performance_profiles_text_models/
+          python3 nightly/test_text_models_perf.py
+
+      - name: Publish traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models
+
+  # VLM accuracy tests
+  nightly-test-vlm-accuracy-2-gpu-runner:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run eval test for VLM models (fixed MMMU-100)
+        timeout-minutes: 240
+        run: |
+          cd test/srt
+          python3 nightly/test_vlms_mmmu_eval.py
+
+  # VLM performance tests
+  nightly-test-vlm-perf-2-gpu-runner:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run perf test for VLM models (MMMU)
+        timeout-minutes: 240
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "2-gpu-runner"
+        run: |
+          cd test/srt
+          rm -rf performance_profiles_vlms/
+          python3 nightly/test_vlms_perf.py
+
+      - name: Publish traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_vlms
+
+  # B200 Performance tests - 4 GPU
+  nightly-test-perf-4-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 4-gpu-b200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-4-gpu-b200 --continue-on-error
+
+  # B200 Performance tests - 8 GPU
+  nightly-test-perf-8-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-b200
+    env:
+      RUNNER_LABELS: 8-gpu-b200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run DeepSeek v3.1 nightly performance test
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-b200"
+        run: |
+          rm -rf test/srt/performance_profiles_deepseek_v31/
+          cd test/srt
+          IS_BLACKWELL=1 python3 nightly/test_deepseek_v31_perf.py
+
+      - name: Publish DeepSeek v3.1 traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v31
+
+      - name: Run DeepSeek v3.2 nightly performance test
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-b200"
+        run: |
+          rm -rf test/srt/performance_profiles_deepseek_v32/
+          cd test/srt
+          IS_BLACKWELL=1 python3 nightly/test_deepseek_v32_perf.py
+
+      - name: Publish DeepSeek v3.2 traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v32
+
+  # Final check job
+  check-all-jobs:
+    if: github.repository == 'sgl-project/sglang' && always()
+    needs:
+      - nightly-test-general-1-gpu-runner
+      - nightly-test-general-4-gpu-h100
+      - nightly-test-general-8-gpu-h200
+      - nightly-test-general-8-gpu-h20
+      - nightly-test-text-accuracy-2-gpu-runner
+      - nightly-test-text-perf-2-gpu-runner
+      - nightly-test-vlm-accuracy-2-gpu-runner
+      - nightly-test-vlm-perf-2-gpu-runner
+      - nightly-test-perf-4-gpu-b200
+      - nightly-test-perf-8-gpu-b200
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"
