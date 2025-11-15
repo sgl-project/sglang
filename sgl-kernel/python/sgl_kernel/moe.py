@@ -111,6 +111,41 @@ def moe_fused_gate(
     )
 
 
+def kimi_k2_moe_fused_gate(
+    input_tensor,
+    bias,
+    topk,
+    renormalize=True,
+    routed_scaling_factor=1.0,
+    apply_routed_scaling_factor_on_output=False,
+):
+    """
+    Simplified fused kernel for Kimi K2 model (num_expert_group=1).
+    This kernel removes the grouped topk logic since all experts belong to a single group.
+
+    Args:
+        input_tensor: Gating output tensor [num_tokens, num_experts]
+        bias: Correction bias tensor [num_experts]
+        topk: Number of experts to select per token
+        renormalize: Whether to renormalize the topk weights
+        routed_scaling_factor: Scaling factor for expert weights
+        apply_routed_scaling_factor_on_output: If true, apply scaling factor to output
+
+    Returns:
+        Tuple of (topk_weights, topk_ids)
+        - topk_weights: [num_tokens, topk] float32 tensor
+        - topk_ids: [num_tokens, topk] int32 tensor
+    """
+    return torch.ops.sgl_kernel.kimi_k2_moe_fused_gate.default(
+        input_tensor,
+        bias,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
+
+
 def fp8_blockwise_scaled_grouped_mm(
     output,
     a_ptrs,
