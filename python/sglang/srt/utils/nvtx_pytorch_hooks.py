@@ -71,7 +71,7 @@ class PytHooks(object):
         return tensor_list
 
     def process_layer_params(self, module_obj):
-        """Extract the static parameters from each of the nn.Layer types
+        """Extract the static parameters from LLM and VLM relevant layer types
 
         Args:
             module_obj(class): Module state data structure.
@@ -84,7 +84,7 @@ class PytHooks(object):
 
         """
         param_info = {}
-        ## Look for layer parameters specific to each layer type
+        # Extract parameters for layers commonly used in LLMs and VLMs
         if (
             isinstance(module_obj, torch.nn.Conv1d)
             or isinstance(module_obj, torch.nn.Conv2d)
@@ -182,10 +182,6 @@ class PytHooks(object):
         elif isinstance(module_obj, torch.nn.Embedding):
             param_info["num_embeddings"] = module_obj.num_embeddings
             param_info["embedding_dim"] = module_obj.embedding_dim
-        elif isinstance(module_obj, torch.nn.ReflectionPad1d):
-            # keeping this limited to ReflectionPad1d for now because the normal
-            # torch.nn.function.pad layer is more complicated in how it handles params
-            param_info["padding"] = module_obj.padding
         elif isinstance(
             module_obj,
             (
@@ -195,19 +191,7 @@ class PytHooks(object):
             ),
         ):
             param_info["scale_factor"] = module_obj.scale_factor
-        elif isinstance(module_obj, torch.nn.LSTM):
-            param_info = self.process_lstm_layer_params(module_obj)
 
-        return param_info
-
-    def process_lstm_layer_params(self, module_obj):
-        param_info = {}
-        param_info["cell"] = "lstm"
-        param_info["hidden_size"] = module_obj.hidden_size
-        param_info["batch_first"] = module_obj.batch_first
-        param_info["bidirectional"] = module_obj.bidirectional
-        param_info["input_size"] = module_obj.input_size
-        param_info["num_layers"] = module_obj.num_layers
         return param_info
 
     def module_fwd_hook(self, module_obj, in_tensor, out_tensor):
