@@ -118,6 +118,9 @@ jobs:
               - "sgl-kernel/**"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+              - "python/sglang/cli/**"
+              - "python/*.toml"
+              - ".github/workflows/pr-test.yml"
 
   # =============================================== sgl-kernel ====================================================
 
@@ -312,14 +315,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Download CUDA 12.9 kernel artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
