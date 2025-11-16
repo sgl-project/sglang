@@ -12,7 +12,7 @@ authors = [
     {name = "Keyang Ru", email = "rukeyang@gmail.com"}
 ]
 requires-python = ">=3.8"
-readme = "README.md"
+readme = "../../README.md"
 license = { text = "Apache-2.0" }
 classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
@@ -44,3 +44,5 @@ dev = [
 [tool.maturin]
 python-source = "."
 module-name = "sglang_router.sglang_router_rs"
+# Exclude bindings/python/README.md to use root README only
+exclude = ["README.md"]
