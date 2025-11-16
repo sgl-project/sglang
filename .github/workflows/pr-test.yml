@@ -29,6 +29,7 @@ jobs:
       main_package: ${{ steps.filter.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
+      is_high_priority: ${{ steps.check-priority.outputs.is_high_priority }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -118,6 +119,19 @@ jobs:
               - "sgl-kernel/**"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+
+      - name: Check for high-priority label
+        id: check-priority
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if [[ "${{ contains(github.event.pull_request.labels.*.name, 'high-priority') }}" == "true" ]]; then
+              echo "is_high_priority=true" >> $GITHUB_OUTPUT
+            else
+              echo "is_high_priority=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "is_high_priority=false" >> $GITHUB_OUTPUT
+          fi
 
   # =============================================== sgl-kernel ====================================================
 
@@ -408,7 +422,7 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: ${{ needs.check-changes.outputs.is_high_priority == 'true' && 15 || 5 }}
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
