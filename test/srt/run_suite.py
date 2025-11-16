@@ -207,7 +207,6 @@ suites = {
     "nightly-1-gpu": [
         TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
         TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_openai_api.py", 30),
@@ -253,9 +252,7 @@ suites = {
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
         TestFile("lora/test_lora_cuda_graph.py"),
-        TestFile("lora/test_lora_qwen3.py"),
-        TestFile("lora/test_lora_tp.py"),
-        TestFile("lora/test_lora_update.py"),
+        TestFile("lora/test_lora_qwen3_vl.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
