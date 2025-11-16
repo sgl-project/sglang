@@ -1,4 +1,4 @@
-default_stages: [commit, push, manual]
+default_stages: [pre-commit, pre-push, manual]
 exclude: ^python/sglang/multimodal_gen/csrc
 
 repos:
