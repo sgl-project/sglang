@@ -44,4 +44,3 @@ echo ""
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 SGL_TOKENIZER_PATH="$TOKENIZER_PATH" SGL_GRPC_ENDPOINT="$ENDPOINT" go run main.go
-

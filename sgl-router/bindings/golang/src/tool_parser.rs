@@ -327,4 +327,3 @@ pub unsafe extern "C" fn sgl_tool_parser_free(handle: *mut ToolParserHandle) {
         let _ = Box::from_raw(handle);
     }
 }
-

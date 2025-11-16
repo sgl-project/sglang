@@ -26,4 +26,3 @@ pub unsafe extern "C" fn sgl_free_token_ids(ptr: *mut u32, count: usize) {
         let _ = Vec::from_raw_parts(ptr, count, count);
     }
 }
-

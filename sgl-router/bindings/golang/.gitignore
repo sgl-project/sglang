@@ -22,4 +22,3 @@ examples/streaming/streaming
 # Environment files
 .env
 .env.local
-

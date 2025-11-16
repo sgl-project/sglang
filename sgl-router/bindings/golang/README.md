@@ -376,7 +376,7 @@ Add to your GitHub Actions workflow:
 - name: Run Go tests
   run: |
     go test -race -cover ./...
-    
+
 - name: Run integration tests (on main branch)
   if: github.ref == 'refs/heads/main'
   env:

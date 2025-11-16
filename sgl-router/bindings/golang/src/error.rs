@@ -48,4 +48,3 @@ pub fn clear_error_message(error_out: *mut *mut c_char) {
 
 // Helper functions for error handling
 // Note: Some helper functions are kept for potential future use
-

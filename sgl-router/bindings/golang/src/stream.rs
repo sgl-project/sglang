@@ -116,14 +116,14 @@ pub unsafe extern "C" fn sgl_stream_read_next(
             // We need to get the converter lock first
             let conversion_result = RUNTIME.block_on(async {
                 let mut converter_guard = converter.lock().await;
-                
+
                 // Clone necessary fields for conversion
                 let tokenizer = Arc::clone(&converter_guard.tokenizer);
                 let model = converter_guard.model.clone();
                 let request_id = converter_guard.request_id.clone();
                 let created = converter_guard.created;
                 let system_fingerprint = converter_guard.system_fingerprint.clone();
-                
+
                 // Call the conversion function
                 convert_proto_chunk_to_openai(
                     proto_response.clone(),
@@ -207,7 +207,7 @@ pub unsafe extern "C" fn sgl_stream_read_next(
                 // Yield to ensure Release ordering is propagated
                 tokio::task::yield_now().await;
             });
-            
+
             set_error_message(error_out, &format!("Stream error: {}", e));
             *is_done_out = 1;
             SglErrorCode::UnknownError
@@ -222,7 +222,7 @@ pub unsafe extern "C" fn sgl_stream_read_next(
                 // Yield to ensure Release ordering is propagated
                 tokio::task::yield_now().await;
             });
-            
+
             *response_json_out = ptr::null_mut();
             *is_done_out = 1;
             SglErrorCode::Success
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn sgl_stream_read_next(
 pub unsafe extern "C" fn sgl_stream_free(handle: *mut SglangStreamHandle) {
     if !handle.is_null() {
         let handle_ref = Box::from_raw(handle);
-        
+
         // Mark stream as completed to prevent abort on drop
         // By this point, the stream should already be completed by ReadNext()
         // but we call it again to be safe
@@ -268,15 +268,15 @@ pub unsafe extern "C" fn sgl_stream_free(handle: *mut SglangStreamHandle) {
             // Yield to ensure the atomic write is visible
             tokio::task::yield_now().await;
         });
-        
+
         // Use a strong memory fence to ensure mark_completed()'s Release write
         // is visible before we drop the last Arc reference
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-        
+
         // Now drop all references - if mark_completed() was called successfully,
         // the drop won't send an abort
         drop(handle_ref.stream);
-        
+
         // Free converter
         let converter = Arc::try_unwrap(handle_ref.converter)
             .ok()
@@ -286,4 +286,3 @@ pub unsafe extern "C" fn sgl_stream_free(handle: *mut SglangStreamHandle) {
         }
     }
 }
-

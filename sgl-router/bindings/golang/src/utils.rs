@@ -42,4 +42,3 @@ pub unsafe extern "C" fn sgl_generate_tool_constraints(
     super::error::set_error_message(error_out, "Tool constraint generation not yet implemented in FFI");
     super::error::SglErrorCode::UnknownError
 }
-

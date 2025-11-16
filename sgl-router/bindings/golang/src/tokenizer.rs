@@ -377,4 +377,3 @@ pub unsafe extern "C" fn sgl_tokenizer_free(handle: *mut TokenizerHandle) {
         let _ = Box::from_raw(handle);
     }
 }
-

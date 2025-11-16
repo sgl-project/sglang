@@ -266,7 +266,7 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
     // Create converter handle and set initial_prompt_tokens immediately
     let mut converter_handle = *Box::from_raw(converter);
     converter_handle.initial_prompt_tokens = Some(prompt_tokens);
-    
+
     // Create stream handle with prompt_tokens
     *stream_handle_out = Box::into_raw(Box::new(SglangStreamHandle {
         stream: Arc::new(tokio::sync::Mutex::new(stream)),
@@ -277,4 +277,3 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
 
     SglErrorCode::Success
 }
-

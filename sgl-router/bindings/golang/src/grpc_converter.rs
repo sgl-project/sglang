@@ -237,7 +237,7 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_convert_chunk(
             return SglErrorCode::ParsingError;
         }
     };
-    
+
     // Build proto::GenerateResponse from JSON value
     let mut proto_response = proto::GenerateResponse {
         request_id: json_value.get("request_id")
@@ -246,7 +246,7 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_convert_chunk(
             .to_string(),
         response: None,
     };
-    
+
     // Parse the response oneof field
     if let Some(chunk_json) = json_value.get("chunk") {
         let chunk = proto::GenerateStreamChunk {
@@ -452,7 +452,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                         handle.skip_special_tokens,
                     )
                 });
-                
+
                 // Process tokens incrementally
                 let mut text_parts = Vec::new();
                 for &token_id in &chunk.token_ids {
@@ -634,7 +634,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
             } else {
                 complete.finish_reason.clone()
             };
-            
+
             // Ensure finish_reason is never empty (defensive check)
             let finish_reason = if finish_reason.is_empty() || finish_reason.trim().is_empty() {
                 "stop".to_string()
@@ -664,7 +664,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                 .copied()
                 .filter(|&v| v > 0)
                 .unwrap_or(complete.completion_tokens);
-            
+
             // Always try to use initial_prompt_tokens if prompt_tokens is 0 or missing
             // This is the most reliable source for prompt tokens since we calculate it from the request
             if prompt_tokens == 0 {
@@ -672,7 +672,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     prompt_tokens = initial_prompt;
                 }
             }
-            
+
             // If completion_tokens is 0, try to infer from output_ids or accumulated chunks
             if completion_tokens == 0 {
                 // Try to use completion_tokens from complete message even if 0
@@ -685,7 +685,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     completion_tokens = last_completion;
                 }
             }
-            
+
             // Final fallback: if both are still 0, try to use initial_prompt_tokens for prompt
             // and calculate completion from output_ids
             if prompt_tokens == 0 && completion_tokens == 0 {
@@ -699,14 +699,14 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     }
                 }
             }
-            
+
             // Final defensive check: ensure prompt_tokens is set if we have initial_prompt_tokens
             if prompt_tokens == 0 {
                 if let Some(initial_prompt) = handle.initial_prompt_tokens {
                     prompt_tokens = initial_prompt;
                 }
             }
-            
+
             // Always create usage, even if values are 0 (defensive)
             let usage = Some(Usage {
                 prompt_tokens: prompt_tokens.max(0) as u32,
@@ -756,4 +756,3 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_free(handle: *mut GrpcRespo
         let _ = Box::from_raw(handle);
     }
 }
-
