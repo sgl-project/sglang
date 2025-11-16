@@ -3646,3 +3646,15 @@ def get_current_device_stream_fast():
     if cached_device_index == -1:
         cached_device_index = torch.get_device_module().current_device()
     return torch.get_device_module().current_stream(cached_device_index)
+
+
+def raise_error_or_warn(obj, flag, counter_name, message, log_interval=1000):
+    if flag:
+        raise ValueError(message)
+    else:
+        if not hasattr(obj, counter_name):
+            setattr(obj, counter_name, 0)
+        count = getattr(obj, counter_name)
+        if count % log_interval == 0:
+            logger.warning(message)
+        setattr(obj, counter_name, count + 1)
