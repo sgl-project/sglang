@@ -95,6 +95,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
+    inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
@@ -3187,6 +3188,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             }
         )
         self.capture_aux_hidden_states = False
+        self._executed_weight_requant_ue8m0 = False
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
@@ -3342,6 +3344,18 @@ class DeepseekV2ForCausalLM(nn.Module):
                         weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
                     if (
+                        should_deepgemm_weight_requant_ue8m0(
+                            weight_block_size=getattr(
+                                self.quant_config, "weight_block_size", None
+                            )
+                        )
+                        and self._executed_weight_requant_ue8m0
+                    ):
+                        weight_scale = inverse_transform_scale_ue8m0(
+                            weight_scale, mn=weight.shape[-2]
+                        )
+
+                    if (
                         _is_cuda
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
@@ -3451,9 +3465,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if not ENABLE_FLASHINFER_FP8_GEMM and should_deepgemm_weight_requant_ue8m0(
-            weight_block_size=getattr(self.quant_config, "weight_block_size", None)
+        if (
+            not ENABLE_FLASHINFER_FP8_GEMM
+            and should_deepgemm_weight_requant_ue8m0(
+                weight_block_size=getattr(self.quant_config, "weight_block_size", None)
+            )
+            and not self._executed_weight_requant_ue8m0
         ):
+            self._executed_weight_requant_ue8m0 = True
             self._weight_requant_ue8m0(is_nextn)
 
         # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
