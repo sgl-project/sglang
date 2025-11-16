@@ -130,21 +130,31 @@ def collect_all_tests(files: list[str], sanity_check: bool = True) -> list[CITes
     ci_tests = []
     for file in files:
         visitor = ut_parse_one_file(file)
-        if sanity_check and len(visitor.ci_tests) == 0:
-            raise ValueError(f"No CustomTestCase found in {file}")
+        if len(visitor.ci_tests) == 0:
+            msg = f"No test cases found in {file}"
+            if sanity_check:
+                raise ValueError(msg)
+            else:
+                logger.warning(msg)
+                continue
 
         for reg in visitor.ci_tests:
-            if sanity_check:
-                if len(reg.ci_registry) == 0:
-                    raise ValueError(
-                        f"No CI registry found in CustomTestCase {reg.testname} in {file}"
-                    )
+            if len(reg.ci_registry) == 0:
+                msg = f"No CI registry found in CustomTestCase {reg.testname} in {file}"
+                if sanity_check:
+                    raise ValueError(msg)
+                else:
+                    logger.warning(msg)
+                    continue
 
-                if len(reg.ci_registry) > 1 and any(
-                    r.backend == HWBackend.SKIP for r in reg.ci_registry
-                ):
-                    raise ValueError(
-                        f"Conflicting CI registry found in CustomTestCase {reg.testname} in {file}"
-                    )
+            if len(reg.ci_registry) > 1 and any(
+                r.backend == HWBackend.SKIP for r in reg.ci_registry
+            ):
+                msg = f"Conflicting CI registry found in CustomTestCase {reg.testname} in {file}"
+                if sanity_check:
+                    raise ValueError(msg)
+                else:
+                    logger.warning(msg)
+                    continue
 
         ci_tests.extend(visitor.ci_tests)
