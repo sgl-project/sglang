@@ -3652,9 +3652,7 @@ def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
     if strict:
         raise ValueError(message)
     else:
-        if not hasattr(obj, counter_name):
-            setattr(obj, counter_name, 0)
-        count = getattr(obj, counter_name)
+        count = getattr(obj, counter_name, 0)
         if count % log_interval == 0:
             logger.warning(message)
         setattr(obj, counter_name, count + 1)
