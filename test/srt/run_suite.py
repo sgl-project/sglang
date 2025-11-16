@@ -13,7 +13,7 @@ class TestFile:
 
 
 # NOTE: please sort the test cases alphabetically by the test file name
-suites = {
+suites_cuda = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("function_call/test_json_schema_constraint.py", 1),
@@ -544,6 +544,7 @@ suite_ascend = {
     ],
 }
 
+suites = dict(suites_cuda)
 suites.update(suite_amd)
 suites.update(suite_xeon)
 suites.update(suite_ascend)
@@ -594,7 +595,7 @@ def auto_partition(files, rank, size):
     return [files[i] for i in indices]
 
 
-def _sanity_check_suites(suites):
+def _sanity_check_suites(applied_suites):
     dir_base = Path(__file__).parent
     disk_files = set(
         [
@@ -603,17 +604,16 @@ def _sanity_check_suites(suites):
             if x.name.startswith("test_")
         ]
     )
+    suite_files = set()
+    for name, suite in applied_suites.items():
+        if name == "__not_in_ci__":
+            continue
+        suite_files.update([test_file.name for test_file in suite])
 
-    suite_files = set(
-        [test_file.name for _, suite in suites.items() for test_file in suite]
-    )
-
-    missing_files = sorted(list(disk_files - suite_files))
+    missing_files = sorted(list(suite_files - disk_files))
     missing_text = "\n".join(f'TestFile("{x}"),' for x in missing_files)
     assert len(missing_files) == 0, (
-        f"Some test files are not in test suite. "
-        f"If this is intentional, please add the following to `not_in_ci` section:\n"
-        f"{missing_text}"
+        f"Some files listed in the test suite do not exist:\n" f"{missing_text}"
     )
 
 
@@ -663,12 +663,21 @@ if __name__ == "__main__":
     args = arg_parser.parse_args()
     print(f"{args=}")
 
-    _sanity_check_suites(suites)
+    applied_suites = suites if args.suite == "all" else suites_cuda
+    if "cpu" in args.suite:
+        applied_suites = suite_xeon
+    elif "xpu" in args.suite:
+        applied_suites = suite_xpu
+    elif "ascend" in args.suite:
+        applied_suites = suite_ascend
+    elif "amd" in args.suite:
+        applied_suites = suite_amd
+    _sanity_check_suites(applied_suites)
 
     if args.suite == "all":
         files = glob.glob("**/test_*.py", recursive=True)
     else:
-        files = suites[args.suite]
+        files = applied_suites[args.suite]
 
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
