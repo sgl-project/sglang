@@ -13,6 +13,7 @@ class HWBackend(Enum):
 @dataclass
 class CIRegistry:
     backend: HWBackend
+    filename: str
     estimation_time: float
     stage: str
 
@@ -47,7 +48,7 @@ class RegistryVisitor(ast.NodeVisitor):
         est_time = None
         ci_stage = None
         for kw in func_call.keywords:
-            if kw.arg == "esimation_time":
+            if kw.arg == "estimation_time":
                 if isinstance(kw.value, ast.Constant):
                     est_time = kw.value.value
             elif kw.arg == "ci_stage":
@@ -64,7 +65,9 @@ class RegistryVisitor(ast.NodeVisitor):
             est_time is not None
         ), "esimation_time is required and should be a constant"
         assert ci_stage is not None, "ci_stage is required and should be a constant"
-        return CIRegistry(backend=hw, estimation_time=est_time, stage=ci_stage)
+        return CIRegistry(
+            backend=hw, filename=self.filename, estimation_time=est_time, stage=ci_stage
+        )
 
     def visit_Module(self, node):
         for stmt in node.body:

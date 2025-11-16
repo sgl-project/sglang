@@ -1,7 +1,7 @@
 import argparse
 import glob
 
-from sglang.test.test_utils import TestFile, run_unittest_files
+from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 suites = {
     "per-commit": [

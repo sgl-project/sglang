@@ -1,14 +1,8 @@
 import argparse
 import glob
-from dataclasses import dataclass
 from pathlib import Path
 
-
-@dataclass
-class TestFile:
-    name: str
-    estimated_time: float = 60
-
+from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
@@ -616,8 +610,6 @@ def _sanity_check_suites(suites):
 
 
 def run_suite_v1(args):
-    from sglang.test.test_utils import run_unittest_files
-
     print(f"{args=}")
 
     _sanity_check_suites(suites)
@@ -636,13 +628,6 @@ def run_suite_v1(args):
 
     exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
-
-
-def run_suite_v2(args):
-    from sglang.test.ci_register import collect_tests
-
-    files = glob.glob("**/test_*.py", recursive=True)
-    collect_tests(files, sanity_check=False)
 
 
 def main():
@@ -690,8 +675,8 @@ def main():
     )
     args = arg_parser.parse_args()
 
+    # FIXME: this will be deprecated soon
     run_suite_v1(args)
-    # run_suite_v2(args)
 
 
 if __name__ == "__main__":
