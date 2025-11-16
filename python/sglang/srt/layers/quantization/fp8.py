@@ -1245,7 +1245,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 routed_scaling_factor=(
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
-                tile_tokens_dim=None,
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=False,
             )
@@ -1322,3 +1321,10 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+
+
+if _is_cuda:
+
+    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
+    def _(mat_a, mat_b, scales_a, scales_b, out_dtype, bias):
+        return mat_a.new_empty((mat_a.shape[0], mat_b.shape[-1]), dtype=out_dtype)
