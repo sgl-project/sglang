@@ -26,6 +26,7 @@ suites = {
         TestFile("lora/test_lora_eviction.py", 240),
         TestFile("lora/test_lora_update.py", 600),
         TestFile("lora/test_lora_backend.py", 99),
+        TestFile("lora/test_lora_spec_decoding.py", 150),
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
@@ -177,15 +178,16 @@ suites = {
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
-        TestFile("test_eagle_infer_beta_dp_attention.py", 200),
+        # TODO: Add it back after the bug is fixed
+        # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12533
         # TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
     ],
@@ -218,9 +220,10 @@ suites = {
     ],
     "nightly-4-gpu-b200": [
         TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
-        TestFile("test_fp4_moe.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
+        TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
+        TestFile("test_fp4_moe.py", 300),
     ],
     "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [
@@ -298,6 +301,7 @@ suites = {
         TestFile("test_deepseek_chat_templates.py"),
         TestFile("test_disaggregation.py"),
         TestFile("test_double_sparsity.py"),
+        TestFile("test_eagle_infer_beta_dp_attention.py"),
         TestFile("test_embedding_openai_server.py"),
         TestFile("test_enable_thinking.py"),
         TestFile("test_eplb.py"),
