@@ -3648,8 +3648,8 @@ def get_current_device_stream_fast():
     return torch.get_device_module().current_stream(cached_device_index)
 
 
-def raise_error_or_warn(obj, flag, counter_name, message, log_interval=1000):
-    if flag:
+def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
+    if strict:
         raise ValueError(message)
     else:
         if not hasattr(obj, counter_name):

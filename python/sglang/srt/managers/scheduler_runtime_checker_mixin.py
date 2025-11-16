@@ -145,7 +145,7 @@ class SchedulerRuntimeCheckerMixin:
             )
             raise_error_or_warn(
                 self,
-                envs.SGLANG_ENABLE_REQ_POOL_LEAK_STRICT_CHECK,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
                 "count_req_pool_leak_warnings",
                 msg,
             )
@@ -162,7 +162,7 @@ class SchedulerRuntimeCheckerMixin:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise_error_or_warn(
                 self,
-                envs.SGLANG_ENABLE_REQ_POOL_LEAK_STRICT_CHECK,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
                 "count_memory_leak_warnings",
                 msg,
             )
