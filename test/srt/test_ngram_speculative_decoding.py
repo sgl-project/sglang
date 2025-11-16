@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-GSM_DATASET_PATH = "/shared/public/data/gsm8k/test.jsonl"
+GSM_DATASET_PATH = None
 
 
 # Default server arguments shared across all tests
