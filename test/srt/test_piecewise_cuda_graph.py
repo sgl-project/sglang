@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -52,6 +52,45 @@ class TestPiecewiseCudaGraphBenchmark(CustomTestCase):
             other_args=["--enable-piecewise-cuda-graph"],
         )
         self.assertLess(prefill_latency, 0.015)
+
+
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestPiecewiseCudaGraphLlama31FP4(CustomTestCase):
+    """MGSM test: piecewise CUDA graph with NVFP4 Llama3.1 8B on Blackwell."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "nvidia/Llama-3.1-8B-Instruct-FP4"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-piecewise-cuda-graph",
+                "--quantization",
+                "modelopt_fp4",
+                "--mem-fraction-static",
+                "0.8",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mgsm_accuracy(self):
+        num_examples = 1319
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=num_examples,
+            num_threads=min(num_examples, 1024),
+        )
+        metrics = run_eval(args)
+        print(f"MGSM Accuracy: {metrics['score']:.3f}")
+        self.assertGreaterEqual(metrics["score"], 0.78)
 
 
 class TestPiecewiseCudaGraphQwen3MoE(CustomTestCase):
