@@ -117,7 +117,7 @@ suites = {
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 450),
         TestFile("test_standalone_speculative_decoding.py", 150),
-        TestFile("test_start_profile.py", 60),
+        TestFile("test_start_profile.py", 180),
         TestFile("test_profile_merger.py", 60),
         TestFile("test_profile_merger_http_api.py", 15),
         TestFile("test_swa_unittest.py", 1),
@@ -213,8 +213,8 @@ suites = {
         TestFile("lora/test_lora_openai_api.py", 30),
         TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
-        TestFile("test_deepseek_v3_deterministic.py", 240),
         TestFile("test_cpp_radix_cache.py", 60),
+        TestFile("test_deepseek_v3_deterministic.py", 240),
     ],
     "nightly-4-gpu-b200": [
         TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
@@ -633,18 +633,6 @@ if __name__ == "__main__":
         help="The suite to run",
     )
     arg_parser.add_argument(
-        "--range-begin",
-        type=int,
-        default=0,
-        help="The begin index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
-        "--range-end",
-        type=int,
-        default=None,
-        help="The end index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
         "--auto-partition-id",
         type=int,
         help="Use auto load balancing. The part id.",
@@ -672,8 +660,6 @@ if __name__ == "__main__":
 
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
-    else:
-        files = files[args.range_begin : args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
