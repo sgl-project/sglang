@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from typing import Callable, Optional, TYPE_CHECKING
+
+import sglang.srt.model_executor.cuda_graph_runner as cgr
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+
+class NgramDecodeCudaGraphRunner(CudaGraphRunner):
+    """Cuda graph runner for decode batches using the dedicated ngram backend."""
+
+    def __init__(self, ngram_worker: "NGRAMWorker"):
+        self.ngram_worker = ngram_worker
+        self._target_model_runner = ngram_worker.target_worker.model_runner
+        self._decode_attn_backend = ngram_worker.target_decode_attn_backend
+        if self._decode_attn_backend is None:
+            raise RuntimeError("target_decode_attn_backend is required for decode graph")
+
+        with self._override_batch_sizes(), self._use_decode_attn_backend(
+            self._target_model_runner
+        ):
+            super().__init__(self._target_model_runner)
+
+        self.capture_forward_mode = ForwardMode.DECODE
+
+    @contextmanager
+    def _use_decode_attn_backend(self, model_runner=None):
+        runner = model_runner or self.model_runner
+        original_backend = runner.attn_backend
+        runner.attn_backend = self._decode_attn_backend
+        try:
+            yield
+        finally:
+            runner.attn_backend = original_backend
+
+    @contextmanager
+    def _override_batch_sizes(self):
+        original = cgr.get_batch_sizes_to_capture
+
+        def filtered(model_runner):
+            backup_capture_bs = model_runner.server_args.cuda_graph_bs
+            model_runner.server_args.cuda_graph_bs = model_runner.server_args.capture_bs_for_decode
+            capture_bs, compile_bs = original(model_runner)
+            threshold = model_runner.server_args.speculative_batch_size_threshold
+            if threshold:
+                capture_bs = [bs for bs in capture_bs if bs > threshold]
+                if not capture_bs:
+                    raise ValueError(
+                        "speculative_batch_size_threshold filters out all capture sizes"
+                    )
+                compile_bs = [bs for bs in compile_bs if bs in capture_bs]
+            model_runner.server_args.cuda_graph_bs = backup_capture_bs
+            return capture_bs, compile_bs
+
+        cgr.get_batch_sizes_to_capture = filtered
+        try:
+            yield
+        finally:
+            cgr.get_batch_sizes_to_capture = original
+
+    def capture_one_batch_size(self, bs: int, forward: Callable):
+        with self._use_decode_attn_backend():
+            return super().capture_one_batch_size(bs, forward)
+
+    def replay_prepare(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        with self._use_decode_attn_backend():
+            return super().replay_prepare(forward_batch, pp_proxy_tensors)

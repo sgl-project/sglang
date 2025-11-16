@@ -10,10 +10,13 @@ from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.ngram_decode_graph_runner import (
+    NgramDecodeCudaGraphRunner,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_bool_env_var
 
@@ -59,6 +62,31 @@ class NGRAMWorker:
             branch_length=server_args.speculative_ngram_branch_length,
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
+
+        self.target_decode_attn_backend = None
+        self.cuda_graph_runner_for_decode = None
+        if server_args.speculative_batch_size_threshold is not None:
+            # Initialize a separate cuda runner and attention backend from verify
+            # TODO: Support different attention backend
+            from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+            from sglang.srt.utils import get_available_gpu_memory
+            import time
+            self.target_decode_attn_backend = FlashAttentionBackend(
+                self.target_worker.model_runner,
+                skip_prefill=True,
+            )
+            self.cuda_graph_runner_for_decode = NgramDecodeCudaGraphRunner(self)
+            tic = time.perf_counter()
+            before_mem = get_available_gpu_memory("cuda", gpu_id)
+            logger.info(
+                f"Capture decode cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            )
+            self.cuda_graph_runner_for_decode.capture()
+            after_mem = get_available_gpu_memory("cuda", gpu_id)
+            logger.info(
+                f"Capture decode cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            )
+
 
     def clear_cache_pool(self):
         self.ngram_cache.reset()
@@ -145,6 +173,8 @@ class NGRAMWorker:
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
         if batch.forward_mode.is_extend():
             return
+        if batch.forward_mode.is_decode() and not batch.is_spec_enabled_for_batch:
+            return
 
         bs = batch.batch_size()
 
@@ -196,6 +226,7 @@ class NGRAMWorker:
             retrive_next_token,
             retrive_next_sibling,
             self.draft_token_num,
+            None,
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
@@ -314,6 +345,27 @@ class NGRAMWorker:
             self._update_ngram_cache(batch)
             batch.forward_mode = ForwardMode.DECODE
 
+        elif model_worker_batch.forward_mode.is_decode():
+            model_worker_batch.spec_info = None
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.target_worker.model_runner
+            )
+            can_cuda_graph = self.cuda_graph_runner_for_decode and self.cuda_graph_runner_for_decode.can_run(
+                forward_batch
+            )
+            if can_cuda_graph:
+                logits_output = self.cuda_graph_runner_for_decode.replay(forward_batch)
+                next_token_ids = self.target_worker.model_runner.sample(
+                    logits_output, forward_batch
+                )
+                can_run_cuda_graph = True
+            else:
+                batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    batch_result.logits_output,
+                    batch_result.next_token_ids,
+                    batch_result.can_run_cuda_graph,
+                )
         else:
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch

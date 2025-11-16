@@ -893,6 +893,7 @@ class CudaGraphRunner:
                 retrive_next_token=None,
                 retrive_next_sibling=None,
                 draft_token_num=self.num_tokens_per_bs,
+                accept_length_cpu=None,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 

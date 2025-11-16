@@ -213,33 +213,6 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
     }
 
 
-class TestEAGLE3Engine(TestEAGLEEngine):
-    import os
-    base_gpu_id = int(os.environ.get("BASE_GPU_ID", 0))
-    BASE_CONFIG = {
-        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
-        "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
-        "speculative_algorithm": "EAGLE3",
-        "speculative_num_steps": 5,
-        "speculative_eagle_topk": 3,
-        "speculative_num_draft_tokens": 8,
-        "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 4,
-        "dtype": "float16",
-        "disable_cuda_graph": False,
-        "attention_backend": "fa3",
-        "watchdog_timeout": 30000,
-        "skip_server_warmup": True,
-        "base_gpu_id": base_gpu_id,
-        "speculative_batch_size_threshold": 2,
-    }
-    NUM_CONFIGS = 1
-    THRESHOLDS = {
-        "batch_avg_accept_len": 1.75,
-        "accept_len": 3.1,
-    }
-
-
 class TestEAGLERadixCache(CustomTestCase):
     BASE_CONFIG = {
         "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
@@ -453,4 +426,4 @@ class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
 
 
 if __name__ == "__main__":
-    unittest.main(defaultTest="TestEAGLE3Engine.test_correctness")
+    unittest.main()

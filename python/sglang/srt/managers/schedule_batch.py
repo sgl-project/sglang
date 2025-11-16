@@ -1669,11 +1669,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # In the case of changing from spec decode -> regular decode
             # we merged previously verfied tokens with the extend generated tokens
             # from differen request.
-            accept_length = [acc + 1 for acc in self.spec_info.accept_length_cpu]
-            accept_length.extend([1] * (bs - len(accept_length)))
-            kept_output_ids = [idx - 1 for idx in list(accumulate(accept_length))]
-            assert len(kept_output_ids) == bs
-            self.input_ids = self.output_ids[kept_output_ids]
+            if self.spec_info.accept_length_cpu is not None:
+                if isinstance(self.spec_info.accept_length_cpu, torch.Tensor):
+                    accept_length_cpu = self.spec_info.accept_length_cpu.tolist()
+                else:
+                    accept_length_cpu = self.spec_info.accept_length_cpu
+                accept_length = [acc + 1 for acc in accept_length_cpu]
+                accept_length.extend([1] * (bs - len(accept_length)))
+                kept_output_ids = [idx - 1 for idx in list(accumulate(accept_length))]
+                assert len(kept_output_ids) == bs
+                self.input_ids = self.output_ids[kept_output_ids]
+            else:
+                self.input_ids = self.output_ids
             self.turning_off_specdecode = False
         else:
             self.input_ids = self.output_ids

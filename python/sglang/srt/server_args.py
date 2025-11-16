@@ -864,6 +864,11 @@ class ServerArgs:
             )
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+        
+        if self.speculative_batch_size_threshold:
+            # Split the two
+            self.capture_bs_for_decode = [bs for bs in capture_bs if bs > self.speculative_batch_size_threshold]
+            capture_bs = [bs for bs in capture_bs if bs <= self.speculative_batch_size_threshold]
 
         return capture_bs
 
