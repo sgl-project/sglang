@@ -340,14 +340,14 @@ class Scheduler(
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.name in {"EAGLE", "EAGLE3"}:
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-        self.draft_worker = self.spec_algorithm.create_draft_worker(
-            **draft_worker_kwargs
-        )
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.is_none_or_ngram():
             self.model_worker = self.tp_worker
         else:
+            self.draft_worker = self.spec_algorithm.create_draft_worker(
+                **draft_worker_kwargs
+            )
             self.model_worker = self.draft_worker
 
         # Get token and memory info from the model worker
