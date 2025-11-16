@@ -42,5 +42,5 @@ dev = [
 
 
 [tool.maturin]
-python-source = "py_src"
+python-source = "."
 module-name = "sglang_router.sglang_router_rs"
