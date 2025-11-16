@@ -26,6 +26,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
+    is_blackwell,
     is_hip,
     is_npu,
     load_json_config,
@@ -109,6 +110,8 @@ class DeepEPLLCombineInput(NamedTuple):
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
+    block_m: Optional[int] = None
+    threshold: Optional[int] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -652,6 +655,22 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args.stream.wait_event(overlap_args.wait_event)
             ctx = torch.cuda.stream(overlap_args.stream)
 
+            if is_blackwell():
+                overlap_args_dict = dict(
+                    overlap=overlap_args.overlap,
+                    src_signals=overlap_args.signal,
+                    src_signal_expect_value=overlap_args.threshold,
+                )
+            else:
+                overlap_args_dict = dict(
+                    overlap=True,
+                    packed_recv_count=self.packed_recv_count,
+                    comp_signal=overlap_args.signal,
+                    block_m=overlap_args.block_m,
+                    threshold=overlap_args.threshold,
+                    num_sms=overlap_args.num_sms,
+                )
+
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
@@ -660,15 +679,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 handle=self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **(
-                    dict(
-                        overlap=overlap_args.overlap,
-                        src_signals=overlap_args.signal,
-                        src_signal_expect_value=overlap_args.threshold,
-                    )
-                    if overlap_args is not None
-                    else {}
-                ),
+                **(overlap_args_dict if overlap_args is not None else {}),
             )
 
         self.packed_recv_count = self.handle = None
@@ -738,7 +749,13 @@ class DeepEPDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
 
     def dispatch(self, *args, **kwargs) -> DispatchOutput:
+        forward_shared_experts = kwargs.pop("forward_shared_experts", None)
+
         self.dispatch_a(*args, **kwargs)
+
+        if forward_shared_experts is not None:
+            forward_shared_experts()
+
         ret = self.dispatch_b()
         return ret
 
@@ -774,7 +791,17 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
         overlap_args: Optional[CombineOverlapArgs] = None,
     ):
-        hidden_states, topk_ids, topk_weights = combine_input
+        hidden_states = combine_input.hidden_states
+        topk_ids = combine_input.topk_ids
+        topk_weights = combine_input.topk_weights
+
+        block_m = getattr(combine_input, "block_m", None)
+        threshold = getattr(combine_input, "threshold", None)
+
+        if overlap_args is not None and block_m is not None and threshold is not None:
+            overlap_args.block_m = block_m
+            overlap_args.threshold = threshold
+
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
