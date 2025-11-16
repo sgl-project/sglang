@@ -325,6 +325,7 @@ jobs:
           echo "Temp: Deleting potentially corrupted Qwen/Qwen-Image and Qwen/Qwen-Image-Edit cache to ensure a fresh download."
           rm -rf /hf_home/hub/models--Qwen--Qwen-Image
           rm -rf /hf_home/hub/models--Qwen--Qwen-Image-Edit
+          rm -rf /hf_home/hub/models--Wan-AI--Wan2.2-I2V-A14B-Diffusers
 
       - name: Run diffusion server tests
         timeout-minutes: 60
@@ -1006,7 +1007,6 @@ jobs:
               exit 1
             fi
           done
-
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
