@@ -609,25 +609,6 @@ def _sanity_check_suites(suites):
     )
 
 
-def run_suite_v1(args):
-    print(f"{args=}")
-
-    _sanity_check_suites(suites)
-
-    if args.suite == "all":
-        files = glob.glob("**/test_*.py", recursive=True)
-    else:
-        files = suites[args.suite]
-
-    if args.auto_partition_size:
-        files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
-
-    print("The running tests are ", [f.name for f in files])
-
-    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
-    exit(exit_code)
-
-
 def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
@@ -660,9 +641,22 @@ def main():
         help="Continue running remaining tests even if one fails (useful for nightly tests)",
     )
     args = arg_parser.parse_args()
+    print(f"{args=}")
 
-    # FIXME: this will be deprecated soon
-    run_suite_v1(args)
+    _sanity_check_suites(suites)
+
+    if args.suite == "all":
+        files = glob.glob("**/test_*.py", recursive=True)
+    else:
+        files = suites[args.suite]
+
+    if args.auto_partition_size:
+        files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
+
+    print("The running tests are ", [f.name for f in files])
+
+    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
+    exit(exit_code)
 
 
 if __name__ == "__main__":
