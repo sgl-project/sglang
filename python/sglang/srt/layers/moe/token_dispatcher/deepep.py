@@ -711,6 +711,8 @@ class DeepEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        super().__init__()
+
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(
@@ -737,8 +739,12 @@ class DeepEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
 
-    def dispatch(self, *args, **kwargs) -> DispatchOutput:
-        self.dispatch_a(*args, **kwargs)
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> DispatchOutput:
+        self.dispatch_a(hidden_states, topk_output)
         ret = self.dispatch_b()
         return ret
 
@@ -763,16 +769,14 @@ class DeepEPDispatcher(BaseDispatcher):
     def combine(
         self,
         combine_input: CombineInput,
-        overlap_args: Optional[CombineOverlapArgs] = None,
-    ) -> Tuple:
-        self.combine_a(combine_input, overlap_args)
+    ) -> torch.Tensor:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
         combine_input: CombineInput,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
@@ -780,7 +784,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            overlap_args=overlap_args,
+            overlap_args=self.overlap_args,
         )
         self._combine_intermediate_state = inner_state
 
