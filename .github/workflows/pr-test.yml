@@ -120,6 +120,7 @@ jobs:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
               - "python/sglang/pyproject.*"
+              - ".github/workflows/pr-test.yml"
 
   # =============================================== sgl-kernel ====================================================
 
