@@ -591,53 +591,38 @@ class MambaMixer2(torch.nn.Module):
             )
 
             if is_target_verify:
-                intermediate_state_cache = layer_cache.intermediate_ssm
-
-                state_indices_batch = state_indices_tensor_d[:num_decodes]
-
-                # Allocate reusable contiguous output buffer once (kernel requires contiguous memory)
-                # Reused across all iterations to avoid repeated allocations
-                out_step_buffer = torch.empty(
-                    (num_decodes, self.num_heads // self.tp_size, self.head_dim),
-                    dtype=preallocated_ssm_out_d.dtype,
-                    device=preallocated_ssm_out_d.device,
+                selective_state_update(
+                    ssm_state,
+                    hidden_states_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_heads // self.tp_size,
+                        self.head_dim,
+                    ),
+                    dt_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_heads // self.tp_size,
+                        self.head_dim,
+                    ),
+                    A_d,
+                    B_d.view(num_decodes, draft_token_num, n_groups, -1),
+                    C_d.view(num_decodes, draft_token_num, n_groups, -1),
+                    D_d,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_tensor_d[:num_decodes],
+                    out=preallocated_ssm_out_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_heads // self.tp_size,
+                        self.head_dim,
+                    ),
+                    disable_state_update=True,
+                    intermediate_states_buffer=layer_cache.intermediate_ssm,
+                    cache_steps=draft_token_num,
                 )
-                all_step_indices = (
-                    torch.arange(num_decode_tokens, device=hidden_states_d.device)
-                    .view(num_decodes, draft_token_num)
-                    .t()
-                )
-
-                for step in range(draft_token_num):
-                    # Get the slice for this draft token step across all batch items
-                    # Tokens are organized as [batch_0_token_0, ..., batch_0_token_N, batch_1_token_0, ...]
-                    step_indices = all_step_indices[step]
-
-                    # Run selective_state_update for this step
-                    # Kernel writes to contiguous buffer, then we copy to strided output
-                    selective_state_update(
-                        ssm_state,
-                        hidden_states_d[step_indices],
-                        dt_d[step_indices],
-                        A_d,
-                        B_d[step_indices],
-                        C_d[step_indices],
-                        D_d,
-                        z=None,
-                        dt_bias=dt_bias,
-                        dt_softplus=True,
-                        state_batch_indices=state_indices_batch,
-                        out=out_step_buffer,
-                        disable_state_update=True,
-                        intermediate_states_buffer=intermediate_state_cache,
-                        cache_steps=draft_token_num,
-                        step_idx=step,
-                    )
-
-                    # Copy to preallocated buffer at correct strided positions
-                    preallocated_ssm_out_d[step_indices] = out_step_buffer.view(
-                        num_decodes, -1
-                    )
             else:
                 selective_state_update(
                     ssm_state,

@@ -65,7 +65,6 @@ def _selective_scan_update_kernel(
     pad_slot_id,
     intermediate_states_buffer,
     cache_steps,
-    step_idx,
     # Matrix dimensions
     batch,
     T,
@@ -79,9 +78,11 @@ def _selective_scan_update_kernel(
     stride_state_dim,
     stride_state_dstate,
     stride_x_batch,
+    stride_x_T,
     stride_x_head,
     stride_x_dim,
     stride_dt_batch,
+    stride_dt_T,
     stride_dt_head,
     stride_dt_dim,
     stride_dt_bias_head,
@@ -90,17 +91,21 @@ def _selective_scan_update_kernel(
     stride_A_dim,
     stride_A_dstate,
     stride_B_batch,
+    stride_B_T,
     stride_B_group,
     stride_B_dstate,
     stride_C_batch,
+    stride_C_T,
     stride_C_group,
     stride_C_dstate,
     stride_D_head,
     stride_D_dim,
     stride_z_batch,
+    stride_z_T,
     stride_z_head,
     stride_z_dim,
     stride_out_batch,
+    stride_out_T,
     stride_out_head,
     stride_out_dim,
     # Meta-parameters
@@ -203,11 +208,10 @@ def _selective_scan_update_kernel(
         if CACHE_INTERMEDIATE_STATES:
             if HAS_STATE_BATCH_INDICES:
                 if state_batch_idx != pad_slot_id:
-                    effective_step_idx = step_idx if T == 1 else current_step_idx
                     cache_ptr_base = (
                         intermediate_states_buffer
                         + state_batch_idx * cache_steps * nheads * dim * dstate
-                        + effective_step_idx * nheads * dim * dstate
+                        + current_step_idx * nheads * dim * dstate
                         + pid_h * dim * dstate
                     )
                     cache_ptrs = cache_ptr_base + (
@@ -224,13 +228,13 @@ def _selective_scan_update_kernel(
 
         current_step_idx += 1
 
-        x_ptr += stride_x_head
-        dt_ptr += stride_dt_head
-        B_ptr += stride_B_group
-        C_ptr += stride_C_group
-        out_ptr += stride_out_head
+        x_ptr += stride_x_T
+        dt_ptr += stride_dt_T
+        B_ptr += stride_B_T
+        C_ptr += stride_C_T
+        out_ptr += stride_out_T
         if HAS_Z:
-            z_ptr += stride_z_head
+            z_ptr += stride_z_T
 
     if not DISABLE_STATE_UPDATE:
         tl.store(state_ptrs, state, mask=mask)
@@ -253,7 +257,6 @@ def selective_state_update(
     disable_state_update=False,
     intermediate_states_buffer=None,
     cache_steps=None,
-    step_idx=0,
 ):
     """
     Argument:
@@ -277,7 +280,6 @@ def selective_state_update(
         disable_state_update: If True, don't write back to state (for speculative verify)
         intermediate_states_buffer: Buffer to cache intermediate states
         cache_steps: Total number of steps in the buffer
-        step_idx: Current step index (which position to write in buffer)
     """
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -334,7 +336,11 @@ def selective_state_update(
     assert out.shape == x.shape
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
-    z_strides = (z.stride(0), z.stride(2), z.stride(3)) if z is not None else (0, 0, 0)
+    z_strides = (
+        (z.stride(0), z.stride(1), z.stride(2), z.stride(3))
+        if z is not None
+        else (0, 0, 0, 0)
+    )
     # We don't want autotune since it will overwrite the state
     # We instead tune by hand.
     BLOCK_SIZE_M, num_warps = (
@@ -368,7 +374,6 @@ def selective_state_update(
             pad_slot_id,
             intermediate_states_buffer,
             cache_steps if cache_steps is not None else 0,
-            step_idx,
             batch,
             T,
             nheads,
@@ -380,9 +385,11 @@ def selective_state_update(
             state.stride(2),
             state.stride(3),
             x.stride(0),
+            x.stride(1),
             x.stride(2),
             x.stride(3),
             dt.stride(0),
+            dt.stride(1),
             dt.stride(2),
             dt.stride(3),
             *(dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else 0,
@@ -390,16 +397,20 @@ def selective_state_update(
             A.stride(1),
             A.stride(2),
             B.stride(0),
+            B.stride(1),
             B.stride(2),
             B.stride(3),
             C.stride(0),
+            C.stride(1),
             C.stride(2),
             C.stride(3),
             *(D.stride(0), D.stride(1)) if D is not None else 0,
             z_strides[0],
             z_strides[1],
             z_strides[2],
+            z_strides[3],
             out.stride(0),
+            out.stride(1),
             out.stride(2),
             out.stride(3),
             dt_softplus,
