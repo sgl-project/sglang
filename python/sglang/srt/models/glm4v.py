@@ -104,7 +104,6 @@ class Glm4vVisionBlock(nn.Module):
         dim: int,
         intermediate_dim: int,
         num_heads: int,
-        attn_implementation: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         num_dummy_heads: int = 0,
@@ -114,37 +113,13 @@ class Glm4vVisionBlock(nn.Module):
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
         self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
 
-        if attn_implementation is None:
-            softmax_in_single_precision = False
-            qkv_backend = None
-            flatten_batch = True
-        elif attn_implementation == "sdpa":
-            softmax_in_single_precision = False
-            qkv_backend = "sdpa"
-            flatten_batch = True
-        elif attn_implementation == "flash_attention_2":
-            softmax_in_single_precision = False
-            qkv_backend = "triton_attn"
-            flatten_batch = True
-        elif attn_implementation == "eager":
-            softmax_in_single_precision = True
-            qkv_backend = "sdpa"
-            flatten_batch = True
-        elif attn_implementation == "flash_attention_3":
-            softmax_in_single_precision = False
-            qkv_backend = "fa3"
-            flatten_batch = True
-
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            rotary_embed="normal",
             proj_bias=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
-            flatten_batch=flatten_batch,
+            flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
