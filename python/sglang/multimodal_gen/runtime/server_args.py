@@ -335,9 +335,15 @@ class ServerArgs:
         return self.host is None or self.port is None
 
     def __post_init__(self):
-        self.scheduler_port = self.settle_port(self.scheduler_port)
+        # Add randomization to avoid race condition when multiple servers start simultaneously
+        if self.attention_backend in ["fa3", "fa4"]:
+            self.attention_backend = "fa"
+
+        initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
+        self.scheduler_port = self.settle_port(initial_scheduler_port)
         # TODO: remove hard code
-        self.master_port = self.settle_port(self.master_port or 30005, 37)
+        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
+        self.master_port = self.settle_port(initial_master_port, 37)
         if self.moba_config_path:
             try:
                 with open(self.moba_config_path) as f:
@@ -379,7 +385,7 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             default=None,
-            choices=[e.name.lower() for e in AttentionBackendEnum],
+            choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
             help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
         )
 
@@ -646,14 +652,45 @@ class ServerArgs:
         scheduler_host = self.host or "localhost"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
-    def settle_port(self, port: int, port_inc: int = 42) -> int:
-        while True:
+    def settle_port(
+        self, port: int, port_inc: int = 42, max_attempts: int = 100
+    ) -> int:
+        """
+        Find an available port with retry logic.
+
+        Args:
+            port: Initial port to check
+            port_inc: Port increment for each attempt
+            max_attempts: Maximum number of attempts to find an available port
+
+        Returns:
+            An available port number
+
+        Raises:
+            RuntimeError: If no available port is found after max_attempts
+        """
+        attempts = 0
+        original_port = port
+
+        while attempts < max_attempts:
             if is_port_available(port):
+                if attempts > 0:
+                    logger.info(
+                        f"Port {original_port} was unavailable, using port {port} instead"
+                    )
                 return port
+
+            attempts += 1
             if port < 60000:
                 port += port_inc
             else:
-                port -= port_inc + 1
+                # Wrap around with randomization to avoid collision
+                port = 5000 + random.randint(0, 1000)
+
+        raise RuntimeError(
+            f"Failed to find available port after {max_attempts} attempts "
+            f"(started from port {original_port})"
+        )
 
     def post_init_serve(self):
         """
@@ -766,7 +803,7 @@ class ServerArgs:
 
     def check_server_sp_args(self):
 
-        if self.pipeline_config.is_image_gen:
+        if self.pipeline_config.task_type.is_image_task():
             if (
                 (self.sp_degree and self.sp_degree > 1)
                 or (self.ulysses_degree and self.ulysses_degree > 1)
@@ -776,13 +813,6 @@ class ServerArgs:
                     "SP is not supported for image generation models for now"
                 )
             self.sp_degree = self.ulysses_degree = self.ring_degree = 1
-
-        if (
-            self.ring_degree is not None
-            and self.ring_degree > 1
-            and self.attention_backend != "fa3"
-        ):
-            raise ValueError("Ring Attention is only supported for fa3 backend for now")
 
         if self.sp_degree == -1:
             # assume we leave all remaining gpus to sp
@@ -814,6 +844,17 @@ class ServerArgs:
             logger.info(
                 f"Ring degree not set, " f"using default value {self.ring_degree}"
             )
+
+        if self.ring_degree > 1:
+            if self.attention_backend != None and self.attention_backend != "fa":
+                raise ValueError(
+                    "Ring Attention is only supported for flash attention backend for now"
+                )
+            else:
+                self.attention_backend = "fa"
+                logger.info(
+                    "Ring Attention is currently only supported for flash attention, attention_backend has been automatically set to flash attention"
+                )
 
         if self.sp_degree == -1:
             self.sp_degree = self.ring_degree * self.ulysses_degree

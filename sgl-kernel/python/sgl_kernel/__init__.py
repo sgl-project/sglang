@@ -34,7 +34,7 @@ from sgl_kernel.elementwise import (
     silu_and_mul,
 )
 from sgl_kernel.expert_specialization import es_fp8_blockwise_scaled_grouped_mm
-from sgl_kernel.fused_moe import fused_marlin_moe
+from sgl_kernel.fused_moe import fused_marlin_moe, moe_wna16_marlin_gemm
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -80,11 +80,12 @@ from sgl_kernel.marlin import (
     awq_marlin_repack,
     gptq_marlin_repack,
 )
-from sgl_kernel.memory import set_kv_buffer_kernel
+from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
+    kimi_k2_moe_fused_gate,
     moe_align_block_size,
     moe_fused_gate,
     moe_sum,

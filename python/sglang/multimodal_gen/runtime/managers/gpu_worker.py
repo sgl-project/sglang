@@ -16,8 +16,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
-from sglang.multimodal_gen.runtime.pipelines import build_pipeline
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines import Req, build_pipeline
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -28,7 +28,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 
 logger = init_logger(__name__)
 
-# ANSI color codes
 CYAN = "\033[1;36m"
 RESET = "\033[0;0m"
 
@@ -96,6 +95,16 @@ class GPUWorker:
         req = batch[0]
         output_batch = self.pipeline.forward(req, server_args)
         if req.perf_logger:
+            logging_info = getattr(output_batch, "logging_info", None) or getattr(
+                req, "logging_info", None
+            )
+            if logging_info:
+                try:
+                    req.perf_logger.log_stage_metrics(logging_info)
+                except Exception:
+                    logger.exception(
+                        "Failed to log stage metrics for request %s", req.request_id
+                    )
             req.perf_logger.log_total_duration("total_inference_time")
         return output_batch
 

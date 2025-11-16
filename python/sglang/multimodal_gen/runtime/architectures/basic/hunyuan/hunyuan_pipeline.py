@@ -9,7 +9,9 @@ using the modular pipeline architecture.
 """
 
 
-from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
 from sglang.multimodal_gen.runtime.pipelines.stages import (
     ConditioningStage,
     DecodingStage,

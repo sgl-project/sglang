@@ -6,7 +6,10 @@ from sgl_kernel import fused_marlin_moe
 from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
+
+set_global_server_args_for_scheduler(object.__new__(ServerArgs))
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):

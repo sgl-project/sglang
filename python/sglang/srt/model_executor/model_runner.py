@@ -31,6 +31,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs import (
     FalconH1Config,
+    JetNemotronConfig,
     KimiLinearConfig,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -148,6 +149,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -326,6 +328,11 @@ class ModelRunner:
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
+        if self.pp_size > 1:
+            assert (
+                self.support_pp
+            ), "Pipeline Parallel is not compatible with this model."
+
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
@@ -336,8 +343,13 @@ class ModelRunner:
         ):
             self.attention_layers = []
             for layer in self.model.model.layers:
-                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
-                    self.attention_layers.append(layer.self_attn.attn)
+                if hasattr(layer, "self_attn"):
+                    if hasattr(layer.self_attn, "attn"):
+                        self.attention_layers.append(layer.self_attn.attn)
+                    elif hasattr(layer.self_attn, "attn_mqa"):
+                        # For DeepSeek model
+                        self.attention_layers.append(layer.self_attn.attn_mqa)
+
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
                 # TODO(yuwei): support Non-Standard GQA
                 log_info_on_rank0(
@@ -745,9 +757,12 @@ class ModelRunner:
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
 
+        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
+            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
+        )
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
-            enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
+            enable_cpu_backup=enable_cpu_backup,
         ):
             self.model = get_model(
                 model_config=self.model_config,
@@ -757,6 +772,11 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state(reverse=True)
 
         get_offloader().post_init()
+
+        # Register model for layerwise NVTX profiling if enabled
+        if self.server_args.enable_layerwise_nvtx_marker:
+            self.pyt_hooks = PytHooks()
+            self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -1314,6 +1334,24 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                # kv_scale_buffer
+                scale_block_size = 16
+
+                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                k = self.model_config.head_dim
+                cell_size = (cell_size // 2) + (
+                    (
+                        n
+                        * k
+                        * num_layers
+                        * 2
+                        * torch._utils._element_size(self.kv_cache_dtype)
+                    )
+                    // scale_block_size
+                )
+
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -1374,7 +1412,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
             return config
         return None
 
@@ -1799,6 +1837,7 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     **extra_args,
                 )
@@ -2050,7 +2089,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
-    ) -> LogitsProcessorOutput:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
@@ -2073,10 +2112,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
-    ) -> LogitsProcessorOutput:
-        if not skip_attn_backend_init:
-            self.attn_backend.init_forward_metadata(forward_batch)
-
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2085,9 +2121,14 @@ class ModelRunner:
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
-        if self.piecewise_cuda_graph_runner is not None:
-            if self.piecewise_cuda_graph_runner.can_run(forward_batch):
-                return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+        if (
+            self.piecewise_cuda_graph_runner is not None
+            and self.piecewise_cuda_graph_runner.can_run(forward_batch)
+        ):
+            return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+
+        if not skip_attn_backend_init:
+            self.attn_backend.init_forward_metadata(forward_batch)
 
         return self.model.forward(
             forward_batch.input_ids,
@@ -2098,7 +2139,7 @@ class ModelRunner:
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
-    ) -> LogitsProcessorOutput:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2187,6 +2228,8 @@ class ModelRunner:
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
+        else:
+            forward_batch.prepare_attn_tp_scatter_input(self)
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
@@ -2200,7 +2243,7 @@ class ModelRunner:
                 reinit_attn_backend=reinit_attn_backend,
                 forward_count=split_forward_count,
             )
-        elif forward_batch.forward_mode.is_extend():
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

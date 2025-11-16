@@ -8,7 +8,7 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 if is_cuda():
     try:
@@ -114,7 +114,7 @@ class Indexer(CustomOp):
         self.fuse_wk_and_weights_proj = fuse_wk_and_weights_proj
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
-            self.half_device_sm_count = align(self.sm_count // 2, 8)
+            self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -290,7 +290,10 @@ class Indexer(CustomOp):
         )
 
         blocksize = page_size
-        if forward_batch.forward_mode.is_target_verify():
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
@@ -337,6 +340,8 @@ class Indexer(CustomOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+
         page_size = forward_batch.token_to_kv_pool.page_size
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
@@ -345,7 +350,10 @@ class Indexer(CustomOp):
         k_scale_list = []
         ks_list = []
         ke_list = []
-        offset = 0
+
+        q_offset = 0
+        k_offset = 0
+
         seq_lens_expanded = metadata.get_seqlens_expanded()
         block_tables = metadata.get_page_table_64()
 
@@ -368,13 +376,17 @@ class Indexer(CustomOp):
                 block_tables[i],
             )
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
-            ks = torch.full((extend_seq_len,), offset, dtype=torch.int32, device="cuda")
-            ke = ks + seq_lens_expanded[offset : offset + extend_seq_len]
+            ks = torch.full(
+                (extend_seq_len,), k_offset, dtype=torch.int32, device="cuda"
+            )
+            ke = ks + seq_lens_expanded[q_offset : q_offset + extend_seq_len]
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
             ks_list.append(ks)
             ke_list.append(ke)
-            offset += extend_seq_len
+
+            q_offset += extend_seq_len
+            k_offset += seq_len
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
@@ -382,21 +394,38 @@ class Indexer(CustomOp):
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
 
+        # Suppose there are two requests, with extend_seq_len = [3, 2]
+        # and seq_lens = [10, 4]
+        # The logits matrix looks like this, with * representing the valid logits
+        # and - representing the invalid logits:
+        #
+        #  ********--|----
+        #  *********-|----
+        #  **********|----
+        #  ----------|***-
+        #  ----------|****
+        #
+        # ks = [0, 0, 0, 10, 10]
+        # ke = [8, 9, 10, 13, 14]
+
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8[:offset],
+            q_fp8[:q_offset],
             kv_fp8,
-            weights[:offset],
+            weights[:q_offset],
             ks,
             ke,
             clean_logits=False,
         )
+
         token_nums, _, _ = q_fp8.shape
         assert logits.shape[0] == len(seq_lens_expanded)
-        raw_topk_result = metadata.topk_transform(logits, self.index_topk)
+        assert logits.shape[1] == k_offset
+
+        raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
         )
-        topk_result[:offset] = raw_topk_result
+        topk_result[:q_offset] = raw_topk_result
         return topk_result
 
     def _forward_cuda_k_only(
@@ -410,13 +439,15 @@ class Indexer(CustomOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
             index_k=k_fp8,
@@ -509,7 +540,7 @@ class Indexer(CustomOp):
             end_pos = seq_len
             topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
 
-            pad_len = align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
+            pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
             topk_indices = torch.nn.functional.pad(
                 topk_indices, (0, pad_len), "constant", -1
             )
@@ -555,14 +586,15 @@ class Indexer(CustomOp):
             return None
 
         # Determine if should skip topk based on sequence length
-        should_skip = False
-        if not forward_batch.forward_mode.is_decode_or_idle():
+        # We can only skip the logits computation if cuda graph is not involved
+        skip_logits_computation = False
+        if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                should_skip = max_kv_len <= self.index_topk
+                skip_logits_computation = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation
-        if should_skip:
+        if skip_logits_computation:
             return self._forward_cuda_k_only(
                 x,
                 positions,
@@ -596,7 +628,7 @@ class Indexer(CustomOp):
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
             index_k=k_fp8,
@@ -622,6 +654,7 @@ class Indexer(CustomOp):
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
             ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
@@ -666,7 +699,12 @@ class Indexer(CustomOp):
         enable_index_cp = (
             get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA") and layer_id >= 4
         )
-        is_prefill = forward_batch.forward_mode.is_extend()
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend()
+        )
 
         attention_tp_rank = get_attention_tp_rank()
         attention_tp_size = get_attention_tp_size()
@@ -757,9 +795,27 @@ class Indexer(CustomOp):
 
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
-                actual_seq_lengths_q = torch.tensor(
-                    [1 + i * 1 for i in range(bs)], dtype=torch.int32, device=k.device
-                )
+                if (
+                    forward_batch.forward_mode.is_draft_extend_v2()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend()
+                ):
+                    num_draft_tokens = (
+                        forward_batch.attn_backend.speculative_num_draft_tokens
+                    )
+                    actual_seq_lengths_q = torch.arange(
+                        num_draft_tokens,
+                        num_draft_tokens + bs,
+                        num_draft_tokens,
+                        dtype=torch.int32,
+                        device=k.device,
+                    )
+                else:
+                    actual_seq_lengths_q = torch.tensor(
+                        [1 + i * 1 for i in range(bs)],
+                        dtype=torch.int32,
+                        device=k.device,
+                    )
             else:
                 actual_seq_lengths_q = (
                     forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q

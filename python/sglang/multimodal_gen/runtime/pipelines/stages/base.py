@@ -16,7 +16,7 @@ from enum import Enum, auto
 import torch
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -185,6 +185,8 @@ class PipelineStage(ABC):
                 raise
 
         # Execute the actual stage logic
+        logging_info = getattr(batch, "logging_info", None)
+
         if envs.SGL_DIFFUSION_STAGE_LOGGING:
             logger.info("[%s] Starting execution", stage_name)
             start_time = time.perf_counter()
@@ -197,7 +199,27 @@ class PipelineStage(ABC):
                     stage_name,
                     execution_time * 1000,
                 )
-                batch.logging_info.add_stage_execution_time(stage_name, execution_time)
+                if logging_info is not None:
+                    try:
+                        logging_info.add_stage_execution_time(
+                            stage_name, execution_time
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[%s] Failed to record stage timing on batch.logging_info",
+                            stage_name,
+                            exc_info=True,
+                        )
+                perf_logger = getattr(batch, "perf_logger", None)
+                if perf_logger is not None:
+                    try:
+                        perf_logger.log_stage_metric(stage_name, execution_time * 1000)
+                    except Exception:
+                        logger.warning(
+                            "[%s] Failed to log stage metric to performance logger",
+                            stage_name,
+                            exc_info=True,
+                        )
             except Exception as e:
                 execution_time = time.perf_counter() - start_time
                 logger.error(
