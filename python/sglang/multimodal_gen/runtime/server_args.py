@@ -385,7 +385,7 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             default=None,
-            choices=[e.name.lower() for e in AttentionBackendEnum + "fa3" + "fa4"],
+            choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
             help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
         )
 
