@@ -696,17 +696,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Determine if we can use the fused kernel (RoPE + quantization + direct KV write)
         # Conditions: save_kv_cache, layer provided, not NSA packed format, kernel available
-        compute_cap = torch.cuda.get_device_capability()
         kernel_available = mla_rope_quantize_fp8_fused is not None
         has_layer = layer is not None
         nsa_flag = getattr(
             forward_batch.token_to_kv_pool, "nsa_kv_cache_store_fp8", False
         )
 
-        # Only enable fusion on SM90+ (H100/B200) due to FP8 hardware support
         use_fused_kv_write = (
             kernel_available
-            and (compute_cap[0] >= 9)
             and save_kv_cache
             and has_layer
             and not nsa_flag
