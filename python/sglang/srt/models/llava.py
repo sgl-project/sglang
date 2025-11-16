@@ -656,11 +656,15 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         self, auto_model_type: Type[AutoModel]
     ) -> Dict[str, str]:
         mapping = {}
-        for config_cls, archs in auto_model_type._model_mapping.items():
-            if isinstance(archs, tuple):
-                mapping[config_cls.__name__] = tuple(arch.__name__ for arch in archs)
-            else:
-                mapping[config_cls.__name__] = archs.__name__
+        for config_cls in auto_model_type._model_mapping.keys():
+            archs = auto_model_type._model_mapping.get(config_cls, None)
+            if archs is not None:
+                if isinstance(archs, tuple):
+                    mapping[config_cls.__name__] = tuple(
+                        arch.__name__ for arch in archs
+                    )
+                else:
+                    mapping[config_cls.__name__] = archs.__name__
         return mapping
 
     def __init__(

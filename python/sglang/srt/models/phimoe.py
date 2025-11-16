@@ -18,7 +18,6 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -210,6 +209,7 @@ class PhiMoE(nn.Module):
         self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
+            layer_id=layer_id,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             reduce_results=True,

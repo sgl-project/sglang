@@ -9,6 +9,7 @@ import tiktoken
 
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
+    dump_bench_raw_result,
     select_sglang_backend,
 )
 
@@ -141,6 +142,13 @@ def main(args):
         pt += num_qs
     assert pt == len(cors)
     weighted_acc = np.mean(cors)
+
+    dump_bench_raw_result(
+        path=args.raw_result_file,
+        states=states,
+        preds=preds,
+        labels=labels,
+    )
 
     # Print results
     print("Total latency: {:.3f}".format(latency))

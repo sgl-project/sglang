@@ -1,0 +1,28 @@
+name: Open A PR to Copy Code From OSS
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 10 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: 'main'
+
+      - name: Install GitHub CLI (if not present)
+        run: |
+          bash scripts/code_sync/install_github_cli.sh
+
+      - name: Copy from OSS code
+        env:
+          GH_TOKEN: ${{ secrets.PAT_FOR_CODE_SYNC_FROM_LIANMIN }}
+        run: |
+          python3 scripts/code_sync/copy_from_oss.py

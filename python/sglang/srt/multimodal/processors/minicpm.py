@@ -15,8 +15,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV, MiniCPMO]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         # Collect special token ids
         tokenizer = self._processor.tokenizer
         self.slice_start_id = getattr(tokenizer, "slice_start_id", None)
@@ -26,7 +26,6 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         self.im_start_id = getattr(tokenizer, "im_start_id", None)
         self.im_end_id = getattr(tokenizer, "im_end_id", None)
         self.im_token_id = getattr(tokenizer, "unk_id", None)
-
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="(<image>./</image>)",
             audio_token="(<audio>./</audio>)",
