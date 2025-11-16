@@ -69,9 +69,9 @@ PYTORCH_VERSION=2.6.0
 TORCHVISION_VERSION=0.21.0
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 
-PTA_VERSION="v7.1.0.1-pytorch2.6.0"
-PTA_NAME="torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
-PTA_URL="https://gitee.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
+PTA_VERSION="v7.2.0-pytorch2.6.0"
+PTA_NAME="torch_npu-2.6.0.post3-cp311-cp311-manylinux_2_28_aarch64.whl"
+PTA_URL="https://gitcode.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
 wget -O "${PTA_NAME}" "${PTA_URL}" && pip install "./${PTA_NAME}"
 ```
 
@@ -87,9 +87,9 @@ git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
 
 #### Triton on Ascend
 
-_Notice:_ We recommend installing triton-ascend from source due to its rapid development, the version on PYPI can't keep up for know. This problem will be solved on Sep. 2025, afterwards `pip install` would be the one and only installing method.
+_Notice:_ We recommend installing triton-ascend from source due to its rapid development, the version on PYPI can't keep up for now.
 
-Please follow Triton-on-Ascend's [installation guide from source](https://gitee.com/ascend/triton-ascend#2%E6%BA%90%E4%BB%A3%E7%A0%81%E5%AE%89%E8%A3%85-triton-ascend) to install the latest `triton-ascend` package.
+Please follow Triton-on-Ascend's [installation guide from source](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md#%E6%BA%90%E4%BB%A3%E7%A0%81%E5%AE%89%E8%A3%85-triton-ascend) to install the latest `triton-ascend` package.
 
 #### DeepEP-compatible Library
 
@@ -108,9 +108,9 @@ pip install -e python[srt_npu]
 
 ### Method 2: Using docker
 
-__Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
+**Notice:** `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
-__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
+**Notice:** The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
 
 ```shell
 # Clone the SGLang repository
