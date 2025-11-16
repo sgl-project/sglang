@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List

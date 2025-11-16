@@ -193,6 +193,9 @@ class Req:
     VSA_sparsity: float = 0.0
     perf_logger: PerformanceLogger | None = None
 
+    # stage logging
+    logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)
+
     # profile
     profile: bool = False
     num_profiled_timesteps: int = 8

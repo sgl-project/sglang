@@ -44,10 +44,10 @@ impl PipelineStage for ResponseProcessingStage {
             RequestType::Responses(_) => {
                 error!(
                     function = "ResponseProcessingStage::execute",
-                    "Responses API not supported in regular pipeline"
+                    "RequestType::Responses reached regular response processing stage"
                 );
-                Err(error::bad_request(
-                    "Responses API processing must be handled by responses handler".to_string(),
+                Err(error::internal_error(
+                    "RequestType::Responses reached regular response processing stage",
                 ))
             }
         }
