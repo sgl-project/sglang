@@ -34,10 +34,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -545,16 +542,16 @@ class Qwen3LLMModel(Qwen3Model):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-            residual = None
+        # if self.pp_group.is_first_rank:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
         else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = forward_batch.input_embeds
+        residual = None
+        # else:
+        #     assert pp_proxy_tensors is not None
+        #     hidden_states = pp_proxy_tensors["hidden_states"]
+        #     residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
@@ -689,6 +686,49 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
+    def post_process(
+        self,
+        inputs_embeds,
+        modalities: List[Modality],
+        embeddings: List[torch.Tensor],
+        indices: List[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if not self.use_deepstack:
+            return embeddings
+        deepstack_embeddings = []
+        new_embeddings = []
+
+        num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+        deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
+            inputs_embeds.shape[-1] * num_deepstack_embeddings,
+        )
+        input_deepstack_embeds = torch.zeros(
+            deepstack_embedding_shape,
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+
+        for i, (modality, embedding, index) in enumerate(
+            zip(modalities, embeddings, indices)
+        ):
+            if embedding is None or index is None:
+                continue
+            if self.use_deepstack.get(modality, False):
+                embedding, deepstack_embedding = self.separate_deepstack_embeds(
+                    embedding
+                )
+                if index is None or deepstack_embedding is None:
+                    continue
+                input_deepstack_embeds[index] = deepstack_embedding.to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+
+            new_embeddings.append(embedding)
+
+        forward_batch.input_deepstack_embeds = input_deepstack_embeds
+        return new_embeddings, forward_batch
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -704,6 +744,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds=None,
         get_embedding: bool = False,
     ):
         """Run forward pass for Qwen3-VL.
@@ -718,26 +759,39 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
+        # if self.is_mrope_enabled:
+        positions = forward_batch.mrope_positions
+        # else:
+        # positions = forward_batch.positions
 
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
+        # if not (
+        #     forward_batch.forward_mode.is_decode()
+        #     or not forward_batch.contains_image_inputs()
+        # ):
+        #     if self.is_mrope_enabled:
+        #         assert positions.ndim == 2 and positions.size(0) == 3, (
+        #             "multimodal section rotary embedding requires "
+        #             f"(3, seq_len) positions, but got {positions.size()}"
+        #         )
 
-        hidden_states = general_mm_embed_routine(
+        # It may seem strange to assign input_embeds again even after passing it as an argument.
+        # This is for compatibility considerations.
+        # In the 'extend' scenario, this forward function is called from two places:
+        # 1. model_runner calls forward directly,
+        # 2. piece_wise_cuda_graph_runner calls forward and replay.
+
+        # Currently,
+        # In 'extend', input_embeds is passed in.
+        # In 'decode', input_ids is passed in.
+        input_embeds = forward_batch.input_embeds
+        input_deepstack_embeds = forward_batch.input_deepstack_embeds
+
+        hidden_states = self.model.forward(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
+            input_embeds=input_embeds,
             positions=positions,
-            use_deepstack=self.use_deepstack,
+            input_deepstack_embeds=input_deepstack_embeds,
         )
 
         if not get_embedding:

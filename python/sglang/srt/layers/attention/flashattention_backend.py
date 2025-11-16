@@ -660,6 +660,7 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        print(f"forward_extend")
         if k is not None:
             assert v is not None
             if save_kv_cache:

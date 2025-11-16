@@ -14,6 +14,7 @@
 """Radix attention."""
 from __future__ import annotations
 
+import time
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -101,6 +102,7 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None

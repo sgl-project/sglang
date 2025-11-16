@@ -90,6 +90,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.mm_utils import multimodal_preprocess_routine
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -2112,11 +2113,26 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        print(f"{self.is_multimodal=}")
+        if self.is_multimodal:
+            forward_batch = multimodal_preprocess_routine(
+                forward_batch=forward_batch,
+                multimodal_model=self.model,
+            )
+            assert forward_batch.input_embeds is not None, "input_embeds is required"
+            # print(f"{forward_batch.input_embeds.shape=}")
+            # print(f"{forward_batch.input_deepstack_embeds.shape=}")
+            print(f"right!!!!!!", flush=True)
+        if forward_batch.positions is not None:
+            print(f"position.shape={forward_batch.positions.shape}")
+        if forward_batch.mrope_positions is not None:
+            print(f"mrope_positions.shape={forward_batch.mrope_positions.shape}")
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+            # should we convert to bfloat16?
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
@@ -2124,6 +2140,7 @@ class ModelRunner:
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         ):
+            print(f"piecewise cuda graph replay")
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
         if not skip_attn_backend_init:
@@ -2248,6 +2265,7 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            forward_batch.input_deepstack_embeds = None
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
