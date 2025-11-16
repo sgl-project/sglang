@@ -603,10 +603,11 @@ def _sanity_check_suites(applied_suites):
             if x.name.startswith("test_")
         ]
     )
-
-    suite_files = set(
-        [test_file.name for _, suite in applied_suites.items() for test_file in suite]
-    )
+    suite_files = set()
+    for name, suite in applied_suites.items():
+        if name == "__not_in_ci__":
+            continue
+        suite_files.update([test_file.name for test_file in suite])
 
     missing_files = sorted(list(suite_files - disk_files))
     missing_text = "\n".join(f'TestFile("{x}"),' for x in missing_files)
