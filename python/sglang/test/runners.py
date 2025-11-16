@@ -557,8 +557,7 @@ class SRTRunner:
             spec_kwargs["speculative_num_steps"] = speculative_num_steps
             spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk
             spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
-
-        if speculative_algorithm == "NGRAM":
+        elif speculative_algorithm == "NGRAM":
             spec_kwargs["speculative_algorithm"] = speculative_algorithm
             spec_kwargs["speculative_ngram_min_match_window_size"] = (
                 speculative_ngram_min_match_window_size
