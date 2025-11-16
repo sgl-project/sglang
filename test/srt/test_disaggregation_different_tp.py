@@ -40,6 +40,8 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
             "prefill",
             "--tp",
             "4",
+            "--mem-fraction-static",
+            "0.9",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -59,6 +61,8 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "4",
+            "--mem-fraction-static",
+            "0.9",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -111,6 +115,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
             "prefill",
             "--tp",
             "2",
+            "--mem-fraction-static",
+            "0.9",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -130,6 +136,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--mem-fraction-static",
+            "0.9",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -182,6 +190,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
             "prefill",
             "--tp",
             "4",
+            "--mem-fraction-static",
+            "0.9",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -201,6 +211,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "4",
+            "--mem-fraction-static",
+            "0.9",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -253,6 +265,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
             "prefill",
             "--tp",
             "2",
+            "--mem-fraction-static",
+            "0.9",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -272,6 +286,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--mem-fraction-static",
+            "0.9",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
