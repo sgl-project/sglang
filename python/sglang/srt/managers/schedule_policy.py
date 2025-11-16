@@ -697,7 +697,7 @@ class PrefillAdder:
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
                 self.rem_total_token_offset -= (
-                    self._get_running_request_total_token_offset(req)
+                    self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1
                 self.running_batch.release_req(
