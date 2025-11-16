@@ -424,7 +424,7 @@ class Llama4ForConditionalGeneration(nn.Module):
     }
 
     # Pattern to match language model layers only (skip vision_model and multi_modal_projector)
-    lora_pattern = re.compile(
+    _lora_pattern = re.compile(
         r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
     )
 
@@ -561,9 +561,19 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         return projected_vision_flat
 
-    def should_apply_lora(self, module_name: str) -> bool:
+    def _should_apply_lora(self, module_name: str) -> bool:
         """Skip vision model and multi_modal_projector for LoRA."""
-        return bool(self.lora_pattern.match(module_name))
+        return bool(self._lora_pattern.match(module_name))
+
+    def map_lora_module_name(self, module_name: str) -> Optional[str]:
+        """
+        Returns the LoRA weight name corresponding to the given model module if LoRA
+        should be applied to it.
+        """
+        if not self._should_apply_lora(module_name):
+            return None
+
+        return module_name.split(".")[-1]
 
     def forward(
         self,
