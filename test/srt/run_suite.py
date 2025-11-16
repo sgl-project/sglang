@@ -181,6 +181,7 @@ suites = {
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
+        TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
@@ -421,6 +422,7 @@ suite_amd = {
         TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("test_abort.py", 51),
+        TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_eval_fp8_accuracy.py", 303),
@@ -453,6 +455,7 @@ suite_amd = {
         # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_sliding_window.py", 250),
+        TestFile("test_type_based_dispatcher.py", 10),
         TestFile("test_wave_attention_kernels.py", 2),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
@@ -523,6 +526,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
+        TestFile("ascend/test_ascend_sampling_backend.py", 400),
     ],
     "per-commit-2-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
