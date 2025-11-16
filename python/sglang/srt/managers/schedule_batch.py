@@ -677,8 +677,6 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
-        # This only counts the decode for a request, excluding the extended tokens.
-        self.last_spec_extended_index = 0
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
@@ -997,9 +995,6 @@ class Req:
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
-    def increment_last_spec_extended_index(self, extended_length: int):
-        self.last_spec_extended_index += extended_length
-
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -1119,9 +1114,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Turn off: need to handle output_ids, set to False once
     # output_ids handled
     turning_off_specdecode: bool = False
-    # Turn on: need to run one step to capture draft hidden states
-    # set to False after one additional step of decode
-    turning_on_specdecode: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1669,7 +1661,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # In the case of changing from spec decode -> regular decode
             # we merged previously verfied tokens with the extend generated tokens
             # from differen request.
-            if self.spec_info.accept_length_cpu is not None:
+            if self.spec_info is not None and self.spec_info.accept_length_cpu is not None:
                 if isinstance(self.spec_info.accept_length_cpu, torch.Tensor):
                     accept_length_cpu = self.spec_info.accept_length_cpu.tolist()
                 else:

@@ -1647,6 +1647,7 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"

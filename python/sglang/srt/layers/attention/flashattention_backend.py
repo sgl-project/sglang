@@ -1599,8 +1599,6 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
-                print(f"Init target verify metadata topk {self.topk} normal")
-                print(f"WHY IS THIS CALLED?")
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]

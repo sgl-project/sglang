@@ -1,14 +1,11 @@
 import unittest
 
-import os
 import requests
 import torch
-import asyncio
 
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.utils import async_stream_and_merge
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -26,47 +23,6 @@ torch_dtype = torch.float16
 prefill_tolerance = 5e-2
 decode_tolerance: float = 5e-2
 
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "/shared/public/sharing/yubwang/Qwen3-4B_eagle3_lss/Qwen3-4B_eagle3"
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "/shared/public/elr-models/Qwen/Qwen3-4B/9e1b55c76f4b5bf0d14d37da8010110060f512e0"
-
-async def async_stream_ramp_up(engine, prompts, params, tokens_per_request: int, tokenizer):
-    outputs = [""] * len(prompts)
-    token_counts = [0] * len(prompts)
-    started = [False] * len(prompts)
-    tasks = {}
-    queue = asyncio.Queue()
-
-    async def stream_one(i: int):
-        async for cleaned_chunk in async_stream_and_merge(engine, prompts[i], params):
-            outputs[i] += cleaned_chunk
-            # Recompute tokens on full generated text to account for cross-boundary merges
-            token_counts[i] = len(tokenizer.encode(outputs[i], truncation=False))
-            await queue.put(("chunk", i, cleaned_chunk))
-        await queue.put(("done", i, ""))
-
-    # Kick off the first prompt
-    started[0] = True
-    tasks[0] = asyncio.create_task(stream_one(0))
-    last_started = 0
-
-    finished = 0
-    accumulated_outputs = [""] * len(prompts)
-    while finished < len(prompts):
-        typ, i, payload = await queue.get()
-        if typ == "chunk":
-            # Accumulate chunks for later printing
-            accumulated_outputs[i] += payload
-            # When the last-started prompt reaches the token threshold, start the next prompt
-            if i == last_started and token_counts[i] >= tokens_per_request:
-                j = last_started + 1
-                if j < len(prompts) and not started[j]:
-                    started[j] = True
-                    last_started = j
-                    tasks[j] = asyncio.create_task(stream_one(j))
-        else:
-            finished += 1
-            print(f"Output for prompt {i}: {accumulated_outputs[i]}")
-    return outputs
 
 class TestEAGLEEngine(CustomTestCase):
     BASE_CONFIG = {
@@ -87,8 +43,6 @@ class TestEAGLEEngine(CustomTestCase):
     }
 
     def setUp(self):
-        print("setup being called!!!!!!!!!!!")
-        os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         self.prompt = "Today is a sunny day and I like"
         self.sampling_params = {"temperature": 0, "max_new_tokens": 8}
 
@@ -97,9 +51,6 @@ class TestEAGLEEngine(CustomTestCase):
         )
         self.ref_output = ref_engine.generate(self.prompt, self.sampling_params)["text"]
         ref_engine.shutdown()
-
-    def tearDown(self):
-        del os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"]
 
     def test_correctness(self):
         configs = [
@@ -114,10 +65,10 @@ class TestEAGLEEngine(CustomTestCase):
                 print(f"{config=}")
                 engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
                 try:
-                    # self._test_single_generation(engine)
+                    self._test_single_generation(engine)
                     self._test_batch_generation(engine)
-                    # self._test_eos_token(engine)
-                    # self._test_acc_length(engine)
+                    self._test_eos_token(engine)
+                    self._test_acc_length(engine)
                 finally:
                     engine.flush_cache()  # check engine alive
                     engine.shutdown()
@@ -135,23 +86,23 @@ class TestEAGLEEngine(CustomTestCase):
             "The capital of France is",
             "The future of AI is",
         ]
-        # params = {"temperature": 0.1, "top_p": 0.95, "max_new_tokens": 500, "frequency_penalty": 0.5}
-        params = {"temperature": 0, "max_new_tokens": 100}
-        tokenizer = get_tokenizer(DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3)
-        asyncio.run(async_stream_ramp_up(engine, prompts, params, tokens_per_request=10, tokenizer=tokenizer))
-        # outputs = engine.generate(prompts, params)
-        # for prompt, output in zip(prompts, outputs):
-            # print(f"Prompt: {prompt}")
-            # print(f"Generated: {output['text']}")
-            # print("-" * 40)
-        # TODO: Fix server info
-        # avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
-        #     "avg_spec_accept_length"
-        # ]
-        # print(f"{avg_spec_accept_length=}")
-        # self.assertGreater(
-        #     avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
-        # )
+        params = {"temperature": 0, "max_new_tokens": 50}
+
+        outputs = engine.generate(prompts, params)
+        for prompt, output in zip(prompts, outputs):
+            print(f"Prompt: {prompt}")
+            print(f"Generated: {output['text']}")
+            print("-" * 40)
+
+        print(f"{engine.get_server_info()=}")
+
+        avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(
+            avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
+        )
 
     def _test_eos_token(self, engine):
         prompt = "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\nToday is a sunny day and I like [/INST]"
@@ -213,6 +164,25 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
     }
 
 
+class TestEAGLE3Engine(TestEAGLEEngine):
+    BASE_CONFIG = {
+        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
+        "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+        "speculative_algorithm": "EAGLE3",
+        "speculative_num_steps": 5,
+        "speculative_eagle_topk": 16,
+        "speculative_num_draft_tokens": 64,
+        "mem_fraction_static": 0.7,
+        "cuda_graph_max_bs": 5,
+        "dtype": "float16",
+    }
+    NUM_CONFIGS = 1
+    THRESHOLDS = {
+        "batch_avg_accept_len": 1.75,
+        "accept_len": 3.1,
+    }
+
+
 class TestEAGLERadixCache(CustomTestCase):
     BASE_CONFIG = {
         "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
@@ -238,7 +208,8 @@ class TestEAGLERadixCache(CustomTestCase):
 
         for i, config in enumerate(configs):
             with self.subTest(i=i):
-                engine = sgl.Engine(**config, log_level="info", decode_log_interval=1)
+                print(f"{config=}")
+                engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
                 try:
                     self._test_acc_length(engine)
                 finally:

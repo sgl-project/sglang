@@ -1966,8 +1966,6 @@ class Scheduler(
             batch.is_spec_enabled_for_batch = threshold is None or batch.batch_size() <= threshold
             if previous_enabled and not batch.is_spec_enabled_for_batch:
                 batch.turning_off_specdecode = True
-            if not previous_enabled and batch.is_spec_enabled_for_batch:
-                batch.turning_on_specdecode = True
 
         # Update batch tensors
         batch.prepare_for_decode()
