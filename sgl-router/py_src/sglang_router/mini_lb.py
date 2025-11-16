@@ -1,15 +1,16 @@
 """
-Minimal HTTP load balancer for prefill and decode servers for testing.
+Minimal HTTP load balancer for prefill and decode servers and optionally vision servers for testing.
 """
 
 import asyncio
+import copy
 import ipaddress
 import logging
 import random
 import urllib
 from http import HTTPStatus
 from itertools import chain
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import aiohttp
 import orjson
@@ -61,6 +62,9 @@ class MiniLoadBalancer:
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
+        self.vision_urls = [url[0] for url in router_args.vision_urls]
+        self.vision_bootstrap_ports = [url[1] for url in router_args.vision_urls]
+        self.enable_multimodal_disagg = router_args.enable_multimodal_disagg
         self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
         self.enable_trace = router_args.enable_trace
         if self.enable_trace and not trace_package_imported:
@@ -79,13 +83,23 @@ class MiniLoadBalancer:
             logger.warning("[MiniLB] Overriding policy to random")
             router_args.policy = "random"
 
-        if not router_args.pd_disaggregation:
-            raise ValueError("MiniLB only supports PD disaggregation mode")
+        if router_args.enable_multimodal_disagg:
+            if len(router_args.vision_urls) == 0:
+                raise ValueError(
+                    "Multimodal disaggregation mode requires at least one vision server"
+                )
+            if len(router_args.prefill_urls) == 0:
+                raise ValueError(
+                    "Multimodal disaggregation mode requires at least one language/prefill server"
+                )
+        else:
+            if not router_args.pd_disaggregation:
+                raise ValueError("MiniLB only supports PD disaggregation mode")
 
-        if len(router_args.prefill_urls) == 0 or len(router_args.decode_urls) == 0:
-            raise ValueError(
-                "MiniLB requires at least one prefill and one decode server"
-            )
+            if len(router_args.prefill_urls) == 0 or len(router_args.decode_urls) == 0:
+                raise ValueError(
+                    "MiniLB requires at least one prefill and one decode server"
+                )
 
     def start(self):
         global lb
@@ -95,7 +109,21 @@ class MiniLoadBalancer:
             trace_set_thread_info("Mini lb")
         uvicorn.run(app, host=self.host, port=self.port)
 
-    def select_pair(self):
+    def _get_trace_headers(self, modified_request) -> Tuple[dict, List[int]]:
+        headers = {}
+        bootstrap_room_list: List[int] = []
+        if self.enable_trace and "bootstrap_room" in modified_request:
+            bootstrap_value = modified_request["bootstrap_room"]
+            bootstrap_room_list = (
+                bootstrap_value
+                if isinstance(bootstrap_value, list)
+                else [bootstrap_value]
+            )
+            trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
+            headers = {"trace_context": trace_context}
+        return headers, bootstrap_room_list
+
+    def select_prefill_decode_pair(self):
         assert len(self.prefill_urls) > 0, "No prefill servers available"
         assert len(self.decode_urls) > 0, "No decode servers available"
         pidx = random.randint(0, len(self.prefill_urls) - 1)
@@ -104,6 +132,17 @@ class MiniLoadBalancer:
             self.prefill_urls[pidx],
             self.prefill_bootstrap_ports[pidx],
             self.decode_urls[didx],
+        )
+
+    def select_vision_prefill_pair(self):
+        assert len(self.vision_urls) > 0, "No vision servers available"
+        assert len(self.prefill_urls) > 0, "No prefill servers available"
+        vidx = random.randint(0, len(self.vision_urls) - 1)
+        pidx = random.randint(0, len(self.prefill_urls) - 1)
+        return (
+            self.vision_urls[vidx],
+            self.vision_bootstrap_ports[vidx],
+            self.prefill_urls[pidx],
         )
 
     async def generate(
@@ -116,16 +155,7 @@ class MiniLoadBalancer:
                 total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
-            headers = {}
-            bootstrap_room_list = []
-            if self.enable_trace:
-                bootstrap_room_list = (
-                    modified_request["bootstrap_room"]
-                    if isinstance(modified_request["bootstrap_room"], list)
-                    else [modified_request["bootstrap_room"]]
-                )
-                trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
-                headers = {"trace_context": trace_context}
+            headers, bootstrap_room_list = self._get_trace_headers(modified_request)
 
             tasks = [
                 session.post(
@@ -186,18 +216,7 @@ class MiniLoadBalancer:
                 )  # Add timeout for request reliability
             ) as session:
                 # Create the tasks for both prefill and decode requests
-                headers = {}
-                bootstrap_room_list = []
-                if self.enable_trace:
-                    bootstrap_room_list = (
-                        modified_request["bootstrap_room"]
-                        if isinstance(modified_request["bootstrap_room"], list)
-                        else [modified_request["bootstrap_room"]]
-                    )
-                    trace_context = trace_get_remote_propagate_context(
-                        bootstrap_room_list
-                    )
-                    headers = {"trace_context": trace_context}
+                headers, bootstrap_room_list = self._get_trace_headers(modified_request)
 
                 tasks = [
                     session.post(
@@ -253,6 +272,182 @@ class MiniLoadBalancer:
                     async for chunk in decode_response.content.iter_chunked(
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
+                        yield chunk
+
+            for bootstrap_room in bootstrap_room_list:
+                trace_slice_end(
+                    "wait_PD_finish",
+                    bootstrap_room,
+                    thread_finish_flag=True,
+                )
+                trace_req_finish(bootstrap_room)
+
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+        )
+
+    async def _check_single_response(self, response: aiohttp.ClientResponse):
+        try:
+            response_json = await response.json()
+            if response.status != 200:
+                return False, response_json
+            return True, None
+        except Exception as e:
+            return False, f"Response check failed: {e}"
+
+    async def multimodal_generate(
+        self,
+        vision_modified_request,
+        language_modified_request,
+        vision_server,
+        language_server,
+        endpoint="v1/chat/completions",
+    ) -> ORJSONResponse:
+        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout)
+        ) as session:
+            headers, bootstrap_room_list = self._get_trace_headers(
+                language_modified_request
+            )
+            vision_task = asyncio.create_task(
+                session.post(
+                    f"{vision_server}/{endpoint}",
+                    json=vision_modified_request,
+                    headers=headers,
+                )
+            )
+            ret_task = asyncio.create_task(
+                session.post(
+                    f"{language_server}/{endpoint}",
+                    json=language_modified_request,
+                    headers=headers,
+                )
+            )
+
+            for bootstrap_room in bootstrap_room_list:
+                trace_slice_end("mini_lb_launch", bootstrap_room, auto_next_anon=True)
+
+            vision_response = await vision_task
+            is_success, error_message = await self._check_single_response(
+                vision_response
+            )
+            if not is_success:
+                await session.post(
+                    f"{language_server}/abort_request",
+                    json={"rid": language_modified_request["rid"]},
+                )
+                logger.info(
+                    "Abort language request %s because vision failed",
+                    language_modified_request["rid"],
+                )
+                for bootstrap_room in bootstrap_room_list:
+                    trace_slice_end(
+                        "wait_PD_finish",
+                        bootstrap_room,
+                        thread_finish_flag=True,
+                    )
+                    trace_req_finish(bootstrap_room)
+                raise HTTPException(
+                    status_code=vision_response.status,
+                    detail=error_message,
+                )
+
+            ret_response = await ret_task
+
+            for bootstrap_room in bootstrap_room_list:
+                trace_slice_end(
+                    "wait_PD_finish",
+                    bootstrap_room,
+                    thread_finish_flag=True,
+                )
+                trace_req_finish(bootstrap_room)
+
+            return ORJSONResponse(
+                content=await ret_response.json(),
+                status_code=ret_response.status,
+            )
+
+    async def multimodal_generate_stream(
+        self,
+        vision_modified_request,
+        language_modified_request,
+        vision_server,
+        language_server,
+        endpoint="v1/chat/completions",
+    ):
+        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        async def stream_results():
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout)
+            ) as session:
+                headers, bootstrap_room_list = self._get_trace_headers(
+                    language_modified_request
+                )
+                vision_task = asyncio.create_task(
+                    session.post(
+                        f"{vision_server}/{endpoint}",
+                        json=vision_modified_request,
+                        headers=headers,
+                    )
+                )
+                ret_task = asyncio.create_task(
+                    session.post(
+                        f"{language_server}/{endpoint}",
+                        json=language_modified_request,
+                        headers=headers,
+                    )
+                )
+
+                for bootstrap_room in bootstrap_room_list:
+                    trace_slice_end(
+                        "mini_lb_launch", bootstrap_room, auto_next_anon=True
+                    )
+
+                vision_response = await vision_task
+                is_success, error_message = await self._check_single_response(
+                    vision_response
+                )
+                if not is_success:
+                    await session.post(
+                        f"{language_server}/abort_request",
+                        json={"rid": language_modified_request["rid"]},
+                    )
+                    logger.info(
+                        "Abort language request %s because vision failed",
+                        language_modified_request["rid"],
+                    )
+                    for bootstrap_room in bootstrap_room_list:
+                        trace_slice_end(
+                            "wait_PD_finish",
+                            bootstrap_room,
+                            thread_finish_flag=True,
+                        )
+                        trace_req_finish(bootstrap_room)
+                    raise HTTPException(
+                        status_code=vision_response.status,
+                        detail=error_message,
+                    )
+
+                ret_response = await ret_task
+
+                if language_modified_request.get("return_logprob", False):
+                    async for chunk in ret_response.content:
+                        decoded_chunk = chunk.decode("utf-8")
+                        if (
+                            decoded_chunk
+                            and decoded_chunk.startswith("data:")
+                            and "[DONE]" not in decoded_chunk
+                        ):
+                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                        else:
+                            yield chunk
+                else:
+                    async for chunk in ret_response.content:
                         yield chunk
 
             for bootstrap_room in bootstrap_room_list:
@@ -377,7 +572,7 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    prefill_server, bootstrap_port, decode_server = lb.select_prefill_decode_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -445,8 +640,70 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
         )
 
 
+async def _forward_to_backend_multimodal(request_data: dict, endpoint_name: str):
+    if endpoint_name != "v1/chat/completions":
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Multimodal endpoint only supports /v1/chat/completions",
+        )
+
+    vision_server, bootstrap_port, language_server = lb.select_vision_prefill_pair
+
+    parsed_url = urllib.parse.urlparse(vision_server)
+    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+    vision_modified_request = copy.deepcopy(request_data)
+    language_modified_request = copy.deepcopy(request_data)
+
+    bootstrap_room = request_data.get("bootstrap_room", _generate_bootstrap_room())
+    rid = request_data.get("rid", str(bootstrap_room))
+
+    vision_modified_request.update(
+        {
+            "bootstrap_host": hostname,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": bootstrap_room,
+            "rid": rid,
+            "stream": False,
+        }
+    )
+    language_modified_request.update(
+        {
+            "bootstrap_host": hostname,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": bootstrap_room,
+            "rid": rid,
+        }
+    )
+
+    for message in language_modified_request.get("messages", []):
+        if isinstance(message.get("content"), list):
+            message["content"] = [
+                content
+                for content in message["content"]
+                if content.get("type") == "text"
+            ]
+
+    if request_data.get("stream", False):
+        return await lb.multimodal_generate_stream(
+            vision_modified_request,
+            language_modified_request,
+            vision_server,
+            language_server,
+            endpoint=endpoint_name,
+        )
+    return await lb.multimodal_generate(
+        vision_modified_request,
+        language_modified_request,
+        vision_server,
+        language_server,
+        endpoint=endpoint_name,
+    )
+
+
 @app.post("/v1/chat/completions")
 async def handle_chat_completion_request(request_data: dict):
+    if lb.enable_multimodal_disagg:
+        return await _forward_to_backend_multimodal(request_data, "v1/chat/completions")
     return await _forward_to_backend(request_data, "v1/chat/completions")
 
 

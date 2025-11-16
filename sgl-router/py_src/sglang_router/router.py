@@ -197,6 +197,8 @@ class Router:
             "oracle_pool_min",
             "oracle_pool_max",
             "oracle_pool_timeout_secs",
+            "vision_urls",
+            "enable_multimodal_disagg",
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)
