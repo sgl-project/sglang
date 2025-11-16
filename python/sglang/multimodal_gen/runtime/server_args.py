@@ -336,6 +336,9 @@ class ServerArgs:
 
     def __post_init__(self):
         # Add randomization to avoid race condition when multiple servers start simultaneously
+        if self.attention_backend in ["fa3", "fa4"]:
+            self.attention_backend = "fa"
+
         initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
         self.scheduler_port = self.settle_port(initial_scheduler_port)
         # TODO: remove hard code
@@ -382,7 +385,7 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             default=None,
-            choices=[e.name.lower() for e in AttentionBackendEnum],
+            choices=[e.name.lower() for e in AttentionBackendEnum + "fa3" + "fa4"],
             help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
         )
 
