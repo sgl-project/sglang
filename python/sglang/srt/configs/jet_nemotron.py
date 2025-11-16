@@ -3,7 +3,12 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    extra_groups_for_head_shards,
+)
+from sglang.srt.distributed.utils import divide
 
 
 @dataclass
@@ -61,14 +66,48 @@ class JetNemotronConfig(PretrainedConfig):
         head_v_dim = int(head_k_dim * jet_block_config.expand_v)
         total_v_dim = num_heads * head_v_dim
 
-        shape = Mamba2StateShape.create(
+        shape = JetNemotronStateShape.create(
             tp_world_size=get_attention_tp_size(),
             intermediate_size=total_v_dim,
             n_groups=num_heads,
             num_heads=num_heads,
-            head_dim=head_v_dim,
-            state_size=head_k_dim,
+            head_dim=head_k_dim,
+            state_size=head_v_dim,
             conv_kernel=jet_block_config.conv_size,
         )
 
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+
+
+@dataclass(kw_only=True, frozen=True)
+class JetNemotronStateShape(Mamba2StateShape):
+    @staticmethod
+    def create(
+        *,
+        tp_world_size: int,
+        intermediate_size: int,
+        n_groups: int,
+        num_heads: int,
+        head_dim: int,
+        state_size: int,
+        conv_kernel: int,
+    ) -> "JetNemotronStateShape":
+        if n_groups % tp_world_size != 0:
+            extra_groups = extra_groups_for_head_shards(n_groups, tp_world_size)
+            n_groups += extra_groups
+        conv_dim = intermediate_size
+
+        conv_state_shape = divide(conv_dim, tp_world_size), conv_kernel
+
+        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+        return JetNemotronStateShape(
+            conv=conv_state_shape,
+            temporal=temporal_state_shape,
+            intermediate_size=intermediate_size,
+            conv_dim=conv_dim,
+            ssm_state_size=state_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+        )
