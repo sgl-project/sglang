@@ -1,4 +1,5 @@
 import abc
+import logging
 from collections import OrderedDict
 from typing import List, Optional
 
@@ -67,6 +68,9 @@ def _get_tensor_size(embedding: torch.Tensor):
     return embedding.element_size() * embedding.numel()
 
 
+logger = logging.getLogger(__name__)
+
+
 class MultiModalStaticCache(MultimodalCache):
     """
     A server-level cache for multimodal embedding.
@@ -100,11 +104,21 @@ class MultiModalStaticCache(MultimodalCache):
             self.mm_cache.move_to_end(mm_hash)
             return True
         data_size = _get_tensor_size(embedding)
+        evicted_bytes = 0
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False
             lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
-            self.current_size -= _get_tensor_size(lru_embedding)
+            freed = _get_tensor_size(lru_embedding)
+            self.current_size -= freed
+            evicted_bytes += freed
+        if evicted_bytes > 0:
+            logger.debug(
+                "Cache eviction: evicted %s bytes, remaining size: %s/%s bytes",
+                evicted_bytes,
+                self.current_size,
+                self.max_size,
+            )
 
         self.mm_cache[mm_hash] = embedding
         self.current_size += data_size
