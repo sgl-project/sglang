@@ -451,6 +451,7 @@ class Req:
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -627,6 +628,10 @@ class Req:
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+
+        # capture routed experts
+        self.return_routed_experts = return_routed_experts
+        self.routed_experts = []
 
         # Embedding (return values)
         self.embedding = None
@@ -943,6 +948,7 @@ class Req:
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.routed_experts = []
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
@@ -1112,6 +1118,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return captured experts
+    return_routed_experts: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1155,6 +1164,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
         )
@@ -1399,6 +1409,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
+        self.out_cache_loc_cpu = out_cache_loc.to("cpu", non_blocking=True)
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
@@ -1450,10 +1461,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        out_cache_loc_cpu = torch.cat(
+            [self.out_cache_loc_cpu, running_batch.out_cache_loc_cpu]
+        )
 
         self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
+        self.out_cache_loc_cpu = out_cache_loc_cpu
 
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
@@ -1657,6 +1672,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc_cpu = self.out_cache_loc.to("cpu", non_blocking=True)
 
         # Update req-level memory management fields
         for req in self.reqs:
@@ -1728,6 +1744,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
+        self.out_cache_loc_cpu = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[keep_indices_device]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
@@ -1773,6 +1790,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
+        self.out_cache_loc_cpu = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
@@ -1824,6 +1842,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
+            out_cache_loc_cpu=self.out_cache_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
@@ -1900,7 +1919,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def __str__(self):
         return (
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
-            f"#req={(len(self.reqs))})"
+            f"#req={(len(self.reqs))}), "
+            f"#out_cache_loc={self.out_cache_loc})"
         )
 
 
@@ -1954,6 +1974,9 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # cpu copy of out_cache_loc
+    out_cache_loc_cpu: Optional[torch.Tensor] = None
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None
