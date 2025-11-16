@@ -199,7 +199,7 @@ class LoRAMemoryPool:
         eviction_time = 0.0
         loading_time = 0.0
         sync_time = 0.0
-        
+
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
             for buffer_id in range(self.max_loras_per_batch):
@@ -263,7 +263,7 @@ class LoRAMemoryPool:
                 load_time = (time.perf_counter() - load_start) * 1000
                 loading_time += load_time
                 logger.info(f"🔴 LoRA loading: {load_time:.2f}ms, uid={uid}")
-        
+
         total_time = (time.perf_counter() - start_time) * 1000
         if num_loaded > 0:
             logger.info(
