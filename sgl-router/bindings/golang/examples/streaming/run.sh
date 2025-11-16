@@ -4,17 +4,20 @@
 # Usage: ./run.sh [tokenizer_path] [endpoint]
 
 # Set library path for Rust FFI library
-# The library is built by the parent Makefile using CARGO_BUILD_DIR (default: ../../../target)
+# The library should be in ./lib directory (created by 'make lib')
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 PARENT_DIR="$(cd "$SCRIPT_DIR" && pwd)"
 # Go up 3 levels: examples/streaming -> examples -> bindings/golang
 BINDINGS_DIR="$(cd "$PARENT_DIR/../.." && pwd)"
 
-if [ -z "$CARGO_BUILD_DIR" ]; then
-    # Default build directory is target (relative to bindings/golang)
-    CARGO_BUILD_DIR="${BINDINGS_DIR}/target"
+LIB_DIR="${BINDINGS_DIR}/lib"
+
+# Check if lib directory exists
+if [ ! -d "$LIB_DIR" ]; then
+    echo "Error: Library directory not found at $LIB_DIR"
+    echo "Please run 'make lib' first to build and export the library"
+    exit 1
 fi
-LIB_DIR="${CARGO_BUILD_DIR}/release"
 
 # Get Python LDFLAGS (needed for Rust FFI that depends on Python)
 PYTHON_LDFLAGS=$(python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || echo "")
