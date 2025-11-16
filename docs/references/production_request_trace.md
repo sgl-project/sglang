@@ -1,3 +1,5 @@
+# Production Request Tracing
+
 SGlang exports request trace data based on the OpenTelemetry Collector. You can enable tracing by adding the `--enable-trace` and configure the OpenTelemetry Collector endpoint using `--otlp-traces-endpoint` when launching the server.
 
 You can find example screenshots of the visualization in https://github.com/sgl-project/sglang/issues/8965.
