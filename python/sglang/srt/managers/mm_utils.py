@@ -798,6 +798,46 @@ def hash_feature(f):
     return data_hash(f)
 
 
+def resolve_language_model(multimodal_model: nn.Module) -> Optional[nn.Module]:
+    # Qwen2-VL / Qwen3-VL Style
+    if hasattr(multimodal_model, "model"):
+        lm = getattr(multimodal_model, "model")
+        if hasattr(lm, "get_input_embeddings"):
+            return lm
+
+    # Llava / OneVision Style
+    if hasattr(multimodal_model, "language_model"):
+        lm = getattr(multimodal_model, "language_model")
+        if hasattr(lm, "get_input_embeddings"):
+            return lm
+
+    if hasattr(multimodal_model, "get_input_embeddings"):
+        return multimodal_model
+
+    return None
+
+
+def should_use_external_mm_preprocess(multimodal_model: nn.Module) -> bool:
+    """Decide whether we should use our generic `multimodal_preprocess_routine`.
+
+    Current strategy:
+        - Llava family (models with vision_tower + multi_modal_projector):
+        Their forward already calls general_mm_embed_routine and includes
+        built-in multimodal processing. If we run it again in ModelRunner,
+        it will conflict with the internal logic, so we skip it here.
+        - Others (such as Qwen2_5_VL / Qwen3VL): use the generic preprocessing.
+    """
+
+    # Llava series model, exists vision_tower and multi_modal_projector
+    if hasattr(multimodal_model, "vision_tower") and hasattr(
+        multimodal_model, "multi_modal_projector"
+    ):
+        return False
+
+    # Other models like Qwen2_5_VL / Qwen3VL
+    return True
+
+
 def multimodal_preprocess_routine(
     forward_batch: ForwardBatch,
     multimodal_model: Optional[nn.Module] = None,
@@ -816,7 +856,10 @@ def multimodal_preprocess_routine(
     Returns:
         Hidden states from language model forward pass
     """
-    language_model = multimodal_model.model
+    if not should_use_external_mm_preprocess(multimodal_model):
+        return forward_batch
+
+    language_model = resolve_language_model(multimodal_model)
 
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
