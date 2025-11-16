@@ -639,6 +639,16 @@ async fn responses_handler(
             })
             .unwrap_or(false);
 
+        // Extract first tool name from request
+        let tool_name = payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|tool| tool.get("name"))
+            .and_then(|name| name.as_str())
+            .unwrap_or("brave_web_search")
+            .to_string();
+
         if has_tools && !has_function_output {
             // First turn: emit streaming tool call events
             let call_id = format!(
@@ -686,7 +696,7 @@ async fn responses_handler(
                         "item": {
                             "id": call_id.clone(),
                             "type": "function_tool_call",
-                            "name": "brave_web_search",
+                            "name": tool_name.clone(),
                             "arguments": "",
                             "status": "in_progress"
                         }
@@ -757,7 +767,7 @@ async fn responses_handler(
                         "item": {
                             "id": call_id.clone(),
                             "type": "function_tool_call",
-                            "name": "brave_web_search",
+                            "name": tool_name,
                             "arguments": "{\"query\":\"SGLang router MCP integration\"}",
                             "status": "completed"
                         }
@@ -1000,6 +1010,16 @@ async fn responses_handler(
             })
             .unwrap_or(false);
 
+        // Extract first tool name from request
+        let tool_name = payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|tool| tool.get("name"))
+            .and_then(|name| name.as_str())
+            .unwrap_or("brave_web_search")
+            .to_string();
+
         if has_tools && !has_function_output {
             let rid = format!("resp-{}", Uuid::new_v4());
             Json(json!({
@@ -1010,7 +1030,7 @@ async fn responses_handler(
                 "output": [{
                     "type": "function_tool_call",
                     "id": "call_1",
-                    "name": "brave_web_search",
+                    "name": tool_name,
                     "arguments": "{\"query\":\"SGLang router MCP integration\"}",
                     "status": "in_progress"
                 }],

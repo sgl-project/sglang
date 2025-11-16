@@ -9,6 +9,8 @@ use axum::{
 use serde_json::{json, to_value};
 use tracing::{debug, error, warn};
 
+// Re-export MCP utilities for use by grpc routers
+pub use crate::routers::openai::mcp::extract_dynamic_mcp_servers;
 use crate::{
     core::WorkerRegistry,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},

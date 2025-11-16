@@ -1138,8 +1138,20 @@ pub(super) async fn handle_streaming_with_tool_interception(
     original_previous_response_id: Option<String>,
     active_mcp: &Arc<crate::mcp::McpManager>,
 ) -> Response {
-    // Transform MCP tools to function tools in payload
-    prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
+    use crate::routers::openai::mcp::extract_dynamic_mcp_servers;
+
+    // Extract all dynamic MCP servers from request
+    let dynamic_servers: Vec<(String, String)> = original_body
+        .tools
+        .as_ref()
+        .map(|tools| extract_dynamic_mcp_servers(tools))
+        .unwrap_or_default();
+
+    // Build tools map with (server_label, tool_name) -> (Tool, server_url)
+    let tools_map = active_mcp.list_tools_for_request(&dynamic_servers).await;
+
+    // Transform MCP tools to function tools in payload with formatted names
+    prepare_mcp_payload_for_streaming(&mut payload, &tools_map);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let should_store = original_body.store.unwrap_or(false);
@@ -1152,6 +1164,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     let headers_opt = headers.cloned();
     let payload_clone = payload.clone();
     let active_mcp_clone = Arc::clone(active_mcp);
+    let tools_map_clone = tools_map.clone();
 
     // Spawn the streaming loop task
     tokio::spawn(async move {
@@ -1443,6 +1456,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 &mut state,
                 server_label,
                 &mut sequence_number,
+                &tools_map_clone,
             )
             .await
             {
@@ -1506,11 +1520,23 @@ pub(super) async fn handle_streaming_response(
     }
 
     // Use the tool loop if the manager has any tools available (static or dynamic).
+    // Check both inventory (static) and request tools (dynamic MCP)
     let active_mcp = mcp_manager.and_then(|mgr| {
-        if mgr.list_tools().is_empty() {
-            None
-        } else {
+        let has_static_tools = !mgr.list_tools().is_empty();
+        let has_dynamic_mcp = original_body
+            .tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+            })
+            .unwrap_or(false);
+
+        if has_static_tools || has_dynamic_mcp {
             Some(mgr)
+        } else {
+            None
         }
     });
 
