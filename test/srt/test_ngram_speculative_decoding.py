@@ -170,7 +170,7 @@ class TestNgramSpeculativeBatchGeneration(TestNgramSpeculativeDecodingBase):
                 self.base_url,
                 prompts,
                 sampling_params,
-                tokens_per_request=10,
+                tokens_until_next_request=10,
                 tokenizer=tokenizer,
             )
         )
@@ -183,7 +183,7 @@ async def async_stream_ramp_up_http(
     base_url: str,
     prompts: List[str],
     sampling_params: Dict,
-    tokens_per_request: int,
+    tokens_until_next_request: int,
     tokenizer,
 ) -> List[str]:
     outputs = [""] * len(prompts)
@@ -234,7 +234,7 @@ async def async_stream_ramp_up_http(
         typ = item[0]
         if typ == "chunk":
             _, idx = item
-            if idx == last_started and token_counts[idx] >= tokens_per_request:
+            if idx == last_started and token_counts[idx] >= tokens_until_next_request:
                 launch_next()
         elif typ == "done":
             _, idx = item

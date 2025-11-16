@@ -1670,7 +1670,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 accept_length.extend([1] * (bs - len(accept_length)))
                 kept_output_ids = [idx - 1 for idx in list(accumulate(accept_length))]
                 assert len(kept_output_ids) == bs
+                print(f"self.output_ids.shape before filtering: {self.output_ids.shape}")
                 self.input_ids = self.output_ids[kept_output_ids]
+                print(f"self.input_ids.shape after filtering: {self.input_ids.shape}")
             else:
                 self.input_ids = self.output_ids
             self.turning_off_specdecode = False

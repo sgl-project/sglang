@@ -10,6 +10,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
@@ -28,9 +29,10 @@ class NgramDecodeCudaGraphRunner(CudaGraphRunner):
         with self._override_batch_sizes(), self._use_decode_attn_backend(
             self._target_model_runner
         ):
+            backup_spec_algorithm = self._target_model_runner.spec_algorithm
+            self._target_model_runner.spec_algorithm = SpeculativeAlgorithm.NONE
             super().__init__(self._target_model_runner)
-
-        self.capture_forward_mode = ForwardMode.DECODE
+            self._target_model_runner.spec_algorithm = backup_spec_algorithm
 
     @contextmanager
     def _use_decode_attn_backend(self, model_runner=None):
