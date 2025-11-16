@@ -169,12 +169,9 @@ impl JobQueue {
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 // Acquire permit (blocks if at concurrency limit)
-                let permit = match sem.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        error!("Semaphore closed, stopping dispatcher");
-                        break;
-                    }
+                let Ok(permit) = sem.clone().acquire_owned().await else {
+                    error!("Semaphore closed, stopping dispatcher");
+                    break;
                 };
 
                 let ctx_clone = ctx.clone();
