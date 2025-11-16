@@ -1,4 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+import base64
 import dataclasses
 import json
 import os
@@ -211,6 +212,33 @@ def sample_step_indices(
         if idx in step_map:
             indices.add(idx)
     return sorted(indices)
+
+
+def validate_image(b64_json: str) -> None:
+    """Decode and validate that image is PNG or JPEG."""
+    image_bytes = base64.b64decode(b64_json)
+    assert is_png(image_bytes) or is_jpeg(image_bytes), "Image must be PNG or JPEG"
+
+
+def validate_video(b64_json: str) -> None:
+    """Decode and validate that video is a valid format."""
+    video_bytes = base64.b64decode(b64_json)
+    is_mp4 = (
+        video_bytes[:4] == b"\x00\x00\x00\x18" or video_bytes[:4] == b"\x00\x00\x00\x1c"
+    )
+    is_webm = video_bytes[:4] == b"\x1a\x45\xdf\xa3"
+    assert is_mp4 or is_webm, "Video must be MP4 or WebM"
+
+
+def validate_openai_video(video_bytes: bytes) -> None:
+    """Validate that video is MP4 or WebM by magic bytes."""
+    is_mp4 = (
+        video_bytes.startswith(b"\x00\x00\x00\x18")
+        or video_bytes.startswith(b"\x00\x00\x00\x1c")
+        or video_bytes[4:8] == b"ftyp"
+    )
+    is_webm = video_bytes.startswith(b"\x1a\x45\xdf\xa3")
+    assert is_mp4 or is_webm, "Video must be MP4 or WebM"
 
 
 @dataclasses.dataclass
