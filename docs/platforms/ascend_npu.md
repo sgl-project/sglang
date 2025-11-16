@@ -71,7 +71,7 @@ pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-ur
 
 PTA_VERSION="v7.2.0-pytorch2.6.0"
 PTA_NAME="torch_npu-2.6.0.post3-cp311-cp311-manylinux_2_28_aarch64.whl"
-PTA_URL="https://gitcode.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
+PTA_URL="https://gitcode.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_NAME}"
 wget -O "${PTA_NAME}" "${PTA_URL}" && pip install "./${PTA_NAME}"
 ```
 
