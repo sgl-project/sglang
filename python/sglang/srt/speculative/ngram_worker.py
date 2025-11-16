@@ -18,13 +18,10 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
+from sglang.srt.speculative.ngram_decode_graph_runner import NgramDecodeCudaGraphRunner
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
-from sglang.srt.speculative.ngram_decode_graph_runner import (
-    NgramDecodeCudaGraphRunner,
-)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_bool_env_var, get_available_gpu_memory
-
+from sglang.srt.utils import get_available_gpu_memory, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +75,9 @@ class NGRAMWorker:
             if backend_str not in ATTENTION_BACKENDS:
                 raise ValueError(f"Invalid attention backend: {backend_str}")
             full_attention_backend = ATTENTION_BACKENDS[backend_str](self.model_runner)
-            attn_backend = attn_backend_wrapper(self.model_runner, full_attention_backend)
+            attn_backend = attn_backend_wrapper(
+                self.model_runner, full_attention_backend
+            )
             self.target_decode_attn_backend = attn_backend
             self.cuda_graph_runner_for_decode = NgramDecodeCudaGraphRunner(self)
             tic = time.perf_counter()
@@ -91,7 +90,6 @@ class NGRAMWorker:
             logger.info(
                 f"Capture decode cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
-
 
     def clear_cache_pool(self):
         self.ngram_cache.reset()
@@ -355,8 +353,9 @@ class NGRAMWorker:
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.target_worker.model_runner
             )
-            can_cuda_graph = self.cuda_graph_runner_for_decode and self.cuda_graph_runner_for_decode.can_run(
-                forward_batch
+            can_cuda_graph = (
+                self.cuda_graph_runner_for_decode
+                and self.cuda_graph_runner_for_decode.can_run(forward_batch)
             )
             if can_cuda_graph:
                 logits_output = self.cuda_graph_runner_for_decode.replay(forward_batch)
@@ -365,7 +364,9 @@ class NGRAMWorker:
                 )
                 can_run_cuda_graph = True
             else:
-                batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+                batch_result = self.target_worker.forward_batch_generation(
+                    model_worker_batch
+                )
                 logits_output, next_token_ids, can_run_cuda_graph = (
                     batch_result.logits_output,
                     batch_result.next_token_ids,

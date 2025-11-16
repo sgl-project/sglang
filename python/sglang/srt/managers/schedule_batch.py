@@ -42,7 +42,7 @@ import re
 import time
 from enum import Enum, auto
 from http import HTTPStatus
-from itertools import chain, accumulate
+from itertools import accumulate, chain
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -1627,9 +1627,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
-
         if not self.spec_algorithm.is_none() and self.is_spec_enabled_for_batch:
-            # if spec decoding is used and enabled for the batch, the decode 
+            # if spec decoding is used and enabled for the batch, the decode
             # batch is prepared inside `forward_batch_speculative_generation`
             # after running draft models.
             return
@@ -1658,19 +1657,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         if self.turning_off_specdecode:
-            # In the case of changing from spec decode -> regular decode
-            # we merged previously verfied tokens with the extend generated tokens
-            # from differen request.
-            if self.spec_info is not None and self.spec_info.accept_length_cpu is not None:
+            # In the case of changing from spec decode to regular decode, we merge
+            # previously verified tokens with the extend generated tokens from different
+            # requests.
+            if (
+                self.spec_info is not None
+                and self.spec_info.accept_length_cpu is not None
+            ):
                 if isinstance(self.spec_info.accept_length_cpu, torch.Tensor):
                     accept_length_cpu = self.spec_info.accept_length_cpu.tolist()
                 else:
                     accept_length_cpu = self.spec_info.accept_length_cpu
                 accept_length = [acc + 1 for acc in accept_length_cpu]
+                # Expand for the newly merged in request.
                 accept_length.extend([1] * (bs - len(accept_length)))
                 kept_output_ids = [idx - 1 for idx in list(accumulate(accept_length))]
                 assert len(kept_output_ids) == bs
-                print(f"self.output_ids.shape before filtering: {self.output_ids.shape}")
+                print(
+                    f"self.output_ids.shape before filtering: {self.output_ids.shape}"
+                )
                 self.input_ids = self.output_ids[kept_output_ids]
                 print(f"self.input_ids.shape after filtering: {self.input_ids.shape}")
             else:
@@ -1678,7 +1683,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.turning_off_specdecode = False
         else:
             self.input_ids = self.output_ids
-        
+
         self.output_ids = None
 
         if self.model_config.is_encoder_decoder:

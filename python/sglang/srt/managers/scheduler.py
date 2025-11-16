@@ -1963,7 +1963,9 @@ class Scheduler(
         if not self.spec_algorithm.is_none() and batch is not None:
             threshold = self.server_args.speculative_batch_size_threshold
             previous_enabled = batch.is_spec_enabled_for_batch
-            batch.is_spec_enabled_for_batch = threshold is None or batch.batch_size() <= threshold
+            batch.is_spec_enabled_for_batch = (
+                threshold is None or batch.batch_size() <= threshold
+            )
             if previous_enabled and not batch.is_spec_enabled_for_batch:
                 batch.turning_off_specdecode = True
 
@@ -2350,8 +2352,10 @@ class Scheduler(
 
         if not self.spec_algorithm.is_none():
             ret["avg_spec_accept_length"] = (
-                self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
-            ) if self.spec_total_num_forward_ct > 0 else 0
+                (self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct)
+                if self.spec_total_num_forward_ct > 0
+                else 0
+            )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 

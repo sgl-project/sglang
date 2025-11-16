@@ -864,11 +864,15 @@ class ServerArgs:
             )
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
-        
+
         if self.speculative_batch_size_threshold is not None:
             # Split the two
-            self.capture_bs_for_decode = [bs for bs in capture_bs if bs > self.speculative_batch_size_threshold]
-            capture_bs = [bs for bs in capture_bs if bs <= self.speculative_batch_size_threshold]
+            self.capture_bs_for_decode = [
+                bs for bs in capture_bs if bs > self.speculative_batch_size_threshold
+            ]
+            capture_bs = [
+                bs for bs in capture_bs if bs <= self.speculative_batch_size_threshold
+            ]
 
         return capture_bs
 
@@ -1646,7 +1650,10 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
-            if self.speculative_batch_size_threshold is not None and self.speculative_algorithm != "NGRAM":
+            if (
+                self.speculative_batch_size_threshold is not None
+                and self.speculative_algorithm != "NGRAM"
+            ):
                 raise ValueError(
                     "Only Ngram speculative decoding supporting setting batch size threshold."
                 )

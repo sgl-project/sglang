@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 import sglang.srt.model_executor.cuda_graph_runner as cgr
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
@@ -29,7 +25,9 @@ class NgramDecodeCudaGraphRunner(CudaGraphRunner):
         self._target_model_runner = ngram_worker.target_worker.model_runner
         self._decode_attn_backend = ngram_worker.target_decode_attn_backend
         if self._decode_attn_backend is None:
-            raise RuntimeError("target_decode_attn_backend is required for decode graph")
+            raise RuntimeError(
+                "target_decode_attn_backend is required for decode graph"
+            )
 
         with self._override_batch_sizes(), self._use_decode_attn_backend(
             self._target_model_runner
@@ -55,7 +53,9 @@ class NgramDecodeCudaGraphRunner(CudaGraphRunner):
 
         def filtered(model_runner):
             backup_capture_bs = model_runner.server_args.cuda_graph_bs
-            model_runner.server_args.cuda_graph_bs = model_runner.server_args.capture_bs_for_decode
+            model_runner.server_args.cuda_graph_bs = (
+                model_runner.server_args.capture_bs_for_decode
+            )
             capture_bs, compile_bs = original(model_runner)
             threshold = model_runner.server_args.speculative_batch_size_threshold
             if threshold:
