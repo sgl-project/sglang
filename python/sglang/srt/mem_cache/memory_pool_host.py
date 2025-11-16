@@ -32,8 +32,6 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 SUPPORT_PIN_MEMORY = not _is_npu
-if SUPPORT_PIN_MEMORY:
-    logger.warning("Current platform not support pin_memory")
 
 
 def synchronized(func):

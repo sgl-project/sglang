@@ -18,7 +18,6 @@ jobs:
   nightly-test-eval-text-models:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -36,7 +35,6 @@ jobs:
   nightly-test-perf-text-models:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -66,7 +64,6 @@ jobs:
   nightly-test-eval-vlms:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -84,7 +81,6 @@ jobs:
   nightly-test-perf-vlms:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -114,7 +110,7 @@ jobs:
   nightly-test-1-gpu:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 1-gpu-runner
-    continue-on-error: true
+
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
@@ -134,7 +130,6 @@ jobs:
   nightly-test-4-gpu:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 4-gpu-h100
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -152,7 +147,6 @@ jobs:
   nightly-test-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-h200
-    continue-on-error: true
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
@@ -172,7 +166,6 @@ jobs:
   nightly-test-8-gpu-h20:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-h20
-    continue-on-error: true
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
     steps:
@@ -188,3 +181,29 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
+
+  check-all-jobs:
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
+    needs:
+      - nightly-test-eval-text-models
+      - nightly-test-perf-text-models
+      - nightly-test-eval-vlms
+      - nightly-test-perf-vlms
+      - nightly-test-1-gpu
+      - nightly-test-4-gpu
+      - nightly-test-8-gpu-h200
+      - nightly-test-8-gpu-h20
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          # Now that continue-on-error is removed, failures will be properly reported
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"
