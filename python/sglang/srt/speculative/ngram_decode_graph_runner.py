@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING
 
 import sglang.srt.model_executor.cuda_graph_runner as cgr
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
@@ -74,14 +73,10 @@ class NgramDecodeCudaGraphRunner(CudaGraphRunner):
         finally:
             cgr.get_batch_sizes_to_capture = original
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_one_batch_size(self, *args, **kwargs):
         with self._use_decode_attn_backend():
-            return super().capture_one_batch_size(bs, forward)
+            return super().capture_one_batch_size(*args, **kwargs)
 
-    def replay_prepare(
-        self,
-        forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ):
+    def replay_prepare(self, *args, **kwargs):
         with self._use_decode_attn_backend():
-            return super().replay_prepare(forward_batch, pp_proxy_tensors)
+            return super().replay_prepare(*args, **kwargs)
