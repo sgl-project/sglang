@@ -952,7 +952,7 @@ class HybridLinearKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         mamba_pool: MambaPool,
-        enable_memory_saver: bool,
+        enable_memory_saver: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
         kv_lora_rank: int = None,
