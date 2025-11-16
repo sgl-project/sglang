@@ -15,11 +15,13 @@
 
 import logging
 import math
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from transformers import PretrainedConfig
 
 from sglang.srt.custom_op import CustomOp
@@ -59,6 +61,64 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
+def silu_and_mul_triton(
+    x: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    b, n = x.shape
+
+    assert n % 2 == 0
+    d = n // 2
+
+    o_dtype = dtype or x.dtype
+    o = torch.empty((b, d), dtype=o_dtype, device=x.device)
+
+    def grid(meta: Mapping[str, int]) -> tuple[int, int]:
+        return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
+
+    silu_and_mul_kernel[grid](
+        o_ptr=o,
+        o_stride=o.stride(0),
+        o_scale_ptr=scale,
+        x_ptr=x,
+        x_stride=x.stride(0),
+        d=d,
+        BLOCK_SIZE=1024,
+        HAS_O_SCALE=scale is not None,
+    )
+
+    return o
+
+
+@triton.jit
+def silu_and_mul_kernel(
+    o_ptr,
+    o_stride,
+    o_scale_ptr,
+    x_ptr,
+    x_stride,
+    d,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_O_SCALE: tl.constexpr,
+) -> None:
+    i = tl.program_id(axis=0).to(tl.int64)
+    j = tl.program_id(axis=1)
+
+    o_row_ptr = o_ptr + o_stride * i
+    x_row_ptr = x_ptr + x_stride * i
+
+    offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < d
+
+    a = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
+    b = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
+
+    result = tl.sigmoid(a) * a * b
+
+    tl.store(o_row_ptr + offsets, result, mask=mask)
+
+
 class SiluAndMul(CustomOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -70,11 +130,7 @@ class SiluAndMul(CustomOp):
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
-        return out
+        return silu_and_mul_triton(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
