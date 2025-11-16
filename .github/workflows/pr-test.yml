@@ -912,6 +912,9 @@ jobs:
       RUNNER_LABELS: 4-gpu-b200
     strategy:
       fail-fast: false
+      matrix:
+        part: [0, 1]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -929,10 +932,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 2 --timeout-per-file 1800
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
