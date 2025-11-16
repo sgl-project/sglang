@@ -35,7 +35,7 @@
         "TextEncodingStage": 834.2,
         "ConditioningStage": 0.1,
         "TimestepPreparationStage": 10.6,
-        "LatentPreparationStage": 5.2,
+        "LatentPreparationStage": 9.0,
         "DenoisingStage": 21202.6,
         "DecodingStage": 476.12
       },
@@ -88,7 +88,7 @@
         "InputValidationStage": 1.03,
         "TextEncodingStage": 3450.0,
         "ConditioningStage": 1.0,
-        "TimestepPreparationStage": 4.0,
+        "TimestepPreparationStage": 6.0,
         "LatentPreparationStage": 15.0,
         "DenoisingStage": 90100.0,
         "DecodingStage": 3650.0
@@ -121,7 +121,7 @@
         "InputValidationStage": 80.0,
         "TextEncodingStage": 3000.0,
         "ConditioningStage": 1.0,
-        "TimestepPreparationStage": 2.0,
+        "TimestepPreparationStage": 6.0,
         "LatentPreparationStage": 30.0,
         "DenoisingStage": 162900.0,
         "DecodingStage": 13500.0
