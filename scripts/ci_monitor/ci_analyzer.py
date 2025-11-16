@@ -74,7 +74,7 @@ class SGLangCIAnalyzer:
                 "sgl-kernel-build-wheels",
             ],
             "unit-test": [
-                "unit-test-frontend",
+                "stage-a-test-1",
                 "unit-test-backend-1-gpu",
                 "unit-test-backend-2-gpu",
                 "unit-test-backend-4-gpu",
