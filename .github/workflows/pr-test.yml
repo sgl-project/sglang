@@ -365,7 +365,7 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  unit-test-frontend:
+  stage-a-test-1:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
@@ -391,8 +391,8 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          cd test/lang
-          python3 run_suite.py --suite per-commit
+          cd test/
+          python3 run_suite.py
 
   unit-test-backend-1-gpu:
     needs: [check-changes, unit-test-frontend, sgl-kernel-build-wheels]
