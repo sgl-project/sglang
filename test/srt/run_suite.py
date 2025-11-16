@@ -633,18 +633,6 @@ if __name__ == "__main__":
         help="The suite to run",
     )
     arg_parser.add_argument(
-        "--range-begin",
-        type=int,
-        default=0,
-        help="The begin index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
-        "--range-end",
-        type=int,
-        default=None,
-        help="The end index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
         "--auto-partition-id",
         type=int,
         help="Use auto load balancing. The part id.",
@@ -672,8 +660,6 @@ if __name__ == "__main__":
 
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
-    else:
-        files = files[args.range_begin : args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
