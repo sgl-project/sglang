@@ -3,8 +3,6 @@ import glob
 from dataclasses import dataclass
 from pathlib import Path
 
-from sglang.test.test_utils import run_unittest_files
-
 
 @dataclass
 class TestFile:
@@ -618,6 +616,8 @@ def _sanity_check_suites(suites):
 
 
 def run_suite_v1(args):
+    from sglang.test.test_utils import run_unittest_files
+
     print(f"{args=}")
 
     _sanity_check_suites(suites)
@@ -639,7 +639,10 @@ def run_suite_v1(args):
 
 
 def run_suite_v2(args):
-    pass
+    from sglang.test.ci_register import collect_tests
+
+    files = glob.glob("**/test_*.py", recursive=True)
+    collect_tests(files, sanity_check=False)
 
 
 def main():
@@ -687,8 +690,8 @@ def main():
     )
     args = arg_parser.parse_args()
 
-    # run_suite_v1(args)
-    run_suite_v2(args)
+    run_suite_v1(args)
+    # run_suite_v2(args)
 
 
 if __name__ == "__main__":
