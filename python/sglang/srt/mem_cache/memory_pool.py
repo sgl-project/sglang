@@ -366,12 +366,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        self._init_mamba_pool(
-            size=mamba_size,
-            cache_params=cache_params,
-            device=device,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
         )
+        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self._init_mamba_pool(
+                size=mamba_size,
+                cache_params=cache_params,
+                device=device,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
 
     def _init_mamba_pool(
         self,
@@ -948,6 +952,7 @@ class HybridLinearKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         mamba_pool: MambaPool,
+        enable_memory_saver: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
         kv_lora_rank: int = None,
@@ -979,7 +984,7 @@ class HybridLinearKVPool(KVCache):
                 head_dim=head_dim,
                 layer_num=self.full_layer_nums,
                 device=device,
-                enable_memory_saver=False,
+                enable_memory_saver=enable_memory_saver,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -991,7 +996,7 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
-                enable_memory_saver=False,
+                enable_memory_saver=enable_memory_saver,
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
