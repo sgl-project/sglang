@@ -16,9 +16,11 @@
  * limitations under the License.
  */
 
+#include <cuda_runtime.h>
+
 #include <flashinfer/quantization.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "utils.h"
 
 using namespace flashinfer;
 

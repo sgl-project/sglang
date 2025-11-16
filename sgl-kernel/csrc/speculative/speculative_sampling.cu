@@ -14,8 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDADataType.h>
+
 #include "speculative_sampling.cuh"
+#include "utils.h"
 
 using namespace flashinfer;
 

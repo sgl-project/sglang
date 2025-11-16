@@ -389,7 +389,7 @@ C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max
 #endif  // HIP_FP8_TYPE_FNUZ
 #endif  // USE_ROCM
 
-#define FULL_MASK 0xffffffff
+constexpr uint32_t FULL_32BIT_MASK = 0xffffffff;
 
 __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
 #ifndef USE_ROCM
@@ -409,11 +409,11 @@ __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
 }
 
 __device__ __forceinline__ float warpReduceMax(float value) {
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 16));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 8));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 4));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 2));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 1));
+  value = fmaxf(value, __shfl_xor_sync(FULL_32BIT_MASK, value, 16));
+  value = fmaxf(value, __shfl_xor_sync(FULL_32BIT_MASK, value, 8));
+  value = fmaxf(value, __shfl_xor_sync(FULL_32BIT_MASK, value, 4));
+  value = fmaxf(value, __shfl_xor_sync(FULL_32BIT_MASK, value, 2));
+  value = fmaxf(value, __shfl_xor_sync(FULL_32BIT_MASK, value, 1));
   return value;
 }
 
