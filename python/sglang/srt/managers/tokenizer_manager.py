@@ -1191,6 +1191,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         async with self.is_pause_cond:
             self.is_pause = True
             self.abort_request(abort_all=True)
+            # we are using the model_update_lock to check if there is still on-going requests.
             while self.model_update_lock.is_locked():
                 self.abort_request(abort_all=True)
                 await asyncio.sleep(1.0)
