@@ -124,7 +124,7 @@ jobs:
         id: check-priority
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            if [[ "${{ contains(github.event.pull_request.labels.*.name, 'high-priority') }}" == "true" ]]; then
+            if [[ "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
               echo "is_high_priority=true" >> $GITHUB_OUTPUT
             else
               echo "is_high_priority=false" >> $GITHUB_OUTPUT
