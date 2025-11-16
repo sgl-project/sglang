@@ -26,12 +26,6 @@ Its core features include:
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
-   basic_usage/deepseek.md
-   basic_usage/deepseek_v32.md
-   basic_usage/gpt_oss.md
-   basic_usage/llama4.md
-   basic_usage/qwen3.md
-   basic_usage/qwen3_vl.md
 
 .. toctree::
    :maxdepth: 1
