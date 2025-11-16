@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
 from sglang.srt.layers.quantization.w8a8_int8 import npu_fused_experts
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -959,7 +960,7 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 # Register fake implementations for torch.compile support
 if _is_cuda:
 
-    @torch.library.register_fake("sgl_kernel::awq_dequantize")
+    @register_fake_if_exists("sgl_kernel::awq_dequantize")
     def _(
         qweight,
         scales,
@@ -971,7 +972,7 @@ if _is_cuda:
         out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 32 // num_bits,)
         return qweight.new_empty(out_shape, dtype=scales.dtype)
 
-    @torch.library.register_fake("sgl_kernel::awq_marlin_repack")
+    @register_fake_if_exists("sgl_kernel::awq_marlin_repack")
     def _(b_q_weight, size_k, size_n, num_bits):
         return b_q_weight.new_empty(
             (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
