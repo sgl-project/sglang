@@ -2145,7 +2145,6 @@ class ModelRunner:
                 forward_batch=forward_batch,
                 multimodal_model=self.model,
             )
-            assert forward_batch.input_embeds is not None, "input_embeds is required"
 
         kwargs = {}
         if self.support_pp:

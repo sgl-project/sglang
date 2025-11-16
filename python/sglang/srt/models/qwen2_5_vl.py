@@ -640,6 +640,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             forward_batch=forward_batch,
             input_embeds=input_embeds,
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         aux_hidden_states = None

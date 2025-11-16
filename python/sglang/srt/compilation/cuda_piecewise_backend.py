@@ -40,27 +40,7 @@ class ConcreteSizeEntry:
 
     compiled: bool = False
     runnable: Callable = None  # type: ignore
-
-    # This change is for supporting piecewise CUDA graph in VLM.
-    # During the initialization phase, we already run 3 forward passes per
-    # capture shape as warmup. Only after that do we start using the piecewise
-    # backend / cudagraph to serve real requests.
-    # If we then add an extra warmup inside CUDAPiecewiseBackend.__call__ on
-    # the real user request, that effectively becomes a duplicate warmup—and
-    # it’s using the real forward_batch state for warmup, which is quite
-    # dangerous, because:
-    # At runtime, PiecewiseCudaGraphRunner uses replay_prepare() to stuff
-    # the user batch into several persistent buffers.
-    # With the combination of buffers / mm_inputs / mrope,
-    # if we call entry.runnable() one more time without any
-    # reset / truncation / correction, some of these buffers can easily
-    # end up in a state that doesn’t match our expectations.
-    # The second request happens to be exactly at the point of
-    # “the first time we ever hit this shape and it triggers warmup again”.
-    # This change is effectively equivalent to disabling the extra warmup
-    # on real requests, and only keeping the 3 warmup runs done during
-    # initialization.
-    num_finished_warmup: int = 1
+    num_finished_warmup: int = 0
     cudagraph: Optional[torch.cuda.CUDAGraph] = None
     output: Optional[Any] = None
 

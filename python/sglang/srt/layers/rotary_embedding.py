@@ -15,6 +15,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -1387,7 +1388,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         ):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
-    # @torch.compile(dynamic=True, backend=get_compiler_backend())
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_native(
         self,
         positions: torch.Tensor,
