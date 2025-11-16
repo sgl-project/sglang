@@ -124,15 +124,7 @@ class CUDAPiecewiseBackend:
             self.check_for_ending_compilation()
             return self.compiled_graph_for_general_shape(*args)
 
-        if not self.sym_shape_indices:
-            # GraphModule no sym shape indices, don't do piecewise
-            return self.compiled_graph_for_general_shape(*args)
-
         runtime_shape = args[self.sym_shape_indices[0]]
-        if isinstance(runtime_shape, torch.Tensor):
-            runtime_shape = int(runtime_shape.item())
-        else:
-            runtime_shape = int(runtime_shape)
 
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
