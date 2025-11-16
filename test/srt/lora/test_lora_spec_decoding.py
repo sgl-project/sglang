@@ -15,7 +15,12 @@
 import multiprocessing as mp
 import unittest
 
-from utils import LoRAAdaptor, LoRAModelCase, run_lora_multiple_batch_on_model_cases
+from utils import (
+    CI_MULTI_LORA_MODELS,
+    LoRAAdaptor,
+    LoRAModelCase,
+    run_lora_multiple_batch_on_model_cases,
+)
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -37,9 +42,24 @@ LORA_MODELS_QWEN3 = [
 ]
 
 
-class TestLoRAQwen3(CustomTestCase):
-    def test_ci_lora_models(self):
-        run_lora_multiple_batch_on_model_cases(LORA_MODELS_QWEN3)
+class TestLoRASpecDecoding(CustomTestCase):
+    def test_qwen(self):
+        run_lora_multiple_batch_on_model_cases(
+            LORA_MODELS_QWEN3,
+            attention_backend="triton",
+            use_spec_decoding=True,
+            disable_cuda_graph=True,
+            enable_deterministic_inference=True,
+        )
+
+    def test_llama(self):
+        run_lora_multiple_batch_on_model_cases(
+            CI_MULTI_LORA_MODELS,
+            attention_backend="triton",
+            use_spec_decoding=True,
+            disable_cuda_graph=True,
+            enable_deterministic_inference=True,
+        )
 
 
 if __name__ == "__main__":

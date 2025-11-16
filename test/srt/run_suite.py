@@ -26,6 +26,7 @@ suites = {
         TestFile("lora/test_lora_eviction.py", 240),
         TestFile("lora/test_lora_update.py", 600),
         TestFile("lora/test_lora_backend.py", 99),
+        TestFile("lora/test_lora_spec_decoding.py", 150),
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
