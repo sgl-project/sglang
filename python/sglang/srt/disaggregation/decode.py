@@ -46,9 +46,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.request_types import FINISH_ABORT, RequestStage
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -67,8 +65,9 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.utils import GenerationBatchResult
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
 
@@ -225,6 +224,8 @@ class DecodePreallocQueue:
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -833,6 +834,8 @@ class SchedulerDisaggregationDecodeMixin:
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:
+        from sglang.srt.managers.utils import GenerationBatchResult
+
         if batch.inner_idle_batch is not None:
             idle_batch = batch.inner_idle_batch
             # Reset the inner idle batch to avoid reusing it.
@@ -884,6 +887,8 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 

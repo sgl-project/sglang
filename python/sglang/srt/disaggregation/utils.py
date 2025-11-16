@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.managers.request_types import FINISH_ABORT
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -346,8 +347,6 @@ def is_mla_backend(target_kv_pool) -> bool:
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 

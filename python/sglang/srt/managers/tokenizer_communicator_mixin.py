@@ -21,6 +21,7 @@ from typing import (
 import fastapi
 import zmq
 
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -68,7 +69,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.server_args import LoRARef, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
 

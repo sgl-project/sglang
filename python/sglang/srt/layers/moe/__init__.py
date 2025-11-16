@@ -1,4 +1,3 @@
-from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     MoeA2ABackend,
@@ -12,6 +11,10 @@ from sglang.srt.layers.moe.utils import (
     is_tbo_enabled,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.utils import LazyImport
+
+MoeRunner = LazyImport("sglang.srt.layers.moe.moe_runner.runner", "MoeRunner")
+MoeRunnerConfig = LazyImport("sglang.srt.layers.moe.moe_runner.base", "MoeRunnerConfig")
 
 __all__ = [
     "DeepEPMode",
