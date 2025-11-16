@@ -58,11 +58,16 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # stage 0: decide hidden_states source
         if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
+            if input_embeds is not None:
                 hidden_states = input_embeds
+            else:
+                if input_ids is None:
+                    raise RuntimeError(
+                        "[Qwen3MoeLLMModel.forward] both input_embeds and input_ids are None on first PP rank."
+                    )
+                hidden_states = self.embed_tokens(input_ids)
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -86,12 +91,29 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 residual,
             )
 
-            # process deepstack
+            # stage 1: process deepstack (MOE: 仅前3层，但加上边界检查)
             if input_deepstack_embeds is not None and layer_idx < 3:
-                sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+                ds = input_deepstack_embeds
+                if ds.dim() != 2:
+                    raise RuntimeError(
+                        f"[Qwen3MoeLLMModel.forward] input_deepstack_embeds.dim={ds.dim()} != 2"
+                    )
+                B_hs, H_hs = hidden_states.size(0), hidden_states.size(-1)
+                B_ds, W = ds.size(0), ds.size(1)
+                B = min(B_hs, B_ds)
+                if B > 0:
+                    if H_hs != self.hidden_size:
+                        raise RuntimeError(
+                            f"[Qwen3MoeLLMModel.forward] hidden_size mismatch: {H_hs} vs model {self.hidden_size}"
+                        )
+                    start = self.hidden_size * layer_idx
+                    end = start + self.hidden_size
+                    if end <= W:
+                        chunk = ds[:B, start:end].to(hidden_states.dtype, copy=False)
+                        hidden_states = hidden_states[:B] + chunk
+                    else:
+                        # 缺块时跳过
+                        pass
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

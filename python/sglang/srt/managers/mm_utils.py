@@ -547,6 +547,15 @@ def embed_mm_inputs(
         if feat.shape[-1] == target_hidden:
             return feat  # 已经对齐
 
+        # ---- DeepStack 优先：如 8192=4*2048。先把主干对齐出来，其余块作为 deepstack 保存到 other_info
+        if feat.shape[-1] % target_hidden == 0 and feat.shape[-1] != target_hidden:
+            k = feat.shape[-1] // target_hidden
+            if k > 1:
+                main = feat[..., :target_hidden]
+                # 把剩余分块收集，供下游 input_deepstack_embeds 同步（若启用）
+                rest = feat[..., target_hidden:]
+                other_info.setdefault("_deepstack_chunks", []).append(rest)
+                return main
         # 候选 projector 名称（尽量覆盖常见实现与别名）
         candidates = [
             f"project_{modality_str}_feature",
@@ -602,12 +611,20 @@ def embed_mm_inputs(
                     f"outputs dim={out.shape[-1]} but hidden={target_hidden}."
                 )
             return out
+        # ---- 临时兜底：仅排障使用
+        import os
 
-        # 没 projector 就显式报错（避免静默降级为随机线性层）
+        import torch.nn as nn
+
+        if os.getenv("SGLANG_MM_TMP_LINEAR_PROJECTOR") == "1":
+            lin = nn.Linear(feat.shape[-1], target_hidden, bias=False).to(
+                feat.device, feat.dtype
+            )
+            return lin(feat)
         raise RuntimeError(
             "[embed_mm_inputs] Found multimodal feature dim "
             f"{feat.shape[-1]} but hidden size is {target_hidden}; no projector found. "
-            "Expose a projector on the model or make `get_*_feature` return aligned features."
+            "Expose a projector or return aligned features; or export SGLANG_MM_TMP_LINEAR_PROJECTOR=1 to use a temporary Linear."
         )
 
     # 2) 逐模态取特征与 mask
@@ -745,10 +762,10 @@ def embed_mm_inputs(
         inputs_embeds[indices] = emb.to(inputs_embeds.device, inputs_embeds.dtype)
 
         # deepstack 同步（仅当该模态启用）
-        if input_deepstack_embeds is not None and use_deepstack.get(modality, False):
-            deep = (
-                deepstack_embeddings.pop(0) if len(deepstack_embeddings) > 0 else None
-            )
+        if input_deepstack_embeds is not None:
+            deep = None
+            if other_info.get("_deepstack_chunks"):
+                deep = other_info["_deepstack_chunks"].pop(0)
             if deep is not None:
                 if deep.shape[0] != len(indices):
                     min_len = min(deep.shape[0], len(indices))

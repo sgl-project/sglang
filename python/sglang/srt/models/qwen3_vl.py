@@ -545,11 +545,18 @@ class Qwen3LLMModel(Qwen3Model):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
+        # stage 0: decide hidden_states source
         if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
+            # 只要上游已经给了 input_embeds，就绝不再触发 embed_tokens()
+            if input_embeds is not None:
                 hidden_states = input_embeds
+            else:
+                # 兼容性防御：input_ids 可能为 None（多模态分支）
+                if input_ids is None:
+                    raise RuntimeError(
+                        "[Qwen3LLMModel.forward] both input_embeds and input_ids are None on first PP rank."
+                    )
+                hidden_states = self.embed_tokens(input_ids)
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -573,13 +580,37 @@ class Qwen3LLMModel(Qwen3Model):
                 residual,
             )
 
-            # process deepstack
+            # stage 1: process deepstack (robust & bounds-checked)
             if (
                 input_deepstack_embeds is not None
                 and layer_idx in self.deepstack_embed_to_decoder_layer
             ):
-                sep = self.hidden_size * layer_idx
-                hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                # 期望 flat 拼接：[..., L*hidden]
+                ds = input_deepstack_embeds
+                if ds.dim() != 2:
+                    # 仅支持 [B, L*H]；如需 [B, L, H] 可在上游 reshape
+                    raise RuntimeError(
+                        f"[Qwen3LLMModel.forward] input_deepstack_embeds.dim={ds.dim()} != 2"
+                    )
+                B_hs, H_hs = hidden_states.size(0), hidden_states.size(-1)
+                B_ds, W = ds.size(0), ds.size(1)
+                # batch 对齐（保守裁剪，不抛错）
+                B = min(B_hs, B_ds)
+                if B == 0:
+                    continue
+                if H_hs != self.hidden_size:
+                    raise RuntimeError(
+                        f"[Qwen3LLMModel.forward] hidden_size mismatch: {H_hs} vs model {self.hidden_size}"
+                    )
+                start = self.hidden_size * layer_idx
+                end = start + self.hidden_size
+                if end <= W:
+                    chunk = ds[:B, start:end].to(hidden_states.dtype, copy=False)
+                    # 避免对 view 做不必要的 in-place；保持可读性
+                    hidden_states = hidden_states[:B] + chunk
+                else:
+                    # 缺块时静默跳过，不杀进程；必要时可改为 warning
+                    pass
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -667,7 +698,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
 
         in_channels = self.visual.patch_embed.in_channels
@@ -676,7 +706,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         per_patch = in_channels * t_patch * p * p
 
         m_size = self.visual.spatial_merge_size
-        patch_group = m_size * m_size 
+        patch_group = m_size * m_size
 
         all_patches = []
         all_grid_thw = []
@@ -689,7 +719,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             if num_full_patches == 0:
                 continue
 
-
             num_groups = num_full_patches // patch_group
             if num_groups == 0:
 
@@ -700,7 +729,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
             patches = flat.view(used_patches, per_patch)
             all_patches.append(patches)
-
 
             grid = torch.tensor(
                 [[num_groups, m_size, m_size]],
@@ -716,13 +744,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 device=self.visual.device,
             )
 
-        pixel_values = torch.cat(all_patches, dim=0)     # [sum_patches, per_patch]
+        pixel_values = torch.cat(all_patches, dim=0)  # [sum_patches, per_patch]
         image_grid_thw = torch.cat(all_grid_thw, dim=0)  # [num_images, 3]
 
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
-
-
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
