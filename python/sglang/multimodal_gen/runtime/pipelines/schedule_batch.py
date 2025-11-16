@@ -235,7 +235,7 @@ class Req:
 
     def set_width_and_height(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
-            width, height = server_args.pipeline_config.set_width_and_height(
+            width, height = server_args.pipeline_config.adjust_size(
                 self.width, self.height, self.pil_image
             )
             self.width = width
