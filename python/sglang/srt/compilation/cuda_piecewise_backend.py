@@ -8,24 +8,12 @@ from unittest.mock import patch
 
 import torch
 import torch.fx as fx
+from sgl_kernel import weak_ref_tensor
 
-import sglang.srt.compilation.weak_ref_tensor_jit  # noqa: F401
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 
 logger = logging.getLogger(__name__)
-
-
-def weak_ref_tensor(tensor: Any) -> Any:
-    """
-    Create a weak reference to a tensor.
-    The new tensor will share the same data as the original tensor,
-    but will not keep the original tensor alive.
-    """
-    if isinstance(tensor, torch.Tensor):
-        # TODO(yuwei): introduce weak_ref_tensor from sgl_kernel
-        return torch.ops.jit_weak_ref_tensor.weak_ref_tensor(tensor)
-    return tensor
 
 
 def weak_ref_tensors(
@@ -135,7 +123,17 @@ class CUDAPiecewiseBackend:
             self.first_run_finished = True
             self.check_for_ending_compilation()
             return self.compiled_graph_for_general_shape(*args)
+
+        if not self.sym_shape_indices:
+            # GraphModule no sym shape indices, don't do piecewise
+            return self.compiled_graph_for_general_shape(*args)
+
         runtime_shape = args[self.sym_shape_indices[0]]
+        if isinstance(runtime_shape, torch.Tensor):
+            runtime_shape = int(runtime_shape.item())
+        else:
+            runtime_shape = int(runtime_shape)
+
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
             return self.compiled_graph_for_general_shape(*args)
