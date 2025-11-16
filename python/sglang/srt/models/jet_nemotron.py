@@ -20,13 +20,10 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2 import Qwen2MLP
+from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
 
 
@@ -235,6 +232,7 @@ class JetNemotronDecoderLayer(nn.Module):
     def __init__(
         self,
         config: JetNemotronConfig,
+        alt_stream: torch.cuda.Stream | None = None,
         layer_id: int = 0,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -305,57 +303,6 @@ class JetNemotronDecoderLayer(nn.Module):
         return hidden_states, None
 
 
-class JetNemotronModel(nn.Module):
-    def __init__(
-        self,
-        config: JetNemotronConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_tokens", prefix),
-        )
-        self.layers = nn.ModuleList(
-            [
-                JetNemotronDecoderLayer(config, layer_id, quant_config, prefix)
-                for layer_id in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers_to_capture = []
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor] = None,
-    ):
-        aux_hidden_states = []
-
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
-
-        for idx, decoder_layer in enumerate(self.layers):
-            if idx in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states)
-            hidden_states, _ = decoder_layer(
-                positions, hidden_states, forward_batch, None
-            )
-
-        hidden_states = self.norm(hidden_states)
-        if aux_hidden_states:
-            return hidden_states, aux_hidden_states
-        return hidden_states
-
-
 class JetNemotronForCausalLM(nn.Module):
     def __init__(
         self,
@@ -368,7 +315,12 @@ class JetNemotronForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        self.model = JetNemotronModel(config, quant_config, prefix)
+        self.model = Qwen2Model(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+            decoder_layer_type=JetNemotronDecoderLayer,
+        )
 
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
