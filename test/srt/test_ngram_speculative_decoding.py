@@ -3,7 +3,7 @@ import json
 import os
 import unittest
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import aiohttp
 import requests
@@ -134,8 +134,6 @@ class TestNgramSpeculativeBatchGeneration(TestNgramSpeculativeDecodingBase):
             "8",
             "--mem-fraction-static",
             "0.7",
-            "--attention-backend",
-            "fa3",
             "--skip-server-warmup",
             "--dtype",
             "float16",
@@ -169,8 +167,14 @@ class TestNgramSpeculativeBatchGeneration(TestNgramSpeculativeDecodingBase):
             )
         )
 
+        self.assertEqual(len(outputs), len(prompts))
         for output in outputs:
-            self.assertTrue(output.strip())
+            self.assertTrue(output["text"].strip())
+            self.assertIsNotNone(output["meta_info"])
+            self.assertIn("spec_verify_ct", output["meta_info"])
+
+        spec_verify_cts = [item["meta_info"]["spec_verify_ct"] for item in outputs]
+        self.assertEqual(spec_verify_cts, [18, 9, 10, 18])
 
 
 async def async_stream_ramp_up_http(
@@ -179,8 +183,8 @@ async def async_stream_ramp_up_http(
     sampling_params: Dict,
     tokens_until_next_request: int,
     tokenizer,
-) -> List[str]:
-    outputs = [""] * len(prompts)
+) -> List[Dict[str, Any]]:
+    outputs = [{"text": "", "meta_info": None} for _ in prompts]
     token_counts = [0] * len(prompts)
     started = [False] * len(prompts)
     tasks: Dict[int, asyncio.Task] = {}
@@ -201,10 +205,13 @@ async def async_stream_ramp_up_http(
                 if not cleaned_chunk:
                     continue
                 pos = len(chunk_text)
-                outputs[idx] += cleaned_chunk
+                outputs[idx]["text"] += cleaned_chunk
                 token_counts[idx] = len(
-                    tokenizer.encode(outputs[idx], truncation=False)
+                    tokenizer.encode(outputs[idx]["text"], truncation=False)
                 )
+                meta_info = payload.get("meta_info")
+                if meta_info:
+                    outputs[idx]["meta_info"] = meta_info
                 await queue.put(("chunk", idx))
         except Exception as exc:  # pragma: no cover - surfaced via queue
             await queue.put(("error", idx, exc))
@@ -277,4 +284,4 @@ async def _stream_server_events(base_url: str, prompt: str, sampling_params: Dic
 
 
 if __name__ == "__main__":
-    unittest.main(defaultTest="TestNgramSpeculativeBatchGeneration.test_batch_generation")
+    unittest.main()
