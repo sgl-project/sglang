@@ -2,7 +2,7 @@
 # This builds the Rust FFI library and provides convenience targets for Go development
 
 # Configuration
-CARGO_BUILD_DIR ?= $(HOME)/cargobuild
+CARGO_BUILD_DIR ?= $(shell pwd)/target
 BUILD_MODE ?= release
 LIB_NAME = libsglang_router_rs
 
@@ -59,7 +59,7 @@ clean:
 	@CARGO_TARGET_DIR=$(CARGO_BUILD_DIR) cargo clean --manifest-path Cargo.toml
 	@echo "Clean complete"
 
-test:
+test: build
 	@echo "Running Go tests..."
 	@go test ./...
 

@@ -4,10 +4,15 @@
 # Usage: ./run.sh [tokenizer_path] [endpoint]
 
 # Set library path for Rust FFI library
-# The library is built by the parent Makefile using CARGO_BUILD_DIR (default: ~/cargobuild)
+# The library is built by the parent Makefile using CARGO_BUILD_DIR (default: ../../../target)
+SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+PARENT_DIR="$(cd "$SCRIPT_DIR" && pwd)"
+# Go up 3 levels: examples/streaming -> examples -> bindings/golang
+BINDINGS_DIR="$(cd "$PARENT_DIR/../.." && pwd)"
+
 if [ -z "$CARGO_BUILD_DIR" ]; then
-    # Default build directory is ~/cargobuild
-    CARGO_BUILD_DIR="${HOME}/cargobuild"
+    # Default build directory is target (relative to bindings/golang)
+    CARGO_BUILD_DIR="${BINDINGS_DIR}/target"
 fi
 LIB_DIR="${CARGO_BUILD_DIR}/release"
 

@@ -96,35 +96,70 @@ func main() {
 ### Streaming Usage
 
 ```go
-stream, err := client.CreateChatCompletionStream(ctx, sglang.ChatCompletionRequest{
-    Model: "default",
-    Messages: []sglang.ChatMessage{
-        {Role: "user", Content: "Tell me a story"},
-    },
-    Stream: true,
-    MaxCompletionTokens: intPtr(500),
-})
-if err != nil {
-    log.Fatal(err)
-}
-defer stream.Close()
+package main
 
-for {
-    chunk, err := stream.Recv()
-    if err == io.EOF {
-        break
-    }
+import (
+    "context"
+    "fmt"
+    "io"
+    "log"
+
+    "github.com/sglang/sglang-go-grpc-sdk"
+)
+
+func main() {
+    // Create client
+    client, err := sglang.NewClient(sglang.ClientConfig{
+        Endpoint:      "grpc://localhost:20000",
+        TokenizerPath: "/path/to/tokenizer",
+    })
     if err != nil {
         log.Fatal(err)
     }
-    
-    for _, choice := range chunk.Choices {
-        if choice.Delta.Content != "" {
-            fmt.Print(choice.Delta.Content)
+    defer client.Close()
+
+    // Create streaming completion
+    ctx := context.Background()
+    stream, err := client.CreateChatCompletionStream(ctx, sglang.ChatCompletionRequest{
+        Model: "default",
+        Messages: []sglang.ChatMessage{
+            {Role: "user", Content: "Tell me a story"},
+        },
+        Stream:              true,
+        MaxCompletionTokens: intPtr(500),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer stream.Close()
+
+    // Read streaming response
+    for {
+        chunk, err := stream.Recv()
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            log.Fatal(err)
+        }
+
+        for _, choice := range chunk.Choices {
+            if choice.Delta.Content != "" {
+                fmt.Print(choice.Delta.Content)
+            }
         }
     }
+    fmt.Println() // newline
 }
-fmt.Println() // newline
+
+// Helper functions for optional pointer fields
+func intPtr(i int) *int {
+    return &i
+}
+
+func float32Ptr(f float32) *float32 {
+    return &f
+}
 ```
 
 ## Examples
@@ -466,9 +501,10 @@ bindings/golang/
 **Error**: `library 'sglang_router_rs' not found`
 
 **Solution**:
-1. Rebuild Rust library: `cd sgl-router && cargo build --release`
-2. Set `CARGO_BUILD_DIR` if using non-standard build location
-3. Ensure Rust toolchain is installed: `rustup toolchain list`
+1. Rebuild Rust library: `cd sgl-router/bindings/golang && make build`
+2. Or manually with cargo: `cd sgl-router/bindings/golang && cargo build --release`
+3. Set `CARGO_BUILD_DIR` if using non-standard build location
+4. Ensure Rust toolchain is installed: `rustup toolchain list`
 
 ### Tests Hanging
 

@@ -279,7 +279,15 @@ func intPtr(i int) *int {
 	return &i
 }
 
-// TestContextCancellation tests that context cancellation is handled
+// TestContextCancellation tests that cancelled context is handled gracefully.
+//
+// NOTE: Currently, the FFI layer is blocking and doesn't actively monitor context cancellation.
+// This test verifies that the client at least returns an error rather than panicking or
+// hanging indefinitely when a pre-cancelled context is passed.
+//
+// Future: When FFI supports context cancellation (via signals or async operations),
+// this test should be updated to assert that the error is context.Canceled or wrapped
+// context cancellation error.
 func TestContextCancellation(t *testing.T) {
 	config := ClientConfig{
 		Endpoint:      "grpc://localhost:20000",
@@ -292,6 +300,7 @@ func TestContextCancellation(t *testing.T) {
 	}
 	defer client.Close()
 
+	// Create a pre-cancelled context
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -302,10 +311,15 @@ func TestContextCancellation(t *testing.T) {
 		},
 	}
 
-	// This should be handled gracefully when context is cancelled
+	// Attempt request with cancelled context
+	// Since FFI is blocking, we expect either:
+	// 1. An error from the server/network
+	// 2. The call to complete normally (FFI doesn't check context)
+	// What we DON'T expect is a panic or indefinite hang
 	_, err = client.CreateChatCompletion(ctx, req)
-	if err == nil {
-		// Either error or cancellation should be detected
-		// This depends on implementation details
+	if err != nil {
+		t.Logf("Request with cancelled context returned error: %v", err)
+	} else {
+		t.Logf("Request with cancelled context completed (FFI may not support context cancellation)")
 	}
 }

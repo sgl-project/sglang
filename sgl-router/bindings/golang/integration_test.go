@@ -11,6 +11,7 @@ package sglang
 
 import (
 	"context"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -116,12 +117,12 @@ func TestIntegrationStreamingCompletion(t *testing.T) {
 
 	for {
 		chunk, err := stream.Recv()
-		if err != nil {
+		if err == io.EOF {
 			// io.EOF is expected at end of stream
-			if err.Error() != "EOF" {
-				t.Fatalf("Stream error: %v", err)
-			}
 			break
+		}
+		if err != nil {
+			t.Fatalf("Stream error: %v", err)
 		}
 
 		chunkCount++

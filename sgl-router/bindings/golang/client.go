@@ -402,8 +402,8 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req ChatComplet
 		return nil, errors.New("client is closed")
 	}
 
-	// Marshal request to JSON
-	// Note: Due to omitempty tag, empty Tools slice will be omitted from JSON.
+	// Marshal request to JSON, then ensure tools field is always present.
+	// Due to omitempty tag, empty Tools slice will be omitted from JSON.
 	// We need to ensure tools field is always present as [] when empty (not omitted),
 	// matching the behavior of complete_sdk example.
 	reqJSON, err := json.Marshal(req)
@@ -411,19 +411,21 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req ChatComplet
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// If Tools is nil or empty, manually add "tools": [] to JSON
-	if req.Tools == nil || len(req.Tools) == 0 {
-		var reqMap map[string]interface{}
-		if err := json.Unmarshal(reqJSON, &reqMap); err == nil {
-			// Check if tools field was omitted
-			if _, exists := reqMap["tools"]; !exists {
-				reqMap["tools"] = []interface{}{}
-				reqJSON, err = json.Marshal(reqMap)
-				if err != nil {
-					return nil, fmt.Errorf("failed to add tools field: %w", err)
-				}
-			}
-		}
+	// Unmarshal into map and ensure tools field is present
+	var reqMap map[string]interface{}
+	if err := json.Unmarshal(reqJSON, &reqMap); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal request to map: %w", err)
+	}
+
+	// Add empty tools array if not present
+	if _, exists := reqMap["tools"]; !exists {
+		reqMap["tools"] = []interface{}{}
+	}
+
+	// Marshal back to JSON
+	reqJSON, err = json.Marshal(reqMap)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request map to JSON: %w", err)
 	}
 
 	// Create stream
