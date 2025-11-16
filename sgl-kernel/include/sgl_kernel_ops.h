@@ -317,6 +317,13 @@ void topk_softmax(
     double moe_softcapping,
     const c10::optional<torch::Tensor>& correction_bias);
 
+void topk_sigmoid(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
+    const c10::optional<torch::Tensor>& correction_bias);
+
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
