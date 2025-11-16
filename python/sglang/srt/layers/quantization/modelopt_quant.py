@@ -11,6 +11,8 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from flashinfer.fused_moe.core import ActivationType
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
@@ -104,6 +106,10 @@ FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
+ACT_STR_TO_TYPE_MAP = {
+        "silu": ActivationType.Swiglu,  # This is the default
+        "relu2": ActivationType.Relu2,
+        }
 
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
@@ -402,11 +408,11 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             else params_dtype
         )
         weight_loader = extra_weight_attrs.get("weight_loader")
-
+        intermediate_size =  2 * intermediate_size_per_partition if layer.moe_runner_config.is_gated else intermediate_size_per_partition
         w13_weight = ModelWeightParameter(
             data=torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                intermediate_size,
                 hidden_size,
                 dtype=weight_dtype,
             ),
@@ -433,9 +439,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             # WEIGHT SCALES - Per-tensor scaling for ModelOpts
             # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
+            w13_scale_shape = (num_experts, 2) if layer.moe_runner_config.is_gated else (num_experts, 1)
             w13_weight_scale = PerTensorScaleParameter(
                 data=torch.full(
-                    (num_experts, 2),
+                    w13_scale_shape,
                     torch.finfo(torch.float32).min,
                     dtype=torch.float32,
                 ),
@@ -487,10 +494,11 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 # Requantize each expert's weights using the combined scale
                 # w13_weight has shape (num_experts, 2 * intermediate_size_per_partition, hidden_size)
                 # where the first intermediate_size_per_partition rows are w1, the next are w3
-                intermediate_size_per_partition = layer.w13_weight.shape[1] // 2
+                num_weights = 2 if layer.moe_runner_config.is_gated else 1
+                intermediate_size_per_partition = layer.w13_weight.shape[1] // num_weights
                 for expert_id in range(layer.w13_weight.shape[0]):
                     start = 0
-                    for shard_id in range(2):  # w1 and w3
+                    for shard_id in range(num_weights):  # (w1 and w3) or w13
                         # Dequantize using the original scale for this shard
                         dq_weight = per_tensor_dequantize(
                             layer.w13_weight[expert_id][
@@ -605,6 +613,29 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             layer.output2_scales_scalar = Parameter(
                 output2_scales_scalar, requires_grad=False
             )
+        elif get_moe_runner_backend().is_flashinfer_cutlass():
+            assert (
+                hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
+            )
+            assert hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None
+            assert (
+                hasattr(layer, "w13_weight_scale")
+                and layer.w13_weight_scale is not None
+            )
+            assert (
+                hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None
+            )
+
+            input_scale = layer.w13_input_scale.to(torch.float32)
+            activation_scale = layer.w2_input_scale.to(torch.float32)
+            w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
+            w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
+
+            layer.fc1_dequant = Parameter(w13_weight_scale * input_scale, requires_grad=False)
+            layer.fc2_quant = Parameter(activation_scale.reciprocal(), requires_grad=False)
+            layer.fc2_dequant = Parameter(activation_scale * w2_weight_scale, requires_grad=False)
+            layer.fc1_input_dequant = Parameter(input_scale, requires_grad=False)
+
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -698,6 +729,51 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                 )
+
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            return StandardCombineInput(hidden_states=output)
+
+
+        if get_moe_runner_backend().is_flashinfer_cutlass():
+            activation = ACT_STR_TO_TYPE_MAP[self.moe_runner_config.activation]
+            assert (
+                (activation is ActivationType.Relu2 and not self.moe_runner_config.is_gated) or activation is ActivationType.Swiglu and self.moe_runner_config.is_gated
+            ), "Only Relu2 non-gated or Swiglu gated are supported for flashinfer cutlass fp8 moe"
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
+            output_dtype = x.dtype
+            original_col = x.shape[1]
+            x_sf = None
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty(
+                    x.shape[0], original_col, dtype=output_dtype, device=x.device
+                )
+            output = flashinfer_cutlass_fused_moe(
+                output=symm_output,
+                input=x_fp8,
+                token_selected_experts=topk_ids.to(torch.int),
+                token_final_scales=topk_weights,
+                fc1_expert_weights=layer.w13_weight,
+                fc2_expert_weights=layer.w2_weight,
+                output_dtype=output_dtype,
+                input_sf=x_sf,
+                quant_scales=[
+                    layer.fc1_dequant,
+                    layer.fc2_quant,
+                    layer.fc2_dequant,
+                    layer.fc1_input_dequant,
+                ],
+                ep_size=layer.moe_ep_size,
+                ep_rank=layer.moe_ep_rank,
+                tp_size=layer.moe_tp_size,
+                tp_rank=layer.moe_tp_rank,
+                tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                activation_type=activation
+            )[0]
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 

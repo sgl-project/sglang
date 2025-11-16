@@ -1066,6 +1066,17 @@ class ServerArgs:
                 f"Disabling Radix Cache for {model_arch} as it is not yet supported."
             )
             self.disable_radix_cache = True
+        elif model_arch in ["NemotronHForCausalLM"]:
+            if self.model_config.quantization in ["modelopt", "modelopt_fp8", "modelopt_fp4"]:
+                assert (
+                    self.model_config.hf_config.mlp_hidden_act == "relu2"
+                )
+                assert (
+                    self.model_config.quantization != "model_opt_fp4", 
+                    "NemotronH model does not support modelopt_fp4 quantization yet."
+                )
+                self.quantization = "modelopt_fp4"if self.model_config.hf_config.quantization_config["quant_algo"] == "NVFP4" else "modelopt_fp8"
+                self.moe_runner_backend = "flashinfer_cutlass"
 
         if is_deepseek_nsa(hf_config):
             if (
@@ -1401,8 +1412,8 @@ class ServerArgs:
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
-                self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer Cutlass MOE"
+                self.quantization in ["modelopt_fp4", "modelopt_fp8"]
+            ), "modelopt_fp4/8 quantization is required for Flashinfer Cutlass MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,
