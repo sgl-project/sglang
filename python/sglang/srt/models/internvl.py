@@ -48,7 +48,6 @@ class InternAttention(nn.Module):
         self.scale = self.head_dim**-0.5
 
         self.attn = VisionAttention(
-            qkv_backend="fa3",
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
             projection_size=self.embed_dim,
