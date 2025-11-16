@@ -5,12 +5,8 @@
 
 # Set library path for Rust FFI library
 # The library should be in ./lib directory (created by 'make lib')
-SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
-PARENT_DIR="$(cd "$SCRIPT_DIR" && pwd)"
-# Go up 3 levels: examples/streaming -> examples -> bindings/golang
-BINDINGS_DIR="$(cd "$PARENT_DIR/../.." && pwd)"
-
-LIB_DIR="${BINDINGS_DIR}/lib"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)/lib"
 
 # Check if lib directory exists
 if [ ! -d "$LIB_DIR" ]; then
