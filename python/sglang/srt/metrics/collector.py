@@ -488,6 +488,11 @@ class SchedulerMetricsCollector:
             documentation="Number of grammar aborted requests.",
             labelnames=labels.keys(),
         )
+        self.num_grammar_timeout = Counter(
+            name="sglang:num_grammar_timeout_total",
+            documentation="Number of grammar timeouts.",
+            labelnames=labels.keys(),
+        )
         self.num_grammar_total = Counter(
             name="sglang:num_grammar_total",
             documentation="Number of the total grammar requests.",
@@ -702,6 +707,9 @@ class SchedulerMetricsCollector:
             self.num_grammar_cache_hit.labels(**self.labels).inc(1)
         if getattr(grammar_stats, "is_grammar_aborted", False):
             self.num_grammar_aborted.labels(**self.labels).inc(1)
+        num_timeout = getattr(grammar_stats, "num_timeout", 0)
+        if num_timeout > 0:
+            self.num_grammar_timeout.labels(**self.labels).inc(num_timeout)
         self.num_grammar_total.labels(**self.labels).inc(1)
 
 
