@@ -660,10 +660,6 @@ if __name__ == "__main__":
 
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
-    else:
-        raise ValueError(
-            "Please specify --auto-partition-size for auto load balancing."
-        )
 
     print("The running tests are ", [f.name for f in files])
 
