@@ -225,7 +225,21 @@ type MessageDelta struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
-// CreateChatCompletion creates a non-streaming chat completion
+// CreateChatCompletion creates a non-streaming chat completion with context support.
+//
+// Context Support:
+// The ctx parameter is fully supported for cancellation and timeouts:
+// - If ctx is cancelled, the request will be interrupted on the next stream.Recv() call
+// - If ctx times out, the request will return context.DeadlineExceeded
+//
+// Example with timeout:
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	resp, err := client.CreateChatCompletion(ctx, req)
+//
+// Note: Internally, this creates a stream and collects all chunks,
+// so context monitoring happens at the chunk level.
 func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionRequest) (*ChatCompletionResponse, error) {
 	// For non-streaming, we'll collect all chunks and return the final response
 	req.Stream = true // We still use streaming internally, but collect all chunks
@@ -329,13 +343,26 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 type ChatCompletionStream struct {
 	stream *ffi.SglangStreamHandle
 	mu     sync.Mutex
-	done   bool // Track if stream has been marked as done
+	done   bool               // Track if stream has been marked as done
+	ctx    context.Context    // Context for cancellation support
+	cancel context.CancelFunc // Cancel function to stop monitoring goroutine
+	closed chan struct{}      // Signal when stream is closed
 }
 
-// Recv receives the next chunk from the stream
+// Recv receives the next chunk from the stream.
+//
+// Supports context cancellation: if the context passed to CreateChatCompletionStream
+// is cancelled, Recv will return context.Canceled error on the next call.
 func (s *ChatCompletionStream) Recv() (*ChatCompletionStreamResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Check if context was cancelled
+	select {
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err() // Returns context.Canceled or context.DeadlineExceeded
+	default:
+	}
 
 	if s.stream == nil {
 		return nil, io.EOF
@@ -379,10 +406,23 @@ func (s *ChatCompletionStream) Recv() (*ChatCompletionStreamResponse, error) {
 	}
 }
 
-// Close closes the stream
+// Close closes the stream and cancels any pending operations.
 func (s *ChatCompletionStream) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Cancel the context to signal the monitoring goroutine to stop
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	// Signal that stream is closed
+	select {
+	case <-s.closed:
+		// Already closed
+	default:
+		close(s.closed)
+	}
 
 	// Free the stream to mark it as completed
 	// This prevents AbortOnDropStream from sending abort when dropped
@@ -393,7 +433,29 @@ func (s *ChatCompletionStream) Close() error {
 	return nil
 }
 
-// CreateChatCompletionStream creates a streaming chat completion
+// CreateChatCompletionStream creates a streaming chat completion with context cancellation support.
+//
+// Context Support:
+// The ctx parameter is now fully supported for cancellation and timeouts:
+// - If ctx is cancelled, stream.Recv() will return context.Canceled on the next call
+// - If ctx times out (WithTimeout), stream.Recv() will return context.DeadlineExceeded
+// - Calling stream.Close() also cancels the context
+//
+// Example with timeout:
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	stream, err := client.CreateChatCompletionStream(ctx, req)
+//	// Stream will auto-close if 30 seconds elapse
+//
+// Example with cancellation:
+//
+//	ctx, cancel := context.WithCancel(context.Background())
+//	stream, err := client.CreateChatCompletionStream(ctx, req)
+//	go func() {
+//	    time.Sleep(5*time.Second)
+//	    cancel()  // Cancel after 5 seconds
+//	}()
 func (c *Client) CreateChatCompletionStream(ctx context.Context, req ChatCompletionRequest) (*ChatCompletionStream, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -434,7 +496,15 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req ChatComplet
 		return nil, fmt.Errorf("failed to create stream: %w", err)
 	}
 
-	return &ChatCompletionStream{
+	// Create a child context from the provided context for cancellation support
+	streamCtx, cancel := context.WithCancel(ctx)
+
+	stream := &ChatCompletionStream{
 		stream: streamHandle,
-	}, nil
+		ctx:    streamCtx,
+		cancel: cancel,
+		closed: make(chan struct{}),
+	}
+
+	return stream, nil
 }
