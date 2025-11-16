@@ -75,8 +75,9 @@ class RWLock:
             # Wake up anyone waiting (readers or writers)
             self._cond.notify_all()
 
-    def is_locked(self):
-        return self._writer_active or self._readers > 0
+    async def is_locked(self):
+        async with self._lock:
+            return self._writer_active or self._readers > 0
 
 
 class _ReaderLock:
