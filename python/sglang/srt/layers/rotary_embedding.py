@@ -1481,6 +1481,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.contiguous()
+        sin = sin.contiguous()
         query_shape = query.shape
         key_shape = key.shape
         if positions.ndim == 2:
