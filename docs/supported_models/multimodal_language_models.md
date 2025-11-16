@@ -45,6 +45,7 @@ in the GitHub search bar.
 | **DotsVLM** (General/OCR)  | `rednote-hilab/dots.vlm1.inst`             | RedNote's vision-language model built on a 1.2B vision encoder and DeepSeek V3 LLM, featuring NaViT vision encoder trained from scratch with dynamic resolution support and enhanced OCR capabilities through structured image data training. |  |
 | **DotsVLM-OCR**            | `rednote-hilab/dots.ocr`                   | Specialized OCR variant of DotsVLM optimized for optical character recognition tasks with enhanced text extraction and document understanding capabilities. | Don't use `--trust-remote-code` |
 | **NVILA** (8B, 15B, Lite-2B, Lite-8B, Lite-15B) | `Efficient-Large-Model/NVILA-8B` | `chatml` | NVILA explores the full stack efficiency of multi-modal design, achieving cheaper training, faster deployment and better performance. |
+| **OpenVLA** (7B)           | `openvla/openvla-7b` | An open source Vision-Language-Action model. Adaptation to SGLang as part of [RoboMonkey](https://robomonkey-vla.github.io/)'s test-time scaling for VLAs. |   |
 
 ## Video Input Support
 
