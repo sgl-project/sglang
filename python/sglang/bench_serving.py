@@ -1383,6 +1383,7 @@ def create_mm_data_row(
     vision_prompt_len = prompt_len - text_prompt_len
 
     use_raw_prompt = backend in [
+        "sglang",
         "sglang-oai",
         "sglang-oai-chat",
         "vllm",

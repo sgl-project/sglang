@@ -3,9 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_dimensions
-
 from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
+from sglang.multimodal_gen.utils import calculate_dimensions
 
 
 @dataclass
