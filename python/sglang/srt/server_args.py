@@ -3895,6 +3895,13 @@ class ServerArgs:
                 )
 
         if self.enable_lora:
+            # Validate compatibility with speculative decoding
+            if self.speculative_algorithm not in ["NGRAM", None]:
+                raise ValueError(
+                    "Currently LoRA is only compatible with NGRAM speculative decoding."
+                )
+
+            # Parse lora_paths
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
                 self.lora_paths = []

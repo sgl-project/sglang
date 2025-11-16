@@ -310,7 +310,10 @@ class CudaGraphRunner:
             set_torch_compile_config()
 
         if self.model_runner.server_args.enable_lora:
-            self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
+            self.model_runner.lora_manager.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=self.max_bs,
+                num_tokens_per_bs=self.num_tokens_per_bs,
+            )
 
         # Graph inputs
         with torch.device(self.device):
