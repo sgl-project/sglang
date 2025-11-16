@@ -17,7 +17,12 @@ if TYPE_CHECKING:
 
 
 class NgramDecodeCudaGraphRunner(CudaGraphRunner):
-    """Cuda graph runner for decode batches using the dedicated ngram backend."""
+    """
+    Cuda graph runner for decode batches using the dedicated attention backend.
+    We patch graph runner with target_decode_attn_backend from ngram worker.
+    The KV cache management including req_to_token_pool and token_to_kv_pool
+    is shared between specdecode and non-specdecode.
+    """
 
     def __init__(self, ngram_worker: "NGRAMWorker"):
         self.ngram_worker = ngram_worker

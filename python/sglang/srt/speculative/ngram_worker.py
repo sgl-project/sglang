@@ -1,10 +1,15 @@
 import logging
+import time
 from typing import List, Optional
 
 import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.layers.attention.attention_registry import (
+    ATTENTION_BACKENDS,
+    attn_backend_wrapper,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -18,7 +23,8 @@ from sglang.srt.speculative.ngram_decode_graph_runner import (
     NgramDecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_available_gpu_memory
+
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +73,13 @@ class NGRAMWorker:
         self.cuda_graph_runner_for_decode = None
         if server_args.speculative_batch_size_threshold is not None:
             # Initialize a separate cuda runner and attention backend from verify
-            # TODO: Support different attention backend
-            from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-            from sglang.srt.utils import get_available_gpu_memory
-            import time
-            self.target_decode_attn_backend = FlashAttentionBackend(
-                self.target_worker.model_runner,
-                skip_prefill=True,
-            )
+            # TODO: Refactor to unify with model_runner on the attn selection.
+            backend_str = server_args.attention_backend
+            if backend_str not in ATTENTION_BACKENDS:
+                raise ValueError(f"Invalid attention backend: {backend_str}")
+            full_attention_backend = ATTENTION_BACKENDS[backend_str](self.model_runner)
+            attn_backend = attn_backend_wrapper(self.model_runner, full_attention_backend)
+            self.target_decode_attn_backend = attn_backend
             self.cuda_graph_runner_for_decode = NgramDecodeCudaGraphRunner(self)
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory("cuda", gpu_id)

@@ -757,6 +757,7 @@ def decode_attention_fwd(
             xai_temperature_len=xai_temperature_len,
         )
     else:
+        # GQA/MQA/MLA
         decode_attention_fwd_grouped(
             q,
             k_buffer,

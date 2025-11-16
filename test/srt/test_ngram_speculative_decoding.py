@@ -13,7 +13,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
     DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -121,8 +120,7 @@ class TestNgramSpeculativeDecodingPaged(TestNgramSpeculativeDecodingBase):
 
 
 class TestNgramSpeculativeBatchGeneration(TestNgramSpeculativeDecodingBase):
-    model = "/shared/public/elr-models/Qwen/Qwen3-4B/9e1b55c76f4b5bf0d14d37da8010110060f512e0"
-    base_gpu_id = int(os.environ.get("BASE_GPU_ID", 0))
+    model = DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST
 
     @classmethod
     def get_server_args(cls):
@@ -138,11 +136,7 @@ class TestNgramSpeculativeBatchGeneration(TestNgramSpeculativeDecodingBase):
             "0.7",
             "--attention-backend",
             "fa3",
-            "--watchdog-timeout",
-            "30000",
             "--skip-server-warmup",
-            "--base-gpu-id",
-            str(cls.base_gpu_id),
             "--dtype",
             "float16",
             "--speculative-batch-size-threshold",
@@ -151,7 +145,7 @@ class TestNgramSpeculativeBatchGeneration(TestNgramSpeculativeDecodingBase):
 
     def test_batch_generation(self):
         """
-        We gradually send over requests with 10 tokens per request to mimic the increase
+        We gradually send over requests every 10 tokens per request to mimic the increase
         in the running batch size.
         """
         requests.get(self.base_url + "/flush_cache")
