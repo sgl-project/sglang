@@ -35,8 +35,6 @@ class TestDeepseekV3FP4(CustomTestCase):
             "modelopt_fp4",
             "--kv-cache-dtype",
             "fp8_e4m3",
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -108,8 +106,6 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "4",
             "--kv-cache-dtype",
             "fp8_e4m3",
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -188,8 +184,6 @@ class TestDeepseekV3FP4CutlassMoE(CustomTestCase):
             "flashinfer_cutlass",
             "--quantization",
             "modelopt_fp4",
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
         ]
         cls.process = popen_launch_server(
             cls.model,
