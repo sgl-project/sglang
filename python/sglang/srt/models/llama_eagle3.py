@@ -157,10 +157,8 @@ class LlamaModel(nn.Module):
 
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
-        if forward_batch.target_hidden_states is not None:
-            hidden_states = forward_batch.target_hidden_states
-        else:
-            hidden_states = forward_batch.spec_info.hidden_states
+
+        hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 

@@ -1111,8 +1111,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Dynamic Spec Decode
     # Enable/disable speculative decoding from batch to batch
     is_spec_enabled_for_batch: bool = False
-    # Turn off: need to handle output_ids, set to False once
-    # output_ids handled
+    # Turn off: need to extract last output_ids, set to False once
+    # output_ids handled.
     turning_off_specdecode: bool = False
 
     # Whether to return hidden states
@@ -1777,7 +1777,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 has_been_filtered = True
             if not self.is_spec_enabled_for_batch:
-                # Decode mode does not filter batch
                 has_been_filtered = False
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
