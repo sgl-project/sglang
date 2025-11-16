@@ -119,7 +119,7 @@ jobs:
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
-              - "python/sglang/pyproject.*"
+              - "python/*.toml"
               - ".github/workflows/pr-test.yml"
 
   # =============================================== sgl-kernel ====================================================
