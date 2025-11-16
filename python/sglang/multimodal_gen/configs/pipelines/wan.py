@@ -37,7 +37,7 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 
 
 @dataclass
-class WanI2VCommonConfig:
+class WanI2VCommonConfig(PipelineConfig):
     # for all wan i2v pipelines
     def adjust_num_frames(self, num_frames):
         vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
