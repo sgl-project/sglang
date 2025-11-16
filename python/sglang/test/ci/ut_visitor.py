@@ -1,4 +1,3 @@
-import argparse
 import ast
 import logging
 from dataclasses import dataclass, field
@@ -14,7 +13,7 @@ class HWBackend(Enum):
 
 
 @dataclass
-class HWConfig:
+class CIRegistry:
     backend: HWBackend
     estimation_time: float
     stage: str
@@ -24,7 +23,7 @@ class HWConfig:
 class CITest:
     filename: str
     testname: str
-    hw_configs: list[HWConfig] = field(default_factory=list)
+    ci_registry: list[CIRegistry] = field(default_factory=list)
 
 
 REGISTER_MAPPING = {
@@ -34,7 +33,7 @@ REGISTER_MAPPING = {
 }
 
 
-def skip_ci(reason: str):
+def skip_ci():
     def wrapper(fn):
         return fn
 
@@ -56,11 +55,11 @@ def register_amd_ci(esimation_time: float, ci_stage: str):
 
 
 class TestCaseVisitor(ast.NodeVisitor):
-    def __init__(self):
-        self.has_custom_test_case = False
-        self.ut_registries = []
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.ci_tests: list[CITest] = []
 
-    def _collect_ci(self, dec):
+    def _collect_ci_registry(self, dec):
         if not isinstance(dec, ast.Call):
             logger.info(f"skip non-call decorator: {ast.dump(dec)}")
             return None
@@ -74,7 +73,7 @@ class TestCaseVisitor(ast.NodeVisitor):
 
         hw = REGISTER_MAPPING[dec.func.id]
         if hw == HWBackend.SKIP:
-            return HWConfig(backend=hw, estimation_time=0, stage="")
+            return CIRegistry(backend=hw, estimation_time=0, stage="")
 
         # parse arguments
         est_time = None
@@ -98,7 +97,7 @@ class TestCaseVisitor(ast.NodeVisitor):
             est_time is not None
         ), "esimation_time is required and should be a constant"
         assert ci_stage is not None, "ci_stage is required and should be a constant"
-        return HWConfig(backend=hw, estimation_time=est_time, stage=ci_stage)
+        return CIRegistry(backend=hw, estimation_time=est_time, stage=ci_stage)
 
     def visit_ClassDef(self, node):
         for base in node.bases:
@@ -107,39 +106,45 @@ class TestCaseVisitor(ast.NodeVisitor):
             if not is_ci_test_case:
                 continue
 
-            self.has_custom_test_case = True
+            ci_test = CITest(filename=self.filename, testname=node.name)
+            self.ci_tests.append(ci_test)
+
             for dec in node.decorator_list:
-                hw_config = self._collect_ci(dec)
-                if hw_config is not None:
-                    self.ut_registries.append(hw_config)
+                ci_registry = self._collect_ci_registry(dec)
+                if ci_registry is not None:
+                    ci_test.ci_registry.append(ci_registry)
 
         self.generic_visit(node)
 
 
-CustomTestCase = object
-
-
-@register_cuda_ci(esimation_time=300, ci_stage="1-gpu")
-class TestGGUF(CustomTestCase):
-    def test_models(self):
-        pass
-
-
-def test_main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--file", type=str, required=True)
-    args = parser.parse_args()
-
-    with open(args.file, "r") as f:
+def ut_parse_one_file(file_path: str):
+    with open(file_path, "r") as f:
         file_content = f.read()
-    tree = ast.parse(file_content, filename=args.file)
-    visitor = TestCaseVisitor()
+    tree = ast.parse(file_content, filename=file_path)
+    visitor = TestCaseVisitor(file_path)
     visitor.visit(tree)
-
-    print(f"{visitor.has_custom_test_case=}")
-    for reg in visitor.ut_registries:
-        print(f"{reg=}")
+    return visitor
 
 
-if __name__ == "__main__":
-    test_main()
+def collect_all_tests(files: list[str], sanity_check: bool = True) -> list[CITest]:
+    ci_tests = []
+    for file in files:
+        visitor = ut_parse_one_file(file)
+        if sanity_check and len(visitor.ci_tests) == 0:
+            raise ValueError(f"No CustomTestCase found in {file}")
+
+        for reg in visitor.ci_tests:
+            if sanity_check:
+                if len(reg.ci_registry) == 0:
+                    raise ValueError(
+                        f"No CI registry found in CustomTestCase {reg.testname} in {file}"
+                    )
+
+                if len(reg.ci_registry) > 1 and any(
+                    r.backend == HWBackend.SKIP for r in reg.ci_registry
+                ):
+                    raise ValueError(
+                        f"Conflicting CI registry found in CustomTestCase {reg.testname} in {file}"
+                    )
+
+        ci_tests.extend(visitor.ci_tests)
