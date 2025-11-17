@@ -112,17 +112,28 @@ def test_circuit_breaker_disable_flag(router_manager, mock_workers):
             "disable_retries": True,
         },
     )
-    r = requests.post(
-        f"{rh.url}/v1/completions",
-        json={
-            "model": "test-model",
-            "prompt": "x",
-            "max_tokens": 1,
-            "stream": False,
-        },
-        timeout=3,
-    )
-    assert r.status_code == 500
+
+    saw_500 = False
+    for _ in range(8):
+        r = requests.post(
+            f"{rh.url}/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "x",
+                "max_tokens": 1,
+                "stream": False,
+            },
+            timeout=3,
+        )
+        if r.status_code == 500:
+            # Worker starts, continue to check
+            saw_500 = True
+            break
+        assert (
+            r.status_code == 503
+        ), "Should only see 503 when waiting for worker to start"
+
+    assert saw_500
 
 
 @pytest.mark.integration
