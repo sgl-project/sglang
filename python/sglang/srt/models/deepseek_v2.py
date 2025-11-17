@@ -417,15 +417,12 @@ def handle_attention_aiter(attn, forward_batch):
 
 def handle_attention_nsa(attn, forward_batch):
     """
-    Dispatch logic is centralized in NativeSparseAttnBackend.should_use_mha()
-    and executed in init_forward_metadata.
+    Dispatch logic is centralized in NativeSparseAttnBackend and executed
+    in init_forward_metadata. Read the decision from backend.use_mha.
     """
     backend = forward_batch.attn_backend
-    if hasattr(backend, "should_use_mha") and backend.should_use_mha(
-        forward_batch, attn
-    )  and (not is_nsa_enable_prefill_cp()):
+    if hasattr(backend, "use_mha") and backend.use_mha and (not is_nsa_enable_prefill_cp()):
         return AttnForwardMethod.MHA_ONE_SHOT
-
     return AttnForwardMethod.MLA
 
 
