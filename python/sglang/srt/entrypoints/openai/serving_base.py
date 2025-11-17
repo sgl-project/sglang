@@ -88,6 +88,8 @@ class OpenAIServingBase(ABC):
         """Handle the specific request type with common pattern
         If you want to override this method, you should be careful to record the validation time.
         """
+        created_time_ts = time.time()
+
         try:
             # Validate request
             validation_start = time.perf_counter()
@@ -102,6 +104,9 @@ class OpenAIServingBase(ABC):
             )
             if hasattr(adapted_request, "validation_time"):
                 adapted_request.validation_time = validation_time
+
+            if hasattr(adapted_request, "created_time_ts"):
+                adapted_request.created_time_ts = created_time_ts
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:

@@ -200,6 +200,9 @@ class GenerateReqInput(BaseReq):
     # Validation step duration
     validation_time: Optional[float] = None
 
+    # Request arrival time
+    created_time_ts: Optional[float] = None
+
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
@@ -739,6 +742,8 @@ class EmbeddingReqInput(BaseReq):
     modalities: Optional[List[str]] = None
     # Validation step duration
     validation_time: Optional[float] = None
+    # Request arrival time
+    created_time_ts: Optional[float] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
     # Priority for the request
