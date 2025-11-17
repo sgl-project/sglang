@@ -340,6 +340,15 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
     steps:
+      - name: Kill lingering processes and cleanup workspace
+        run: |
+          pkill -f "python.*sglang" || true
+          pkill -f "python.*bench_serving" || true
+          pkill -f "pytest" || true
+          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
+          sleep 2
+          sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -481,6 +490,15 @@ jobs:
       matrix:
         part: [0, 1]
     steps:
+      - name: Kill lingering processes and cleanup workspace
+        run: |
+          pkill -f "python.*sglang" || true
+          pkill -f "python.*bench_serving" || true
+          pkill -f "pytest" || true
+          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
+          sleep 2
+          sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -786,6 +804,15 @@ jobs:
     env:
       RUNNER_LABELS: 2-gpu-runner
     steps:
+      - name: Kill lingering processes and cleanup workspace
+        run: |
+          pkill -f "python.*sglang" || true
+          pkill -f "python.*bench_serving" || true
+          pkill -f "pytest" || true
+          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
+          sleep 2
+          sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -886,6 +913,15 @@ jobs:
     env:
       RUNNER_LABELS: 2-gpu-runner
     steps:
+      - name: Kill lingering processes and cleanup workspace
+        run: |
+          pkill -f "python.*sglang" || true
+          pkill -f "python.*bench_serving" || true
+          pkill -f "pytest" || true
+          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
+          sleep 2
+          sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
       - name: Checkout code
         uses: actions/checkout@v4
 
