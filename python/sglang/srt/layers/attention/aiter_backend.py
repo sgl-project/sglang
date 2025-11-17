@@ -1041,8 +1041,10 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     if self.kv_cache_dtype == fp8_dtype:
-                        kvc = kvc.to(torch.bfloat16)
-                        k_pe = k_pe.to(torch.bfloat16)
+                        dtype = q.dtype
+
+                        kvc = kvc.to(dtype)
+                        k_pe = k_pe.to(dtype)
 
                     kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
 
@@ -1201,6 +1203,11 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
+            if self.kv_cache_dtype == fp8_dtype:
+                dtype = q.dtype
+                k_cache = k_cache.to(dtype)
+                v_cache = v_cache.to(dtype)
+
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
@@ -1289,16 +1296,23 @@ class AiterAttnBackend(AttentionBackend):
             # k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
         else:
             self.logits_soft_cap = layer.logit_cap
+
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+
+            if self.kv_cache_dtype == fp8_dtype:
+                dtype = q.dtype
+
+                k_cache = k_cache.to(dtype)
+                v_cache = v_cache.to(dtype)
+
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 self.workspace_buffer,
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                    -1, 1, layer.tp_k_head_num, layer.qk_head_dim
-                ),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                    -1, 1, layer.tp_v_head_num, layer.v_head_dim
-                ),
+                k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
                 self.scale,
                 self.forward_metadata.kv_indptr,
                 self.forward_metadata.kv_indices,
