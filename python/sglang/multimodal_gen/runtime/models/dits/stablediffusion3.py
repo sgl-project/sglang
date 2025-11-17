@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.models.dits.stable_diffusion_3 import StableDiffusion3TransformerConfig
+from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import StableDiffusion3TransformerConfig
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
