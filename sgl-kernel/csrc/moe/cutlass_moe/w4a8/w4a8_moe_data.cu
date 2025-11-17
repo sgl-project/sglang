@@ -62,14 +62,12 @@ cumsum_block_scan(const int32_t* __restrict__ input, int32_t* __restrict__ outpu
 
   int tid = threadIdx.x;
   int32_t base_prefix_sum = 0;
-  // Optimized: precompute number of chunks to reduce branch overhead
   const int num_chunks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
   for (int chunk = 0; chunk < num_chunks; chunk++) {
     const int base_idx = chunk * BLOCK_SIZE;
     const int index = base_idx + tid;
 
-    // Load value with conditional to avoid out-of-bounds access
     const int32_t val = (index < n) ? input[index * input_stride] : 0;
     int32_t local_prefix_sum;
     BlockScan(temp_scan_storage).InclusiveSum(val, local_prefix_sum);
@@ -77,7 +75,6 @@ cumsum_block_scan(const int32_t* __restrict__ input, int32_t* __restrict__ outpu
     if (index < n) {
       output[index] = prefix_sum;
     }
-    // Optimized: only synchronize and broadcast when needed (not on last chunk)
     if (chunk < num_chunks - 1) {
       if (tid == BLOCK_SIZE - 1) {
         s_broadcast_val = prefix_sum;
