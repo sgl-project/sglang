@@ -144,7 +144,7 @@ To host a model with your own container, follow the following steps:
 <summary>Dockerfile Build Script: <code>build-and-push.sh</code></summary>
 
 ```bash
-#! /bin/bash
+#!/bin/bash
 AWS_ACCOUNT="<YOUR_AWS_ACCOUNT>"
 AWS_REGION="<YOUR_AWS_REGION>"
 REPOSITORY_NAME="<YOUR_REPOSITORY_NAME>"
