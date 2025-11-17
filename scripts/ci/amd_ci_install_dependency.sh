@@ -22,7 +22,7 @@ case "${GPU_ARCH}" in
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
     docker exec ci_sglang pip install -e "python[dev_hip]" --no-deps # TODO: only for mi35x
     # For lmms_evals evaluating MMMU
-    docker exec -w / ci_sglang git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     docker exec -w /lmms-eval ci_sglang pip install -e . --no-deps # TODO: only for mi35x
     ;;
   mi30x|mi300|mi325)
@@ -30,7 +30,7 @@ case "${GPU_ARCH}" in
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
     docker exec ci_sglang pip install -e "python[dev_hip]"
     # For lmms_evals evaluating MMMU
-    docker exec -w / ci_sglang git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     docker exec -w /lmms-eval ci_sglang pip install -e .
     ;;
   *)

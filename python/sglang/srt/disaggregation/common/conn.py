@@ -32,8 +32,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
-    get_free_port,
     get_local_ip_auto,
+    get_zmq_socket_on_host,
     is_valid_ipv6_address,
     maybe_wrap_ipv6_address,
 )
@@ -68,17 +68,22 @@ class CommonKVManager(BaseKVManager):
         )
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
-        self.rank_port = get_free_port()
         self.local_ip = get_local_ip_auto()
-        self.server_socket = zmq.Context().socket(zmq.PULL)
-        if is_valid_ipv6_address(self.local_ip):
-            self.server_socket.setsockopt(zmq.IPV6, 1)
+
+        # bind zmq socket
+        context = zmq.Context()
+        zmq_bind_host = maybe_wrap_ipv6_address(self.local_ip)
+        self.rank_port, self.server_socket = get_zmq_socket_on_host(
+            context, zmq.PULL, host=zmq_bind_host
+        )
+        logger.debug(f"kv manager bind to {zmq_bind_host}:{self.rank_port}")
+
         self.request_status: Dict[int, KVPoll] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._register_to_bootstrap()
-            self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
-            self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+            self.transfer_infos = {}
+            self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -91,9 +96,6 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
-
-    def _bind_server_socket(self):
-        self.server_socket.bind(format_tcp_address(self.local_ip, self.rank_port))
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
@@ -177,7 +179,6 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
-
     def __init__(
         self,
         mgr: BaseKVManager,
@@ -201,6 +202,7 @@ class CommonKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]] = None,
     ):
         pass
 
@@ -245,6 +247,7 @@ class CommonKVReceiver(BaseKVReceiver):
                     f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.bootstrap_infos = None
                 return
             else:
                 logger.debug(

@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
+    try_cached_model,
 )
 
 
@@ -15,7 +16,7 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
         cls.start_prefill()

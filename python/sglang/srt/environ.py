@@ -2,6 +2,7 @@ import os
 import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
+from enum import IntEnum
 from typing import Any
 
 
@@ -74,6 +75,11 @@ class EnvField:
         return self.get()
 
 
+class EnvTuple(EnvField):
+    def parse(self, value: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip())
+
+
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
         return value
@@ -105,28 +111,55 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class ToolStrictLevel(IntEnum):
+    """
+    Defines the strictness levels for tool call parsing and validation.
+
+    OFF: No strict validation
+    FUNCTION: Enables structural tag constraints for all tools
+    PARAMETER: Enforces strict parameter validation for all tools
+    """
+
+    OFF = 0
+    FUNCTION = 1
+    PARAMETER = 2
+
+
 class Envs:
     # fmt: off
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+
+    # Logging Options
+    SGLANG_LOG_GC = EnvBool(False)
+    SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
+    SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
-    SGLANG_AMD_CI = EnvBool(False)
-    SGLANG_TEST_RETRACT = EnvBool(False)
+    SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
+    SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
-    SGLANG_GC_LOG = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
-    SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
+    SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
+
+    # Scheduler: memory leak test
+    SGLANG_TEST_RETRACT = EnvBool(False)
+    SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
+    SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
+    SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -136,27 +169,35 @@ class Envs:
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
 
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
     SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
 
+    # Tool Calling
+    SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
 
     # Mooncake KV Transfer
-    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvBool(False)
+    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -166,11 +207,14 @@ class Envs:
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
-    SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    SGLANG_ENABLE_FLASHINFER_FP8_GEMM = EnvBool(False)
+    # Default to the pick from flashinfer
+    SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
+    SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
@@ -181,6 +225,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
+    SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -197,12 +242,11 @@ class Envs:
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
-    # vLLM dependencies
-    USE_VLLM_CUSTOM_ALLREDUCE = EnvBool(False)
+    # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
-    RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)
@@ -221,13 +265,56 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
+    # Overlap Spec V2
+    SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
+    SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+
+    # VLM
+    SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    SGLANG_RESIZE_RESAMPLE = EnvStr("")
+
+    # Release & Resume Memory
+    SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+
+    # Sparse Embeddings
+    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+
+    # Logits processor
+    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
+    SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+
+    # Tool-Call behavior
+    SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+
+    # Ngram
+    SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+
+    # Warmup
+    SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
+
+    # Health Check
+    SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
     # fmt: on
 
 
 envs = Envs()
 
 
+def _print_deprecated_env(new_name: str, old_name: str):
+    if old_name in os.environ:
+        warnings.warn(
+            f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
+        )
+        os.environ[new_name] = os.environ[old_name]
+
+
 def _convert_SGL_to_SGLANG():
+    _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
+    _print_deprecated_env(
+        "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
+    )
+
     for key, value in os.environ.items():
         if key.startswith("SGL_"):
             new_key = key.replace("SGL_", "SGLANG_", 1)

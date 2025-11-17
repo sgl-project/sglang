@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import importlib.util
 import logging
-from enum import Enum
+from contextlib import contextmanager
+from enum import Enum, IntEnum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
-
-from packaging import version as pkg_version
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -50,7 +49,7 @@ class MoeRunnerBackend(Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
-    TRITON_KERNEL = "triton_kernel"
+    TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
@@ -66,8 +65,8 @@ class MoeRunnerBackend(Enum):
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
 
-    def is_triton_kernel(self):
-        return self == MoeRunnerBackend.TRITON_KERNEL
+    def is_triton_kernels(self):
+        return self == MoeRunnerBackend.TRITON_KERNELS
 
     def is_flashinfer_trtllm(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM
@@ -118,6 +117,7 @@ class DeepEPMode(Enum):
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
+SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
@@ -129,6 +129,7 @@ DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 def initialize_moe_config(server_args: ServerArgs):
     global MOE_A2A_BACKEND
     global MOE_RUNNER_BACKEND
+    global SPECULATIVE_MOE_RUNNER_BACKEND
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
@@ -138,6 +139,11 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
+    SPECULATIVE_MOE_RUNNER_BACKEND = (
+        MoeRunnerBackend(server_args.speculative_moe_runner_backend)
+        if server_args.speculative_moe_runner_backend is not None
+        else MOE_RUNNER_BACKEND
+    )
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
@@ -151,7 +157,6 @@ def initialize_moe_config(server_args: ServerArgs):
 def get_moe_a2a_backend() -> MoeA2ABackend:
     global MOE_A2A_BACKEND
     if MOE_A2A_BACKEND is None:
-        logger.warning("MOE_A2A_BACKEND is not initialized, using default backend")
         MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return MOE_A2A_BACKEND
 
@@ -159,11 +164,22 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
 def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
-        logger.warning(
-            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected"
+        log_info_on_rank0(
+            logger,
+            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected",
         )
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
+
+
+def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
+    global SPECULATIVE_MOE_RUNNER_BACKEND
+    if SPECULATIVE_MOE_RUNNER_BACKEND is None:
+        logger.warning(
+            "SPECULATIVE_MOE_RUNNER_BACKEND is not initialized, using auto backend"
+        )
+        SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
+    return SPECULATIVE_MOE_RUNNER_BACKEND
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -207,16 +223,6 @@ def get_tbo_token_distribution_threshold() -> float:
 
 
 @lru_cache(maxsize=1)
-def should_use_flashinfer_trtllm_moe():
-    result = get_moe_runner_backend().is_flashinfer_trtllm() and (
-        not importlib.util.find_spec("flashinfer")
-        or pkg_version.parse(__import__("flashinfer").__version__)
-        >= pkg_version.parse("0.2.9rc1")
-    )
-    return result
-
-
-@lru_cache(maxsize=1)
 def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
@@ -227,3 +233,37 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and is_dp_attention_enabled()
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
+
+
+@contextmanager
+def speculative_moe_backend_context():
+    """
+    Context manager to temporarily use the speculative MoE backend for draft model operations.
+    This ensures that draft models in speculative decoding use the configured speculative backend.
+    """
+    global MOE_RUNNER_BACKEND
+    original_backend = MOE_RUNNER_BACKEND
+    try:
+        MOE_RUNNER_BACKEND = get_speculative_moe_runner_backend()
+        yield
+    finally:
+        MOE_RUNNER_BACKEND = original_backend
+
+
+# The type of method in top-K routing, for use in torch custom op
+# Please keep this in sync with the counterpart defined in https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/trtllm/fused_moe/runner.h
+class RoutingMethodType(IntEnum):
+    # Default: Softmax -> TopK
+    Default = (0,)
+    # Renormalize: TopK -> Softmax
+    Renormalize = (1,)
+    # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
+    DeepSeekV3 = (2,)
+    # Llama4: Top1 -> Sigmoid
+    Llama4 = (3,)
+    # Qwen3: Softmax -> TopK -> Renormalize
+    RenormalizeNaive = (4,)
+    # TopK only (no softmax)
+    TopK = (5,)
+    # Unspecified
+    Unspecified = 6

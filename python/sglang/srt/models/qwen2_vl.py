@@ -28,7 +28,6 @@ from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from transformers import Qwen2VLConfig
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
@@ -128,7 +127,6 @@ class Qwen2VisionBlock(nn.Module):
         mlp_ratio: float,
         act_layer: Type[nn.Module] = QuickGELU,
         norm_layer: Type[nn.Module] = None,
-        attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -138,23 +136,12 @@ class Qwen2VisionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        if attn_implementation == "sdpa":
-            qkv_backend = "sdpa"
-            softmax_in_single_precision = False
-        elif attn_implementation == "flash_attention_2":
-            qkv_backend = "triton_attn"
-            softmax_in_single_precision = False
-        elif attn_implementation == "eager":
-            qkv_backend = "sdpa"
-            softmax_in_single_precision = True
 
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -334,7 +321,6 @@ class Qwen2VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                 )
@@ -513,6 +499,10 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        # skip visual tower
+        return not module_name.startswith("visual")
 
     def forward(
         self,

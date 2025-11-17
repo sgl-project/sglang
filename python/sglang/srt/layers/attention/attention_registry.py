@@ -34,7 +34,9 @@ def create_flashinfer_backend(runner):
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(runner)
+        return FlashInferAttnBackend(
+            runner, init_new_workspace=runner.init_new_workspace
+        )
     else:
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
@@ -187,6 +189,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             GDNAttnBackend,
             HybridLinearAttnBackend,
+            KimiLinearAttnBackend,
             LightningAttentionBackend,
             Mamba2AttnBackend,
         )
@@ -197,7 +200,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             if is_blackwell():
                 assert (
                     runner.server_args.attention_backend == "triton"
-                ), "triton backend is the only supported backend on Blackwell GPUs for hybrid GDN models, use --attention-backend triton to specify the backend."
+                    or runner.server_args.attention_backend == "trtllm_mha"
+                ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
@@ -206,6 +210,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
+        elif runner.kimi_linear_config is not None:
+            linear_attn_backend = KimiLinearAttnBackend(runner)
         elif runner.hybrid_lightning_attn_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
@@ -218,3 +224,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     return full_attn_backend
+
+
+@register_attention_backend("intel_xpu")
+def create_intel_xpu_backend(runner):
+    from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+    return XPUAttentionBackend(runner)

@@ -18,11 +18,10 @@ mod tests;
 // Re-export commonly used types
 pub use errors::{ParserError, ParserResult};
 pub use factory::{ParserFactory, ParserRegistry, PooledParser};
-pub use traits::{PartialJsonParser, ToolParser};
-pub use types::{FunctionCall, PartialToolCall, StreamingParseResult, ToolCall};
-
 // Re-export parsers for convenience
 pub use parsers::{
-    DeepSeekParser, Glm4MoeParser, GptOssParser, JsonParser, KimiK2Parser, LlamaParser,
+    DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
     MistralParser, PythonicParser, QwenParser, Step3Parser,
 };
+pub use traits::{PartialJsonParser, ToolParser};
+pub use types::{FunctionCall, PartialToolCall, StreamingParseResult, ToolCall};

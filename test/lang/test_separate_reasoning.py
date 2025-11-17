@@ -7,7 +7,7 @@ python3 -m unittest test/lang/test_separate_reasoning.py
 
 import unittest
 
-from sglang import assistant, gen, separate_reasoning, user
+from sglang import gen, separate_reasoning
 from sglang.lang.ir import SglExprList, SglSeparateReasoning
 from sglang.test.test_utils import CustomTestCase
 

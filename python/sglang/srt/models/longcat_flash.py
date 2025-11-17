@@ -44,9 +44,8 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -64,7 +63,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -82,25 +80,25 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.utils import (
+    maybe_executor_submit,
+    should_async_load,
+    should_deepgemm_weight_requant_ue8m0,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
-    LazyValue,
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
-    get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_hip,
-    is_non_idle_and_non_empty,
     is_npu,
-    is_sm100_supported,
 )
 
 _is_hip = is_hip()
@@ -113,13 +111,7 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        bmm_fp8,
-        dsv3_fused_a_gemm,
-        dsv3_router_gemm,
-        merge_state_v2,
-    )
+    from sgl_kernel import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -786,11 +778,8 @@ class LongcatFlashForCausalLM(nn.Module):
         # TODO(linguoyuan) EPMoE not support DEEPGEMM_BLACKWELL, DeepEP needs to be supported in the future
         deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 = False
 
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and hasattr(self.quant_config, "weight_block_size")
-            and self.quant_config.weight_block_size is not None
+        if should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=getattr(self.quant_config, "weight_block_size", None)
         ):
             self._weight_requant_ue8m0()
 
@@ -834,8 +823,8 @@ class LongcatFlashForCausalLM(nn.Module):
             experts = layer.mlp.experts
             if isinstance(experts, DeepEPMoE):
                 for w in [
-                    experts.w13_weight_fp8,
-                    experts.w2_weight_fp8,
+                    (experts.w13_weight, experts.w13_weight_scale_inv),
+                    (experts.w2_weight, experts.w2_weight_scale_inv),
                 ]:
                     requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
@@ -867,6 +856,7 @@ class LongcatFlashForCausalLM(nn.Module):
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
+                use_async_loading = should_async_load(loaded_weight)
                 if "mtp" in name:
                     continue
                 weight_names.append(name)
@@ -890,8 +880,12 @@ class LongcatFlashForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
+                    maybe_executor_submit(
+                        executor=executor,
+                        futures=futures,
+                        use_async=use_async_loading,
+                        func=weight_loader,
+                        func_args=(param, loaded_weight, shard_id),
                     )
                     break
                 else:
@@ -902,15 +896,16 @@ class LongcatFlashForCausalLM(nn.Module):
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        futures.append(
-                            executor.submit(
-                                weight_loader,
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
+                        maybe_executor_submit(
+                            executor=executor,
+                            futures=futures,
+                            use_async=use_async_loading,
+                            func=weight_loader,
+                            func_args=(param, loaded_weight, name),
+                            func_kwargs={
+                                "shard_id": shard_id,
+                                "expert_id": expert_id,
+                            },
                         )
                         break
                     else:
@@ -964,8 +959,12 @@ class LongcatFlashForCausalLM(nn.Module):
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                futures.append(
-                                    executor.submit(weight_loader, param, fused_weight)
+                                maybe_executor_submit(
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(param, fused_weight),
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
@@ -990,8 +989,12 @@ class LongcatFlashForCausalLM(nn.Module):
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            futures.append(
-                                executor.submit(weight_loader, param, loaded_weight)
+                            maybe_executor_submit(
+                                executor=executor,
+                                futures=futures,
+                                use_async=use_async_loading,
+                                func=weight_loader,
+                                func_args=(param, loaded_weight),
                             )
 
             # Wait for all tasks to complete and raise any exceptions.

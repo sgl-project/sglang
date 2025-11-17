@@ -1,16 +1,14 @@
 import argparse
 import ast
 import asyncio
-import json
 import re
 import time
+from typing import Optional
 
 import numpy as np
 
 import sglang as sgl
-from sglang.lang.api import set_default_backend
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
+from sglang.utils import download_and_cache_file, read_jsonl
 
 INVALID = -9999999
 

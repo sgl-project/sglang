@@ -41,6 +41,7 @@ uv pip install mooncake-transfer-engine
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --disaggregation-mode prefill \
+  --port 30000 \
   --disaggregation-ib-device mlx5_roce0
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -179,6 +180,7 @@ pip install . --config-settings=setup-args="-Ducx_path=/path/to/ucx"
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --disaggregation-mode prefill \
+  --port 30000 \
   --disaggregation-transfer-backend nixl
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -282,6 +284,7 @@ export ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=true
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --disaggregation-mode prefill \
+  --port 30000 \
   --disaggregation-transfer-backend ascend
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \

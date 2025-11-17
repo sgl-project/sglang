@@ -13,7 +13,7 @@ def is_mla_preprocess_enabled() -> bool:
 
 
 if is_mla_preprocess_enabled():
-    import sgl_kernel_npu
+    import sgl_kernel_npu  # noqa: F401
     import torch_npu
 
     torch.npu.config.allow_internal_format = True

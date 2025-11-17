@@ -1,19 +1,24 @@
-use super::{CircuitBreaker, WorkerError, WorkerResult};
-use crate::core::CircuitState;
-use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
-use crate::grpc_client::SglangSchedulerClient;
-use crate::metrics::RouterMetrics;
-use crate::protocols::worker_spec::WorkerInfo;
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, LazyLock,
+    },
+    time::{Duration, Instant},
+};
+
 use async_trait::async_trait;
-use futures;
+use serde::{Deserialize, Serialize};
 use serde_json;
-use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
-use std::time::Instant;
-use tokio::sync::{Mutex, RwLock};
-use tokio::time;
+use tokio::{sync::RwLock, time};
+
+use super::{CircuitBreaker, WorkerError, WorkerResult};
+use crate::{
+    core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
+    metrics::RouterMetrics,
+    protocols::worker_spec::WorkerInfo,
+    routers::grpc::client::GrpcClient,
+};
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -224,7 +229,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get or create a gRPC client for this worker
     /// Returns None for HTTP workers, Some(client) for gRPC workers
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>>;
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>>;
 
     /// Reset the gRPC client connection (for reconnection scenarios)
     /// No-op for HTTP workers
@@ -236,15 +241,33 @@ pub trait Worker: Send + Sync + fmt::Debug {
 }
 
 /// Connection mode for worker communication
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum ConnectionMode {
     /// HTTP/REST connection
+    #[default]
     Http,
     /// gRPC connection
     Grpc {
         /// Optional port for gRPC endpoint (if different from URL)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         port: Option<u16>,
     },
+}
+
+impl ConnectionMode {
+    /// Check if this connection mode matches another, with special handling for gRPC
+    /// This allows matching any gRPC connection regardless of port when comparing
+    /// Grpc { port: None } as a wildcard
+    pub fn matches(&self, filter: &ConnectionMode) -> bool {
+        match (self, filter) {
+            (ConnectionMode::Http, ConnectionMode::Http) => true,
+            (ConnectionMode::Grpc { .. }, ConnectionMode::Grpc { port: None }) => true,
+            (ConnectionMode::Grpc { port: p1 }, ConnectionMode::Grpc { port: p2 }) => p1 == p2,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for ConnectionMode {
@@ -255,6 +278,38 @@ impl fmt::Display for ConnectionMode {
                 Some(p) => write!(f, "gRPC(port:{})", p),
                 None => write!(f, "gRPC"),
             },
+        }
+    }
+}
+
+/// Runtime implementation type for gRPC workers
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeType {
+    /// SGLang runtime (default)
+    #[default]
+    Sglang,
+    /// vLLM runtime
+    Vllm,
+}
+
+impl fmt::Display for RuntimeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuntimeType::Sglang => write!(f, "sglang"),
+            RuntimeType::Vllm => write!(f, "vllm"),
+        }
+    }
+}
+
+impl std::str::FromStr for RuntimeType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sglang" => Ok(RuntimeType::Sglang),
+            "vllm" => Ok(RuntimeType::Vllm),
+            _ => Err(format!("Unknown runtime type: {}", s)),
         }
     }
 }
@@ -322,6 +377,8 @@ pub struct WorkerMetadata {
     pub worker_type: WorkerType,
     /// Connection mode
     pub connection_mode: ConnectionMode,
+    /// Runtime type (for gRPC workers)
+    pub runtime_type: RuntimeType,
     /// Additional labels/tags
     pub labels: std::collections::HashMap<String, String>,
     /// Health check configuration
@@ -345,7 +402,7 @@ pub struct BasicWorker {
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
     /// Lazily initialized gRPC client for gRPC workers
-    pub grpc_client: Arc<RwLock<Option<Arc<Mutex<SglangSchedulerClient>>>>>,
+    pub grpc_client: Arc<RwLock<Option<Arc<GrpcClient>>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -483,7 +540,7 @@ impl Worker for BasicWorker {
         &self.circuit_breaker
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>> {
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>> {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
@@ -500,16 +557,19 @@ impl Worker for BasicWorker {
                     return Ok(Some(client.clone()));
                 }
 
+                let runtime_str = self.metadata.runtime_type.to_string();
                 tracing::info!(
-                    "Lazily initializing gRPC client for worker: {}",
+                    "Lazily initializing gRPC client ({}) for worker: {}",
+                    runtime_str,
                     self.metadata.url
                 );
-                match SglangSchedulerClient::connect(&self.metadata.url).await {
+                match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
                     Ok(client) => {
-                        let client_arc = Arc::new(Mutex::new(client));
+                        let client_arc = Arc::new(client);
                         *client_guard = Some(client_arc.clone());
                         tracing::info!(
-                            "Successfully connected gRPC client for worker: {}",
+                            "Successfully connected gRPC client ({}) for worker: {}",
+                            runtime_str,
                             self.metadata.url
                         );
                         Ok(Some(client_arc))
@@ -555,8 +615,7 @@ impl Worker for BasicWorker {
             return Ok(false);
         };
 
-        let client = grpc_client.lock().await;
-        match time::timeout(timeout, client.health_check()).await {
+        match time::timeout(timeout, grpc_client.health_check()).await {
             Ok(Ok(resp)) => {
                 tracing::debug!(
                     "gRPC health OK for {}: healthy={}",
@@ -727,7 +786,7 @@ impl Worker for DPAwareWorker {
         format!("{}{}", self.base_url, route)
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>> {
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>> {
         self.base_worker.get_grpc_client().await
     }
 
@@ -892,89 +951,6 @@ impl HealthChecker {
     }
 }
 
-/// Start an async background health checker for a collection of workers
-pub fn start_health_checker(
-    workers: Arc<std::sync::RwLock<Vec<Arc<dyn Worker>>>>,
-    check_interval_secs: u64,
-) -> HealthChecker {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    let handle = tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(check_interval_secs));
-
-        // Counter for periodic load reset (every 10 health check cycles)
-        let mut check_count = 0u64;
-        const LOAD_RESET_INTERVAL: u64 = 10;
-
-        loop {
-            interval.tick().await;
-
-            // Check for shutdown signal
-            if shutdown_clone.load(Ordering::Acquire) {
-                tracing::debug!("Health checker shutting down");
-                break;
-            }
-
-            check_count += 1;
-
-            // Check health of all workers
-            let workers_to_check = match workers.read() {
-                Ok(guard) => guard.clone(),
-                Err(poisoned) => {
-                    tracing::error!("Worker lock poisoned: {}", poisoned);
-                    continue;
-                }
-            };
-
-            // Periodically reset load counters to prevent drift
-            // Only do this when we believe all workers should be idle
-            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
-                // Only reset if load appears to be very low (likely drift)
-                if max_load <= 2 {
-                    tracing::debug!(
-                        "Resetting load counters to prevent drift (max_load: {})",
-                        max_load
-                    );
-                    for worker in &workers_to_check {
-                        worker.reset_load();
-                    }
-                }
-            }
-
-            // Perform health checks concurrently
-            let health_checks = workers_to_check.iter().map(|worker| {
-                let worker_url = worker.url().to_string();
-                let was_healthy = worker.is_healthy();
-
-                async move {
-                    match worker.check_health_async().await {
-                        Ok(_) => {
-                            if !was_healthy {
-                                tracing::info!("Worker {} is now healthy", worker_url);
-                            }
-                        }
-                        Err(e) => {
-                            if was_healthy {
-                                tracing::warn!("Worker {} health check failed: {}", worker_url, e);
-                            } else {
-                                // Worker was already unhealthy, log at debug level
-                                tracing::debug!("Worker {} remains unhealthy: {}", worker_url, e);
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Execute all health checks concurrently
-            futures::future::join_all(health_checks).await;
-        }
-    });
-
-    HealthChecker { handle, shutdown }
-}
-
 /// Helper to convert Worker trait object to WorkerInfo struct
 pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
     let worker_type_str = match worker.worker_type() {
@@ -988,6 +964,11 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         _ => None,
     };
 
+    let runtime_type = match worker.connection_mode() {
+        ConnectionMode::Grpc { .. } => Some(worker.metadata().runtime_type.to_string()),
+        ConnectionMode::Http => None,
+    };
+
     WorkerInfo {
         id: worker.url().to_string(),
         url: worker.url().to_string(),
@@ -998,6 +979,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         is_healthy: worker.is_healthy(),
         load: worker.load(),
         connection_mode: format!("{:?}", worker.connection_mode()),
+        runtime_type,
         tokenizer_path: worker.tokenizer_path().map(String::from),
         reasoning_parser: worker.reasoning_parser().map(String::from),
         tool_parser: worker.tool_parser().map(String::from),
@@ -1010,10 +992,10 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 
 #[cfg(test)]
 mod tests {
+    use std::{thread, time::Duration};
+
     use super::*;
     use crate::core::CircuitBreakerConfig;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_worker_type_display() {
@@ -1488,8 +1470,9 @@ mod tests {
 
     #[test]
     fn test_load_counter_performance() {
-        use crate::core::BasicWorkerBuilder;
         use std::time::Instant;
+
+        use crate::core::BasicWorkerBuilder;
 
         let worker = BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)

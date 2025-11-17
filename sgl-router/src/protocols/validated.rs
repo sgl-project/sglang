@@ -83,20 +83,11 @@ where
 
         // Then, automatically validate the data
         data.validate().map_err(|validation_errors| {
-            // Extract the first error message from the validation errors
-            let error_message = validation_errors
-                .field_errors()
-                .values()
-                .flat_map(|errors| errors.iter())
-                .find_map(|e| e.message.as_ref())
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "Validation failed".to_string());
-
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "error": {
-                        "message": error_message,
+                        "message": validation_errors.to_string(),
                         "type": "invalid_request_error",
                         "code": 400
                     }
@@ -126,9 +117,10 @@ impl<T> std::ops::DerefMut for ValidatedJson<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde::{Deserialize, Serialize};
     use validator::Validate;
+
+    use super::*;
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
     struct TestRequest {

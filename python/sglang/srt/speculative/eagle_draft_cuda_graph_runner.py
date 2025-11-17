@@ -9,10 +9,12 @@ from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
+    DeepEPCudaGraphRunnerAdapter,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
     set_global_graph_memory_pool,
+    set_is_extend_in_batch,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -40,8 +42,11 @@ class EAGLEDraftCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
         # Parse args
         self.eagle_worker = eagle_worker
-        self.model_runner = model_runner = eagle_worker.model_runner
-        self.model_runner: EAGLEWorker
+        if not hasattr(eagle_worker, "model_runner"):
+            # V2: EagleDraftWorker
+            self.model_runner = model_runner = eagle_worker.draft_runner
+        else:
+            self.model_runner = model_runner = eagle_worker.model_runner
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -58,6 +63,8 @@ class EAGLEDraftCudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_pdmux = False
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         server_args = model_runner.server_args
 
         # Batch sizes to capture
@@ -76,17 +83,19 @@ class EAGLEDraftCudaGraphRunner:
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
+        self.extend_seq_lens_cpu = [self.seq_len_fill_value] * self.max_bs
 
         if self.enable_torch_compile:
             set_torch_compile_config()
 
         # Graph inputs
-        with torch.device("cuda"):
+        with torch.device(model_runner.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
+            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.zeros(
                 (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
             )
@@ -149,17 +158,39 @@ class EAGLEDraftCudaGraphRunner:
 
         return is_bs_supported
 
+    def _create_graph(self):
+        return torch.cuda.CUDAGraph()
+
+    def _capture_init(self, run_once_fn):
+        for _ in range(2):
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+            run_once_fn()
+
+    def _capture_graph(self, graph, pool, stream, run_once_fn):
+        with torch.cuda.graph(graph, pool=pool, stream=stream):
+            out = run_once_fn()
+        return out
+
+    def _replay(self, forward_batch: ForwardBatch):
+        self.graphs[self.bs].replay()
+
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(self, num_seqs: int, forward: Callable):
-        graph = torch.cuda.CUDAGraph()
+    def capture_one_batch_size(
+        self, num_seqs: int, forward: Callable, stream_idx: int = 0
+    ):
+        graph = self._create_graph()
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
 
         # Graph inputs
         req_pool_indices = self.req_pool_indices[:num_seqs]
         seq_lens = self.seq_lens[:num_seqs]
+        seq_lens_cpu = self.seq_lens_cpu[:num_seqs]
+        extend_seq_lens = self.extend_seq_lens[:num_seqs]
+        extend_seq_lens_cpu = self.extend_seq_lens_cpu[:num_seqs]
         out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
@@ -222,6 +253,9 @@ class EAGLEDraftCudaGraphRunner:
             input_ids=None,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
@@ -249,7 +283,12 @@ class EAGLEDraftCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+            )
+            set_is_extend_in_batch(False)
 
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
@@ -261,16 +300,12 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
+        self.deepep_adapter.capture(is_extend_in_batch=False)
 
-            run_once()
-
-        with torch.cuda.graph(
-            graph, pool=get_global_graph_memory_pool(), stream=stream
-        ):
-            out = run_once()
+        self._capture_init(run_once)
+        out = self._capture_graph(
+            graph, get_global_graph_memory_pool(), stream, run_once
+        )
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out
@@ -282,6 +317,8 @@ class EAGLEDraftCudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
+        self.deepep_adapter.replay()
+
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
@@ -336,10 +373,12 @@ class EAGLEDraftCudaGraphRunner:
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )
+        self.raw_bs = raw_bs
+        self.bs = bs
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
         # Replay
-        self.graphs[bs].replay()
+        self._replay(forward_batch)
         out = self.output_buffers[bs]
 
         if bs != raw_bs:

@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -149,6 +150,74 @@ class TestDeepseekV3W4Afp8DeepepNormal(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(
+        self,
+    ):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Eval accuracy of GSM8K: {metrics=}")
+
+        self.assertGreater(metrics["accuracy"], 0.92)
+
+
+class TestDeepseekV3W4Afp8DeepepAutoMtp(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--tp",
+            "8",
+            "--trust-remote-code",
+            "--ep-size",
+            "8",
+            "--cuda-graph-bs",
+            "256",
+            "--disable-radix-cache",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-mode",
+            "auto",
+            "--dp",
+            "8",
+            "--enable-dp-attention",
+            "--moe-runner-backend",
+            "cutlass",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+        ]
+        if not is_in_amd_ci():
+            other_args += ["--mem-frac", "0.7"]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env={
+                **os.environ,
+                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+            },
         )
 
     @classmethod

@@ -1,16 +1,20 @@
 // Factory and registry for creating model-specific reasoning parsers.
 // Now with parser pooling support for efficient reuse across requests.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use tokio::sync::Mutex;
 
-use crate::reasoning_parser::parsers::{
-    BaseReasoningParser, DeepSeekR1Parser, Glm45Parser, KimiParser, Qwen3Parser,
-    QwenThinkingParser, Step3Parser,
+use crate::reasoning_parser::{
+    parsers::{
+        BaseReasoningParser, DeepSeekR1Parser, Glm45Parser, KimiParser, MiniMaxParser, Qwen3Parser,
+        QwenThinkingParser, Step3Parser,
+    },
+    traits::{ParseError, ParserConfig, ReasoningParser},
 };
-use crate::reasoning_parser::traits::{ParseError, ParserConfig, ReasoningParser};
 
 /// Type alias for pooled parser instances.
 /// Uses tokio::Mutex to avoid blocking the async executor.
@@ -185,6 +189,9 @@ impl ParserFactory {
         // Register Step3 parser (same format as DeepSeek-R1 but separate for debugging)
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
 
+        // Register MiniMax parser (appends <think> token at the beginning)
+        registry.register_parser("minimax", || Box::new(MiniMaxParser::new()));
+
         // Register model patterns
         registry.register_pattern("deepseek-r1", "deepseek_r1");
         registry.register_pattern("qwen3-thinking", "qwen3_thinking");
@@ -194,6 +201,9 @@ impl ParserFactory {
         registry.register_pattern("glm45", "glm45");
         registry.register_pattern("kimi", "kimi");
         registry.register_pattern("step3", "step3");
+        registry.register_pattern("minimax", "minimax");
+        registry.register_pattern("minimax-m2", "minimax");
+        registry.register_pattern("mm-m2", "minimax");
 
         Self { registry }
     }
@@ -326,6 +336,17 @@ mod tests {
         assert_eq!(glm45.model_type(), "glm45");
     }
 
+    #[test]
+    fn test_minimax_model() {
+        let factory = ParserFactory::new();
+        let minimax = factory.create("minimax-m2").unwrap();
+        assert_eq!(minimax.model_type(), "minimax");
+
+        // Also test alternate patterns
+        let mm = factory.create("mm-m2-chat").unwrap();
+        assert_eq!(mm.model_type(), "minimax");
+    }
+
     #[tokio::test]
     async fn test_pooled_parser_reuse() {
         let factory = ParserFactory::new();
@@ -402,8 +423,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_high_concurrency_parser_access() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Instant;
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Instant,
+        };
 
         let factory = ParserFactory::new();
         let num_tasks = 100;
