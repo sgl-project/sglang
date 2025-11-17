@@ -210,14 +210,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - uses: actions/checkout@v4
 
@@ -252,14 +272,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - uses: actions/checkout@v4
 
@@ -295,14 +335,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - uses: actions/checkout@v4
 
@@ -348,14 +408,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -413,14 +493,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -460,14 +560,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -504,14 +624,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -644,14 +784,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -716,14 +876,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -780,14 +960,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -826,14 +1026,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -896,14 +1116,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -939,14 +1179,34 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          # Kill all Python processes that might hold file handles
-          pkill -9 -f "python" || true
-          # Give NFS time to release locks
-          sleep 5
-          # Force remove any .nfs* files
-          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
-          # Clean workspace
-          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
+          set -x
+          # Get workspace root - works across all runners
+          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
+          echo "Cleaning workspace at: $WORK_ROOT"
+
+          # Kill all processes with open files in workspace
+          if [ -d "$WORK_ROOT" ]; then
+            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+              echo "Killing processes: $pids"
+              kill $pids 2>/dev/null || true
+              sleep 2
+              # Force kill any remaining
+              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
+              if [ -n "$pids2" ]; then
+                echo "Force killing: $pids2"
+                kill -9 $pids2 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Wait for NFS to release locks
+          sleep 3
+
+          # Remove workspace contents
+          if [ -d "$WORK_ROOT" ]; then
+            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
+          fi
 
       - name: Checkout code
         uses: actions/checkout@v4
