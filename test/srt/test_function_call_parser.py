@@ -1631,11 +1631,13 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertEqual(
             result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
         )
+        self.assertEqual(result.calls[0].tool_index, 0)
         self.assertEqual(result.calls[1].name, "get_weather")
         self.assertEqual(
             result.calls[1].parameters, '{"city": "Shanghai", "date": "2024-06-28"}'
         )
         self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls[1].tool_index, 1)
 
     def test_streaming_tool_call(self):
         """Test streaming incremental parsing of a tool call."""
