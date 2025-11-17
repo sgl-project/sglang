@@ -178,6 +178,7 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     # 1. Exact match
     if model_path in _MODEL_PATH_TO_NAME:
         model_name = _MODEL_PATH_TO_NAME[model_path]
+        logger.debug(f"Resolved model name '{model_name}' from exact path match.")
         return _CONFIG_REGISTRY.get(model_name)
 
     # 2. Partial match: find the best (longest) match to avoid conflicts
@@ -201,7 +202,19 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
                 best_match_name = model_name
 
     if best_match_name:
+        logger.debug(
+            f"Resolved model name '{best_match_name}' from partial path match."
+        )
         return _CONFIG_REGISTRY.get(best_match_name)
+
+    # 2.5. Fallback: Infer from path by checking against all registered model names.
+    all_model_names = sorted(_CONFIG_REGISTRY.keys(), key=len, reverse=True)
+    for model_name in all_model_names:
+        if model_name in cleaned_model_path:
+            logger.debug(
+                f"Inferred model name '{model_name}' from path '{model_path}'."
+            )
+            return _CONFIG_REGISTRY.get(model_name)
 
     # 3. Use detectors
     if os.path.exists(model_path):
@@ -213,6 +226,9 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
 
     for model_name, detector in _MODEL_NAME_DETECTORS:
         if detector(model_path.lower()) or detector(pipeline_name):
+            logger.debug(
+                f"Resolved model name '{model_name}' using a registered detector."
+            )
             return _CONFIG_REGISTRY.get(model_name)
 
     return None
@@ -423,17 +439,11 @@ def _register_configs():
         model_name="qwen-image",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
-        # model_paths=[
-        #     "Qwen/Qwen-Image",
-        # ],
     )
     register_configs(
         model_name="qwen-image-edit",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
-        # model_paths=[
-        #     "Qwen/Qwen-Image-Edit",
-        # ],
     )
 
 
