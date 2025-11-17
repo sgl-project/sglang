@@ -111,7 +111,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         return o.to(q.dtype), final_state
 
 
-# @torch.compiler.disable
+@torch.compiler.disable
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
