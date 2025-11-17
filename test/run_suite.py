@@ -1,10 +1,19 @@
+import argparse
 import glob
 from typing import List
 
 from sglang.test.ci.ci_register import CIRegistry, HWBackend, collect_tests
 from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
-LABEL_MAPPING = {HWBackend.CUDA: ["stage-a-test-1"]}
+HW_MAPPING = {
+    "cpu": HWBackend.CPU,
+    "cuda": HWBackend.CUDA,
+}
+
+LABEL_MAPPING = {
+    HWBackend.CUDA: ["stage-a-test-1"],
+    HWBackend.CPU: ["default"],
+}
 
 
 def _filter_tests(
@@ -32,7 +41,23 @@ def run_per_commit(hw: HWBackend, suite: str):
 
 
 def main():
-    run_per_commit(HWBackend.CUDA, "stage-a-test-1")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--hw",
+        type=str,
+        choices=["cpu", "cuda"],
+        required=True,
+        help="Hardware backend to run tests on.",
+    )
+    parser.add_argument(
+        "--suite",
+        type=str,
+        required=True,
+        help="Test suite to run.",
+    )
+    args = parser.parse_args()
+    hw = HW_MAPPING[args.hw]
+    run_per_commit(hw, args.suite)
 
 
 if __name__ == "__main__":
