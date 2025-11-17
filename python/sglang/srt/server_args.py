@@ -497,6 +497,10 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
 
+    # P2P transfer settings: null by default
+    enable_p2p_transfer: bool = False
+    p2p_transfer_ib_device: Optional[str] = None
+
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
@@ -3308,6 +3312,19 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action=DeprecatedAction,
             help="NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead.",
+        )
+        parser.add_argument(
+            "--enable-p2p-transfer",
+            action="store_true",
+            help="Enable P2P weight transfer between GPUs when updating model weights in RL training.",
+        )
+        parser.add_argument(
+            "--p2p-transfer-ib-device",
+            type=str,
+            default=ServerArgs.p2p_transfer_ib_device,
+            help="The InfiniBand devices for P2P transfer, accepts single device (e.g., --p2p-transfer-ib-device mlx5_0) "
+            "or multiple comma-separated devices (e.g., --p2p-transfer-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
 
         # Configuration file support

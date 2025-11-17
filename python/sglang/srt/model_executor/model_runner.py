@@ -145,6 +145,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.common import get_local_ip_auto
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -152,6 +153,7 @@ from sglang.srt.utils.offloader import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.weight_sync.p2p_transfer import P2PTransferEngine
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -1201,13 +1203,29 @@ class ModelRunner:
             message = f"Failed to destroy custom process group: {e}."
             logger.error(message)
             return False, message
+        
+    def connect_to_weights_update_engine(self, remote_ip, remote_port):
+        """Establish connection to the weights update engine through p2p transfer engine
+
+        Args:
+            remote_ip: the IP address of the weights update engine.
+            remote_port: the port of the weights update engine.
+        """
+        self.p2p_transfer_engine = P2PTransferEngine(
+            hostname=get_local_ip_auto(),
+            gpu_id=self.gpu_id,
+            ib_device=self.server_args.p2p_transfer_ib_device,
+        )
+        self.p2p_transfer_engine.connect(remote_ip, remote_port)
+
+        return True, "Succeeded to connect to weights update engine."
 
     def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
 
-        Args:
+        Args:names
             name: the name of the parameter to be updated.
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
@@ -1226,14 +1244,24 @@ class ModelRunner:
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
                 weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
+
+                if (get_global_server_args().enable_p2p_transfer):
+                    weight_length = weight.numel() * weight.element_size()
+                    self.p2p_transfer_engine.register(weight.data_ptr(), weight_length)
+                    self.p2p_transfer_engine.send_back_address(weight.data_ptr(), weight_length)
+                    handles.append(
+                        self.p2p_transfer_engine.recv_complete_signal()
                     )
-                )
+                else:
+                    handles.append(
+                        torch.distributed.broadcast(
+                            weight,
+                            src=0,
+                            group=self._model_update_group[group_name],
+                            async_op=True,
+                        )
+                    )
+
                 weights.append((name, weight))
             for handle in handles:
                 handle.wait()
