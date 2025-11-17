@@ -149,6 +149,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -771,6 +772,11 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state(reverse=True)
 
         get_offloader().post_init()
+
+        # Register model for layerwise NVTX profiling if enabled
+        if self.server_args.enable_layerwise_nvtx_marker:
+            self.pyt_hooks = PytHooks()
+            self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -1831,6 +1837,7 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     **extra_args,
                 )
@@ -2236,7 +2243,7 @@ class ModelRunner:
                 reinit_attn_backend=reinit_attn_backend,
                 forward_count=split_forward_count,
             )
-        elif forward_batch.forward_mode.is_extend():
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
