@@ -224,7 +224,7 @@ def timestep_embedding_cuda(
     max_period: int = 10000,
     dtype: torch.dtype = torch.float32,
 ):
-    # NOTE: output dtype always be float32. According to python code: timestep_embedding
+    # TODO: output dtype always be float32. According to python code: timestep_embedding
     dtype = torch.float32
 
     B = t.shape[0]
