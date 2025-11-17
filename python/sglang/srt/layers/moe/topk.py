@@ -72,7 +72,7 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import moe_fused_gate
+    from moe_cuda import moe_fused_gate
 
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
