@@ -242,12 +242,8 @@ class ExpertLocationMetadata:
             logical_to_rank_dispatch_physical_map=(
                 compute_logical_to_rank_dispatch_physical_map(
                     logical_to_all_physical_map=logical_to_all_physical_map,
-<<<<<<< HEAD
                     num_gpus=ep_size,
                     num_nodes=server_args.nnodes,
-=======
-                    ep_size=ep_size,
->>>>>>> main
                     num_physical_experts=num_physical_experts,
                     # TODO improve when we have real EP rank
                     ep_rank=torch.distributed.get_rank() % ep_size,
