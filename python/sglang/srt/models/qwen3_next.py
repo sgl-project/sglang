@@ -59,6 +59,9 @@ from contextlib import nullcontext
 import triton
 import triton.language as tl
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils import direct_register_custom_op
+
 
 @triton.jit
 def fused_qkvzba_split_reshape_cat_kernel(
@@ -1052,9 +1055,6 @@ class Qwen3NextForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3NextForCausalLM
-
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils import direct_register_custom_op
 
 
 def gdn_with_output(

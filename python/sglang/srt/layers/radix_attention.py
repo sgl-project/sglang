@@ -147,7 +147,7 @@ def unified_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-
+    device_id = torch.cuda.current_device()
     kwargs = {}
     if q_rope is not None:
         kwargs["q_rope"] = q_rope
