@@ -380,6 +380,7 @@ suites = {
         TestFile("test_w8a8_quantization.py"),
         TestFile("test_wave_attention_backend.py"),
         TestFile("test_weight_version.py"),
+        TestFile("test_deepseek_v32_cp_single_node.py", 275),
     ],
 }
 
