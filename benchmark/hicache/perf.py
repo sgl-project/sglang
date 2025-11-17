@@ -210,6 +210,7 @@ def test_hicache_kernel(args: HicacheBenchArgs) -> None:
 def main() -> None:
     torch.cuda.set_device(0)
     stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
 
     tic = torch.cuda.Event(enable_timing=True)
     toc = torch.cuda.Event(enable_timing=True)
@@ -220,14 +221,14 @@ def main() -> None:
 
     # test peak bandwidth
     tic.record()
-    host_mem.copy_(cuda_mem, non_blocking=True)
+    cuda_mem.copy_(host_mem, non_blocking=True)
     toc.record()
     toc.synchronize()
     dur = tic.elapsed_time(toc)
     print(f"Peak H->D Bandwidth: {(BUF_SIZE / (1024**3)) / (dur / 1000):.2f} GB/s")
 
     tic.record()
-    cuda_mem.copy_(host_mem, non_blocking=True)
+    host_mem.copy_(cuda_mem, non_blocking=True)
     toc.record()
     toc.synchronize()
     dur = tic.elapsed_time(toc)

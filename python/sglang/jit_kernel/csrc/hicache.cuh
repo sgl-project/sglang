@@ -107,8 +107,6 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void hicache_transfer_a
       const auto v_cache_src = static_cast<src_ptr_t>(v_ptr_src)[layer];
       const auto k_cache_dst = static_cast<dst_ptr_t>(k_ptr_dst)[layer];
       const auto v_cache_dst = static_cast<dst_ptr_t>(v_ptr_dst)[layer];
-      const auto pos_src = static_cast<const T*>(indices_src)[i];
-      const auto pos_dst = static_cast<const T*>(indices_dst)[i];
       const auto src_k = pointer::offset(k_cache_src, pos_src * kv_cache_src_stride);
       const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
       const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
