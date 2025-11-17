@@ -26,6 +26,7 @@ Its core features include:
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
+   basic_usage/popular_model_usage.rst
 
 .. toctree::
    :maxdepth: 1
