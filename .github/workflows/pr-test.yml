@@ -320,14 +320,6 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
-      - name: Clean Corrupted Hugging Face Model Cache
-        run: |
-          echo "Temp: Deleting potentially corrupted Qwen/Qwen-Image and Qwen/Qwen-Image-Edit cache to ensure a fresh download. This is temporary"
-          rm -rf /hf_home/hub/models--Qwen--Qwen-Image
-          rm -rf /hf_home/hub/models--Qwen--Qwen-Image-Edit
-          rm -rf /hf_home/hub/models--Wan-AI--Wan2.2-I2V-A14B-Diffusers
-          rm -rf /hf_home/hub/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
-
       - name: Run diffusion server tests
         timeout-minutes: 60
         run: |
