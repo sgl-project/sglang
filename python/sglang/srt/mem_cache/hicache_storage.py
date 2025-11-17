@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 import torch
 
+from python.sglang.srt.metrics.collector import StorageMetrics
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -162,7 +163,7 @@ class HiCacheStorage(ABC):
     def clear(self) -> None:
         pass
 
-    def get_stats(self):
+    def get_stats(self) -> Optional[StorageMetrics]:
         return None
 
 

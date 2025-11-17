@@ -486,18 +486,24 @@ class HiCacheHF3FS(HiCacheStorage):
             logger.error(f"close HiCacheHF3FS: {e}")
         logger.info("close HiCacheHF3FS")
 
-    @synchronized()
-    def get_stats(self):
-        storage_metrics = StorageMetrics()
-        storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
-        storage_metrics.backup_pgs.extend(self.backup_pgs)
-        storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
-        storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
-        self.prefetch_pgs.clear()
-        self.backup_pgs.clear()
-        self.prefetch_bandwidth.clear()
-        self.backup_bandwidth.clear()
-        return storage_metrics
+    def get_stats(self) -> Optional[StorageMetrics]:
+        # Acquire lock without blocking
+        if not self.lock.acquire(blocking=False):
+            return None
+
+        try:
+            storage_metrics = StorageMetrics()
+            storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
+            storage_metrics.backup_pgs.extend(self.backup_pgs)
+            storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
+            storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
+            self.prefetch_pgs.clear()
+            self.backup_pgs.clear()
+            self.prefetch_bandwidth.clear()
+            self.backup_bandwidth.clear()
+            return storage_metrics
+        finally:
+            self.lock.release()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
