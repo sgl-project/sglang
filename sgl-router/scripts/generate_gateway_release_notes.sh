@@ -154,7 +154,7 @@ echo "" >&2
 generate_notes() {
     case $FORMAT in
         markdown|github)
-            echo "## What's Changed in Gateway/Router"
+            echo "## What's Changed in Gateway"
             echo ""
             echo "### Gateway Changes ($COMMIT_COUNT commits)"
             echo ""
