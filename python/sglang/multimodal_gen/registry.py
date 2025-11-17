@@ -181,39 +181,14 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
         logger.debug(f"Resolved model name '{model_name}' from exact path match.")
         return _CONFIG_REGISTRY.get(model_name)
 
-    # 2. Partial match: find the best (longest) match to avoid conflicts
-    #    like "Qwen-Image" and "Qwen-Image-Edit".
+    # 2. Partial match: find the best (longest) match against all registered model names.
+    # This provides a zero-configuration way to recognize models if their
+    # path contains their registered model_name.
     cleaned_model_path = re.sub(r"--", "/", model_path.lower())
-
-    best_match_name = None
-    best_match_len = -1
-
-    # Check mappings, prioritizing longer keys to resolve ambiguity
-    sorted_mappings = sorted(
-        _MODEL_PATH_TO_NAME.items(), key=lambda item: len(item[0]), reverse=True
-    )
-
-    for registered_id, model_name in sorted_mappings:
-        normalized_registered_id = registered_id.lower()
-        if normalized_registered_id in cleaned_model_path:
-            # Find the best match based on the longest key
-            if len(normalized_registered_id) > best_match_len:
-                best_match_len = len(normalized_registered_id)
-                best_match_name = model_name
-
-    if best_match_name:
-        logger.debug(
-            f"Resolved model name '{best_match_name}' from partial path match."
-        )
-        return _CONFIG_REGISTRY.get(best_match_name)
-
-    # 2.5. Fallback: Infer from path by checking against all registered model names.
     all_model_names = sorted(_CONFIG_REGISTRY.keys(), key=len, reverse=True)
     for model_name in all_model_names:
         if model_name in cleaned_model_path:
-            logger.debug(
-                f"Inferred model name '{model_name}' from path '{model_path}'."
-            )
+            logger.debug(f"Resolved model name '{model_name}' from partial path match.")
             return _CONFIG_REGISTRY.get(model_name)
 
     # 3. Use detectors
