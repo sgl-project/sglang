@@ -27,11 +27,11 @@ Note: Difference between Area Maintainer and Codeowner
 
 ## Pull Request Merge Process
 1. Author submits a pull request (PR) and fills out the PR checklist.
-2. A bot assigns this PR to an Area Maintainer and @ them. At the same time, GitHub will auto-request reviews from Codeowners.
+2. A bot assigns this PR to an Area Maintainer and @-mention them. At the same time, GitHub will auto-request reviews from Codeowners.
 3. The Area Maintainer coordinates the review (asking people to review) and approves the PR; the Codeowner approves the PR.
 4. We can now merge the code:
    - Ideal case: For each modified file, one Codeowner approves the PR. It also passes the required CI. Then anyone with write permission can merge the code.
-   - It is often very hard to meet all requirements due to flaky CI and slow responses. Area Maintainer can bypass the branch protection and merge the PR.
+   - In cases where it is difficult to meet all requirements due to flaky CI or slow responses, an Area Maintainer can bypass branch protection to merge the PR.
 
 ## The List of Area Maintainers and Reviewers
 TODO
