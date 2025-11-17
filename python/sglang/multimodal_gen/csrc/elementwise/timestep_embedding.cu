@@ -25,7 +25,7 @@ limitations under the License.
 #include "vec_dtypes.cuh" // #include <flashinfer/vec_dtypes.cuh>
 using namespace flashinfer;
 
-// // TODO:
+// // TODO: debug only for now
 // #include "sgl_kernel_ops.h"
 // TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 //   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
@@ -34,7 +34,7 @@ using namespace flashinfer;
 // # TODO: namespace
 // REGISTER_EXTENSION(common_ops)
 
-// TODO: hard code for now.
+// TODO: hard code for now. reuse in some where
 // at::vec::convert_to_float instead later
 template <typename T> __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
@@ -105,7 +105,7 @@ template <typename O, typename T> __device__ O cast_to(T x) {
     }                                                                          \
   }()
 
-// TODO: template review
+// TODO:
 // assert operations is float??
 __device__ float calculate_frequency_and_angle(float t_val, int freq_idx,
                                                int half, int max_period) {
@@ -115,7 +115,6 @@ __device__ float calculate_frequency_and_angle(float t_val, int freq_idx,
   return t_val * freqs;
 }
 
-// TODO: tune vec_size?
 template <typename T, typename O, uint32_t vec_size = 8>
 __global__ void
 timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
@@ -166,10 +165,7 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
     }
   }
 
-  // TODO: review, assert output buffer is zero init?
-  // if dim % 2:
-  //     embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])],
-  //     dim=-1)
+  // fill zero if odd
   if (dim % 2 != 0) {
     int out_idx_pad = pid_b * stride_out_b + (dim - 1) * stride_out_d;
     output_ptr[out_idx_pad] = 0.;
@@ -206,7 +202,10 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
   DIM_SWITCH(dim, kDim, /* bad case */ 1, [&] {
     // if dim not in [512, 1024, 2048, 4096]:
     //    vec_size = 1
-    constexpr int vec_size = (kDim % 8 == 0) ? 8 : 1;
+    constexpr int vec_size = (kDim % 8 == 0)   ? 8
+                             : (kDim % 4 == 0) ? 4
+                             : (kDim % 2 == 0) ? 2
+                                               : 1;
     constexpr int num_threads = 512 / vec_size;
     constexpr int BLOCK_SIZE_DIM = vec_size * num_threads;
     // TODO: low sm usage, like 512 / 8 / 2 = 32
