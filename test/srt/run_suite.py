@@ -8,7 +8,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
-        TestFile("function_call/test_json_schema_constraint.py", 1),
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("hicache/test_hicache_variants.py", 393),
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
@@ -70,7 +69,6 @@ suites = {
         TestFile("test_flashmla.py", 230),
         TestFile("test_fp8_utils.py", 5),
         TestFile("rotary_embedding/test_mrope.py", 10),
-        TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 80),
         TestFile("test_gpt_oss_1gpu.py", 750),
         TestFile("test_harmony_parser.py", 20),
@@ -87,6 +85,7 @@ suites = {
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
         TestFile("test_mla_int8_deepseek_v3.py", 300),
+        TestFile("test_model_hooks.py", 1),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_ngram_speculative_decoding.py", 290),
@@ -238,7 +237,6 @@ suites = {
         TestFile("ep/test_hybrid_dp_ep_tp_mtp.py"),
         TestFile("ep/test_moe_deepep.py"),
         TestFile("ep/test_moe_deepep_eval_accuracy_large.py"),
-        TestFile("function_call/test_unknown_tool_name.py"),
         TestFile("hicache/test_disaggregation_hicache.py"),
         TestFile("hicache/test_hicache_storage_benchmark.py"),
         TestFile("hicache/test_hicache_storage_e2e.py"),
@@ -380,7 +378,6 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
-        TestFile("function_call/test_json_schema_constraint.py", 1),
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
@@ -420,7 +417,6 @@ suite_amd = {
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_eval_fp8_accuracy.py", 303),
-        TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_input_embeddings.py", 38),

@@ -28,12 +28,15 @@ __Note__: Difference between Merge Oncall and Codeowner
 ## Pull Request Merge Process
 1. The author submits a pull request (PR) and fills out the PR checklist.
 2. A bot assigns this PR to a Merge Oncall and @-mentions them. At the same time, GitHub will automatically request reviews from Codeowners.
-3. The Merge Oncall coordinates the review (e.g., asking people to review) and approves the PR; the relevant Codeowners also approve the PR.
+3. The Merge Oncall coordinates the review (e.g., asking people to review) and approves the PR; the relevant Codeowners also approve the PR. If the assigned Merge Oncall is not responsive, the author can ping other related Merge Oncalls and Reviewers in the list below.
 4. The code can now be merged:
    - **Ideal case:** For each modified file, one Codeowner has approved the PR. The PR has also passed the required CI tests. Then, anyone with write permission can merge the PR.
    - **Exception:** In cases where it is difficult to meet all requirements (due to flaky CI or slow responses), a Merge Oncall can bypass branch protection to merge the PR.
 
+If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.ai/): #dev, #pull-request, and #ci-cd-build-release.
+
 ## The List of Merge Oncalls and Reviewers
+TODO
 
 This list is based on the current situation. If you or someone you know would like to take on more responsibility and are qualified, please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
 
@@ -51,3 +54,5 @@ The format is @github-username (Slack username).
 
 ### Ascend NPUs
 @iforgetmyname (Even Zhou)
+
+This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
