@@ -13,8 +13,8 @@ def _filter_tests(
     ci_tests = [t for t in ci_tests if t.backend == hw]
     ret = []
     for t in ci_tests:
-        assert t.stage in LABEL_MAPPING[hw], f"Unknown stage {t.stage} for backend {hw}"
-        if t.stage == suite:
+        assert t.suite in LABEL_MAPPING[hw], f"Unknown stage {t.suite} for backend {hw}"
+        if t.suite == suite:
             ret.append(t)
     return ret
 
@@ -22,7 +22,7 @@ def _filter_tests(
 def run_per_commit(hw: HWBackend, suite: str):
     files = glob.glob("per_commit/**/*.py", recursive=True)
     ci_tests = _filter_tests(collect_tests(files), hw, suite)
-    test_files = [TestFile(t.filename, t.estimation_time) for t in ci_tests]
+    test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
     run_unittest_files(
         test_files,
