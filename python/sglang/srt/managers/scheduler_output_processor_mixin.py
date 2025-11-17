@@ -244,7 +244,7 @@ class SchedulerOutputProcessorMixin:
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
-        # 🔑 只有在实际使用spec decode时才更新指标（动态spec场景下需要检查 num_accepted_tokens）
+        # only update spec metrics when spec decoding is actually used  
         if not self.spec_algorithm.is_none() and result.num_accepted_tokens is not None:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 

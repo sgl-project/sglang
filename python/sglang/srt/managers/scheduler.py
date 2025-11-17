@@ -1736,10 +1736,9 @@ class Scheduler(
             )
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
-        # FIXME(sunpeng): figure out why memory_leak
-        # if memory_leak:
-        #     msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-        #     raise ValueError(msg)
+        if memory_leak:
+            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+            raise ValueError(msg)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
@@ -2279,19 +2278,6 @@ class Scheduler(
         batch.forward_mode = ForwardMode.EXTEND
         batch.spec_algorithm = self.spec_algorithm
 
-        # # Create initial spec_info only if it doesn't exist
-        # if batch.spec_info is None:
-        #     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-            
-        #     batch.spec_info = EagleDraftInput.create_idle_input(
-        #         device=batch.device,
-        #         hidden_size=batch.model_config.hidden_size,
-        #         dtype=batch.model_config.dtype,
-        #         topk=self.server_args.speculative_eagle_topk or 1,
-        #         capture_hidden_mode=CaptureHiddenMode.LAST,
-        #     )
-
-        # For EXTEND mode, we need to properly allocate memory for the new token
         # while preserving the existing paged KV cache
         bs = batch.batch_size()
 
@@ -2314,23 +2300,6 @@ class Scheduler(
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
-
-        # 🔧 CRITICAL PRE-CHECK: Validate spec state consistency BEFORE any forward
-        # This catches any spec state that slipped through earlier cleanup stages
-        if batch.spec_info is not None:
-            # Check if we should be using spec based on decision
-            should_use_spec = self.should_use_speculative_decoding(batch)
-            if not should_use_spec:
-                # Only log when we actually need to clean (error case)
-                logger.error(
-                    f"run_batch PRE-CHECK: batch has spec_info but should NOT use spec! "
-                    f"batch_size={batch.batch_size()}, forward_mode={batch.forward_mode.name}, "
-                    f"out_cache_loc size={len(batch.out_cache_loc) if batch.out_cache_loc is not None else 0}. "
-                    f"Force cleaning now to prevent crash."
-                )
-                self.cleanup_speculative_state(batch)
-
-        use_spec_decoding = False
 
         # Run forward
         if self.is_generation:
@@ -2385,7 +2354,6 @@ class Scheduler(
             else:
                 use_spec_decoding = self.should_use_speculative_decoding(batch)
                 
-                # Only log when switching modes to reduce log spam
                 batch_size = batch.batch_size()
                 threshold = self.server_args.speculative_batch_size_threshold
                 
@@ -2404,16 +2372,13 @@ class Scheduler(
                         logger.info(f"Switching from spec to non-spec mode (batch_size={batch_size})")
                         self.last_step_in_spec_mode = False
                     
-                    # 🔧 CRITICAL FIX: ALWAYS clean batch's spec_info when in non-spec mode!
+                    # clean batch's spec_info when in non-spec mode!
                     # This handles cases where batch inherited spec_info from merge
                     # but last_step_in_spec_mode was already False
                     if batch.spec_info is not None:
-                        # Log at debug to reduce overhead
-                        logger.debug(f"Cleaning residual spec_info (batch_size={batch_size})")
                         self.cleanup_speculative_state(batch)
 
-                    # 🔑 使用 tp_worker (target-only)，而不是 model_worker (EAGLEWorker)
-                    # 当动态禁用 spec decode 时，应该直接运行 target model
+                    # use tp_worker to run the batch
                     batch_or_worker_batch = batch.get_model_worker_batch()
                     batch_result = self.tp_worker.forward_batch_generation(batch_or_worker_batch)
                     future_indices_or_next_token_ids = batch_result.next_token_ids
@@ -2422,11 +2387,14 @@ class Scheduler(
                 # Case 3: Has config and dynamically enabled - spec mode
                 else:
                     # Handle non-spec -> spec transition
-                    orig_forward_mode = None
                     if not self.last_step_in_spec_mode:
-                        logger.info(f"Switching from non-spec to spec mode (batch_size={batch_size})")
-                        orig_forward_mode = self.initialize_speculative_state(batch)
+                        # Store orig_forward_mode on batch so process_batch_result can restore it
+                        batch.spec_init_orig_forward_mode = self.initialize_speculative_state(batch)
                         self.last_step_in_spec_mode = True
+                    else:
+                        batch.spec_init_orig_forward_mode = None
+                        # Make sure spec_algorithm is set for subsequent switches
+                        batch.spec_algorithm = self.spec_algorithm
 
                     # Note: self.model_worker is draft_worker (eagle_worker) when spec is configured
                     # The eagle_worker will run in spec mode because batch.spec_algorithm is set
@@ -2438,10 +2406,6 @@ class Scheduler(
                         self.spec_num_total_accepted_tokens += batch_result.num_accepted_tokens + bs
                         self.spec_num_total_forward_ct += bs
                         self.num_generated_tokens += batch_result.num_accepted_tokens
-
-                    # Restore forward mode if we just switched
-                    if orig_forward_mode is not None:
-                        batch.forward_mode = orig_forward_mode
 
                     future_indices_or_next_token_ids = batch_result.next_token_ids
 
@@ -2508,6 +2472,12 @@ class Scheduler(
             if self.enable_overlap:
                 if result.copy_done is not None:
                     result.copy_done.synchronize()
+
+        # Restore forward_mode if this was a spec initialization with EXTEND
+        # Do NOT clean up prefix_lens/extend_lens - they will be managed by eagle_worker
+        if hasattr(batch, 'spec_init_orig_forward_mode') and batch.spec_init_orig_forward_mode is not None:
+            batch.forward_mode = batch.spec_init_orig_forward_mode
+            batch.spec_init_orig_forward_mode = None
 
         self.maybe_send_health_check_signal()
 

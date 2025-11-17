@@ -1018,7 +1018,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
-    spec_info: Optional[SpecInput] = None   # EagleDraftInput 或 EagleVerifyInput
+    spec_info: Optional[SpecInput] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1665,14 +1665,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
         # 1) current batch is always prefill, whose seq_lens and allocate_lens are not a future
         # 2) other batch is always decode, which is finished in previous step
-
-        if self.spec_info is None and other.spec_info is not None:
-            other.out_cache_loc = None
-            
-            # Clear other's spec state
-            other.spec_info = None
-            other.spec_algorithm = SpeculativeAlgorithm.NONE
-
+        
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -1716,6 +1709,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # 状态不一致，完全清除spec状态
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+                other.out_cache_loc = None
                 self.spec_info = None
                 self.spec_algorithm = SpeculativeAlgorithm.NONE
 

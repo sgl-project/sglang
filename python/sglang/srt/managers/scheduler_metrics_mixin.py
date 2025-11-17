@@ -248,7 +248,7 @@ class SchedulerMetricsMixin:
 
         msg = f"Decode batch. #running-req: {num_running_reqs}, {token_usage_msg}"
 
-        # 🔑 动态spec场景：只有实际运行了spec decode才打印指标
+        # only update spec metrics when spec decoding is actually used  
         if self.spec_algorithm.is_none() or self.spec_num_total_forward_ct == 0:
             spec_accept_length = 0
             spec_accept_rate = 0
