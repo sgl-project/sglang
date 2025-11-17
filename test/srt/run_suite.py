@@ -177,9 +177,7 @@ suites = {
         # TODO: Add it back after the bug is fixed
         # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
-    "per-commit-8-gpu-b200": [
-        TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
-    ],
+    "per-commit-8-gpu-b200": [],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
@@ -219,7 +217,9 @@ suites = {
         TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
         TestFile("test_fp4_moe.py", 300),
     ],
-    "nightly-8-gpu-b200": [],
+    "nightly-8-gpu-b200": [
+        TestFile("nightly/test_deepseek_r1_fp8_trtllm_backend.py", 3600),
+    ],
     "nightly-4-gpu": [
         TestFile("test_qwen3_next_deterministic.py", 200),
     ],
