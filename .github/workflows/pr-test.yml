@@ -562,7 +562,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -623,7 +623,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
   performance-test-1-gpu-part-2:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -676,7 +676,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-1-gpu-part-3:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -770,7 +770,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
