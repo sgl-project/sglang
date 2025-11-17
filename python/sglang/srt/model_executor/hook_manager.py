@@ -1,12 +1,12 @@
 import fnmatch
 import importlib
 import logging
+from typing import Any, Callable, List, Optional
 
 import torch.nn as nn
 
-from typing import Any, Callable, List, Optional
-
 logger = logging.getLogger(__name__)
+
 
 def register_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
     """
@@ -19,16 +19,12 @@ def register_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
         spec_name = spec.get("name", "")
         target_patterns = spec.get("target_modules", [])
         if not target_patterns:
-            logger.warning(
-                f"Hook spec '{spec_name}' has no 'target_modules', skipping"
-            )
+            logger.warning(f"Hook spec '{spec_name}' has no 'target_modules', skipping")
             continue
 
         hook_factory_path = spec.get("hook_factory")
         if not hook_factory_path:
-            logger.warning(
-                f"Hook spec '{spec_name}' has no 'hook_factory', skipping"
-            )
+            logger.warning(f"Hook spec '{spec_name}' has no 'hook_factory', skipping")
             continue
 
         config = spec.get("config") or {}
@@ -57,10 +53,8 @@ def register_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
 
         for module_name, module in matched:
             _ = module.register_forward_hook(hook)
-            logger.info(
-                f"Registered forward hook '{spec_name}' "
-                f"on {module_name}"
-            )
+            logger.info(f"Registered forward hook '{spec_name}' " f"on {module_name}")
+
 
 def resolve_callable(path: Optional[str]) -> Optional[Callable]:
     if path is None:
