@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_DEEPSEEK_R1_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -13,11 +12,13 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
+FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
+
 
 class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = try_cached_model(DEFAULT_DEEPSEEK_R1_MODEL_FOR_TEST)
+        cls.model = try_cached_model(FULL_DEEPSEEK_V3_MODEL_PATH)
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
