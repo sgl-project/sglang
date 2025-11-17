@@ -622,6 +622,7 @@ class MambaMixer2(torch.nn.Module):
                     disable_state_update=True,
                     intermediate_states_buffer=layer_cache.intermediate_ssm,
                     cache_steps=draft_token_num,
+                    retrieve_parent_token=metadata.retrieve_parent_token,
                 )
             else:
                 selective_state_update(

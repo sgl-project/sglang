@@ -48,6 +48,14 @@ else:
         is not None
     }
 )
+@triton.heuristics(
+    {
+        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args[
+            "retrieve_parent_token_ptr"
+        ]
+        is not None
+    }
+)
 @triton.jit(do_not_specialize=["T"])
 def _selective_scan_update_kernel(
     # Pointers to matrices
@@ -65,6 +73,7 @@ def _selective_scan_update_kernel(
     pad_slot_id,
     intermediate_states_buffer,
     cache_steps,
+    retrieve_parent_token_ptr,
     # Matrix dimensions
     batch,
     T,
@@ -108,6 +117,8 @@ def _selective_scan_update_kernel(
     stride_out_T,
     stride_out_head,
     stride_out_dim,
+    stride_retrieve_parent_token_batch,
+    stride_retrieve_parent_token_T,
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     TIE_HDIM: tl.constexpr,
@@ -118,6 +129,7 @@ def _selective_scan_update_kernel(
     HAS_STATE_BATCH_INDICES: tl.constexpr,
     DISABLE_STATE_UPDATE: tl.constexpr,
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
+    HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
@@ -163,8 +175,36 @@ def _selective_scan_update_kernel(
         D_ptrs = D_ptr + offs_m * stride_D_dim
     A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
 
+    cache_idx = -1
+    if CACHE_INTERMEDIATE_STATES:
+        if HAS_STATE_BATCH_INDICES:
+            cache_idx = state_batch_idx
+        else:
+            cache_idx = pid_b
+
     current_step_idx = 0
     for _ in range(T):
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+            if current_step_idx != 0 and cache_idx >= 0:
+                parent_ptr = (
+                    retrieve_parent_token_ptr
+                    + pid_b * stride_retrieve_parent_token_batch
+                    + current_step_idx * stride_retrieve_parent_token_T
+                )
+                parent_step_idx = tl.load(parent_ptr).to(tl.int32)
+
+                if parent_step_idx >= 0 and parent_step_idx < T:
+                    step_offset = parent_step_idx * nheads * dim * dstate
+                    cache_ptr = (
+                        intermediate_states_buffer
+                        + cache_idx * cache_steps * nheads * dim * dstate
+                        + step_offset
+                        + pid_h * dim * dstate
+                        + offs_m[:, None] * dstate
+                        + offs_n[None, :]
+                    )
+                    state = tl.load(cache_ptr, mask=mask, other=0.0)
+
         x_ptrs = x_ptr + offs_m * stride_x_dim
         dt_ptrs = dt_ptr + offs_m * stride_dt_dim
         B_ptrs = B_ptr + offs_n * stride_B_dstate
@@ -257,6 +297,7 @@ def selective_state_update(
     disable_state_update=False,
     intermediate_states_buffer=None,
     cache_steps=None,
+    retrieve_parent_token=None,
 ):
     """
     Argument:
@@ -280,6 +321,7 @@ def selective_state_update(
         disable_state_update: If True, don't write back to state (for speculative verify)
         intermediate_states_buffer: Buffer to cache intermediate states
         cache_steps: Total number of steps in the buffer
+        retrieve_parent_token: (batch, T) tensor of parent token indices for EAGLE tree attention
     """
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -358,6 +400,13 @@ def selective_state_update(
         and dt.stride(-1) == 0
         and dt_bias.stride(-1) == 0
     )
+
+    retrieve_parent_token_strides = (
+        (retrieve_parent_token.stride(0), retrieve_parent_token.stride(1))
+        if retrieve_parent_token is not None
+        else (0, 0)
+    )
+
     with torch.cuda.device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
@@ -374,6 +423,7 @@ def selective_state_update(
             pad_slot_id,
             intermediate_states_buffer,
             cache_steps if cache_steps is not None else 0,
+            retrieve_parent_token,
             batch,
             T,
             nheads,
@@ -413,6 +463,8 @@ def selective_state_update(
             out.stride(1),
             out.stride(2),
             out.stride(3),
+            retrieve_parent_token_strides[0],
+            retrieve_parent_token_strides[1],
             dt_softplus,
             tie_hdim,
             BLOCK_SIZE_M,
