@@ -193,6 +193,9 @@ class Req:
     VSA_sparsity: float = 0.0
     perf_logger: PerformanceLogger | None = None
 
+    # stage logging
+    logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)
+
     # profile
     profile: bool = False
     num_profiled_timesteps: int = 8
@@ -232,7 +235,7 @@ class Req:
 
     def set_width_and_height(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
-            width, height = server_args.pipeline_config.set_width_and_height(
+            width, height = server_args.pipeline_config.adjust_size(
                 self.width, self.height, self.pil_image
             )
             self.width = width
