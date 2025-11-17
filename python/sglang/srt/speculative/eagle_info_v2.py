@@ -254,6 +254,7 @@ class EagleVerifyInputV2Mixin:
         self: EagleVerifyInput,
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
+        vocab_mask: torch.Tensor = None,
     ):
         """
         Verify and find accepted tokens based on logits output and batch
@@ -273,6 +274,13 @@ class EagleVerifyInputV2Mixin:
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
         device = batch.input_ids.device
+
+        # Apply grammar mask if provided
+        if vocab_mask is not None:
+            assert self.grammar is not None
+            self.grammar.apply_vocab_mask(
+                logits=next_token_logits, vocab_mask=vocab_mask
+            )
 
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         predict = torch.zeros(
