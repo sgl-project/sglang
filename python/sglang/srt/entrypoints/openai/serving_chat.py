@@ -407,7 +407,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if self._get_reasoning_from_request(
                 request
             ) and self.reasoning_parser not in ["qwen3", "glm4"]:
-                # qwen3 and glm4 think internally without a leaning <think> token
+                # qwen3 and glm4 think internally without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
