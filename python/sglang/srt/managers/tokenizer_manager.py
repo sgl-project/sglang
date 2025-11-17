@@ -1779,6 +1779,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
+                meta_info["spec_accept_token_num"] = accepted_tokens
+                meta_info["spec_draft_token_num"] = total_draft_tokens
+                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
     def _calculate_timing_metrics(
         self,

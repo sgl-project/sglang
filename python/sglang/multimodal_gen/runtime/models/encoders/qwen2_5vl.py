@@ -137,7 +137,7 @@ class Qwen2_5_VLAttention(nn.Module):
             softmax_scale=self.scaling,
             causal=True,
             supported_attention_backends=(
-                AttentionBackendEnum.FA3,
+                AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )

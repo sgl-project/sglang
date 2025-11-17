@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "model": "Qwen/Qwen-Image",
+    "model": "Diffusion Server",
     "hardware": "CI H100 80GB pool",
     "description": "Reference numbers captured from the CI diffusion server baseline run"
   },
@@ -35,7 +35,7 @@
         "TextEncodingStage": 834.2,
         "ConditioningStage": 0.1,
         "TimestepPreparationStage": 10.6,
-        "LatentPreparationStage": 5.2,
+        "LatentPreparationStage": 9.0,
         "DenoisingStage": 21202.6,
         "DecodingStage": 476.12
       },
@@ -57,12 +57,12 @@
       "expected_avg_denoise_ms": 720.0,
       "expected_median_denoise_ms": 718.0,
       "stages_ms": {
-        "InputValidationStage": 14,
+        "InputValidationStage": 23,
         "ImageEncodingStage": 990.0,
-        "ImageVAEEncodingStage": 252.76,
+        "ImageVAEEncodingStage": 340.0,
         "ConditioningStage": 0.13,
         "TimestepPreparationStage": 13.78,
-        "LatentPreparationStage": 9.18,
+        "LatentPreparationStage": 10.0,
         "DenoisingStage": 36000.0,
         "DecodingStage": 645
       },
@@ -77,6 +77,66 @@
         "42": 720.0, "43": 720.0, "44": 720.0, "45": 720.0, "46": 720.0, "47": 720.0,
         "48": 720.0, "49": 720.0
       }
+    },
+    "text_to_video": {
+      "notes": "Single-video generation using the default prompt",
+      "expected_e2e_ms": 95616.59,
+      "expected_avg_denoise_ms": 1798.77,
+      "expected_median_denoise_ms": 1786.78,
+
+      "stages_ms": {
+        "InputValidationStage": 1.03,
+        "TextEncodingStage": 3450.0,
+        "ConditioningStage": 1.0,
+        "TimestepPreparationStage": 6.0,
+        "LatentPreparationStage": 15.0,
+        "DenoisingStage": 90100.0,
+        "DecodingStage": 3650.0
+      },
+
+      "denoise_step_ms": {
+        "0": 3500.0, "10": 1800.0, "20": 1800.0, "29": 1800.0, "39": 1800.0, "49": 1800.0
+      },
+      "frames_per_second": 0.51,
+      "total_frames": 49,
+      "avg_frame_time_ms": 1951.36
+    },
+    "image_to_video": {
+      "notes": "Image-to-Video generation baseline placeholder: TODO(bug)",
+      "expected_e2e_ms": 1000000000.0,
+      "expected_avg_denoise_ms": 1000000000.0,
+      "expected_median_denoise_ms": 1000000000.0,
+      "stages_ms": {},
+      "denoise_step_ms": {},
+      "frames_per_second": null,
+      "total_frames": null,
+      "avg_frame_time_ms": null
+    },
+    "text_image_to_video": {
+      "notes": "Text-and-Image-to-Video generation baseline for Wan2.2-TI2V-5B",
+      "expected_e2e_ms": 178300.0,
+      "expected_avg_denoise_ms": 3250.0,
+      "expected_median_denoise_ms": 3260.0,
+      "stages_ms": {
+        "InputValidationStage": 80.0,
+        "TextEncodingStage": 3000.0,
+        "ConditioningStage": 1.0,
+        "TimestepPreparationStage": 6.0,
+        "LatentPreparationStage": 30.0,
+        "DenoisingStage": 162900.0,
+        "DecodingStage": 13500.0
+      },
+      "denoise_step_ms": {
+        "0": 3700.0,
+        "10": 3300.0,
+        "20": 3300.0,
+        "29": 3300.0,
+        "39": 3300.0,
+        "49": 3300.0
+      },
+      "frames_per_second": null,
+      "total_frames": null,
+      "avg_frame_time_ms": null
     }
   }
 }
