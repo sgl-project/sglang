@@ -3,11 +3,7 @@
 import logging
 from typing import Any, Iterable, Optional, Tuple
 
-import mindspore as ms
-import numpy as np
 import torch
-import torch_npu
-from mindspore import Tensor, mint, mutable
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -17,6 +13,15 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.registry import import_model_classes
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
+if is_npu:
+    import mindspore as ms
+    import numpy as np
+    import torch_npu
+    from mindspore import Tensor, mint, mutable
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +205,10 @@ class MindSporeForCausalLM(torch.nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.model.load_weights(weights)
+        for _, cell in self.model.cells_and_names():
+            quant_method = getattr(cell, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(cell)
 
     def get_kvcache(self, forward_batch: ForwardBatch):
         def prepare_cache(cache_list, is_key_cache):
