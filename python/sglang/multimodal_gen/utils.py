@@ -801,3 +801,13 @@ def save_decoded_latents_as_video(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     imageio.mimsave(output_path, frames, fps=fps, format="mp4")
+
+
+def calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height, None
