@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [synchronize, labeled]
+    types: [synchronize]
   workflow_dispatch:
     inputs:
       version:
@@ -32,14 +32,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Skip if PR triggered by non-'run-ci' label
-        if: github.event_name == 'pull_request' &&
-            github.event.action == 'labeled' &&
-            github.event.label.name != 'run-ci'
-        run: |
-          echo "Skip this run because the PR was triggered by a label other than 'run-ci'."
-          exit 1
 
       - name: Fail if the PR does not have the 'run-ci' label
         if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
