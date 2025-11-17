@@ -86,9 +86,9 @@ if [[ -z "$PREV_TAG" ]] || [[ -z "$CURR_TAG" ]]; then
     usage
 fi
 
-# Navigate to repo root
+# Navigate to repo root (main sglang repo, not sgl-router)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 echo -e "${BLUE}Generating Gateway/Router release notes...${NC}" >&2
@@ -130,8 +130,10 @@ echo -e "${BLUE}Analyzing contributors...${NC}" >&2
 # Get all contributors in this release (with commit count)
 CONTRIBUTORS=$(git log "$PREV_TAG..$CURR_TAG" --format='%aN <%aE>' --no-merges "${PATH_ARGS[@]}" | sort | uniq -c | sort -rn)
 
-# Get all contributors before this release
-PREV_CONTRIBUTORS=$(git log "..$PREV_TAG" --format='%aN <%aE>' --no-merges "${PATH_ARGS[@]}" | sort | uniq)
+# Get all contributors before this release (from initial commit up to PREV_TAG)
+# Using $(git rev-list --max-parents=0 HEAD) to get initial commit ensures we check entire history
+INITIAL_COMMIT=$(git rev-list --max-parents=0 HEAD | tail -1)
+PREV_CONTRIBUTORS=$(git log "$INITIAL_COMMIT..$PREV_TAG" --format='%aN <%aE>' --no-merges "${PATH_ARGS[@]}" | sort | uniq)
 
 # Find new contributors
 NEW_CONTRIBUTORS=""
