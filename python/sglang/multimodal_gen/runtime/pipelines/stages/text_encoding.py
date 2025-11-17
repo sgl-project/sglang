@@ -249,13 +249,10 @@ class TextEncodingStage(PipelineStage):
 
             is_stable_diffusion3 = isinstance(server_args.pipeline_config, StableDiffusion3PipelineConfig)
             if is_stable_diffusion3:
-                if i == 0:
+                if i in (0, 1):
                     tok_kwargs['max_length'] = 77
                     tok_kwargs['padding'] = "max_length"
-                if i == 1:
-                    tok_kwargs['max_length'] = 77
-                    tok_kwargs['padding'] = "max_length"
-                if i == 2:
+                elif i == 2:
                     tok_kwargs['max_length'] = 256
 
             text_inputs = tokenizer(processed_texts, **tok_kwargs).to(target_device)
@@ -281,22 +278,16 @@ class TextEncodingStage(PipelineStage):
             if is_stable_diffusion3:
                 if i!=2:
                     prompt_embeds = prompt_embeds[-2]
-                    _, seq_len, _ = prompt_embeds.shape
-                    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-                    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-                else:
-                    _, seq_len, _ = prompt_embeds.shape
-                    # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
-                    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-                    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-            embeds_list.append(prompt_embeds)
-            if is_stable_diffusion3:
-                if i!=2:
                     tmp_pooled_prompt_embeds=outputs.pooler_output
                     tmp_pooled_prompt_embeds = tmp_pooled_prompt_embeds.repeat(1, num_images_per_prompt)
                     tmp_pooled_prompt_embeds = tmp_pooled_prompt_embeds.view(batch_size * num_images_per_prompt, -1)
-
                     pooled_embeds_list.append(tmp_pooled_prompt_embeds)
+                _, seq_len, _ = prompt_embeds.shape
+                # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
+                prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+                prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+            embeds_list.append(prompt_embeds)
+
             if is_flux:
                 pooled_embeds_list.append(outputs.pooler_output)
             if return_attention_mask:

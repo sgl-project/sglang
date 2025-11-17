@@ -70,7 +70,7 @@ class LatentPreparationStage(PipelineStage):
             vae_scale_factor=server_args.pipeline_config.vae_config.get_vae_scale_factor() if server_args.pipeline_config.vae_config.get_vae_scale_factor() else 8
             shape = (
                 batch_size,
-                16, ## StableDiffusion3PipelineConfig.in_channel
+                server_args.pipeline_config.dit_config.arch_config.in_channels,
                 int(height) // vae_scale_factor,
                 int(width) // vae_scale_factor,
             )

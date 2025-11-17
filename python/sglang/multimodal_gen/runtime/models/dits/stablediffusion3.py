@@ -136,12 +136,12 @@ class SD3Transformer2DModel(CachableDiT):
         hidden_states = self.pos_embed(hidden_states)  # takes care of adding positional embeddings too.
         temb = self.time_text_embed(timestep, pooled_projections)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-
-        if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
-            ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
-            ip_hidden_states, ip_temb = self.image_proj(ip_adapter_image_embeds, timestep)
-
-            joint_attention_kwargs.update(ip_hidden_states=ip_hidden_states, temb=ip_temb)
+        # Copied from diffusers/models/transformers/transformer_sd3.py#SD3Transformer2DModel, but without the self.image_proj method; commented out temporarily for robustness.
+        # if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
+        #     ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
+        #     ip_hidden_states, ip_temb = self.image_proj(ip_adapter_image_embeds, timestep)
+        #
+        #     joint_attention_kwargs.update(ip_hidden_states=ip_hidden_states, temb=ip_temb)
 
         for index_block, block in enumerate(self.transformer_blocks):
             # Skip specified layers
