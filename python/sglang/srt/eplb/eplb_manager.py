@@ -74,7 +74,7 @@ class EPLBManager:
             self._server_args, self._model_runner.model_config, logical_count
         )
 
-        update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
+        update_layer_ids_chunks = self._compute_update_layer_ids_chunks(expert_location_metadata)
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
             if len(update_layer_ids_chunks) > 1:
                 yield
@@ -105,10 +105,13 @@ class EPLBManager:
 
         return True
 
-    def _compute_update_layer_ids_chunks(self) -> List[List[int]]:
+    def _compute_update_layer_ids_chunks(self, expert_location_metadata=None) -> List[List[int]]:
         all_layer_ids = sorted(
             list(self._model_runner.model.routed_experts_weights_of_layer.keys())
         )
+        if expert_location_metadata.update_layer_idx is not None:
+            update_layer_idx = expert_location_metadata.update_layer_idx
+            all_layer_ids = [lid for lid in update_layer_idx if lid in all_layer_ids]
         chunk_size = self._rebalance_layers_per_chunk or 1000000
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 

@@ -219,3 +219,12 @@ def rebalance_experts(
 
 
 __all__ = ["rebalance_experts"]
+
+if __name__ == "__main__":
+    import time
+    for it in range(32):
+        hotness = torch.randint(1, 1000, (256, 58, 256))
+        st = time.time()
+        rebalance_experts(hotness.sum(0), 256 + 64, 8, 4, 64, False)
+        et = time.time()
+        print(f"iteration {it}: time {(et - st) * 1000:.2f} ms")
