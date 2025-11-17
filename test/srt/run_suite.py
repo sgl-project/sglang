@@ -218,7 +218,7 @@ suites = {
         TestFile("test_fp4_moe.py", 300),
     ],
     "nightly-8-gpu-b200": [
-        TestFile("nightly/test_deepseek_r1_fp8_trtllm_backend.py", 3600),
+        TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
     ],
     "nightly-4-gpu": [
         TestFile("test_qwen3_next_deterministic.py", 200),
