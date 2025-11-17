@@ -22,7 +22,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 
@@ -391,6 +391,7 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
+
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -576,6 +577,9 @@ class ServerArgs:
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
+
+    # For forward hooks
+    hooks: Optional[List[dict[str, Any]]] = None
 
     def __post_init__(self):
         """
@@ -3723,6 +3727,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
+        )
+
+        # For registering hooks
+        parser.add_argument(
+            "--hooks",
+            type=json_list_type,
+            default=None,
+            help="The hooks to be attached.",
         )
 
     @classmethod
