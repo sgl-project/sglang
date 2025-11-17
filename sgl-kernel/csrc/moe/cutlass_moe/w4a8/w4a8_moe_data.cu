@@ -18,25 +18,25 @@ __global__ void compute_problem_sizes_w4a8(
   int occurrences = 0;
   // Optimized: vectorized memory access using int4 for better memory bandwidth
   // Process vectorized chunks first
-  const int vec_size = 4;
-  const int vec_length = topk_length / vec_size;
-  const int vec_start_idx = threadIdx.x;
-  const int vec_stride = BLOCK_SIZE;
+  bool aligned = (reinterpret_cast<uintptr_t>(topk_ids) % 16 == 0);
 
-  for (int i = vec_start_idx; i < vec_length; i += vec_stride) {
-    // Load 4 int32 values at once using int4
-    int4 vec_data;
-    memcpy(&vec_data, &topk_ids[i * vec_size], sizeof(int4));
-    occurrences += (vec_data.x == expert_id);
-    occurrences += (vec_data.y == expert_id);
-    occurrences += (vec_data.z == expert_id);
-    occurrences += (vec_data.w == expert_id);
-  }
+  if (aligned) {
+    const int4* vec_ptr = reinterpret_cast<const int4*>(topk_ids);
+    int vec_length = topk_length / 4;
 
-  // Process remaining elements that don't fit in vectorized chunks
-  const int remaining_start = vec_length * vec_size;
-  for (int i = remaining_start + threadIdx.x; i < topk_length; i += BLOCK_SIZE) {
-    occurrences += (topk_ids[i] == expert_id);
+    for (int i = threadIdx.x; i < vec_length; i += BLOCK_SIZE) {
+      int4 vec_data = vec_ptr[i];
+      occurrences +=
+          (vec_data.x == expert_id) + (vec_data.y == expert_id) + (vec_data.z == expert_id) + (vec_data.w == expert_id);
+    }
+
+    for (int i = vec_length * 4 + threadIdx.x; i < topk_length; i += BLOCK_SIZE) {
+      occurrences += (topk_ids[i] == expert_id);
+    }
+  } else {
+    for (int i = threadIdx.x; i < topk_length; i += BLOCK_SIZE) {
+      occurrences += (topk_ids[i] == expert_id);
+    }
   }
 
   using BlockReduce = cub::BlockReduce<int, BLOCK_SIZE>;
