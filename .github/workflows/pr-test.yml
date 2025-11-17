@@ -33,6 +33,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Debug PR labels
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Labels raw:"
+          echo '${{ toJson(github.event.pull_request.labels) }}'
+          echo "Label names only:"
+          echo '${{ toJson(github.event.pull_request.labels.*.name) }}'
+
       - name: Fail if the PR does not have the 'run-ci' label
         if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
         run: |
