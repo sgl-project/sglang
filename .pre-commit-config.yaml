@@ -31,7 +31,7 @@ repos:
         args:
           - --select=F401,F821
           - --fix
-        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-router/py_*)
+        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-router/py_*|test/)
         exclude: |
           (?x)^(
           .*/__init__\.py$|
