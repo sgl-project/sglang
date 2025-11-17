@@ -893,6 +893,7 @@ jobs:
   pr-test-finish:
     needs:
       [
+        call-gate,
         check-changes,
 
         sgl-kernel-build-wheels,
