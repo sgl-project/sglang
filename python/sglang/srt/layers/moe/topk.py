@@ -129,6 +129,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_use_fused_moe_gate = get_bool_env_var("SGLANG_USE_FUSED_MOE_GATE")
 
 if _is_cuda:
     from moe_cuda import moe_fused_gate
@@ -1266,7 +1267,11 @@ def biased_grouped_topk_gpu(
 
     elif (
         _is_cuda 
-        and ((gating_output.shape[1] // num_expert_group  <= 32) or (gating_output.shape[1] == 256 and num_expert_group == 1))  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
+        and ((
+                _use_fused_moe_gate
+                and gating_output.shape[1] // num_expert_group  <= 32) or (gating_output.shape[1] == 256
+                and num_expert_group == 1
+            ))  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and is_power_of_two(num_experts)
     ):
         topk_weights, topk_ids = moe_fused_gate(
