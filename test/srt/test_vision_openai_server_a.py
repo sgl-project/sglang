@@ -207,12 +207,11 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
 
 
 if __name__ == "__main__":
-    # Note: Cannot delete mixin classes imported via * since they're not in local scope
-    # del (
-    #     TestOpenAIMLLMServerBase,
-    #     ImageOpenAITestMixin,
-    #     VideoOpenAITestMixin,
-    #     AudioOpenAITestMixin,
-    #     OmniOpenAITestMixin,
-    # )
+    del (
+        TestOpenAIMLLMServerBase,
+        ImageOpenAITestMixin,
+        VideoOpenAITestMixin,
+        AudioOpenAITestMixin,
+        OmniOpenAITestMixin,
+    )
     unittest.main()
