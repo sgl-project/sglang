@@ -2450,7 +2450,7 @@ class ServerArgs:
             "--trace-level",
             type=int,
             default=ServerArgs.trace_level,
-            help="Enable opentelemetry trace level",
+            help="0: disable tracing. 1: Trace important slices. 2: Trace all slices except nested ones. 3: Trace all slices.",
         )
         parser.add_argument(
             "--trace-module",

@@ -86,7 +86,7 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
         stage_context.metric_trace_slice_end(RequestStage.TOKENIZER)
         ```
 
-    - In trace_slice_end, use auto_next_anon to automatically create the next anonymous slice, which can reduce the number of instrumentation points needed.
+    - In metric_trace_slice_end, use auto_next_anon to automatically create the next anonymous slice, which can reduce the number of instrumentation points needed.
         ```python
         stage_context.metric_trace_slice_start(RequestStage.ANONYMOUS)
         stage_context.metric_trace_slice_end(RequestStage.A, auto_next_anon = True)
