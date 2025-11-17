@@ -119,12 +119,7 @@ find_latest_image() {
 
   echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
   local any_local
-  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' \
-            | grep "^rocm/sgl-dev:" \
-            | grep "${ROCM_VERSION}" \
-            | grep "${gpu_arch}" \
-            | sort -r \
-            | head -n 1)
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
   if [[ -n "$any_local" ]]; then
       echo "Using cached fallback image: ${any_local}" >&2
       echo "${any_local}"
