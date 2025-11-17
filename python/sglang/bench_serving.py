@@ -1895,6 +1895,7 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    mooncake_processed_requests: List[DatasetRow] = []
     pbar_total = len(input_requests)
     if (
         backend == "sglang" and args.dataset_name == "mooncake"
@@ -1922,6 +1923,8 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     async for request in request_generator:
+        if backend == "sglang" and args.dataset_name == "mooncake":
+            mooncake_processed_requests.append(request)
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
                 lora_name = random.choice(lora_names)
@@ -1993,6 +1996,9 @@ async def benchmark(
             accept_length = None
     else:
         accept_length = None
+
+    if backend == "sglang" and args.dataset_name == "mooncake":
+        input_requests = mooncake_processed_requests
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
