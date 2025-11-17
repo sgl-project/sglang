@@ -37,6 +37,8 @@ from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
     load_token_map,
+    shift_append_input_ids_triton,
+    warmup_eagle_triton_kernels,
 )
 from sglang.srt.utils.common import (
     empty_context,
@@ -45,17 +47,6 @@ from sglang.srt.utils.common import (
     is_npu,
     next_power_of_2,
 )
-
-# Import Triton kernel for input_ids optimization
-try:
-    from sglang.srt.speculative.spec_utils import (
-        shift_append_input_ids_triton,
-        warmup_eagle_triton_kernels,
-    )
-
-    _triton_available = True
-except ImportError:
-    _triton_available = False
 
 _is_npu = is_npu()
 
@@ -225,12 +216,8 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
     def _warmup_triton_kernels(self):
-        if not _triton_available or self.device != "cuda" or _is_npu:
-            return
-        try:
+        if self.device == "cuda" and not _is_npu:
             warmup_eagle_triton_kernels(self.device)
-        except Exception as e:
-            logger.warning(f"Failed to warmup EAGLE Triton kernels: {e}")
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -470,7 +457,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Construct input_ids (in-place)
         if not batch.forward_mode.is_idle():
-            if _triton_available and self.device == "cuda" and not _is_npu:
+            if self.device == "cuda" and not _is_npu:
                 shift_append_input_ids_triton(
                     batch.input_ids, forward_batch.extend_seq_lens, next_token_ids
                 )
