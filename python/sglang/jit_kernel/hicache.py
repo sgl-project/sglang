@@ -13,20 +13,32 @@ DEFAULT_BLOCK_QUOTA = 2
 
 
 @lru_cache(maxsize=None)
-def _jit_hicache_module(element_size: int, block_quota: int) -> Module:
+def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> Module:
     num_threads, occupancy = 1024, 1
     args = make_cpp_args(
         element_size,
         block_quota,
+        unroll,
         num_threads,
         occupancy,
     )
+    print("Loading HiCache JIT module with args:", args)
     return load_jit(
         "hicache",
         *args,
         cuda_files=["hicache.cuh"],
         cuda_wrappers=[("launch_one", f"HiCacheKernel<{args}>::run_one")],
     )
+
+
+def _default_unroll(element_size: int) -> int:
+    if element_size <= 512:
+        return 4
+    elif element_size <= 1024:
+        return 2
+
+    # fallback: no unroll
+    return 1
 
 
 def transfer_hicache_one_layer(
@@ -38,6 +50,7 @@ def transfer_hicache_one_layer(
     indices_src: torch.Tensor,
     *,
     element_dim: int | None = None,
+    unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> None:
     element_dim = element_dim or k_cache_dst.size(-1)
@@ -47,7 +60,12 @@ def transfer_hicache_one_layer(
     v_cache_dst = v_cache_dst.view(-1, element_dim)
     element_size = element_dim * k_cache_dst.element_size()
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    module = _jit_hicache_module(element_size, block_quota=block_quota)
+    unroll = unroll or _default_unroll(element_size)
+    module = _jit_hicache_module(
+        element_size=element_size,
+        unroll=unroll,
+        block_quota=block_quota,
+    )
     module.launch_one(
         k_cache_dst,
         v_cache_dst,
@@ -69,6 +87,7 @@ def transfer_hicache_all_layer(
     kv_cache_dst_stride_bytes: int,
     *,
     element_size: int | None = None,
+    unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> None:
     if element_size is None:  # assume both contiguous
@@ -76,7 +95,12 @@ def transfer_hicache_all_layer(
         element_size = kv_cache_dst_stride_bytes
 
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    module = _jit_hicache_module(element_size, block_quota=block_quota)
+    unroll = unroll or _default_unroll(element_size)
+    module = _jit_hicache_module(
+        element_size=element_size,
+        unroll=unroll,
+        block_quota=block_quota,
+    )
     module.launch_all(
         k_ptr_dst,
         v_ptr_dst,
