@@ -821,6 +821,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     @torch.no_grad()
     def forward(
         self,

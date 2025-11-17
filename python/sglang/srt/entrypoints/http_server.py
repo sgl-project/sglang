@@ -420,6 +420,12 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    if (
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
+        and request.url.path == "/health"
+    ):
+        return Response(status_code=200)
+
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
 
@@ -718,11 +724,6 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {
         "success": success,
         "message": message,
@@ -816,11 +817,6 @@ async def update_weights_from_tensor(
         obj, request
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -838,11 +834,6 @@ async def update_weights_from_distributed(
         )
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -856,11 +847,6 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
         obj, request
     )
-
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
 
     content = {"success": success, "message": message}
     if success:
@@ -1323,12 +1309,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
-
-
-def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
-    """Update weight version if provided."""
-    if weight_version is not None:
-        _global_state.tokenizer_manager.server_args.weight_version = weight_version
 
 
 def _create_error_response(e):
