@@ -994,6 +994,12 @@ class MaybeTboDeepEPDispatcher:
     def dispatch_b(self, **kwargs):
         return self._execute("dispatch_b", **kwargs)
 
+    def dispatch_a_peo(self, **kwargs):
+        return self._execute("dispatch_a_peo", **kwargs)
+
+    def dispatch_b_peo(self, **kwargs):
+        return self._execute("dispatch_b_peo", **kwargs)
+
     def combine(self, **kwargs) -> torch.Tensor:
         return self._execute("combine", **kwargs)
 
@@ -1002,6 +1008,12 @@ class MaybeTboDeepEPDispatcher:
 
     def combine_b(self, **kwargs):
         return self._execute("combine_b", **kwargs)
+
+    def combine_a_peo(self, **kwargs):
+        return self._execute("combine_a_peo", **kwargs)
+
+    def combine_b_peo(self, **kwargs):
+        return self._execute("combine_b_peo", **kwargs)
 
     def set_quant_config(self, quant_config: dict):
         for inner in self._inners:

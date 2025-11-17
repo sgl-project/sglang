@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union, Callable
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_config,
     get_moe_runner_backend,
     is_tbo_enabled,
+    is_peo_enabled,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import CombineOverlapArgs
 
 try:
-    from deep_ep import Buffer, Config
+    from deep_ep import Buffer, Config, EventOverlap
 
     if not _is_npu:
         from sglang.srt.layers.quantization.fp8_kernel import (
@@ -326,6 +327,31 @@ class _DeepEPDispatcherImplBase:
     def dispatch_b(self, *args, **kwargs):
         raise NotImplementedError
 
+    def dispatch_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        use_expert_overlap: bool = False,
+        num_rounds: int = -1,
+        round_id: int = -1,
+        send_num_sms: int = -1,
+        recv_num_sms: int = -1,
+        hook_use_comm_stream: bool = False,
+    ):
+        raise NotImplementedError
+
+    def dispatch_b_peo(
+        self,
+        hidden_states: Tuple[torch.Tensor, torch.Tensor],
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        masked_m: torch.Tensor,
+        expected_m: int,
+        event: EventOverlap,
+        hook: Callable,
+    ):
+        raise NotImplementedError
+
     def combine_a(
         self,
         hidden_states: torch.Tensor,
@@ -336,6 +362,28 @@ class _DeepEPDispatcherImplBase:
         raise NotImplementedError
 
     def combine_b(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def combine_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        use_expert_overlap: bool = False,
+        num_rounds: int = -1,
+        round_id: int = -1,
+        send_num_sms: int = -1,
+        recv_num_sms: int = -1,
+        hook_use_comm_stream: bool = False,
+    ):
+        raise NotImplementedError
+
+    def combine_b_peo(
+        self,
+        hidden_states: torch.Tensor,
+        event: EventOverlap,
+        hook: Callable
+    ):
         raise NotImplementedError
 
     def _get_buffer(self):
@@ -689,6 +737,152 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.quant_config = quant_config
 
 
+class _DeepEPDispatcherImplLowLatencyPEO(_DeepEPDispatcherImplLowLatency):
+    def __init__(self, return_recv_hook: bool, **kwargs):
+        super().__init__(return_recv_hook=return_recv_hook, **kwargs)
+
+        self.dispatch_x = None
+        self.masked_m = None
+        self.combined_x = None
+
+    def dispatch_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        use_expert_overlap: bool = False,
+        num_rounds: int = -1,
+        round_id: int = -1,
+        send_num_sms: int = -1,
+        recv_num_sms: int = -1,
+        hook_use_comm_stream: bool = False,
+    ):
+        buffer = self._get_buffer()
+        topk_weights, topk_idx  = topk_output.topk_weights, topk_output.topk_ids
+        topk_idx = topk_idx.to(torch.int64)
+        expected_m = (
+            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            + self.num_experts
+        ) // self.num_experts
+
+        dispatch_x, masked_m, tmp_handle, event, hook = buffer.low_latency_dispatch(
+            hidden_states,
+            topk_idx,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+            use_fp8=not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"),
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                        and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+            use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                      and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+            use_expert_overlap=use_expert_overlap,
+            num_rounds=num_rounds,
+            round_id=round_id,
+            send_num_sms=send_num_sms,
+            recv_num_sms=recv_num_sms,
+            hook_use_comm_stream=hook_use_comm_stream
+        )
+        if round_id == 0:
+            self.handle = tmp_handle
+            self.dispatch_x = dispatch_x
+            self.masked_m = masked_m
+
+        return (
+            self.dispatch_x,
+            topk_idx,
+            topk_weights,
+            self.masked_m,
+            expected_m,
+            event,
+            hook,
+            num_rounds,
+            round_id,
+        )
+
+    def dispatch_b_peo(
+        self,
+        hidden_states: Tuple[torch.Tensor, torch.Tensor],
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        masked_m: torch.Tensor,
+        expected_m: int,
+        event: EventOverlap,
+        hook: Callable,
+        num_rounds: int = -1,
+        round_id: int = -1,
+    ):
+        hook() if self.return_recv_hook else event.current_stream_wait()
+
+        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+            masked_m
+        )
+
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
+        deepep_output = DeepEPLLDispatchOutput(
+            hidden_states,
+            hidden_states_scale,
+            topk_idx,
+            topk_weights,
+            masked_m,
+            expected_m,
+        )
+
+        if round_id == num_rounds - 1:
+            del self.dispatch_x
+            del self.masked_m
+
+        return deepep_output
+
+    def combine_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        use_expert_overlap: bool = False,
+        num_rounds: int = -1,
+        round_id: int = -1,
+        send_num_sms: int = -1,
+        recv_num_sms: int = -1,
+        hook_use_comm_stream: bool = False
+    ):
+        buffer = self._get_buffer()
+        combined_x, event, hook = buffer.low_latency_combine(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            self.handle,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            use_expert_overlap=use_expert_overlap,
+            num_rounds=num_rounds,
+            round_id=round_id,
+            send_num_sms=send_num_sms,
+            recv_num_sms=recv_num_sms,
+            hook_use_comm_stream=hook_use_comm_stream
+        )
+        if round_id == 0:
+            self.combined_x = combined_x
+        if round_id == num_rounds - 1:
+            del self.handle
+            self.handle = None
+
+        return self.combined_x, event, hook
+
+    def combine_b_peo(
+        self,
+        hidden_states: torch.Tensor,
+        event: EventOverlap,
+        hook: Callable
+    ):
+        hook() if self.return_recv_hook else event.current_stream_wait()
+        return hidden_states
+
+
 @dataclass
 class _Stage(Enum):
     INITIAL = auto()
@@ -725,10 +919,16 @@ class DeepEPDispatcher(BaseDispatcher):
         )
 
         if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
-                return_recv_hook=return_recv_hook,
-                **common_kwargs,
-            )
+            if is_peo_enabled():
+                self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatencyPEO(
+                    return_recv_hook=return_recv_hook,
+                    **common_kwargs,
+                )
+            else:
+                self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+                    return_recv_hook=return_recv_hook,
+                    **common_kwargs,
+                )
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
                 async_finish=async_finish,
@@ -760,6 +960,32 @@ class DeepEPDispatcher(BaseDispatcher):
         del self._dispatch_intermediate_state
         return self._get_impl().dispatch_b(*inner_state)
 
+    def dispatch_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        use_expert_overlap: bool = False,
+        num_rounds: int = -1,
+        round_id: int = -1,
+        send_num_sms: int = -1,
+        recv_num_sms: int = -1,
+        hook_use_comm_stream: bool = False,
+    ):
+        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+        return self._get_impl().dispatch_a_peo(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            use_expert_overlap=use_expert_overlap,
+            num_rounds=num_rounds,
+            round_id=round_id,
+            send_num_sms=send_num_sms,
+            recv_num_sms=recv_num_sms,
+            hook_use_comm_stream=hook_use_comm_stream,
+        )
+
+    def dispatch_b_peo(self, inner_state):
+        return self._get_impl().dispatch_b_peo(*inner_state)
+
     def combine(
         self,
         combine_input: CombineInput,
@@ -789,6 +1015,31 @@ class DeepEPDispatcher(BaseDispatcher):
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
+
+    def combine_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        use_expert_overlap: bool = False,
+        num_rounds: int = -1,
+        round_id: int = -1,
+        send_num_sms: int = -1,
+        recv_num_sms: int = -1,
+    ):
+        return self._get_impl().combine_a_peo(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            use_expert_overlap=use_expert_overlap,
+            num_rounds=num_rounds,
+            round_id=round_id,
+            send_num_sms=send_num_sms,
+            recv_num_sms=recv_num_sms,
+        )
+
+    def combine_b_peo(self, inner_state):
+        return self._get_impl().combine_b_peo(*inner_state)
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()

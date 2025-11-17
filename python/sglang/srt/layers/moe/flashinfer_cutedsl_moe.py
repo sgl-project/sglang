@@ -33,6 +33,7 @@ def flashinfer_cutedsl_moe_masked(
     down_sm_count: Optional[int] = None,
     down_signals: Optional[torch.Tensor] = None,
     down_start_event: Optional[torch.cuda.Event] = None,
+    up_sm_count: Optional[int] = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -145,6 +146,14 @@ def flashinfer_cutedsl_moe_masked(
         sf_vec_size=sf_vec_size,
         alpha=w1_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w1_alpha),
+        **(
+            dict(
+                sm_count=up_sm_count,
+                dst_signals=down_signals,
+            )
+            if up_sm_count is not None or down_signals is not None
+            else {}
+        ),
     )  # in logical [m, n, l]
 
     # SILU and quantization
