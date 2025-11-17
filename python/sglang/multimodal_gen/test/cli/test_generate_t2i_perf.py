@@ -10,6 +10,15 @@ from sglang.multimodal_gen.test.test_utils import TestGenerateBase
 logger = init_logger(__name__)
 
 
+class TestStableDiffusionT2Image(TestGenerateBase):
+    model_path = "stabilityai/stable-diffusion-3-medium-diffusers"
+    extra_args = []
+    data_type: DataType = DataType.IMAGE
+    thresholds = {
+        "test_single_gpu": 9.0 * 1.05,
+    }
+
+
 class TestFlux_T2V(TestGenerateBase):
     model_path = "black-forest-labs/FLUX.1-dev"
     extra_args = []

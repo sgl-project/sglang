@@ -4,7 +4,6 @@
 """
 Latent preparation stage for diffusion pipelines.
 """
-import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipelines import StableDiffusion3PipelineConfig

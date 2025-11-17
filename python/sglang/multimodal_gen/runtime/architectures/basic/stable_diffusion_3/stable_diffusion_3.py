@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """StableDiffusion3 pipeline implementation for sglang."""
 
-from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase, Req
+from sglang.multimodal_gen.runtime.pipelines import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines.stages import (
     ConditioningStage,
     DecodingStage,
