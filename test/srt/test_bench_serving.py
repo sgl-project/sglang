@@ -548,18 +548,12 @@ class TestBenchServing(CustomTestCase):
                 )
 
             self.assertEqual(res["successful_requests"], res["total_requests"])
-            if batch_size == 10:
-                avg_latency_bound = 60
-                p95_latency_bound = 65
-            elif batch_size == 25:
-                avg_latency_bound = 115
-                p95_latency_bound = 120
-            elif batch_size == 50:
-                avg_latency_bound = 190
-                p95_latency_bound = 195
-            else:
-                avg_latency_bound = 250
-                p95_latency_bound = 250
+            bounds = {
+                10: (60, 65),
+                25: (115, 120),
+                50: (190, 195),
+            }
+            avg_latency_bound, p95_latency_bound = bounds.get(batch_size, (250, 250))
             self.assertLess(res["avg_latency_ms"], avg_latency_bound)
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
