@@ -129,17 +129,13 @@ class MambaPool:
         temporal: torch.Tensor
 
         def at_layer_idx(self, layer: int):
-            if isinstance(self.conv, list):
-                return type(self)(
-                    conv=[v[layer] for v in self.conv],
-                    temporal=self.temporal[layer],
-                )
-            return type(self)(
-                **{
-                    f.name: getattr(self, f.name)[layer]
-                    for f in dataclasses.fields(self)
-                }
-            )
+            kwargs = {}
+            for k, v in vars(self).items():
+                if k == "conv" or k == "intermediate_conv_window":
+                    kwargs[k] = [conv[layer] for conv in v]
+                else:
+                    kwargs[k] = v[layer]
+            return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
             return sum(
