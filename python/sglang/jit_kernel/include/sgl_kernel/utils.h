@@ -13,7 +13,7 @@ namespace host {
 struct PanicError : public std::runtime_error {
  public:
   // copy and move constructors
-  PanicError(std::string msg) : runtime_error(msg), m_message(std::move(msg)) {}
+  explicit PanicError(std::string msg) : runtime_error(msg), m_message(std::move(msg)) {}
   auto detail() const -> std::string_view {
     const auto sv = std::string_view{m_message};
     const auto pos = sv.find(": ");
@@ -40,9 +40,9 @@ inline auto panic(std::source_location location, Args&&... args) -> void {
 
 template <typename... Args>
 struct RuntimeCheck {
-  template <typename T>
-  explicit RuntimeCheck(
-      T&& condition, Args&&... args, std::source_location location = std::source_location::current()) {
+  using Loc_t = std::source_location;
+  template <typename Cond>
+  explicit RuntimeCheck(Cond&& condition, Args&&... args, Loc_t location = Loc_t::current()) {
     if (!condition) {
       [[unlikely]];
       ::host::panic(location, std::forward<Args>(args)...);
@@ -50,10 +50,15 @@ struct RuntimeCheck {
   }
 };
 
-template <typename T, typename... Args>
-explicit RuntimeCheck(T&&, Args&&...) -> RuntimeCheck<Args...>;
+template <typename Cond, typename... Args>
+explicit RuntimeCheck(Cond&&, Args&&...) -> RuntimeCheck<Args...>;
 
-template <std::integral T, std::integral U>
+template <std::signed_integral T, std::signed_integral U>
+inline constexpr auto div_ceil(T a, U b) {
+  return (a + b - 1) / b;
+}
+
+template <std::unsigned_integral T, std::unsigned_integral U>
 inline constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
@@ -63,6 +68,8 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
 }
 
 namespace pointer {
+
+// we only allow void * pointer arithmetic for safety
 
 template <typename T, std::integral... U>
 inline auto offset(T* ptr, U... offset) -> void* {

@@ -22,7 +22,6 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         num_threads,
         occupancy,
     )
-    print("Loading HiCache JIT module with args:", args)
     return load_jit(
         "hicache",
         *args,
@@ -34,7 +33,8 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
 def _default_unroll(element_size: int) -> int:
     if element_size <= 512:
         return 4
-    elif element_size <= 1024:
+
+    if element_size <= 1024:
         return 2
 
     # fallback: no unroll
