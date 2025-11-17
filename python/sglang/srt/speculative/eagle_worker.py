@@ -420,9 +420,9 @@ class EAGLEWorker(TpModelWorker):
                     self.page_size,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
-                last_page_lens = prefix_lens_cpu % self.page_size
+                last_page_lens_cpu = prefix_lens_cpu % self.page_size
                 num_new_pages_per_topk = (
-                    last_page_lens + self.speculative_num_steps + self.page_size - 1
+                    last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
                 ) // self.page_size
                 seq_lens_cpu = (
                     prefix_lens_cpu // self.page_size * self.page_size
@@ -444,7 +444,7 @@ class EAGLEWorker(TpModelWorker):
             )
         if self.page_size > 1 and self.topk > 1:
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-            duplicate_cache_len = torch.sum(last_page_lens).item() * (self.topk - 1)
+            duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (self.topk - 1)
             target_cache_loc = torch.zeros(
                 duplicate_cache_len, dtype=torch.int32, device=self.device
             )
@@ -471,7 +471,7 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_steps,
             self.page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps),
+            next_power_of_2(self.speculative_num_steps + self.page_size),
         )
 
         if self.page_size > 1 and self.topk > 1:

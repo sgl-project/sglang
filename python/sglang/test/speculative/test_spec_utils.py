@@ -4,12 +4,13 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache
-from sglang.srt.speculative.eagle_utils import assign_draft_cache_locs
+from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
+from sglang.srt.speculative.spec_utils import assign_draft_cache_locs
 from sglang.srt.utils import next_power_of_2
 
+BYTES_PER_TILE = 128
 
-class TestEagleUtils(unittest.TestCase):
+class TestSpecUtils(unittest.TestCase):
 
     def setUp(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -86,7 +87,7 @@ class TestEagleUtils(unittest.TestCase):
             speculative_num_steps,
             page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(speculative_num_steps),
+            next_power_of_2(speculative_num_steps + page_size),
         )
 
         out_cache_loc = out_cache_loc[: num_seqs * topk * speculative_num_steps]
@@ -95,13 +96,14 @@ class TestEagleUtils(unittest.TestCase):
         )
         assert torch.allclose(source_cache_loc, expected_source_cache_loc)
 
-        copy_all_layer_kv_cache[(len(self.data_ptrs),)](
+        copy_all_layer_kv_cache_tiled[(len(self.data_ptrs),)](
             self.data_ptrs,
             self.data_strides,
             target_cache_loc,
             source_cache_loc,
             len(target_cache_loc),
             next_power_of_2(len(target_cache_loc)),
+            BYTES_PER_TILE,
         )
         assert torch.allclose(
             self.k_cache[0][16:19, 0, 0],
@@ -164,7 +166,7 @@ class TestEagleUtils(unittest.TestCase):
             speculative_num_steps,
             page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(speculative_num_steps),
+            next_power_of_2(speculative_num_steps + page_size),
         )
         out_cache_loc = out_cache_loc[: num_seqs * topk * speculative_num_steps]
         # fmt: off
@@ -203,13 +205,14 @@ class TestEagleUtils(unittest.TestCase):
         assert torch.allclose(out_cache_loc, expected_out_cache_loc)
         assert torch.allclose(source_cache_loc, expected_source_cache_loc)
         assert torch.allclose(target_cache_loc, expected_target_cache_loc)
-        copy_all_layer_kv_cache[(len(self.data_ptrs),)](
+        copy_all_layer_kv_cache_tiled[(len(self.data_ptrs),)](
             self.data_ptrs,
             self.data_strides,
             target_cache_loc,
             source_cache_loc,
             len(target_cache_loc),
             next_power_of_2(len(target_cache_loc)),
+            BYTES_PER_TILE,
         )
         assert torch.allclose(
             self.k_cache[0][81:84, 0, 0],
@@ -266,11 +269,73 @@ class TestEagleUtils(unittest.TestCase):
             speculative_num_steps,
             page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(speculative_num_steps),
+            next_power_of_2(speculative_num_steps + page_size),
         )
         out_cache_loc = out_cache_loc[: num_seqs * topk * speculative_num_steps]
         expected_out_cache_loc = torch.arange(11, 11 + extend_lens_num, device=device)
         assert torch.allclose(out_cache_loc, expected_out_cache_loc)
+
+    def test_assign_draft_cache_locs_page_size_gt_spec_steps(self):
+        device = self.device
+        num_seqs = 1
+        page_size = 16
+        speculative_num_steps = 4
+        topk = 3
+        seq_lens_num = 12
+        pool_len = 256
+        req_pool_indices = torch.arange(num_seqs, dtype=torch.int32, device=device)
+        req_to_token = torch.zeros((num_seqs, pool_len), dtype=torch.int32, device=device)
+        req_to_token[0, :seq_lens_num] = torch.arange(
+            seq_lens_num, dtype=torch.int32, device=device
+        )
+        seq_lens = torch.tensor([seq_lens_num], dtype=torch.int32, device=device)
+        last_page_len = seq_lens_num % page_size
+        last_page_lens = torch.tensor([last_page_len], dtype=torch.int32, device=device)
+        last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
+        num_new_pages_per_topk_val = (
+            last_page_len + speculative_num_steps + page_size - 1
+        ) // page_size
+        num_new_pages_per_topk = torch.tensor(
+            [num_new_pages_per_topk_val], dtype=torch.int32, device=device
+        )
+        extend_lens_num = num_new_pages_per_topk_val * page_size * topk
+        extend_lens = torch.tensor([extend_lens_num], dtype=torch.int32, device=device)
+        out_cache_loc = torch.arange(
+            2000, 2000 + extend_lens_num, dtype=torch.int32, device=device
+        )
+        duplicate_cache_len = int(last_page_len * (topk - 1))
+        target_cache_loc = torch.zeros(
+            duplicate_cache_len, dtype=torch.int32, device=device
+        )
+        source_cache_loc = torch.zeros(
+            duplicate_cache_len, dtype=torch.int32, device=device
+        )
+        assign_draft_cache_locs[(num_seqs,)](
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            extend_lens,
+            num_new_pages_per_topk,
+            out_cache_loc,
+            source_cache_loc,
+            target_cache_loc,
+            last_page_lens_cumsum,
+            req_to_token.shape[1],
+            topk,
+            speculative_num_steps,
+            page_size,
+            next_power_of_2(num_seqs),
+            next_power_of_2(speculative_num_steps + page_size),
+        )
+        trimmed = out_cache_loc[: num_seqs * topk * speculative_num_steps]
+        expected = []
+        for topk_id in range(topk):
+            start = seq_lens_num + topk_id * num_new_pages_per_topk_val * page_size
+            expected.append(
+                req_to_token[0, start : start + speculative_num_steps].clone()
+            )
+        expected_out_cache_loc = torch.cat(expected)
+        assert torch.allclose(trimmed, expected_out_cache_loc)
 
 
 if __name__ == "__main__":
