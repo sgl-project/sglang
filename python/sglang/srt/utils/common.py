@@ -267,7 +267,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+    return backend not in ["torch_native", "intel_amx"]
 
 
 try:
@@ -651,6 +651,11 @@ def prepare_weight_cache(handle, cache):
 def wait_cmo_stream():
     cur_stream = torch.get_device_module().current_stream()
     cur_stream.wait_stream(get_cmo_stream())
+
+
+@lru_cache(maxsize=1)
+def get_device_module():
+    return torch.get_device_module()
 
 
 def set_random_seed(seed: int) -> None:
@@ -2709,7 +2714,10 @@ class BumpAllocator:
 def log_info_on_rank0(logger, msg):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-    if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+    try:
+        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+            logger.info(msg)
+    except:
         logger.info(msg)
 
 
@@ -3641,3 +3649,13 @@ def get_current_device_stream_fast():
     if cached_device_index == -1:
         cached_device_index = torch.get_device_module().current_device()
     return torch.get_device_module().current_stream(cached_device_index)
+
+
+def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
+    if strict:
+        raise ValueError(message)
+    else:
+        count = getattr(obj, counter_name, 0)
+        if count % log_interval == 0:
+            logger.warning(message)
+        setattr(obj, counter_name, count + 1)

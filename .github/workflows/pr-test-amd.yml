@@ -192,6 +192,8 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    env:
+      RUNNER_LABELS: linux-mi300-gpu-8
     strategy:
       fail-fast: false
       matrix:

@@ -16,10 +16,8 @@ import multiprocessing as mp
 import unittest
 
 import torch
-from transformers import AutoProcessor
 
-from sglang.srt.utils import load_image
-from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
+from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import get_similarities
 
 TEXTS = "two Subway Series sandwiches with meats, cheese, lettuce, tomatoes, and onions on a black background, accompanied by the Subway Series logo, highlighting a new sandwich series."

@@ -27,7 +27,6 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "8",
                     "--dp",
                     "8",
-                    "--enable-dp-attention",
                 ],
             },
             {
@@ -38,7 +37,6 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "8",
                     "--dp",
                     "8",
-                    "--enable-dp-attention",
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-num-steps",
@@ -59,7 +57,6 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     "8",
                     "--dp",
                     "8",
-                    "--enable-dp-attention",
                     "--attention-backend",
                     "nsa",
                     "--nsa-prefill-backend",

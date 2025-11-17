@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use validator;
 
 // ============================================================================
 // Default value helpers
@@ -71,6 +72,35 @@ impl StringOrArray {
             StringOrArray::Array(arr) => arr.clone(),
         }
     }
+}
+
+/// Validates stop sequences (max 4, non-empty strings)
+/// Used by both ChatCompletionRequest and ResponsesRequest
+pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
+    match stop {
+        StringOrArray::String(s) => {
+            if s.is_empty() {
+                return Err(validator::ValidationError::new(
+                    "stop sequences cannot be empty",
+                ));
+            }
+        }
+        StringOrArray::Array(arr) => {
+            if arr.len() > 4 {
+                return Err(validator::ValidationError::new(
+                    "maximum 4 stop sequences allowed",
+                ));
+            }
+            for s in arr {
+                if s.is_empty() {
+                    return Err(validator::ValidationError::new(
+                        "stop sequences cannot be empty",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
