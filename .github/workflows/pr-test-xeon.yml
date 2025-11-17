@@ -5,18 +5,22 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
+      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xeon.yml"
+      - "docker/xeon.Dockerfile"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
+      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xeon.yml"
+      - "docker/xeon.Dockerfile"
     types: [synchronize, labeled]
   workflow_dispatch:
 

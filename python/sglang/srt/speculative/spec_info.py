@@ -140,7 +140,6 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
             cls._flags[flag_name.upper()].add(algo.value)
 
     @classmethod
-    @classmethod
     def from_string(cls, name: Optional[str]) -> SpeculativeAlgorithm:
         if name is None:
             return cls.NONE

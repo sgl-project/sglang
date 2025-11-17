@@ -1,19 +1,10 @@
-// MCP Connection Pool
-//
-// This module provides connection pooling for dynamic MCP servers (per-request).
-// Connections are cached and reused to avoid 70-650ms connection overhead on every request.
-//
-// Performance target:
-// - First request: 70-650ms (connection establishment)
-// - Subsequent requests: <1ms (cache hit)
-// - 90%+ reduction in per-request overhead
+/// MCP Connection Pool
+///
+/// This module provides connection pooling for dynamic MCP servers (per-request).
+use std::sync::Arc;
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-use dashmap::DashMap;
+use lru::LruCache;
+use parking_lot::Mutex;
 use rmcp::{service::RunningService, RoleClient};
 
 use crate::mcp::{
@@ -24,13 +15,14 @@ use crate::mcp::{
 /// Type alias for MCP client
 type McpClient = RunningService<RoleClient, ()>;
 
+/// Type alias for eviction callback
+type EvictionCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Cached MCP connection with metadata
 #[derive(Clone)]
 pub struct CachedConnection {
     /// The MCP client instance
     pub client: Arc<McpClient>,
-    /// Last time this connection was accessed
-    pub last_used: Instant,
     /// Server configuration used to create this connection
     pub config: McpServerConfig,
 }
@@ -38,89 +30,88 @@ pub struct CachedConnection {
 impl CachedConnection {
     /// Create a new cached connection
     pub fn new(client: Arc<McpClient>, config: McpServerConfig) -> Self {
-        Self {
-            client,
-            last_used: Instant::now(),
-            config,
-        }
-    }
-
-    /// Update last_used timestamp
-    pub fn touch(&mut self) {
-        self.last_used = Instant::now();
-    }
-
-    /// Check if connection has been idle for longer than TTL
-    pub fn is_idle(&self, idle_ttl: Duration) -> bool {
-        self.last_used.elapsed() > idle_ttl
+        Self { client, config }
     }
 }
 
 /// Connection pool for dynamic MCP servers
 ///
-/// Provides thread-safe connection pooling with automatic cleanup of idle connections.
+/// Provides thread-safe connection pooling with LRU eviction.
 /// Connections are keyed by server URL and reused across requests.
 pub struct McpConnectionPool {
-    /// Map of server_url -> cached connection
-    connections: DashMap<String, CachedConnection>,
+    /// LRU cache of server_url -> cached connection
+    connections: Arc<Mutex<LruCache<String, CachedConnection>>>,
 
-    /// Idle connection TTL (connections unused for this duration are cleaned up)
-    idle_ttl: Duration,
-
-    /// Maximum number of cached connections (prevents unbounded growth)
+    /// Maximum number of cached connections (LRU capacity)
     max_connections: usize,
 
     /// Global proxy configuration (applied to all dynamic servers)
     /// Can be overridden per-server via McpServerConfig.proxy
     global_proxy: Option<McpProxyConfig>,
+
+    /// Optional eviction callback (called when LRU evicts a connection)
+    /// Used to clean up tools from inventory
+    eviction_callback: Option<EvictionCallback>,
 }
 
 impl McpConnectionPool {
+    /// Default max connections for pool
+    const DEFAULT_MAX_CONNECTIONS: usize = 200;
+
     /// Create a new connection pool with default settings
     ///
     /// Default settings:
-    /// - idle_ttl: 300 seconds (5 minutes)
-    /// - max_connections: 100
+    /// - max_connections: 200
     /// - global_proxy: Loaded from environment variables (MCP_HTTP_PROXY, etc.)
     pub fn new() -> Self {
         Self {
-            connections: DashMap::new(),
-            idle_ttl: Duration::from_secs(300),
-            max_connections: 100,
+            connections: Arc::new(Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(Self::DEFAULT_MAX_CONNECTIONS).unwrap(),
+            ))),
+            max_connections: Self::DEFAULT_MAX_CONNECTIONS,
             global_proxy: McpProxyConfig::from_env(),
+            eviction_callback: None,
         }
     }
 
-    /// Create a new connection pool with custom settings
-    pub fn with_config(idle_ttl: Duration, max_connections: usize) -> Self {
+    /// Create a new connection pool with custom capacity
+    pub fn with_capacity(max_connections: usize) -> Self {
         Self {
-            connections: DashMap::new(),
-            idle_ttl,
+            connections: Arc::new(Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(max_connections).unwrap(),
+            ))),
             max_connections,
             global_proxy: McpProxyConfig::from_env(),
+            eviction_callback: None,
         }
     }
 
     /// Create a new connection pool with full custom configuration
-    pub fn with_full_config(
-        idle_ttl: Duration,
-        max_connections: usize,
-        global_proxy: Option<McpProxyConfig>,
-    ) -> Self {
+    pub fn with_full_config(max_connections: usize, global_proxy: Option<McpProxyConfig>) -> Self {
         Self {
-            connections: DashMap::new(),
-            idle_ttl,
+            connections: Arc::new(Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(max_connections).unwrap(),
+            ))),
             max_connections,
             global_proxy,
+            eviction_callback: None,
         }
+    }
+
+    /// Set the eviction callback (called when LRU evicts a connection)
+    pub fn set_eviction_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.eviction_callback = Some(Arc::new(callback));
     }
 
     /// Get an existing connection or create a new one
     ///
     /// This method:
-    /// 1. Checks if a connection exists for the given URL
-    /// 2. If exists and fresh, updates last_used and returns it (fast path <1ms)
-    /// 3. If not exists or stale, creates new connection (slow path 70-650ms)
+    /// 1. Checks if a connection exists for the given URL (fast path <1ms)
+    /// 2. If exists, promotes it in LRU and returns it
+    /// 3. If not exists, creates new connection (slow path 70-650ms)
     ///
     /// # Arguments
     /// * `server_url` - The MCP server URL (used as cache key)
@@ -139,96 +130,77 @@ impl McpConnectionPool {
         F: FnOnce(McpServerConfig, Option<McpProxyConfig>) -> Fut,
         Fut: std::future::Future<Output = McpResult<McpClient>>,
     {
-        // Fast path: Check if connection exists and is still fresh
-        if let Some(mut entry) = self.connections.get_mut(server_url) {
-            let cached = entry.value_mut();
-
-            // Check if connection is still within TTL
-            if !cached.is_idle(self.idle_ttl) {
-                // Update last_used and return cached connection
-                cached.touch();
+        // Fast path: Check if connection exists in LRU cache
+        {
+            let mut connections = self.connections.lock();
+            if let Some(cached) = connections.get(server_url) {
+                // LRU get() promotes the entry
                 return Ok(Arc::clone(&cached.client));
             }
-
-            // Connection is stale, drop it and create new one
-            drop(entry);
-            self.connections.remove(server_url);
         }
 
         // Slow path: Create new connection
-        // Enforce max_connections limit
-        if self.connections.len() >= self.max_connections {
-            self.cleanup_idle_connections();
+        let client = connect_fn(server_config.clone(), self.global_proxy.clone()).await?;
+        let client_arc = Arc::new(client);
 
-            // If still at limit after cleanup, remove oldest connection
-            if self.connections.len() >= self.max_connections {
-                if let Some(oldest_key) = self.find_oldest_connection() {
-                    self.connections.remove(&oldest_key);
+        // Cache the new connection (LRU will automatically evict oldest if at capacity)
+        let cached = CachedConnection::new(Arc::clone(&client_arc), server_config);
+        {
+            let mut connections = self.connections.lock();
+            if let Some((evicted_key, _evicted_conn)) =
+                connections.push(server_url.to_string(), cached)
+            {
+                // Call eviction callback if set
+                if let Some(callback) = &self.eviction_callback {
+                    callback(&evicted_key);
                 }
             }
         }
 
-        // Create new MCP client using the provided connect function
-        let client = connect_fn(server_config.clone(), self.global_proxy.clone()).await?;
-        let client_arc = Arc::new(client);
-
-        // Cache the new connection
-        let cached = CachedConnection::new(Arc::clone(&client_arc), server_config);
-        self.connections.insert(server_url.to_string(), cached);
-
         Ok(client_arc)
-    }
-
-    /// Remove all idle connections that have exceeded the TTL
-    ///
-    /// This method is called:
-    /// - Automatically when max_connections limit is reached
-    /// - Can be called manually by background cleanup task
-    pub fn cleanup_idle_connections(&self) {
-        let now = Instant::now();
-        self.connections
-            .retain(|_, cached| now.duration_since(cached.last_used) < self.idle_ttl);
-    }
-
-    /// Find the oldest connection (by last_used timestamp)
-    ///
-    /// Used for eviction when max_connections is reached and cleanup didn't free space
-    fn find_oldest_connection(&self) -> Option<String> {
-        self.connections
-            .iter()
-            .min_by_key(|entry| entry.value().last_used)
-            .map(|entry| entry.key().clone())
     }
 
     /// Get current number of cached connections
     pub fn len(&self) -> usize {
-        self.connections.len()
+        self.connections.lock().len()
     }
 
     /// Check if pool is empty
     pub fn is_empty(&self) -> bool {
-        self.connections.is_empty()
+        self.connections.lock().is_empty()
     }
 
-    /// Clear all connections (useful for tests)
+    /// Clear all connections
     pub fn clear(&self) {
-        self.connections.clear();
+        self.connections.lock().clear();
     }
 
     /// Get connection statistics
     pub fn stats(&self) -> PoolStats {
-        let total = self.connections.len();
-        let idle_count = self
-            .connections
-            .iter()
-            .filter(|entry| entry.value().is_idle(self.idle_ttl))
-            .count();
+        let total = self.connections.lock().len();
 
         PoolStats {
             total_connections: total,
-            active_connections: total - idle_count,
-            idle_connections: idle_count,
+            capacity: self.max_connections,
         }
+    }
+
+    /// List all server keys in the pool
+    pub fn list_server_keys(&self) -> Vec<String> {
+        self.connections
+            .lock()
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Get a connection by server key without creating it
+    /// Promotes the entry in LRU cache if found
+    pub fn get(&self, server_key: &str) -> Option<Arc<McpClient>> {
+        self.connections
+            .lock()
+            .get(server_key)
+            .map(|cached| Arc::clone(&cached.client))
     }
 }
 
@@ -242,8 +214,7 @@ impl Default for McpConnectionPool {
 #[derive(Debug, Clone)]
 pub struct PoolStats {
     pub total_connections: usize,
-    pub active_connections: usize,
-    pub idle_connections: usize,
+    pub capacity: usize,
 }
 
 #[cfg(test)]
@@ -272,113 +243,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(invalid_value)]
-    fn test_cached_connection_touch() {
-        let config = create_test_config("http://localhost:3000");
-        let client: Arc<McpClient> = Arc::new(unsafe {
-            // SAFETY: This is only for testing the CachedConnection struct
-            std::mem::MaybeUninit::zeroed().assume_init()
-        });
-        let mut cached = CachedConnection::new(client.clone(), config);
-
-        let first_time = cached.last_used;
-        std::thread::sleep(Duration::from_millis(10));
-        cached.touch();
-        assert!(cached.last_used > first_time);
-
-        // Prevent drop of invalid Arc (would segfault)
-        std::mem::forget(client);
-    }
-
-    #[test]
-    #[allow(invalid_value)]
-    fn test_cached_connection_is_idle() {
-        let config = create_test_config("http://localhost:3000");
-        let client: Arc<McpClient> = Arc::new(unsafe {
-            // SAFETY: This is only for testing the CachedConnection struct
-            std::mem::MaybeUninit::zeroed().assume_init()
-        });
-        let cached = CachedConnection::new(client.clone(), config);
-
-        // Fresh connection should not be idle
-        assert!(!cached.is_idle(Duration::from_secs(1)));
-
-        // Wait and check
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(cached.is_idle(Duration::from_millis(50)));
-
-        // Prevent drop of invalid Arc (would segfault)
-        std::mem::forget(client);
-    }
-
-    #[test]
     fn test_pool_stats() {
-        let pool = McpConnectionPool::with_config(Duration::from_millis(100), 10);
+        let pool = McpConnectionPool::with_capacity(10);
 
         let stats = pool.stats();
         assert_eq!(stats.total_connections, 0);
-        assert_eq!(stats.active_connections, 0);
-        assert_eq!(stats.idle_connections, 0);
-    }
-
-    #[test]
-    #[allow(invalid_value)]
-    fn test_cleanup_idle_connections() {
-        let pool = McpConnectionPool::with_config(Duration::from_millis(50), 10);
-
-        // Initially empty
-        assert_eq!(pool.len(), 0);
-
-        // Add a connection manually for testing
-        let config = create_test_config("http://localhost:3000");
-        let client: Arc<McpClient> =
-            Arc::new(unsafe { std::mem::MaybeUninit::zeroed().assume_init() });
-        let cached = CachedConnection::new(client.clone(), config);
-        pool.connections
-            .insert("http://localhost:3000".to_string(), cached);
-
-        assert_eq!(pool.len(), 1);
-
-        // Wait for TTL to expire
-        std::thread::sleep(Duration::from_millis(100));
-
-        // Cleanup should remove idle connection
-        pool.cleanup_idle_connections();
-        assert_eq!(pool.len(), 0);
-
-        // Prevent drop of invalid Arc (would segfault)
-        std::mem::forget(client);
-    }
-
-    #[test]
-    #[allow(invalid_value)]
-    fn test_find_oldest_connection() {
-        let pool = McpConnectionPool::new();
-
-        // Collect clients to forget at end
-        let mut clients = Vec::new();
-
-        // Add connections with different timestamps
-        for i in 0..3 {
-            let url = format!("http://localhost:{}", 3000 + i);
-            let config = create_test_config(&url);
-            let client: Arc<McpClient> =
-                Arc::new(unsafe { std::mem::MaybeUninit::zeroed().assume_init() });
-            let cached = CachedConnection::new(client.clone(), config);
-            pool.connections.insert(url, cached);
-            clients.push(client);
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        // Oldest should be the first one
-        let oldest = pool.find_oldest_connection();
-        assert!(oldest.is_some());
-        assert_eq!(oldest.unwrap(), "http://localhost:3000");
-
-        // Prevent drop of invalid Arcs (would segfault)
-        for client in clients {
-            std::mem::forget(client);
-        }
+        assert_eq!(stats.capacity, 10);
     }
 
     #[test]
@@ -392,7 +262,8 @@ mod tests {
             Arc::new(unsafe { std::mem::MaybeUninit::zeroed().assume_init() });
         let cached = CachedConnection::new(client.clone(), config);
         pool.connections
-            .insert("http://localhost:3000".to_string(), cached);
+            .lock()
+            .push("http://localhost:3000".to_string(), cached);
 
         assert_eq!(pool.len(), 1);
 
@@ -418,8 +289,7 @@ mod tests {
         };
 
         // Create pool with proxy
-        let pool =
-            McpConnectionPool::with_full_config(Duration::from_secs(300), 100, Some(proxy.clone()));
+        let pool = McpConnectionPool::with_full_config(100, Some(proxy.clone()));
 
         // Verify proxy is stored
         assert!(pool.global_proxy.is_some());

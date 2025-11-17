@@ -1,7 +1,6 @@
 import time
 import unittest
 
-import msgspec
 import requests
 import zmq
 from msgspec.msgpack import Decoder
@@ -10,8 +9,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    EventBatch,
-    KVCacheEvent,
     KVEventBatch,
 )
 from sglang.srt.utils import kill_process_tree

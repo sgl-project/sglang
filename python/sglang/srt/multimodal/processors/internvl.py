@@ -231,7 +231,10 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         pixel_values = torch.cat(pixel_values, dim=0)
 
         original_placeholder = "<<<__IMG_CONTEXT_PLACEHOLDER__>>>"
-        input_text = input_text.replace(self.IMG_CONTEXT_TOKEN, original_placeholder)
+
+        input_text = base_output.input_text.replace(
+            self.IMG_CONTEXT_TOKEN, original_placeholder
+        )
 
         input_text_updated = input_text
         for num_patches in num_patches_list:

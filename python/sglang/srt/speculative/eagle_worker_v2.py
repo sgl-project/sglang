@@ -4,9 +4,9 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
-from torch.cuda import Stream as CudaStream
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -20,6 +20,10 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_extend_npu_graph_runner import (
+    EAGLEDraftExtendNpuGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_npu_graph_runner import EAGLEDraftNpuGraphRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
@@ -38,18 +42,21 @@ from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
     get_available_gpu_memory,
+    is_npu,
     next_power_of_2,
 )
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
 
 def _get_plan_stream(
     device: str,
-) -> Tuple[Optional[CudaStream], contextlib.AbstractContextManager]:
+) -> Tuple[any, contextlib.AbstractContextManager]:
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream: CudaStream = torch.get_device_module(device).Stream()
-        plan_stream_ctx = torch.cuda.stream(plan_stream)
+        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
@@ -99,7 +106,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        with empty_context():
+        with empty_context(), speculative_moe_backend_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -125,7 +132,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(self.draft_runner.tp_group):
+        with self.draft_tp_context(
+            self.draft_runner.tp_group
+        ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -209,6 +218,10 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.server_args.disable_cuda_graph:
             return
 
+        Device2DraftCudaGraphRunner = {
+            "npu": EAGLEDraftNpuGraphRunner,
+            "cuda": EAGLEDraftCudaGraphRunner,
+        }
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
@@ -216,22 +229,29 @@ class EagleDraftWorker(BaseDraftWorker):
             logger.info(
                 f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
+            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
+                self.target_worker.device
+            ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
+        Device2ExtendCudaGraphRunner = {
+            "npu": EAGLEDraftExtendNpuGraphRunner,
+            "cuda": EAGLEDraftExtendCudaGraphRunner,
+        }
         # Capture extend
-        if self.draft_extend_attn_backend:
+        # FIXME cuda not support draft_extend capture
+        if self.draft_extend_attn_backend and _is_npu:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
-            )
+            self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
+                self.target_worker.device
+            ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
@@ -254,12 +274,22 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch,
             )
         else:
-            if self.speculative_num_steps > 1:
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 1
+            ):
                 # Skip attention backend init for 1-step draft,
                 # `draft_forward` only does sample in this case.
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
+            )
+
+        if model_worker_batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
             )
 
         # Build tree mask
@@ -403,13 +433,14 @@ class EagleDraftWorker(BaseDraftWorker):
             next_token_ids: Next token ids generated from the target forward.
         """
         # Construct input_ids
-        pt = 0
-        for i, extend_len in enumerate(batch.extend_seq_lens):
-            input_ids = batch.input_ids[pt : pt + extend_len]
-            batch.input_ids[pt : pt + extend_len] = torch.cat(
-                (input_ids[1:], next_token_ids[i].reshape(1))
-            )
-            pt += extend_len
+        if not batch.forward_mode.is_idle():
+            pt = 0
+            for i, extend_len in enumerate(batch.extend_seq_lens):
+                input_ids = batch.input_ids[pt : pt + extend_len]
+                batch.input_ids[pt : pt + extend_len] = torch.cat(
+                    (input_ids[1:], next_token_ids[i].reshape(1))
+                )
+                pt += extend_len
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
@@ -417,7 +448,11 @@ class EagleDraftWorker(BaseDraftWorker):
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
             allocate_lens=batch.seq_lens,
+            # draft mode is same with decode mode, only 1 num token per batch
+            num_tokens_per_batch=1,
+            num_tokens_for_logprob_per_batch=1,
         )
+
         batch.spec_info = next_draft_input
 
         # Run forward
@@ -438,6 +473,8 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
+            num_tokens_per_batch=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_batch=1,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -453,15 +490,27 @@ class EagleDraftWorker(BaseDraftWorker):
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
+                self.cuda_graph_runner_for_draft_extend,
             )
 
         if self.plan_stream:
-            torch.cuda.current_stream().wait_stream(self.plan_stream)
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
 
         # Run draft extend batch in the main compute stream
-        draft_logits_output = self.draft_runner.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
+        can_cuda_graph = (
+            self.cuda_graph_runner_for_draft_extend
+            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
+        if can_cuda_graph:
+            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                forward_batch
+            )
+        else:
+            draft_logits_output, _ = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            )
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -544,16 +593,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
-        if model_worker_batch.forward_mode.is_decode():
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
-            assert draft_input.is_draft_input()
-            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
-            assert verify_input.is_verify_input()
-            model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
-            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
-            return batch_output
-        else:
+        if (
+            model_worker_batch.forward_mode.is_extend()
+            or model_worker_batch.is_extend_in_batch
+        ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(
@@ -568,6 +611,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_token_ids,
             )
             return batch_output
+        else:
+            if model_worker_batch.spec_info is None:
+                model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
+                    device=self.device,
+                    hidden_size=self.target_worker.model_config.hidden_size,
+                    dtype=self.target_worker.model_config.dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
+            draft_input: EagleDraftInput = model_worker_batch.spec_info
+            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            assert verify_input.is_verify_input()
+            model_worker_batch.spec_info = verify_input
+            batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
+            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+            return batch_output
 
     def verify(
         self,
@@ -577,7 +636,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
-        batch.seq_lens.record_stream(torch.cuda.current_stream())
+        batch.seq_lens.record_stream(
+            torch.get_device_module(self.device).current_stream()
+        )
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
@@ -596,7 +657,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
-            torch.cuda.current_stream().wait_stream(self.plan_stream)
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
 
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
@@ -628,17 +691,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_length
-        verify_done = torch.cuda.Event()
+        verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
-        all_verified_id = predict[accept_index]
-        verified_id = torch.empty_like(accept_length, dtype=torch.int32)
-        fill_new_verified_id[(bs,)](
-            all_verified_id,
-            accept_length,
-            verified_id,
-            self.speculative_num_draft_tokens,
-        )
+        if not batch.forward_mode.is_idle():
+            all_verified_id = predict[accept_index]
+            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+            fill_new_verified_id[(bs,)](
+                all_verified_id,
+                accept_length,
+                verified_id,
+                self.speculative_num_draft_tokens,
+            )
+        else:
+            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(

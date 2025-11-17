@@ -37,7 +37,11 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
-from xgrammar import StructuralTag
+
+try:
+    from xgrammar import StructuralTag
+except:
+    StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str
 
