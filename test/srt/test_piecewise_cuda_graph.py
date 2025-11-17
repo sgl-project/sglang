@@ -248,7 +248,6 @@ class TestPiecewiseCudaGraphFP8(CustomTestCase):
         print(f"MGSM Accuracy: {metrics['score']:.3f}")
 
 
-
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
     """Test piecewise CUDA graph with Qwen2.5-VL-7B-Instruct model"""
 
