@@ -921,8 +921,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except json.JSONDecodeError as e:
-                logger.error(f"Tool call parsing error: {e}")
-                return ToolCallProcessingResult(None, text, finish_reason)
+                logger.error(
+                    f"Tool call parsing error: {e}, {text=}, fallback to be parsed by FunctionCallParser"
+                )
+                # return ToolCallProcessingResult(None, text, finish_reason)
 
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, self.tool_call_parser)

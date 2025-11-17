@@ -407,6 +407,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
 
+            # TODO(yingchun): Handle tool calls
             choice_data = CompletionResponseChoice(
                 index=idx,
                 text=text,
