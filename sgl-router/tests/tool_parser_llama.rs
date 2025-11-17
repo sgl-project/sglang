@@ -5,7 +5,7 @@
 use sglang_router_rs::tool_parser::{LlamaParser, ToolParser};
 
 mod common;
-use common::create_test_tools;
+use common::{create_test_tools, streaming_helpers::*};
 
 #[tokio::test]
 async fn test_llama_python_tag_format() {
@@ -396,4 +396,60 @@ async fn test_llama_streaming_multiple_tools_chunked() {
             assert_eq!(name, "get_time");
         }
     }
+}
+
+// =============================================================================
+// REALISTIC STREAMING TESTS
+// =============================================================================
+
+#[tokio::test]
+async fn test_llama_realistic_chunks_with_python_tag() {
+    let tools = create_test_tools();
+    let mut parser = LlamaParser::new();
+
+    let input = r#"<|python_tag|>{"name": "calculate", "parameters": {"x": 10, "y": 20}}"#;
+    let chunks = create_realistic_chunks(input);
+
+    assert!(chunks.len() > 15, "Should have many small chunks");
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "calculate");
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed tool name");
+}
+
+#[tokio::test]
+async fn test_llama_python_tag_arrives_in_parts() {
+    let tools = create_test_tools();
+    let mut parser = LlamaParser::new();
+
+    // Python tag itself arrives in small chunks
+    let chunks = vec![
+        "<|p", "yth", "on_", "tag", "|>{", r#"""#, "na", r#"me""#, ": ", r#"""#, "sea", "rch",
+        r#"""#, ", ", r#"""#, "par", "ame", "ter", "s", r#"""#, ": {", r#"""#, "q", r#"""#, ": ",
+        r#"""#, "tes", "t", r#"""#, "}}",
+    ];
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "search");
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed tool name");
 }

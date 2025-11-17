@@ -3,7 +3,7 @@
 You can install SGLang using one of the methods below.
 
 This page primarily applies to common NVIDIA GPU platforms.
-For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md).
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-10-13-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md).
 
 ## Method 1: With pip or uv
 
@@ -12,10 +12,11 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install sglang --prerelease=allow
+uv pip install "sglang" --prerelease=allow
 ```
 
 **Quick fixes to common problems**
+
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
@@ -24,7 +25,7 @@ uv pip install sglang --prerelease=allow
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.3.post3 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
@@ -33,6 +34,7 @@ pip install -e "python"
 ```
 
 **Quick fixes to common problems**
+
 - If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
 
 ## Method 3: Using docker

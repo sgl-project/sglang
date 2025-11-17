@@ -1,6 +1,6 @@
 MiB = 1024 * 1024
 
-SYMM_MEM_ALL_REDUCE_MAX_SIZES = {
+TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES = {
     9: {
         2: 64 * MiB,  # 64 MB
         4: 64 * MiB,  # 64 MB

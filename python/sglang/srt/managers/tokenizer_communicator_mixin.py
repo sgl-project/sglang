@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import os
 import time
 import uuid
 from collections import deque
@@ -46,7 +45,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
-    MultiTokenizerWrapper,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -65,6 +63,8 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -82,8 +82,6 @@ logger = logging.getLogger(__name__)
 
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
-
-    enable_multi_tokenizer = False
 
     def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
         self._sender = sender
@@ -104,8 +102,6 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            if _Communicator.enable_multi_tokenizer:
-                obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
@@ -126,8 +122,6 @@ class _Communicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj:
-                if _Communicator.enable_multi_tokenizer:
-                    obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
                 self._sender.send_pyobj(obj)
 
         await self._result_event.wait()
@@ -175,6 +169,9 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         self.update_weights_from_tensor_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_weights_from_ipc_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.get_weights_by_name_communicator = _Communicator(
@@ -242,6 +239,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromTensorReqOutput,
                     self.update_weights_from_tensor_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromIPCReqOutput,
+                    self.update_weights_from_ipc_communicator.handle_recv,
                 ),
                 (
                     GetWeightsByNameReqOutput,
@@ -318,6 +319,10 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         with_stack = False if with_stack is False or env_with_stack is False else True
+        env_record_shapes: bool = get_bool_env_var(
+            "SGLANG_PROFILE_RECORD_SHAPES", "true"
+        )
+        record_shapes = (record_shapes is not False) and env_record_shapes
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -401,7 +406,13 @@ class TokenizerCommunicatorMixin:
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
             results = await self.update_weights_from_distributed_communicator(obj)
-            return _Communicator.merge_results(results)
+            success, message = _Communicator.merge_results(results)
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
 
     async def init_weights_send_group_for_remote_instance(
         self,
@@ -448,7 +459,41 @@ class TokenizerCommunicatorMixin:
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
             result = (await self.update_weights_from_tensor_communicator(obj))[0]
-            return result.success, result.message
+            success, message = result.success, result.message
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
+
+    async def update_weights_from_ipc(
+        self,
+        obj: UpdateWeightsFromIPCReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Update weights via IPC for checkpoint-engine integration."""
+        self.auto_create_handle_loop()
+        try:
+            # For now, we only support single data parallel instance
+            assert (
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            logger.info("Starting IPC weight update")
+            # This means that weight sync cannot run while requests are in progress.
+            async with self.model_update_lock.writer_lock:
+                result = (await self.update_weights_from_ipc_communicator(obj))[0]
+                success, message = result.success, result.message
+        except Exception as e:
+            error_msg = f"IPC weight update failed: {str(e)}"
+            logger.error(error_msg)
+            success, message = False, error_msg
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
 
     async def load_lora_adapter(
         self: TokenizerManager,
@@ -617,8 +662,6 @@ class TokenizerCommunicatorMixin:
         elif obj.session_id in self.session_futures:
             return None
 
-        if self.server_args.tokenizer_worker_num > 1:
-            obj = MultiTokenizerWrapper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
 
         self.session_futures[obj.session_id] = asyncio.Future()
@@ -668,3 +711,8 @@ class TokenizerCommunicatorMixin:
                     f"Invalid --log-requests-level: {self.log_requests_level=}"
                 )
         return max_length, skip_names, out_skip_names
+
+    def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
+        """Update weight version if provided."""
+        if weight_version is not None:
+            self.server_args.weight_version = weight_version

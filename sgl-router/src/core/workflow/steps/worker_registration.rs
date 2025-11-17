@@ -16,17 +16,18 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
+    app_context::AppContext,
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        DPAwareWorkerBuilder, DpInfo, HealthConfig, Worker, WorkerManager, WorkerType,
+        DPAwareWorkerBuilder, HealthConfig, RuntimeType, Worker, WorkerType,
     },
-    grpc_client::SglangSchedulerClient,
     protocols::worker_spec::WorkerConfigRequest,
-    server::AppContext,
+    routers::grpc::client::GrpcClient,
 };
 
 // HTTP client for metadata fetching
@@ -37,6 +38,85 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .expect("Failed to create HTTP client")
 });
 
+/// Server information returned from worker endpoints
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ServerInfo {
+    #[serde(alias = "model")]
+    model_id: Option<String>,
+    model_path: Option<String>,
+    served_model_name: Option<String>,
+    dp_size: Option<usize>,
+    version: Option<String>,
+    max_batch_size: Option<usize>,
+    max_total_tokens: Option<usize>,
+    max_prefill_tokens: Option<usize>,
+    max_running_requests: Option<usize>,
+    max_num_reqs: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DpInfo {
+    pub dp_size: usize,
+    pub model_id: String,
+}
+
+/// Parse server info from JSON response using serde
+fn parse_server_info(json: Value) -> Result<ServerInfo, String> {
+    serde_json::from_value(json).map_err(|e| format!("Failed to parse server info: {}", e))
+}
+
+/// Get server info from /get_server_info endpoint
+async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerInfo, String> {
+    let base_url = url.trim_end_matches('/');
+    let server_info_url = format!("{}/get_server_info", base_url);
+
+    let mut req = HTTP_CLIENT.get(&server_info_url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to {}: {}", server_info_url, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Server returned status {} from {}",
+            response.status(),
+            server_info_url
+        ));
+    }
+
+    let json = response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("Failed to parse response from {}: {}", server_info_url, e))?;
+
+    parse_server_info(json)
+}
+
+/// Get DP info for a worker URL
+async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, String> {
+    let info = get_server_info(url, api_key).await?;
+
+    let dp_size = info
+        .dp_size
+        .ok_or_else(|| format!("No dp_size in response from {}", url))?;
+
+    let model_id = info
+        .model_id
+        .filter(|s| !s.is_empty())
+        .or(info.served_model_name.filter(|s| !s.is_empty()))
+        .or_else(|| {
+            info.model_path
+                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(DpInfo { dp_size, model_id })
+}
+
 /// Helper: Strip protocol prefix from URL
 fn strip_protocol(url: &str) -> String {
     url.trim_start_matches("http://")
@@ -46,29 +126,41 @@ fn strip_protocol(url: &str) -> String {
 }
 
 /// Helper: Try HTTP health check
-async fn try_http_health_check(url: &str, timeout_secs: u64) -> Result<(), String> {
+///
+/// Uses the provided client (from app_context) which supports both HTTP and HTTPS.
+/// For HTTPS URLs, the client's TLS configuration (mTLS, CA certs) is used.
+/// For plain HTTP URLs, the client handles them normally without TLS overhead.
+async fn try_http_health_check(
+    url: &str,
+    timeout_secs: u64,
+    client: &Client,
+) -> Result<(), String> {
+    // Preserve the protocol (http or https) from the original URL
+    let is_https = url.starts_with("https://");
+    let protocol = if is_https { "https" } else { "http" };
     let clean_url = strip_protocol(url);
-    let health_url = format!("http://{}/health", clean_url);
+    let health_url = format!("{}://{}/health", protocol, clean_url);
 
-    HTTP_CLIENT
+    // Use the AppContext client for both HTTP and HTTPS
+    // The rustls backend handles both protocols correctly
+    client
         .get(&health_url)
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
-        .map_err(|e| format!("HTTP health check failed: {}", e))?;
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("Health check failed: {}", e))?;
 
     Ok(())
 }
 
-/// Helper: Try gRPC health check
-async fn try_grpc_health_check(url: &str, timeout_secs: u64) -> Result<(), String> {
-    let grpc_url = if url.starts_with("grpc://") {
-        url.to_string()
-    } else {
-        format!("grpc://{}", strip_protocol(url))
-    };
-
-    let connect_future = SglangSchedulerClient::connect(&grpc_url);
+/// Helper: Perform gRPC health check with runtime type
+async fn do_grpc_health_check(
+    grpc_url: &str,
+    timeout_secs: u64,
+    runtime_type: &str,
+) -> Result<(), String> {
+    let connect_future = GrpcClient::connect(grpc_url, runtime_type);
     let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
         .await
         .map_err(|_| "gRPC connection timeout".to_string())?
@@ -83,58 +175,48 @@ async fn try_grpc_health_check(url: &str, timeout_secs: u64) -> Result<(), Strin
     Ok(())
 }
 
-/// Helper: Fetch HTTP metadata
-async fn fetch_http_metadata(
+/// Helper: Try gRPC health check
+///
+/// If runtime_type is specified, uses the appropriate client (SGLang or vLLM).
+/// If not specified, tries SGLang first, then falls back to vLLM.
+async fn try_grpc_health_check(
     url: &str,
-    api_key: Option<&str>,
-) -> Result<HashMap<String, String>, String> {
-    let clean_url = strip_protocol(url);
-    let info_url = if clean_url.starts_with("http://") || clean_url.starts_with("https://") {
-        format!("{}/get_server_info", clean_url)
-    } else {
-        format!("http://{}/get_server_info", clean_url)
-    };
-
-    let mut request = HTTP_CLIENT.get(&info_url);
-    if let Some(key) = api_key {
-        request = request.header("Authorization", format!("Bearer {}", key));
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch HTTP metadata: {}", e))?;
-
-    let server_info: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse HTTP metadata: {}", e))?;
-
-    let mut labels = HashMap::new();
-
-    if let Some(model_path) = server_info.get("model_path").and_then(|v| v.as_str()) {
-        if !model_path.is_empty() {
-            labels.insert("model_path".to_string(), model_path.to_string());
-        }
-    }
-    if let Some(tokenizer_path) = server_info.get("tokenizer_path").and_then(|v| v.as_str()) {
-        if !tokenizer_path.is_empty() {
-            labels.insert("tokenizer_path".to_string(), tokenizer_path.to_string());
-        }
-    }
-
-    Ok(labels)
-}
-
-/// Helper: Fetch gRPC metadata
-async fn fetch_grpc_metadata(url: &str) -> Result<HashMap<String, String>, String> {
+    timeout_secs: u64,
+    runtime_type: Option<&str>,
+) -> Result<(), String> {
     let grpc_url = if url.starts_with("grpc://") {
         url.to_string()
     } else {
         format!("grpc://{}", strip_protocol(url))
     };
 
-    let client = SglangSchedulerClient::connect(&grpc_url)
+    match runtime_type {
+        Some(runtime) => do_grpc_health_check(&grpc_url, timeout_secs, runtime).await,
+        None => {
+            // Runtime not specified: Try SGLang first, then vLLM as fallback
+            if let Ok(()) = do_grpc_health_check(&grpc_url, timeout_secs, "sglang").await {
+                return Ok(());
+            }
+
+            // Try vLLM as fallback
+            do_grpc_health_check(&grpc_url, timeout_secs, "vllm")
+                .await
+                .map_err(|e| {
+                    format!(
+                        "gRPC health check failed (tried both SGLang and vLLM): {}",
+                        e
+                    )
+                })
+        }
+    }
+}
+
+/// Fetch metadata from gRPC server with runtime type
+async fn do_fetch_grpc_metadata(
+    grpc_url: &str,
+    runtime_type: &str,
+) -> Result<HashMap<String, String>, String> {
+    let client = GrpcClient::connect(grpc_url, runtime_type)
         .await
         .map_err(|e| format!("Failed to connect to gRPC: {}", e))?;
 
@@ -143,53 +225,47 @@ async fn fetch_grpc_metadata(url: &str) -> Result<HashMap<String, String>, Strin
         .await
         .map_err(|e| format!("Failed to fetch gRPC metadata: {}", e))?;
 
-    let mut labels = HashMap::new();
+    Ok(model_info.to_labels())
+}
 
-    // Extract all available fields
-    if !model_info.model_path.is_empty() {
-        labels.insert("model_path".to_string(), model_info.model_path.clone());
-    }
-    if !model_info.tokenizer_path.is_empty() {
-        labels.insert(
-            "tokenizer_path".to_string(),
-            model_info.tokenizer_path.clone(),
-        );
-    }
-    if !model_info.served_model_name.is_empty() {
-        labels.insert(
-            "served_model_name".to_string(),
-            model_info.served_model_name.clone(),
-        );
-    }
-    if !model_info.weight_version.is_empty() {
-        labels.insert(
-            "weight_version".to_string(),
-            model_info.weight_version.clone(),
-        );
-    }
-    if !model_info.model_type.is_empty() {
-        labels.insert("model_type".to_string(), model_info.model_type.clone());
-    }
-    if model_info.max_context_length > 0 {
-        labels.insert(
-            "max_context_length".to_string(),
-            model_info.max_context_length.to_string(),
-        );
-    }
-    if model_info.max_req_input_len > 0 {
-        labels.insert(
-            "max_req_input_len".to_string(),
-            model_info.max_req_input_len.to_string(),
-        );
-    }
-    if model_info.vocab_size > 0 {
-        labels.insert("vocab_size".to_string(), model_info.vocab_size.to_string());
-    }
-    if model_info.is_generation {
-        labels.insert("is_generation".to_string(), "true".to_string());
-    }
+/// Helper: Fetch gRPC metadata
+///
+/// If runtime_type is specified, uses the appropriate client (SGLang or vLLM).
+/// If not specified, tries SGLang first, then falls back to vLLM.
+/// Returns (labels, detected_runtime_type)
+async fn fetch_grpc_metadata(
+    url: &str,
+    runtime_type: Option<&str>,
+) -> Result<(HashMap<String, String>, String), String> {
+    let grpc_url = if url.starts_with("grpc://") {
+        url.to_string()
+    } else {
+        format!("grpc://{}", strip_protocol(url))
+    };
 
-    Ok(labels)
+    match runtime_type {
+        Some(runtime) => {
+            let labels = do_fetch_grpc_metadata(&grpc_url, runtime).await?;
+            Ok((labels, runtime.to_string()))
+        }
+        None => {
+            // Runtime not specified: Try SGLang first, then vLLM as fallback
+            if let Ok(labels) = do_fetch_grpc_metadata(&grpc_url, "sglang").await {
+                return Ok((labels, "sglang".to_string()));
+            }
+
+            // Try vLLM as fallback
+            let labels = do_fetch_grpc_metadata(&grpc_url, "vllm")
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to fetch gRPC metadata (tried both SGLang and vLLM): {}",
+                        e
+                    )
+                })?;
+            Ok((labels, "vllm".to_string()))
+        }
+    }
 }
 
 /// Step 1: Detect connection mode by probing both HTTP and gRPC
@@ -201,27 +277,33 @@ impl StepExecutor for DetectConnectionModeStep {
         let config: Arc<WorkerConfigRequest> = context
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+        let app_context: Arc<AppContext> = context
+            .get("app_context")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
-        info!(
+        debug!(
             "Detecting connection mode for {} (timeout: {}s, max_attempts: {})",
             config.url, config.health_check_timeout_secs, config.max_connection_attempts
         );
 
         // Try both protocols in parallel using configured timeout
+        // Use the AppContext client which has TLS configuration (CA certs, client identity)
         let url = config.url.clone();
         let timeout = config.health_check_timeout_secs;
+        let client = &app_context.client;
+        let runtime_type = config.runtime.as_deref();
         let (http_result, grpc_result) = tokio::join!(
-            try_http_health_check(&url, timeout),
-            try_grpc_health_check(&url, timeout)
+            try_http_health_check(&url, timeout, client),
+            try_grpc_health_check(&url, timeout, runtime_type)
         );
 
         let connection_mode = match (http_result, grpc_result) {
             (Ok(_), _) => {
-                info!("{} detected as HTTP", config.url);
+                debug!("{} detected as HTTP", config.url);
                 ConnectionMode::Http
             }
             (_, Ok(_)) => {
-                info!("{} detected as gRPC", config.url);
+                debug!("{} detected as gRPC", config.url);
                 ConnectionMode::Grpc { port: None }
             }
             (Err(http_err), Err(grpc_err)) => {
@@ -259,30 +341,54 @@ impl StepExecutor for DiscoverMetadataStep {
             .get("connection_mode")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("connection_mode".to_string()))?;
 
-        info!(
+        debug!(
             "Discovering metadata for {} ({:?})",
             config.url, *connection_mode
         );
 
-        let discovered_labels = match connection_mode.as_ref() {
+        let (discovered_labels, detected_runtime) = match connection_mode.as_ref() {
             ConnectionMode::Http => {
-                fetch_http_metadata(&config.url, config.api_key.as_deref()).await
+                match get_server_info(&config.url, config.api_key.as_deref()).await {
+                    Ok(server_info) => {
+                        let mut labels = HashMap::new();
+                        if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
+                            labels.insert("model_path".to_string(), model_path);
+                        }
+                        if let Some(served_model_name) =
+                            server_info.served_model_name.filter(|s| !s.is_empty())
+                        {
+                            labels.insert("served_model_name".to_string(), served_model_name);
+                        }
+
+                        Ok((labels, None))
+                    }
+                    Err(e) => Err(e),
+                }
             }
-            ConnectionMode::Grpc { .. } => fetch_grpc_metadata(&config.url).await,
+            ConnectionMode::Grpc { .. } => {
+                let runtime_type = config.runtime.as_deref();
+                fetch_grpc_metadata(&config.url, runtime_type)
+                    .await
+                    .map(|(labels, runtime)| (labels, Some(runtime)))
+            }
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);
-            HashMap::new()
+            (HashMap::new(), None)
         });
 
-        info!(
+        debug!(
             "Discovered {} metadata labels for {}",
             discovered_labels.len(),
             config.url
         );
 
-        // Store discovered labels in context
+        // Store discovered labels and detected runtime in context
         context.set("discovered_labels", discovered_labels);
+        if let Some(runtime) = detected_runtime {
+            debug!("Detected runtime type: {}", runtime);
+            context.set("detected_runtime_type", runtime);
+        }
 
         Ok(StepResult::Success)
     }
@@ -304,30 +410,30 @@ impl StepExecutor for DiscoverDPInfoStep {
 
         // Skip DP discovery if not DP-aware
         if !config.dp_aware {
-            info!(
+            debug!(
                 "Worker {} is not DP-aware, skipping DP discovery",
                 config.url
             );
             return Ok(StepResult::Success);
         }
 
-        info!("Discovering DP info for {} (DP-aware)", config.url);
+        debug!("Discovering DP info for {} (DP-aware)", config.url);
 
         // Get DP info from worker
-        let dp_info = WorkerManager::get_dp_info(&config.url, config.api_key.as_deref())
+        let dp_info = get_dp_info(&config.url, config.api_key.as_deref())
             .await
             .map_err(|e| WorkflowError::StepFailed {
                 step_id: StepId::new("discover_dp_info"),
                 message: format!("Failed to get DP info: {}", e),
             })?;
 
-        info!(
+        debug!(
             "Discovered DP size {} for {} (model: {})",
             dp_info.dp_size, config.url, dp_info.model_id
         );
 
         // Store DP info in context
-        context.set("dp_info", Arc::new(dp_info));
+        context.set("dp_info", dp_info);
 
         Ok(StepResult::Success)
     }
@@ -406,12 +512,12 @@ impl StepExecutor for CreateWorkerStep {
                 .cloned();
 
             if let Some(model_id) = derived_model_id {
-                info!("Derived model_id from metadata: {}", model_id);
+                debug!("Derived model_id from metadata: {}", model_id);
                 final_labels.insert("model_id".to_string(), model_id);
             }
         }
 
-        info!(
+        debug!(
             "Creating worker {} with {} discovered + {} config = {} final labels",
             config.url,
             discovered_labels.len(),
@@ -431,6 +537,26 @@ impl StepExecutor for CreateWorkerStep {
                 _ => WorkerType::Regular,
             })
             .unwrap_or(WorkerType::Regular);
+
+        // Get detected runtime type (for gRPC workers)
+        let runtime_type = if matches!(connection_mode.as_ref(), ConnectionMode::Grpc { .. }) {
+            // Try to get detected runtime from context, fall back to config, or default to sglang
+            if let Some(detected_runtime) = context.get::<String>("detected_runtime_type") {
+                match detected_runtime.as_str() {
+                    "vllm" => RuntimeType::Vllm,
+                    _ => RuntimeType::Sglang,
+                }
+            } else if let Some(ref runtime) = config.runtime {
+                match runtime.as_str() {
+                    "vllm" => RuntimeType::Vllm,
+                    _ => RuntimeType::Sglang,
+                }
+            } else {
+                RuntimeType::Sglang
+            }
+        } else {
+            RuntimeType::Sglang // Default for HTTP workers
+        };
 
         // Build circuit breaker config
         let circuit_breaker_config = {
@@ -471,7 +597,7 @@ impl StepExecutor for CreateWorkerStep {
         };
 
         if normalized_url != config.url {
-            info!(
+            debug!(
                 "Normalized worker URL: {} -> {} ({:?})",
                 config.url,
                 normalized_url,
@@ -486,7 +612,7 @@ impl StepExecutor for CreateWorkerStep {
                 .get("dp_info")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
 
-            info!(
+            debug!(
                 "Creating {} DP-aware workers for {} (dp_size: {})",
                 dp_info.dp_size, config.url, dp_info.dp_size
             );
@@ -497,6 +623,7 @@ impl StepExecutor for CreateWorkerStep {
                     DPAwareWorkerBuilder::new(normalized_url.clone(), rank, dp_info.dp_size)
                         .worker_type(worker_type.clone())
                         .connection_mode(connection_mode.as_ref().clone())
+                        .runtime_type(runtime_type.clone())
                         .circuit_breaker_config(circuit_breaker_config.clone())
                         .health_config(health_config.clone());
 
@@ -512,7 +639,7 @@ impl StepExecutor for CreateWorkerStep {
                 worker.set_healthy(false);
                 workers.push(worker);
 
-                info!(
+                debug!(
                     "Created DP-aware worker {}@{}/{} ({:?})",
                     config.url,
                     rank,
@@ -522,7 +649,7 @@ impl StepExecutor for CreateWorkerStep {
             }
 
             // Store workers (plural) and labels in context
-            context.set("workers", Arc::new(workers));
+            context.set("workers", workers);
             context.set("labels", final_labels);
 
             Ok(StepResult::Success)
@@ -531,6 +658,7 @@ impl StepExecutor for CreateWorkerStep {
             let mut builder = BasicWorkerBuilder::new(normalized_url.clone())
                 .worker_type(worker_type)
                 .connection_mode(connection_mode.as_ref().clone())
+                .runtime_type(runtime_type)
                 .circuit_breaker_config(circuit_breaker_config)
                 .health_config(health_config);
 
@@ -545,7 +673,7 @@ impl StepExecutor for CreateWorkerStep {
             let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
             worker.set_healthy(false);
 
-            info!(
+            debug!(
                 "Created worker object for {} ({:?}) with {} labels",
                 config.url,
                 connection_mode.as_ref(),
@@ -589,13 +717,13 @@ impl StepExecutor for RegisterWorkerStep {
             for worker in workers.iter() {
                 let worker_id = app_context.worker_registry.register(Arc::clone(worker));
                 worker_ids.push(worker_id.clone());
-                info!(
+                debug!(
                     "Registered DP-aware worker {} with ID {:?}",
                     config.url, worker_id
                 );
             }
 
-            context.set("worker_ids", Arc::new(worker_ids));
+            context.set("worker_ids", worker_ids);
             Ok(StepResult::Success)
         } else {
             // Non-DP-aware path: Register single worker
@@ -607,7 +735,7 @@ impl StepExecutor for RegisterWorkerStep {
                 .worker_registry
                 .register(Arc::clone(worker.as_ref()));
 
-            info!("Registered worker {} with ID {:?}", config.url, worker_id);
+            debug!("Registered worker {} with ID {:?}", config.url, worker_id);
             context.set("worker_id", worker_id);
 
             Ok(StepResult::Success)
@@ -664,7 +792,7 @@ impl StepExecutor for UpdatePoliciesStep {
                 }
             }
 
-            info!(
+            debug!(
                 "Updated policies for {} DP-aware workers {} (model: {})",
                 workers.len(),
                 config.url,
@@ -692,8 +820,15 @@ impl StepExecutor for UpdatePoliciesStep {
                         .init_cache_aware_policy(&model_id, &all_workers);
                 }
             }
+            let prefill_workers = app_context.worker_registry.get_prefill_workers();
+            let policy = app_context.policy_registry.get_prefill_policy();
+            if policy.name() == "bucket" {
+                app_context
+                    .policy_registry
+                    .init_pd_bucket_policies(&prefill_workers);
+            }
 
-            info!(
+            debug!(
                 "Updated policies for worker {} (model: {})",
                 config.url, model_id
             );
@@ -728,7 +863,7 @@ impl StepExecutor for ActivateWorkerStep {
                 worker.set_healthy(true);
             }
 
-            info!(
+            debug!(
                 "Activated {} DP-aware workers {} (marked as healthy)",
                 workers.len(),
                 config.url
@@ -757,7 +892,29 @@ impl StepExecutor for ActivateWorkerStep {
 /// Note: Actual health check timeouts and retry attempts are configured per-worker
 /// via WorkerConfigRequest (populated from router config). The timeouts and retry
 /// policies here serve as workflow-level bounds to prevent infinite waiting.
-pub fn create_worker_registration_workflow() -> WorkflowDefinition {
+///
+/// # Arguments
+/// * `router_config` - Router configuration containing health check settings
+pub fn create_worker_registration_workflow(
+    router_config: &crate::config::RouterConfig,
+) -> WorkflowDefinition {
+    // Use health check timeout from config with 30 second buffer as workflow-level upper bound
+    let detect_timeout = Duration::from_secs(router_config.health_check.timeout_secs + 30);
+
+    // Calculate max_attempts to match the detect_timeout
+    // With Linear backoff (increment 1s, max 5s):
+    // - Attempts 1-5: 0s, 1s, 2s, 3s, 4s = 10s total
+    // - Attempts 6+: 5s each
+    // max_attempts = 5 + (timeout_seconds - 10) / 5
+    // Use 90% of timeout to leave buffer for actual connection attempts
+    let timeout_secs = detect_timeout.as_secs() as f64;
+    let effective_timeout = timeout_secs * 0.9;
+    let max_attempts = if effective_timeout > 10.0 {
+        (5 + ((effective_timeout - 10.0) / 5.0).ceil() as u32).max(3)
+    } else {
+        3
+    };
+
     WorkflowDefinition::new("worker_registration", "Worker Registration")
         .add_step(
             StepDefinition::new(
@@ -766,14 +923,14 @@ pub fn create_worker_registration_workflow() -> WorkflowDefinition {
                 Arc::new(DetectConnectionModeStep),
             )
             .with_retry(RetryPolicy {
-                max_attempts: 100,
+                max_attempts,
                 backoff: BackoffStrategy::Linear {
                     increment: Duration::from_secs(1),
                     max: Duration::from_secs(5),
                 },
             })
-            // Workflow-level timeout (upper bound); step uses config.health_check_timeout_secs
-            .with_timeout(Duration::from_secs(7200)) // 2 hours max
+            // Workflow-level timeout uses configured health check timeout + buffer
+            .with_timeout(detect_timeout)
             .with_failure_action(FailureAction::FailWorkflow),
         )
         .add_step(

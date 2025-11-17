@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -112,10 +113,10 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        if (
+        if dtype == torch.float32 or (
             (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
-            and not _is_xpu
+            and not (_is_xpu)
         ):
             from vllm._custom_ops import rotary_embedding
 
@@ -124,18 +125,34 @@ class RotaryEmbedding(CustomOp):
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
+        self._apply_rotary_emb_wrapped = _apply_rotary_emb
+
+        if get_global_server_args().rl_on_policy_target is not None:
+            self._forward_method = self.forward_native
+            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
+                self._apply_rotary_emb_wrapped
+            )
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
+        init_device = (
+            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
+        )
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+                torch.arange(
+                    0, self.rotary_dim, 2, dtype=torch.float, device=init_device
+                )
+                / self.rotary_dim
             )
         )
+        if get_global_server_args().rl_on_policy_target is not None:
+            inv_freq = inv_freq.cuda()
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
@@ -173,14 +190,16 @@ class RotaryEmbedding(CustomOp):
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = self._apply_rotary_emb_wrapped(
+            query_rot, cos, sin, self.is_neox_style
+        )
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
@@ -254,7 +273,11 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+        if (
+            _is_cuda
+            and (self.head_size in [64, 128, 256, 512])
+            and self.dtype != torch.float32
+        ):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -296,9 +319,20 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # TODO: make a wrapper, and XPU will implement this kernel later.
-        return self.forward_native(positions, query, key, offsets)
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+        return torch.ops.sgl_kernel.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
@@ -789,7 +823,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
         cos_sin = self.cos_sin_cache[
             torch.add(positions, offsets) if offsets is not None else positions
         ]
@@ -1053,6 +1086,7 @@ def _triton_mrope_forward(
     mrope_section_h: tl.constexpr,
     mrope_section_w: tl.constexpr,
     is_interleaved: tl.constexpr,
+    is_neox_style: tl.constexpr,
 ):
     # Adapted from
     # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/qwen2vl_mrope.py
@@ -1107,51 +1141,99 @@ def _triton_mrope_forward(
     # program instance (i.e. for the current token) separately
     # ####################################################################
     # left half of the head
-    first_half_q_offsets = (
-        tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
-    )
-    first_half_k_offsets = (
-        tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
-    )
-    first_q_mask = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (
-        tl.arange(0, pad_hd // 2)[None, :] < rd // 2
-    )
-    first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (
-        tl.arange(0, pad_hd // 2)[None, :] < rd // 2
-    )
+    if is_neox_style:
+        first_half_q_offsets = (
+            tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
+        )
+        first_half_k_offsets = (
+            tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
+        )
+        first_q_mask = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (
+            tl.arange(0, pad_hd // 2)[None, :] < rd // 2
+        )
+        first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (
+            tl.arange(0, pad_hd // 2)[None, :] < rd // 2
+        )
 
-    q_tile_1 = tl.load(q_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(
-        sin_row.dtype
-    )
-    k_tile_1 = tl.load(k_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(
-        sin_row.dtype
-    )
+        q_tile_1 = tl.load(q_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(
+            sin_row.dtype
+        )
+        k_tile_1 = tl.load(k_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(
+            sin_row.dtype
+        )
 
-    # right half of the head
-    second_half_q_offsets = first_half_q_offsets + (rd // 2)
-    second_half_k_offsets = first_half_k_offsets + (rd // 2)
-    second_q_mask = first_q_mask
-    second_k_mask = first_k_mask
+        # right half of the head
+        second_half_q_offsets = first_half_q_offsets + (rd // 2)
+        second_half_k_offsets = first_half_k_offsets + (rd // 2)
+        second_q_mask = first_q_mask
+        second_k_mask = first_k_mask
 
-    q_tile_2 = tl.load(q_ptr + second_half_q_offsets, mask=second_q_mask, other=0).to(
-        sin_row.dtype
-    )
-    k_tile_2 = tl.load(k_ptr + second_half_k_offsets, mask=second_k_mask, other=0).to(
-        sin_row.dtype
-    )
+        q_tile_2 = tl.load(
+            q_ptr + second_half_q_offsets, mask=second_q_mask, other=0
+        ).to(sin_row.dtype)
+        k_tile_2 = tl.load(
+            k_ptr + second_half_k_offsets, mask=second_k_mask, other=0
+        ).to(sin_row.dtype)
 
-    # y = [x1, x2] * [cos, cos] + [-x2, x1] * [sin, sin]
-    # Since cos and sin are now half-size,
-    # we use the same cos_row and sin_row for both halves
-    new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
-    tl.store(q_ptr + first_half_q_offsets, new_q_tile_1, mask=first_q_mask)
-    new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
-    tl.store(q_ptr + second_half_q_offsets, new_q_tile_2, mask=second_q_mask)
+        # y = [x1, x2] * [cos, cos] + [-x2, x1] * [sin, sin]
+        # Since cos and sin are now half-size,
+        # we use the same cos_row and sin_row for both halves
+        new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
+        tl.store(q_ptr + first_half_q_offsets, new_q_tile_1, mask=first_q_mask)
+        new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
+        tl.store(q_ptr + second_half_q_offsets, new_q_tile_2, mask=second_q_mask)
 
-    new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
-    tl.store(k_ptr + first_half_k_offsets, new_k_tile_1, mask=first_k_mask)
-    new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
-    tl.store(k_ptr + second_half_k_offsets, new_k_tile_2, mask=second_k_mask)
+        new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
+        tl.store(k_ptr + first_half_k_offsets, new_k_tile_1, mask=first_k_mask)
+        new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
+        tl.store(k_ptr + second_half_k_offsets, new_k_tile_2, mask=second_k_mask)
+    else:
+        base_q = tl.arange(0, pad_n_qh)[:, None] * hd
+        base_k = tl.arange(0, pad_n_kh)[:, None] * hd
+        even_idx = 2 * tl.arange(0, pad_hd // 2)[None, :]
+        odd_idx = even_idx + 1
+
+        even_q_offsets = base_q + even_idx
+        odd_q_offsets = base_q + odd_idx
+        even_k_offsets = base_k + even_idx
+        odd_k_offsets = base_k + odd_idx
+
+        idx_mask = tl.arange(0, pad_hd // 2)[None, :] < (rd // 2)
+        qn_mask = tl.arange(0, pad_n_qh)[:, None] < n_qh
+        kn_mask = tl.arange(0, pad_n_kh)[:, None] < n_kh
+
+        even_q_mask = qn_mask & idx_mask
+        odd_q_mask = qn_mask & idx_mask
+        even_k_mask = kn_mask & idx_mask
+        odd_k_mask = kn_mask & idx_mask
+
+        q_tile_1 = tl.load(q_ptr + even_q_offsets, mask=even_q_mask, other=0).to(
+            sin_row.dtype
+        )
+        k_tile_1 = tl.load(k_ptr + even_k_offsets, mask=even_k_mask, other=0).to(
+            sin_row.dtype
+        )
+
+        q_tile_2 = tl.load(q_ptr + odd_q_offsets, mask=odd_q_mask, other=0).to(
+            sin_row.dtype
+        )
+        k_tile_2 = tl.load(k_ptr + odd_k_offsets, mask=odd_k_mask, other=0).to(
+            sin_row.dtype
+        )
+
+        # y = [x_even, x_odd] * [cos, cos] + [-x_odd, x_even] * [sin, sin]
+        # NeoX-style rotary embedding:
+        # Each (even, odd) channel pair forms one rotation arm.
+        # cos_row and sin_row each have length rd//2, shared across all (even, odd) pairs.
+        new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
+        tl.store(q_ptr + even_q_offsets, new_q_tile_1, mask=even_q_mask)
+        new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
+        tl.store(q_ptr + odd_q_offsets, new_q_tile_2, mask=odd_q_mask)
+
+        new_k_tile_1 = k_tile_1 * cos_row - k_tile_2 * sin_row
+        tl.store(k_ptr + even_k_offsets, new_k_tile_1, mask=even_k_mask)
+        new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
+        tl.store(k_ptr + odd_k_offsets, new_k_tile_2, mask=odd_k_mask)
 
 
 def triton_mrope(
@@ -1163,6 +1245,7 @@ def triton_mrope(
     head_size: int,
     rotary_dim: int,
     mrope_interleaved: bool,
+    is_neox_style: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The mrope triton kernel.
 
@@ -1213,8 +1296,34 @@ def triton_mrope(
         mrope_section[1],
         mrope_section[2],
         mrope_interleaved,
+        is_neox_style,
     )
     return q, k
+
+
+@torch._dynamo.disable()
+def triton_mrope_wrapper(
+    query,
+    key,
+    cos,
+    sin,
+    mrope_section,
+    head_size,
+    rotary_dim,
+    mrope_interleaved,
+    is_neox_style,
+):
+    return triton_mrope(
+        query,
+        key,
+        cos,
+        sin,
+        mrope_section,
+        head_size,
+        rotary_dim,
+        mrope_interleaved,
+        is_neox_style,
+    )
 
 
 class MRotaryEmbedding(RotaryEmbedding):
@@ -1280,7 +1389,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def forward_native(
+    def _forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1341,6 +1450,30 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
+
+        if positions.ndim == 2 and self.mrope_section and _is_cuda:
+            return self._forward_triton(positions, query, key)
+        elif _is_npu:
+            return self._forward_npu(positions, query, key)
+        else:
+            return self._forward_native(positions, query, key)
+
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    def _forward_triton(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None
 
@@ -1348,12 +1481,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.contiguous()
+        sin = sin.contiguous()
         query_shape = query.shape
         key_shape = key.shape
         if positions.ndim == 2:
             assert self.mrope_section
 
-            q, k = triton_mrope(
+            q, k = triton_mrope_wrapper(
                 query,
                 key,
                 cos,
@@ -1362,6 +1497,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self.head_size,
                 self.rotary_dim,
                 self.mrope_interleaved,
+                self.is_neox_style,
             )
 
             return q.reshape(query_shape), k.reshape(key_shape)
@@ -1378,6 +1514,32 @@ class MRotaryEmbedding(RotaryEmbedding):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def _forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # TODO: remove this when npu_mrope supports QNumHeads * QHeadSize > 4096
+        if query.shape[1] > 4096:
+            return self._forward_native(positions, query, key)
+        rotary_mode = "half"
+        if self.is_neox_style:
+            rotary_mode = "half"
+        else:
+            rotary_mode = "interleave"
+        mrope_section = [0, 0, 0]
+        query_out, key_out = torch_npu.npu_mrope(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
+        )
+        return query_out, key_out
 
     # Copied from https://github.com/huggingface/transformers/blob/c8e0e603de9b3d49161a15fe6e8ea84badfb5d02/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1439
     @staticmethod

@@ -27,6 +27,7 @@ python3 test_choices.py
 ## Adding or Updating Tests in CI
 
 - Create new test files under `test/srt` or `test/lang` depending on the type of test.
+- For nightly tests, place them in `test/srt/nightly/`. Use the `NightlyBenchmarkRunner` helper class in `nightly_utils.py` for performance benchmarking tests.
 - Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py`) so they are picked up in CI. For most small test cases, they can be added to the `per-commit-1-gpu` suite. Sort the test cases alphabetically by name.
 - Ensure you added `unittest.main()` for unittest and `pytest.main([__file__])` for pytest in the scripts. The CI run them via `python3 test_file.py`.
 - The CI will run some suites such as `per-commit-1-gpu`, `per-commit-2-gpu`, and `nightly-1-gpu` automatically. If you need special setup or custom test groups, you may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows).
@@ -46,4 +47,4 @@ python3 test_choices.py
 
 ## Adding New Models to Nightly CI
 - **For text models**: extend [global model lists variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`, or add more model lists
-- **For vlms**: extend the `MODEL_THRESHOLDS` global dictionary in `test_nightly_vlms_.*.py`, see [here](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/test/srt/test_nightly_vlms_mmmu_eval.py#L19)
+- **For vlms**: extend the `MODEL_THRESHOLDS` global dictionary in `test/srt/nightly/test_vlms_mmmu_eval.py`
