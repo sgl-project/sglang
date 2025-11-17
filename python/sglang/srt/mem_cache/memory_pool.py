@@ -1061,7 +1061,9 @@ def set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     loc = tl.load(loc_ptr + pid_loc)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    is_valid = loc >= 0
+    safe_loc = tl.where(is_valid, loc, 0)
+    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
         src = tl.load(
@@ -1075,7 +1077,7 @@ def set_mla_kv_buffer_kernel(
             mask=mask,
         )
 
-    tl.store(dst_ptr, src, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
 
 
 def set_mla_kv_buffer_triton(
@@ -1231,6 +1233,12 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
+
+        valid_mask = loc >= 0
+        if not valid_mask.all():
+            loc = loc[valid_mask]
+            cache_k = cache_k[valid_mask]
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:

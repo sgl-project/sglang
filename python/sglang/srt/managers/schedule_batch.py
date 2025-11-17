@@ -1015,13 +1015,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         return req_pool_indices
 
-    def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
+    def alloc_token_slots(
+        self, num_tokens: int, backup_state: bool = False, token_positions: Optional[torch.Tensor] = None
+    ):
         self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
 
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens, token_positions=token_positions)
         if out_cache_loc is None:
             phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
             error_msg = (
@@ -1048,6 +1050,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         backup_state: bool = False,
+        token_positions: Optional[torch.Tensor] = None,
     ):
         # Over estimate the number of tokens: assume each request needs a new page.
         num_tokens = (
@@ -1066,6 +1069,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+            token_positions=token_positions,
         )
         if out_cache_loc is None:
             error_msg = (
@@ -1087,6 +1091,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         backup_state: bool = False,
+        token_positions: Optional[torch.Tensor] = None,
     ):
         # Over estimate the number of tokens: assume each request needs a new page.
         num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
@@ -1096,7 +1101,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             state = self.token_to_kv_pool_allocator.backup_state()
 
         out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
+            seq_lens, seq_lens_cpu, last_loc, token_positions=token_positions
         )
         if out_cache_loc is None:
             error_msg = (
@@ -1274,8 +1279,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         # Allocate memory
+        # Build token positions for DCP interleaved storage
+        token_positions = None
+        try:
+            from sglang.srt.distributed.parallel_state import get_dcp_world_size
+            if get_dcp_world_size() > 1:
+                # Build token positions: each token's position in its sequence (0-indexed)
+                token_positions_list = []
+                for req in reqs:
+                    seq_len = len(req.fill_ids)
+                    # Positions for extend tokens (after prefix)
+                    pre_len = len(req.prefix_indices)
+                    extend_positions = torch.arange(pre_len, seq_len, dtype=torch.int64)
+                    token_positions_list.append(extend_positions)
+                if token_positions_list:
+                    token_positions = torch.cat(token_positions_list).to(self.device)
+        except (ImportError, AttributeError):
+            pass
+        
         if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+            out_cache_loc = self.alloc_token_slots(extend_num_tokens, token_positions=token_positions)
         else:
             last_loc = [
                 (
@@ -1292,6 +1315,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 seq_lens_cpu,
                 torch.cat(last_loc),
                 extend_num_tokens,
+                token_positions=token_positions,
             )
 
         # Write allocated tokens to req_to_token_pool
@@ -1706,14 +1730,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         # Allocate memory
+        # Build token positions for DCP interleaved storage
+        token_positions = None
+        try:
+            from sglang.srt.distributed.parallel_state import get_dcp_world_size
+            if get_dcp_world_size() > 1:
+                # For decode, token position is seq_len - 1 (the last token position)
+                token_positions = (self.seq_lens - 1).to(torch.int64)
+        except (ImportError, AttributeError):
+            pass
+        
         if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = self.alloc_token_slots(bs)
+            self.out_cache_loc = self.alloc_token_slots(bs, token_positions=token_positions)
         else:
             last_loc = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, self.seq_lens - 2
             ]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                self.seq_lens, self.seq_lens_cpu, last_loc
+                self.seq_lens, self.seq_lens_cpu, last_loc, token_positions=token_positions
             )
 
         self.req_to_token_pool.write(

@@ -20,7 +20,7 @@ Page-aligned memory pool.
 """
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -31,6 +31,13 @@ from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_world_size, get_dcp_rank, get_tensor_model_parallel_rank
+)
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -142,15 +149,50 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
 
-    def alloc(self, need_size: int):
-        if self.need_sort and need_size > len(self.free_pages):
+    def alloc(self, need_size: int, token_positions: Optional[torch.Tensor] = None):
+        """
+        Allocate token slots.
+        
+        Args:
+            need_size: Number of tokens to allocate
+            token_positions: Optional tensor of shape (need_size,) containing
+                the position of each token in its sequence (0-indexed). Used for
+                DCP interleaved storage where token_idx % dcp_world_size determines
+                which rank stores the token.
+        """
+        # Filter tokens based on DCP interleaved storage if enabled
+        if token_positions is not None and get_dcp_world_size() > 1:
+            # Create mask for tokens that belong to this rank
+            token_rank_mask = (token_positions % get_dcp_world_size()) == get_dcp_rank()
+            # Calculate how many tokens belong to this rank
+            local_need_size = token_rank_mask.sum().item()
+        else:
+            token_rank_mask = None
+            local_need_size = need_size
+
+        if self.need_sort and local_need_size > len(self.free_pages):
             self.merge_and_sort_free()
 
-        if need_size > len(self.free_pages):
+        if local_need_size > len(self.free_pages):
             return None
 
-        select_index = self.free_pages[:need_size]
-        self.free_pages = self.free_pages[need_size:]
+        # Allocate only for local tokens belonging to this rank
+        alloc_count = local_need_size
+        alloc_indices = self.free_pages[:alloc_count]
+        self.free_pages = self.free_pages[alloc_count:]
+
+        if token_rank_mask is None:
+            # Non-DCP path: alloc_count == need_size
+            return alloc_indices
+
+        # DCP path: return a tensor of length need_size with -1 for non-local tokens
+        select_index = torch.full(
+            (need_size,), -1, dtype=torch.int64, device=self.device
+        )
+        if alloc_indices.numel() > 0:
+            select_index[token_rank_mask] = alloc_indices
+
+        #logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, select_index={select_index}, token_rank_mask={token_rank_mask}")
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -464,7 +506,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        token_positions: Optional[torch.Tensor] = None,
     ):
+        """
+        Allocate token slots for extend phase.
+        
+        Args:
+            token_positions: Optional tensor of shape (extend_num_tokens,) containing
+                the position of each token in its sequence (0-indexed). Used for
+                DCP interleaved storage where token_idx % dcp_world_size determines
+                which rank stores the token.
+        """
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
@@ -476,7 +528,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
         bs = len(prefix_lens)
-        if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
+
+        # Filter tokens based on DCP interleaved storage if enabled
+        if token_positions is not None and get_dcp_world_size() > 1:
+            # Create mask for tokens that belong to this rank
+            token_rank_mask = (token_positions % get_dcp_world_size()) == get_dcp_rank()
+            # Calculate how many tokens belong to this rank
+            local_extend_num_tokens = token_rank_mask.sum().item()
+        else:
+            token_rank_mask = None
+            local_extend_num_tokens = extend_num_tokens
+
+        if self.need_sort and local_extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
         ):
             self.merge_and_sort_free()
@@ -484,6 +547,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
+        
+        # Allocate indices for all tokens first (needed for kernel)
         alloc_extend_kernel[(bs,)](
             prefix_lens,
             seq_lens,
@@ -503,10 +568,43 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             page_size=self.page_size,
             prefix_lens=prefix_lens_cpu,
         )
-        if num_new_pages > len(self.free_pages):
-            return None
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        # Filter out indices for tokens not belonging to this rank
+        # TODO: need to check
+        if token_rank_mask is not None:
+            # Save unused indices before setting placeholder
+            unused_indices = out_indices[~token_rank_mask].clone()
+
+            # Calculate which pages are actually used by tokens on this rank
+            used_indices = out_indices[token_rank_mask]
+            if used_indices.numel() > 0:
+                used_pages = torch.unique(used_indices // self.page_size)
+            else:
+                used_pages = torch.empty(0, dtype=torch.int64, device=self.device)
+
+            # Set placeholder (-1) for tokens not on this rank
+            out_indices[~token_rank_mask] = -1
+
+            # Free pages that were allocated for tokens not on this rank
+            if unused_indices.numel() > 0:
+                unused_pages = torch.unique(unused_indices // self.page_size)
+                unused_pages = unused_pages[unused_pages >= 0]  # Exclude placeholder
+                if unused_pages.numel() > 0:
+                    # Return unused pages to free pool
+                    self.free_pages = torch.cat([self.free_pages, unused_pages])
+
+            if used_pages.numel() > 0:
+                keep_mask = ~torch.isin(self.free_pages, used_pages)
+                self.free_pages = self.free_pages[keep_mask]
+
+            if self.need_sort:
+                self.free_pages, _ = torch.sort(self.free_pages)
+            #logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, out_indices={out_indices}, token_rank_mask={token_rank_mask}")
+
+        else:
+            if num_new_pages > len(self.free_pages):
+                return None
+            self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
     def alloc_decode(
@@ -514,13 +612,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        token_positions: Optional[torch.Tensor] = None,
     ):
+        """
+        Allocate token slots for decode phase.
+
+        Args:
+            token_positions: Optional tensor of shape (bs,) containing the position
+                of each token in its sequence (0-indexed). Used for DCP interleaved
+                storage where token_idx % dcp_world_size determines which rank
+                stores the token.
+        """
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
         bs = len(seq_lens)
+
+        # Filter tokens based on DCP interleaved storage if enabled
+        if token_positions is not None and get_dcp_world_size() > 1:
+            # Create mask for tokens that belong to this rank
+            token_rank_mask = (token_positions % get_dcp_world_size()) == get_dcp_rank()
+        else:
+            token_rank_mask = None
+
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
 
@@ -542,10 +658,41 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             page_size=self.page_size,
             decode=True,
         )
-        if num_new_pages > len(self.free_pages):
-            return None
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        # Filter out indices for tokens not belonging to this rank
+        # TODO: need to check
+        if token_rank_mask is not None:
+            # Save unused indices before setting placeholder
+            unused_indices = out_indices[~token_rank_mask].clone()
+
+            # Calculate which pages are actually used by tokens on this rank
+            used_indices = out_indices[token_rank_mask]
+            if used_indices.numel() > 0:
+                used_pages = torch.unique(used_indices // self.page_size)
+            else:
+                used_pages = torch.empty(0, dtype=torch.int64, device=self.device)
+
+            # Set placeholder (-1) for tokens not on this rank
+            out_indices[~token_rank_mask] = -1
+
+            # Free pages that were allocated for tokens not on this rank
+            if unused_indices.numel() > 0:
+                unused_pages = torch.unique(unused_indices // self.page_size)
+                unused_pages = unused_pages[unused_pages >= 0]  # Exclude placeholder
+                if unused_pages.numel() > 0:
+                    self.free_pages = torch.cat([self.free_pages, unused_pages])
+
+            if used_pages.numel() > 0:
+                keep_mask = ~torch.isin(self.free_pages, used_pages)
+                self.free_pages = self.free_pages[keep_mask]
+
+            if self.need_sort:
+                self.free_pages, _ = torch.sort(self.free_pages)
+            #logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, out_indices={out_indices}, token_rank_mask={token_rank_mask}")
+        else:
+            if num_new_pages > len(self.free_pages):
+                return None
+            self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
     def free(self, free_index: torch.Tensor):
