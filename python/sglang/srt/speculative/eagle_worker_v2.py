@@ -52,6 +52,7 @@ try:
         shift_append_input_ids_triton,
         warmup_eagle_triton_kernels,
     )
+
     _triton_available = True
 except ImportError:
     _triton_available = False
@@ -151,7 +152,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-        
+
         # Warmup Triton kernels to avoid JIT compilation overhead
         self._warmup_triton_kernels()
 
@@ -467,7 +468,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Create ForwardBatch first to reuse extend_seq_lens
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
 
-        # Construct input_ids (in-place modification)
+        # Construct input_ids (in-place)
         if not batch.forward_mode.is_idle():
             if _triton_available and self.device == "cuda" and not _is_npu:
                 shift_append_input_ids_triton(
