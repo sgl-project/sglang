@@ -62,7 +62,7 @@ wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
-Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release by the end of September, 2025.
+Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release in the future.
 
 ```shell
 PYTORCH_VERSION=2.6.0
