@@ -3074,6 +3074,7 @@ class ServerArgs:
                 "page_first",
                 "page_first_direct",
                 "page_first_kv_split",
+                "page_head",
             ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
