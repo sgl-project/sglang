@@ -128,7 +128,7 @@ sky status --endpoint 30000 sglang
 
 </details>
 
-## Method 7: Run on Amazon Web Services SageMaker
+## Method 7: Run on AWS SageMaker
 
 <details>
 <summary>More</summary>
