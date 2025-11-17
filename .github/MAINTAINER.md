@@ -33,7 +33,10 @@ __Note__: Difference between Merge Oncall and Codeowner
    - **Ideal case:** For each modified file, one Codeowner has approved the PR. The PR has also passed the required CI tests. Then, anyone with write permission can merge the PR.
    - **Exception:** In cases where it is difficult to meet all requirements (due to flaky CI or slow responses), a Merge Oncall can bypass branch protection to merge the PR.
 
+If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.ai/): #dev, #pull-request, and #ci-cd-build-release.
+
 ## The List of Merge Oncalls and Reviewers
+TODO
 
 This list is based on the current situation. If you or someone you know would like to take on more responsibility and are qualified, please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
 
@@ -51,3 +54,5 @@ The format is @github-username (Slack username).
 
 ### Ascend NPUs
 @iforgetmyname (Even Zhou)
+
+This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
