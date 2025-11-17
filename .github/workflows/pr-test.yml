@@ -52,10 +52,13 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const HOURS = 2;
-            const actor = context.actor;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
+            const curRun = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: context.runId
+            });
+            const triggeringActor = curRun.data.triggering_actor?.login || context.actor;
 
             async function hasHighPermission(username) {
               try {
@@ -68,8 +71,8 @@ jobs:
               }
             }
 
-            if (await hasHighPermission(actor)) {
-              core.info(`Triggering user '${actor}' has high permission. No rate limit applied.`);
+            if (await hasHighPermission(triggeringActor)) {
+              core.info(`Triggering user '${triggeringActor}' has high permission. No rate limit applied.`);
               return;
             }
 
@@ -79,7 +82,7 @@ jobs:
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
-              workflow_id: context.workflow,
+              workflow_id: 'pr-test.yml',
               event: eventName,
               per_page: 100,
             });
@@ -88,12 +91,12 @@ jobs:
             const recentFound = runs.find((run) => {
               if (String(run.id) === String(context.runId)) return false;
               if (new Date(run.created_at) < cutoff) return false;
-              return (run.actor?.login === actor) || (run.triggering_actor?.login === actor);
+              return (run.actor?.login === triggeringActor) || (run.triggering_actor?.login === triggeringActor);
             });
 
             if (recentFound) {
               core.setFailed(
-                `User '${actor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
+                `User '${triggeringActor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
                 `Please wait ${HOURS} hours before triggering again.`
               );
             } else {
@@ -115,6 +118,9 @@ jobs:
               - "sgl-kernel/**"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+              - "python/sglang/cli/**"
+              - "python/*.toml"
+              - ".github/workflows/pr-test.yml"
 
   # =============================================== sgl-kernel ====================================================
 
@@ -199,6 +205,8 @@ jobs:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -228,6 +236,8 @@ jobs:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -259,6 +269,7 @@ jobs:
     runs-on: 1-gpu-runner
     env:
       CI: true
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -300,14 +311,26 @@ jobs:
   multimodal-gen-test:
     needs: [check-changes]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: ubuntu-latest
+    runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Run placeholder test
+
+      - name: Install dependencies
         run: |
-          echo "Running multimodal_gen tests..."
-          echo "This is a placeholder for future tests."
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+
+      - name: Clean Corrupted Hugging Face Model Cache
+        run: |
+          echo "Temp: Deleting potentially corrupted Qwen/Qwen-Image and Qwen/Qwen-Image-Edit cache to ensure a fresh download."
+          rm -rf /hf_home/hub/models--Qwen--Qwen-Image
+          rm -rf /hf_home/hub/models--Qwen--Qwen-Image-Edit
+
+      - name: Run diffusion server tests
+        timeout-minutes: 60
+        run: |
+          cd python
+          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
@@ -347,6 +370,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -374,8 +399,11 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
@@ -401,10 +429,12 @@ jobs:
           python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
   unit-test-backend-2-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-1-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
+    env:
+      RUNNER_LABELS: 2-gpu-runner
     strategy:
       fail-fast: false
       matrix:
@@ -436,6 +466,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-h100
+    env:
+      RUNNER_LABELS: 4-gpu-h100
     strategy:
       fail-fast: false
       matrix:
@@ -467,10 +499,12 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -491,7 +525,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -500,6 +534,7 @@ jobs:
     runs-on: 8-gpu-h20
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+      RUNNER_LABELS: 8-gpu-h20
     strategy:
       fail-fast: false
       matrix:
@@ -531,6 +566,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -590,6 +627,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -641,6 +680,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -674,6 +715,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
+    env:
+      RUNNER_LABELS: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -731,6 +774,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -761,6 +806,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
+    env:
+      RUNNER_LABELS: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -791,6 +838,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-h100
+    env:
+      RUNNER_LABELS: 4-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -818,6 +867,8 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
+    env:
+      RUNNER_LABELS: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -840,47 +891,25 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
 
-  unit-test-backend-8-gpu-deepseek-v32:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 8-gpu-h200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200-deepseek-v32
-
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-b200
+    env:
+      RUNNER_LABELS: 4-gpu-b200
     strategy:
       fail-fast: false
+      matrix:
+        part: [0, 1]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
@@ -891,16 +920,18 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 2 --timeout-per-file 1800
 
   unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-gb200
+    env:
+      RUNNER_LABELS: 4-gpu-gb200
     strategy:
       fail-fast: false
     steps:
@@ -941,6 +972,7 @@ jobs:
         unit-test-backend-1-gpu,
         unit-test-backend-2-gpu,
         unit-test-backend-4-gpu,
+        unit-test-backend-8-gpu-h20,
         unit-test-backend-8-gpu-h200,
         performance-test-1-gpu-part-1,
         performance-test-1-gpu-part-2,

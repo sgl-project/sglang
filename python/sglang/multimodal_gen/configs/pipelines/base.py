@@ -4,7 +4,7 @@
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
-from enum import Enum
+from enum import Enum, auto
 from typing import Any
 
 import torch
@@ -26,6 +26,19 @@ from sglang.multimodal_gen.utils import (
 )
 
 logger = init_logger(__name__)
+
+
+# NOTE: possible duplication with DataType, WorkloadType
+# this may focus on the model's original ability
+class ModelTaskType(Enum):
+    I2V = auto()  # Image to Video
+    T2V = auto()  # Text to Video
+    TI2V = auto()  # Text and Image to Video
+    T2I = auto()  # Text to Image
+    I2I = auto()  # Image to Image
+
+    def is_image_task(self):
+        return self == ModelTaskType.T2I or self == ModelTaskType.I2I
 
 
 class STA_Mode(str, Enum):
@@ -51,10 +64,10 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
 class PipelineConfig:
     """Base configuration for all pipeline architectures."""
 
+    task_type: ModelTaskType
+
     model_path: str = ""
     pipeline_config_path: str | None = None
-
-    is_image_gen: bool = False
 
     # generation parameters
     # controls the timestep embedding generation
@@ -113,9 +126,6 @@ class PipelineConfig:
     dmd_denoising_steps: list[int] | None = field(default=None)
 
     # Wan2.2 TI2V parameters
-    ti2v_task: bool = False
-    i2v_task: bool = False
-    ti2i_task: bool = False
     boundary_ratio: float | None = None
 
     # Compilation

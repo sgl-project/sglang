@@ -130,7 +130,6 @@ class Qwen3_VisionBlock(nn.Module):
         intermediate_dim: int,
         hidden_act="silu",
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
-        attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -140,33 +139,13 @@ class Qwen3_VisionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
 
-        if attn_implementation == "sdpa":
-            softmax_in_single_precision = False
-            qkv_backend = "sdpa"
-            flatten_batch = True
-        elif attn_implementation == "flash_attention_2":
-            softmax_in_single_precision = False
-            qkv_backend = "triton_attn"
-            flatten_batch = True
-        elif attn_implementation == "eager":
-            softmax_in_single_precision = True
-            qkv_backend = "sdpa"
-            flatten_batch = True
-        elif attn_implementation == "flash_attention_3":
-            softmax_in_single_precision = False
-            qkv_backend = "fa3"
-            flatten_batch = True
-
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            rotary_embed="normal",
             proj_bias=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
-            flatten_batch=flatten_batch,
+            flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -283,7 +262,6 @@ class Qwen3VLMoeVisionModel(nn.Module):
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_3",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                 )

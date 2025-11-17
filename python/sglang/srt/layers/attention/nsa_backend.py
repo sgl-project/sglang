@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     NSA_FUSE_TOPK,
     compute_nsa_seqlens,
 )
+from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
@@ -136,10 +137,14 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     def get_seqlens_expanded(self) -> torch.Tensor:
         return self.attn_metadata.nsa_seqlens_expanded
 
+    def get_cu_seqlens_k(self) -> torch.Tensor:
+        return self.attn_metadata.cu_seqlens_k
+
     def topk_transform(
         self,
         logits: torch.Tensor,
         topk: int,
+        ks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel import (
             fast_topk_transform_fused,
@@ -148,7 +153,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         )
 
         if not NSA_FUSE_TOPK:
-            return fast_topk_v2(logits, self.get_seqlens_expanded(), topk)
+            return fast_topk_v2(
+                logits, self.get_seqlens_expanded(), topk, row_starts=ks
+            )
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
             return fast_topk_transform_fused(
@@ -157,6 +164,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 page_table_size_1=self.attn_metadata.page_table_1,
                 cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
                 topk=topk,
+                row_starts=ks,
             )
         elif self.topk_transform_method == TopkTransformMethod.RAGGED:
             return fast_topk_transform_ragged_fused(
@@ -164,6 +172,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 lengths=self.get_seqlens_expanded(),
                 topk_indices_offset=self.attn_metadata.topk_indices_offset,
                 topk=topk,
+                row_starts=ks,
             )
         else:
             assert False, f"Unsupported {self.topk_transform_method = }"
@@ -298,8 +307,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
-            max_seqlen_q = self.speculative_num_draft_tokens
-            nsa_max_seqlen_q = self.speculative_num_draft_tokens
+            max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
                 0,
                 batch_size * self.speculative_num_draft_tokens + 1,
@@ -332,6 +340,43 @@ class NativeSparseAttnBackend(AttentionBackend):
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
+        elif forward_batch.forward_mode.is_draft_extend():
+            assert (
+                forward_batch.extend_seq_lens_cpu is not None
+                and forward_batch.extend_seq_lens is not None
+                and forward_batch.extend_prefix_lens_cpu is not None
+            ), "All of them must not be None"
+
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            assert forward_batch.extend_seq_lens is not None
+
+            max_seqlen_q = 1
+            cu_seqlens_q = torch.arange(
+                0,
+                forward_batch.extend_num_tokens + 1,
+                1,
+                dtype=torch.int32,
+                device=device,
+            )
+            seqlens_expanded = torch.cat(
+                [
+                    torch.arange(
+                        kv_len - qo_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    for qo_len, kv_len in zip(
+                        forward_batch.extend_seq_lens_cpu,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        strict=True,
+                    )
+                ]
+            )
+            page_table = torch.repeat_interleave(
+                page_table, repeats=forward_batch.extend_seq_lens, dim=0
+            )
+
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -512,7 +557,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 )
             else:
                 flashmla_metadata = None
-        elif forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
@@ -562,64 +607,6 @@ class NativeSparseAttnBackend(AttentionBackend):
                     "flashmla_metadata"
                 ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
 
-                flashmla_metadata.copy_(
-                    self._compute_flashmla_metadata(
-                        cache_seqlens=nsa_cache_seqlens_int32,
-                        seq_len_q=1,
-                    )
-                )
-            else:
-                flashmla_metadata = None
-        elif forward_mode.is_draft_extend():
-            cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
-                torch.int32
-            )
-            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-            page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
-            max_seqlen_k = page_table_1.shape[1]
-
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.speculative_num_draft_tokens,
-                device=self.device,
-                dtype=torch.int32,
-            )
-
-            max_seqlen_q = max(extend_seq_lens_cpu)
-            cu_seqlens_q = compute_cu_seqlens(extend_seq_lens.to(torch.int32))
-
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
-            )
-            nsa_cache_seqlens_int32 = compute_nsa_seqlens(
-                seqlens_expanded, nsa_index_topk=self.nsa_index_topk
-            )
-            nsa_extend_seq_lens_list = [1] * bs
-
-            if NSA_DECODE_IMPL == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
-                # As the DeepGemm is not support for q_len = 3/4 in Indexer and every token has independent topk_indices,
-                # we made the Q shape [bs * speculative_num_draft_tokens, 1, head_nums, dim].
-                # So seq_len_q is 1 for flashmla_metadata in target_verify and draft_extend mode.
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
@@ -741,14 +728,18 @@ class NativeSparseAttnBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
-            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = spec_info.accept_length[:bs].tolist()
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens_cpu.tolist()
-            ]
+            extend_seq_lens = spec_info.accept_length[:bs]
+            extend_seq_lens_cpu = extend_seq_lens.tolist()
+
+            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+            page_indices = torch.repeat_interleave(
+                page_indices, repeats=extend_seq_lens, dim=0
+            )
+            metadata.page_table_1[: page_indices.shape[0], :max_seqlen_k].copy_(
+                page_indices
+            )
+
             seqlens_expanded = torch.cat(
                 [
                     torch.arange(
@@ -759,21 +750,21 @@ class NativeSparseAttnBackend(AttentionBackend):
                     )
                     for qo_len, kv_len in zip(
                         extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
+                        seq_lens_cpu.tolist(),
                         strict=True,
                     )
                 ]
             )
-            metadata.nsa_seqlens_expanded[: seqlens_expanded.size(0)].copy_(
+            metadata.nsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
                 seqlens_expanded
             )
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, self.nsa_index_topk
             )
-            metadata.nsa_cache_seqlens_int32[: seqlens_expanded.size(0)].copy_(
+            metadata.nsa_cache_seqlens_int32[: seqlens_expanded.shape[0]].copy_(
                 nsa_cache_seqlens
             )
-        seqlens_expanded_size = seqlens_expanded.size(0)
+        seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
             and metadata.nsa_cu_seqlens_k is not None
@@ -788,8 +779,9 @@ class NativeSparseAttnBackend(AttentionBackend):
         assert self.real_page_size == metadata.page_size
         if self.real_page_size > 1:
             real_table = self._transform_table_1_to_real(page_indices)
-            new_len = real_table.shape[1]
-            metadata.real_page_table[:, :new_len].copy_(real_table)
+            new_rows = real_table.shape[0]
+            new_cols = real_table.shape[1]
+            metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
@@ -906,7 +898,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         if NSA_PREFILL_IMPL == "tilelang":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -916,7 +908,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
         elif NSA_PREFILL_IMPL == "flashmla_sparse":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
 
             # NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 has no effect here,
             # because the flashmla_sparse kernel doesn't support fp8 compute
@@ -942,7 +934,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
         elif NSA_PREFILL_IMPL == "flashmla_kv":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1026,7 +1018,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         if NSA_DECODE_IMPL == "flashmla_sparse":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1036,7 +1028,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
         elif NSA_DECODE_IMPL == "flashmla_kv":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1049,7 +1041,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
         elif NSA_DECODE_IMPL == "tilelang":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
