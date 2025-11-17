@@ -9,7 +9,7 @@ import torch
 
 from sglang.multimodal_gen.configs.models.dits import StableDiffusion3TransformerConfig
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, ModelTaskType
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
@@ -76,6 +76,8 @@ class StableDiffusion3PipelineConfig(PipelineConfig):
 
     # SD3 specific parameters
     guidance_scale: float = 7.0
+
+    task_type: ModelTaskType = ModelTaskType.T2I
 
     def __post_init__(self):
         """Post initialization for SD3 specific setup."""

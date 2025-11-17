@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.pipelines import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.stablediffusion3 import StableDiffusion3PipelineConfig
 from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
@@ -42,6 +43,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
+from sglang.multimodal_gen.configs.sample.stablediffusion3 import StableDiffusion3SamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
@@ -417,6 +419,14 @@ def _register_configs():
         pipeline_config_cls=QwenImageEditPipelineConfig,
         model_path_to_name_mappings={
             "Qwen/Qwen-Image-Edit": "qwen-image-edit",
+        },
+    )
+    register_configs(
+        model_name="stable-diffusion-3-medium",
+        sampling_param_cls=StableDiffusion3SamplingParams,
+        pipeline_config_cls=StableDiffusion3PipelineConfig,
+        model_path_to_name_mappings={
+            "stabilityai/stable-diffusion-3-medium-diffusers": "stable-diffusion-3-medium",
         },
     )
 
