@@ -716,8 +716,11 @@ def biased_grouped_topk_gpu(
     ), "routed_scaling_factor is required for biased_grouped_topk"
     # TODO: moe_fused_gate kernel is not supported for num_fused_shared_experts > 0 now.
     if (
-        _is_cuda 
-        and ((gating_output.shape[1] // num_expert_group  <= 32) or (gating_output.shape[1] == 256 and num_expert_group == 1))  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
+        _is_cuda
+        and (
+            (gating_output.shape[1] // num_expert_group <= 32)
+            or (gating_output.shape[1] == 256 and num_expert_group == 1)
+        )
         and is_power_of_two(correction_bias.shape[0])
     ):
         topk_weights, topk_ids = moe_fused_gate(
