@@ -15,12 +15,12 @@ This section explains how to configure the request tracing and export the trace 
     pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc
     ```
 
-2. launch opentelemetry collector and jaeger
+2. Launch OpenTelemetry collector and Jaeger
     ```bash
     docker compose -f examples/monitoring/tracing_compose.yaml up -d
     ```
 
-3. start your SGLang server with tracing enabled
+3. Start your SGLang server with tracing enabled
     ```bash
     # set env variables
     export SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS=500
@@ -31,7 +31,7 @@ This section explains how to configure the request tracing and export the trace 
     python -m sglang_router.launch_router --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other option>
     ```
 
-    Replace `0.0.0.0:4317` with the actual endpoint of the opentelemetry collector. If you launched the openTelemetry collector with tracing_compose.yaml, the default receiving port is 4317.
+    Replace `0.0.0.0:4317` with the actual endpoint of the OpenTelemetry collector. If you launched the openTelemetry collector with tracing_compose.yaml, the default receiving port is 4317.
 
     To use the HTTP/protobuf span exporter, set the following environment variable and point to an HTTP endpoint, for example, `http://0.0.0.0:4318/v1/traces`.
     ```bash
@@ -39,7 +39,7 @@ This section explains how to configure the request tracing and export the trace 
     ```
 
 
-4. raise some requests
+4. Raise some requests
 5. Observe whether trace data is being exported
     * Access port 16686 of Jaeger using a web browser to visualize the request traces.
     * The OpenTelemetry Collector also exports trace data in JSON format to /tmp/otel_trace.json. In a follow-up patch, we will provide a tool to convert this data into a Perfetto-compatible format, enabling visualization of requests in the Perfetto UI.
@@ -47,7 +47,7 @@ This section explains how to configure the request tracing and export the trace 
 ## How to add Tracing for slices you're interested in?
 We have already inserted instrumentation points in the tokenizer and scheduler main threads. If you wish to trace additional request execution segments or perform finer-grained tracing, please use the APIs from the tracing package as described below.
 
-1. initialization
+1. Initialization
 
     Every process involved in tracing during the initialization phase should execute:
     ```python
@@ -61,7 +61,7 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
     ```
     The "thread label" can be regarded as the name of the thread, used to distinguish different threads in the visualization view.
 
-2. create a time recorder for a request
+2. Create a time recorder for a request
     Each request needs to call `SGLangStageContext()` to initialize a time recorder, which is used to generate slice spans and request stage metrics. You can either store it within the request object or maintain it as a global variable. A set of APIs for managing the global time recorder is provided in `python/sglang/srt/tracing/trace_metric_warpper.py`.
 
 3. Mark the beginning and end of a request
@@ -71,7 +71,7 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
     ```
     SGLangStageContext() and trace_req_finish() must be called within the same process, for example, in the tokenizer.
 
-4. Add tracing for slice
+4. Add tracing for a slice
 
     * Add slice tracing normally:
         ```python
@@ -111,13 +111,13 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
         ```
 
 6. When the request execution flow transfers to another node(PD disaggregation), the trace context needs to be explicitly propagated.
-    - sender: Execute the following code before sending the request to node thread via http
+    - sender: Execute the following code before sending the request to the node thread via HTTP
         ```python
         trace_context = trace_get_remote_propagate_context_batch(bootstrap_room_list)
         headers = {"trace_context": trace_context}
         session.post(url, headers=headers)
         ```
-    - receiver: Execute the following code after receiving the request via http
+    - receiver: Execute the following code after receiving the request via HTTP
         ```python
         trace_set_remote_propagate_context_batch(request.headers['trace_context'])
         ```
