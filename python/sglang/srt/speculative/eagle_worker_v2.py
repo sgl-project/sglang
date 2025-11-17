@@ -453,17 +453,25 @@ class EagleDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
-        # Construct input_ids
+        # Construct spec_info
+        next_draft_input = EagleDraftInput(
+            hidden_states=target_hidden_states,
+            verified_id=next_token_ids,
+            new_seq_lens=batch.seq_lens,
+            allocate_lens=batch.seq_lens,
+            num_tokens_per_batch=1,
+            num_tokens_for_logprob_per_batch=1,
+        )
+        batch.spec_info = next_draft_input
+
+        # Create ForwardBatch first to reuse extend_seq_lens
+        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+
+        # Construct input_ids (in-place modification)
         if not batch.forward_mode.is_idle():
             if _triton_available and self.device == "cuda" and not _is_npu:
-                if isinstance(batch.extend_seq_lens, list):
-                    extend_seq_lens_tensor = torch.tensor(
-                        batch.extend_seq_lens, dtype=torch.int32, device=self.device
-                    )
-                else:
-                    extend_seq_lens_tensor = batch.extend_seq_lens
                 shift_append_input_ids_triton(
-                    batch.input_ids, extend_seq_lens_tensor, next_token_ids
+                    batch.input_ids, forward_batch.extend_seq_lens, next_token_ids
                 )
             else:
                 pt = 0
@@ -474,21 +482,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     )
                     pt += extend_len
 
-        # Construct spec_info
-        next_draft_input = EagleDraftInput(
-            hidden_states=target_hidden_states,
-            verified_id=next_token_ids,
-            new_seq_lens=batch.seq_lens,
-            allocate_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 num token per batch
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
-        )
-
-        batch.spec_info = next_draft_input
-
         # Run forward
-        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         logits_output, _ = self.draft_runner.forward(forward_batch)
 
         # Update spec_info for the next draft step
