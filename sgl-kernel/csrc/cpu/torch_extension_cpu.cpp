@@ -88,6 +88,8 @@ void extend_attention_cpu(
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    std::optional<at::Tensor> k_buf_scale,
+    std::optional<at::Tensor> v_buf_scale,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
@@ -278,7 +280,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // extend
   m.def(
       "extend_attention_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
-      "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
+      "Tensor v_buffer, Tensor? k_buf_scale, Tensor? v_buf_scale, Tensor req_to_token, Tensor req_pool_indices, Tensor "
+      "seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
