@@ -6,10 +6,6 @@ from sglang.test.test_utils import TestFile, run_unittest_files
 suites = {
     "per-commit": [
         TestFile("test_srt_backend.py"),
-        # Skip this due to some OPENAI_API_KEY issues
-        # "test_openai_backend.py",
-        TestFile("test_separate_reasoning.py"),
-        TestFile("test_separate_reasoning_execution.py"),
     ],
 }
 

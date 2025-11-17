@@ -15,11 +15,11 @@ import uuid
 from typing import Dict, Optional
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
 
 class SessionReqNode:
-    def __init__(self, req, parent=None, childs=None):
+    def __init__(self, req: Req, parent=None, childs=None):
         self.req = req
         self.parent = parent
         if parent is not None:
@@ -36,12 +36,12 @@ class SessionReqNode:
             req_node.clear(req_dict)
 
         if self.req.finished_reason is None:
-            self.req.to_abort = True
+            self.req.to_finish = FINISH_ABORT()
         del req_dict[self.req.rid]
 
     def abort(self):
         if self.req.finished_reason is None:
-            self.req.to_abort = True
+            self.req.to_finish = FINISH_ABORT()
 
     def __str__(self):
         return self._str_helper(self.req.rid)
@@ -54,7 +54,7 @@ class SessionReqNode:
             prefix += " -- " + self.childs[0].req.rid
             ret = self.childs[0]._str_helper(prefix)
             for child in self.childs[1:]:
-                prefix = " " * len(origin_prefix) + r" \- " + child.req.rid
+                prefix = " " * len(origin_prefix) + " \\- " + child.req.rid
                 ret += child._str_helper(prefix)
             return ret
 
@@ -106,14 +106,22 @@ class Session:
                 last_req.origin_input_ids
                 + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
             )
+
+            if session_params.drop_previous_output:
+                input_ids = last_req.origin_input_ids[:]
+
             if session_params.offset and session_params.offset != 0:
                 input_ids = input_ids[: session_params.offset] + req.input_ids
             else:
                 input_ids += req.input_ids
+
             input_ids_unpadded = (
                 last_req.origin_input_ids_unpadded
                 + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
             )
+            if session_params.drop_previous_output:
+                input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
+
             if session_params.offset and session_params.offset != 0:
                 input_ids_unpadded = (
                     input_ids_unpadded[: session_params.offset] + req.input_ids
@@ -129,19 +137,21 @@ class Session:
             origin_input_ids=input_ids,
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
-            lora_path=req.lora_path,
+            lora_id=req.lora_id,
             session_id=self.session_id,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            vocab_size=tokenizer.vocab_size,
         )
         if last_req is not None:
-            new_req.multimodal_inputs = last_req.mm_inputs
+            new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
+
         if abort:
-            new_req.to_abort = True
+            new_req.set_finish_with_abort("Invalid request session id")
         else:
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node

@@ -1,12 +1,14 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
+import concurrent.futures
 import fnmatch
 import glob
 import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -33,9 +35,14 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.utils import print_warning_once
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp8Config,
+)
+from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +113,9 @@ def convert_bin_to_safetensor_file(
 
     dirname = os.path.dirname(sf_filename)
     os.makedirs(dirname, exist_ok=True)
+
+    from safetensors.torch import save_file
+
     save_file(loaded, sf_filename, metadata={"format": "pt"})
 
     # check file size
@@ -128,11 +138,26 @@ def convert_bin_to_safetensor_file(
             raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
+def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
+    for prefix, new_prefix in prefix_mapping.items():
+        if key.startswith(prefix):
+            key = key.replace(prefix, new_prefix, 1)
+    return key
+
+
+def replace_substrings(key: str, substring_mapping: dict[str, str]) -> str:
+    for substr, new_substr in substring_mapping.items():
+        if substr in key:
+            key = key.replace(substr, new_substr)
+    return key
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
+    remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
@@ -202,22 +227,176 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        if remap_prefix is not None:
+            exclude_modules = [
+                replace_prefix(key, remap_prefix)
+                for key in config["quantization"]["exclude_modules"]
+            ]
+            config["quantization"]["exclude_modules"] = exclude_modules
+        config["packed_modules_mapping"] = packed_modules_mapping
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
-        elif model_config.quantization == "modelopt":
-            if config["producer"]["name"] == "modelopt":
-                if "FP4" in config["quantization"]["quant_algo"]:
-                    return ModelOptFp4Config.from_config(config)
-                else:
-                    return quant_cls.from_config(config)
-            else:
-                raise ValueError(
-                    f"Unsupported quantization config"
-                    f" found for {model_config.quantization} in {f}."
-                )
+        elif model_config.quantization.startswith("modelopt") and (
+            config.get("producer", {}).get("name", "").startswith("modelopt")
+        ):
+            quant_algo = config["quantization"]["quant_algo"]
+            if quant_algo is None:
+                # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+                if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
+                    raise ValueError(
+                        f"Invalid quant_config, quantization method: {model_config.quantization},"
+                        f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                    )
+                return None
+            elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
+                return ModelOptFp8Config.from_config(config)
+            elif "FP4" in quant_algo:
+                return ModelOptFp4Config.from_config(config)
+        return quant_cls.from_config(config)
 
-    return quant_cls.from_config(config)
+
+def find_local_hf_snapshot_dir(
+    model_name_or_path: str,
+    cache_dir: Optional[str],
+    allow_patterns: List[str],
+    revision: Optional[str] = None,
+) -> Optional[str]:
+    """If the weights are already local, skip downloading and returns the path."""
+    if os.path.isdir(model_name_or_path):
+        return None
+
+    found_local_snapshot_dir = None
+
+    # Check custom cache_dir (if provided)
+    if cache_dir:
+        try:
+            repo_folder = os.path.join(
+                cache_dir,
+                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+                    ["models", *model_name_or_path.split("/")]
+                ),
+            )
+            rev_to_use = revision
+            if not rev_to_use:
+                ref_main = os.path.join(repo_folder, "refs", "main")
+                if os.path.isfile(ref_main):
+                    with open(ref_main) as f:
+                        rev_to_use = f.read().strip()
+            if rev_to_use:
+                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
+                if os.path.isdir(rev_dir):
+                    found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning(
+                "Failed to find local snapshot in custom cache_dir %s: %s",
+                cache_dir,
+                e,
+            )
+
+    # Check default HF cache as well
+    if not found_local_snapshot_dir:
+        try:
+            rev_dir = find_local_repo_dir(model_name_or_path, revision)
+            if rev_dir and os.path.isdir(rev_dir):
+                found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning("Failed to find local snapshot in default HF cache: %s", e)
+
+    # if any incomplete file exists, force re-download by returning None
+    if found_local_snapshot_dir:
+        repo_folder = os.path.abspath(
+            os.path.join(found_local_snapshot_dir, "..", "..")
+        )
+        blobs_dir = os.path.join(repo_folder, "blobs")
+        if os.path.isdir(blobs_dir) and glob.glob(
+            os.path.join(blobs_dir, "*.incomplete")
+        ):
+            logger.info(
+                "Found .incomplete files in %s for %s. "
+                "Considering local snapshot incomplete.",
+                blobs_dir,
+                model_name_or_path,
+            )
+            return None
+
+    # if local snapshot exists, validate it contains at least one weight file
+    # matching allow_patterns before skipping download.
+    if found_local_snapshot_dir is None:
+        return None
+
+    local_weight_files: List[str] = []
+    try:
+        for pattern in allow_patterns:
+            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+            for f in matched_files:
+                # os.path.exists returns False for broken symlinks.
+                if not os.path.exists(f):
+                    continue
+                local_weight_files.append(f)
+    except Exception as e:
+        logger.warning(
+            "Failed to scan local snapshot %s with patterns %s: %s",
+            found_local_snapshot_dir,
+            allow_patterns,
+            e,
+        )
+        local_weight_files = []
+
+    # After we have a list of valid files, check for sharded model completeness.
+    # Check if all safetensors with name model-{i}-of-{n}.safetensors exists
+    checked_sharded_model = False
+    for f in local_weight_files:
+        if checked_sharded_model:
+            break
+        base_name = os.path.basename(f)
+        # Regex for files like model-00001-of-00009.safetensors
+        match = re.match(r"(.*?)-([0-9]+)-of-([0-9]+)\.(.*)", base_name)
+        if match:
+            prefix = match.group(1)
+            shard_id_str = match.group(2)
+            total_shards_str = match.group(3)
+            suffix = match.group(4)
+            total_shards = int(total_shards_str)
+
+            # Check if all shards are present
+            missing_shards = []
+            for i in range(1, total_shards + 1):
+                # Reconstruct shard name, preserving padding of original shard id
+                shard_name = (
+                    f"{prefix}-{i:0{len(shard_id_str)}d}-of-{total_shards_str}.{suffix}"
+                )
+                expected_path = os.path.join(found_local_snapshot_dir, shard_name)
+                # os.path.exists returns False for broken symlinks, which is desired.
+                if not os.path.exists(expected_path):
+                    missing_shards.append(shard_name)
+
+            if missing_shards:
+                logger.info(
+                    "Found incomplete sharded model %s. Missing shards: %s. "
+                    "Will attempt download.",
+                    model_name_or_path,
+                    missing_shards,
+                )
+                return None
+
+            # If we found and verified one set of shards, we are done.
+            checked_sharded_model = True
+
+    if len(local_weight_files) > 0:
+        logger.info(
+            "Found local HF snapshot for %s at %s; skipping download.",
+            model_name_or_path,
+            found_local_snapshot_dir,
+        )
+        return found_local_snapshot_dir
+    else:
+        logger.info(
+            "Local HF snapshot at %s has no files matching %s; will attempt download.",
+            found_local_snapshot_dir,
+            allow_patterns,
+        )
+    return None
 
 
 def download_weights_from_hf(
@@ -244,6 +423,16 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
+
+    if is_in_ci():
+        # If the weights are already local, skip downloading and returns the path.
+        # This is used to skip too-many Huggingface API calls in CI.
+        path = find_local_hf_snapshot_dir(
+            model_name_or_path, cache_dir, allow_patterns, revision
+        )
+        if path is not None:
+            return path
+
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
         fs = HfFileSystem()
@@ -256,7 +445,7 @@ def download_weights_from_hf(
                 allow_patterns = [pattern]
                 break
 
-    logger.info("Using model weights format %s", allow_patterns)
+    log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
@@ -422,6 +611,7 @@ def safetensors_weights_iterator(
     hf_weights_files: List[str],
     is_all_weights_sharded: bool = False,
     decryption_key: Optional[str] = None,
+    disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -443,9 +633,70 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        result = safetensors.torch.load_file(st_file, device="cpu")
-        for name, param in result.items():
-            yield name, param
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+                for name, param in result.items():
+                    yield name, param
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    yield name, f.get_tensor(name)
+
+
+def multi_thread_safetensors_weights_iterator(
+    hf_weights_files: List[str],
+    is_all_weights_sharded: bool = False,
+    decryption_key: Optional[str] = None,
+    max_workers: int = 4,
+    disable_mmap: bool = False,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Multi-Thread iterate over the weights in the model safetensor files.
+
+    If is_all_weights_sharded is True, it uses more optimize read by reading an
+    entire file instead of reading each tensor one by one.
+    """
+    if decryption_key:
+        logger.warning(
+            "Multi-Thread loading is not working for encrypted safetensor weights."
+        )
+        yield from safetensors_encrypted_weights_iterator(
+            hf_weights_files, is_all_weights_sharded, decryption_key
+        )
+        return
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    def _load_file(st_file: str):
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
+
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
+
+        if enable_tqdm:
+            futures_iter = tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(hf_weights_files),
+                desc="Multi-thread loading shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        else:
+            futures_iter = concurrent.futures.as_completed(futures)
+
+        for future in futures_iter:
+            state_dict = future.result()
+            for name, param in state_dict.items():
+                yield name, param
 
 
 def pt_weights_iterator(
@@ -464,6 +715,39 @@ def pt_weights_iterator(
         state = torch.load(bin_file, map_location="cpu", weights_only=True)
         yield from state.items()
         del state
+
+
+def multi_thread_pt_weights_iterator(
+    hf_weights_files: List[str],
+    max_workers: int = 4,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Multi-Thread iterate over the weights in the model bin/pt files."""
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    def _load_file(bin_file: str):
+        return torch.load(bin_file, map_location="cpu", weights_only=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_load_file, bin_file) for bin_file in hf_weights_files
+        ]
+
+        if enable_tqdm:
+            futures_iter = tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(hf_weights_files),
+                desc="Multi-thread loading pt checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        else:
+            futures_iter = concurrent.futures.as_completed(futures)
+
+        for future in futures_iter:
+            state = future.result()
+            yield from state.items()
 
 
 def get_gguf_extra_tensor_names(
@@ -570,7 +854,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_attention_tp_rank()
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
@@ -733,6 +1017,16 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                 return None
             return remapped_name
 
+    quark_scale_names = {
+        ".q_proj.output_scale": ".attn.q_scale",
+        ".k_proj.output_scale": ".attn.k_scale",
+        ".v_proj.output_scale": ".attn.v_scale",
+        "self_attn.prob_output_scale": ".attn.prob_scale",
+    }
+    for quark_scale_name, sglang_scale_name in quark_scale_names.items():
+        if name.endswith(quark_scale_name):
+            return name.replace(quark_scale_name, sglang_scale_name)
+
     # If there were no matches, return the untouched param name
     return name
 
@@ -853,3 +1147,57 @@ def kv_cache_scales_loader(
         tp_rank,
     )
     return []
+
+
+def get_actual_shard_size(shard_size, weight_start, weight_end):
+    if weight_end < weight_start:
+        return 0
+
+    return min(shard_size, weight_end - weight_start)
+
+
+def reset_param_data_if_needed(param_data, dim, start, length):
+    if length == 0:
+        return
+
+    assert length > 0, f"Length should be positive, but got {length}"
+
+    param_data.narrow(dim, start, length).zero_()
+    return
+
+
+def narrow_padded_param_and_loaded_weight(
+    param_data,
+    loaded_weight,
+    param_data_start,
+    weight_start,
+    dim,
+    shard_size,
+    narrow_weight=True,
+):
+    actual_shard_size = get_actual_shard_size(
+        shard_size, weight_start, loaded_weight.size(dim)
+    )
+
+    if narrow_weight:
+        if actual_shard_size > 0:
+            loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
+        else:
+            # No real data to load; create a dummy tensor filled with zeros
+            loaded_weight = torch.zeros_like(
+                param_data.narrow(dim, param_data_start, actual_shard_size)
+            )
+
+    # [Note] Reset padded weights to zero.
+    # If the actual shard size is less than the shard size, we need to reset
+    # the padded param_data to zero and then copy the loaded_weight into it.
+    reset_param_data_if_needed(
+        param_data,
+        dim,
+        param_data_start + actual_shard_size,
+        shard_size - actual_shard_size,
+    )
+
+    param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
+
+    return param_data, loaded_weight

@@ -1,15 +1,9 @@
-import base64
-import copy
-import dataclasses
 import multiprocessing
-import pickle
-import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import requests
 import torch
-import torch.distributed as dist
 
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
@@ -64,11 +58,9 @@ class HttpServerEngineAdapter(EngineBase):
 
     def _make_request(self, endpoint: str, payload: Optional[dict] = None):
         """Make a POST request to the specified endpoint with the given payload.
-
         Args:
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
-
         Returns:
             The JSON response from the server
         """
@@ -85,7 +77,6 @@ class HttpServerEngineAdapter(EngineBase):
     ):
         """
         Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
-
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """

@@ -2,23 +2,7 @@ from typing import Tuple, Union
 
 import torch
 
-from sglang.srt.lora.utils import LoRABatchInfo
-
-
-def get_fuse_output_add_from_name(name: str) -> bool:
-    mapping = {
-        "triton": True,
-        "flashinfer": False,
-    }
-    return mapping.get(name, False)
-
-
-def get_fuse_stacked_lora_b_from_name(name: str) -> bool:
-    mapping = {
-        "triton": True,
-        "flashinfer": False,
-    }
-    return mapping.get(name, False)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class BaseLoRABackend:
@@ -26,17 +10,14 @@ class BaseLoRABackend:
        Each backend has its own implementation of Lora kernels.
 
     Args:
-        name: name of backend
-        batch_info: information of current batch for use
-        fuse_output_add: if set to True, the output buffer for storing result will be passed in when doing lora_b forward,
-                                 and the operation of adding will be fused into kernel
+        max_loras_per_batch: maximum number of different lora weights
+                             that can be applied in a single forward batch.
+        device: the device where the backend runs.
     """
 
-    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
-        self.name = name
-        self.batch_info = batch_info
-        self.fuse_output_add = get_fuse_output_add_from_name(name)
-        self.fuse_stacked_lora_b = get_fuse_stacked_lora_b_from_name(name)
+    def __init__(self, max_loras_per_batch: int, device: torch.device):
+        self.max_loras_per_batch = max_loras_per_batch
+        self.device = device
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -113,21 +94,41 @@ class BaseLoRABackend:
         """
         pass
 
-    def set_batch_info(self, batch_info: LoRABatchInfo):
-        self.batch_info = batch_info
+    def init_cuda_graph_batch_info(
+        self,
+        max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
+    ):
+        """Initialize the batch info for CUDA Graph mode.
 
+        This method provides a hook for each backend to conduct its own initialization
+        logic for CUDA Graph mode.
 
-def get_backend_from_name(name: str) -> BaseLoRABackend:
-    """
-    Get corresponding backend class from backend's name
-    """
-    if name == "triton":
-        from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+        Args:
+            cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
+            max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
+            num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
+        """
+        pass
 
-        return TritonLoRABackend
-    elif name == "flashinfer":
-        from sglang.srt.lora.backend.flashinfer_backend import FlashInferLoRABackend
+    def prepare_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+        use_cuda_graph: bool,
+    ):
+        """Prepare the lora weights and batch info for current forward batch.
 
-        return FlashInferLoRABackend
-    else:
-        raise ValueError(f"Invalid backend: {name}")
+        This method provides a hook for each backend to conduct its own preparation
+        logic for each forward batch.
+
+        Args:
+            forward_batch: the ForwardBatch object for current forward pass
+            weight_indices: list of indices of lora weights to be applied for current batch
+            lora_ranks: list of lora ranks corresponding to weight_indices
+            scalings: list of scaling factors corresponding to weight_indices
+            use_cuda_graph: whether to use CUDA Graph for this batch
+        """
+        pass

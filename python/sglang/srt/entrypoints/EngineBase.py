@@ -29,6 +29,7 @@ class EngineBase(ABC):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        rid: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """Generate outputs based on given inputs."""
         pass
@@ -46,6 +47,14 @@ class EngineBase(ABC):
         flush_cache: bool = True,
     ):
         """Update model weights with in-memory tensor data."""
+        pass
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a new LoRA adapter without re-launching the engine."""
+        pass
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a LoRA adapter without re-launching the engine."""
         pass
 
     @abstractmethod

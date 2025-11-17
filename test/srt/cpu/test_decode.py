@@ -1,10 +1,11 @@
 import unittest
 
-import sgl_kernel
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.test.test_utils import CustomTestCase
+
+torch.manual_seed(1234)
 
 
 class TestDecodeAttention(CustomTestCase):
@@ -57,8 +58,7 @@ class TestDecodeAttention(CustomTestCase):
 
         return output
 
-    def _test_grouped_decode_attention_once(self, B, H_Q, H_KV, D, D_V, device):
-        dtype = torch.bfloat16
+    def _test_grouped_decode_attention_once(self, B, H_Q, H_KV, D, D_V, dtype, device):
         # This represents the number of tokens already in the sequence
         seq_len = 1024
         total_tokens = B * seq_len
@@ -100,9 +100,10 @@ class TestDecodeAttention(CustomTestCase):
             device=device,
         )
 
-        # k_buffer, v_buffer, key and value supports non-contiguous tensors
+        # k_buffer, v_buffer, query, key and value supports non-contiguous tensors
         k_buffer = k_buffer.transpose(0, 1).contiguous().transpose(0, 1)
         v_buffer = v_buffer.transpose(0, 1).contiguous().transpose(0, 1)
+        q = q.transpose(0, 1).contiguous().transpose(0, 1)
         key = key.transpose(0, 1).contiguous().transpose(0, 1)
         value = value.transpose(0, 1).contiguous().transpose(0, 1)
         torch.ops.sgl_kernel.decode_attention_cpu(
@@ -155,9 +156,10 @@ class TestDecodeAttention(CustomTestCase):
         ]
 
         for B, H_Q, H_KV, D, D_V in configs:
-            self._test_grouped_decode_attention_once(
-                B, H_Q, H_KV, D, D_V, device=device
-            )
+            for dtype in [torch.bfloat16, torch.float16]:
+                self._test_grouped_decode_attention_once(
+                    B, H_Q, H_KV, D, D_V, dtype=dtype, device=device
+                )
 
     def test_grouped_decode_attention(self):
         self._test_grouped_decode_attention("cpu")

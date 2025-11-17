@@ -17,6 +17,7 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     initialize_model_parallel,
 )
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -56,22 +57,31 @@ def multi_process_parallel(
 
 
 class TestCustomAllReduce(CustomTestCase):
+    TEST_SIZES = [
+        512,
+        4096,
+        32768,
+        262144,
+        2097152,
+        16777216,
+        33554432,
+        67108864,
+    ]  # 512B...32MB
+    WORLD_SIZES = [2, 4, 6, 8]
+    TEST_LOOP = 10
+
     @classmethod
     def setUpClass(cls):
-        random.seed(42)
-        # 512B to 32MB
-        cls.test_sizes = [512, 4096, 32768, 262144, 2097152, 16777216, 33554432]
-        cls.world_sizes = [2, 4, 6, 8]
-        cls.test_loop = 10
+        random.seed(42)  # keep the deterministic seed
 
     def test_graph_allreduce(self):
-        for world_size in self.world_sizes:
+        for world_size in self.WORLD_SIZES:
             if world_size > torch.cuda.device_count():
                 continue
             multi_process_parallel(world_size, self, self.graph_allreduce)
 
     def test_eager_allreduce(self):
-        for world_size in self.world_sizes:
+        for world_size in self.WORLD_SIZES:
             if world_size > torch.cuda.device_count():
                 continue
             multi_process_parallel(world_size, self, self.eager_allreduce)
@@ -91,6 +101,9 @@ class TestCustomAllReduce(CustomTestCase):
         initialize_model_parallel(tensor_model_parallel_size=world_size)
         group = get_tensor_model_parallel_group().device_group
 
+        # Set global server args to avoid "Global server args is not set yet!" error
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
         # A small all_reduce for warmup.
         # this is needed because device communicators might be created lazily
         # (e.g. NCCL). This will ensure that the communicator is initialized
@@ -102,9 +115,9 @@ class TestCustomAllReduce(CustomTestCase):
         torch.cuda.synchronize()
         del data
 
-        for sz in self.test_sizes:
+        for sz in self.TEST_SIZES:
             for dtype in [torch.float32, torch.float16, torch.bfloat16]:
-                for _ in range(self.test_loop):
+                for _ in range(self.TEST_LOOP):
                     with graph_capture() as graph_capture_context:
                         # use integers so result matches NCCL exactly
                         inp1 = torch.randint(
@@ -151,9 +164,12 @@ class TestCustomAllReduce(CustomTestCase):
         initialize_model_parallel(tensor_model_parallel_size=world_size)
         group = get_tensor_model_parallel_group().device_group
 
-        for sz in self.test_sizes:
+        # Set global server args to avoid "Global server args is not set yet!" error
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+        for sz in self.TEST_SIZES:
             for dtype in [torch.float32, torch.float16, torch.bfloat16]:
-                for _ in range(self.test_loop):
+                for _ in range(self.TEST_LOOP):
                     inp1 = torch.randint(
                         1, 16, (sz,), dtype=dtype, device=torch.cuda.current_device()
                     )

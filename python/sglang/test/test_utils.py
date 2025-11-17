@@ -1,20 +1,27 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
+import asyncio
 import copy
+import json
 import logging
 import os
 import random
+import re
 import subprocess
+import sys
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import partial
+from datetime import datetime
+from functools import partial, wraps
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 import requests
 import torch
@@ -22,8 +29,6 @@ import torch.nn.functional as F
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
-from sglang.lang.backend.openai import OpenAI
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -37,8 +42,11 @@ from sglang.utils import get_exception_traceback
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = "Qwen/Qwen3-Reranker-0.6B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
@@ -47,6 +55,10 @@ DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
+
+# NVFP4 models
+DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
+DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4 = "nvidia/Qwen3-30B-A3B-FP4"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -57,29 +69,57 @@ DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8 = (
 DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
     "nvidia/Llama-3.1-8B-Instruct-FP8"
 )
+DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
+DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
+
+# MXFP4 models
+# Standard MXFP4 MoE test model
+DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE = "openai/gpt-oss-20b"
+
+# W8A8 models
+DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
+DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
+
+# INT4 models
+DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+)
 
 # EAGLE
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
+DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
+    "meta-llama/Llama-3.1-8B-Instruct"
+)
+DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
+DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
+    "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",  # auto_round:auto_gptq
+    "Intel/Qwen2-0.5B-Instruct-int4-sym-AutoRound",  # auto_round:auto_awq
+)
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
     "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it,jet-ai/Jet-Nemotron-2B"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -97,20 +137,37 @@ def is_in_ci():
 
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
-    return get_bool_env_var("SGLANG_AMD_CI")
+    return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
+
+
+def is_blackwell_system():
+    """Return whether it is running on a Blackwell (B200) system."""
+    return get_bool_env_var("IS_BLACKWELL")
+
+
+def _use_cached_default_models(model_repo: str):
+    cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
+    if cache_dir and model_repo:
+        model_path = os.path.join(cache_dir, model_repo)
+        if os.path.isdir(model_path):
+            return os.path.abspath(model_path)
+    return ""
 
 
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
     )
 else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 
@@ -335,12 +392,16 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
+    parser.add_argument("--raw-result-file", type=str)
     args = parser.parse_args()
 
     return args
 
 
 def select_sglang_backend(args: argparse.Namespace):
+    from sglang.lang.backend.openai import OpenAI
+    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False
@@ -359,8 +420,6 @@ def _get_call_generate(args: argparse.Namespace):
         return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "gserver":
-        return partial(call_generate_gserver, url=f"{args.host}:{args.port}")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":
@@ -417,16 +476,61 @@ def get_call_select(args: argparse.Namespace):
     return func
 
 
+def _get_default_models():
+    import inspect
+
+    current_module = inspect.getmodule(_get_default_models)
+    default_models = set()
+    for name, value in current_module.__dict__.items():
+        if (
+            isinstance(name, str)
+            and "DEFAULT_" in name
+            and "MODEL_" in name
+            and isinstance(value, str)
+        ):
+            if "," in value:
+                parts = [part.strip() for part in value.split(",")]
+                default_models.update(parts)
+            else:
+                default_models.add(value.strip())
+    return json.dumps(list(default_models))
+
+
+def try_cached_model(model_repo: str):
+    model_dir = _use_cached_default_models(model_repo)
+    return model_dir if model_dir else model_repo
+
+
+def popen_with_error_check(command: list[str], allow_exit: bool = False):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _run_and_check():
+        stdout, stderr = process.communicate()
+
+        while process.poll() is None:
+            time.sleep(5)
+
+        if not allow_exit or process.returncode != 0:
+            raise Exception(
+                f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
+            )
+
+    t = threading.Thread(target=_run_and_check)
+    t.start()
+    return process
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: list[str] = [],
+    other_args: Optional[list[str]] = None,
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
     pd_separated: bool = False,
+    num_replicas: Optional[int] = None,
 ):
     """Launch a server process with automatic device detection.
 
@@ -434,17 +538,19 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
     """
+    other_args = other_args or []
+
     # Auto-detect device if needed
     if device == "auto":
         device = auto_config_device()
-        print(f"Auto-configed device: {device}", flush=True)
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    if pd_separated:
+    use_mixed_pd_engine = not pd_separated and num_replicas is not None
+    if pd_separated or use_mixed_pd_engine:
         command = "sglang.launch_pd_server"
     else:
         command = "sglang.launch_server"
@@ -458,7 +564,7 @@ def popen_launch_server(
         *[str(x) for x in other_args],
     ]
 
-    if pd_separated:
+    if pd_separated or use_mixed_pd_engine:
         command.extend(
             [
                 "--lb-host",
@@ -477,6 +583,15 @@ def popen_launch_server(
             ]
         )
 
+    if use_mixed_pd_engine:
+        command.extend(
+            [
+                "--mixed",
+                "--num-replicas",
+                str(num_replicas),
+            ]
+        )
+
     if api_key:
         command += ["--api-key", api_key]
 
@@ -485,18 +600,36 @@ def popen_launch_server(
     if return_stdout_stderr:
         process = subprocess.Popen(
             command,
-            stdout=return_stdout_stderr[0],
-            stderr=return_stdout_stderr[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
             text=True,
+            bufsize=1,
         )
+
+        def _dump(src, sinks):
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    sink.write(line)
+                    sink.flush()
+            src.close()
+
+        threading.Thread(
+            target=_dump,
+            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_dump,
+            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+            daemon=True,
+        ).start()
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
-
             return_code = process.poll()
             if return_code is not None:
                 # Server failed to start (non-zero exit code) or crashed
@@ -602,9 +735,22 @@ class TestFile:
     estimated_time: float = 60
 
 
-def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+def run_unittest_files(
+    files: List[TestFile], timeout_per_file: float, continue_on_error: bool = False
+):
+    """
+    Run a list of test files.
+
+    Args:
+        files: List of TestFile objects to run
+        timeout_per_file: Timeout in seconds for each test file
+        continue_on_error: If True, continue running remaining tests even if one fails.
+                          If False, stop at first failure (default behavior for PR tests).
+    """
     tic = time.perf_counter()
     success = True
+    passed_tests = []
+    failed_tests = []
 
     for i, file in enumerate(files):
         filename, estimated_time = file.name, file.estimated_time
@@ -636,23 +782,51 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             ret_code = run_with_timeout(
                 run_one_file, args=(filename,), timeout=timeout_per_file
             )
-            assert (
-                ret_code == 0
-            ), f"expected return code 0, but {filename} returned {ret_code}"
+            if ret_code != 0:
+                print(
+                    f"\n✗ FAILED: {filename} returned exit code {ret_code}\n",
+                    flush=True,
+                )
+                success = False
+                failed_tests.append((filename, f"exit code {ret_code}"))
+                if not continue_on_error:
+                    # Stop at first failure for PR tests
+                    break
+                # Otherwise continue to next test for nightly tests
+            else:
+                passed_tests.append(filename)
         except TimeoutError:
             kill_process_tree(process.pid)
             time.sleep(5)
             print(
-                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
+                f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n",
                 flush=True,
             )
             success = False
-            break
+            failed_tests.append((filename, f"timeout after {timeout_per_file}s"))
+            if not continue_on_error:
+                # Stop at first timeout for PR tests
+                break
+            # Otherwise continue to next test for nightly tests
 
     if success:
         print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
     else:
         print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
+
+    # Print summary
+    print(f"\n{'='*60}", flush=True)
+    print(f"Test Summary: {len(passed_tests)}/{len(files)} passed", flush=True)
+    print(f"{'='*60}", flush=True)
+    if passed_tests:
+        print("✓ PASSED:", flush=True)
+        for test in passed_tests:
+            print(f"  {test}", flush=True)
+    if failed_tests:
+        print("\n✗ FAILED:", flush=True)
+        for test, reason in failed_tests:
+            print(f"  {test} ({reason})", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     return 0 if success else -1
 
@@ -677,6 +851,9 @@ def get_benchmark_args(
     seed: int = 0,
     device="auto",
     pd_separated: bool = False,
+    lora_name=None,
+    lora_request_distribution="uniform",
+    lora_zipf_alpha=1.5,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -704,7 +881,9 @@ def get_benchmark_args(
         extra_request_body=None,
         apply_chat_template=False,
         profile=None,
-        lora_name=None,
+        lora_name=lora_name,
+        lora_request_distribution=lora_request_distribution,
+        lora_zipf_alpha=lora_zipf_alpha,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
@@ -727,6 +906,8 @@ def run_bench_serving(
     need_warmup=False,
     seed: int = 0,
     device="auto",
+    background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
+    lora_name: Optional[str] = None,
 ):
     if device == "auto":
         device = auto_config_device()
@@ -754,18 +935,186 @@ def run_bench_serving(
         disable_ignore_eos=disable_ignore_eos,
         seed=seed,
         device=device,
+        lora_name=lora_name,
     )
 
-    try:
+    async def _run():
         if need_warmup:
             warmup_args = copy.deepcopy(args)
             warmup_args.num_prompts = 16
-            run_benchmark(warmup_args)
-        res = run_benchmark(args)
+            await asyncio.to_thread(run_benchmark, warmup_args)
+
+        start_event = asyncio.Event()
+        stop_event = asyncio.Event()
+        task_handle = (
+            asyncio.create_task(background_task(base_url, start_event, stop_event))
+            if background_task
+            else None
+        )
+
+        try:
+            start_event.set()
+            result = await asyncio.to_thread(run_benchmark, args)
+        finally:
+            if task_handle:
+                stop_event.set()
+                await task_handle
+
+        return result
+
+    try:
+        res = asyncio.run(_run())
     finally:
         kill_process_tree(process.pid)
 
     assert res["completed"] == num_prompts
+    return res
+
+
+def run_score_benchmark(
+    model,
+    num_requests=100,
+    batch_size=5,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """Score API benchmark function compatible with run_bench_serving pattern"""
+    if other_server_args is None:
+        other_server_args = []
+
+    if device == "auto":
+        device = auto_config_device()
+
+    # Launch the server (consistent with run_bench_serving)
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+
+    async def _run_benchmark():
+        # Load tokenizer for generating test data
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+
+        # Score API configuration
+        score_query_tokens = 120
+        score_item_tokens = 180
+        score_label_token_ids = [9454, 2753]  # Yes/No token IDs
+        special_token = "<|im_start|>"
+
+        def generate_text_with_token_count(num_tokens):
+            """Generate text with precise token count using replicated token."""
+            text = special_token * num_tokens
+            actual_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+            if actual_tokens != num_tokens:
+                text = special_token * (
+                    num_tokens
+                    // len(tokenizer.encode(special_token, add_special_tokens=False))
+                )
+            return text
+
+        if need_warmup:
+            warmup_data = {
+                "query": generate_text_with_token_count(score_query_tokens),
+                "items": [
+                    generate_text_with_token_count(score_item_tokens) for _ in range(3)
+                ],
+                "label_token_ids": score_label_token_ids,
+                "model": model,
+                "apply_softmax": True,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                try:
+                    await session.post(
+                        f"{base_url}/v1/score",
+                        json=warmup_data,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    )
+                except:
+                    pass  # Ignore warmup errors
+
+        test_requests = []
+        for i in range(num_requests):
+            query = generate_text_with_token_count(score_query_tokens)
+            items = [
+                generate_text_with_token_count(score_item_tokens)
+                for _ in range(batch_size)
+            ]
+
+            score_data = {
+                "query": query,
+                "items": items,
+                "label_token_ids": score_label_token_ids,
+                "model": model,
+                "apply_softmax": True,
+            }
+            test_requests.append(score_data)
+
+        start_time = time.monotonic()
+        successful_requests = 0
+        total_latency = 0
+        latencies = []
+
+        async with aiohttp.ClientSession() as session:
+            for request_data in test_requests:
+                try:
+                    request_start = time.monotonic()
+                    async with session.post(
+                        f"{base_url}/v1/score",
+                        json=request_data,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as response:
+                        if response.status == 200:
+                            response_data = await response.json()
+                            request_end = time.monotonic()
+
+                            if "scores" in response_data or "logprobs" in response_data:
+                                latency_ms = (request_end - request_start) * 1000
+                                latencies.append(latency_ms)
+                                total_latency += latency_ms
+                                successful_requests += 1
+                except Exception:
+                    continue
+
+        end_time = time.monotonic()
+        total_time = end_time - start_time
+
+        if successful_requests > 0:
+            throughput = successful_requests / total_time
+            avg_latency = total_latency / successful_requests
+            latencies.sort()
+            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
+
+            return {
+                "completed": successful_requests,
+                "total_requests": num_requests,
+                "throughput": throughput,
+                "avg_latency_ms": avg_latency,
+                "p95_latency_ms": p95_latency,
+                "successful_requests": successful_requests,
+            }
+        else:
+            return {
+                "completed": 0,
+                "total_requests": num_requests,
+                "throughput": 0,
+                "avg_latency_ms": 0,
+                "p95_latency_ms": 0,
+                "successful_requests": 0,
+            }
+
+    try:
+        res = asyncio.run(_run_benchmark())
+    finally:
+        kill_process_tree(process.pid)
+
+    assert res["completed"] == res["successful_requests"]
     return res
 
 
@@ -839,12 +1188,23 @@ def run_bench_one_batch(model, other_args):
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
-        lastline = output.split("\n")[-3]
-        output_throughput = float(lastline.split(" ")[-2])
+        # Return prefill_latency, decode_throughput, decode_latency
+        prefill_line = output.split("\n")[-9]
+        decode_line = output.split("\n")[-3]
+        pattern = (
+            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        )
+        match = re.search(pattern, prefill_line)
+        if match:
+            prefill_latency = float(match.group("latency"))
+        match = re.search(pattern, decode_line)
+        if match:
+            decode_latency = float(match.group("latency"))
+            decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
 
-    return output_throughput
+    return prefill_latency, decode_throughput, decode_latency
 
 
 def run_bench_offline_throughput(model, other_args):
@@ -865,7 +1225,7 @@ def run_bench_offline_throughput(model, other_args):
         *[str(x) for x in other_args],
     ]
 
-    print(f"{command=}")
+    print(f"command={' '.join(command)}")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
@@ -1227,6 +1587,93 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 raise
 
 
+def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
+    """Sends generate request serially and returns status codes. Max concurrency is 1."""
+
+    def generate():
+        prompt = """
+        System: You are a helpful assistant.
+        User: What is the capital of France?
+        Assistant: The capital of France is
+        """
+        response = requests.post(
+            f"{base_url}/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 500,
+                },
+            },
+        )
+        return response.status_code
+
+    return [generate() for _ in range(num_requests)]
+
+
+async def send_concurrent_generate_requests(
+    base_url: str, num_requests: int
+) -> List[str]:
+    """Sends generate request concurrently and returns status codes. Max concurrency is num_requests."""
+
+    async def async_generate():
+        async with aiohttp.ClientSession() as session:
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+            async with session.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 500,
+                    },
+                },
+            ) as response:
+                return response.status
+
+    tasks = [asyncio.create_task(async_generate()) for _ in range(num_requests)]
+    return await asyncio.gather(*tasks)
+
+
+async def send_concurrent_generate_requests_with_custom_params(
+    base_url: str,
+    custom_params: List[dict[str, Any]],
+) -> Tuple[int, Any]:
+    """Sends generate request concurrently with custom parameters and returns status code and response json tuple. Max concurrency is num_requests."""
+
+    base_payload = {
+        "text": """
+                System: You are a helpful assistant.
+                User: What is the capital of France?
+                Assistant: The capital of France is
+                """,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 500,
+        },
+    }
+
+    async def async_generate_with_priority(req):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url}/generate",
+                json=req,
+            ) as response:
+                resp_json = await response.json()
+                return (response.status, resp_json)
+
+    tasks = []
+    for c in custom_params:
+        req = base_payload.copy()
+        req.update(c)
+        tasks.append(asyncio.create_task(async_generate_with_priority(req)))
+    return await asyncio.gather(*tasks)
+
+
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         max_retry = int(
@@ -1236,3 +1683,222 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+
+    def setUp(self):
+        print(f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}")
+
+
+def dump_bench_raw_result(
+    path: str,
+    states,
+    preds,
+    labels,
+):
+    if not path:
+        return
+
+    rows = []
+    for i in range(len(states)):
+        state = states[i]
+        output = state["answer"]
+        prompt = _ensure_remove_suffix(state.text(), output)
+        rows.append(
+            dict(
+                prompt_id=i,
+                prompt=prompt,
+                output=output,
+                correct=bool(preds[i] == labels[i]),
+            )
+        )
+
+    print(f"BenchRawResultDumper save results to {path}")
+    Path(path).write_text("\n".join(json.dumps(row) for row in rows))
+
+
+def _ensure_remove_suffix(text: str, suffix: str):
+    assert text.endswith(suffix)
+    return text.removesuffix(suffix)
+
+
+class ModelLaunchSettings:
+    def __init__(
+        self,
+        model_path: str,
+        tp_size: int = 1,
+        extra_args: Optional[List[str]] = None,
+        env: Optional[dict] = None,
+    ):
+        self.model_path = model_path
+        self.tp_size = tp_size
+        self.extra_args = list(extra_args) if extra_args else []
+        self.env = env
+
+        if self.tp_size > 1 and "--tp" not in self.extra_args:
+            self.extra_args.extend(["--tp", str(self.tp_size)])
+
+        fixed_args = ["--enable-multimodal", "--trust-remote-code"]
+        for fixed_arg in fixed_args:
+            if fixed_arg not in self.extra_args:
+                self.extra_args.append(fixed_arg)
+
+
+class ModelEvalMetrics:
+    def __init__(self, accuracy: float, eval_time: float):
+        self.accuracy = accuracy
+        self.eval_time = eval_time
+
+
+def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:
+    match = re.search(r"\[Profile\]\((.*?)\)", output)
+    if match:
+        trace_link = match.group(1)
+        return trace_link
+    return None
+
+
+def parse_models(model_string: str):
+    return [model.strip() for model in model_string.split(",") if model.strip()]
+
+
+def check_evaluation_test_results(
+    results,
+    test_name,
+    model_accuracy_thresholds,
+    model_latency_thresholds=None,
+    model_count=None,
+):
+    """
+    results: list of tuple of (model_path, accuracy, latency)
+    """
+    failed_models = []
+    if model_latency_thresholds is not None:
+        summary = " | model | status | score | score_threshold | latency | latency_threshold | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | \n"
+    else:
+        summary = " | model | status | score | score_threshold | \n"
+        summary += "| ----- | ------ | ----- | --------------- | \n"
+
+    results_dict = {res[0]: (res[1], res[2]) for res in results}
+
+    for model, accuracy_threshold in sorted(model_accuracy_thresholds.items()):
+        latency_threshold = (
+            model_latency_thresholds.get(model)
+            if model_latency_thresholds is not None
+            else 1e9
+        )
+
+        if model in results_dict:
+            accuracy, latency = results_dict[model]
+            is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
+            status_emoji = "✅" if is_success else "❌"
+
+            if not is_success:
+                if accuracy < accuracy_threshold:
+                    failed_models.append(
+                        f"\nScore Check Failed: {model}\n"
+                        f"Model {model} score ({accuracy:.4f}) is below threshold ({accuracy_threshold:.4f})"
+                    )
+                if latency > latency_threshold:
+                    failed_models.append(
+                        f"\nLatency Check Failed: {model}\n"
+                        f"Model {model} latency ({latency:.4f}) is above threshold ({latency_threshold:.4f})"
+                    )
+
+            if model_latency_thresholds is not None:
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+            else:
+                line = (
+                    f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
+                )
+        else:
+            status_emoji = "❌"
+            failed_models.append(f"Model failed to launch or be evaluated: {model}")
+            if model_latency_thresholds is not None:
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold}\n"
+            else:
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold}\n"
+
+        summary += line
+
+    print(summary)
+
+    if is_in_ci():
+        write_github_step_summary(f"## {test_name}\n{summary}")
+
+    if failed_models:
+        print("Some models failed the evaluation.")
+        raise AssertionError("\n".join(failed_models))
+
+
+# Bench knobs for bench_one_batch_server (override by env)
+def _parse_int_list_env(name: str, default_val: str):
+    val = os.environ.get(name, default_val)
+    return [int(x) for x in val.split(",") if x]
+
+
+# Return filenames
+def find_traces_under_path(path: str) -> List[str]:
+    results = []
+    for _, dirs, files in os.walk(path):
+        for file in files:
+            if file.endswith(".trace.json.gz"):
+                results.append(f"{file}")
+    return results
+
+
+def write_results_to_json(model, metrics, mode="a"):
+    result = {
+        "timestamp": datetime.now().isoformat(),
+        "model": model,
+        "metrics": metrics,
+        "score": metrics["score"],
+    }
+
+    if "latency" in metrics:
+        result["latency"] = (metrics.get("latency"),)
+
+    existing_results = []
+    if mode == "a" and os.path.exists("results.json"):
+        try:
+            with open("results.json", "r") as f:
+                existing_results = json.load(f)
+        except json.JSONDecodeError:
+            existing_results = []
+
+    if isinstance(existing_results, list):
+        existing_results.append(result)
+    else:
+        existing_results = [result]
+
+    with open("results.json", "w") as f:
+        json.dump(existing_results, f, indent=2)
+
+
+def intel_amx_benchmark(extra_args=None, min_throughput=None):
+    def decorator(test_func):
+        @wraps(test_func)
+        def wrapper(self):
+            common_args = [
+                "--attention-backend",
+                "intel_amx",
+                "--disable-radix",
+                "--trust-remote-code",
+            ]
+            full_args = common_args + (extra_args or [])
+
+            model = test_func(self)
+            prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+                model, full_args
+            )
+
+            print(f"{model=}")
+            print(f"{prefill_latency=}")
+            print(f"{decode_throughput=}")
+            print(f"{decode_latency=}")
+
+            if is_in_ci() and min_throughput is not None:
+                self.assertGreater(decode_throughput, min_throughput)
+
+        return wrapper
+
+    return decorator

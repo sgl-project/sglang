@@ -1,0 +1,45 @@
+name: Cancel All Pending PR Test Runs
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflows:
+        description: 'Space-separated list of workflow filenames to cancel'
+        required: true
+        type: string
+        default: 'pr-test.yml pr-test-xeon.yml'
+
+permissions:
+  actions: write   # Needed to cancel runs
+  contents: read   # Needed to read repo info
+
+jobs:
+  cancel-pending:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install GitHub CLI
+        run: sudo apt-get install -y gh jq
+
+      - name: Cancel all pending/waiting runs for specified workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Read the space-separated string from the input into a bash array
+          WORKFLOW_FILES=(${{ github.event.inputs.workflows }})
+
+          echo "Targeting ${#WORKFLOW_FILES[@]} workflow(s): ${{ github.event.inputs.workflows }}"
+
+          for workflow_file in "${WORKFLOW_FILES[@]}"; do
+            echo "--- Checking workflow: $workflow_file ---"
+            gh run list \
+              --repo "$REPO" \
+              --workflow "$workflow_file" \
+              --json databaseId,status \
+              --limit 1000 \
+              | jq -r '.[] | select(.status=="queued" or .status=="in_progress") | .databaseId' \
+              | while read run_id; do
+                  echo "Cancelling run ID: $run_id for workflow: $workflow_file"
+                  gh run cancel "$run_id" --repo "$REPO"
+                done
+          done

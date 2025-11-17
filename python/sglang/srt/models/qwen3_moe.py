@@ -18,71 +18,65 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    parallel_state,
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather,
-    attn_tp_reduce_scatter,
-    dp_gather_partial,
-    dp_scatter,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    get_local_attention_dp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from sglang.srt.managers.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
-from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
-from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_flashinfer_available,
+    is_non_idle_and_non_empty,
+)
 
 Qwen3MoeConfig = None
 
+_is_flashinfer_available = is_flashinfer_available()
+
 logger = logging.getLogger(__name__)
+_is_cuda = is_cuda()
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -102,21 +96,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        self.experts = get_moe_impl_class()(
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=False,
+        )
+
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            + get_global_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
-                else {}
-            ),
         )
 
         self.gate = ReplicatedLinear(
@@ -127,34 +121,26 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if global_server_args_dict["enable_deepep_moe"]:
+        if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_tensor_model_parallel_world_size()
+            self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
-                config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
+                config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
-            self.renormalize = config.norm_topk_prob
-
-            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.num_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
-                async_finish=True,  # TODO
-                return_recv_hook=True,
-            )
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
-        if not global_server_args_dict["enable_deepep_moe"]:
-            return self.forward_normal(hidden_states)
+        if not get_moe_a2a_backend().is_deepep():
+            return self.forward_normal(
+                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -165,16 +151,25 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             if name not in ["correction_bias"]
         ]
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
-        if self.tp_size > 1:
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -182,64 +177,23 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        forward_mode = forward_batch.forward_mode
-        if is_non_idle_and_non_empty(forward_mode, hidden_states):
+        if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-
-            topk_weights, topk_idx = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=False,
-                renormalize=self.renormalize,
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
             )
         else:
-            topk_idx = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            topk_weights = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
-        if self.ep_size > 1:
-            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
-            (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                reorder_topk_ids,
-                num_recv_tokens_per_expert,
-                seg_indptr,
-                masked_m,
-                expected_m,
-            ) = self.deepep_dispatcher.dispatch(
-                hidden_states=hidden_states,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                forward_mode=forward_mode,
-            )
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            reorder_topk_ids=reorder_topk_ids,
-            seg_indptr=seg_indptr,
-            masked_m=masked_m,
-            expected_m=expected_m,
-            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
-            forward_mode=forward_mode,
+            topk_output=topk_output,
         )
-        if self.ep_size > 1:
-            final_hidden_states = self.deepep_dispatcher.combine(
-                hidden_states=final_hidden_states,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                forward_mode=forward_mode,
-            )
         return final_hidden_states
 
     def op_gate(self, state):
@@ -258,33 +212,22 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.topk_weights_local, state.topk_idx_local = select_experts(
+                state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=False,
-                    renormalize=self.renormalize,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
                 )
         else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
+            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
-            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
-            self.deepep_dispatcher.dispatch_a(
+            self.experts.dispatcher.dispatch_a(
                 hidden_states=state.pop("hidden_states_mlp_input"),
-                topk_idx=state.pop("topk_idx_local"),
-                topk_weights=state.pop("topk_weights_local"),
-                forward_mode=state.forward_batch.forward_mode,
+                topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -293,45 +236,26 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                (
-                    state.hidden_states_experts_input,
-                    state.topk_idx_dispatched,
-                    state.topk_weights_dispatched,
-                    state.reorder_topk_ids,
-                    state.num_recv_tokens_per_expert,
-                    state.seg_indptr,
-                    state.masked_m,
-                    state.expected_m,
-                ) = self.deepep_dispatcher.dispatch_b(
+                state.dispatch_output = self.experts.dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts(
-            hidden_states=state.pop("hidden_states_experts_input"),
-            topk_idx=state.topk_idx_dispatched,
-            topk_weights=state.topk_weights_dispatched,
-            reorder_topk_ids=state.pop("reorder_topk_ids"),
-            seg_indptr=state.pop("seg_indptr"),
-            masked_m=state.pop("masked_m"),
-            expected_m=state.pop("expected_m"),
-            num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
-            forward_mode=state.forward_batch.forward_mode,
+        state.combine_input = self.experts.run_moe_core(
+            dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
-            self.deepep_dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.pop("topk_idx_dispatched"),
-                topk_weights=state.pop("topk_weights_dispatched"),
-                forward_mode=state.forward_batch.forward_mode,
+            self.experts.dispatcher.combine_a(
+                combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
+            state.pop("dispatch_output")
 
     def op_combine_b(self, state):
         if self.ep_size > 1:
-            state.hidden_states_after_combine = self.deepep_dispatcher.combine_b(
+            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -354,6 +278,8 @@ class Qwen3MoeAttention(nn.Module):
         attention_bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -411,7 +337,12 @@ class Qwen3MoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            dual_chunk_attention_config=dual_chunk_attention_config,
         )
+        self.compatible_with_fused_kv_buffer = (
+            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
+        )
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -423,15 +354,27 @@ class Qwen3MoeAttention(nn.Module):
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.alt_stream = alt_stream
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
+        # overlap qk norm
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            with torch.cuda.stream(self.alt_stream):
+                k_by_head = k.reshape(-1, self.head_dim)
+                k_by_head = self.k_norm(k_by_head)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            k_by_head = k.reshape(-1, self.head_dim)
+            k_by_head = self.k_norm(k_by_head)
         q = q_by_head.view(q.shape)
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         return q, k
 
@@ -458,7 +401,21 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=(
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+                else None
+            ),
+        )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -466,7 +423,13 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(*inner_state)
+        attn_output = self.attn(
+            *inner_state,
+            save_kv_cache=not (
+                enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+            ),
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -491,6 +454,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -503,6 +467,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
+        dual_chunk_attention_config = getattr(
+            config, "dual_chunk_attention_config", None
+        )
         self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -516,13 +483,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            dual_chunk_attention_config=dual_chunk_attention_config,
+            alt_stream=alt_stream,
         )
 
         self.layer_id = layer_id
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        self.local_dp_size = get_local_attention_dp_size()
 
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
@@ -559,6 +527,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -567,10 +537,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if hidden_states.shape[0] != 0:
@@ -584,11 +560,27 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
+
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+        )
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
@@ -623,9 +615,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
     def op_mlp(self, state):
         hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.mlp(
-            hidden_states, state.forward_batch.forward_mode
-        )
+        state.hidden_states_mlp_output = self.mlp(hidden_states, state.forward_batch)
 
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -658,12 +648,15 @@ class Qwen3MoeModel(Qwen2MoeModel):
         config: Qwen3MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_type=Qwen3MoeDecoderLayer,
     ) -> None:
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
         super().__init__(
             config=config,
             quant_config=quant_config,
             prefix=prefix,
-            decoder_layer_type=Qwen3MoeDecoderLayer,
+            decoder_layer_type=decoder_layer_type,
+            alt_stream=alt_stream,
         )
 
 
@@ -688,9 +681,13 @@ class Qwen3MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(
@@ -709,12 +706,59 @@ class Qwen3MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return hidden_states
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+
+        # decoder layer
+        for i in range(start, end):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer = self.model.layers[i]
+                forward_batch.hidden_states, forward_batch.residual = layer(
+                    positions,
+                    forward_batch.hidden_states,
+                    forward_batch,
+                    forward_batch.residual,
+                )
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
+            forward_batch.hidden_states = hidden_states
+            # logits process
+            result = self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            result = None
+
+        return result
 
     @property
     def start_layer(self):
@@ -723,6 +767,26 @@ class Qwen3MoeForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.set_eagle3_layers_to_capture(
+                [
+                    2,
+                    num_layers // 2,
+                    num_layers - 3,
+                ]
+            )  # Specific layers for EAGLE3 support
+        else:
+            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -734,14 +798,17 @@ class Qwen3MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
         )
 
-        params_dict = dict(self.named_parameters())
+        # Cache params_dict to avoid repeated expensive traversal of model parameters
+        if not hasattr(self, "_cached_params_dict"):
+            self._cached_params_dict = dict(self.named_parameters())
+        params_dict = self._cached_params_dict
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
@@ -780,11 +847,22 @@ class Qwen3MoeForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # Track if this is an expert weight to enable early skipping
+                is_expert_weight = False
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
+
+                    # Mark as expert weight regardless of whether we can process it
+                    is_expert_weight = True
+
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        # Expert weight not on this rank, will be skipped below
+                        continue
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -796,6 +874,10 @@ class Qwen3MoeForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    if is_expert_weight:
+                        # This is an expert weight but not mapped to this rank, skip all remaining processing
+                        continue
+
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
@@ -812,11 +894,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
         # TODO mimic deepseek
-        self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(self.start_layer, self.end_layer)
-            if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-        }
+        # Lazy initialization of expert weights cache to avoid slowing down load_weights
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+            }
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

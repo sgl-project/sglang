@@ -1,12 +1,12 @@
-import itertools
 import unittest
 
-import sgl_kernel
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 from utils import precision
 
 from sglang.test.test_utils import CustomTestCase
+
+torch.manual_seed(1234)
 
 
 class TestMLA(CustomTestCase):

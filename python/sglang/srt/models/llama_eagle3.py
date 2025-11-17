@@ -19,6 +19,7 @@ from sglang.srt.utils import add_prefix
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
+import copy
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -27,7 +28,7 @@ from transformers import LlamaConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -35,7 +36,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLM
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -57,6 +59,15 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+        )
+
+        if config.model_type == "llama4_text":
+            inter_size = config.intermediate_size_mlp
+        else:
+            inter_size = config.intermediate_size
+
+        self.mlp = LlamaMLP(
+            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -99,17 +110,35 @@ class LlamaModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+
+        self.is_mrope_enabled = (
+            hasattr(config, "rope_scaling")
+            and config.rope_scaling is not None
+            and "mrope_section" in config.rope_scaling
+        )
+        # fix rope_scaling for qwen2.5-vl
+        if self.is_mrope_enabled:
+            config.rope_scaling["rope_type"] = "default"
+
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
+
         if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(config.target_hidden_size * 3, config.hidden_size)
+            self.hidden_size_in = config.target_hidden_size
         else:
-            self.fc = torch.nn.Linear(config.hidden_size * 3, config.hidden_size)
+            self.hidden_size_in = config.hidden_size
+
+        self.fc = torch.nn.Linear(
+            self.hidden_size_in * 3,
+            config.hidden_size,
+            bias=getattr(config, "bias", False),
+        )
+
+        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -126,9 +155,16 @@ class LlamaModel(nn.Module):
         else:
             embeds = input_embeds
 
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
+
+        # idle batch
+        if hidden_states.shape[0] == 0:
+            return hidden_states, [hidden_states]
 
         residual = None
         hidden_states, residual = self.midlayer(
@@ -167,9 +203,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
+            if config.draft_vocab_size is None:
+                self.load_lm_head_from_target = True
+                config.draft_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
                 config.draft_vocab_size,
                 config.hidden_size,
@@ -177,20 +217,57 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
 
-        self.logits_processor = LogitsProcessor(config)
-        self.capture_aux_hidden_states = True
+        config_ = copy.deepcopy(config)
+        config_.vocab_size = (
+            config_.draft_vocab_size
+        )  # draft logits processor has it's own vocab size
+        self.logits_processor = LogitsProcessor(config_)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        self.capture_aux_hidden_states = True
+        self.hot_token_id = None
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        params_dict = dict(self.named_parameters())
+        # Define the parameter mapping for stacked parameters
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
         for name, loaded_weight in weights:
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
+                continue
 
-            if "d2t" not in name and "t2d" not in name and "lm_head" not in name:
-                new_name = f"model.{name}"
-                super().load_weights([(new_name, loaded_weight)])
-            elif "lm_head" in name:
-                super().load_weights([(name, loaded_weight)])
+            if "t2d" in name:
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param_name = f"model.{name}" if name not in params_dict else name
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Handle regular parameters
+                param_name = name if name in params_dict else f"model.{name}"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
     def get_hot_token_id(self):
         return self.hot_token_id

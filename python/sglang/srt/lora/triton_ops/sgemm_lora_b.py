@@ -31,22 +31,39 @@ def _sgemm_lora_b_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    # For fused output scaling and adding
-    fuse_scaling_add,
+    # For fused output scaling
     scalings,
 ):
-    # x: (s, K), s is the sum of sequence lengths
-    # weights: (num_lora, N, K)
-    # output: (s, N)
+    """
+    Computes a segmented batched matrix multiplication for the LoRA B matrix
+    and adds the result to the output in-place.
+
+    When a sequence's rank is 0, the kernel is essentially a no-op, following
+    the convention in pytorch where the product of two matrices of shape (m, 0)
+    and (0, n) is an all-zero matrix of shape (m, n).
+
+    Args:
+        x (torch.Tensor): The intermediate tensor from the LoRA 'A' multiplication,
+            of shape `(s, K)`, where `s` is the total number of tokens.
+        weights (torch.Tensor): The LoRA 'B' weights for all available adapters,
+            with shape `(num_lora, N, K)`.
+        output (torch.Tensor): The output tensor of shape `(s, N)`. This can be
+            the base model's output for a fused add operation.
+    """
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
     batch_id = tl.program_id(axis=1)
+    w_index = tl.load(weight_indices + batch_id)
+    rank = tl.load(lora_ranks + w_index)
+
+    # If rank is 0, this kernel is a no-op.
+    if rank == 0:
+        return
+
     pid = tl.program_id(axis=0)
     seg_len = tl.load(seg_lens + batch_id)
-    w_index = tl.load(weight_indices + batch_id)
     seg_start = tl.load(seg_indptr + batch_id)
-    rank = tl.load(lora_ranks + w_index)
     scaling = tl.load(scalings + w_index)
     # Adjust K (rank) according to the specific LoRA adapter
     K = tl.minimum(K, rank)
@@ -74,8 +91,7 @@ def _sgemm_lora_b_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len)
-            and (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
@@ -95,8 +111,7 @@ def _sgemm_lora_b_kernel(
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
     output_mask = s_offset[:, None] < seg_len
-    if fuse_scaling_add:
-        partial_sum += tl.load(output_ptr, mask=output_mask)
+    partial_sum += tl.load(output_ptr, mask=output_mask)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
@@ -132,11 +147,9 @@ def sgemm_lora_b_fwd(
     )
 
     if base_output is None:
-        output = torch.empty((S, N), device=x.device, dtype=x.dtype)
-        fuse_scaling_add = False
+        output = torch.zeros((S, N), device=x.device, dtype=x.dtype)
     else:
         output = base_output
-        fuse_scaling_add = True
 
     _sgemm_lora_b_kernel[grid](
         x,
@@ -158,7 +171,6 @@ def sgemm_lora_b_fwd(
         BLOCK_S,
         BLOCK_N,
         BLOCK_R,
-        fuse_scaling_add,
         batch_info.scalings,
     )
     return output

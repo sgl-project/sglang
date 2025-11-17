@@ -409,8 +409,8 @@ void sm89_dispatch_shape(
     cutlass_int8_scaled_mm<
         ElementOutput,
         ArchTag,
-        cutlass::gemm::GemmShape<32, 64, 128>,
-        cutlass::gemm::GemmShape<16, 64, 64>,
+        cutlass::gemm::GemmShape<128, 128, 64>,
+        cutlass::gemm::GemmShape<64, 64, 64>,
         InstructionShape,
         5>(out, mat_a, mat_b, scales_a, scales_b, bias);
   }
@@ -672,7 +672,7 @@ torch::Tensor int8_scaled_mm(
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
   TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
   TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
-  TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
+  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
   TORCH_CHECK(mat_a.size(1) % 16 == 0, "mat_a.size(1) must be multiple of 16 for memory alignment");
   TORCH_CHECK(mat_b.size(0) % 16 == 0, "mat_b.size(0) must be multiple of 16 for memory alignment");

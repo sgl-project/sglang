@@ -19,7 +19,7 @@ from transformers import (
 from transformers.image_utils import to_numpy_array
 
 from sglang.srt.configs.utils import register_image_processor, register_processor
-from sglang.srt.mm_utils import expand2square
+from sglang.srt.multimodal.mm_utils import expand2square
 
 
 class DictToObject(dict):
@@ -284,6 +284,9 @@ class VLMImageProcessor(BaseImageProcessor):
 
 
 class DictOutput(object):
+    def items(self):
+        return self.__dict__.items()
+
     def keys(self):
         return self.__dict__.keys()
 

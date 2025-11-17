@@ -3,7 +3,6 @@ Usage:
 python3 -m unittest test_vision_chunked_prefill.TestVisionChunkedPrefill.test_chunked_prefill
 """
 
-import base64
 import io
 import os
 import unittest
@@ -11,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Union
 
 import numpy as np
+import pybase64
 import requests
 from PIL import Image
 
@@ -45,7 +45,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
             pil_img = Image.fromarray(frame)
             buff = io.BytesIO()
             pil_img.save(buff, format="JPEG")
-            base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
+            base64_str = pybase64.b64encode(buff.getvalue()).decode("utf-8")
             base64_frames.append(base64_str)
 
         messages = [{"role": "user", "content": []}]
@@ -178,7 +178,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
             print(output_chunked)
             print("output without chunked prefill:")
             print(output_no_chunked)
-            assert output_chunked == output_no_chunked
+            self.assertEqual(output_chunked, output_no_chunked)
 
     def test_chunked_prefill(self):
         self._test_chunked_prefill(batches=[False, True], num_frames=[1, [2, 6, 8, 10]])

@@ -1,10 +1,10 @@
-# DeepSeek V3 Support
+# DeepSeek V3.1/V3/R1 Support
 
 The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVIDIA and AMD GPUs **from day one**. SGLang also supports [MLA optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [DP attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models), making SGLang one of the best open-source LLM engines for running DeepSeek models. SGLang is the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended).
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
-For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.ai/references/deepseek.html).
+For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.ai/basic_usage/deepseek.html).
 
 ## Installation & Launch
 
@@ -33,7 +33,7 @@ Add [performance optimization options](#performance-optimization-options) as nee
 
 ```bash
 # Installation
-pip install "sglang[all]>=0.4.7.post1"
+pip install "sglang[all]>=0.5.5.post3"
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
@@ -50,7 +50,9 @@ Add [performance optimization options](#performance-optimization-options) as nee
 - [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models): For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 - [Torch.compile Optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#torchcompile-latency-optimizations): Add `--enable-torch-compile` argument to enable it. This will take some time while server starts. The maximum batch size for torch.compile optimization can be controlled with `--torch-compile-max-bs`. It's recommended to set it between `1` and `8`. (e.g., `--torch-compile-max-bs 8`)
 
-### Example: Sending requests with OpenAI API
+### Usage: Chat with DeepSeek
+
+#### DeepSeek V3/R1
 
 ```python3
 import openai
@@ -69,6 +71,82 @@ response = client.chat.completions.create(
 )
 print(response)
 ```
+
+#### DeepSeek V3.1
+On top of the basic usage similar to the DeepSeek V3/R1 example, DeepSeek V3.1 supports a request-level thinking/non-thinking toggle. Simply switch the `"thinking"` field in `extra_body={"chat_template_kwargs": {"thinking": True}}` to enable/disable the thinking mode.
+
+##### Non Thinking
+```python3
+import openai
+client = openai.Client(
+    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+# Chat completion
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "Answer the following with the second letter of the correct answer only: What is the capital of France?"},
+    ],
+    temperature=0,
+    max_tokens=1024,
+    extra_body = {"chat_template_kwargs": {"thinking": False}}
+)
+print(response.choices[0].message.content)
+```
+Answer:
+```
+h
+```
+* The correct response should be 'A', as the correct answer to the question is 'Paris'.
+##### Thinking
+```python3
+import openai
+client = openai.Client(
+    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+# Chat completion
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "Answer the following with the second letter of the correct answer only: What is the capital of France?"},
+    ],
+    temperature=0,
+    max_tokens=1024,
+    extra_body = {"chat_template_kwargs": {"thinking": True}}
+)
+print(response)
+```
+Answer:
+```
+First, the question is: "What is the capital of France?" I know that the capital of France is Paris.
+
+The user says: "Answer the following with the second letter of the correct answer only." So, I need to provide only the second letter of the correct answer.
+
+The correct answer is "Paris". Now, I need to find the second letter of "Paris".
+
+Let's spell it out: P-A-R-I-S.
+
+- First letter: P
+
+- Second letter: A
+
+- Third letter: R
+
+- Fourth letter: I
+
+- Fifth letter: S
+
+So, the second letter is "A".
+
+I should only output the second letter, which is "A". No additional text or explanation, just the letter.
+
+The user emphasized "the second letter of the correct answer only", so my response should be just "A".
+
+Finally, I need to make sure that this is the correct answer. Yes, Paris is indeed the capital of France.</think>A
+```
+* The response contains `</think>` thinking trace and model was able to derive the correct answer from it.
 
 ### Example: Serving with two H20\*8 nodes
 
@@ -178,6 +256,8 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1
 
 ### Example: Serving with 8 A100/A800 with AWQ Quantization
 
+**Recommended Usage**
+
 Add `--quantization moe_wna16` flag to enable moe wna16 kernel for better performance.
 One example is as follows:
 
@@ -185,6 +265,13 @@ One example is as follows:
 python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization moe_wna16
 ```
 
+Alternatively, you can use `--quantization awq_marlin` as follows:
+
+```bash
+python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization awq_marlin --dtype float16
+```
+
+Note that `awq_marlin` only supports `float16` now, which may lead to some precision loss.
 
 ### Example: Serving with 16 A100/A800 with int8 Quantization
 
@@ -280,6 +367,21 @@ edit your `config.json` and remove the `quantization_config` block. For example:
 ```
 
 Removing this block typically resolves the error. For more details, see the discussion in [sgl-project/sglang#3491](https://github.com/sgl-project/sglang/issues/3491#issuecomment-2650779851).
+
+# Example: Serving with 4 H200 with w4fp8 Quantization
+There are mixed-precision quantization methods where MoE layers are computed using W4(int)A(FP)8 quantization while the dense layers remain in FP8 precision. Users can run these models efficiently on 4xH200 GPUs (or potentially 8xH100 GPUs), as the pre-quantized weights are already available on Hugging Face. Here's an example:
+
+```bash
+python -m sglang.launch_server --model novita/Deepseek-V3-0324-W4AFP8 --mem-fraction-static 0.85 --disable-shared-experts-fusion --tp-size 4
+```
+
+Other variants of pre-quantized DeepSeek models are also available:
+
+- [novita/Deepseek-V3.1-W4AFP8](https://huggingface.co/novita/Deepseek-V3.1-W4AFP8)
+- [novita/Deepseek-R1-0528-W4AFP8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8)
+- [novita/Deepseek-R1-W4AFP8](https://huggingface.co/novita/Deepseek-R1-W4AFP8)
+- [novita/Deepseek-V3-0324-W4AFP8](https://huggingface.co/novita/Deepseek-V3-0324-W4AFP8)
+
 
 ## DeepSeek V3 Optimization Plan
 

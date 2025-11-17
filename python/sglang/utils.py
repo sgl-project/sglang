@@ -1,31 +1,53 @@
 """Common utilities"""
 
-import base64
 import importlib
 import json
 import logging
 import os
 import random
-import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
 import traceback
 import urllib.request
 import weakref
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
+import pybase64
 import requests
 from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
+
+
+def execute_once(func):
+    has_run = None
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        nonlocal has_run
+        if not has_run:
+            func(*args, **kwargs)
+            has_run = True
+
+    return wrapper
+
+
+@execute_once
+def info_once(message: str):
+    logger.info(message)
 
 
 def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
@@ -137,7 +159,15 @@ def http_request(
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            if sys.version_info >= (3, 13):
+                # Python 3.13+: Use SSL context (cafile removed)
+                if verify and isinstance(verify, str):
+                    context = ssl.create_default_context(cafile=verify)
+                else:
+                    context = ssl.create_default_context()
+                resp = urllib.request.urlopen(req, data=data, context=context)
+            else:
+                resp = urllib.request.urlopen(req, data=data, cafile=verify)
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)
@@ -148,15 +178,15 @@ def encode_image_base64(image_path: Union[str, bytes]):
     if isinstance(image_path, str):
         with open(image_path, "rb") as image_file:
             data = image_file.read()
-            return base64.b64encode(data).decode("utf-8")
+            return pybase64.b64encode(data).decode("utf-8")
     elif isinstance(image_path, bytes):
-        return base64.b64encode(image_path).decode("utf-8")
+        return pybase64.b64encode(image_path).decode("utf-8")
     else:
         # image_path is PIL.WebPImagePlugin.WebPImageFile
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")
-        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return pybase64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 def encode_frame(frame):
@@ -223,7 +253,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     video_bytes = b"".join(encoded_frames)
 
     # Encode the concatenated bytes to base64
-    video_base64 = "video:" + base64.b64encode(video_bytes).decode("utf-8")
+    video_base64 = "video:" + pybase64.b64encode(video_bytes).decode("utf-8")
 
     return video_base64
 
@@ -270,17 +300,6 @@ def find_printable_text(text: str):
     # which may change with the subsequent token -- there are probably smarter ways to do this!)
     else:
         return text[: text.rfind(" ") + 1]
-
-
-def graceful_registry(sub_module_name: str):
-    def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
-        if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} receive sigterm")
-
-    signal.signal(signal.SIGTERM, graceful_shutdown)
 
 
 class LazyImport:
@@ -340,10 +359,8 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def is_in_ci():
-    from sglang.test.test_utils import is_in_ci
-
-    return is_in_ci()
+def is_in_ci() -> bool:
+    return envs.SGLANG_IS_IN_CI.get()
 
 
 def print_highlight(html_content: str):
@@ -450,7 +467,8 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
+                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
+                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
@@ -463,12 +481,47 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
-        self._mapping = mapping
+        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
+        # to maintains registration order
+        self._mapping = OrderedDict(mapping)
+        # MRO cache for inheritance-based matching
+        self._mro_cache = {}
+        self._fallback_fn = None
+
+    def add_fallback_fn(self, fallback_fn: Callable):
+        self._fallback_fn = fallback_fn
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        for ty, fn in other._mapping.items():
+            if ty not in self._mapping:
+                self._mapping[ty] = fn
+
+        self._mro_cache.clear()
+        return self
 
     def __call__(self, obj: Any):
-        for ty, fn in self._mapping:
+        obj_type = type(obj)
+        # 1. First try exact match(o(1))
+        fn = self._mapping.get(obj_type)
+        if fn is not None:
+            return fn(obj)
+
+        # 2. If exact match fails, check MRO cache
+        cached_fn = self._mro_cache.get(obj_type)
+        if cached_fn is not None:
+            return cached_fn(obj)
+
+        # 3.search in registration order for compatible type(maintains origin behavior)
+        for ty, fn in self._mapping.items():
             if isinstance(obj, ty):
+                self._mro_cache[obj_type] = fn
                 return fn(obj)
+
+        # 4. if no matching type found, cache this result
+        self._mro_cache[obj_type] = None
+
+        if self._fallback_fn is not None:
+            return self._fallback_fn(obj)
         raise ValueError(f"Invalid object: {obj}")
 
 

@@ -1,0 +1,31 @@
+name: Open A PR to Copy Diff To OSS
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'The commit SHA to copy. Defaults to LAST to copy the latest commit.'
+        required: false
+        default: 'LAST'
+
+permissions:
+  contents: write
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install GitHub CLI (if not present)
+        run: |
+          bash scripts/code_sync/install_github_cli.sh
+
+      - name: Copy to OSS code
+        env:
+          GH_TOKEN: ${{ secrets.PAT_FOR_CODE_SYNC_FROM_LIANMIN }}
+        run: |
+          python3 scripts/code_sync/copy_to_oss.py --commit ${{ github.event.inputs.commit_sha }}

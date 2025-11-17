@@ -24,18 +24,23 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
-from transformers import PretrainedConfig, SiglipVisionConfig
+from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.models.phi4mm_audio import AudioEmbedding
 
 logger = logging.getLogger(__name__)
 
@@ -47,25 +52,6 @@ VISION_ENCODER_TO_PROCESSING_CONFIG = {
         "token_compression_factor": 2,
     },
 }
-
-
-def get_navit_vision_model():
-    vision_config = {
-        "hidden_size": 1152,
-        "image_size": 448,
-        "intermediate_size": 4304,
-        "model_type": "siglip_vision_model",
-        "num_attention_heads": 16,
-        "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
-        "patch_size": 14,
-    }
-    model_config = SiglipVisionConfig(**vision_config)
-
-    vision_model = Idefics2VisionTransformer(
-        config=model_config, require_post_norm=False
-    )
-
-    return vision_model
 
 
 class Phi4MMImageEncoder(nn.Module):
@@ -83,8 +69,9 @@ class Phi4MMImageEncoder(nn.Module):
         # n_embed or hidden_size
         hidden_size = config.n_embd if hasattr(config, "n_embd") else config.hidden_size
         self.type_feature = "patch"
-
-        self.img_processor = get_navit_vision_model()
+        self.img_processor = Idefics2VisionTransformer(
+            config=config.vision_config, require_post_norm=False
+        )
 
         pe_weight = self.img_processor.embeddings.position_embedding.weight
         L, D = pe_weight.size()
@@ -416,17 +403,53 @@ class Phi4MMForCausalLM(nn.Module):
             model_dir=config._name_or_path,
         )
 
+        if isinstance(config.embd_layer["audio_embd_layer"], dict):
+            embedding_config = {
+                "embedding_cls": config.embd_layer["audio_embd_layer"]["embedding_cls"],
+                **config.embd_layer["audio_embd_layer"],
+            }
+        else:
+            embedding_config = {"embedding_cls": config.embd_layer["embedding_cls"]}
+
+        self.embed_tokens_extend = AudioEmbedding(config, **embedding_config)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         dtype = next(self.vision_encoder.parameters()).dtype
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
-            dtype
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(dtype)
+        image_attention_mask = torch.cat(
+            [
+                item.image_attention_mask
+                for item in items
+                if hasattr(item, "image_attention_mask")
+            ],
+            dim=0,
         )
-        image_attention_mask = torch.cat([item.image_emb_mask for item in items], dim=0)
         image_sizes = torch.cat([item.image_sizes for item in items], dim=0)
         image_embeds = self.vision_encoder(
             pixel_values, image_sizes, image_attention_mask
         )
         return torch.cat(image_embeds).type(dtype)
+
+    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # (e.g. multiple examples) and the second dim is the multi-audio dim
+        # (e.g. multiple audios in the same example)
+        embed_tokens_extend_param = next(self.embed_tokens_extend.parameters())
+        device = embed_tokens_extend_param.device
+        dtype = embed_tokens_extend_param.dtype
+        audio_embeds = [
+            self.embed_tokens_extend(
+                # item.feature: (num_audios_in_a_sequence, T, D)
+                # item.audio_attention_mask: (num_audios_in_a_sequence, T, D) BoolTensor or None
+                audio_features=item.feature.to(device).type(dtype),
+                audio_attention_mask=(
+                    item.audio_attention_mask.to(device)
+                    if hasattr(item, "audio_attention_mask")
+                    else None
+                ),
+            )
+            for item in items
+        ]
+        return torch.cat(audio_embeds).type(dtype)
 
     def forward(
         self,
@@ -439,16 +462,17 @@ class Phi4MMForCausalLM(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+                Modality.AUDIO: self.get_audio_feature,
+            },
             positions=positions,
         )
 
         return hidden_states
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs
-        im_token_id: int = mm_inputs.im_token_id
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens([im_token_id])
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def should_apply_lora(self, module_name: str) -> bool:
@@ -462,6 +486,9 @@ class Phi4MMForCausalLM(nn.Module):
             (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
         ]
         prefix_mapping = {
+            "model.embed_tokens_extend.audio_embed.audio_projection.vision.": "embed_tokens_extend.audio_projection_for_vision.",
+            "model.embed_tokens_extend.audio_embed.audio_projection.speech.": "embed_tokens_extend.audio_projection.",
+            "model.embed_tokens_extend.audio_embed.": "embed_tokens_extend.",
             "model.embed_tokens_extend.image_embed.": "vision_encoder.",
             "model.": "language_model.model.",
         }
@@ -470,7 +497,6 @@ class Phi4MMForCausalLM(nn.Module):
             "img_processor.encoder.layers.26",
             "img_processor.head",
             "img_processor.post_layernorm",
-            "audio",
         ]
 
         def _should_skip(name: str) -> bool:

@@ -3,23 +3,30 @@ import logging
 import re
 from typing import List
 
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
-from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
 
 class MistralDetector(BaseFormatDetector):
     """
-    Detector for Mistral models.
-    Assumes function call format:
-      [TOOL_CALLS] [{"name":"func1", "arguments":{...}}, {"name":"func2", "arguments":{...}}]
+    Detector for Mistral model function call format.
+
+    The Mistral format uses a simple bracket-delimited structure with JSON arrays
+    containing function call objects.
+
+    Format Structure:
+    ```
+    [TOOL_CALLS] [{"name": "function_name", "arguments": {json_args}}, ...]
+    ```
+
+    Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
     """
 
     def __init__(self):
@@ -119,13 +126,4 @@ class MistralDetector(BaseFormatDetector):
             begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
             end="}]",
             trigger="[TOOL_CALLS]",
-        )
-
-    def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            function_format="json",
-            tool_call_separator=self.tool_call_separator,
         )

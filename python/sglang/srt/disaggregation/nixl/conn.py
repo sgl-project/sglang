@@ -1,53 +1,46 @@
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import logging
-import queue
-import socket
+import os
 import struct
 import threading
+import time
 import uuid
 from collections import defaultdict
-from functools import cache
-from typing import Dict, List, Optional, Set, Tuple, TypeAlias, Union
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
 import requests
-import zmq
-from aiohttp import web
 
-from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
+    CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_local_ip_by_remote
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
-
-NixlEngineInfo: TypeAlias = Dict[str, Union[str, int]]
 
 GUARD = "NixlMsgGuard".encode("ascii")
 
 
 @dataclasses.dataclass
 class TransferInfo:
+    """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
+
     room: int
     endpoint: str
     dst_port: int
-    agent_metadata: bytes
     agent_name: str
-    dst_kv_ptrs: list[int]
     dst_kv_indices: npt.NDArray[np.int32]
-    dst_aux_ptrs: list[int]
     dst_aux_index: int
-    dst_gpu_id: int
     required_dst_info_num: int
 
     def is_dummy(self):
@@ -59,14 +52,43 @@ class TransferInfo:
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
-            agent_metadata=msg[3],
-            agent_name=msg[4].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_kv_indices=np.frombuffer(msg[6], dtype=np.int32),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[7])//8}Q", msg[7])),
-            dst_aux_index=int(msg[8].decode("ascii")),
-            dst_gpu_id=int(msg[9].decode("ascii")),
-            required_dst_info_num=int(msg[10].decode("ascii")),
+            agent_name=msg[3].decode("ascii"),
+            dst_kv_indices=np.frombuffer(msg[4], dtype=np.int32),
+            dst_aux_index=int(msg[5].decode("ascii")),
+            required_dst_info_num=int(msg[6].decode("ascii")),
+        )
+
+
+@dataclasses.dataclass
+class KVArgsRegisterInfo:
+    """Contains base pointers and other info which only needs to be sent once by KVReceiver. Received by prefill bootstrap thread."""
+
+    room: str
+    endpoint: str
+    dst_port: int
+    agent_name: str
+    agent_metadata: bytes
+    dst_kv_ptrs: list[int]
+    dst_aux_ptrs: list[int]
+    gpu_id: int
+    decode_tp_size: int
+    decode_tp_rank: int
+    dst_kv_item_len: int
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]):
+        return cls(
+            room=str(msg[0].decode("ascii")),
+            endpoint=msg[1].decode("ascii"),
+            dst_port=int(msg[2].decode("ascii")),
+            agent_name=msg[3].decode("ascii"),
+            agent_metadata=msg[4],
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
+            gpu_id=int(msg[7].decode("ascii")),
+            decode_tp_size=int(msg[8].decode("ascii")),
+            decode_tp_rank=int(msg[9].decode("ascii")),
+            dst_kv_item_len=int(msg[10].decode("ascii")),
         )
 
 
@@ -84,7 +106,13 @@ class TransferStatus:
     def is_done(self):
         if self.num_kvs_expected is None:
             return False
+        # Check for failure state
+        if self.num_kvs_expected == -1:
+            return True  # Failed transfers are considered "done"
         return self.num_kvs_expected == len(self.received_kvs) and self.received_aux
+
+    def is_failed(self):
+        return self.num_kvs_expected == -1
 
 
 class NixlKVManager(CommonKVManager):
@@ -105,22 +133,132 @@ class NixlKVManager(CommonKVManager):
                 "to run SGLang with NixlTransferEngine."
             ) from e
         self.agent = nixl_agent(str(uuid.uuid4()))
-        self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.request_status = {}
-            self.transfer_infos: Dict[int, TransferInfo] = {}
-            self.peer_names: Dict[str, str] = {}
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            self.heartbeat_failures = {}
+            self.session_pool = defaultdict(requests.Session)
+            self.session_pool_lock = threading.Lock()
+            self.addr_to_rooms_tracker = defaultdict(set)
+            self.connection_lock = threading.Lock()
+
+            # Heartbeat interval should be at least 2 seconds
+            self.heartbeat_interval = max(
+                float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
+            )
+            # Heartbeat failure should be at least 1
+            self.max_failures = max(
+                get_int_env_var("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2), 1
+            )
+            self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _start_heartbeat_checker_thread(self):
+        """
+        Start the heartbeat checker thread for Decode worker.
+        TODO (smor): unite nixl heartbeat checker with mooncake's.
+        """
+
+        def heartbeat_checker():
+            while True:
+                time.sleep(self.heartbeat_interval)
+                with self.connection_lock:
+                    addresses = list(self.prefill_dp_size_table.keys())
+
+                for bootstrap_addr in addresses:
+                    session = None
+                    try:
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(2, 3),
+                            headers={"Connection": "keep-alive"},
+                        )
+                        if response.status_code == 200:
+                            self.heartbeat_failures[bootstrap_addr] = 0
+
+                            current_rooms = self.addr_to_rooms_tracker[
+                                bootstrap_addr
+                            ].copy()
+
+                            for bootstrap_room in current_rooms:
+                                # Remove successful transfers from the tracker
+                                if bootstrap_room not in self.transfer_statuses:
+                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
+                                        bootstrap_room
+                                    )
+                        else:
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
+                            )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
+                    except Exception:
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
+
+        threading.Thread(target=heartbeat_checker, daemon=True).start()
+
+    def _handle_node_failure(self, failed_bootstrap_addr):
+        """Handle failure of a prefill node."""
+        with self.connection_lock:
+            keys_to_remove = [
+                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+            ]
+            for k in keys_to_remove:
+                del self.connection_pool[k]
+            if failed_bootstrap_addr in self.prefill_attn_tp_size_table:
+                del self.prefill_attn_tp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_dp_size_table:
+                del self.prefill_dp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_pp_size_table:
+                del self.prefill_pp_size_table[failed_bootstrap_addr]
+
+            possible_affected_rooms = self.addr_to_rooms_tracker.get(
+                failed_bootstrap_addr, []
+            )
+            if failed_bootstrap_addr in self.addr_to_rooms_tracker:
+                del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+
+        # Mark all pending transfers associated with the failed node as failed
+        affected_rooms = []
+        for room in possible_affected_rooms:
+            if (
+                room in self.transfer_statuses
+                and not self.transfer_statuses[room].is_done()
+            ):
+                # Mark the transfer as failed by setting a special state
+                self.transfer_statuses[room].num_kvs_expected = -1  # Indicates failure
+                affected_rooms.append(room)
+
+        logger.error(
+            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
+            f"{len(affected_rooms)} transfers affected"
+        )
 
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
@@ -134,13 +272,16 @@ class NixlKVManager(CommonKVManager):
                 self.request_status[bootstrap_room], status
             )
 
+    def record_failure(self, bootstrap_room: int, failure_reason: str):
+        pass
+
     def register_buffer_to_engine(self):
         kv_addrs = []
         for kv_data_ptr, kv_data_len in zip(
             self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
         ):
             kv_addrs.append((kv_data_ptr, kv_data_len, self.kv_args.gpu_id, ""))
-        self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
+        self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM")
         logger.debug(f"Register kv tensors, len(kv_addr)= {len(kv_addrs)}")
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
@@ -149,15 +290,18 @@ class NixlKVManager(CommonKVManager):
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         ):
             aux_addrs.append((aux_data_ptr, aux_data_len, 0, ""))
-        self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM", is_sorted=True)
+        self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM")
         logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
-    def _add_remote(self, agent_name: str, agent_metadata: bytes):
-        if agent_name not in self.peer_names:
-            self.peer_names[agent_name] = self.agent.add_remote_agent(agent_metadata)
-        return self.peer_names[agent_name]
+    def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
+        agent_name = decode_kv_args.agent_name
+        if agent_name in self.decode_kv_args_table:
+            logger.info(f"Peer {agent_name} was already registered, ignoring.")
+            return
+        self.decode_kv_args_table[agent_name] = decode_kv_args
+        self.agent.add_remote_agent(decode_kv_args.agent_metadata)
 
     def send_kvcache(
         self,
@@ -175,14 +319,44 @@ class NixlKVManager(CommonKVManager):
 
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
-        num_layers = len(self.kv_args.kv_data_ptrs)
+        if self.is_mla_backend:
+            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            )
+            kv_item_len = self.kv_args.kv_item_lens[0]
+            layers_params = [
+                (
+                    src_kv_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            )
+
+            kv_item_len = self.kv_args.kv_item_lens[0]
+            layers_params = [
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+
         src_addrs = []
         dst_addrs = []
-        for layer_id in range(num_layers):
-            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
-            dst_ptr = dst_kv_ptrs[layer_id]
-            item_len = self.kv_args.kv_item_lens[layer_id]
-
+        for src_ptr, dst_ptr, item_len in layers_params:
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -193,8 +367,8 @@ class NixlKVManager(CommonKVManager):
         logger.debug(
             f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
         )
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM", is_sorted=True)
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM", is_sorted=True)
+        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
         # Transfer data
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
@@ -210,6 +384,137 @@ class NixlKVManager(CommonKVManager):
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
+    def send_kvcache_slice(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_gpu_id: int,
+        notif: str,
+        prefill_tp_size: int,
+        decode_tp_size: int,
+        decode_tp_rank: int,
+        dst_kv_item_len: int,
+    ):
+        # Get configuration from kv_args
+        local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
+        dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
+        num_kv_heads = self.kv_args.kv_head_num
+
+        # Calculate head distribution
+        src_heads_per_rank = num_kv_heads
+        dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
+
+        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        page_size = self.kv_args.page_size
+
+        bytes_per_head_slice_to_send = (
+            dst_kv_item_len // page_size // dst_heads_per_rank
+        )
+
+        # Determine which heads to send
+        if prefill_tp_size > decode_tp_size:
+            # Multiple prefill ranks to one decode rank
+            src_head_start_offset = 0
+            num_heads_to_send = src_heads_per_rank
+            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+        else:
+            # Send KVCache from 1 prefill instance to multiple decode instances
+            src_head_start_offset = (
+                dst_tp_rank_in_group * dst_heads_per_rank
+            ) % src_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start_offset = 0
+
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+        )
+        # Create transfer descriptors
+        src_addrs = []
+        dst_addrs = []
+
+        bytes_per_token_on_prefill = src_kv_item_len // page_size
+        bytes_per_token_on_decode = dst_kv_item_len // page_size
+
+        # Calculate precise byte offset and length for the sub-slice within the token
+        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
+        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
+        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice_to_send
+
+        src_dst_ptr_pairs = [
+            (
+                src_k_ptrs[layer_id],
+                dst_k_ptrs[layer_id],
+            )
+            for layer_id in range(layers_current_pp_stage)
+        ] + [
+            (
+                src_v_ptrs[layer_id],
+                dst_v_ptrs[layer_id],
+            )
+            for layer_id in range(layers_current_pp_stage)
+        ]
+
+        src_addrs = []
+        dst_addrs = []
+
+        # Calculate strides for a single token slot
+        bytes_per_token_on_prefill = src_kv_item_len // page_size
+        bytes_per_token_on_decode = dst_kv_item_len // page_size
+
+        for src_ptr, dst_ptr in src_dst_ptr_pairs:
+            for i in range(len(prefill_kv_indices)):
+                prefill_page_idx = int(prefill_kv_indices[i])
+                decode_page_idx = int(dst_kv_indices[i])
+
+                # Get the starting addresses for the current src and dst pages
+                src_page_start_addr = src_ptr + prefill_page_idx * src_kv_item_len
+                dst_page_start_addr = dst_ptr + decode_page_idx * dst_kv_item_len
+
+                # Iterate through each valid token slot within the current page
+                for token_slot_in_page in range(page_size):
+                    # Calculate the start address of the current token slot
+                    src_token_slot_start_addr = (
+                        src_page_start_addr
+                        + token_slot_in_page * bytes_per_token_on_prefill
+                    )
+                    dst_token_slot_start_addr = (
+                        dst_page_start_addr
+                        + token_slot_in_page * bytes_per_token_on_decode
+                    )
+
+                    # Calculate final src and dst addresses by applying head-slice offsets
+                    src_slice_addr = src_token_slot_start_addr + src_head_slice_offset
+                    dst_slice_addr = dst_token_slot_start_addr + dst_head_slice_offset
+
+                    src_addrs.append(
+                        (
+                            src_slice_addr,
+                            heads_bytes_per_token_to_send,
+                            self.kv_args.gpu_id,
+                        )
+                    )
+                    dst_addrs.append(
+                        (dst_slice_addr, heads_bytes_per_token_to_send, dst_gpu_id)
+                    )
+
+        # Use NIXL agent for transfer
+        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
+
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        )
+        if not xfer_handle:
+            raise Exception("Failed to create sliced KV transfer")
+
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("Failed to post sliced KV transfer")
+
+        return xfer_handle
+
     def send_aux(
         self,
         peer_name: str,
@@ -218,16 +523,21 @@ class NixlKVManager(CommonKVManager):
         dst_aux_index: int,
         notif: str,
     ):
-        # Make descs
-        aux_item_len = self.kv_args.aux_item_lens[0]
-        prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
-        )
-        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
-        src_addrs = [(prefill_aux_addr, aux_item_len, 0)]
-        dst_addrs = [(decode_aux_addr, aux_item_len, 0)]
-        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM", is_sorted=True)
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM", is_sorted=True)
+        src_addrs = []
+        dst_addrs = []
+
+        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+        prefill_aux_item_lens = self.kv_args.aux_item_lens
+
+        for i, _ in enumerate(dst_aux_ptrs):
+            length = prefill_aux_item_lens[i]
+            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            src_addrs.append((src_addr, length, 0))
+            dst_addrs.append((dst_addr, length, 0))
+
+        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
         # Transfer data
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
@@ -262,31 +572,54 @@ class NixlKVManager(CommonKVManager):
             if req.is_dummy():
                 continue
 
-            peer_name = self._add_remote(req.agent_name, req.agent_metadata)
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
             assert len(chunked_dst_kv_indice) == len(kv_indices)
+            assert req.agent_name in self.decode_kv_args_table
 
             notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
-            kv_xfer_handle = self.send_kvcache(
-                peer_name,
-                kv_indices,
-                req.dst_kv_ptrs,
-                chunked_dst_kv_indice,
-                req.dst_gpu_id,
-                notif,
-            )
+            decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
+
+            if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
+                kv_xfer_handle = self.send_kvcache(
+                    req.agent_name,
+                    kv_indices,
+                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                    chunked_dst_kv_indice,
+                    self.decode_kv_args_table[req.agent_name].gpu_id,
+                    notif,
+                )
+            else:
+                kv_xfer_handle = self.send_kvcache_slice(
+                    req.agent_name,
+                    kv_indices,
+                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                    chunked_dst_kv_indice,
+                    self.decode_kv_args_table[req.agent_name].gpu_id,
+                    notif,
+                    prefill_tp_size=self.attn_tp_size,
+                    decode_tp_size=decode_tp_size,
+                    decode_tp_rank=self.decode_kv_args_table[
+                        req.agent_name
+                    ].decode_tp_rank,
+                    dst_kv_item_len=self.decode_kv_args_table[
+                        req.agent_name
+                    ].dst_kv_item_len,
+                )
+
             handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
-            if is_last:
+            if is_last and self.pp_group.is_last_rank:
                 assert aux_index is not None
                 aux_xfer_handle = self.send_aux(
-                    peer_name,
+                    req.agent_name,
                     aux_index,
-                    req.dst_aux_ptrs,
+                    self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
                     req.dst_aux_index,
                     str(req.room) + "_aux",
                 )
                 handles.append(aux_xfer_handle)
+        if is_last:
+            del self.transfer_infos[bootstrap_room]
         return handles
 
     def update_transfer_status(self):
@@ -314,8 +647,6 @@ class NixlKVManager(CommonKVManager):
         return self.transfer_statuses[room].is_done()
 
     def _start_bootstrap_thread(self):
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
-
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
@@ -328,16 +659,23 @@ class NixlKVManager(CommonKVManager):
                 ), f"First message should be {GUARD}. Foreign traffic?"
                 waiting_req_bytes = waiting_req_bytes[1:]
                 room = waiting_req_bytes[0].decode("ascii")
-
-                required_dst_info_num = int(waiting_req_bytes[10].decode("ascii"))
+                agent_name = waiting_req_bytes[3].decode("ascii")
+                if room == "None":
+                    # Register new peer and save KV base pointers.
+                    self._add_remote_peer(
+                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    )
+                    logger.debug(f"Register KVArgs from {agent_name} successfully")
+                    continue
                 room = int(room)
-                agent_name = waiting_req_bytes[4].decode("ascii")
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
                 self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
                     waiting_req_bytes
                 )
-
+                required_dst_info_num = self.transfer_infos[room][
+                    agent_name
+                ].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     logger.debug(f"{room=} is bootstrapped")
@@ -346,8 +684,7 @@ class NixlKVManager(CommonKVManager):
         threading.Thread(target=bootstrap_thread).start()
 
 
-class NixlKVSender(BaseKVSender):
-
+class NixlKVSender(CommonKVSender):
     def __init__(
         self,
         mgr: NixlKVManager,
@@ -356,24 +693,15 @@ class NixlKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
     ):
-        self.kv_mgr = mgr
-        self.bootstrap_room = bootstrap_room
-        self.aux_index = None
-        self.bootstrap_server_url = bootstrap_addr
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.xfer_handles = []
         self.has_sent = False
         self.chunk_id = 0
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        # inner state
-        self.curr_idx = 0
-
-    def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
-        self.num_kv_indices = num_kv_indices
-        self.aux_index = aux_index
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -391,6 +719,7 @@ class NixlKVSender(BaseKVSender):
         self.chunk_id += 1
         if is_last:
             self.has_sent = True
+            del self.kv_mgr.request_status[self.bootstrap_room]
 
     def poll(self) -> KVPoll:
         if not self.has_sent:
@@ -412,47 +741,50 @@ class NixlKVReceiver(CommonKVReceiver):
         mgr: NixlKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        data_parallel_rank: Optional[int] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
         self.started_transfer = False
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
+        self.conclude_state = None
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
-        for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+        # Track this room with its bootstrap address for heartbeat monitoring
+        if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
+                self.bootstrap_room
             )
+
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List[int]] = None,
+    ):
+        if self.bootstrap_infos is None:
+            logger.error(
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+
+        for bootstrap_info in self.bootstrap_infos:
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
             )
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
-
-            # TODO: send_kv_args earlier
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-
             logger.debug(
-                f"Sending to {self.prefill_server_url} with bootstrap room {self.bootstrap_room}"
+                f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
                 sock.send_multipart(
                     [
                         GUARD,
                         str(self.bootstrap_room).encode("ascii"),
-                        get_local_ip_by_remote().encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.agent.get_agent_metadata(),
                         self.kv_mgr.agent.name.encode("ascii"),
-                        packed_kv_data_ptrs,
                         kv_indices.tobytes() if not is_dummy else b"",
-                        packed_aux_data_ptrs,
                         str(aux_index).encode("ascii"),
-                        str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )
@@ -460,17 +792,52 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = True
 
     def poll(self) -> KVPoll:
+        if self.conclude_state is not None:
+            return self.conclude_state
         if not self.started_transfer:
             return KVPoll.WaitingForInput  # type: ignore
 
         self.kv_mgr.update_transfer_status()
-
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
-            return KVPoll.Success  # type: ignore
+            # Check if the transfer failed
+            if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
+                self.conclude_state = KVPoll.Failed
+                logger.error(
+                    f"Transfer for room {self.bootstrap_room} failed due to node failure"
+                )
+            else:
+                self.conclude_state = KVPoll.Success
+            del self.kv_mgr.transfer_statuses[self.bootstrap_room]
+            return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
     def _register_kv_args(self):
-        pass
+        for bootstrap_info in self.bootstrap_infos:
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+            packed_aux_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            )
+
+            with lock:
+                sock.send_multipart(
+                    [
+                        GUARD,
+                        "None".encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.kv_mgr.agent.name.encode("ascii"),
+                        self.kv_mgr.agent.get_agent_metadata(),
+                        packed_kv_data_ptrs,
+                        packed_aux_data_ptrs,
+                        str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+                        str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii"),
+                        str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
+                        str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                    ]
+                )
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")

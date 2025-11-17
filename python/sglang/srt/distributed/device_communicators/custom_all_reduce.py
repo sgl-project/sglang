@@ -4,122 +4,37 @@ import ctypes
 import logging
 import os
 from contextlib import contextmanager
-from functools import wraps
-from typing import Any, Callable, List, Optional, TypeVar, Union
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from typing_extensions import ParamSpec
 
 from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
+    is_full_nvlink,
+    is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
 
-logger = logging.getLogger(__name__)
+try:
+    # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
+    import sgl_kernel  # noqa: F401
+
+    custom_ar = True
+except ImportError:
+    # For CPUs
+    custom_ar = False
+
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
-if _is_cuda:
-    try:
-        import pynvml
-    except ImportError as e:
-        logger.warning("Failed to import pynvml with %r", e)
-
-if _is_hip:
-    try:
-        from amdsmi import (
-            AmdSmiException,
-            amdsmi_get_processor_handles,
-            amdsmi_init,
-            amdsmi_shut_down,
-            amdsmi_topo_get_link_type,
-        )
-    except ImportError as e:
-        logger.warning("Failed to import amdsmi with %r", e)
-
-try:
-    if ops.use_vllm_custom_allreduce and not _is_hip:
-        # Use vLLM custom allreduce
-        ops.meta_size()
-    else:
-        # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-        import sgl_kernel
-    custom_ar = True
-except Exception:
-    # For CPUs
-    custom_ar = False
-
 logger = logging.getLogger(__name__)
-
-_P = ParamSpec("_P")
-_R = TypeVar("_R")
-
-
-def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
-    @wraps(fn)
-    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        if _is_hip:
-            try:
-                amdsmi_init()
-                return fn(*args, **kwargs)
-            finally:
-                amdsmi_shut_down()
-        else:
-            pynvml.nvmlInit()
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                pynvml.nvmlShutdown()
-
-    return wrapper
-
-
-@with_nvml_context
-def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
-    if _is_hip:
-        """
-        query if the set of gpus are fully connected by xgmi (1 hop)
-        """
-        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
-        for i, handle in enumerate(handles):
-            for j, peer_handle in enumerate(handles):
-                if i < j:
-                    try:
-                        link_type = amdsmi_topo_get_link_type(handle, peer_handle)
-                        # type is 2 for XGMI
-                        if link_type["hops"] != 1 or link_type["type"] != 2:
-                            return False
-                    except AmdSmiException as error:
-                        logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
-                        return False
-        return True
-    else:
-        """
-        query if the set of gpus are fully connected by nvlink (1 hop)
-        """
-        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
-        for i, handle in enumerate(handles):
-            for j, peer_handle in enumerate(handles):
-                if i < j:
-                    try:
-                        p2p_status = pynvml.nvmlDeviceGetP2PStatus(
-                            handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
-                        )
-                        if p2p_status != pynvml.NVML_P2P_STATUS_OK:
-                            return False
-                    except pynvml.NVMLError:
-                        logger.exception(
-                            "NVLink detection failed. This is normal if your"
-                            " machine has no NVLink equipped."
-                        )
-                        return False
-        return True
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -134,13 +49,6 @@ def _can_p2p(rank: int, world_size: int) -> bool:
         if not gpu_p2p_access_check(rank, i):
             return False
     return True
-
-
-def is_weak_contiguous(inp: torch.Tensor):
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
-    )
 
 
 class CustomAllreduce:
@@ -273,7 +181,7 @@ class CustomAllreduce:
             # is enough for 131072 such tuples. The largest model I've seen only
             # needs less than 10000 of registered tuples.
             self.rank_data = torch.empty(
-                8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+                max_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta_ptrs, self.rank_data, rank, self.full_nvlink
@@ -290,7 +198,7 @@ class CustomAllreduce:
             )
             handles, offsets = self._gather_ipc_meta(shard_data)
             self.rank_data = torch.empty(
-                8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+                max_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
@@ -298,6 +206,7 @@ class CustomAllreduce:
             self.register_buffer(self.buffer)
 
         self.disabled = False
+        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
     @staticmethod
     def create_shared_buffer(
@@ -389,11 +298,11 @@ class CustomAllreduce:
         if _is_hip:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
-            logger.info("Registering %d cuda graph addresses", len(offset))
+            log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             ops.register_graph_buffers(self._ptr, handles, offsets)
         else:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
-            logger.info("Registering %d cuda graph addresses", len(offset))
+            log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             # We cannot directly use `dist.all_gather_object` here
             # because it is incompatible with `gloo` backend under inference mode.
             # see https://github.com/pytorch/pytorch/issues/126032 for details.
@@ -482,11 +391,11 @@ class CustomAllreduce:
                 if _is_hip:
                     return self.all_reduce_reg(input)
                 else:
-                    return self.all_reduce(input, registered=True)
+                    return self.all_reduce(input, registered=not self.tms_cudagraph)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
-                return torch.empty_like(input)
+                return torch.zeros_like(input)
         else:
             if _is_hip:
                 # note: outside of cuda graph context,
@@ -507,3 +416,23 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
+
+
+def dispatch_custom_allreduce():
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
+    if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+        try:
+            from aiter.dist.device_communicators.custom_all_reduce import (
+                CustomAllreduce as AiterCustomAllreduce,
+            )
+
+            logger.info("Using AiterCustomAllreduce for ROCm.")
+            return AiterCustomAllreduce
+        except ImportError as e:
+            logger.warning(
+                "Aiter custom all-reduce not available (optional dependency missing); "
+                "falling back to sglang CustomAllreduce. Details: %s",
+                e,
+            )
+            return CustomAllreduce
+    return CustomAllreduce

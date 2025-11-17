@@ -16,13 +16,10 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
-import logging
-import math
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import PixtralVisionConfig, PretrainedConfig
 from transformers.models.pixtral.modeling_pixtral import PixtralRotaryEmbedding
 from transformers.models.pixtral.modeling_pixtral import (
@@ -109,7 +106,6 @@ class PixtralHFTransformerBlock(nn.Module):
             quant_config=quant_config,
             dropout=0.0,
             use_context_forward=False,
-            softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=f"{prefix}.attention",
         )
@@ -268,15 +264,14 @@ class PixtralHFVisionModel(nn.Module):
 
     DEFAULT_IMAGE_TOKEN_ID = 10
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        return self.input_padder.pad_input_tokens(input_ids, image_inputs)
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        return self.input_padder.pad_input_tokens(input_ids, mm_inputs)
 
     def __init__(
         self,
         config: PixtralVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         *,
-        image_token_id: int = DEFAULT_IMAGE_TOKEN_ID,
         num_hidden_layers_override: Optional[int] = None,
         prefix: str = "",
     ) -> None:
@@ -314,11 +309,8 @@ class PixtralHFVisionModel(nn.Module):
             )
 
         # Initialize patch position embedding
-        self.image_token_id = image_token_id
         self.patch_positional_embedding = PixtralRotaryEmbedding(config)
-        self.input_padder = MultiModalityDataPaddingPatternMultimodalTokens(
-            [self.image_token_id]
-        )
+        self.input_padder = MultiModalityDataPaddingPatternMultimodalTokens()
 
     @property
     def dtype(self):
