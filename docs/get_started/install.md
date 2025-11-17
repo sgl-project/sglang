@@ -123,6 +123,7 @@ HF_TOKEN=<secret> sky launch -c sglang --env HF_TOKEN sglang.yaml
 # Get the HTTP API endpoint
 sky status --endpoint 30000 sglang
 ```
+</details>
 
 ## Method 7: Run on Amazon Web Services SageMaker
 
