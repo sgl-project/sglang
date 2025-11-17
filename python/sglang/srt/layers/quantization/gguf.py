@@ -33,7 +33,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -188,12 +188,16 @@ def fused_moe_gguf(
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if activation == "silu":
-            silu_and_mul(out, x)
+            silu_and_mul(x, out)
         elif activation == "gelu":
-            gelu_and_mul(out, x)
+            gelu_and_mul(x, out)
         else:
             raise ValueError(f"Unsupported activation: {activation}")
         return out
+
+    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+        moe_align_block_size,
+    )
 
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
@@ -529,7 +533,6 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         topk_weights, topk_ids, _ = topk_output
-        print(layer.w13_qweight_type.weight_type)
         output = fused_moe_gguf(
             x=x,
             w1=layer.w13_qweight,
