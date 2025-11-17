@@ -57,6 +57,8 @@ def wsynchronized():
 class Hf3fsUsrBioClient(Hf3fsClient):
     """HF3FS client implementation using usrbio."""
 
+    IO_WAIT_TIMEOUT_SECONDS = 5
+
     def __init__(self, path: str, size: int, bytes_per_page: int, entries: int):
         if not HF3FS_AVAILABLE:
             raise ImportError(
@@ -122,7 +124,7 @@ class Hf3fsUsrBioClient(Hf3fsClient):
 
         # submit
         ionum = len(offsets)
-        resv = self.ior_r.submit().wait(min_results=ionum, timeout=datetime.timedelta(seconds=5))
+        resv = self.ior_r.submit().wait(min_results=ionum, timeout=datetime.timedelta(seconds=Hf3fsUsrBioClient.IO_WAIT_TIMEOUT_SECONDS))
 
         # results
         hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
@@ -146,7 +148,7 @@ class Hf3fsUsrBioClient(Hf3fsClient):
 
         # submit
         ionum = len(offsets)
-        resv = self.ior_w.submit().wait(min_results=ionum, timeout=datetime.timedelta(seconds=5))
+        resv = self.ior_w.submit().wait(min_results=ionum, timeout=datetime.timedelta(seconds=Hf3fsUsrBioClient.IO_WAIT_TIMEOUT_SECONDS))
 
         # results
         results = [res.result for res in resv]
