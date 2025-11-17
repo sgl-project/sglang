@@ -1921,14 +1921,14 @@ class Scheduler(
                         and self.last_batch.spec_info is None
                     ):
 
-                        # Retract all running requests - they will be rescheduled with clean state
+                        # Retract all running requests
                         retracted_reqs = []
                         for req in self.running_batch.reqs:
                             self.tree_cache.cache_finished_req(req, is_insert=False)
                             req.reset_for_retract()
                             retracted_reqs.append(req)
                         
-                        # Clear running_batch completely
+                        # Clear running_batch completely  
                         self.running_batch = ScheduleBatch(
                             reqs=[], batch_is_full=False
                         )
@@ -1937,6 +1937,7 @@ class Scheduler(
                         self.running_batch = self.last_batch
                         
                         # Re-add retracted requests to queue
+                        # OPTIMIZATION: Use _add_request_to_queue which respects retracted flag
                         for req in retracted_reqs:
                             self._add_request_to_queue(req, is_retracted=True)
                         
@@ -2303,12 +2304,14 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            # Dynamic decision for speculative decoding based on batch size
-            has_spec_config = not self.spec_algorithm.is_none()
-
-            # Case 1: No spec config - always run in non-spec mode
-            if not has_spec_config:
-                batch_or_worker_batch = batch.get_model_worker_batch()
+            # Check if we should use dynamic spec logic
+            # If dynamic spec is disabled OR no spec config, use original sglang logic
+            if not self.server_args.enable_dynamic_spec or self.spec_algorithm.is_none():
+                # Original sglang behavior - no dynamic switching
+                batch_or_worker_batch = batch
+                
+                if self.enable_overlap or self.spec_algorithm.is_none():
+                    batch_or_worker_batch = batch.get_model_worker_batch()
 
                 if self.enable_overlap:
                     assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
@@ -2349,8 +2352,10 @@ class Scheduler(
                     )
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                     self.update_cache_from_scheduler(batch, batch_result)
+                
+                use_spec_decoding = not self.spec_algorithm.is_none()
 
-            # Cases 2 & 3: Has spec config - dynamic decision based on batch size
+            # Dynamic spec is enabled - make runtime decision based on batch size
             else:
                 use_spec_decoding = self.should_use_speculative_decoding(batch)
                 
@@ -2363,7 +2368,7 @@ class Scheduler(
                         f"threshold={threshold}, use_spec={use_spec_decoding}"
                     )
 
-                # Case 2: Has config but dynamically disabled - non-spec mode with state management
+                # Dynamically disabled - non-spec mode with state management
                 if not use_spec_decoding:
                     batch.spec_algorithm = SpeculativeAlgorithm.NONE
                     
@@ -2373,8 +2378,6 @@ class Scheduler(
                         self.last_step_in_spec_mode = False
                     
                     # clean batch's spec_info when in non-spec mode!
-                    # This handles cases where batch inherited spec_info from merge
-                    # but last_step_in_spec_mode was already False
                     if batch.spec_info is not None:
                         self.cleanup_speculative_state(batch)
 
@@ -2384,7 +2387,7 @@ class Scheduler(
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                     self.update_cache_from_scheduler(batch, batch_result)
 
-                # Case 3: Has config and dynamically enabled - spec mode
+                # Dynamically enabled - spec mode
                 else:
                     # Handle non-spec -> spec transition
                     if not self.last_step_in_spec_mode:
