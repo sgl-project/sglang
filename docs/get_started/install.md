@@ -171,82 +171,11 @@ echo "Build and push completed successfully!"
 
 </details>
 
-3. Deploy a model for serving on AWS Sagemaker. For more information, check out [sagemaker-python-sdk](https://github.com/aws/sagemaker-python-sdk)
+3. Deploy a model for serving on AWS Sagemaker, refer to [deploy_and_serve_endpoint.py](https://github.com/sgl-project/sglang/blob/main/examples/sagemaker/deploy_and_serve_endpoint.py). For more information, check out [sagemaker-python-sdk](https://github.com/aws/sagemaker-python-sdk).
     1. By default, the model server on SageMaker will run with the following command: `python3 -m sglang.launch_server --model-path opt/ml/model --host 0.0.0.0 --port 8080`. This is optimal for hosting your own model with SageMaker.
     2. To modify your model serving parameters, the [serve](https://github.com/sgl-project/sglang/blob/main/docker/serve) script allows for all available options within `python3 -m sglang.launch_server --help` cli by specifying environment variables with prefix `SM_SGLANG_`.
     3. The serve script will automatically convert all environment variables with prefix `SM_SGLANG_` from `SM_SGLANG_INPUT_ARGUMENT` into `--input-argument` to be parsed into `python3 -m sglang.launch_server` cli.
     4. For example, to run [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) with reasoning parser, simply add additional environment variables `SM_SGLANG_MODEL_PATH=Qwen/Qwen3-0.6B` and `SM_SGLANG_REASONING_PARSER=qwen3`.
-
-```python
-import json
-import boto3
-import sagemaker
-
-from sagemaker import serializers
-from sagemaker.model import Model
-from sagemaker.predictor import Predictor
-
-boto_session = boto3.session.Session()
-sm_client = boto_session.client("sagemaker")
-sm_role = boto_session.resource("iam").Role("SageMakerRole").arn
-
-endpoint_name="<YOUR_ENDPOINT_NAME>"
-image_uri="<YOUR_DOCKER_IMAGE_URI>"
-model_id="<YOUR_MODEL_ID>" # eg: Qwen/Qwen3-0.6B from https://huggingface.co/Qwen/Qwen3-0.6B
-hf_token="<YOUR_HUGGINGFACE_TOKEN>"
-prompt="<YOUR_ENDPOINT_PROMPT>"
-
-model = Model(
-  name=endpoint_name,
-  image_uri=image_uri,
-  role=sm_role,
-  env={
-      "SM_SGLANG_MODEL_PATH": model_id,
-      "HF_TOKEN": hf_token,
-  },
-)
-print("Model created successfully")
-print("Starting endpoint deployment (this may take 10-15 minutes)...")
-
-endpoint_config = model.deploy(
-    instance_type="ml.g5.12xlarge",
-    initial_instance_count=1,
-    endpoint_name=endpoint_name,
-    inference_ami_version="al2-ami-sagemaker-inference-gpu-3-1",
-    wait=True,
-)
-print("Endpoint deployment completed successfully")
-
-
-print(f"Creating predictor for endpoint: {endpoint_name}")
-predictor = Predictor(
-    endpoint_name=endpoint_name,
-    serializer=serializers.JSONSerializer(),
-)
-
-payload = {
-    "model": model_id,
-    "messages": [{"role": "user", "content": prompt}],
-    "max_tokens": 2400,
-    "temperature": 0.01,
-    "top_p": 0.9,
-    "top_k": 50,
-}
-print(f"Sending inference request with prompt: '{prompt[:50]}...'")
-response = predictor.predict(payload)
-print("Inference request completed successfully")
-
-if isinstance(response, bytes):
-    response = response.decode("utf-8")
-
-if isinstance(response, str):
-    try:
-        response = json.loads(response)
-    except json.JSONDecodeError:
-        print("Warning: Response is not valid JSON. Returning as string.")
-
-print(f"Received model response: '{response}'")
-```
 
 </details>
 
