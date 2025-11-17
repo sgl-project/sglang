@@ -10,26 +10,36 @@ from typing import Any
 
 from dateutil.tz import UTC
 
-LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
-if LOG_DIR:
-    LOG_DIR = os.path.abspath(LOG_DIR)
-else:
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
-    LOG_DIR = os.path.join(project_root, "logs")
+
+def _is_in_ci() -> bool:
+    """Check if running in CI environment."""
+    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("true", "1", "yes")
+
 
 # Configure a specific logger for performance metrics
 perf_logger = logging.getLogger("performance")
 perf_logger.setLevel(logging.INFO)
 perf_logger.propagate = False  # Prevent perf logs from going to the main logger
 
-# Ensure the logs directory exists
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
+# Only set up file logging if NOT in CI
+if not _is_in_ci():
+    LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
+    if LOG_DIR:
+        LOG_DIR = os.path.abspath(LOG_DIR)
+    else:
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../../")
+        )
+        LOG_DIR = os.path.join(project_root, "logs")
 
-# Set up a file handler for the performance logger
-handler = logging.FileHandler(os.path.join(LOG_DIR, "performance.log"))
-handler.setFormatter(logging.Formatter("%(message)s"))
-perf_logger.addHandler(handler)
+    # Ensure the logs directory exists
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
+
+    # Set up a file handler for the performance logger
+    handler = logging.FileHandler(os.path.join(LOG_DIR, "performance.log"))
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    perf_logger.addHandler(handler)
 
 
 def get_git_commit_hash() -> str:

@@ -208,37 +208,6 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - uses: actions/checkout@v4
 
       - name: Cleanup
@@ -270,37 +239,6 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - uses: actions/checkout@v4
 
       - name: Cleanup
@@ -333,37 +271,6 @@ jobs:
       CI: true
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - uses: actions/checkout@v4
 
       - name: Cleanup
@@ -405,38 +312,9 @@ jobs:
     needs: [check-changes]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
+    env:
+      SGLANG_IS_IN_CI: true
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -491,37 +369,6 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -558,37 +405,6 @@ jobs:
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -622,37 +438,6 @@ jobs:
       matrix:
         part: [0, 1]
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -782,37 +567,6 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -874,37 +628,6 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -958,37 +681,6 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -1024,37 +716,6 @@ jobs:
     env:
       RUNNER_LABELS: 2-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -1114,37 +775,6 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -1177,37 +807,6 @@ jobs:
     env:
       RUNNER_LABELS: 2-gpu-runner
     steps:
-      - name: Kill lingering processes and cleanup workspace
-        run: |
-          set -x
-          # Get workspace root - works across all runners
-          WORK_ROOT=$(pwd | sed 's|/sglang/sglang.*||')/sglang
-          echo "Cleaning workspace at: $WORK_ROOT"
-
-          # Kill all processes with open files in workspace
-          if [ -d "$WORK_ROOT" ]; then
-            pids=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-            if [ -n "$pids" ]; then
-              echo "Killing processes: $pids"
-              kill $pids 2>/dev/null || true
-              sleep 2
-              # Force kill any remaining
-              pids2=$(lsof +D "$WORK_ROOT" -t 2>/dev/null || true)
-              if [ -n "$pids2" ]; then
-                echo "Force killing: $pids2"
-                kill -9 $pids2 2>/dev/null || true
-              fi
-            fi
-          fi
-
-          # Wait for NFS to release locks
-          sleep 3
-
-          # Remove workspace contents
-          if [ -d "$WORK_ROOT" ]; then
-            rm -rf "$WORK_ROOT"/* "$WORK_ROOT"/.* 2>/dev/null || true
-          fi
-
       - name: Checkout code
         uses: actions/checkout@v4
 
