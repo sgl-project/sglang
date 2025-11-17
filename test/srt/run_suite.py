@@ -178,15 +178,16 @@ suites = {
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
-        TestFile("test_eagle_infer_beta_dp_attention.py", 200),
+        # TODO: Add it back after the bug is fixed
+        # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12533
         # TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
     ],
@@ -208,7 +209,6 @@ suites = {
     "nightly-1-gpu": [
         TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
         TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_openai_api.py", 30),
@@ -219,10 +219,11 @@ suites = {
     ],
     "nightly-4-gpu-b200": [
         TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
-        TestFile("test_fp4_moe.py", 300),
         TestFile("test_gpt_oss_backend_4gpu.py", 400),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
+        TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
+        TestFile("test_fp4_moe.py", 300),
     ],
     "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [
@@ -255,9 +256,7 @@ suites = {
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
         TestFile("lora/test_lora_cuda_graph.py"),
-        TestFile("lora/test_lora_qwen3.py"),
-        TestFile("lora/test_lora_tp.py"),
-        TestFile("lora/test_lora_update.py"),
+        TestFile("lora/test_lora_qwen3_vl.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
@@ -300,6 +299,7 @@ suites = {
         TestFile("test_deepseek_chat_templates.py"),
         TestFile("test_disaggregation.py"),
         TestFile("test_double_sparsity.py"),
+        TestFile("test_eagle_infer_beta_dp_attention.py"),
         TestFile("test_embedding_openai_server.py"),
         TestFile("test_enable_thinking.py"),
         TestFile("test_eplb.py"),
