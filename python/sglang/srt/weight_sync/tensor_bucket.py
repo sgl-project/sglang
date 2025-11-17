@@ -22,6 +22,7 @@ class FlattenedTensorBucket:
     while preserving all metadata needed for reconstruction.
     """
 
+    # This field is solely for users of to check whether the class supports this feature
     supports_multi_dtypes = True
 
     def __init__(
