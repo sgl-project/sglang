@@ -1086,9 +1086,7 @@ class FlashInferFP4MoE(FusedMoE):
         hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
             hidden_states,
             self.w13_input_scale_quant,
-            16,  # sf_vec_size
-            False,  # use_ue8m0
-            False,  # is_sf_swizzled_layout
+            is_sf_swizzled_layout=False,
         )
 
         hs_fp4 = hs_fp4_bytes.reshape(
@@ -1127,6 +1125,12 @@ class FlashInferFP4MoE(FusedMoE):
             None
             if topk_config.correction_bias is None
             else topk_config.correction_bias.to(hidden_states.dtype)
+        )
+
+        router_logits = (
+            router_logits.to(torch.float32)
+            if routing_method_type == RoutingMethodType.DeepSeekV3
+            else router_logits
         )
 
         with use_symmetric_memory(
@@ -1170,7 +1174,7 @@ class FlashInferFP4MoE(FusedMoE):
             intermediate_size=self.intermediate_size_per_partition,
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            routed_scaling_factor=None,
             tile_tokens_dim=None,
             routing_method_type=routing_method_type,
             do_finalize=True,

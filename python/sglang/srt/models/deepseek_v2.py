@@ -649,7 +649,11 @@ class DeepseekV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
+            routing_method_type=(
+                RoutingMethodType.Renormalize
+                if config.norm_topk_prob
+                else RoutingMethodType.DeepSeekV3
+            ),
             prefix=add_prefix("experts", prefix),
         )
 
@@ -1203,6 +1207,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
+
+        self.llama_4_scaling = (
+            config.to_dict()["llama_4_scaling"]["beta"]
+            if "llama_4_scaling" in config
+            else None
+        )
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
@@ -1967,6 +1977,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
+
+            if self.llama_4_scaling:
+                q *= self.llama_4_scaling
 
             attn_output = self.attn_mqa(
                 q,
@@ -3333,6 +3346,7 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(nn.Module):
     # for quark model load
     packed_modules_mapping = {}
+    model_cls = DeepseekV2Model
 
     def __init__(
         self,
@@ -3359,7 +3373,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.use_nsa = is_deepseek_nsa(config)
-        self.model = DeepseekV2Model(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         if self.pp_group.is_last_rank:
@@ -3930,16 +3944,24 @@ class DeepseekV2ForCausalLM(nn.Module):
                             ):
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                                cat_dim = 0
-                                if self.quant_config is not None and (
-                                    self.quant_config.get_name() == "awq"
-                                    or self.quant_config.get_name() == "awq_marlin"
-                                    or self.quant_config.get_name() == "moe_wna16"
-                                ):
-                                    cat_dim = 1
-                                fused_weight = torch.cat(
-                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                )
+
+                                if q_a_proj_weight.shape == torch.Size(
+                                    []
+                                ) and kv_a_proj_weight.shape == torch.Size([]):
+                                    fused_weight = q_a_proj_weight
+                                else:
+                                    cat_dim = 0
+                                    if self.quant_config is not None and (
+                                        self.quant_config.get_name() == "awq"
+                                        or self.quant_config.get_name() == "awq_marlin"
+                                        or self.quant_config.get_name() == "moe_wna16"
+                                    ):
+                                        cat_dim = 1
+
+                                    fused_weight = torch.cat(
+                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                                    )
+
                                 param_name = (
                                     name.replace(
                                         "q_a_proj", "fused_qkv_a_proj_with_mqa"
