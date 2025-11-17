@@ -182,8 +182,6 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
         return _CONFIG_REGISTRY.get(model_name)
 
     # 2. Partial match: find the best (longest) match against all registered model names.
-    # This provides a zero-configuration way to recognize models if their
-    # path contains their registered model_name.
     cleaned_model_path = re.sub(r"--", "/", model_path.lower())
     all_model_names = sorted(_CONFIG_REGISTRY.keys(), key=len, reverse=True)
     for model_name in all_model_names:
