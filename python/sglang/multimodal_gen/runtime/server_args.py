@@ -336,6 +336,9 @@ class ServerArgs:
 
     def __post_init__(self):
         # Add randomization to avoid race condition when multiple servers start simultaneously
+        if self.attention_backend in ["fa3", "fa4"]:
+            self.attention_backend = "fa"
+
         initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
         self.scheduler_port = self.settle_port(initial_scheduler_port)
         # TODO: remove hard code
@@ -382,7 +385,7 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             default=None,
-            choices=[e.name.lower() for e in AttentionBackendEnum],
+            choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
             help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
         )
 
@@ -843,14 +846,14 @@ class ServerArgs:
             )
 
         if self.ring_degree > 1:
-            if self.attention_backend != None and self.attention_backend != "fa3":
+            if self.attention_backend != None and self.attention_backend != "fa":
                 raise ValueError(
-                    "Ring Attention is only supported for fa3 backend for now"
+                    "Ring Attention is only supported for flash attention backend for now"
                 )
             else:
-                self.attention_backend = "fa3"
+                self.attention_backend = "fa"
                 logger.info(
-                    "Ring Attention is currently only supported for fa3, attention_backend has been automatically set to fa3"
+                    "Ring Attention is currently only supported for flash attention, attention_backend has been automatically set to flash attention"
                 )
 
         if self.sp_degree == -1:
