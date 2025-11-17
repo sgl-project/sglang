@@ -548,7 +548,7 @@ class MambaMixer2(torch.nn.Module):
                     self.conv1d.bias,
                     self.activation,
                     conv_state_indices=state_indices_tensor_d[:num_decodes],
-                    intermediate_conv_window=layer_cache.intermediate_conv_window,
+                    intermediate_conv_window=layer_cache.intermediate_conv_window[0],
                     retrieve_next_token=metadata.retrieve_next_token,
                     retrieve_next_sibling=metadata.retrieve_next_sibling,
                     retrieve_parent_token=metadata.retrieve_parent_token,
