@@ -698,12 +698,38 @@ def is_vmoba_available() -> bool:
 
 # adapted from: https://github.com/Wan-Video/Wan2.2/blob/main/wan/utils/utils.py
 def masks_like(
-    tensor, zero=False, generator=None, p=0.2
+    tensors, zero=False, generator=None, p=0.2
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    assert isinstance(tensor, list)
-    out1 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensor]
+    """
+    Generate binary masks for Text-to-Image-to-Video (TI2V) tasks.
 
-    out2 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensor]
+    Creates masks to control which frames should be preserved vs replaced.
+    Primarily used to fix the first frame to the input image while generating other frames.
+
+    Args:
+        tensors: List of tensors with shape [C, T, H, W]
+        zero: If True, set first frame (dim 1, index 0) to zero. Default: False
+        generator: Optional random generator for stochastic masking
+        p: Probability of applying special noise when generator is provided. Default: 0.2
+
+    Returns:
+        Tuple of two lists of tensors:
+        - When zero=False: Both lists contain all-ones tensors
+        - When zero=True (no generator): First frame set to 0, others to 1
+        - When zero=True (with generator): First frame set to small random values with probability p
+
+    Example:
+        >>> latent = torch.randn(48, 69, 96, 160)  # [C, T, H, W]
+        >>> _, mask = masks_like([latent], zero=True)
+        >>> # mask[0][:, 0] == 0 (first frame)
+        >>> # mask[0][:, 1:] == 1 (other frames)
+        >>> blended = (1.0 - mask[0]) * image + mask[0] * latent
+        >>> # Result: first frame = image, other frames = latent
+    """
+    assert isinstance(tensors, list)
+    out1 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensors]
+
+    out2 = [torch.ones(u.shape, dtype=u.dtype, device=u.device) for u in tensors]
 
     if zero:
         if generator is not None:
@@ -775,3 +801,13 @@ def save_decoded_latents_as_video(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     imageio.mimsave(output_path, frames, fps=fps, format="mp4")
+
+
+def calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height, None

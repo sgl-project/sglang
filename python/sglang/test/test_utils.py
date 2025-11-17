@@ -14,7 +14,6 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
 from functools import partial, wraps
 from pathlib import Path
@@ -58,6 +57,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
+DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4 = "nvidia/Qwen3-30B-A3B-FP4"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -70,6 +70,10 @@ DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
 )
 DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
+
+# MXFP4 models
+# Standard MXFP4 MoE test model
+DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE = "openai/gpt-oss-20b"
 
 # W8A8 models
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
@@ -103,7 +107,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
 )
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
@@ -111,7 +115,7 @@ DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it,jet-ai/Jet-Nemotron-2B"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
@@ -700,91 +704,6 @@ def popen_launch_pd_server(
     return process
 
 
-def run_with_timeout(
-    func: Callable,
-    args: tuple = (),
-    kwargs: Optional[dict] = None,
-    timeout: float = None,
-):
-    """Run a function with timeout."""
-    ret_value = []
-
-    def _target_func():
-        ret_value.append(func(*args, **(kwargs or {})))
-
-    t = threading.Thread(target=_target_func)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        raise TimeoutError()
-
-    if not ret_value:
-        raise RuntimeError()
-
-    return ret_value[0]
-
-
-@dataclass
-class TestFile:
-    name: str
-    estimated_time: float = 60
-
-
-def run_unittest_files(files: List[TestFile], timeout_per_file: float):
-    tic = time.perf_counter()
-    success = True
-
-    for i, file in enumerate(files):
-        filename, estimated_time = file.name, file.estimated_time
-        process = None
-
-        def run_one_file(filename):
-            nonlocal process
-
-            filename = os.path.join(os.getcwd(), filename)
-            print(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
-                flush=True,
-            )
-            tic = time.perf_counter()
-
-            process = subprocess.Popen(
-                ["python3", filename], stdout=None, stderr=None, env=os.environ
-            )
-            process.wait()
-            elapsed = time.perf_counter() - tic
-
-            print(
-                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
-                flush=True,
-            )
-            return process.returncode
-
-        try:
-            ret_code = run_with_timeout(
-                run_one_file, args=(filename,), timeout=timeout_per_file
-            )
-            assert (
-                ret_code == 0
-            ), f"expected return code 0, but {filename} returned {ret_code}"
-        except TimeoutError:
-            kill_process_tree(process.pid)
-            time.sleep(5)
-            print(
-                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
-                flush=True,
-            )
-            success = False
-            break
-
-    if success:
-        print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
-    else:
-        print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
-
-    return 0 if success else -1
-
-
 def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
 
@@ -950,7 +869,6 @@ def run_score_benchmark(
     )
 
     async def _run_benchmark():
-
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -1640,7 +1558,7 @@ class CustomTestCase(unittest.TestCase):
         )
 
     def setUp(self):
-        print(f"[Test Method] {self._testMethodName}", flush=True)
+        print(f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}")
 
 
 def dump_bench_raw_result(

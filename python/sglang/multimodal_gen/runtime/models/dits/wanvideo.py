@@ -349,7 +349,6 @@ class WanTransformerBlock(nn.Module):
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
-
         if temb.dim() == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -368,12 +367,12 @@ class WanTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
                 e.chunk(6, dim=1)
             )
+
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = (
-            self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
-        ).to(orig_dtype)
+        norm1 = self.norm1(hidden_states.float())
+        norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -690,7 +689,7 @@ class WanTransformer3DModel(CachableDiT):
         d = self.hidden_size // self.num_attention_heads
         self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
 
-        self.rope = NDRotaryEmbedding(
+        self.rotary_emb = NDRotaryEmbedding(
             rope_dim_list=self.rope_dim_list,
             rope_theta=10000,
             dtype=torch.float32 if current_platform.is_mps() else torch.float64,
@@ -720,12 +719,14 @@ class WanTransformer3DModel(CachableDiT):
             encoder_hidden_states_image = None
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+
         p_t, p_h, p_w = self.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        freqs_cos, freqs_sin = self.rope.forward_from_grid(
+        # The rotary embedding layer correctly handles SP offsets internally.
+        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
             (
                 post_patch_num_frames * self.sp_size,
                 post_patch_height,
@@ -743,9 +744,9 @@ class WanTransformer3DModel(CachableDiT):
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
-
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
+            # ti2v
             ts_seq_len = timestep.shape[1]
             timestep = timestep.flatten()  # batch_size * seq_len
         else:

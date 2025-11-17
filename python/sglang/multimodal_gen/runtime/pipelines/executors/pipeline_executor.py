@@ -8,7 +8,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import List
 
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

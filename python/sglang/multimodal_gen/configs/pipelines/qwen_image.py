@@ -4,13 +4,13 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
-from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_dimensions
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, PipelineConfig
+from sglang.multimodal_gen.utils import calculate_dimensions
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -64,7 +64,7 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 class QwenImagePipelineConfig(PipelineConfig):
     should_use_guidance: bool = False
 
-    is_image_gen: bool = True
+    task_type: ModelTaskType = ModelTaskType.T2I
 
     vae_tiling: bool = False
 
@@ -117,15 +117,7 @@ class QwenImagePipelineConfig(PipelineConfig):
         width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        # _pack_latents(latents, batch_size, num_channels_latents, height, width)
-        latents = latents.view(
-            batch_size, num_channels_latents, height // 2, 2, width // 2, 2
-        )
-        latents = latents.permute(0, 2, 4, 1, 3, 5)
-        latents = latents.reshape(
-            batch_size, (height // 2) * (width // 2), num_channels_latents * 4
-        )
-        return latents
+        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
 
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
@@ -202,7 +194,7 @@ class QwenImagePipelineConfig(PipelineConfig):
 
 
 class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
-    ti2i_task = True
+    task_type: ModelTaskType = ModelTaskType.I2I
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         # TODO: lots of duplications here

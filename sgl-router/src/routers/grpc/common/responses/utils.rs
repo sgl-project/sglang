@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{json, to_value};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     core::WorkerRegistry,
@@ -44,6 +44,10 @@ pub async fn ensure_mcp_connection(
                 .await
                 .is_none()
             {
+                error!(
+                    function = "ensure_mcp_connection",
+                    "Failed to connect to MCP server"
+                );
                 return Err(error::failed_dependency(
                     "Failed to connect to MCP server. Check server_url and authorization.",
                 ));
