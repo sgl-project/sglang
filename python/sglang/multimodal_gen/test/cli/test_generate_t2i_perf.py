@@ -9,6 +9,7 @@ from sglang.multimodal_gen.test.test_utils import TestGenerateBase
 
 logger = init_logger(__name__)
 
+
 class TestStableDiffusionT2Image(TestGenerateBase):
     model_path = "stabilityai/stable-diffusion-3-medium-diffusers"
     extra_args = []
