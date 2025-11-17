@@ -1,16 +1,8 @@
 import argparse
 import glob
-from dataclasses import dataclass
 from pathlib import Path
 
-from sglang.test.test_utils import run_unittest_files
-
-
-@dataclass
-class TestFile:
-    name: str
-    estimated_time: float = 60
-
+from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
@@ -619,7 +611,7 @@ def _sanity_check_suites(suites):
     )
 
 
-if __name__ == "__main__":
+def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
         "--timeout-per-file",
@@ -667,3 +659,7 @@ if __name__ == "__main__":
 
     exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
