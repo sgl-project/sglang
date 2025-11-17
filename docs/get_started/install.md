@@ -3,7 +3,7 @@
 You can install SGLang using one of the methods below.
 
 This page primarily applies to common NVIDIA GPU platforms.
-For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-10-13-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md).
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md), and [Intel XPU](../platforms/xpu.md).
 
 ## Method 1: With pip or uv
 
@@ -25,7 +25,7 @@ uv pip install "sglang" --prerelease=allow
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.5.post2 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
@@ -35,7 +35,7 @@ pip install -e "python"
 
 **Quick fixes to common problems**
 
-- If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
+- If you want to develop SGLang, you can try the dev docker image. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
 
 ## Method 3: Using docker
 

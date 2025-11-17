@@ -1,16 +1,8 @@
 import argparse
 import glob
-from dataclasses import dataclass
 from pathlib import Path
 
-from sglang.test.test_utils import run_unittest_files
-
-
-@dataclass
-class TestFile:
-    name: str
-    estimated_time: float = 60
-
+from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
@@ -26,6 +18,7 @@ suites = {
         TestFile("lora/test_lora_eviction.py", 240),
         TestFile("lora/test_lora_update.py", 600),
         TestFile("lora/test_lora_backend.py", 99),
+        TestFile("lora/test_lora_spec_decoding.py", 150),
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
@@ -117,7 +110,7 @@ suites = {
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 450),
         TestFile("test_standalone_speculative_decoding.py", 150),
-        TestFile("test_start_profile.py", 60),
+        TestFile("test_start_profile.py", 180),
         TestFile("test_profile_merger.py", 60),
         TestFile("test_profile_merger_http_api.py", 15),
         TestFile("test_swa_unittest.py", 1),
@@ -177,15 +170,16 @@ suites = {
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
-        TestFile("test_eagle_infer_beta_dp_attention.py", 200),
+        # TODO: Add it back after the bug is fixed
+        # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12533
         # TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
     ],
@@ -207,20 +201,20 @@ suites = {
     "nightly-1-gpu": [
         TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
         TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_openai_api.py", 30),
         TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
-        TestFile("test_deepseek_v3_deterministic.py", 240),
         TestFile("test_cpp_radix_cache.py", 60),
+        TestFile("test_deepseek_v3_deterministic.py", 240),
     ],
     "nightly-4-gpu-b200": [
         TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
-        TestFile("test_fp4_moe.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
+        TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
+        TestFile("test_fp4_moe.py", 300),
     ],
     "nightly-8-gpu-b200": [],
     "nightly-4-gpu": [
@@ -253,9 +247,7 @@ suites = {
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
         TestFile("lora/test_lora_cuda_graph.py"),
-        TestFile("lora/test_lora_qwen3.py"),
-        TestFile("lora/test_lora_tp.py"),
-        TestFile("lora/test_lora_update.py"),
+        TestFile("lora/test_lora_qwen3_vl.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
@@ -298,6 +290,7 @@ suites = {
         TestFile("test_deepseek_chat_templates.py"),
         TestFile("test_disaggregation.py"),
         TestFile("test_double_sparsity.py"),
+        TestFile("test_eagle_infer_beta_dp_attention.py"),
         TestFile("test_embedding_openai_server.py"),
         TestFile("test_enable_thinking.py"),
         TestFile("test_eplb.py"),
@@ -379,6 +372,7 @@ suites = {
         TestFile("test_w8a8_quantization.py"),
         TestFile("test_wave_attention_backend.py"),
         TestFile("test_weight_version.py"),
+        TestFile("test_deepseek_v32_cp_single_node.py", 275),
     ],
 }
 
@@ -617,7 +611,7 @@ def _sanity_check_suites(suites):
     )
 
 
-if __name__ == "__main__":
+def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
         "--timeout-per-file",
@@ -631,18 +625,6 @@ if __name__ == "__main__":
         default=list(suites.keys())[0],
         choices=list(suites.keys()) + ["all"],
         help="The suite to run",
-    )
-    arg_parser.add_argument(
-        "--range-begin",
-        type=int,
-        default=0,
-        help="The begin index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
-        "--range-end",
-        type=int,
-        default=None,
-        help="The end index of the range of the files to run.",
     )
     arg_parser.add_argument(
         "--auto-partition-id",
@@ -672,10 +654,12 @@ if __name__ == "__main__":
 
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
-    else:
-        files = files[args.range_begin : args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
     exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

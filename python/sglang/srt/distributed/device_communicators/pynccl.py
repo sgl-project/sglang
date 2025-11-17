@@ -209,6 +209,34 @@ class PyNcclCommunicator:
                 cudaStream_t(stream.cuda_stream),
             )
 
+    def cp_all_gather_into_tensor(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        stream=None,
+        sizes: Optional[list[int]] = None,
+    ):
+        """
+        Currently, it is mainly used in context parallelism,
+        primarily leveraging pynccl to implement non-blocking allgather communication.
+        """
+        # nccl communicator created on a specific device
+        # will only work on tensors on the same device
+        # otherwise it will cause "illegal memory access"
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        stream = self._resolve_stream(stream)
+        self.nccl.ncclAllGather(
+            buffer_type(input_tensor.data_ptr()),
+            buffer_type(output_tensor.data_ptr()),
+            input_tensor.numel(),
+            ncclDataTypeEnum.from_torch(input_tensor.dtype),
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
     def reduce_scatter(
         self,
         output_tensor: torch.Tensor,
