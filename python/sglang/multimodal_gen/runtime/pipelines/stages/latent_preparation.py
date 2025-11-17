@@ -15,7 +15,8 @@ from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
+from sglang.multimodal_gen.configs.pipelines import StableDiffusion3PipelineConfig
+import torch
 logger = init_logger(__name__)
 
 
@@ -65,7 +66,19 @@ class LatentPreparationStage(PipelineStage):
         )
         height = batch.height
         width = batch.width
+        if isinstance(server_args.pipeline_config, StableDiffusion3PipelineConfig):
+            vae_scale_factor=server_args.pipeline_config.vae_config.get_vae_scale_factor() if server_args.pipeline_config.vae_config.get_vae_scale_factor() else 8
+            shape = (
+                batch_size,
+                server_args.pipeline_config.dit_config.arch_config.in_channels,
+                int(height) // vae_scale_factor,
+                int(width) // vae_scale_factor,
+            )
 
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            batch.latents = latents
+            batch.raw_latent_shape = latents.shape
+            return batch
         # TODO(will): remove this once we add input/output validation for stages
         if height is None or width is None:
             raise ValueError("Height and width must be provided")

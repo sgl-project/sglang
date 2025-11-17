@@ -42,7 +42,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-
+from sglang.multimodal_gen.configs.pipelines.stablediffusion3 import StableDiffusion3PipelineConfig
 logger = init_logger(__name__)
 
 
@@ -88,8 +88,10 @@ class ComponentLoader(ABC):
             "vae": (VAELoader, "diffusers"),
             "text_encoder": (TextEncoderLoader, "transformers"),
             "text_encoder_2": (TextEncoderLoader, "transformers"),
+            "text_encoder_3": (TextEncoderLoader, "transformers"),
             "tokenizer": (TokenizerLoader, "transformers"),
             "tokenizer_2": (TokenizerLoader, "transformers"),
+            "tokenizer_3": (TokenizerLoader, "transformers"),
             "image_processor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
             "processor": (AutoProcessorLoader, "transformers"),
@@ -242,7 +244,9 @@ class TextEncoderLoader(ComponentLoader):
         logger.info("HF model config: %s", model_config)
 
         def is_not_first_encoder(module_name):
-            return "2" in module_name
+            return "2" in module_name or "3" in module_name
+        def is_third_encoder(module_name):
+            return "3" in module_name
 
         # TODO(mick): had to throw an exception for different text-encoder arch
         if not is_not_first_encoder(module_name):
@@ -251,11 +255,16 @@ class TextEncoderLoader(ComponentLoader):
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
-        else:
-            assert len(server_args.pipeline_config.text_encoder_configs) == 2
+        elif not is_third_encoder(module_name):
+            # assert len(server_args.pipeline_config.text_encoder_configs) == 2
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
+        else:
+            assert len(server_args.pipeline_config.text_encoder_configs) == 3
+            encoder_config = server_args.pipeline_config.text_encoder_configs[2]
+            encoder_config.update_model_arch(model_config)
+            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[2]
         target_device = get_local_torch_device()
         # TODO(will): add support for other dtypes
         return self.load_model(
@@ -460,6 +469,18 @@ class VAELoader(ComponentLoader):
 
         # Find all safetensors files
         safetensors_list = glob.glob(os.path.join(str(model_path), "*.safetensors"))
+        if isinstance(server_args.pipeline_config, StableDiffusion3PipelineConfig):
+            precision = server_args.pipeline_config.vae_precision
+            base_name = "diffusion_pytorch_model"
+
+            # Priority: fp16 > full precision > any matching file
+            if precision == "fp16":
+                fp16_path = os.path.join(str(model_path), f"{base_name}.fp16.safetensors")
+                target_files = [fp16_path] if os.path.exists(fp16_path) else []
+            else:
+                full_path = os.path.join(str(model_path), f"{base_name}.safetensors")
+                target_files = [full_path] if os.path.exists(full_path) else []
+            safetensors_list = target_files
         # TODO(PY)
         assert (
             len(safetensors_list) == 1
