@@ -1712,6 +1712,7 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
+        flag_no_token = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
@@ -1760,8 +1761,7 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
-                    if use_elasticmem:
-                        self.emem_orch.try_resize()
+                    flag_no_token = True
                 break
 
         # Update waiting queue
@@ -1819,6 +1819,9 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        if use_elasticmem and flag_no_token:
+            self.emem_orch.try_resize()
 
         # Mixed-style chunked prefill
         if (
