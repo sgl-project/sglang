@@ -77,7 +77,7 @@ class SD3Transformer2DModel(CachableDiT):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states: List[torch.Tensor] = [],
         pooled_projections: torch.Tensor = None, # TODO: this should probably be removed
         timestep: torch.LongTensor = None,
         block_controlnet_hidden_states: List = None,
@@ -86,6 +86,8 @@ class SD3Transformer2DModel(CachableDiT):
         return_dict: bool = True,
         skip_layers: Optional[List[int]] = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        # should be convert [prompt_embeds,pooled_embeds]
+        assert len(encoder_hidden_states) == 2
         pooled_projections=encoder_hidden_states[1]
         encoder_hidden_states=encoder_hidden_states[0]
 
