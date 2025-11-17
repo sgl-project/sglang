@@ -84,10 +84,7 @@ def shift_append_input_ids_triton(
     assert input_ids.is_contiguous()
 
     bs = extend_seq_lens.shape[0]
-    if extend_seq_lens.dtype != torch.int32:
-        lens_i32 = extend_seq_lens.to(dtype=torch.int32)
-    else:
-        lens_i32 = extend_seq_lens
+    lens_i32 = extend_seq_lens.to(dtype=torch.int32)
     offsets = torch.cumsum(lens_i32, dim=0) - lens_i32
 
     shift_append_input_ids_kernel[(bs,)](
