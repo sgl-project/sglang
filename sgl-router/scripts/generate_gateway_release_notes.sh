@@ -156,7 +156,7 @@ generate_notes() {
         markdown|github)
             echo "## What's Changed in Gateway/Router"
             echo ""
-            echo "### Gateway/Router Changes ($COMMIT_COUNT commits)"
+            echo "### Gateway Changes ($COMMIT_COUNT commits)"
             echo ""
 
             # Categorize commits with author attribution
@@ -164,17 +164,31 @@ generate_notes() {
                 commit_hash=$(echo "$line" | awk '{print $1}')
                 commit_msg=$(echo "$line" | cut -d' ' -f2-)
 
-                # Get author and PR number from commit
-                author=$(git show -s --format='%aN' "$commit_hash")
+                # Get PR number from commit message
                 pr_num=$(echo "$commit_msg" | grep -o '(#[0-9]*' | grep -o '[0-9]*' | head -1)
 
-                # Get GitHub username if available (from commit trailers or email)
-                gh_user=$(git show -s --format='%aE' "$commit_hash" | sed 's/@users\.noreply\.github\.com$//' | sed 's/^[0-9]*+//')
+                # Try to get GitHub username from PR if gh CLI is available
+                gh_user=""
+                if [[ -n "$pr_num" ]] && command -v gh &> /dev/null; then
+                    gh_user=$(gh pr view "$pr_num" --json author --jq '.author.login' 2>/dev/null || echo "")
+                fi
+
+                # Fallback: try to extract from email (works for users.noreply.github.com emails)
+                if [[ -z "$gh_user" ]]; then
+                    email=$(git show -s --format='%aE' "$commit_hash")
+                    gh_user=$(echo "$email" | sed 's/@users\.noreply\.github\.com$//' | sed 's/^[0-9]*+//')
+                    # If still contains @, it's not a GitHub username
+                    if [[ "$gh_user" == *"@"* ]]; then
+                        gh_user=""
+                    fi
+                fi
 
                 # Format author link
-                if [[ "$gh_user" != *"@"* ]] && [[ -n "$gh_user" ]]; then
+                if [[ -n "$gh_user" ]]; then
                     author_link="by @$gh_user"
                 else
+                    # Final fallback: use full name
+                    author=$(git show -s --format='%aN' "$commit_hash")
                     author_link="by $author"
                 fi
 
@@ -199,13 +213,29 @@ generate_notes() {
                         name=$(echo "$contributor" | sed 's/ <.*//')
                         email=$(echo "$contributor" | sed 's/.*<\(.*\)>/\1/')
 
-                        # Try to get GitHub username from email
-                        gh_user=$(echo "$email" | sed 's/@users\.noreply\.github\.com$//' | sed 's/^[0-9]*+//')
-
                         # Get their first commit
                         first_commit=$(git log "$PREV_TAG..$CURR_TAG" --author="$contributor" --format='%h' --reverse --no-merges "${PATH_ARGS[@]}" | head -1)
 
-                        if [[ "$gh_user" != *"@"* ]] && [[ -n "$gh_user" ]]; then
+                        # Try to get GitHub username from first commit's PR
+                        gh_user=""
+                        if command -v gh &> /dev/null; then
+                            commit_msg=$(git log --format=%s -n 1 "$first_commit")
+                            pr_num=$(echo "$commit_msg" | grep -o '(#[0-9]*' | grep -o '[0-9]*' | head -1)
+                            if [[ -n "$pr_num" ]]; then
+                                gh_user=$(gh pr view "$pr_num" --json author --jq '.author.login' 2>/dev/null || echo "")
+                            fi
+                        fi
+
+                        # Fallback: try to get GitHub username from email
+                        if [[ -z "$gh_user" ]]; then
+                            gh_user=$(echo "$email" | sed 's/@users\.noreply\.github\.com$//' | sed 's/^[0-9]*+//')
+                            # If still contains @, it's not a GitHub username
+                            if [[ "$gh_user" == *"@"* ]]; then
+                                gh_user=""
+                            fi
+                        fi
+
+                        if [[ -n "$gh_user" ]]; then
                             echo "* @$gh_user made their first contribution in https://github.com/sgl-project/sglang/commit/$first_commit"
                         else
                             echo "* $name made their first contribution in https://github.com/sgl-project/sglang/commit/$first_commit"
