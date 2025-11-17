@@ -69,6 +69,7 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    ACTIVATION: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -88,7 +89,10 @@ def _layer_norm_fwd_1pass_kernel(
     x = tl.load(X + cols, mask=cols < N, other=0.0).to(tl.float32)
     if HAS_Z and not NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=cols < N).to(tl.float32)
-        x *= z * tl.sigmoid(z)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            x *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            x *= tl.sigmoid(z)
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=0) / N
         tl.store(Mean + row, mean)
@@ -108,7 +112,10 @@ def _layer_norm_fwd_1pass_kernel(
     y = x_hat * w + b if HAS_BIAS else x_hat * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
-        y *= z * tl.sigmoid(z)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            y *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            y *= tl.sigmoid(z)
     # Write output
     tl.store(Y + cols, y, mask=mask)
 
@@ -123,6 +130,7 @@ def _layer_norm_fwd(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    activation: str = "swish",
 ):
     M, N = x.shape
     if group_size is None:
@@ -177,6 +185,7 @@ def _layer_norm_fwd(
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
+            ACTIVATION=activation,
         )
     return out, mean, rstd
 
@@ -191,6 +200,7 @@ def rms_norm_gated(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    activation: str = "swish",
 ):
     """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
 
@@ -216,6 +226,7 @@ def rms_norm_gated(
         group_size=group_size,
         norm_before_gate=norm_before_gate,
         is_rms_norm=is_rms_norm,
+        activation=activation,
     )
     return y.reshape(x_shape_og)
 
@@ -233,6 +244,7 @@ class LayerNormFn(torch.autograd.Function):
         group_size=None,
         norm_before_gate=True,
         is_rms_norm=False,
+        activation: str = "swish",
     ):
         return rms_norm_gated(
             x=x,
@@ -243,6 +255,7 @@ class LayerNormFn(torch.autograd.Function):
             group_size=group_size,
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
+            activation=activation,
         )
 
 
@@ -255,9 +268,10 @@ def layernorm_fn(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    activation: str = "swish",
 ):
     return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm
+        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm, activation
     )
 
 
@@ -271,6 +285,7 @@ class LayerNorm(torch.nn.Module):
         norm_before_gate=True,
         device=None,
         dtype=None,
+        activation: str = "swish",
     ):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
@@ -279,6 +294,7 @@ class LayerNorm(torch.nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
+        self.activation = activation
         self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
         self.bias = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
         self.group_size = group_size
@@ -300,6 +316,7 @@ class LayerNorm(torch.nn.Module):
             eps=self.eps,
             norm_before_gate=self.norm_before_gate,
             is_rms_norm=False,
+            activation=self.activation,
         )
 
 
@@ -313,6 +330,7 @@ class RMSNorm(torch.nn.Module):
         norm_before_gate=True,
         device=None,
         dtype=None,
+        activation: str = "swish",
     ):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
@@ -320,6 +338,7 @@ class RMSNorm(torch.nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
+        self.activation = activation
         self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
         self.register_parameter("bias", None)
         self.group_size = group_size
@@ -340,4 +359,5 @@ class RMSNorm(torch.nn.Module):
             group_size=self.group_size,
             norm_before_gate=self.norm_before_gate,
             is_rms_norm=True,
+            activation=self.activation,
         )

@@ -17,11 +17,8 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.lightning_attn.fused_group_rmsnorm import (
-    FusedGroupRMSNormSigmoidGate,
-    RMSNormTP,
-)
-from sglang.srt.layers.attention.lightning_attn.rmsnorm import rms_norm_triton_fn
+from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -82,6 +79,40 @@ def weight_loader_with_alias(alias: str):
         return inner_func
 
     return wrapper
+
+
+class BailingGroupRMSNormGate(RMSNormGated):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-5,
+        group_size=None,
+        norm_before_gate=True,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(
+            hidden_size,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            device=device,
+            dtype=dtype,
+            activation="sigmoid",
+        )
+        self.weight.weight_loader = self.weight_loader
+
+    @staticmethod
+    def weight_loader(
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        shard_size = loaded_weight.shape[0] // tp_size
+        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        param.data.copy_(loaded_weight[shard].contiguous())
+        return
 
 
 class BailingMLP(nn.Module):
@@ -350,20 +381,17 @@ class BailingMoELinearAttention(nn.Module):
 
         self.group_norm_size = getattr(config, "group_norm_size", 1)
         self.rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
-        if self.group_norm_size > 1:
-            assert (
-                self.tp_size <= self.group_norm_size
-            ), "tp_size must be less than or equal to group_norm_size that can use local rms norm"
-            assert (
-                self.group_norm_size % self.tp_size == 0
-            ), "group_norm_size must be divisible by tp_size"
-            self.g_norm = FusedGroupRMSNormSigmoidGate(
-                self.hidden_inner_size,
-                eps=self.rms_norm_eps,
-                group_norm_size=self.group_norm_size,
-            )
-        else:
-            self.g_norm = RMSNormTP(self.hidden_inner_size, eps=self.rms_norm_eps)
+        assert (
+            self.tp_size <= self.group_norm_size
+        ), "tp_size must be less than or equal to group_norm_size that can use local rms norm"
+        assert (
+            self.group_norm_size % self.tp_size == 0
+        ), "group_norm_size must be divisible by tp_size"
+        self.g_norm = BailingGroupRMSNormGate(
+            hidden_size=self.hidden_inner_size // self.tp_size,
+            eps=self.rms_norm_eps,
+            group_size=self.hidden_inner_size // self.group_norm_size,
+        )
         # use fp32 rotary embedding
         if hasattr(config, "rotary_dim"):
             rotary_dim = config.rotary_dim
@@ -408,11 +436,19 @@ class BailingMoELinearAttention(nn.Module):
         if self.use_qk_norm:
             q = q.reshape(-1, self.tp_heads, self.head_dim)
             k = k.reshape(-1, self.tp_kv_heads, self.head_dim)
-            q = rms_norm_triton_fn(
-                q, self.query_layernorm.weight.data, eps=self.rms_norm_eps
+            q = layernorm_fn(
+                q,
+                self.query_layernorm.weight.data,
+                bias=None,
+                eps=self.rms_norm_eps,
+                is_rms_norm=True,
             )
-            k = rms_norm_triton_fn(
-                k, self.key_layernorm.weight.data, eps=self.rms_norm_eps
+            k = layernorm_fn(
+                k,
+                self.key_layernorm.weight.data,
+                bias=None,
+                eps=self.rms_norm_eps,
+                is_rms_norm=True,
             )
 
             q = q.reshape(-1, self.q_size_per_rank)
@@ -429,12 +465,8 @@ class BailingMoELinearAttention(nn.Module):
             q = q * self.scaling
         hidden = self.attn(q, k, v, forward_batch)
         gate, _ = self.g_proj(hidden_states)
-        if self.group_norm_size > 1:
-            hidden = self.g_norm(hidden, gate)
-        else:
-            hidden = self.g_norm(hidden)
-            hidden = F.sigmoid(gate) * hidden
-        hidden = hidden.to(hidden_states.dtype)
+        hidden = self.g_norm(hidden, gate)
+        hidden = hidden.data.to(hidden_states.dtype)
         hidden, _ = self.dense(hidden)
         return hidden
 
