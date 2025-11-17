@@ -683,7 +683,6 @@ class Engine(EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
         os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if (
@@ -733,7 +732,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.17",
+            "0.3.17.post1",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -756,10 +755,13 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 
 def _init_tokenizer_manager(
-    server_args: ServerArgs, port_args: PortArgs
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> TokenizerManager:
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
+    tokenizer_manager = TokenizerManagerClass(server_args, port_args)
 
     # Initialize templates
     template_manager = TemplateManager()
