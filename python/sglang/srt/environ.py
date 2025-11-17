@@ -136,6 +136,7 @@ class Envs:
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
@@ -290,6 +291,9 @@ class Envs:
 
     # Warmup
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
+
+    # Health Check
+    SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
 
     # fmt: on
 
