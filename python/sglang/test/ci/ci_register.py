@@ -6,6 +6,7 @@ from typing import List
 
 
 class HWBackend(Enum):
+    CPU = auto()
     CUDA = auto()
     AMD = auto()
 
@@ -18,6 +19,10 @@ class CIRegistry:
     suite: str
 
 
+def register_cpu_ci(est_time: float, suite: str):
+    pass
+
+
 def register_cuda_ci(est_time: float, suite: str):
     pass
 
@@ -27,6 +32,7 @@ def register_amd_ci(est_time: float, suite: str):
 
 
 REGISTER_MAPPING = {
+    "register_cpu_ci": HWBackend.CPU,
     "register_cuda_ci": HWBackend.CUDA,
     "register_amd_ci": HWBackend.AMD,
 }
