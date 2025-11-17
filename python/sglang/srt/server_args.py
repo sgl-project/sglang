@@ -576,7 +576,7 @@ class ServerArgs:
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
 
-    # encoder mode
+    # For encoder dp
     mm_enable_dp_encoder: bool = False
 
     def __post_init__(self):
