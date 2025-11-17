@@ -17,8 +17,8 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
     num_threads, occupancy = 1024, 1
     args = make_cpp_args(
         element_size,
-        block_quota,
         unroll,
+        block_quota,
         num_threads,
         occupancy,
     )
