@@ -9,9 +9,12 @@ use std::{collections::HashMap, sync::Arc};
 use axum::http::HeaderMap;
 use serde_json::Value;
 
+use super::{
+    client::GrpcClient,
+    proto_wrapper::{ProtoGenerateComplete, ProtoGenerateRequest, ProtoStream},
+};
 use crate::{
     core::Worker,
-    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::{GenerateRequest, GenerateResponse},
@@ -68,7 +71,7 @@ pub struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     // Stage 4: Request building outputs
-    pub proto_request: Option<proto::GenerateRequest>,
+    pub proto_request: Option<ProtoGenerateRequest>,
 
     // Stage 5: Dispatch metadata
     pub dispatch: Option<DispatchMetadata>,
@@ -122,11 +125,11 @@ pub enum WorkerSelection {
 /// Client selection (Step 3)
 pub enum ClientSelection {
     Single {
-        client: SglangSchedulerClient,
+        client: GrpcClient,
     },
     Dual {
-        prefill: SglangSchedulerClient,
-        decode: SglangSchedulerClient,
+        prefill: GrpcClient,
+        decode: GrpcClient,
     },
 }
 
@@ -150,7 +153,7 @@ pub struct ResponseState {
     pub streaming: StreamingState,
 
     /// Collected responses (non-streaming)
-    pub collected: Option<Vec<proto::GenerateComplete>>,
+    pub collected: Option<Vec<ProtoGenerateComplete>>,
 
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,
@@ -346,56 +349,56 @@ impl ClientSelection {
         matches!(self, Self::Dual { .. })
     }
 
-    pub fn single(&self) -> Option<&SglangSchedulerClient> {
+    pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
             _ => None,
         }
     }
 
-    pub fn single_mut(&mut self) -> Option<&mut SglangSchedulerClient> {
+    pub fn single_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
             _ => None,
         }
     }
 
-    pub fn dual(&self) -> Option<(&SglangSchedulerClient, &SglangSchedulerClient)> {
+    pub fn dual(&self) -> Option<(&GrpcClient, &GrpcClient)> {
         match self {
             Self::Dual { prefill, decode } => Some((prefill, decode)),
             _ => None,
         }
     }
 
-    pub fn dual_mut(&mut self) -> Option<(&mut SglangSchedulerClient, &mut SglangSchedulerClient)> {
+    pub fn dual_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient)> {
         match self {
             Self::Dual { prefill, decode } => Some((prefill, decode)),
             _ => None,
         }
     }
 
-    pub fn prefill_client(&self) -> Option<&SglangSchedulerClient> {
+    pub fn prefill_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
             _ => None,
         }
     }
 
-    pub fn prefill_client_mut(&mut self) -> Option<&mut SglangSchedulerClient> {
+    pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
             _ => None,
         }
     }
 
-    pub fn decode_client(&self) -> Option<&SglangSchedulerClient> {
+    pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
             _ => None,
         }
     }
 
-    pub fn decode_client_mut(&mut self) -> Option<&mut SglangSchedulerClient> {
+    pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
             _ => None,
@@ -404,14 +407,14 @@ impl ClientSelection {
 }
 
 /// Result of request execution (streams from workers)
-/// Uses AbortOnDropStream to automatically abort on cancellation
+/// Uses ProtoStream to automatically abort on cancellation
 pub enum ExecutionResult {
     Single {
-        stream: AbortOnDropStream,
+        stream: ProtoStream,
     },
     Dual {
-        prefill: AbortOnDropStream,
-        decode: Box<AbortOnDropStream>,
+        prefill: ProtoStream,
+        decode: Box<ProtoStream>,
     },
 }
 

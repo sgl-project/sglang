@@ -10,8 +10,8 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.17
-ARG SGL_VERSION=0.5.5.post1
+ARG SGL_KERNEL_VERSION=0.3.17.post1
+ARG SGL_VERSION=0.5.5.post2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
@@ -19,11 +19,13 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
+ARG FLASHINFER_VERSION=0.5.2
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
+    FLASHINFER_VERSION=${FLASHINFER_VERSION}
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
@@ -41,7 +43,10 @@ RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y &
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
  && update-alternatives --set python3 /usr/bin/python3.12 \
  && wget https://bootstrap.pypa.io/get-pip.py \
- && python3 get-pip.py
+ && python3 get-pip.py \
+ # Fix for `apt-add-repository`
+ && cd /usr/lib/python3/dist-packages/ \
+ && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
 # Set timezone and install all packages
 RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -127,8 +132,8 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
    fi \
  && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-      python3 -m pip install flashinfer-jit-cache==0.5.0 --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
-    fi \
+      python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+   fi \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \

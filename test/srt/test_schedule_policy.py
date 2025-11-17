@@ -6,7 +6,7 @@ from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     SchedulePolicy,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.test_utils import CustomTestCase
 

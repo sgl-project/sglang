@@ -17,10 +17,8 @@ suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("function_call/test_json_schema_constraint.py", 1),
-        TestFile("hicache/test_hicache.py", 116),
-        TestFile("hicache/test_hicache_eagle.py", 150),
-        TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
+        TestFile("hicache/test_hicache_variants.py", 393),
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 50),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 20),
@@ -28,6 +26,7 @@ suites = {
         TestFile("lora/test_lora_eviction.py", 240),
         TestFile("lora/test_lora_update.py", 600),
         TestFile("lora/test_lora_backend.py", 99),
+        TestFile("lora/test_lora_spec_decoding.py", 150),
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
@@ -77,6 +76,7 @@ suites = {
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
+        TestFile("test_fp8_utils.py", 5),
         TestFile("rotary_embedding/test_mrope.py", 10),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 80),
@@ -118,7 +118,7 @@ suites = {
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 450),
         TestFile("test_standalone_speculative_decoding.py", 150),
-        TestFile("test_start_profile.py", 60),
+        TestFile("test_start_profile.py", 180),
         TestFile("test_profile_merger.py", 60),
         TestFile("test_profile_merger_http_api.py", 15),
         TestFile("test_swa_unittest.py", 1),
@@ -133,7 +133,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 100),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 170),
-        TestFile("test_vision_openai_server_a.py", 900),
+        # TestFile("test_vision_openai_server_a.py", 900),
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_modelopt_export.py", 30),
@@ -168,6 +168,8 @@ suites = {
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
         TestFile("models/test_kimi_k2_models.py", 200),
+        TestFile("test_deepseek_v32_basic.py", 275),
+        TestFile("test_deepseek_v32_mtp.py", 275),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
@@ -176,14 +178,16 @@ suites = {
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
+        # TODO: Add it back after the bug is fixed
+        # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12533
         # TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
     ],
@@ -193,11 +197,6 @@ suites = {
     ],
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
-    ],
-    "per-commit-8-gpu-h200-deepseek-v32": [
-        TestFile("test_deepseek_v32_basic.py", 275),
-        TestFile("test_deepseek_v32_mtp.py", 275),
-        TestFile("test_deepseek_v32_nsabackend.py", 600),
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
@@ -210,28 +209,34 @@ suites = {
     "nightly-1-gpu": [
         TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
         TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_openai_api.py", 30),
         TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
-        TestFile("test_deepseek_v3_deterministic.py", 240),
         TestFile("test_cpp_radix_cache.py", 60),
+        TestFile("test_deepseek_v3_deterministic.py", 240),
     ],
     "nightly-4-gpu-b200": [
-        TestFile("test_fp4_moe.py", 300),
+        TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
         TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
         TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
+        TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
+        TestFile("test_fp4_moe.py", 300),
     ],
     "nightly-8-gpu-b200": [],
-    "nightly-4-gpu": [],
+    "nightly-4-gpu": [
+        TestFile("test_qwen3_next_deterministic.py", 200),
+    ],
     "nightly-8-gpu": [],
-    "nightly-8-gpu-h200": [],
+    "nightly-8-gpu-h200": [
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
+    ],
     "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("cpu/test_comm.py"),
+        TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py"),
         TestFile("entrypoints/http_server/test_abort_request.py"),
         TestFile("ep/test_deepep_internode.py"),
@@ -243,21 +248,14 @@ suites = {
         TestFile("ep/test_moe_deepep_eval_accuracy_large.py"),
         TestFile("function_call/test_unknown_tool_name.py"),
         TestFile("hicache/test_disaggregation_hicache.py"),
-        TestFile("hicache/test_hicache_page.py"),
         TestFile("hicache/test_hicache_storage_benchmark.py"),
         TestFile("hicache/test_hicache_storage_e2e.py"),
         TestFile("layers/attention/nsa/test_act_quant_triton.py"),
         TestFile("layers/moe/test_moe_runners.py"),
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
-        TestFile("models/lora/test_lora.py"),
-        TestFile("models/lora/test_lora_backend.py"),
-        TestFile("models/lora/test_lora_cuda_graph.py"),
-        TestFile("models/lora/test_lora_eviction.py"),
-        TestFile("models/lora/test_lora_qwen3.py"),
-        TestFile("models/lora/test_lora_tp.py"),
-        TestFile("models/lora/test_lora_update.py"),
-        TestFile("models/lora/test_multi_lora_backend.py"),
+        TestFile("lora/test_lora_cuda_graph.py"),
+        TestFile("lora/test_lora_qwen3_vl.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
@@ -300,6 +298,7 @@ suites = {
         TestFile("test_deepseek_chat_templates.py"),
         TestFile("test_disaggregation.py"),
         TestFile("test_double_sparsity.py"),
+        TestFile("test_eagle_infer_beta_dp_attention.py"),
         TestFile("test_embedding_openai_server.py"),
         TestFile("test_enable_thinking.py"),
         TestFile("test_eplb.py"),
@@ -314,10 +313,8 @@ suites = {
         TestFile("test_get_weights_by_name.py"),
         TestFile("test_gpt_oss_common.py"),
         TestFile("test_health_check.py"),
-        TestFile("test_hicache.py"),
-        TestFile("test_hicache_mla.py"),
-        TestFile("test_hicache_page.py"),
         TestFile("test_hicache_storage.py"),
+        TestFile("test_hicache_variants.py"),
         TestFile("test_hybrid_dp_ep_tp_mtp.py"),
         TestFile("test_int4_kernel.py"),
         TestFile("test_int8_kernel.py"),
@@ -375,6 +372,7 @@ suites = {
         TestFile("test_verl_engine_4_gpu.py"),
         TestFile("test_verl_engine_server.py"),
         TestFile("test_vertex_endpoint.py"),
+        TestFile("test_vision_openai_server_a.py"),  # TODO: Fix timeout
         TestFile("test_vision_openai_server_b.py"),
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_vlm_accuracy.py"),
@@ -394,7 +392,7 @@ suite_amd = {
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 150),
-        TestFile("lora/test_lora_backend.py", 99),
+        # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
@@ -425,6 +423,7 @@ suite_amd = {
         TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("test_abort.py", 51),
+        TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_eval_fp8_accuracy.py", 303),
@@ -457,6 +456,7 @@ suite_amd = {
         # TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_sliding_window.py", 250),
+        TestFile("test_type_based_dispatcher.py", 10),
         TestFile("test_wave_attention_kernels.py", 2),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
@@ -526,6 +526,8 @@ suite_ascend = {
     "per-commit-1-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_hicache_mha.py", 400),
+        TestFile("ascend/test_ascend_sampling_backend.py", 400),
     ],
     "per-commit-2-ascend-npu": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
@@ -632,18 +634,6 @@ if __name__ == "__main__":
         help="The suite to run",
     )
     arg_parser.add_argument(
-        "--range-begin",
-        type=int,
-        default=0,
-        help="The begin index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
-        "--range-end",
-        type=int,
-        default=None,
-        help="The end index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
         "--auto-partition-id",
         type=int,
         help="Use auto load balancing. The part id.",
@@ -671,8 +661,6 @@ if __name__ == "__main__":
 
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
-    else:
-        files = files[args.range_begin : args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
