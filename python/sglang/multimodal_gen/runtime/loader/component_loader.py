@@ -21,6 +21,9 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.pipelines.stablediffusion3 import (
+    StableDiffusion3PipelineConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
@@ -42,7 +45,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-from sglang.multimodal_gen.configs.pipelines.stablediffusion3 import StableDiffusion3PipelineConfig
+
 logger = init_logger(__name__)
 
 
@@ -245,6 +248,7 @@ class TextEncoderLoader(ComponentLoader):
 
         def is_not_first_encoder(module_name):
             return "2" in module_name or "3" in module_name
+
         def is_third_encoder(module_name):
             return "3" in module_name
 
@@ -475,7 +479,9 @@ class VAELoader(ComponentLoader):
 
             # Priority: fp16 > full precision > any matching file
             if precision == "fp16":
-                fp16_path = os.path.join(str(model_path), f"{base_name}.fp16.safetensors")
+                fp16_path = os.path.join(
+                    str(model_path), f"{base_name}.fp16.safetensors"
+                )
                 target_files = [fp16_path] if os.path.exists(fp16_path) else []
             else:
                 full_path = os.path.join(str(model_path), f"{base_name}.safetensors")
