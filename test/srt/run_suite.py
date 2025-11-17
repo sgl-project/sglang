@@ -1,16 +1,8 @@
 import argparse
 import glob
-from dataclasses import dataclass
 from pathlib import Path
 
-from sglang.test.test_utils import run_unittest_files
-
-
-@dataclass
-class TestFile:
-    name: str
-    estimated_time: float = 60
-
+from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
@@ -95,6 +87,7 @@ suites = {
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
         TestFile("test_mla_int8_deepseek_v3.py", 300),
+        TestFile("test_model_hooks.py", 1),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_ngram_speculative_decoding.py", 290),
@@ -209,7 +202,6 @@ suites = {
     "nightly-1-gpu": [
         TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
         TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_openai_api.py", 30),
@@ -256,9 +248,7 @@ suites = {
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
         TestFile("lora/test_lora_cuda_graph.py"),
-        TestFile("lora/test_lora_qwen3.py"),
-        TestFile("lora/test_lora_tp.py"),
-        TestFile("lora/test_lora_update.py"),
+        TestFile("lora/test_lora_qwen3_vl.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
@@ -383,6 +373,7 @@ suites = {
         TestFile("test_w8a8_quantization.py"),
         TestFile("test_wave_attention_backend.py"),
         TestFile("test_weight_version.py"),
+        TestFile("test_deepseek_v32_cp_single_node.py", 275),
     ],
 }
 
@@ -621,7 +612,7 @@ def _sanity_check_suites(suites):
     )
 
 
-if __name__ == "__main__":
+def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
         "--timeout-per-file",
@@ -669,3 +660,7 @@ if __name__ == "__main__":
 
     exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
