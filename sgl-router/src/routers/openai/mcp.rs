@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use super::utils::event_types;
 use crate::{
-    mcp,
+    mcp::{self, format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR},
     protocols::responses::{
         generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
     },
@@ -258,18 +258,16 @@ pub(super) async fn execute_streaming_tool_calls(
             continue;
         }
 
-        // Parse formatted name: server_label__tool_name (double underscore separator)
+        // Parse formatted name using regex: server_label__tool_name
         let formatted_tool_name = &call.name;
         let (call_server_label, original_tool_name) =
-            if let Some(sep_pos) = formatted_tool_name.find("__") {
-                let label = &formatted_tool_name[..sep_pos];
-                let tool = &formatted_tool_name[sep_pos + 2..]; // +2 to skip "__"
-                (label.to_string(), tool.to_string())
+            if let Some((server, tool)) = parse_tool_name(formatted_tool_name) {
+                (server, tool)
             } else {
                 // Fallback: treat entire name as tool name (shouldn't happen with new format)
                 warn!(
-                    "Tool name '{}' not in expected format 'server_label__tool_name'",
-                    formatted_tool_name
+                    "Tool name '{}' not in expected format 'server_label{}tool_name'",
+                    formatted_tool_name, TOOL_NAME_SEPARATOR
                 );
                 ("unknown".to_string(), formatted_tool_name.clone())
             };
@@ -393,7 +391,7 @@ pub(super) fn prepare_mcp_payload_for_streaming(
 
         // Add MCP tools with formatted names (server_label__tool_name)
         for ((server_label, tool_name), (tool, _server_url)) in tools_map {
-            let formatted_name = format!("{}__{}", server_label, tool_name);
+            let formatted_name = format_tool_name(server_label, tool_name);
             let parameters = Value::Object((*tool.input_schema).clone());
             let tool_json = serde_json::json!({
                 "type": event_types::ITEM_TYPE_FUNCTION,
@@ -578,15 +576,15 @@ pub(super) fn send_mcp_call_completion_events_with_error(
     let effective_output_index = call.effective_output_index();
 
     // Strip server_label__ prefix from formatted name
-    let original_tool_name = if let Some(sep_pos) = call.name.find("__") {
-        &call.name[sep_pos + 2..]
+    let original_tool_name = if let Some((_, tool)) = parse_tool_name(&call.name) {
+        tool
     } else {
-        &call.name
+        call.name.clone()
     };
 
     // Build mcp_call item
     let mcp_call_item = build_mcp_call_item(
-        original_tool_name,
+        &original_tool_name,
         &call.arguments_buffer,
         output,
         server_label,
@@ -770,18 +768,16 @@ pub(super) async fn execute_tool_loop(
                 );
             }
 
-            // Parse formatted name: server_label__tool_name (double underscore separator)
+            // Parse formatted name using regex: server_label__tool_name
             let formatted_tool_name = &tool_name;
             let (server_label_parsed, original_tool_name) =
-                if let Some(sep_pos) = formatted_tool_name.find("__") {
-                    let label = &formatted_tool_name[..sep_pos];
-                    let tool = &formatted_tool_name[sep_pos + 2..]; // +2 to skip "__"
-                    (label.to_string(), tool.to_string())
+                if let Some((server, tool)) = parse_tool_name(formatted_tool_name) {
+                    (server, tool)
                 } else {
                     // Fallback: treat entire name as tool name
                     warn!(
-                        "Tool name '{}' not in expected format 'server_label__tool_name'",
-                        formatted_tool_name
+                        "Tool name '{}' not in expected format 'server_label{}tool_name'",
+                        formatted_tool_name, TOOL_NAME_SEPARATOR
                     );
                     ("unknown".to_string(), formatted_tool_name.clone())
                 };
@@ -942,15 +938,15 @@ pub(super) fn build_incomplete_response(
                     .unwrap_or("{}");
 
                 // Strip server_label__ prefix from formatted name
-                let original_tool_name = if let Some(sep_pos) = tool_name.find("__") {
-                    &tool_name[sep_pos + 2..]
+                let original_tool_name = if let Some((_, tool)) = parse_tool_name(tool_name) {
+                    tool
                 } else {
-                    tool_name
+                    tool_name.to_string()
                 };
 
                 // Mark as incomplete - not executed
                 let mcp_call_item = build_mcp_call_item(
-                    original_tool_name,
+                    &original_tool_name,
                     args,
                     "", // No output - wasn't executed
                     server_label,

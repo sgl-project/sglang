@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use super::conversions;
 use crate::{
-    mcp::{self, error::McpError, McpManager},
+    mcp::{
+        self, error::McpError, format_tool_name, parse_tool_name, McpManager, TOOL_NAME_SEPARATOR,
+    },
     protocols::{
         chat::{
             ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -259,8 +261,8 @@ pub(super) async fn execute_tool_loop(
     // Build MCP tools with formatted names: server_label/tool_name
     let mut mcp_tools = Vec::new();
     for ((server_label, tool_name), (tool, _server_url)) in &tools_map {
-        // Format tool name as server_label__tool_name (double underscore separator)
-        let formatted_name = format!("{}__{}", server_label, tool_name);
+        // Format tool name using utility function
+        let formatted_name = format_tool_name(server_label, tool_name);
         let mut tool_clone = tool.clone();
         tool_clone.name = std::borrow::Cow::Owned(formatted_name);
         mcp_tools.push(tool_clone);
@@ -393,17 +395,15 @@ pub(super) async fn execute_tool_loop(
                     formatted_tool_name, call_id, args_json_str
                 );
 
-                // Parse formatted name: server_label__tool_name (double underscore separator)
+                // Parse formatted name using regex: server_label__tool_name
                 let (server_label, original_tool_name) =
-                    if let Some(sep_pos) = formatted_tool_name.find("__") {
-                        let server_label = &formatted_tool_name[..sep_pos];
-                        let tool_name = &formatted_tool_name[sep_pos + 2..]; // +2 to skip "__"
-                        (server_label.to_string(), tool_name.to_string())
+                    if let Some((server, tool)) = parse_tool_name(&formatted_tool_name) {
+                        (server, tool)
                     } else {
                         // Fallback: treat entire name as tool name (shouldn't happen)
                         warn!(
-                            "Tool name '{}' not in expected format 'server_label__tool_name'",
-                            formatted_tool_name
+                            "Tool name '{}' not in expected format 'server_label{}tool_name'",
+                            formatted_tool_name, TOOL_NAME_SEPARATOR
                         );
                         ("unknown".to_string(), formatted_tool_name.clone())
                     };
@@ -692,8 +692,8 @@ async fn execute_tool_loop_streaming_internal(
     // Build MCP tools with formatted names: server_label__tool_name
     let mut mcp_tools = Vec::new();
     for ((server_label, tool_name), (tool, _server_url)) in &tools_map {
-        // Format tool name as server_label__tool_name (double underscore separator)
-        let formatted_name = format!("{}__{}", server_label, tool_name);
+        // Format tool name using utility function
+        let formatted_name = format_tool_name(server_label, tool_name);
         let mut tool_clone = tool.clone();
         tool_clone.name = std::borrow::Cow::Owned(formatted_name);
         mcp_tools.push(tool_clone);
@@ -847,17 +847,15 @@ async fn execute_tool_loop_streaming_internal(
                     state.total_calls, state.total_calls, formatted_tool_name, call_id
                 );
 
-                // Parse formatted name: server_label__tool_name (double underscore separator)
+                // Parse formatted name using regex: server_label__tool_name
                 let (server_label, original_tool_name) =
-                    if let Some(sep_pos) = formatted_tool_name.find("__") {
-                        let server_label = &formatted_tool_name[..sep_pos];
-                        let tool_name = &formatted_tool_name[sep_pos + 2..]; // +2 to skip "__"
-                        (server_label.to_string(), tool_name.to_string())
+                    if let Some((server, tool)) = parse_tool_name(&formatted_tool_name) {
+                        (server, tool)
                     } else {
                         // Fallback: treat entire name as tool name (shouldn't happen)
                         warn!(
-                            "Tool name '{}' not in expected format 'server_label__tool_name'",
-                            formatted_tool_name
+                            "Tool name '{}' not in expected format 'server_label{}tool_name'",
+                            formatted_tool_name, TOOL_NAME_SEPARATOR
                         );
                         ("unknown".to_string(), formatted_tool_name.clone())
                     };

@@ -3,7 +3,7 @@
 //! Manages both static MCP servers (from config) and dynamic MCP servers (from requests).
 //! Static clients are never evicted; dynamic clients use LRU eviction via connection pool.
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
@@ -165,9 +165,7 @@ impl McpManager {
     pub async fn list_tools_for_request(
         &self,
         dynamic_servers: &[(String, String)],
-    ) -> std::collections::HashMap<(String, String), (Tool, String)> {
-        use std::collections::HashMap;
-
+    ) -> HashMap<(String, String), (Tool, String)> {
         let mut result = HashMap::new();
 
         // Add static tools from config

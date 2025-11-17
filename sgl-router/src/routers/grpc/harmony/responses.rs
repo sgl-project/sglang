@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
-    mcp::{self, McpManager},
+    mcp::{self, format_tool_name, parse_tool_name, McpManager, TOOL_NAME_SEPARATOR},
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
@@ -58,6 +58,7 @@ use crate::{
         common::responses::{
             build_sse_response, ensure_mcp_connection, persist_response_if_needed,
             streaming::{OutputItemType, ResponseStreamEventEmitter},
+            utils::extract_dynamic_mcp_servers,
         },
         context::SharedComponents,
         error,
@@ -294,8 +295,6 @@ async fn execute_with_mcp_loop(
     ctx: &HarmonyResponsesContext,
     mut current_request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
-    use crate::routers::grpc::common::responses::utils::extract_dynamic_mcp_servers;
-
     let mut iteration_count = 0;
 
     // Extract all dynamic MCP servers from request
@@ -668,8 +667,6 @@ async fn execute_mcp_tool_loop_streaming(
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) {
-    use crate::routers::grpc::common::responses::utils::extract_dynamic_mcp_servers;
-
     // Extract all dynamic MCP servers from request
     let dynamic_servers: Vec<(String, String)> = current_request
         .tools
@@ -733,8 +730,8 @@ async fn execute_mcp_tool_loop_streaming(
     let tool_items: Vec<_> = tools_map
         .iter()
         .map(|((server_label, tool_name), (tool, _server_url))| {
-            // Use formatted name server_label__tool_name (double underscore separator)
-            let formatted_name = format!("{}__{}", server_label, tool_name);
+            // Use formatted name: server_label__tool_name
+            let formatted_name = format_tool_name(server_label, tool_name);
             json!({
                 "name": formatted_name,
                 "description": tool.description,
@@ -1203,18 +1200,16 @@ async fn execute_mcp_tools(
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
-        // Parse formatted name: server_label__tool_name (double underscore separator)
+        // Parse formatted name using regex: server_label__tool_name
         let formatted_tool_name = &tool_call.function.name;
         let (server_label, original_tool_name) =
-            if let Some(sep_pos) = formatted_tool_name.find("__") {
-                let server_label = &formatted_tool_name[..sep_pos];
-                let tool_name = &formatted_tool_name[sep_pos + 2..]; // +2 to skip "__"
-                (server_label.to_string(), tool_name.to_string())
+            if let Some((server, tool)) = parse_tool_name(formatted_tool_name) {
+                (server, tool)
             } else {
                 // Fallback: treat entire name as tool name (shouldn't happen with new format)
                 warn!(
-                    "Tool name '{}' not in expected format 'server_label__tool_name'",
-                    formatted_tool_name
+                    "Tool name '{}' not in expected format 'server_label{}tool_name'",
+                    formatted_tool_name, TOOL_NAME_SEPARATOR
                 );
                 ("unknown".to_string(), formatted_tool_name.clone())
             };
@@ -1442,31 +1437,6 @@ pub(crate) struct ToolResult {
     pub(crate) is_error: bool,
 }
 
-/// Convert MCP tools to Responses API tool format
-///
-/// Converts MCP Tool entries (from rmcp SDK) to ResponseTool format so the model
-/// knows about available MCP tools when making tool calls.
-pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
-    mcp_tools
-        .iter()
-        .map(|tool_info| ResponseTool {
-            r#type: ResponseToolType::Mcp,
-            function: Some(Function {
-                name: tool_info.name.to_string(),
-                description: tool_info.description.as_ref().map(|d| d.to_string()),
-                parameters: Value::Object((*tool_info.input_schema).clone()),
-                strict: None,
-            }),
-            server_url: None, // MCP tools from inventory don't have individual server URLs
-            authorization: None,
-            server_label: None,
-            server_description: tool_info.description.as_ref().map(|d| d.to_string()),
-            require_approval: None,
-            allowed_tools: None,
-        })
-        .collect()
-}
-
 /// Convert tools map to ResponseTools with formatted names (server_label__tool_name)
 ///
 /// This function formats tool names as `server_label__tool_name` to prevent name collisions
@@ -1477,8 +1447,8 @@ fn convert_mcp_tools_map_to_response_tools(
     tools_map
         .iter()
         .map(|((server_label, tool_name), (tool_info, _server_url))| {
-            // Format tool name as server_label__tool_name (double underscore separator)
-            let formatted_name = format!("{}__{}", server_label, tool_name);
+            // Format tool name using utility function
+            let formatted_name = format_tool_name(server_label, tool_name);
 
             ResponseTool {
                 r#type: ResponseToolType::Mcp,

@@ -11,6 +11,7 @@ pub mod manager;
 pub mod oauth;
 pub mod proxy;
 pub mod tool_args;
+pub mod utils;
 
 // Re-export the main types for convenience
 pub use config::{
@@ -23,3 +24,4 @@ pub use inventory::ToolInventory;
 pub use manager::{McpManager, McpManagerStats};
 pub use proxy::{create_http_client, resolve_proxy_config};
 pub use tool_args::ToolArgs;
+pub use utils::{format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR};

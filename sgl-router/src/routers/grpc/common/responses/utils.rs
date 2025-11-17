@@ -97,7 +97,7 @@ pub fn validate_worker_availability(
 /// It's used by both Harmony and Regular routers for different purposes:
 ///
 /// - **Harmony router**: Extracts both Function and MCP tools (with `include_mcp: true`)
-///   because MCP schemas are populated by convert_mcp_tools_to_response_tools() before the
+///   because MCP schemas are populated by convert_mcp_tools_map_to_response_tools() before the
 ///   pipeline runs. These tools are used to generate structural constraints in the
 ///   Harmony preparation stage.
 ///
@@ -122,7 +122,7 @@ pub fn extract_tools_from_response_tools(
                     tool_type: "function".to_string(),
                     function: f.clone(),
                 }),
-                // MCP tools: Schema populated by convert_mcp_tools_to_response_tools()
+                // MCP tools: Schema populated by convert_mcp_tools_map_to_response_tools()
                 // Only include if requested (Harmony case)
                 ResponseToolType::Mcp if include_mcp => rt.function.as_ref().map(|f| Tool {
                     tool_type: "function".to_string(),
