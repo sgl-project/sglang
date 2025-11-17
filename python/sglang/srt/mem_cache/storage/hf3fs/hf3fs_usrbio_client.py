@@ -2,6 +2,7 @@ import logging
 import multiprocessing
 import os
 import threading
+import datetime
 from functools import wraps
 from pathlib import Path
 from typing import List
@@ -121,7 +122,7 @@ class Hf3fsUsrBioClient(Hf3fsClient):
 
         # submit
         ionum = len(offsets)
-        resv = self.ior_r.submit().wait(min_results=ionum)
+        resv = self.ior_r.submit().wait(min_results=ionum, timeout=datetime.timedelta(seconds=5))
 
         # results
         hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
@@ -145,7 +146,7 @@ class Hf3fsUsrBioClient(Hf3fsClient):
 
         # submit
         ionum = len(offsets)
-        resv = self.ior_w.submit().wait(min_results=ionum)
+        resv = self.ior_w.submit().wait(min_results=ionum, timeout=datetime.timedelta(seconds=5))
 
         # results
         results = [res.result for res in resv]

@@ -331,7 +331,7 @@ class HiCacheHF3FS(HiCacheStorage):
             use_mock_client=use_mock_client,
         )
 
-    @synchronized()
+    
     def _batch_get(
         self,
         keys: List[str],
@@ -379,7 +379,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
-    @synchronized()
+    
     def _batch_set(
         self,
         keys: List[str],
@@ -486,7 +486,7 @@ class HiCacheHF3FS(HiCacheStorage):
             logger.error(f"close HiCacheHF3FS: {e}")
         logger.info("close HiCacheHF3FS")
 
-    @synchronized()
+   
     def get_stats(self):
         storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
