@@ -243,6 +243,7 @@ class ServerArgs:
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    fastapi_root_path: str = ""
     grpc_mode: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
@@ -2023,6 +2024,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="The port of the HTTP server.",
+        )
+        parser.add_argument(
+            "--fastapi-root-path",
+            type=str,
+            default=ServerArgs.fastapi_root_path,
+            help="App is behind a path based routing proxy.",
         )
         parser.add_argument(
             "--grpc-mode",
