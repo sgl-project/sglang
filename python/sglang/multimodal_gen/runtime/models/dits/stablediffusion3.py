@@ -160,14 +160,12 @@ class SD3Transformer2DModel(CachableDiT):
             )
 
             if torch.is_grad_enabled() and self.gradient_checkpointing and not is_skip:
-                encoder_embeddings, hidden_states = (
-                    self._gradient_checkpointing_func(
-                        block,
-                        hidden_states,
-                        encoder_embeddings,
-                        temb,
-                        joint_attention_kwargs,
-                    )
+                encoder_embeddings, hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_embeddings,
+                    temb,
+                    joint_attention_kwargs,
                 )
             elif not is_skip:
                 encoder_embeddings, hidden_states = block(
