@@ -87,6 +87,7 @@ suites = {
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
         TestFile("test_mla_int8_deepseek_v3.py", 300),
+        TestFile("test_model_hooks.py", 1),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_ngram_speculative_decoding.py", 290),
