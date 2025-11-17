@@ -24,6 +24,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-iso
 # ARG SGL_KERNEL_FORCE=0
 # RUN python3 -m pip install https://y.y.y/aie-shared-objects/sgl_kernel-0.3.16.post2-cp310-abi3-manylinux2014_x86_64.whl \
 #    --no-cache-dir --force-reinstall --no-deps && echo "force=${SGL_KERNEL_FORCE}"
+RUN python3 -m pip install https://y.y.y/git-assert/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir --force-reinstall 
 
 COPY . .
 
