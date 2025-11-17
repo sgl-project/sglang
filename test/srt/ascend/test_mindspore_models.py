@@ -36,6 +36,8 @@ class TestMindSporeQwen3(CustomTestCase):
                 "1",
                 "--dp-size",
                 "1",
+                "--mem-fraction-static",
+                0.8,
             ],
         )
 

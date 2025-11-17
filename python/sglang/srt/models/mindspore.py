@@ -17,7 +17,7 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
-if is_npu:
+if _is_npu:
     import mindspore as ms
     import numpy as np
     import torch_npu

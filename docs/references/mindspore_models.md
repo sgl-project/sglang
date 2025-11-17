@@ -30,10 +30,9 @@ You will need to install the following packages, due to the support of tensor co
 
 ```shell
 pip install mindspore
-pip install torch==2.7.1
-pip install torch_npu==2.7.1rc1
+pip install "torch>=2.7.1"
+pip install "torch_npu>=2.7.1rc1"
 pip install triton_ascend
-pip install torchvision==0.22.1
 ```
 
 ```shell
