@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """StableDiffusion3 Transformer model implementation."""
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 from diffusers.models.attention import JointTransformerBlock
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
