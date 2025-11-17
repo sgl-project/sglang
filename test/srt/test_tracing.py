@@ -4,7 +4,7 @@ import subprocess
 import time
 import unittest
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Dict, Optional, Union
 
 import requests
 import zmq
