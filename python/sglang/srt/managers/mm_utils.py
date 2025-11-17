@@ -266,8 +266,8 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         input_ids_tensor = torch.as_tensor(input_ids)
 
-        # Check if image splitting is enabled
-        if envs.SGLANG_ENABLE_IMAGE_SPLITTING.get():
+        # Check if MM splitting is enabled
+        if envs.SGLANG_ENABLE_MM_SPLITTING.get():
             items_by_modality = defaultdict(list)
             for item in mm_inputs.mm_items:
                 items_by_modality[item.modality].append(item)
