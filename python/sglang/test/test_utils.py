@@ -980,14 +980,14 @@ async def _run_api_benchmark_requests(
 ):
     """
     Helper function to run API benchmark requests and collect metrics.
-    
+
     Args:
         base_url: The base URL of the server
         endpoint: The API endpoint to test (e.g., "/v1/score", "/v1/embeddings")
         test_requests: List of request payloads to send
         num_requests: Total number of requests expected
         response_validator: Function to validate if response contains expected data
-    
+
     Returns:
         Dictionary with benchmark metrics
     """
