@@ -396,7 +396,7 @@ class Scheduler(
         self.is_hybrid = self.tp_worker.is_hybrid
         self.is_hybrid_gdn = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
-            or (self.tp_worker.model_runner.hybrid_lightning_attn_config is not None)
+            or self.tp_worker.model_runner.hybrid_lightning_attn_config is not None
         )
 
         if self.is_hybrid:

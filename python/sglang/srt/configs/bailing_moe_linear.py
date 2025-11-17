@@ -1,11 +1,8 @@
-import enum
-
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.configs.qwen3_next import HybridLayerType, Qwen3NextConfig
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 logger = logging.get_logger(__name__)
 
@@ -115,6 +112,8 @@ class BailingMoeLinearConfig(Qwen3NextConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
             intermediate_size=0,  # lightning attention

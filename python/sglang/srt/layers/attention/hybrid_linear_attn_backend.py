@@ -876,7 +876,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode)
+        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
         self.forward_metadata = LightningAttnMetadata.prepare_decode(
             metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
         )
