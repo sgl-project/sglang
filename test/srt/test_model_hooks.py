@@ -5,7 +5,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from sglang.srt.model_executor import model_runner as mr
+from sglang.srt.model_executor.hook_manager import register_hooks
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,28 +46,14 @@ class TinyModel(nn.Module):
         return self.outer(x)
 
 
-class DummyModelRunner:
-    """
-    Minimal stand-in for ModelRunner that only exposes `model` and
-    reuses the real ModelRunner.register_hooks implementation.
-    """
-
-    def __init__(self):
-        self.model = TinyModel()
-
-    # Reuse the ModelRunner.register_hooks method as an unbound function
-    register_hooks = mr.ModelRunner.register_hooks
-
-
-class TestModelRunnerHooks(CustomTestCase):
+class TestAttachHooks(CustomTestCase):
     """Tests for ModelRunner.register_hooks / resolve_callable integration."""
 
     def setUp(self):
         HOOK_CALLS.clear()
 
-    def test_hook_is_called(self):
+    def test_hook_is_attached(self):
         """Hook from a factory string is registered and fired."""
-        runner = DummyModelRunner()
         hook_specs = [
             {
                 "target_modules": ["outer.0", "outer.1"],
@@ -76,47 +62,46 @@ class TestModelRunnerHooks(CustomTestCase):
             },
             {
                 "target_modules": ["inner.*"],
-                "hook_factory": ("test_model_hooks:dummy_hook_factory"),
+                "hook_factory": "test_model_hooks:dummy_hook_factory",
                 "config": {"tag": "forward-ok"},
             },
         ]
 
-        runner.register_hooks(hook_specs)
+        model = TinyModel()
+        register_hooks(model, hook_specs)
 
         x = torch.randn(3, 4)
-        _ = runner.model(x)
+        _ = model(x)
 
         self.assertEqual(
             len(HOOK_CALLS),
             4,
             "Forward hook was not called correct number of times",
         )
-
         tags = {call["tag"] for call in HOOK_CALLS}
         self.assertIn("forward-ok", tags)
 
     def test_no_matching_modules_does_not_crash(self):
         """Hook spec with no matching modules should not crash."""
-        runner = DummyModelRunner()
-
+        model = TinyModel()
         hook_specs = [
             {
                 "name": "no_match",
                 "target_modules": ["does_not_exist.*"],
-                "hook_factory": ("test_model_hooks:dummy_hook_factory"),
+                "hook_factory": "test_model_hooks:dummy_hook_factory",
                 "config": {"tag": "unused"},
             }
         ]
 
-        runner.register_hooks(hook_specs)
+        register_hooks(model, hook_specs)
 
         x = torch.randn(3, 4)
-        _ = runner.model(x)
+        _ = model(x)
 
         # No hooks should have fired
         self.assertEqual(len(HOOK_CALLS), 0)
 
-    def test_cli_hooks_reach_model_and_fire(self):
+    def test_cli_hooks_reach_model(self):
         """
         Ensure that when hooks are provided via CLI, they are parsed into
         ServerArgs, passed to ModelRunner.register_hooks, and actually
@@ -129,7 +114,7 @@ class TestModelRunnerHooks(CustomTestCase):
             {
                 "name": "outer_and_inner_from_cli",
                 "target_modules": ["outer.0", "outer.1", "inner.*"],
-                "hook_factory": ("test_model_hooks:dummy_hook_factory"),
+                "hook_factory": "test_model_hooks:dummy_hook_factory",
                 "config": {"tag": "cli-hook"},
             }
         ]
@@ -137,7 +122,6 @@ class TestModelRunnerHooks(CustomTestCase):
         cli_args = [
             "--model-path",
             "Qwen/Qwen2-7B-Instruct",  # Dummy value; not used in this test
-            "--enable-hooks",
             "--hooks",
             json.dumps(hooks_spec),
         ]
@@ -145,14 +129,13 @@ class TestModelRunnerHooks(CustomTestCase):
         args = parser.parse_args(cli_args)
         server_args = ServerArgs.from_cli_args(args)
 
-        self.assertTrue(server_args.enable_hooks)
         self.assertEqual(server_args.hooks, hooks_spec)
 
-        runner = DummyModelRunner()
-        runner.register_hooks(server_args.hooks)
+        model = TinyModel()
+        register_hooks(model, server_args.hooks)
 
         x = torch.randn(3, 4)
-        _ = runner.model(x)
+        _ = model(x)
 
         # We expect hooks on outer.0, outer.1, inner.0, inner.1  => 4 calls
         self.assertEqual(

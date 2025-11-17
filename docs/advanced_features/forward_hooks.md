@@ -1,6 +1,6 @@
 ## Model Hooks
 
-SGLang supports attaching **PyTorch forward hooks** to specific submodules in the loaded model, configured **entirely via `server_args` JSON**.
+SGLang supports attaching PyTorch forward hooks to specific submodules in the loaded model, configured entirely via `server_args` JSON.
 
 This is useful for:
 
@@ -14,21 +14,19 @@ Hooks are attached once during `ModelRunner.initialize` and run on every forward
 
 ### Configuration overview
 
-Hooks are configured via two new `ServerArgs` fields:
+Hooks are configured via a `ServerArgs` field:
 
 ```python
 class ServerArgs:
     ...
     # For forward hooks
-    enable_hooks: bool = False
     hooks: Optional[List[dict[str, Any]]] = None
-```
+````
 
 In JSON form, a minimal configuration looks like:
 
 ```jsonc
 {
-  "enable_hooks": true,
   "hooks": [
     {
       "name": "outer_linear_hooks",
@@ -44,21 +42,12 @@ In JSON form, a minimal configuration looks like:
 
 #### Top-level fields
 
-* `enable_hooks` (bool, default: `false`)
-  When `true`, `ModelRunner.initialize()` will look for `server_args.hooks` and register hooks accordingly.
-
 * `hooks` (optional list of objects)
-  Each element is a **hook spec** describing:
+  Each element is a hook spec describing:
 
   * Which modules to target
   * Which Python factory to call
   * What configuration to pass into that factory
-
-> If `enable_hooks` is `true` but `hooks` is empty or `null`, SGLang logs:
->
-> ```text
-> enable_hooks=True but no 'hooks' specified in server_args
-> ```
 
 ---
 
@@ -143,8 +132,9 @@ def resolve_callable(path: Optional[str]) -> Optional[Callable]:
 
 * If the path is malformed (not enough dots and no `:`), a `ValueError` is raised at startup.
 * If the module imports but the attribute is missing, an `AttributeError` is raised with a clear error message.
+* If the hook factory returns `None`, a warning is logged and no hook is registered for that spec (initialization continues).
 
-Both of these cause initialization to fail fast with a descriptive error.
+The first two cause initialization to fail fast with a descriptive error; the last one is non-fatal.
 
 #### `config` (optional)
 
@@ -159,36 +149,48 @@ Both of these cause initialization to fail fast with a descriptive error.
 Hooks are registered in `ModelRunner.initialize()`:
 
 ```python
-if server_args.enable_hooks:
-    hook_specs = getattr(server_args, "hooks", None)
-    if hook_specs:
-        self.register_hooks(hook_specs)
-    else:
-        logger.warning(
-            "enable_hooks=True but no 'hooks' specified in server_args"
-        )
+if server_args.hooks:
+    register_hooks(self.model, server_args.hooks)
 ```
 
-The actual registration logic is implemented in `ModelRunner.register_hooks`:
+The actual registration logic is implemented by `register_hooks`:
 
 ```python
-def register_hooks(self, hook_specs: List[dict[str, Any]]) -> None:
+def register_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
     """
     hook_specs is a list of dicts from server_args.hooks.
     Attaches forward hooks to the matching modules.
     """
-    name_to_module = dict(self.model.named_modules())
+    name_to_module = dict(model.named_modules())
 
     for spec in hook_specs:
-        target_patterns = spec["target_modules"]
-        hook_factory_path = spec.get("hook_factory")
-        config = spec.get("config") or {}
+        spec_name = spec.get("name", "")
+        target_patterns = spec.get("target_modules", [])
+        if not target_patterns:
+            logger.warning(
+                f"Hook spec '{spec_name}' has no 'target_modules', skipping"
+            )
+            continue
 
+        hook_factory_path = spec.get("hook_factory")
+        if not hook_factory_path:
+            logger.warning(
+                f"Hook spec '{spec_name}' has no 'hook_factory', skipping"
+            )
+            continue
+
+        config = spec.get("config") or {}
         hook_factory = resolve_callable(hook_factory_path)
 
         hook = hook_factory(config) if hook_factory else None
+        if hook is None:
+            logger.warning(
+                f"Hook factory '{hook_factory_path}' for spec '{spec_name}' "
+                "returned None, not registering any hook"
+            )
+            continue
 
-        # Resolve patterns like "outer.*" or "outer.inner.*"
+        # Resolve patterns like "model.layers.*.mlp"
         matched = []
         for name, module in name_to_module.items():
             if any(fnmatch.fnmatch(name, pattern) for pattern in target_patterns):
@@ -196,7 +198,7 @@ def register_hooks(self, hook_specs: List[dict[str, Any]]) -> None:
 
         if not matched:
             logger.warning(
-                f"No modules matched hook spec '{spec.get('name', '')}' "
+                f"No modules matched hook spec '{spec_name}' "
                 f"patterns={target_patterns}"
             )
             continue
@@ -205,7 +207,7 @@ def register_hooks(self, hook_specs: List[dict[str, Any]]) -> None:
             if hook:
                 _ = module.register_forward_hook(hook)
                 logger.info(
-                    f"Registered forward hook '{spec.get('name', '')}' "
+                    f"Registered forward hook '{spec_name}' "
                     f"on {module_name}"
                 )
 ```
@@ -214,8 +216,9 @@ Key points:
 
 * Hooks are **forward hooks only** (via `module.register_forward_hook`).
 * They are attached once at initialization.
-* Hook handles are currently not stored on `ModelRunner` (i.e. no runtime removal API yet).
-* Failure to match any modules is **non-fatal**; a warning is logged instead.
+* Hook handles are currently not stored on `ModelRunner` (they cannot be removed later via this API).
+* Failure to match any modules is non-fatal; a warning is logged instead.
+* If a hook factory returns `None`, a warning is logged and that spec is skipped.
 
 ---
 
@@ -224,9 +227,9 @@ Key points:
 A hook factory is a regular Python function:
 
 * Takes a `config: dict` (from JSON)
-* Returns a **forward hook** function with signature `(module, inputs, output)`
+* Returns a forward hook function with signature `(module, inputs, output)`
 
-Example (from the tests):
+Example:
 
 ```python
 HOOK_CALLS = []
@@ -252,7 +255,6 @@ In JSON:
 
 ```jsonc
 {
-  "enable_hooks": true,
   "hooks": [
     {
       "name": "capture_outer",
@@ -275,60 +277,21 @@ This will:
 
 ---
 
-### Testing and examples
-
-The behavior of `register_hooks` and `resolve_callable` is covered by tests in:
-
-* `test/srt/test_model_hooks.py`
-
-The tests demonstrate:
-
-1. **Hooks are called** when a valid `hook_factory` path and `target_modules` are provided.
-
-   ```python
-   hook_specs = [
-       {
-           "target_modules": ["outer.0", "outer.1"],
-           "hook_factory": "sglang.test.srt.test_model_hooks:dummy_hook_factory",
-           "config": {"tag": "forward-ok"},
-       }
-   ]
-
-   runner.register_hooks(hook_specs)
-   x = torch.randn(3, 4)
-   _ = runner.model(x)
-
-   assert len(HOOK_CALLS) > 0
-   ```
-
-2. **No matching modules is non-fatal** and doesn’t crash the forward pass:
-
-   ```python
-   hook_specs = [
-       {
-           "name": "no_match",
-           "target_modules": ["does_not_exist.*"],
-           "hook_factory": "sglang.test.test_model_hooks:dummy_hook_factory",
-           "config": {"tag": "unused"},
-       }
-   ]
-
-   runner.register_hooks(hook_specs)
-   x = torch.randn(3, 4)
-   _ = runner.model(x)
-
-   assert len(HOOK_CALLS) == 0
-   ```
-
----
-
 ### Summary
 
-* Use `enable_hooks: true` to turn on the feature.
-* Define `hooks` as a list of specs.
+* Define `hooks` as a list of specs in `ServerArgs` to turn on the feature.
+
 * Each spec:
 
   * selects modules via `target_modules` (glob patterns over `model.named_modules()`),
   * points to a hook factory via `hook_factory`,
   * passes arbitrary `config` into that factory.
+
+* Hook factories are resolved via `resolve_callable`, which supports `module:factory` and `module.submodule.factory`.
+
 * Hooks are standard PyTorch forward hooks, attached once at startup and invoked on every forward pass.
+
+* Misconfiguration is either:
+
+  * **fatal and explicit** (bad path / missing attribute), or
+  * **non-fatal with clear warnings** (no targets matched, or factory returned `None`).

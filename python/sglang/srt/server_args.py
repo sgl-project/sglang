@@ -572,7 +572,6 @@ class ServerArgs:
     decrypted_draft_config_file: Optional[str] = None
 
     # For forward hooks
-    enable_hooks: bool = False
     hooks: Optional[List[dict[str, Any]]] = None
 
     def __post_init__(self):
@@ -3668,16 +3667,10 @@ class ServerArgs:
 
         # For registering hooks
         parser.add_argument(
-            "--enable-hooks",
-            dest="enable_hooks",
-            action="store_true",
-            help="Enable forward hooks on the model",
-        )
-        parser.add_argument(
             "--hooks",
             type=json_list_type,
             default=None,
-            help="The hooks to be attached. Only run when hooks are enabled",
+            help="The hooks to be attached.",
         )
 
     @classmethod

@@ -398,7 +398,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Forward hooks
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--enable-hooks` | Enable registration of user-defined PyTorch forward hooks on the model. When set, hooks defined via `--hooks` are attached during server initialization. This is useful for logging intermediate activations, debugging, or custom instrumentation. | `False` | bool flag (set to enable) |
 | `--hooks` | JSON-formatted list of hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
 
 ## Debug tensor dumps

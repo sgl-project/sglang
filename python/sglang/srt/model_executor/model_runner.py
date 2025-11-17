@@ -14,9 +14,7 @@
 """ModelRunner runs the forward passes of the models."""
 
 import datetime
-import fnmatch
 import gc
-import importlib
 import inspect
 import json
 import logging
@@ -26,7 +24,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -114,6 +112,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.hook_manager import register_hooks
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -498,14 +497,8 @@ class ModelRunner:
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
-        if server_args.enable_hooks:
-            hook_specs = getattr(server_args, "hooks", None)
-            if hook_specs:
-                self.register_hooks(hook_specs)
-            else:
-                logger.warning(
-                    "enable_hooks=True but no 'hooks' specified in server_args"
-                )
+        if server_args.hooks:
+            register_hooks(self.model, server_args.hooks)
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -2057,54 +2050,6 @@ class ModelRunner:
                     f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
                 )
 
-    def register_hooks(self, hook_specs: List[dict[str, Any]]) -> None:
-        """
-        hook_specs is a list of dicts from server_args.hooks.
-        Attaches forward hooks to the matching modules.
-        """
-        name_to_module = dict(self.model.named_modules())
-
-        for spec in hook_specs:
-            spec_name = spec.get("name", "")
-            target_patterns = spec.get("target_modules")
-            if not target_patterns:
-                logger.warning(
-                    f"Hook spec '{spec_name}' has no 'target_modules', skipping"
-                )
-                continue
-
-            hook_factory_path = spec.get("hook_factory")
-            if not hook_factory_path:
-                logger.warning(
-                    f"Hook spec '{spec_name}' has no 'hook_factory', skipping"
-                )
-                continue
-
-            config = spec.get("config") or {}
-            hook_factory = resolve_callable(hook_factory_path)
-            hook = hook_factory(config) if hook_factory else None
-
-            # Resolve patterns like "model.layers.*.mlp"
-            matched = []
-            for name, module in name_to_module.items():
-                if any(fnmatch.fnmatch(name, pattern) for pattern in target_patterns):
-                    matched.append((name, module))
-
-            if not matched:
-                logger.warning(
-                    f"No modules matched hook spec '{spec.get('name', '')}' "
-                    f"patterns={target_patterns}"
-                )
-                continue
-
-            for module_name, module in matched:
-                if hook:
-                    _ = module.register_forward_hook(hook)
-                    logger.info(
-                        f"Registered forward hook '{spec.get('name', '')}' "
-                        f"on {module_name}"
-                    )
-
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
         from sglang.srt.layers.model_parallel import tensor_parallel
@@ -2425,32 +2370,6 @@ def _unwrap_tensor(tensor, tp_rank, device):
     if isinstance(tensor, LocalSerializedTensor):
         tensor = tensor.get(tp_rank)
     return tensor.to(device)
-
-
-def resolve_callable(path: Optional[str]) -> Optional[Callable]:
-    if path is None:
-        return None
-
-    if ":" in path:
-        module_name, fn_name = path.split(":", 1)
-    else:
-        parts = path.split(".")
-        if len(parts) < 2:
-            raise ValueError(
-                f"Invalid hook callable path '{path}'. "
-                "Expected 'module.submodule:factory' or 'module.submodule.factory'."
-            )
-        *mod_parts, fn_name = parts
-        module_name = ".".join(mod_parts)
-
-    module = importlib.import_module(module_name)
-    try:
-        return getattr(module, fn_name)
-    except AttributeError as e:
-        raise AttributeError(
-            f"Module '{module_name}' has no attribute '{fn_name}' "
-            f"(from hook path '{path}')"
-        ) from e
 
 
 @dataclass
