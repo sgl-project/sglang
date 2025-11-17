@@ -46,6 +46,16 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 
+# Import Triton kernel for input_ids optimization
+try:
+    from sglang.srt.speculative.spec_utils import (
+        shift_append_input_ids_triton,
+        warmup_eagle_triton_kernels,
+    )
+    _triton_available = True
+except ImportError:
+    _triton_available = False
+
 _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
@@ -141,6 +151,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        
+        # Warmup Triton kernels to avoid JIT compilation overhead
+        self._warmup_triton_kernels()
 
     def init_token_map(self):
         # Load hot token ids
@@ -209,6 +222,14 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
+
+    def _warmup_triton_kernels(self):
+        if not _triton_available or self.device != "cuda" or _is_npu:
+            return
+        try:
+            warmup_eagle_triton_kernels(self.device)
+        except Exception as e:
+            logger.warning(f"Failed to warmup EAGLE Triton kernels: {e}")
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -434,13 +455,24 @@ class EagleDraftWorker(BaseDraftWorker):
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
-            pt = 0
-            for i, extend_len in enumerate(batch.extend_seq_lens):
-                input_ids = batch.input_ids[pt : pt + extend_len]
-                batch.input_ids[pt : pt + extend_len] = torch.cat(
-                    (input_ids[1:], next_token_ids[i].reshape(1))
+            if _triton_available and self.device == "cuda" and not _is_npu:
+                if isinstance(batch.extend_seq_lens, list):
+                    extend_seq_lens_tensor = torch.tensor(
+                        batch.extend_seq_lens, dtype=torch.int32, device=self.device
+                    )
+                else:
+                    extend_seq_lens_tensor = batch.extend_seq_lens
+                shift_append_input_ids_triton(
+                    batch.input_ids, extend_seq_lens_tensor, next_token_ids
                 )
-                pt += extend_len
+            else:
+                pt = 0
+                for i, extend_len in enumerate(batch.extend_seq_lens):
+                    input_ids = batch.input_ids[pt : pt + extend_len]
+                    batch.input_ids[pt : pt + extend_len] = torch.cat(
+                        (input_ids[1:], next_token_ids[i].reshape(1))
+                    )
+                    pt += extend_len
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
