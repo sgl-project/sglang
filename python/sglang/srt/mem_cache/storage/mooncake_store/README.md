@@ -208,7 +208,7 @@ MOONCAKE_MASTER=127.0.0.1:50051 \
 MOONCAKE_PROTOCOL="rdma" \
 # Auto-discovery by default. To pin NICs:
 # export MOONCAKE_DEVICE="mlx5_0,mlx5_1"
-MOONCAKE_GLOBAL_SEGMENT_SIZE=16777216 \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=536870912 \
 python3 [path of test_mooncake_store.py]
 ```
 
