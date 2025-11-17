@@ -96,7 +96,7 @@ class SD3Transformer2DModel(CachableDiT):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
         skip_layers: Optional[List[int]] = None,
-    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+    ) -> torch.Tensor:
         # should be convert [prompt_embeds,pooled_embeds]
         assert len(encoder_hidden_states) == 2
         pooled_projections = encoder_hidden_states[1]
@@ -226,9 +226,6 @@ class SD3Transformer2DModel(CachableDiT):
                 width * patch_size,
             )
         )
-
-        if not return_dict:
-            return (output,)
 
         return output
 

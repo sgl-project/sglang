@@ -246,11 +246,37 @@ class TextEncoderLoader(ComponentLoader):
         model_config.pop("torch_dtype", None)
         logger.info("HF model config: %s", model_config)
 
-        def is_not_first_encoder(module_name):
-            return "2" in module_name or "3" in module_name
+        is_stable_diffusion3 = isinstance(
+            server_args.pipeline_config, StableDiffusion3PipelineConfig
+        )
+        if is_stable_diffusion3:
+            if not ("2" in module_name or "3" in module_name):
+                encoder_config = server_args.pipeline_config.text_encoder_configs[0]
+                encoder_config.update_model_arch(model_config)
+                for key, value in diffusers_pretrained_config.__dict__.items():
+                    setattr(encoder_config.arch_config, key, value)
+                encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
+            elif "2" in module_name:
+                encoder_config = server_args.pipeline_config.text_encoder_configs[1]
+                encoder_config.update_model_arch(model_config)
+                encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
+            else:
+                assert len(server_args.pipeline_config.text_encoder_configs) == 3
+                encoder_config = server_args.pipeline_config.text_encoder_configs[2]
+                encoder_config.update_model_arch(model_config)
+                encoder_dtype = server_args.pipeline_config.text_encoder_precisions[2]
+            target_device = get_local_torch_device()
+            # TODO(will): add support for other dtypes
+            return self.load_model(
+                model_path,
+                encoder_config,
+                target_device,
+                server_args,
+                encoder_dtype,
+            )
 
-        def is_third_encoder(module_name):
-            return "3" in module_name
+        def is_not_first_encoder(module_name):
+            return "2" in module_name
 
         # TODO(mick): had to throw an exception for different text-encoder arch
         if not is_not_first_encoder(module_name):
@@ -259,16 +285,12 @@ class TextEncoderLoader(ComponentLoader):
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
-        elif not is_third_encoder(module_name):
-            # assert len(server_args.pipeline_config.text_encoder_configs) == 2
+        else:
+            assert len(server_args.pipeline_config.text_encoder_configs) == 2
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
-        else:
-            assert len(server_args.pipeline_config.text_encoder_configs) == 3
-            encoder_config = server_args.pipeline_config.text_encoder_configs[2]
-            encoder_config.update_model_arch(model_config)
-            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[2]
+
         target_device = get_local_torch_device()
         # TODO(will): add support for other dtypes
         return self.load_model(
