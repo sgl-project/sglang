@@ -261,8 +261,8 @@ def validate_model_shards(model_path: Path) -> Tuple[bool, Optional[str], List[P
         # Match against the full path string to get proper path separation
         match = shard_pattern.search(str(shard_file))
         if match:
-            shard_num = int(match.group(2))
-            total = int(match.group(3))
+            shard_num = int(match.group(1))
+            total = int(match.group(2))
             parent = shard_file.parent
             key = (str(parent.relative_to(model_path)), total)
 
