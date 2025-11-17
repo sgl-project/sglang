@@ -25,8 +25,9 @@ rm -f "$TMP_VERSION_FILE"
 
 
 # Default base tags (can be overridden by command line arguments)
-DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi30x"
-DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi35x"
+ROCM_VERSION="rocm700"
+DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
+DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -115,6 +116,20 @@ find_latest_image() {
       return 0
     fi
   done
+
+  echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
+  local any_local
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+            | grep "^rocm/sgl-dev:" \
+            | grep "${ROCM_VERSION}" \
+            | grep "${gpu_arch}" \
+            | sort -r \
+            | head -n 1)
+  if [[ -n "$any_local" ]]; then
+      echo "Using cached fallback image: ${any_local}" >&2
+      echo "${any_local}"
+      return 0
+  fi
 
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
   echo "Using hard-coded fallback…" >&2
