@@ -194,12 +194,6 @@ RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]
     MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
 fi
 
-# Reinstall nccl and cublas for cuda 13
-RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
-  python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-  python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-fi
-
 # Python tools
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     datamodel_code_generator \
@@ -214,6 +208,12 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     scikit-build-core \
     nixl \
     py-spy
+
+# Reinstall nccl and cublas for cuda 13
+RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+  python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+  python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
+fi
 
 # Install development tools and utilities
 RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
