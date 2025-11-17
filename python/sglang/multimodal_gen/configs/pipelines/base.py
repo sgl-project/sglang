@@ -354,13 +354,14 @@ class PipelineConfig:
 
         # 2. Instantiate PipelineConfig
         if model_info is None:
-            logger.warning(
-                "Couldn't find model info for %s. Using the default pipeline config.",
-                model_path,
+            # The error is already logged in get_model_info.
+            # We raise an exception here to stop the execution.
+            raise ValueError(
+                f"Failed to get model info for '{model_path}'. "
+                "Please check the model path and ensure it is registered correctly."
             )
-            pipeline_config = cls()
-        else:
-            pipeline_config = model_info.pipeline_config_cls()
+
+        pipeline_config = model_info.pipeline_config_cls()
 
         # 3. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
