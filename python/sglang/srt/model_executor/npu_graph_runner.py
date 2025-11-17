@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+import sglang
 from sglang.srt.configs.model_config import is_deepseek_nsa
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.utils import get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +37,38 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
+@contextmanager
+def patch_model_npu(
+    model: torch.nn.Module,
+    enable_compile: bool,
+    num_tokens: int,
+    tp_group: GroupCoordinator,
+):
+    if enable_compile:
+        backend = get_compiler_backend("reduce-overhead")
+        yield torch.compile(
+            torch.no_grad()(model.forward),
+            fullgraph=True,
+            dynamic=False,
+            backend=backend,
+        )
+    else:
+        yield model.forward
+
+
 class NPUGraphRunner(CudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
+        sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
         super().__init__(model_runner)
 
     def _create_device_graph(self):
+        self.run_once_by_compile = False
         return torch.npu.NPUGraph()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
+        self.run_once_by_compile = True
         with torch.npu.graph(
             graph,
             pool=pool,

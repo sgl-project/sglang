@@ -298,6 +298,8 @@ class CudaGraphRunner:
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        self.run_once_by_compile = True
+
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
@@ -663,16 +665,21 @@ class CudaGraphRunner:
             set_dp_buffer_len(global_dp_buffer_len, num_tokens)
             set_is_extend_in_batch(False)
 
+            if self.run_once_by_compile:
+                forward_fn = forward
+            else:
+                forward_fn = self.model_runner.model.forward
+
             kwargs = {}
             if (
                 self.pp_size > 1
-                and "pp_proxy_tensors" in inspect.signature(forward).parameters
+                and "pp_proxy_tensors" in inspect.signature(forward_fn).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
 
-            logits_output_or_pp_proxy_tensors = forward(
+            logits_output_or_pp_proxy_tensors = forward_fn(
                 input_ids,
                 forward_batch.positions,
                 forward_batch,
