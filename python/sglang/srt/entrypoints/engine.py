@@ -608,6 +608,9 @@ class Engine(EngineBase):
     def save_sharded_model(self, **kwargs):
         self.collective_rpc("save_sharded_model", **kwargs)
 
+    def save_serverless_llm_state(self, **kwargs):
+        self.collective_rpc("save_serverless_llm_state", **kwargs)
+
     def score(
         self,
         query: Optional[Union[str, List[int]]] = None,
