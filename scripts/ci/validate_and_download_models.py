@@ -79,7 +79,11 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "8-gpu-b200": ["deepseek-ai/DeepSeek-V3.1", "deepseek-ai/DeepSeek-V3.2-Exp"],
     "4-gpu-b200": ["nvidia/DeepSeek-V3-0324-FP4"],
     "4-gpu-gb200": ["nvidia/DeepSeek-V3-0324-FP4"],
-    "4-gpu-h100": ["lmsys/sglang-ci-dsv3-test", "lmsys/sglang-ci-dsv3-test-NextN"],
+    "4-gpu-h100": [
+        "lmsys/sglang-ci-dsv3-test",
+        "lmsys/sglang-ci-dsv3-test-NextN",
+        "lmsys/gpt-oss-120b-bf16",
+    ],
 }
 
 

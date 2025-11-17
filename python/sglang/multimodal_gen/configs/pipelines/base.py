@@ -37,7 +37,7 @@ class ModelTaskType(Enum):
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
 
-    def is_image_task(self):
+    def is_image_gen(self):
         return self == ModelTaskType.T2I or self == ModelTaskType.I2I
 
 
@@ -134,11 +134,14 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def set_width_and_height(self, width, height, image):
+    def adjust_size(self, width, height, image):
         """
         image: input image
         """
         return width, height
+
+    def adjust_num_frames(self, num_frames):
+        return num_frames
 
     # called in ImageEncodingStage, preprocess the image
     def preprocess_image(self, image, image_processor: VaeImageProcessor):
