@@ -1,4 +1,6 @@
-SGlang exports request trace data based on the OpenTelemetry Collector. You can enable tracing by adding the `--trace-level` and configure the OpenTelemetry Collector endpoint using `--otlp-traces-endpoint` when launching the server. The `--trace-level` option accepts configurable values from `1` to `3`, with higher numbers indicating more detailed tracing. Additionally, you can use `--trace-module` to specify the module to trace; currently, only `request` is supported.
+# Production Request Tracing
+
+SGLang exports request trace data based on the OpenTelemetry Collector. You can enable tracing by adding the `--trace-level` and configure the OpenTelemetry Collector endpoint using `--otlp-traces-endpoint` when launching the server. The `--trace-level` option accepts configurable values from `1` to `3`, with higher numbers indicating more detailed tracing. Additionally, you can use `--trace-module` to specify the module to trace; currently, only `request` is supported.
 
 You can find example screenshots of the visualization in https://github.com/sgl-project/sglang/issues/8965.
 

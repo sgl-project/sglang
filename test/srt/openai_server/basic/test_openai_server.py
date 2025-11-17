@@ -7,12 +7,10 @@ python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test
 
 import json
 import random
-import re
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-import numpy as np
 import openai
 import requests
 
