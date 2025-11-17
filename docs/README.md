@@ -7,8 +7,31 @@ Most documentation files are located under the `docs/` folder.
 
 ### Install Dependency
 
+#### System Dependencies
+
+These are the system-level tools required for documentation compilation. `pandoc` is a universal document converter and is not a Python package, so it cannot be installed via `pip`.
+
 ```bash
-apt-get update && apt-get install -y pandoc parallel retry
+# Debian/Ubuntu
+sudo apt-get update && sudo apt-get install -y pandoc parallel retry
+
+# macOS
+brew install pandoc parallel retry
+
+# CentOS/RHEL (Check your version with `cat /etc/redhat-release` or `hostnamectl`)
+# For CentOS/RHEL 7 and older:
+sudo yum install -y epel-release
+sudo yum install -y pandoc parallel retry
+
+# For CentOS/RHEL 8 and newer:
+sudo dnf install -y pandoc parallel retry
+```
+
+#### Python Dependencies
+
+These are the Python packages required for the project, specified in `requirements.txt`.
+
+```bash
 pip install -r requirements.txt
 ```
 
