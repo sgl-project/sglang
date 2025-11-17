@@ -1,14 +1,3 @@
-"""
-性能对比测试：CUDA Kernel vs PyTorch 实现（256/1 配置）
-
-测试 moe_fused_gate CUDA kernel 和 PyTorch 原生实现在 256/1 配置下的性能差异。
-
-配置说明：
-- 256 experts / 1 group = VPT 256
-- 这是最高行并行度配置
-- 测试不同批处理大小的性能
-"""
-
 import torch
 import time
 import argparse
