@@ -1,4 +1,3 @@
-import os
 import random
 import unittest
 from typing import Sequence
@@ -8,7 +7,7 @@ from utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase, ensure_reproducibili
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, calculate_rouge_l, is_in_ci
+from sglang.test.test_utils import CustomTestCase, calculate_rouge_l
 
 
 class TestLoRAQwen3VLGating(CustomTestCase):
@@ -165,6 +164,7 @@ def _run_lora_multiple_batch_on_model_cases(
                 lora_backend=backend,
                 sleep_on_idle=True,
                 attention_backend="torch_native",
+                disable_radix_cache=True,
             )
 
             ensure_reproducibility()
@@ -217,19 +217,6 @@ class TestLoRAQwen3VLIntegration(CustomTestCase):
 
     def test_ci_lora_models(self):
         for label, model_case in LORA_MODEL_VARIANTS:
-            with self.subTest(variant=label):
-                _run_lora_multiple_batch_on_model_cases(
-                    [model_case],
-                    max_new_tokens=LORA_MAX_NEW_TOKENS,
-                    variant_label=label,
-                )
-
-    def test_all_lora_models(self):
-        if is_in_ci():
-            return
-        for label, model_case in LORA_MODEL_VARIANTS:
-            if "ONLY_RUN" in os.environ and os.environ["ONLY_RUN"] != model_case.base:
-                continue
             with self.subTest(variant=label):
                 _run_lora_multiple_batch_on_model_cases(
                     [model_case],

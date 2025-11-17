@@ -885,7 +885,7 @@ class IndividualTokenRefinerBlock(nn.Module):
             head_size=hidden_size // num_attention_heads,
             # TODO: remove hardcode; remove STA
             supported_attention_backends=(
-                AttentionBackendEnum.FA3,
+                AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )

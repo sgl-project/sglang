@@ -86,7 +86,7 @@ class CausalWanSelfAttention(nn.Module):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=(
-                AttentionBackendEnum.FA3,
+                AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )

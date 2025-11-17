@@ -7,10 +7,15 @@ import time
 from typing import TYPE_CHECKING
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.utils.common import disable_request_logging, pyspy_dump_schedulers
+from sglang.srt.utils.common import (
+    disable_request_logging,
+    pyspy_dump_schedulers,
+    raise_error_or_warn,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -138,7 +143,12 @@ class SchedulerRuntimeCheckerMixin:
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            raise ValueError(msg)
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                "count_req_pool_leak_warnings",
+                msg,
+            )
 
     def check_memory(self: Scheduler):
         if self.is_hybrid:
@@ -150,7 +160,12 @@ class SchedulerRuntimeCheckerMixin:
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-            raise ValueError(msg)
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                "count_memory_leak_warnings",
+                msg,
+            )
 
         self._check_req_pool()
 

@@ -239,6 +239,7 @@ class TestNSAIndexer(CustomTestCase):
         }
         params.update(kwargs)
 
+        torch.set_default_dtype(self.dtype)
         indexer = Indexer(**params)
         # Move indexer to CUDA device
         indexer = indexer.to(device=self.device)
