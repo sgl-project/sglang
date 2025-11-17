@@ -299,6 +299,10 @@ class ServerlessLLMModelLoader(BaseModelLoader):
                 f"Model loader extra config is not supported for load format {load_config.load_format}"
             )
 
+    def download_model(self, model_config: ModelConfig) -> None:
+        # Nothing to download; ServerlessLLM store streams tensors
+        pass
+
     @staticmethod
     def _filter_subtensors(tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Filter out view/sub-tensors that share storage with other tensors."""
