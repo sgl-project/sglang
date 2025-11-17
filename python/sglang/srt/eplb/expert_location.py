@@ -435,7 +435,7 @@ def _find_nearest_expert(
         == node_rank
     ]
     if len(same_node_physical_expert_ids) > 0:
-        return same_node_physical_expert_ids[0]
+        return same_node_physical_expert_ids[moe_ep_rank % len(same_node_physical_expert_ids)]
 
     # 4. At last, leave it as -1 to indicate not found.
     return -1
