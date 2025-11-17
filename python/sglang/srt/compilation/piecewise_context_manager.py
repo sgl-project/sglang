@@ -4,6 +4,22 @@ from typing import Any, List, Optional
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+_in_piecewise_cuda_graph = False
+
+
+def is_in_piecewise_cuda_graph():
+    return _in_piecewise_cuda_graph
+
+
+@contextmanager
+def enable_piecewise_cuda_graph():
+    global _in_piecewise_cuda_graph
+    _in_piecewise_cuda_graph = True
+
+    yield
+
+    _in_piecewise_cuda_graph = False
+
 
 @dataclass
 class ForwardContext:

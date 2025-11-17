@@ -34,6 +34,8 @@ class _Dumper:
         self._partial_name: Optional[str] = None
         self._dump_index = 0
         self._forward_pass_id = 0
+        self._global_ctx = {}
+        self._override_enable = None
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -42,22 +44,41 @@ class _Dumper:
             return
 
         # Users may want to `dump` only on some ranks, thus determine name here
-        if self._partial_name is None:
-            self._partial_name = _get_partial_name()
+        self._ensure_partial_name()
 
         self._forward_pass_id += 1
         print(
             f"[Dumper] [{time.time()}] on_forward_pass_start id={self._forward_pass_id}"
         )
 
-    def dump(self, name, value, **kwargs):
-        if not self._enable:
+    def _ensure_partial_name(self):
+        if self._partial_name is None:
+            self._partial_name = _get_partial_name()
+            print(f"[Dumper] Choose partial_name={self._partial_name}")
+
+    def set_ctx(self, **kwargs):
+        """
+        Example:
+
+        dumper.override_enable(self.layer_id <= 3)
+        dumper.set_ctx(layer_id=self.layer_id)
+        ...
+        dumper.set_ctx(layer_id=None)
+        """
+        self._global_ctx = {
+            k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
+        }
+
+    def override_enable(self, value: bool):
+        self._override_enable = value
+
+    def dump(self, name, value, save: bool = True, **kwargs):
+        if not (self._enable and (self._override_enable is not False)):
             return
 
-        assert (
-            self._forward_pass_id >= 1
-        ), "Do you forget to call `dumper.on_forward_pass_start()`?"
-        assert self._partial_name is not None
+        if self._forward_pass_id < 1:
+            print("Dump without on_forward_pass_start()")
+        self._ensure_partial_name()
         self._dump_index += 1
 
         rank = _get_rank()
@@ -67,6 +88,7 @@ class _Dumper:
             name=name,
             dump_index=self._dump_index,
             **kwargs,
+            **self._global_ctx,
         )
         full_filename = "___".join(f"{k}={v}" for k, v in full_kwargs.items()) + ".pt"
         path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
@@ -78,10 +100,11 @@ class _Dumper:
             f"type={type(value)} "
             f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
             f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
+            f"device={value.device if isinstance(value, torch.Tensor) else None} "
             f"sample_value={sample_value}"
         )
 
-        if self._enable_write_file:
+        if self._enable_write_file and save:
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(value, str(path))
 
@@ -109,15 +132,28 @@ def get_truncated_value(value):
         return [get_truncated_value(x) for x in value]
 
     if not isinstance(value, torch.Tensor):
-        return None
+        return value
 
     if value.numel() < 200:
         return value
 
-    slices = [
-        slice(0, 5) if dim_size > 200 else slice(None) for dim_size in value.shape
-    ]
+    slices = [slice(0, 5) if dim_size > 50 else slice(None) for dim_size in value.shape]
     return value[tuple(slices)]
 
 
 dumper = _Dumper()
+
+
+def get_tensor_info(x):
+    """
+    from sglang.srt.debug_utils.dumper import get_tensor_info
+    """
+    if not isinstance(x, torch.Tensor):
+        return f"type={type(x)} value={x}"
+    min = x.float().min() if x.numel() > 0 else None
+    max = x.float().max() if x.numel() > 0 else None
+    mean = x.float().mean() if x.numel() > 0 else None
+    torch.set_printoptions(precision=10)
+    x_sample = str(x.flatten()[:5])
+    torch.set_printoptions(precision=4)
+    return f"shape={x.shape} dtype={x.dtype} device={x.device} stride={x.stride()} req_grad={x.requires_grad} min={min} max={max} mean={mean} x_sample={x_sample}"

@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul

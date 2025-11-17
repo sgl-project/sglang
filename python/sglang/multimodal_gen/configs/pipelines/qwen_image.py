@@ -4,13 +4,13 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
-from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_dimensions
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, PipelineConfig
+from sglang.multimodal_gen.utils import calculate_dimensions
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -273,7 +273,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         image = image_processor.resize(image, calculated_height, calculated_width)
         return image
 
-    def set_width_and_height(self, width, height, image):
+    def adjust_size(self, width, height, image):
         image_size = image[0].size if isinstance(image, list) else image.size
         calculated_width, calculated_height, _ = calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
