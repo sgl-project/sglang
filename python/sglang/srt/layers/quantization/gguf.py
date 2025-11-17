@@ -43,7 +43,7 @@ if _is_cuda:
         ggml_mul_mat_vec_a8,
     )
 else:
-    warnings.warn(f"Only CUDA support GGUF q uantization currently.")
+    warnings.warn(f"Only CUDA support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -517,8 +517,6 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.fused_experts is None
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
@@ -531,6 +529,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         topk_weights, topk_ids, _ = topk_output
+        print(layer.w13_qweight_type.weight_type)
         output = fused_moe_gguf(
             x=x,
             w1=layer.w13_qweight,
