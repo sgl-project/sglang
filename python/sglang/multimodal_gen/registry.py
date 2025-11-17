@@ -11,6 +11,7 @@ import dataclasses
 import importlib
 import os
 import pkgutil
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 from sglang.multimodal_gen.configs.pipelines import (
@@ -178,10 +179,28 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
         model_name = _MODEL_PATH_TO_NAME[model_path]
         return _CONFIG_REGISTRY.get(model_name)
 
-    # 2. Partial match
-    for registered_id, model_name in _MODEL_PATH_TO_NAME.items():
-        if registered_id in model_path:
-            return _CONFIG_REGISTRY.get(model_name)
+    # 2. Partial match: find the best (longest) match to avoid conflicts
+    #    like "Qwen-Image" and "Qwen-Image-Edit".
+    cleaned_model_path = re.sub(r"--", "/", model_path.lower())
+
+    best_match_name = None
+    best_match_len = -1
+
+    # Check mappings, prioritizing longer keys to resolve ambiguity
+    sorted_mappings = sorted(
+        _MODEL_PATH_TO_NAME.items(), key=lambda item: len(item[0]), reverse=True
+    )
+
+    for registered_id, model_name in sorted_mappings:
+        normalized_registered_id = registered_id.lower()
+        if normalized_registered_id in cleaned_model_path:
+            # Find the best match based on the longest key
+            if len(normalized_registered_id) > best_match_len:
+                best_match_len = len(normalized_registered_id)
+                best_match_name = model_name
+
+    if best_match_name:
+        return _CONFIG_REGISTRY.get(best_match_name)
 
     # 3. Use detectors
     if os.path.exists(model_path):
