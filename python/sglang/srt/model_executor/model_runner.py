@@ -86,6 +86,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -160,10 +161,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
-)
-
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
 )
 
 MLA_ATTENTION_BACKENDS = [

@@ -36,22 +36,16 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-from sglang.srt.configs.model_config import AttentionArch
-
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
-    scaled_fp8_quant,
-)
-
-from sglang.srt.utils import (
-    get_bool_env_var,
-)
-
 import math
 
 from aiter import get_mla_metadata_v1
 
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.utils import get_bool_env_var
+
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST")
+
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -180,11 +174,11 @@ class AiterAttnBackend(AttentionBackend):
         gpu = torch.cuda.current_device()
         device_properties = torch.cuda.get_device_properties(gpu)
         cu_num = device_properties.multi_processor_count
-    
+
         nhead = self.num_head
-    
+
         max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * nhead / 128))
-    
+
         work_metadata = torch.empty([10], dtype=torch.uint64, device="cuda")
         work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
         work_info_set = torch.empty(
@@ -192,7 +186,7 @@ class AiterAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device="cuda",
         ).fill_(-1)
-    
+
         reduce_indptr = torch.empty(
             [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
         )
@@ -200,10 +194,19 @@ class AiterAttnBackend(AttentionBackend):
             [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
         )
         reduce_partial_map = torch.empty(
-            [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
+            [batch_size * max_qo_tiles_per_batch * cu_num],
+            dtype=torch.int32,
+            device="cuda",
         )
-    
-        return work_metadata, work_indptr, work_info_set, reduce_indptr, reduce_final_map, reduce_partial_map
+
+        return (
+            work_metadata,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -253,7 +256,14 @@ class AiterAttnBackend(AttentionBackend):
                     page_size = 1
 
                     max_seqlen_qo = 1
-                    work_metadata, work_indptr, work_info_set, reduce_indptr, reduce_final_map, reduce_partial_map = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+                    (
+                        work_metadata,
+                        work_indptr,
+                        work_info_set,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
 
                     meta = get_mla_metadata_v1(
                         qo_indptr,
@@ -304,7 +314,14 @@ class AiterAttnBackend(AttentionBackend):
                     page_size = 1
 
                     max_seqlen_qo = max(forward_batch.extend_seq_lens_cpu)
-                    work_metadata, work_indptr, work_info_set, reduce_indptr, reduce_final_map, reduce_partial_map = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+                    (
+                        work_metadata,
+                        work_indptr,
+                        work_info_set,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
 
                     meta = get_mla_metadata_v1(
                         qo_indptr,
@@ -388,13 +405,20 @@ class AiterAttnBackend(AttentionBackend):
                     self.req_to_token.stride(0),
                 )
 
-                #if self.kv_cache_dtype == fp8_dtype:
+                # if self.kv_cache_dtype == fp8_dtype:
                 if _use_mla_ps_kernel:
                     nhead_kv = 1
                     page_size = 1
 
                     max_seqlen_qo = draft_num
-                    work_metadata, work_indptr, work_info_set, reduce_indptr, reduce_final_map, reduce_partial_map = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+                    (
+                        work_metadata,
+                        work_indptr,
+                        work_info_set,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
 
                     meta = get_mla_metadata_v1(
                         qo_indptr,
@@ -515,16 +539,21 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        #if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
+        # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
         if self.use_mla and _use_mla_ps_kernel:
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
-                1
-                if self.num_draft_tokens is None
-                else self.num_draft_tokens 
+                1 if self.num_draft_tokens is None else self.num_draft_tokens
             )
 
-            self.work_metadata, self.work_indptr, self.work_info_set, self.reduce_indptr, self.reduce_final_map, self.reduce_partial_map = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, max_bs)
+            (
+                self.work_metadata,
+                self.work_indptr,
+                self.work_info_set,
+                self.reduce_indptr,
+                self.reduce_final_map,
+                self.reduce_partial_map,
+            ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, max_bs)
 
         else:
             self.work_metadata = None
@@ -609,11 +638,10 @@ class AiterAttnBackend(AttentionBackend):
                     work_metadata = self.work_metadata
                     work_info_set = self.work_info_set
                     work_indptr = self.work_indptr
-                    
+
                     reduce_indptr = self.reduce_indptr
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
-
 
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
@@ -655,7 +683,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = self.num_draft_tokens
 
-                #if self.kv_cache_dtype == fp8_dtype:
+                # if self.kv_cache_dtype == fp8_dtype:
                 if _use_mla_ps_kernel:
                     nhead_kv = 1
                     page_size = 1
@@ -681,7 +709,7 @@ class AiterAttnBackend(AttentionBackend):
                     work_metadata = self.work_metadata
                     work_info_set = self.work_info_set
                     work_indptr = self.work_indptr
-                    
+
                     reduce_indptr = self.reduce_indptr
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
@@ -768,7 +796,7 @@ class AiterAttnBackend(AttentionBackend):
                 work_metadata = self.work_metadata
                 work_info_set = self.work_info_set
                 work_indptr = self.work_indptr
-                
+
                 reduce_indptr = self.reduce_indptr
                 reduce_final_map = self.reduce_final_map
                 reduce_partial_map = self.reduce_partial_map
@@ -874,7 +902,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
 
-            #if self.use_mla and self.kv_cache_dtype == fp8_dtype:
+            # if self.use_mla and self.kv_cache_dtype == fp8_dtype:
             if self.use_mla and _use_mla_ps_kernel:
                 max_q_len = self.num_draft_tokens
 
@@ -1013,7 +1041,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     if self.kv_cache_dtype == fp8_dtype:
-                        kvc  = kvc.to(torch.bfloat16)
+                        kvc = kvc.to(torch.bfloat16)
                         k_pe = k_pe.to(torch.bfloat16)
 
                     kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
@@ -1080,8 +1108,6 @@ class AiterAttnBackend(AttentionBackend):
             elif forward_batch.forward_mode.is_target_verify():
                 o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
 
-                
-
                 if self.kv_cache_dtype == fp8_dtype:
                     q_input = q.to(fp8_dtype)
                     q_scale = torch.ones([1], dtype=torch.float, device="cuda")
@@ -1119,7 +1145,7 @@ class AiterAttnBackend(AttentionBackend):
                     q_scale=q_scale,
                     kv_scale=kv_scale,
                 )
-                #K_Buffer = K_Buffer.view(-1, 1, layer.qk_head_dim)
+                # K_Buffer = K_Buffer.view(-1, 1, layer.qk_head_dim)
                 return o
             elif forward_batch.forward_mode.is_draft_extend():
                 o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
@@ -1162,7 +1188,7 @@ class AiterAttnBackend(AttentionBackend):
                     q_scale=q_scale,
                     kv_scale=kv_scale,
                 )
-                #K_Buffer = K_Buffer.view(-1, 1, layer.qk_head_dim)
+                # K_Buffer = K_Buffer.view(-1, 1, layer.qk_head_dim)
                 return o
             else:
                 raise ValueError(
@@ -1227,10 +1253,10 @@ class AiterAttnBackend(AttentionBackend):
             reduce_partial_map = self.forward_metadata.reduce_partial_map
 
             if self.kv_cache_dtype == fp8_dtype:
-                #q_input, q_scale = scaled_fp8_quant(
+                # q_input, q_scale = scaled_fp8_quant(
                 #    q,
-                #)
-                #q_scale = q_scale.to(torch.float)
+                # )
+                # q_scale = q_scale.to(torch.float)
                 q_input = q.to(fp8_dtype)
                 q_scale = torch.ones([1], dtype=torch.float, device="cuda")
                 kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
@@ -1260,7 +1286,7 @@ class AiterAttnBackend(AttentionBackend):
                 q_scale=kv_scale,
                 kv_scale=kv_scale,
             )
-            #k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
+            # k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
         else:
             self.logits_soft_cap = layer.logit_cap
             paged_attention_ragged(
