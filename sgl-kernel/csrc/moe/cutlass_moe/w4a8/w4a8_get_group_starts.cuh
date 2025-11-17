@@ -125,12 +125,10 @@ void run_int4_fp8_get_group_gemm_starts(
     torch::Tensor& out_tensors,
     torch::Tensor const& a_scales,
     torch::Tensor const& b_scales) {
-#ifndef NDEBUG
   TORCH_CHECK(a_tensors.dtype() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(b_tensors.dtype() == torch::kInt8);
   TORCH_CHECK(a_scales.dtype() == torch::kFloat32);
   TORCH_CHECK(b_scales.dtype() == torch::kBFloat16);
-#endif
 
   int num_experts = static_cast<int>(expert_offsets.size(0));
   bool per_act_token = a_scales.numel() != 1;

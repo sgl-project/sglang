@@ -173,9 +173,6 @@ void cutlass_w4a8_group_gemm_caller(
   bool per_act_token = a_scales.numel() != 1;
   bool per_out_ch = b_scales.numel() != num_experts;
 
-  // Optimized: reduce checks in hot path - only check critical dimensions
-  // Full checks are still performed but grouped together for better branch prediction
-#ifndef NDEBUG
   // Check inputs
   TORCH_CHECK(a_tensors.dim() == 2 or a_tensors.dim() == 3, "A tensor must be 2D/3D");
   TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
@@ -198,7 +195,6 @@ void cutlass_w4a8_group_gemm_caller(
   TORCH_CHECK(b_tensors.scalar_type() == torch::kInt8, "B tensor must contain packed int4 values (stored as int8)");
   TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32, "Expert offsets must be int32 type");
   TORCH_CHECK(problem_sizes.scalar_type() == torch::kInt32, "Problem sizes must be int32 type");
-#endif
 
   auto stream = at::cuda::getCurrentCUDAStream(a_tensors.device().index());
   auto options_int = torch::TensorOptions().dtype(torch::kInt64).device(a_tensors.device());
