@@ -24,7 +24,6 @@ The following is the flow of data structures for a batch:
 
 ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
-
 - ScheduleBatch is managed by `scheduler.py::Scheduler`.
   It contains high-level scheduling data. Most of the data is on the CPU.
 - ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
