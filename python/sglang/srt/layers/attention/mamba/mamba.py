@@ -409,7 +409,6 @@ class MambaMixer2(torch.nn.Module):
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
         num_actual_tokens = num_prefill_tokens + num_decode_tokens
-
         assert num_actual_tokens == projected_states.shape[0]
 
         # NOTE: V0 put prefill before decode

@@ -283,13 +283,6 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
-            self.hf_config.architectures[0] = "NemotronHMTPForCausalLM"
-            self.hf_config.num_hidden_layers += 1
-            self.hf_config.hybrid_override_pattern = (
-                "*" * self.hf_config.num_hidden_layers
-            )
-
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
         derived_context_len = get_context_length(self.hf_text_config)
