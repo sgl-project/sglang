@@ -646,7 +646,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             if self.topk > 1:
-                if forward_batch.forward_mode.is_decode_or_idle():
+                if forward_batch.forward_mode.is_decode_or_idle() and forward_batch.spec_info is not None:
                     last_page_lens = forward_batch.seq_lens % self.page_size
                     # First attention handles prefix - last_page_len part.
                     metadata.cache_seqlens_int32 -= last_page_lens  # Both (B, )
