@@ -138,7 +138,7 @@ To deploy on SGLang on AWS SageMaker, check out [AWS SageMaker Inference](https:
 To host a model with your own container, follow the following steps:
 
 1. Build a docker container with [sagemaker.Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/sagemaker.Dockerfile) alongside the [serve](https://github.com/sgl-project/sglang/blob/main/docker/serve) script.
-1. Push your container onto AWS ECR.
+2. Push your container onto AWS ECR.
 
 <details>
 <summary>Dockerfile Build Script: <code>build-and-push.sh</code></summary>
@@ -171,12 +171,18 @@ echo "Build and push completed successfully!"
 
 </details>
 
-3. Deploy a model for serving on AWS Sagemaker. for more information, check out [sagemaker-python-sdk](https://github.com/aws/sagemaker-python-sdk)
+3. Deploy a model for serving on AWS Sagemaker. For more information, check out [sagemaker-python-sdk](https://github.com/aws/sagemaker-python-sdk)
+  1. By default, the model server on SageMaker will run with the following command: `python3 -m sglang.launch_server --model-path opt/ml/model --host 0.0.0.0 --port 8080`. This is optimal for hosting your own model with SageMaker.
+  2. To modify your model serving parameters, the [serve](https://github.com/sgl-project/sglang/blob/main/docker/serve) script allows for all available options within `python3 -m sglang.launch_server --help` cli by specifying environment variables with prefix `SM_SGLANG_`.
+  3. The serve script will automatically convert all environment variables with prefix `SM_SGLANG_` from `SM_SGLANG_INPUT_ARGUMENT` into `--input-argument` to be parsed into `python3 -m sglang.launch_server` cli.
+  4. For example, to run [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) with reasoning parser, simply add additional environment variables `SM_SGLANG_MODEL_PATH=Qwen/Qwen3-0.6B` and `SM_SGLANG_REASONING_PARSER=qwen3`.
 
 ```python
+import json
 import boto3
 import sagemaker
 
+from sagemaker import serializers
 from sagemaker.model import Model
 from sagemaker.predictor import Predictor
 
@@ -191,7 +197,7 @@ hf_token="<YOUR_HUGGINGFACE_TOKEN>"
 prompt="<YOUR_ENDPOINT_PROMPT>"
 
 model = Model(
-  name=name,
+  name=endpoint_name,
   image_uri=image_uri,
   role=sm_role,
   env={
@@ -203,9 +209,9 @@ print("Model created successfully")
 print("Starting endpoint deployment (this may take 10-15 minutes)...")
 
 endpoint_config = model.deploy(
-    instance_type=instance_type,
+    instance_type="ml.g5.12xlarge",
     initial_instance_count=1,
-    endpoint_name=name,
+    endpoint_name=endpoint_name,
     inference_ami_version="al2-ami-sagemaker-inference-gpu-3-1",
     wait=True,
 )
@@ -219,7 +225,7 @@ predictor = Predictor(
 )
 
 payload = {
-    "model": model_if,
+    "model": model_id,
     "messages": [{"role": "user", "content": prompt}],
     "max_tokens": 2400,
     "temperature": 0.01,
@@ -241,11 +247,6 @@ if isinstance(response, str):
 
 print(f"Received model response: '{response}'")
 ```
-
-3. By default, the model server on SageMaker will run with the following command: `python3 -m sglang.launch_server --model-path opt/ml/model --host 0.0.0.0 --port 8080`. This is optimal for hosting your own model with SageMaker.
-   To modify your model serving parameters, the [serve](https://github.com/sgl-project/sglang/blob/main/docker/serve) script allows for all available options within `python3 -m sglang.launch_server --help` cli by specifying environment variables with prefix `SM_SGLANG_`.
-   The serve script will automatically convert all environment variables with prefix `SM_SGLANG_` from `SM_SGLANG_INPUT_ARGUMENT` into `--input-argument` to be parsed into `python3 -m sglang.launch_server` cli.
-   For example, to run [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) with reasoning parser, simply add additional environment variables `SM_SGLANG_MODEL_PATH=Qwen/Qwen3-0.6B` and `SM_SGLANG_REASONING_PARSER=qwen3`.
 
 </details>
 
