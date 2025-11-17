@@ -17,10 +17,10 @@ def _make_wrapper(tup: Tuple[str, str]) -> str:
 def _resolve_kernel_path() -> pathlib.Path:
     cur_dir = pathlib.Path(__file__).parent.resolve()
 
-    # first, try ../../../sgl-kernel/jit
+    # first, try this directory structure
     def _environment_install():
-        candidate = (cur_dir / "../../../sgl-kernel/jit").resolve()
-        if candidate.exists():
+        candidate = cur_dir.resolve()
+        if (candidate / "include").exists() and (candidate / "csrc").exists():
             return candidate
         return None
 

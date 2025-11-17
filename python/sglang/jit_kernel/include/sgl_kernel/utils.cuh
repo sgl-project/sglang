@@ -14,11 +14,6 @@ namespace device {
 
 inline constexpr auto kWarpThreads = 32u;
 
-template <std::integral T, std::integral U>
-__always_inline __device__ constexpr auto div_ceil(T a, U b) {
-  return (a + b - 1) / b;
-}
-
 namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
