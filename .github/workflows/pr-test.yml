@@ -210,12 +210,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - uses: actions/checkout@v4
 
@@ -250,12 +252,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - uses: actions/checkout@v4
 
@@ -291,12 +295,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - uses: actions/checkout@v4
 
@@ -342,12 +348,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -405,12 +413,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -450,12 +460,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -492,12 +504,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -630,12 +644,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -700,12 +716,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -762,12 +780,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -806,12 +826,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -874,12 +896,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -915,12 +939,14 @@ jobs:
     steps:
       - name: Kill lingering processes and cleanup workspace
         run: |
-          pkill -f "python.*sglang" || true
-          pkill -f "python.*bench_serving" || true
-          pkill -f "pytest" || true
-          lsof +D "$GITHUB_WORKSPACE" -t 2>/dev/null | xargs -r kill -9 || true
-          sleep 2
-          rm -rf "$GITHUB_WORKSPACE"/* || true
+          # Kill all Python processes that might hold file handles
+          pkill -9 -f "python" || true
+          # Give NFS time to release locks
+          sleep 5
+          # Force remove any .nfs* files
+          find "$GITHUB_WORKSPACE" -name ".nfs*" -type f -delete 2>/dev/null || true
+          # Clean workspace
+          rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.??* 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@v4
