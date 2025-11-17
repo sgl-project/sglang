@@ -124,7 +124,10 @@ def test_hicache_kernel(args: HicacheBenchArgs) -> None:
     def _fast_test_correctness(bs: int):
         src_indices = _gen_indices(CUDA_CACHE_SIZE, bs)
         dst_indices = _gen_indices(HOST_CACHE_SIZE, bs)
-        # load from cuda to host
+        host_cache_cuda = torch.randn_like(host_cache, device="cuda")
+        host_cache.copy_(host_cache_cuda, non_blocking=True)
+
+        # copy from cuda to host
         jit_hicache_impl(
             k_cache_dst=host_cache[0],
             v_cache_dst=host_cache[1],
