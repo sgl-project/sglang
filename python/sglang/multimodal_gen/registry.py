@@ -12,6 +12,7 @@ import importlib
 import os
 import pkgutil
 import re
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 from sglang.multimodal_gen.configs.pipelines import (
@@ -232,6 +233,7 @@ class ModelInfo:
     pipeline_config_cls: Type[PipelineConfig]
 
 
+@lru_cache(maxsize=1)
 def get_model_info(model_path: str) -> Optional[ModelInfo]:
     """
     Resolves all necessary classes (pipeline, sampling, config) for a given model path.
@@ -271,16 +273,12 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
     # 3. Get configuration classes (sampling, pipeline config)
     config_info = _get_config_info(model_path)
     if not config_info:
-        logger.warning(
-            f"No specific configuration registered for '{model_path}'. "
-            f"Falling back to default SamplingParams and PipelineConfig."
+        logger.error(
+            f"Could not resolve configuration for model '{model_path}'. "
+            "It is not a registered model path or detected by any registered model family detectors. "
+            f"Known model paths: {list(_MODEL_PATH_TO_NAME.keys())}"
         )
-        # Fallback to defaults if no specific config is found
-        from sglang.multimodal_gen.configs.sample.base import SamplingParams
-
-        config_info = ConfigInfo(
-            sampling_param_cls=SamplingParams, pipeline_config_cls=PipelineConfig
-        )
+        return None
 
     # 4. Combine and return the complete model info
     return ModelInfo(
@@ -425,18 +423,17 @@ def _register_configs():
         model_name="qwen-image",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
-        model_paths=[
-            "Qwen/Qwen-Image",
-        ],
-        model_detectors=[lambda id: "qwen-image" in id.lower()],
+        # model_paths=[
+        #     "Qwen/Qwen-Image",
+        # ],
     )
     register_configs(
         model_name="qwen-image-edit",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
-        model_paths=[
-            "Qwen/Qwen-Image-Edit",
-        ],
+        # model_paths=[
+        #     "Qwen/Qwen-Image-Edit",
+        # ],
     )
 
 
