@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, Mamba2CacheParams
+from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -124,30 +124,31 @@ class ReqToTokenPool:
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
-        conv: Union[torch.Tensor, List[torch.Tensor]]
+        conv: List[torch.Tensor]
         temporal: torch.Tensor
 
         def at_layer_idx(self, layer: int):
-            if isinstance(self.conv, list):
-                return type(self)(
-                    conv=[v[layer] for v in self.conv],
-                    temporal=self.temporal[layer],
-                )
-            return type(self)(**{k: v[layer] for k, v in vars(self).items()})
+            kwargs = {}
+            for k, v in vars(self).items():
+                if k == "conv" or k == "intermediate_conv_window":
+                    kwargs[k] = [conv[layer] for conv in v]
+                else:
+                    kwargs[k] = v[layer]
+            return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
             return sum(get_tensor_size_bytes(t) for t in vars(self).values())
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: Union[torch.Tensor, List[torch.Tensor]]
-        intermediate_conv_window: torch.Tensor
+        intermediate_ssm: torch.Tensor
+        intermediate_conv_window: List[torch.Tensor]
 
     def __init__(
         self,
         *,
         size: int,
-        cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
+        cache_params: BaseLinearStateParams,
         device: str,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
@@ -165,29 +166,19 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        self.is_kda_cache = isinstance(cache_params, KimiLinearCacheParams)
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.enable_custom_mem_pool
             else nullcontext()
         ):
-            if self.is_kda_cache:
-                conv_state = [
-                    torch.zeros(
-                        size=(num_mamba_layers, size + 1) + conv_shape,
-                        dtype=conv_dtype,
-                        device=device,
-                    )
-                    for conv_shape in conv_state_shape
-                ]
-            else:
-                # assume conv_state = (dim, state_len)
-                assert conv_state_shape[0] > conv_state_shape[1]
-                conv_state = torch.zeros(
-                    size=(num_mamba_layers, size + 1) + conv_state_shape,
+            conv_state = [
+                torch.zeros(
+                    size=(num_mamba_layers, size + 1) + conv_shape,
                     dtype=conv_dtype,
                     device=device,
                 )
+                for conv_shape in conv_state_shape
+            ]
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,
@@ -210,34 +201,20 @@ class MambaPool:
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-
-                if self.is_kda_cache:
-                    intermediate_conv_window_cache = [
-                        torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                size + 1,
-                                speculative_num_draft_tokens,
-                                conv_shape[0],
-                                conv_shape[1],
-                            ),
-                            dtype=conv_dtype,
-                            device="cuda",
-                        )
-                        for conv_shape in conv_state_shape
-                    ]
-                else:
-                    intermediate_conv_window_cache = torch.zeros(
+                intermediate_conv_window_cache = [
+                    torch.zeros(
                         size=(
                             num_mamba_layers,
                             size + 1,
                             speculative_num_draft_tokens,
-                            conv_state_shape[0],
-                            conv_state_shape[1],
+                            conv_shape[0],
+                            conv_shape[1],
                         ),
                         dtype=conv_dtype,
                         device="cuda",
                     )
+                    for conv_shape in conv_state_shape
+                ]
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -289,11 +266,8 @@ class MambaPool:
         if free_index.numel() == 0:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))
-        if self.is_kda_cache:
-            for i in range(len(self.mamba_cache.conv)):
-                self.mamba_cache.conv[i][:, free_index] = 0
-        else:
-            self.mamba_cache.conv[:, free_index] = 0
+        for i in range(len(self.mamba_cache.conv)):
+            self.mamba_cache.conv[i][:, free_index] = 0
         self.mamba_cache.temporal[:, free_index] = 0
 
     def clear(self):
@@ -309,14 +283,10 @@ class MambaPool:
         self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        if self.is_kda_cache:
-            for i in range(len(self.mamba_cache.conv)):
-                self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
-                    :, src_index
-                ]
-        else:
-            self.mamba_cache.conv[:, dst_index] = self.mamba_cache.conv[:, src_index]
-
+        for i in range(len(self.mamba_cache.conv)):
+            self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
+                :, src_index
+            ]
         self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
             :, src_index
         ]
@@ -330,9 +300,13 @@ class MambaPool:
         return dst_index
 
     def get_contiguous_buf_infos(self):
-        state_tensors = [
-            getattr(self.mamba_cache, field) for field in vars(self.mamba_cache)
-        ]
+        state_tensors = []
+        for field in vars(self.mamba_cache):
+            value = getattr(self.mamba_cache, field)
+            if isinstance(value, list):
+                state_tensors.extend(value)
+            else:
+                state_tensors.append(value)
         data_ptrs, data_lens, item_lens = [], [], []
 
         for _, state_tensor in enumerate(state_tensors):
@@ -357,7 +331,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
+        cache_params: BaseLinearStateParams,
         speculative_num_draft_tokens: int = None,
     ):
         super().__init__(
@@ -380,7 +354,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def _init_mamba_pool(
         self,
         size: int,
-        cache_params: Union["Mamba2CacheParams", "KimiLinearCacheParams"],
+        cache_params: BaseLinearStateParams,
         device: str,
         speculative_num_draft_tokens: int = None,
     ):
@@ -952,7 +926,7 @@ class HybridLinearKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         mamba_pool: MambaPool,
-        enable_memory_saver: bool,
+        enable_memory_saver: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
         kv_lora_rank: int = None,
