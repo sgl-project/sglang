@@ -485,7 +485,9 @@ class MultimodalInputs:
                             patches_per_video.append(int(torch.prod(grid).item()))
                         else:
                             grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                            patches_per_video.append(int(torch.prod(grid_tensor).item()))
+                            patches_per_video.append(
+                                int(torch.prod(grid_tensor).item())
+                            )
 
                     # Calculate cumulative patches to get slice indices for each video
                     cumulative = torch.cumsum(
@@ -504,12 +506,20 @@ class MultimodalInputs:
                     # Group frames by video: calculate frame indices for each video
                     frame_start_indices = [0]
                     for i in range(num_videos):
-                        frame_start_indices.append(frame_start_indices[-1] + frames_per_video[i])
+                        frame_start_indices.append(
+                            frame_start_indices[-1] + frames_per_video[i]
+                        )
 
                     # Expand each video into a separate item
                     for video_idx in range(num_videos):
-                        start, end = slice_indices[video_idx], slice_indices[video_idx + 1]
-                        frame_start, frame_end = frame_start_indices[video_idx], frame_start_indices[video_idx + 1]
+                        start, end = (
+                            slice_indices[video_idx],
+                            slice_indices[video_idx + 1],
+                        )
+                        frame_start, frame_end = (
+                            frame_start_indices[video_idx],
+                            frame_start_indices[video_idx + 1],
+                        )
 
                         new_item = copy.deepcopy(item)
                         if item.feature is not None:
