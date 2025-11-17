@@ -59,6 +59,12 @@ ROTARY_EMBED_CLASSES = {
 
 
 @dataclasses.dataclass
+class VisionForwardMetadata:
+    cu_seqlens: torch.Tensor
+    max_seqlen: int
+
+
+@dataclasses.dataclass
 class SingletonCache:
     data: Any = None
 
@@ -368,18 +374,23 @@ class VisionAiterAttention(nn.Module):
         seq_len: int,
         **kwargs,
     ) -> torch.Tensor:
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-        elif isinstance(cu_seqlens, SingletonCache):
-            if cu_seqlens.empty():
-                cu_seqlens.set_data(
-                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-                )
-            cu_seqlens = cu_seqlens.get_data()
+        vision_forward_metadata = kwargs.get("vision_forward_metadata", None)
+        if vision_forward_metadata is None:
+            if cu_seqlens is None:
+                cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+            elif isinstance(cu_seqlens, SingletonCache):
+                if cu_seqlens.empty():
+                    cu_seqlens.set_data(
+                        _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                    )
+                cu_seqlens = cu_seqlens.get_data()
 
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seq_lens.max().item()
+        else:
+            cu_seqlens = vision_forward_metadata.cu_seqlens
+            max_seqlen = vision_forward_metadata.max_seqlen
 
         return self.flash_attn_varlen_func(
             q=q,
@@ -513,6 +524,8 @@ class VisionAttention(nn.Module):
         # Additional dummy heads are used to enable TP for common GPU counts.
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
+        self.vision_forward_metadata: VisionForwardMetadata = None
+
         if self.qk_normalization:
             self.q_norm = RMSNorm(
                 self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
@@ -575,6 +588,28 @@ class VisionAttention(nn.Module):
             tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
         )
+
+    def init_vision_forward_metadata(self, grid_thw, pixel_values):
+        cu_seqlens = torch.cat(
+            [
+                torch.tensor([0], device=grid_thw.device),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
+            ]
+        )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(pixel_values.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        self.vision_forward_metadata = VisionForwardMetadata(
+            cu_seqlens,
+            max_seqlen,
+        )
+        return self.vision_forward_metadata
+
+    def set_vision_forward_metadata(self, vision_forward_metadata):
+        self.vision_forward_metadata = vision_forward_metadata
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
@@ -725,6 +760,7 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            vision_forward_metadata=self.vision_forward_metadata,
         )
 
         assert output.dim() == 3, output.shape
