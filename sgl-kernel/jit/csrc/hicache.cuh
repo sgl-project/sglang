@@ -23,12 +23,13 @@ struct HicacheKernelParams {
   std::size_t length;
   std::size_t kv_cache_src_stride;
   std::size_t kv_cache_dst_stride;
-  std::size_t num_layers = 0;
+  std::size_t num_layers = 0;  // only used in all_layer transfer
 };
 
 template <
     std::integral T,
     std::size_t kElementSize,
+    std::size_t kUnroll,
     std::size_t kBlockQuota,
     std::size_t kNumThreads,
     std::size_t kMaxOccupancy>
@@ -37,7 +38,10 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void hicache_transfer_p
   // each warp acts as a worker
   using namespace device;
   static_assert(kNumThreads % kWarpThreads == 0);
-  constexpr auto kWarpsPerBlock = static_cast<uint32_t>(kNumThreads) / kWarpThreads;
+  static_assert(kWarpThreads % kUnroll == 0);
+
+  constexpr auto kWarpThreads = device::kWarpThreads / kUnroll;
+  constexpr auto kWarpsPerBlock = kNumThreads / kWarpThreads;
   constexpr auto kWorkers = kWarpsPerBlock * kBlockQuota;
 
   const auto& [
@@ -58,16 +62,17 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void hicache_transfer_p
     const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
     const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
     const auto dst_v = pointer::offset(v_cache_dst, pos_dst * kv_cache_dst_stride);
-    const auto vec_k = warp::load_vec<kElementSize, kGranularity>(src_k);
-    const auto vec_v = warp::load_vec<kElementSize, kGranularity>(src_v);
-    warp::store_vec<kElementSize, kGranularity>(dst_k, vec_k);
-    warp::store_vec<kElementSize, kGranularity>(dst_v, vec_v);
+    const auto vec_k = warp::load_vec<kElementSize, kGranularity, kWarpThreads>(src_k);
+    const auto vec_v = warp::load_vec<kElementSize, kGranularity, kWarpThreads>(src_v);
+    warp::store_vec<kElementSize, kGranularity, kWarpThreads>(dst_k, vec_k);
+    warp::store_vec<kElementSize, kGranularity, kWarpThreads>(dst_v, vec_v);
   }
 }
 
 template <
     std::integral T,
     std::size_t kElementSize,
+    std::size_t kUnroll,
     std::size_t kBlockQuota,
     std::size_t kNumThreads,
     std::size_t kMaxOccupancy>
@@ -79,6 +84,7 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void hicache_transfer_a
   using dst_ptr_t = std::add_pointer_t<void* const>;
 
   static_assert(kNumThreads % kWarpThreads == 0);
+  constexpr auto kWarpThreads = device::kWarpThreads / kUnroll;
   constexpr auto kWarpsPerBlock = static_cast<uint32_t>(kNumThreads) / kWarpThreads;
   constexpr auto kWorkers = kWarpsPerBlock * kBlockQuota;
 
@@ -107,16 +113,28 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void hicache_transfer_a
       const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
       const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
       const auto dst_v = pointer::offset(v_cache_dst, pos_dst * kv_cache_dst_stride);
-      const auto vec_k = warp::load_vec<kElementSize, kGranularity>(src_k);
-      const auto vec_v = warp::load_vec<kElementSize, kGranularity>(src_v);
-      warp::store_vec<kElementSize, kGranularity>(dst_k, vec_k);
-      warp::store_vec<kElementSize, kGranularity>(dst_v, vec_v);
+      const auto vec_k = warp::load_vec<kElementSize, kGranularity, kWarpThreads>(src_k);
+      const auto vec_v = warp::load_vec<kElementSize, kGranularity, kWarpThreads>(src_v);
+      warp::store_vec<kElementSize, kGranularity, kWarpThreads>(dst_k, vec_k);
+      warp::store_vec<kElementSize, kGranularity, kWarpThreads>(dst_v, vec_v);
     }
   }
 }
 
-template <std::size_t kElementSize, std::size_t kBlockQuota, std::size_t kNumThreads, std::size_t kMaxOccupancy>
+template <
+    std::size_t kElementSize,
+    std::size_t kUnroll,
+    std::size_t kBlockQuota,
+    std::size_t kNumThreads,
+    std::size_t kMaxOccupancy>
 struct HiCacheKernel {
+  template <typename T>
+  static constexpr auto _kernel_one =
+      hicache_transfer_per_layer<T, kElementSize, kUnroll, kBlockQuota, kNumThreads, kMaxOccupancy>;
+  template <typename T>
+  static constexpr auto _kernel_all =
+      hicache_transfer_all_layer<T, kElementSize, kUnroll, kBlockQuota, kNumThreads, kMaxOccupancy>;
+
   static void run_one(
       const tvm::ffi::TensorView k_cache_dst,
       const tvm::ffi::TensorView v_cache_dst,
@@ -169,8 +187,8 @@ struct HiCacheKernel {
     const auto use_int32 = indices_dtype.unwrap().bits == 32;
     const auto device = indices_device.unwrap();
 
-    constexpr auto kWarpsPerBlock = kNumThreads / device::kWarpThreads;
-    const auto num_blocks = std::min(div_ceil(length, kWarpsPerBlock), kBlockQuota);
+    constexpr auto kWorkersPerBlock = kNumThreads / (device::kWarpThreads / kUnroll);
+    const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
     const auto params = HicacheKernelParams{
         .k_cache_dst = k_cache_dst_ptr,
         .v_cache_dst = v_cache_dst_ptr,
@@ -182,9 +200,7 @@ struct HiCacheKernel {
         .kv_cache_src_stride = kv_cache_src_stride,
         .kv_cache_dst_stride = kv_cache_dst_stride,
     };
-    const auto kernel =
-        use_int32 ? hicache_transfer_per_layer<int32_t, kElementSize, kBlockQuota, kNumThreads, kMaxOccupancy>
-                  : hicache_transfer_per_layer<int64_t, kElementSize, kBlockQuota, kNumThreads, kMaxOccupancy>;
+    const auto kernel = use_int32 ? _kernel_one<int32_t> : _kernel_one<int64_t>;
     LaunchKernel(num_blocks, kNumThreads, device)(kernel, params);
   }
 
@@ -228,8 +244,8 @@ struct HiCacheKernel {
     const auto use_int32 = dtype_.unwrap().bits == 32;
     const auto device = device_.unwrap();
 
-    constexpr auto kWarpsPerBlock = kNumThreads / device::kWarpThreads;
-    const auto num_blocks = std::min(div_ceil(length, kWarpsPerBlock), kBlockQuota);
+    constexpr auto kWorkersPerBlock = kNumThreads / (device::kWarpThreads / kUnroll);
+    const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
     const auto params = HicacheKernelParams{
         .k_cache_dst = k_cache_dst_ptr,
         .v_cache_dst = v_cache_dst_ptr,
@@ -242,9 +258,7 @@ struct HiCacheKernel {
         .kv_cache_dst_stride = kv_dst_stride,
         .num_layers = static_cast<std::size_t>(N.unwrap()),
     };
-    const auto kernel =
-        use_int32 ? hicache_transfer_all_layer<int32_t, kElementSize, kBlockQuota, kNumThreads, kMaxOccupancy>
-                  : hicache_transfer_all_layer<int64_t, kElementSize, kBlockQuota, kNumThreads, kMaxOccupancy>;
+    const auto kernel = use_int32 ? _kernel_all<int32_t> : _kernel_all<int64_t>;
     LaunchKernel(num_blocks, kNumThreads, device)(kernel, params);
   }
 };

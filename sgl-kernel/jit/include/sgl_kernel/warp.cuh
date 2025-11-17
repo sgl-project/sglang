@@ -22,7 +22,7 @@ inline constexpr auto get_mem_package() {
   }
 }
 
-inline constexpr auto resolve_unit_size(std::size_t x) -> std::size_t {
+inline constexpr auto default_unit_size(std::size_t x) -> std::size_t {
   if (x % (16 * kWarpThreads) == 0) return 16;
   if (x % (8 * kWarpThreads) == 0) return 8;
   if (x % (4 * kWarpThreads) == 0) return 4;
@@ -33,7 +33,7 @@ template <std::size_t kBytes, std::size_t kUnit>
 using mem_package_t = decltype(get_mem_package<kUnit>());
 
 template <typename T, std::size_t N>
-struct uint_vec {
+struct storage_vec {
   T data[N];
 };
 
@@ -76,79 +76,69 @@ __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& v
 
 }  // namespace details
 
-template <std::size_t kBytes, std::size_t kUnit = details::resolve_unit_size(kBytes)>
+template <
+    std::size_t kBytes,
+    std::size_t kUnit = details::default_unit_size(kBytes),
+    std::size_t kThreads = ::device::kWarpThreads>
 __always_inline __device__ void copy(void* __restrict__ dst, const void* __restrict__ src) {
   using Package = details::mem_package_t<kBytes, kUnit>;
-  constexpr auto kBytesPerLoop = sizeof(Package) * kWarpThreads;
+  constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
   constexpr auto kLoopCount = kBytes / kBytesPerLoop;
   static_assert(kBytes % kBytesPerLoop == 0, "kBytes must be multiple of 128 bytes");
 
   const auto dst_packed = static_cast<Package*>(dst);
   const auto src_packed = static_cast<const Package*>(src);
-  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto lane_id = threadIdx.x % kThreads;
 
 #pragma unroll kLoopCount
   for (std::size_t i = 0; i < kLoopCount; ++i) {
-    const auto j = i * kWarpThreads + lane_id;
+    const auto j = i * kThreads + lane_id;
     dst_packed[j] = src_packed[j];
   }
 }
 
-template <std::size_t kBytes, std::size_t kUnit = details::resolve_unit_size(kBytes)>
+template <
+    std::size_t kBytes,
+    std::size_t kUnit = details::default_unit_size(kBytes),
+    std::size_t kThreads = ::device::kWarpThreads>
 __always_inline __device__ auto load_vec(const void* __restrict__ src) {
   using Package = details::mem_package_t<kBytes, kUnit>;
-  constexpr auto kBytesPerLoop = sizeof(Package) * kWarpThreads;
+  constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
   constexpr auto kLoopCount = kBytes / kBytesPerLoop;
-  using vec_t = details::uint_vec<Package, kLoopCount>;
   static_assert(kBytes % kBytesPerLoop == 0, "kBytes must be multiple of 128 bytes");
 
   const auto src_packed = static_cast<const Package*>(src);
-  const auto lane_id = threadIdx.x % kWarpThreads;
-  vec_t vec;
+  const auto lane_id = threadIdx.x % kThreads;
+  details::storage_vec<Package, kLoopCount> vec;
 
 #pragma unroll kLoopCount
   for (std::size_t i = 0; i < kLoopCount; ++i) {
-    const auto j = i * kWarpThreads + lane_id;
-    // vec.data[i] = src_packed[j];
+    const auto j = i * kThreads + lane_id;
     vec.data[i] = details::load_nc(src_packed + j);
   }
+
   return vec;
 }
 
-template <std::size_t kBytes, std::size_t kUnit = details::resolve_unit_size(kBytes), typename T>
-__always_inline __device__ void store_vec(void* __restrict__ dst, const T& vec) {
+template <
+    std::size_t kBytes,
+    std::size_t kUnit = details::default_unit_size(kBytes),
+    std::size_t kThreads = ::device::kWarpThreads,
+    typename Tp>
+__always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
   using Package = details::mem_package_t<kBytes, kUnit>;
-  constexpr auto kBytesPerLoop = sizeof(Package) * kWarpThreads;
+  constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
   constexpr auto kLoopCount = kBytes / kBytesPerLoop;
-  using vec_t = details::uint_vec<Package, kLoopCount>;
   static_assert(kBytes % kBytesPerLoop == 0, "kBytes must be multiple of 128 bytes");
-  static_assert(std::is_same_v<T, vec_t>, "store_vec: src type mismatch");
+  static_assert(std::is_same_v<Tp, details::storage_vec<Package, kLoopCount>>);
 
   const auto dst_packed = static_cast<Package*>(dst);
-  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto lane_id = threadIdx.x % kThreads;
 
 #pragma unroll kLoopCount
   for (std::size_t i = 0; i < kLoopCount; ++i) {
-    const auto j = i * kWarpThreads + lane_id;
-    // dst_packed[j] = vec.data[i];
+    const auto j = i * kThreads + lane_id;
     details::store_nc(dst_packed + j, vec.data[i]);
-  }
-}
-
-template <std::size_t kBytes, std::size_t kUnit = details::resolve_unit_size(kBytes)>
-__always_inline __device__ void reset(void* __restrict__ dst) {
-  using Package = details::mem_package_t<kBytes, kUnit>;
-  constexpr auto kBytesPerLoop = sizeof(Package) * kWarpThreads;
-  constexpr auto kLoopCount = kBytes / kBytesPerLoop;
-  static_assert(kBytes % kBytesPerLoop == 0, "warp_copy: kBytes must be multiple of 128 bytes");
-
-  const auto dst_ = static_cast<Package*>(dst);
-  const auto lane_id = threadIdx.x % kWarpThreads;
-  const auto zero_value = Package{};
-
-#pragma unroll kLoopCount
-  for (std::size_t i = 0; i < kLoopCount; ++i) {
-    dst_[i * 32u + lane_id] = zero_value;
   }
 }
 
