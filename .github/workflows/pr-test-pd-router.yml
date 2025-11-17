@@ -147,7 +147,7 @@ jobs:
       run: |
         source "$HOME/.cargo/env"
         echo "Building sgl-router..."
-        cd sgl-router
+        cd sgl-router/bindings/python
         pip install maturin
         maturin build --release --out dist --features vendored-openssl
         pip install --force-reinstall dist/*.whl
