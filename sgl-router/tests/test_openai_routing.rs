@@ -602,6 +602,7 @@ async fn test_unsupported_endpoints() {
 
     let generate_request = GenerateRequest {
         text: Some("Hello world".to_string()),
+        model: None,
         input_ids: None,
         input_embeds: None,
         image_data: None,

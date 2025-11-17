@@ -1462,6 +1462,8 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         if positions.ndim == 2 and self.mrope_section and _is_cuda:
             return self._forward_triton(positions, query, key)
+        elif _is_npu:
+            return self._forward_npu(positions, query, key)
         else:
             return self._forward_native(positions, query, key)
 
@@ -1479,6 +1481,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.contiguous()
+        sin = sin.contiguous()
         query_shape = query.shape
         key_shape = key.shape
         if positions.ndim == 2:
@@ -1510,6 +1514,32 @@ class MRotaryEmbedding(RotaryEmbedding):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def _forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # TODO: remove this when npu_mrope supports QNumHeads * QHeadSize > 4096
+        if query.shape[1] > 4096:
+            return self._forward_native(positions, query, key)
+        rotary_mode = "half"
+        if self.is_neox_style:
+            rotary_mode = "half"
+        else:
+            rotary_mode = "interleave"
+        mrope_section = [0, 0, 0]
+        query_out, key_out = torch_npu.npu_mrope(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
+        )
+        return query_out, key_out
 
     # Copied from https://github.com/huggingface/transformers/blob/c8e0e603de9b3d49161a15fe6e8ea84badfb5d02/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1439
     @staticmethod

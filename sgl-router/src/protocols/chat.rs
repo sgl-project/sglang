@@ -5,7 +5,12 @@ use serde_json::Value;
 use validator::Validate;
 
 use super::{
-    common::*,
+    common::{
+        default_model, default_true, validate_stop, ChatLogProbs, ContentPart, Function,
+        FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
+        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
+        Usage,
+    },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::protocols::{
@@ -300,34 +305,6 @@ pub struct ChatCompletionRequest {
 // ============================================================================
 // Validation Functions
 // ============================================================================
-
-/// Validates stop sequences (max 4, non-empty strings)
-fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
-    match stop {
-        StringOrArray::String(s) => {
-            if s.is_empty() {
-                return Err(validator::ValidationError::new(
-                    "stop sequences cannot be empty",
-                ));
-            }
-        }
-        StringOrArray::Array(arr) => {
-            if arr.len() > 4 {
-                return Err(validator::ValidationError::new(
-                    "maximum 4 stop sequences allowed",
-                ));
-            }
-            for s in arr {
-                if s.is_empty() {
-                    return Err(validator::ValidationError::new(
-                        "stop sequences cannot be empty",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
 
 /// Validates messages array is not empty and has valid content
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::ValidationError> {

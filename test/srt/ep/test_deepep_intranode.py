@@ -1,6 +1,5 @@
 # Copy from deepseek-ai/DeepEP/tests/test_intranode.py
 
-import os
 import time
 
 # noinspection PyUnresolvedReferences
