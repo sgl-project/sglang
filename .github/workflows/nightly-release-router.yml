@@ -120,15 +120,15 @@ jobs:
             protoc --version
 
       - name: List built packages
-        run: ${{ matrix.ls || 'ls -lh' }} dist/
+        run: ${{ matrix.ls || 'ls -lh' }} bindings/python/dist/
 
       - name: Check packages
-        run: twine check --strict dist/*
+        run: twine check --strict bindings/python/dist/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: packages-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'auto' }}
-          path: dist/
+          path: bindings/python/dist/
 
   build-sdist:
     name: Build SDist
@@ -174,7 +174,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
-          path: dist/*.tar.gz
+          path: bindings/python/dist/*.tar.gz
 
   upload:
     name: Upload to TestPyPI

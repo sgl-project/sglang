@@ -38,12 +38,15 @@ except ImportError:
 # Add new runner labels and models here as needed
 RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "1-gpu-runner": [
+        "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
         "deepseek-ai/DeepSeek-OCR",
         "google/gemma-3-4b-it",
+        "intfloat/e5-mistral-7b-instruct",
         "lmms-lab/llava-onevision-qwen2-0.5b-ov",
         "lmsys/sglang-ci-dsv3-test",
         "lmsys/sglang-EAGLE-llama2-chat-7B",
         "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B",
+        "marco/mcdse-2b-v1",
         "meta-llama/Llama-2-7b-chat-hf",
         "meta-llama/Llama-3.2-1B-Instruct",
         "meta-llama/Llama-3.1-8B-Instruct",
@@ -55,6 +58,7 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "Qwen/Qwen2.5-7B-Instruct",
         "Qwen/Qwen3-8B",
         "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "Qwen/Qwen3-Embedding-8B",
         "Qwen/QwQ-32B-AWQ",
         "Qwen/Qwen3-30B-A3B",
     ],
@@ -75,7 +79,11 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "8-gpu-b200": ["deepseek-ai/DeepSeek-V3.1", "deepseek-ai/DeepSeek-V3.2-Exp"],
     "4-gpu-b200": ["nvidia/DeepSeek-V3-0324-FP4"],
     "4-gpu-gb200": ["nvidia/DeepSeek-V3-0324-FP4"],
-    "4-gpu-h100": ["lmsys/sglang-ci-dsv3-test", "lmsys/sglang-ci-dsv3-test-NextN"],
+    "4-gpu-h100": [
+        "lmsys/sglang-ci-dsv3-test",
+        "lmsys/sglang-ci-dsv3-test-NextN",
+        "lmsys/gpt-oss-120b-bf16",
+    ],
 }
 
 
