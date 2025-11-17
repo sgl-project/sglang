@@ -99,7 +99,7 @@ class SD3Transformer2DModel(CachableDiT):
         # should be convert [prompt_embeds,pooled_embeds]
         assert len(encoder_hidden_states) == 2
         pooled_projections = encoder_hidden_states[1]
-        encoder_hidden_states = encoder_hidden_states[0]
+        encoder_embeddings = encoder_hidden_states[0]
 
         """
         The [`SD3Transformer2DModel`] forward method.
@@ -149,13 +149,7 @@ class SD3Transformer2DModel(CachableDiT):
             hidden_states
         )  # takes care of adding positional embeddings too.
         temb = self.time_text_embed(timestep, pooled_projections)
-        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-        # Copied from diffusers/models/transformers/transformer_sd3.py#SD3Transformer2DModel, but without the self.image_proj method; commented out temporarily for robustness.
-        # if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
-        #     ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
-        #     ip_hidden_states, ip_temb = self.image_proj(ip_adapter_image_embeds, timestep)
-        #
-        #     joint_attention_kwargs.update(ip_hidden_states=ip_hidden_states, temb=ip_temb)
+        encoder_embeddings = self.context_embedder(encoder_embeddings)
 
         for index_block, block in enumerate(self.transformer_blocks):
             # Skip specified layers
@@ -166,19 +160,19 @@ class SD3Transformer2DModel(CachableDiT):
             )
 
             if torch.is_grad_enabled() and self.gradient_checkpointing and not is_skip:
-                encoder_hidden_states, hidden_states = (
+                encoder_embeddings, hidden_states = (
                     self._gradient_checkpointing_func(
                         block,
                         hidden_states,
-                        encoder_hidden_states,
+                        encoder_embeddings,
                         temb,
                         joint_attention_kwargs,
                     )
                 )
             elif not is_skip:
-                encoder_hidden_states, hidden_states = block(
+                encoder_embeddings, hidden_states = block(
                     hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states=encoder_embeddings,
                     temb=temb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )

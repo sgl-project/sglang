@@ -100,11 +100,6 @@ class ConditioningStage(PipelineStage):
                 batch.negative_prompt_embeds = [negative_prompt_embeds]
                 batch.neg_pooled_embeds = [negative_pooled_prompt_embeds]
 
-            # if batch.do_classifier_free_guidance:
-            #     prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            #     pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
-            #     batch.prompt_embeds = [prompt_embeds]
-            #     batch.pooled_embeds = [pooled_prompt_embeds]
 
             return batch
         # TODO!!
