@@ -338,6 +338,7 @@ class ServerlessLLMModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sllm_store.torch import load_dict
+
         from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         tp_rank = get_tensor_model_parallel_rank()
@@ -368,6 +369,7 @@ class ServerlessLLMModelLoader(BaseModelLoader):
     ) -> None:
         """Save current TP shard tensors to ServerlessLLM store format."""
         from sllm_store.torch import save_dict
+
         from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         rank = get_tensor_model_parallel_rank()
@@ -391,7 +393,7 @@ class ServerlessLLMModelLoader(BaseModelLoader):
         normalized_path = os.path.normpath(local_model_path)
         normalized_storage = os.path.normpath(storage_path)
         if normalized_path.startswith(normalized_storage):
-            return normalized_path[len(normalized_storage):].lstrip(os.sep)
+            return normalized_path[len(normalized_storage) :].lstrip(os.sep)
         return normalized_path
 
     def _initialize_model_on_cpu(self, model_config: ModelConfig) -> nn.Module:
@@ -409,8 +411,8 @@ class ServerlessLLMModelLoader(BaseModelLoader):
     def _build_storage_to_keys(
         state_dict: Dict[str, torch.Tensor],
     ) -> Dict[Tuple[torch.device, int], List[str]]:
-        storage_to_keys: Dict[Tuple[torch.device, int], List[str]] = collections.defaultdict(
-            list
+        storage_to_keys: Dict[Tuple[torch.device, int], List[str]] = (
+            collections.defaultdict(list)
         )
         for key, tensor in state_dict.items():
             if tensor.numel() > 0:
@@ -449,11 +451,15 @@ class ServerlessLLMModelLoader(BaseModelLoader):
         return loaded_params
 
     @staticmethod
-    def _assert_all_parameters_loaded(model: nn.Module, loaded_params: Set[str]) -> None:
+    def _assert_all_parameters_loaded(
+        model: nn.Module, loaded_params: Set[str]
+    ) -> None:
         all_param_names = set(dict(model.named_parameters()).keys())
         missing_params = all_param_names - loaded_params
         if missing_params:
-            raise ValueError(f"Missing parameters {tuple(missing_params)} in loaded state!")
+            raise ValueError(
+                f"Missing parameters {tuple(missing_params)} in loaded state!"
+            )
 
     def _run_post_load_hooks(
         self, model: nn.Module, target_device: torch.device, model_config: ModelConfig
@@ -463,7 +469,9 @@ class ServerlessLLMModelLoader(BaseModelLoader):
         post_load_weights(model, model_config)
 
     @staticmethod
-    def _apply_quantization_hooks(model: nn.Module, target_device: torch.device) -> None:
+    def _apply_quantization_hooks(
+        model: nn.Module, target_device: torch.device
+    ) -> None:
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None:
