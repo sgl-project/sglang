@@ -17,7 +17,7 @@ from sglang.multimodal_gen.configs.pipelines.wan import (
     WanT2V480PConfig,
     WanT2V720PConfig,
 )
-from sglang.multimodal_gen.configs.pipelines.stablediffsuion3 import StableDiffusion3PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.stablediffusion3 import StableDiffusion3PipelineConfig
 __all__ = [
     "HunyuanConfig",
     "FastHunyuanConfig",
