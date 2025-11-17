@@ -22,6 +22,8 @@ class FlattenedTensorBucket:
     while preserving all metadata needed for reconstruction.
     """
 
+    supports_multi_dtypes = True
+
     def __init__(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]] = None,
