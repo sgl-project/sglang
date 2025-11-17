@@ -10,6 +10,7 @@ use serde_json::{json, to_value};
 use tracing::{debug, error, warn};
 
 // Re-export MCP utilities for use by grpc routers
+// TODO: we should have a common module for MCP utilities that can be used by all openai/grpc regular/harmony routers.
 pub use crate::routers::openai::mcp::extract_dynamic_mcp_servers;
 use crate::{
     core::WorkerRegistry,
