@@ -320,12 +320,6 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
-      - name: Clean Corrupted Hugging Face Model Cache
-        run: |
-          echo "Temp: Deleting potentially corrupted Qwen/Qwen-Image and Qwen/Qwen-Image-Edit cache to ensure a fresh download."
-          rm -rf /hf_home/hub/models--Qwen--Qwen-Image
-          rm -rf /hf_home/hub/models--Qwen--Qwen-Image-Edit
-
       - name: Run diffusion server tests
         timeout-minutes: 60
         run: |
@@ -392,7 +386,9 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/
-          python3 run_suite.py
+          python3 run_suite.py --hw cuda --suite stage-a-test-1
+          # temporarily put backend-independent cpu tests here
+          python3 run_suite.py --hw cpu --suite default
 
   unit-test-backend-1-gpu:
     needs: [check-changes, stage-a-test-1, sgl-kernel-build-wheels]
@@ -1009,7 +1005,6 @@ jobs:
               exit 1
             fi
           done
-
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
