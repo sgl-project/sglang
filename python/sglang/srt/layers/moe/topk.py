@@ -131,7 +131,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sgl_kernel import moe_fused_gate
+    from moe_cuda import moe_fused_gate
 
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
