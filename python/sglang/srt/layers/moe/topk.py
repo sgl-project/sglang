@@ -70,6 +70,7 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_fused_moe_gate = get_bool_env_var("SGLANG_USE_FUSED_MOE_GATE")
 
 if _is_cuda:
     from moe_cuda import moe_fused_gate
@@ -719,7 +720,11 @@ def biased_grouped_topk_gpu(
         _is_cuda
         and (
             (gating_output.shape[1] // num_expert_group <= 32)
-            or (gating_output.shape[1] == 256 and num_expert_group == 1)
+            or (
+                _use_fused_moe_gate
+                and gating_output.shape[1] == 256
+                and num_expert_group == 1
+            )
         )
         and is_power_of_two(correction_bias.shape[0])
     ):
