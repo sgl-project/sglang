@@ -36,24 +36,21 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
 
 if is_cuda():
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn as causal_conv1d_fn_cuda,
-    )
+    pass
 
-    causal_conv1d_fn = causal_conv1d_fn_cuda
+    # TODO: add this back. This is temporarily commented to wait for sgl-kernel new version release
+    # causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update_npu,
     )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
+    from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
+    # TODO: add this back. This is temporarily commented to wait for sgl-kernel new version release
+    # causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
 
 
@@ -630,50 +627,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = mamba_cache_params.conv
         ssm_states = mamba_cache_params.temporal
+        is_spec_decoding = isinstance(mamba_cache_params, MambaPool.SpeculativeState)
         if is_target_verify:
-            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
-            conv_states_to_use = conv_states.clone()
+            assert is_spec_decoding
+            last_steps = mamba_cache_params.last_steps
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
-            conv_states_to_use = conv_states
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = (
-                mixed_qkv.view(batch_size, draft_token_num, -1)
-                .transpose(1, 2)
-                .contiguous()
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
-                conv_states_to_use,
+                conv_states,
                 conv_weights,
                 bias,
                 activation,
                 conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
+                last_steps=last_steps,
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
-            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states_to_use,
+                conv_states=conv_states,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -708,15 +694,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 beta=beta,
                 initial_state_source=ssm_states,
                 initial_state_indices=cache_indices,
+                last_steps=last_steps,
                 cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            recurrent_state = ssm_states[cache_indices]
+            if is_spec_decoding:
+                # ssm_states is a tensor of shape [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # for extend, we only need to use the main state (the first draft token). after that, the next verify will use the main state (the first draft token) and calculate the next temporal state and conv state.
+                recurrent_state = ssm_states[cache_indices, 0]
+            else:
+                # ssm_states is a tensor of shape [num_layers, size + 1, HV, K, V]
+                recurrent_state = ssm_states[cache_indices]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -730,7 +722,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[cache_indices] = last_recurrent_state
+            if is_spec_decoding:
+                # for extend, we only need to use the main state (the first draft token). after that, the next verify will use the main state (the first draft token) and calculate the next temporal state and conv state.
+                ssm_states[cache_indices, 0] = last_recurrent_state
+            else:
+                ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
@@ -960,7 +956,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
-    def update_mamba_state_after_mtp_verify(self, accepted_indices, model):
+    def update_mamba_state_after_mtp_verify(
+        self, accepted_indices: torch.Tensor, model
+    ):
         request_number = accepted_indices.shape[0]
 
         state_indices_tensor = (
@@ -973,24 +971,4 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv
-        ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
-
-        # SSM state updates (chunked to reduce peak memory)
-        valid_mask = accepted_indices >= 0
-
-        # Compute common indices once to avoid duplication
-        valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        last_steps = accepted_indices[valid_mask].to(torch.int64)  # [N]
-
-        # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
-            :, valid_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
-
-        # Scatter into conv_states at the chosen cache lines
-        conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
-            :, valid_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        mamba_caches.last_steps[state_indices_tensor] = accepted_indices
