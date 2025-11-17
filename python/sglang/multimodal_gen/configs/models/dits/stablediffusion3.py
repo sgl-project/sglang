@@ -23,6 +23,7 @@ class StableDiffusion3TransformerArchConfig(DiTArchConfig):
 @dataclass
 class StableDiffusion3TransformerConfig(DiTConfig):
     """Configuration for StableDiffusion3 Transformer model."""
+
     arch_config: StableDiffusion3TransformerArchConfig = field(
         default_factory=StableDiffusion3TransformerArchConfig
     )

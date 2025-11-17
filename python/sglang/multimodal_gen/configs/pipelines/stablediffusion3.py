@@ -6,10 +6,8 @@ from typing import Callable, Tuple
 
 import torch
 
-
-from sglang.multimodal_gen.configs.models.dits import StableDiffusion3TransformerConfig
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, ModelTaskType
+from sglang.multimodal_gen.configs.models.dits import StableDiffusion3TransformerConfig
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
@@ -18,6 +16,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
+from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, PipelineConfig
 
 
 def t5_preprocess_text(prompt: str) -> str:
@@ -42,14 +41,10 @@ class StableDiffusion3PipelineConfig(PipelineConfig):
 
     # Model configurations - use generic ModelConfig, actual config loaded from model files
     dit_config: DiTConfig = field(default_factory=StableDiffusion3TransformerConfig)
-    vae_config: VAEConfig = field(
-        default_factory=StableDiffusion3VAEConfig
-    )
+    vae_config: VAEConfig = field(default_factory=StableDiffusion3VAEConfig)
     # Text encoders
     text_encoder_configs: Tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (
-            CLIPTextConfig(), CLIPTextConfig(), T5Config()
-        )
+        default_factory=lambda: (CLIPTextConfig(), CLIPTextConfig(), T5Config())
     )
 
     # Precision settings
@@ -66,11 +61,13 @@ class StableDiffusion3PipelineConfig(PipelineConfig):
         )
     )
 
-    postprocess_text_funcs: Tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = field(
-        default_factory=lambda: (
-            clip_postprocess_text,  # CLIP-L
-            clip_postprocess_text,  # CLIP-G
-            t5_postprocess_text,  # T5-XXL
+    postprocess_text_funcs: Tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
+        field(
+            default_factory=lambda: (
+                clip_postprocess_text,  # CLIP-L
+                clip_postprocess_text,  # CLIP-G
+                t5_postprocess_text,  # T5-XXL
+            )
         )
     )
 

@@ -38,8 +38,7 @@ class StableDiffusion3Pipeline(ComposedPipelineBase):
         """Set up pipeline stages for StableDiffusion3."""
 
         self.add_stage(
-            stage_name="input_validation_stage",
-            stage=InputValidationStage()
+            stage_name="input_validation_stage", stage=InputValidationStage()
         )
 
         self.add_stage(
@@ -58,10 +57,7 @@ class StableDiffusion3Pipeline(ComposedPipelineBase):
             ),
         )
 
-        self.add_stage(
-            stage_name="conditioning_stage",
-            stage=ConditioningStage()
-        )
+        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
 
         self.add_stage(
             stage_name="timestep_preparation_stage",
@@ -87,8 +83,7 @@ class StableDiffusion3Pipeline(ComposedPipelineBase):
         )
 
         self.add_stage(
-            stage_name="decoding_stage",
-            stage=DecodingStage(vae=self.get_module("vae"))
+            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
         )
 
 

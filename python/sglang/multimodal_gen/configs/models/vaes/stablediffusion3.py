@@ -3,10 +3,7 @@
 
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.models.vaes.base import (
-    VAEArchConfig,
-    VAEConfig,
-)
+from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
 
 
 @dataclass
@@ -91,38 +88,24 @@ class StableDiffusion3VAEConfig(VAEConfig):
         pass
 
     @classmethod
-    def from_pretrained_config(
-        cls, config_dict: dict
-    ) -> "StableDiffusion3VAEConfig":
+    def from_pretrained_config(cls, config_dict: dict) -> "StableDiffusion3VAEConfig":
         """Create config from diffusers pretrained model config."""
         arch_config = StableDiffusion3VAEArchConfig()
 
         # Update from config dict if provided
         if config_dict:
-            arch_config.scaling_factor = config_dict.get(
-                "scaling_factor", 1.5305
-            )
-            arch_config.shift_factor = config_dict.get(
-                "shift_factor", 0.0609
-            )
+            arch_config.scaling_factor = config_dict.get("scaling_factor", 1.5305)
+            arch_config.shift_factor = config_dict.get("shift_factor", 0.0609)
             arch_config.in_channels = config_dict.get("in_channels", 3)
             arch_config.out_channels = config_dict.get("out_channels", 3)
-            arch_config.latent_channels = config_dict.get(
-                "latent_channels", 16
-            )
+            arch_config.latent_channels = config_dict.get("latent_channels", 16)
             arch_config.sample_size = config_dict.get("sample_size", 128)
             arch_config.block_out_channels = tuple(
                 config_dict.get("block_out_channels", [128, 256, 512, 512])
             )
-            arch_config.layers_per_block = config_dict.get(
-                "layers_per_block", 2
-            )
-            arch_config.norm_num_groups = config_dict.get(
-                "norm_num_groups", 32
-            )
-            arch_config.attention_head_dim = config_dict.get(
-                "attention_head_dim", 8
-            )
+            arch_config.layers_per_block = config_dict.get("layers_per_block", 2)
+            arch_config.norm_num_groups = config_dict.get("norm_num_groups", 32)
+            arch_config.attention_head_dim = config_dict.get("attention_head_dim", 8)
 
         return cls(arch_config=arch_config)
 

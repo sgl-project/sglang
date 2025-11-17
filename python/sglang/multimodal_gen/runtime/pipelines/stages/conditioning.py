@@ -7,12 +7,12 @@ Conditioning stage for diffusion pipelines.
 
 import torch
 
+from sglang.multimodal_gen.configs.pipelines import StableDiffusion3PipelineConfig
 from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines.stages.validators import (
     StageValidators as V,
 )
-from sglang.multimodal_gen.configs.pipelines import StableDiffusion3PipelineConfig
 from sglang.multimodal_gen.runtime.pipelines.stages.validators import VerificationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -44,40 +44,59 @@ class ConditioningStage(PipelineStage):
         Returns:
             The batch with applied conditioning.
         """
-        is_stable_diffusion3= isinstance(server_args.pipeline_config, StableDiffusion3PipelineConfig)
+        is_stable_diffusion3 = isinstance(
+            server_args.pipeline_config, StableDiffusion3PipelineConfig
+        )
         if is_stable_diffusion3:
             prompt_embeds_list = batch.prompt_embeds
             negative_prompt_embeds_list = batch.negative_prompt_embeds
             pooled_embeds_list = batch.pooled_embeds
             neg_pooled_embeds_list = batch.neg_pooled_embeds
             # prompt deal
-            clipt_encoder_embeds=prompt_embeds_list[0]
-            clipg_encoder_embeds=prompt_embeds_list[1]
-            t5_encoder_embeds=prompt_embeds_list[2]
-            clipt_pool_embeds=pooled_embeds_list[0]
-            clipg_pool_embeds=pooled_embeds_list[1]
-            clip_prompt_embeds = torch.cat([clipt_encoder_embeds, clipg_encoder_embeds], dim=-1)
+            clipt_encoder_embeds = prompt_embeds_list[0]
+            clipg_encoder_embeds = prompt_embeds_list[1]
+            t5_encoder_embeds = prompt_embeds_list[2]
+            clipt_pool_embeds = pooled_embeds_list[0]
+            clipg_pool_embeds = pooled_embeds_list[1]
+            clip_prompt_embeds = torch.cat(
+                [clipt_encoder_embeds, clipg_encoder_embeds], dim=-1
+            )
             clip_prompt_embeds = torch.nn.functional.pad(
-                clip_prompt_embeds, (0, t5_encoder_embeds.shape[-1] - clip_prompt_embeds.shape[-1])
+                clip_prompt_embeds,
+                (0, t5_encoder_embeds.shape[-1] - clip_prompt_embeds.shape[-1]),
             )
             prompt_embeds = torch.cat([clip_prompt_embeds, t5_encoder_embeds], dim=-2)
-            pooled_prompt_embeds = torch.cat([clipt_pool_embeds, clipg_pool_embeds], dim=-1)
+            pooled_prompt_embeds = torch.cat(
+                [clipt_pool_embeds, clipg_pool_embeds], dim=-1
+            )
             batch.prompt_embeds = [prompt_embeds]
             batch.pooled_embeds = [pooled_prompt_embeds]
 
             # negative prompt deal
             if batch.do_classifier_free_guidance:
-                negative_clipt_encoder_embeds=negative_prompt_embeds_list[0]
-                negative_clipg_encoder_embeds=negative_prompt_embeds_list[1]
-                negative_t5_encoder_embeds=negative_prompt_embeds_list[2]
-                negative_clipt_pool_embeds=neg_pooled_embeds_list[0]
-                negative_clipg_pool_embeds=neg_pooled_embeds_list[1]
-                negative_clip_prompt_embeds = torch.cat([negative_clipt_encoder_embeds, negative_clipg_encoder_embeds], dim=-1)
-                negative_clip_prompt_embeds = torch.nn.functional.pad(
-                    negative_clip_prompt_embeds, (0, negative_t5_encoder_embeds.shape[-1] - negative_clip_prompt_embeds.shape[-1])
+                negative_clipt_encoder_embeds = negative_prompt_embeds_list[0]
+                negative_clipg_encoder_embeds = negative_prompt_embeds_list[1]
+                negative_t5_encoder_embeds = negative_prompt_embeds_list[2]
+                negative_clipt_pool_embeds = neg_pooled_embeds_list[0]
+                negative_clipg_pool_embeds = neg_pooled_embeds_list[1]
+                negative_clip_prompt_embeds = torch.cat(
+                    [negative_clipt_encoder_embeds, negative_clipg_encoder_embeds],
+                    dim=-1,
                 )
-                negative_prompt_embeds = torch.cat([negative_clip_prompt_embeds, negative_t5_encoder_embeds], dim=-2)
-                negative_pooled_prompt_embeds = torch.cat([negative_clipt_pool_embeds, negative_clipg_pool_embeds], dim=-1)
+                negative_clip_prompt_embeds = torch.nn.functional.pad(
+                    negative_clip_prompt_embeds,
+                    (
+                        0,
+                        negative_t5_encoder_embeds.shape[-1]
+                        - negative_clip_prompt_embeds.shape[-1],
+                    ),
+                )
+                negative_prompt_embeds = torch.cat(
+                    [negative_clip_prompt_embeds, negative_t5_encoder_embeds], dim=-2
+                )
+                negative_pooled_prompt_embeds = torch.cat(
+                    [negative_clipt_pool_embeds, negative_clipg_pool_embeds], dim=-1
+                )
                 batch.negative_prompt_embeds = [negative_prompt_embeds]
                 batch.neg_pooled_embeds = [negative_pooled_prompt_embeds]
 
