@@ -681,6 +681,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
                 None,
+                None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
                 output=symm_output,
