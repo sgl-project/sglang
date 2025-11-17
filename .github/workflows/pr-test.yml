@@ -22,11 +22,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ============================================== PR gating check ===================================================
   call-gate:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
-
   # =============================================== check changes ====================================================
   check-changes:
     needs: [call-gate]
