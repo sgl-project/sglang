@@ -26,7 +26,7 @@ from typing import Dict, List, Literal, Optional, Union
 
 import orjson
 
-from sglang.srt.compilation.npu.config import CompilationConfig
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -657,10 +657,6 @@ class ServerArgs:
 
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
-
-        if not self.compilation_config:
-            self.compilation_config = CompilationConfig()
-            self.compilation_config.splitting_ops = ["atb._npu_paged_attention"]
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers

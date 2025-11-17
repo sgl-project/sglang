@@ -19,8 +19,8 @@ from typing import Any, Callable
 
 import torch
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.npu.compilation_context import CompilationContext
-from sglang.srt.compilation.npu.config import CompilationConfig
 from sglang.srt.compilation.npu.npu_graph_compiler_backend import (
     NpuGraphCompilerBackend,
 )

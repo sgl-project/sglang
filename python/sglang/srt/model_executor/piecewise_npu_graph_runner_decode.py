@@ -23,8 +23,8 @@ import torch
 import torch._dynamo.config
 import tqdm
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.npu.compilation_context import CompilationContext
-from sglang.srt.compilation.npu.config import CompilationConfig
 from sglang.srt.compilation.npu.patch_dynamo import (
     patch_dynamo_context,
     patch_dynamo_context_call,
@@ -145,7 +145,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 class PiecewiseNPUGraphRunnerDecode:
     """A PiecewiseNPUGraphRunnerDecode runs the forward pass of a model with npu graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self, model_runner: ModelRunner, compilation_config: CompilationConfig
+    ):
         model_runner.attn_backend.enable_piecewise_npu_graph_decode = True
 
         patch_dynamo_context()
@@ -155,11 +157,11 @@ class PiecewiseNPUGraphRunnerDecode:
 
         # Parse args
         self.model_runner = model_runner
-        self.compilation_config = CompilationConfig()
-        self.compilation_config.splitting_ops = ["atb._npu_paged_attention"]
+        if compilation_config is None:
+            compilation_config = CompilationConfig()
+            compilation_config.splitting_ops = ["atb._npu_paged_attention"]
+        self.compilation_config = compilation_config
         self.compilation_context = CompilationContext()
-
-        # self.compilation_context = model_runner.server_args.compilation_config
 
         self.graphs = {}
         self.output_buffers = {}
