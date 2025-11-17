@@ -394,7 +394,9 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/
-          python3 run_suite.py
+          python3 run_suite.py --hw cuda --suite stage-a-test-1
+          # temporarily put backend-independent cpu tests here
+          python3 run_suite.py --hw cpu --suite default
 
   unit-test-backend-1-gpu:
     needs: [check-changes, stage-a-test-1, sgl-kernel-build-wheels]

@@ -16,6 +16,9 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(1.0, "default")
 
 
 class TestJsonSchemaConstraint(unittest.TestCase):
