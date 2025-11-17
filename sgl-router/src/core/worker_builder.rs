@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     worker::{
-        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
+        WorkerType,
     },
 };
-use crate::grpc_client::SglangSchedulerClient;
+use crate::routers::grpc::client::GrpcClient;
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -14,10 +15,11 @@ pub struct BasicWorkerBuilder {
     api_key: Option<String>,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
+    runtime_type: RuntimeType,
     labels: HashMap<String, String>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<SglangSchedulerClient>,
+    grpc_client: Option<GrpcClient>,
 }
 
 impl BasicWorkerBuilder {
@@ -28,6 +30,7 @@ impl BasicWorkerBuilder {
             api_key: None,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
@@ -42,6 +45,7 @@ impl BasicWorkerBuilder {
             api_key: None,
             worker_type,
             connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
@@ -64,6 +68,12 @@ impl BasicWorkerBuilder {
     /// Set the connection mode (HTTP or gRPC)
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.connection_mode = mode;
+        self
+    }
+
+    /// Set the runtime type (SGLang or vLLM)
+    pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
+        self.runtime_type = runtime_type;
         self
     }
 
@@ -92,7 +102,7 @@ impl BasicWorkerBuilder {
     }
 
     /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: SglangSchedulerClient) -> Self {
+    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
         self.grpc_client = Some(client);
         self
     }
@@ -139,6 +149,7 @@ impl BasicWorkerBuilder {
             api_key: self.api_key,
             worker_type: self.worker_type,
             connection_mode: self.connection_mode,
+            runtime_type: self.runtime_type,
             labels: self.labels,
             health_config: self.health_config,
             bootstrap_host,
@@ -168,10 +179,11 @@ pub struct DPAwareWorkerBuilder {
     dp_size: usize,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
+    runtime_type: RuntimeType,
     labels: HashMap<String, String>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<SglangSchedulerClient>,
+    grpc_client: Option<GrpcClient>,
 }
 
 impl DPAwareWorkerBuilder {
@@ -184,6 +196,7 @@ impl DPAwareWorkerBuilder {
             dp_size,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
@@ -205,6 +218,7 @@ impl DPAwareWorkerBuilder {
             dp_size,
             worker_type,
             connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
@@ -227,6 +241,12 @@ impl DPAwareWorkerBuilder {
     /// Set the connection mode (HTTP or gRPC)
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.connection_mode = mode;
+        self
+    }
+
+    /// Set the runtime type (SGLang or vLLM)
+    pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
+        self.runtime_type = runtime_type;
         self
     }
 
@@ -255,7 +275,7 @@ impl DPAwareWorkerBuilder {
     }
 
     /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: SglangSchedulerClient) -> Self {
+    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
         self.grpc_client = Some(client);
         self
     }
@@ -266,6 +286,7 @@ impl DPAwareWorkerBuilder {
         let mut builder = BasicWorkerBuilder::new(worker_url)
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
+            .runtime_type(self.runtime_type)
             .labels(self.labels)
             .health_config(self.health_config)
             .circuit_breaker_config(self.circuit_breaker_config);

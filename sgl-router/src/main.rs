@@ -478,12 +478,7 @@ impl CliArgs {
         } else if self.pd_disaggregation {
             let decode_urls = self.decode.clone();
 
-            if !self.service_discovery && (prefill_urls.is_empty() || decode_urls.is_empty()) {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "PD disaggregation mode requires --prefill and --decode URLs when not using service discovery".to_string(),
-                });
-            }
-
+            // Allow empty URLs to support dynamic worker addition
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
@@ -491,12 +486,7 @@ impl CliArgs {
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else {
-            if !self.service_discovery && self.worker_urls.is_empty() {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Regular mode requires --worker-urls when not using service discovery"
-                        .to_string(),
-                });
-            }
+            // Allow empty URLs to support dynamic worker addition
             RoutingMode::Regular {
                 worker_urls: self.worker_urls.clone(),
             }

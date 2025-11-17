@@ -3,15 +3,19 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::response::Response;
-use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use super::{error, ProcessedMessages};
+use super::{
+    client::GrpcClient,
+    error,
+    proto_wrapper::{ProtoGenerateComplete, ProtoStream},
+    ProcessedMessages,
+};
 use crate::{
     core::Worker,
-    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
+    grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{
@@ -24,6 +28,7 @@ use crate::{
         ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
         ReasoningParser,
     },
+    routers::grpc::proto_wrapper::ProtoResponseVariant,
     tokenizer::{
         cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
@@ -37,18 +42,24 @@ use crate::{
 };
 
 /// Get gRPC client from worker, returning appropriate error response on failure
-pub async fn get_grpc_client_from_worker(
-    worker: &Arc<dyn Worker>,
-) -> Result<SglangSchedulerClient, Response> {
+pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {
+    // Get cached client from worker (or create one if not cached yet)
     let client_arc = worker
         .get_grpc_client()
         .await
         .map_err(|e| {
-            error!(function = "get_grpc_client_from_worker", error = %e, "Failed to get gRPC client");
+            error!(
+                function = "get_grpc_client_from_worker",
+                error = %e,
+                "Failed to get gRPC client from worker"
+            );
             error::internal_error(format!("Failed to get gRPC client: {}", e))
         })?
         .ok_or_else(|| {
-            error!(function = "get_grpc_client_from_worker", "Selected worker not configured for gRPC");
+            error!(
+                function = "get_grpc_client_from_worker",
+                "Selected worker not configured for gRPC"
+            );
             error::internal_error("Selected worker is not configured for gRPC")
         })?;
 
@@ -587,32 +598,31 @@ pub fn parse_json_schema_response(
 /// * `Ok(Vec<GenerateComplete>)` - All complete responses collected from the stream
 /// * `Err(Response)` - Error response if the stream fails or returns an error
 pub async fn collect_stream_responses(
-    stream: &mut AbortOnDropStream,
+    stream: &mut ProtoStream,
     worker_name: &str,
-) -> Result<Vec<proto::GenerateComplete>, Response> {
-    use proto::generate_response::Response::*;
-
+) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
 
     while let Some(response) = stream.next().await {
         match response {
             Ok(gen_response) => {
-                match gen_response.response {
-                    Some(Complete(complete)) => {
+                match gen_response.into_response() {
+                    ProtoResponseVariant::Complete(complete) => {
                         all_responses.push(complete);
                     }
-                    Some(Error(err)) => {
-                        error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message, "Worker generation error");
+                    ProtoResponseVariant::Error(err) => {
+                        error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message(), "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
                         return Err(error::internal_error(format!(
                             "{} generation failed: {}",
-                            worker_name, err.message
+                            worker_name,
+                            err.message()
                         )));
                     }
-                    Some(Chunk(_chunk)) => {
+                    ProtoResponseVariant::Chunk(_chunk) => {
                         // Streaming chunk - no action needed
                     }
-                    None => {
+                    ProtoResponseVariant::None => {
                         // Empty response - no action needed
                     }
                 }
@@ -804,12 +814,12 @@ pub fn create_tool_parser(
     }
 }
 
-/// Convert proto::OutputLogProbs to OpenAI ChatLogProbs format
+/// Convert OutputLogProbs to OpenAI ChatLogProbs format
 ///
 /// This function decodes token IDs using the tokenizer and builds the logprobs structure
 /// expected by the OpenAI API format.
 pub fn convert_proto_to_openai_logprobs(
-    proto_logprobs: &proto::OutputLogProbs,
+    proto_logprobs: &OutputLogProbs,
     tokenizer: &Arc<dyn Tokenizer>,
 ) -> Result<ChatLogProbs, String> {
     let mut content_items = Vec::new();
@@ -877,13 +887,11 @@ pub fn convert_proto_to_openai_logprobs(
     })
 }
 
-/// Convert proto::OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
+/// Convert OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// Each inner vec contains [logprob (f64), token_id (i32), ...]
-pub fn convert_generate_output_logprobs(
-    proto_logprobs: &proto::OutputLogProbs,
-) -> Vec<Vec<Option<f64>>> {
+pub fn convert_generate_output_logprobs(proto_logprobs: &OutputLogProbs) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
         .token_logprobs
         .iter()
@@ -892,13 +900,11 @@ pub fn convert_generate_output_logprobs(
         .collect()
 }
 
-/// Convert proto::InputLogProbs to Generate format Vec<Vec<Option<f64>>>
+/// Convert InputLogProbs to Generate format Vec<Vec<Option<f64>>>
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// First token has null logprob: [[null, token_id], [logprob, token_id], ...]
-pub fn convert_generate_input_logprobs(
-    proto_logprobs: &proto::InputLogProbs,
-) -> Vec<Vec<Option<f64>>> {
+pub fn convert_generate_input_logprobs(proto_logprobs: &InputLogProbs) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
         .token_logprobs
         .iter()
