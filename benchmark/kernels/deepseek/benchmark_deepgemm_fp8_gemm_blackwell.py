@@ -1,19 +1,19 @@
+import argparse
 from typing import Tuple
 
-import argparse
 import torch
 import triton
 from deep_gemm import ceil_div
 from flashinfer.gemm import gemm_fp8_nt_groupwise
+
 from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     w8a8_block_fp8_matmul_deepgemm,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
-    requant_weight_ue8m0,
-)
+from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0
 
 BLOCK_SIZE = 128
+
 
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
@@ -156,9 +156,7 @@ def calculate_diff(m: int, n: int, k: int):
     # We can directly quantize y here, but to mimic the behavior of the actual
     # implementations, we requant it here.
     dg_y_fp8, dg_y_scale = requant_weight_ue8m0(
-        y_fp8,
-        y_scale,
-        [BLOCK_SIZE, BLOCK_SIZE]
+        y_fp8, y_scale, [BLOCK_SIZE, BLOCK_SIZE]
     )
     out_deepgemm = fp8_gemm_deepgemm_blackwell(
         dg_x_fp8, dg_x_scale, dg_y_fp8, dg_y_scale
@@ -168,7 +166,9 @@ def calculate_diff(m: int, n: int, k: int):
     print(f"Flashinfer output: {out_flashinfer[0, 0:5]}")
     print(f"DeepGEMM output: {out_deepgemm[0, 0:5]}")
 
-    flashinfer_deepgemm_match = check_accuracy(out_flashinfer, out_deepgemm, 0.1, 0.6, 0.95)
+    flashinfer_deepgemm_match = check_accuracy(
+        out_flashinfer, out_deepgemm, 0.1, 0.6, 0.95
+    )
     print("Correctness check:")
     print(f"  - Flashinfer vs DeepGEMM: {'✅' if flashinfer_deepgemm_match else '❌'}")
 
@@ -191,9 +191,7 @@ def _benchmark(m, n, k, tp_size, provider):
         scale_ue8m0=True,
     )
     dg_y_fp8, dg_y_scale = requant_weight_ue8m0(
-        y_fp8,
-        y_scale,
-        [BLOCK_SIZE, BLOCK_SIZE]
+        y_fp8, y_scale, [BLOCK_SIZE, BLOCK_SIZE]
     )
 
     quantiles = [0.5, 0.2, 0.8]
@@ -231,6 +229,7 @@ def _benchmark(m, n, k, tp_size, provider):
 def get_benchmark_plot_friendly(tp_size):
     all_configs = create_benchmark_configs(tp_size)
     x_vals = list(range(len(all_configs)))
+
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["cfg_id"],
@@ -271,12 +270,12 @@ def get_benchmark(tp_size):
     def benchmark(m, n, k, tp_size, provider):
         ms, min_ms, max_ms = _benchmark(m, n, k, tp_size, provider)
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
+
     return benchmark
 
 
 if __name__ == "__main__":
-    if (not torch.cuda.is_available()
-        or torch.cuda.get_device_capability()[0] != 10):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         print("Skipping benchmark because the device is not supported")
         exit(0)
 
@@ -320,7 +319,8 @@ if __name__ == "__main__":
 
     # Get the benchmark function with the specified tp_size
     benchmark = (
-        get_benchmark_plot_friendly(args.tp_size) if args.plot_friendly
+        get_benchmark_plot_friendly(args.tp_size)
+        if args.plot_friendly
         else get_benchmark(args.tp_size)
     )
 
