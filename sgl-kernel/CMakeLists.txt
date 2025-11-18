@@ -42,7 +42,7 @@ endif()
 find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
-# Third Party
+# Third Party repos
 # cutlass
 FetchContent_Declare(
     repo-cutlass
@@ -96,15 +96,6 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
-
-# flash-attention origin
-FetchContent_Declare(
-    repo-flash-attention-origin
-    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
-    GIT_TAG        9dbed03d1a7a5862998c182c83d8265fea9dc21b
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-flash-attention-origin)
 
 # mscclpp
 FetchContent_Declare(
@@ -271,6 +262,8 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
+# All source files
+# NOTE: Please sort the filenames alphabetically
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/allreduce/mscclpp_allreduce.cu"
@@ -279,16 +272,15 @@ set(SOURCES
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
+    "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/cast.cu"
-    "csrc/elementwise/copy.cu"
     "csrc/elementwise/concat_mla.cu"
+    "csrc/elementwise/copy.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/elementwise/topk.cu"
-    "csrc/common_extension.cc"
-
-    "csrc/quantization/gguf/gguf_kernel.cu"
+    "csrc/expert_specialization/es_fp8_blockwise.cu"
 
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
@@ -314,10 +306,12 @@ set(SOURCES
     "csrc/gemm/marlin/gptq_marlin_repack.cu"
     "csrc/gemm/marlin/awq_marlin_repack.cu"
     "csrc/gemm/gptq/gptq_kernel.cu"
-
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
+    "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
+    "csrc/memory/store.cu"
+    "csrc/memory/weak_ref_tensor.cpp"
 
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
@@ -325,6 +319,7 @@ set(SOURCES
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/kimi_k2_moe_fused_gate.cu"
     "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
@@ -332,15 +327,11 @@ set(SOURCES
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
-    "csrc/memory/store.cu"
-    "csrc/kvcacheio/transfer.cu"
-
+    "csrc/quantization/gguf/gguf_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
-
-    "csrc/expert_specialization/es_fp8_blockwise.cu"
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
@@ -356,17 +347,7 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
-# =========================== Common SM90 Build ============================= #
-# Build SM90 library with fast math optimization (same namespace, different directory)
-Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-
-target_compile_definitions(common_ops_sm90_build PRIVATE
-    USE_FAST_MATH=1
-)
-target_compile_options(common_ops_sm90_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
-)
-target_include_directories(common_ops_sm90_build PRIVATE
+set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
@@ -376,6 +357,15 @@ target_include_directories(common_ops_sm90_build PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+
+# =========================== Common SM90 Build ============================= #
+# Build SM90 library with fast math optimization (same namespace, different directory)
+Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+
+target_compile_options(common_ops_sm90_build PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
+)
+target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
 # Set output name and separate build directory to avoid conflicts
 set_target_properties(common_ops_sm90_build PROPERTIES
     OUTPUT_NAME "common_ops"
@@ -386,22 +376,10 @@ set_target_properties(common_ops_sm90_build PROPERTIES
 # Build SM100+ library with precise math (same namespace, different directory)
 Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_definitions(common_ops_sm100_build PRIVATE
-    USE_FAST_MATH=0
-)
 target_compile_options(common_ops_sm100_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
 )
-target_include_directories(common_ops_sm100_build PRIVATE
-    ${repo-cutlass_SOURCE_DIR}/include
-    ${repo-cutlass_SOURCE_DIR}/tools/util/include
-    ${repo-flashinfer_SOURCE_DIR}/include
-    ${repo-flashinfer_SOURCE_DIR}/csrc
-    ${repo-mscclpp_SOURCE_DIR}/include
-    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
-    ${repo-cutlass_SOURCE_DIR}/examples/common
-    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
-)
+target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
 # Set output name and separate build directory to avoid conflicts
 set_target_properties(common_ops_sm100_build PROPERTIES
     OUTPUT_NAME "common_ops"
@@ -432,6 +410,7 @@ add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
+
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
@@ -453,7 +432,7 @@ target_compile_definitions(common_ops_sm100_build PRIVATE
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
-# ============================ Optional Install ============================= #
+# ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
 if (SGL_KERNEL_ENABLE_FA3)
@@ -553,10 +532,10 @@ target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERN
 target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
-# ============================ Extra Install ============================= #
+# ============================ Extra Install: FLashMLA ============================= #
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
 
-# ============================ DeepGEMM (JIT) ============================= #
+# ============================ Extra Install: DeepGEMM (JIT) ============================= #
 # Create a separate library for DeepGEMM's Python API.
 # This keeps its compilation isolated from the main common_ops.
 set(DEEPGEMM_SOURCES
@@ -601,17 +580,17 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
 
-# triton_kernels
+# ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
 
-# flash attention 4
+# ============================ Extra Install: FA4 ============================= #
 # TODO: find a better install condition.
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     # flash_attn/cute
-    install(DIRECTORY "${repo-flash-attention-origin_SOURCE_DIR}/flash_attn/cute/"
+    install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
             DESTINATION "flash_attn/cute"
             PATTERN ".git*" EXCLUDE
             PATTERN "__pycache__" EXCLUDE)

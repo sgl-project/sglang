@@ -221,7 +221,7 @@ def get_rope_scaling(config):
             "attn_factor": attn_factor,
             "beta_fast": beta_fast,
             "beta_slow": beta_slow,
-            "dtype": torch.float,
+            "dtype": torch.bfloat16,
         }
         return rope_scaling
     else:

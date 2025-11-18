@@ -189,6 +189,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             GDNAttnBackend,
             HybridLinearAttnBackend,
+            KimiLinearAttnBackend,
             Mamba2AttnBackend,
         )
         from sglang.srt.utils import is_blackwell, is_npu
@@ -198,7 +199,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             if is_blackwell():
                 assert (
                     runner.server_args.attention_backend == "triton"
-                ), "triton backend is the only supported backend on Blackwell GPUs for hybrid GDN models, use --attention-backend triton to specify the backend."
+                    or runner.server_args.attention_backend == "trtllm_mha"
+                ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
@@ -207,6 +209,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
+        elif runner.kimi_linear_config is not None:
+            linear_attn_backend = KimiLinearAttnBackend(runner)
         else:
             raise ValueError(
                 "Expected hybrid GDN or NemotronH models, but got unknown model."

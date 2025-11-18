@@ -13,11 +13,12 @@ from torch import nn
 
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
+    CudaIpcTensorTransportProxy,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
+from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
@@ -77,7 +78,6 @@ class TransportProxyTensor(torch.Tensor):
             "tensor_data": None,
             "ipc_extra": None,
         }
-
         transport_mode = self._metadata.get("transport_mode", "default")
 
         if transport_mode == "cuda_ipc" and self.is_cuda:
@@ -91,6 +91,7 @@ class TransportProxyTensor(torch.Tensor):
                     "dtype": self.dtype,
                     "stride": self.stride(),
                     "device_index": self.device.index,
+                    "storage_offset": self.storage_offset(),
                 }
                 state["tensor_data"] = None
             except Exception as e:
@@ -113,12 +114,13 @@ class TransportProxyTensor(torch.Tensor):
 
         if transport_mode == "cuda_ipc" and state["ipc_extra"] is not None:
             ipc_extra = state["ipc_extra"]
-            handle, shape, dtype, stride, source_device_index = (
+            handle, shape, dtype, stride, source_device_index, s_offset = (
                 ipc_extra["handle"],
                 ipc_extra["shape"],
                 ipc_extra["dtype"],
                 ipc_extra["stride"],
                 ipc_extra["device_index"],
+                ipc_extra["storage_offset"],
             )
 
             try:
@@ -127,7 +129,7 @@ class TransportProxyTensor(torch.Tensor):
                     storage = torch.UntypedStorage._new_shared_cuda(*handle)
                     reconstructed_tensor = torch.empty(
                         0, dtype=dtype, device=target_device
-                    ).set_(storage, storage_offset=0, size=shape, stride=stride)
+                    ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
                     self.set_(reconstructed_tensor)
             except Exception as e:
                 print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
@@ -283,17 +285,12 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return ret_input_ids
 
 
-embedding_cache: Optional[MultiModalCache] = None
+embedding_cache: Optional[MultiModalStaticCache] = None
 
 
-def init_embedding_cache(max_size: int = 0):
+def init_mm_embedding_cache(max_size: int = 0):
     global embedding_cache
-    embedding_cache = MultiModalCache(max_size)
-
-
-def get_embedding_hash(embedding_items: List[MultimodalDataItem]) -> int:
-    hash_list = [item.hash for item in embedding_items]
-    return hash(tuple(hash_list))
+    embedding_cache = MultiModalStaticCache(max_size)
 
 
 def get_embedding_chunk(
@@ -380,14 +377,15 @@ def _get_chunked_prefill_embedding(
         embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
-        embedding_items_hash = get_embedding_hash(embedding_items_per_req)
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        embedding_per_req = embedding_cache.get(embedding_items_hash)
+        item_hashes = [item.hash for item in embedding_items_per_req]
+        embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
+        embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
             embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
+            if not embedding_cache.set(embedding_items_hash, embedding_per_req):
                 print_warning_once(
                     "Multimodal embedding cache is full. This typically occurs when a single "
                     "embedding exceeds the cache size limit. Consider increasing the "
@@ -662,43 +660,46 @@ def general_mm_embed_routine(
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
-    if (
-        not forward_batch.forward_mode.is_decode()
-        and not forward_batch.forward_mode.is_target_verify()
-        and forward_batch.contains_mm_inputs()
-    ):
-        mm_inputs_list = [
-            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-        ]
-        extend_prefix_lens = [
-            prefix_len
-            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        extend_seq_lens = [
-            seq_len
-            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.mm_inputs[i] is not None
-        ]
-        inputs_embeds, other_info = embed_mm_inputs(
-            mm_inputs_list=mm_inputs_list,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
-            input_ids=input_ids,
-            multimodal_model=multimodal_model,
-            input_embedding=embed_tokens,
-            data_embedding_func_mapping=data_embedding_funcs,
-            placeholder_tokens=placeholder_tokens,
-            use_deepstack=use_deepstack,
-        )
-        # add for qwen3_vl deepstack
-        if use_deepstack:
-            kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-        # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
-        # just being defensive here
-        forward_batch.mm_inputs = None
+    if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.contains_mm_inputs()
+        ):
+            mm_inputs_list = [
+                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+            ]
+            extend_prefix_lens = [
+                prefix_len
+                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            extend_seq_lens = [
+                seq_len
+                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.mm_inputs[i] is not None
+            ]
+            inputs_embeds, other_info = embed_mm_inputs(
+                mm_inputs_list=mm_inputs_list,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_seq_lens=extend_seq_lens,
+                input_ids=input_ids,
+                multimodal_model=multimodal_model,
+                input_embedding=embed_tokens,
+                data_embedding_func_mapping=data_embedding_funcs,
+                placeholder_tokens=placeholder_tokens,
+                use_deepstack=use_deepstack,
+            )
+            # add for qwen3_vl deepstack
+            if use_deepstack:
+                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+            # just being defensive here
+            forward_batch.mm_inputs = None
+        else:
+            inputs_embeds = embed_tokens(input_ids)
     else:
-        inputs_embeds = embed_tokens(input_ids)
+        inputs_embeds = None
 
     hidden_states = language_model(
         input_ids=None,
@@ -811,4 +812,7 @@ def hash_feature(f):
         return data_hash(arr_bytes)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
+    elif isinstance(f, CudaIpcTensorTransportProxy):
+        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
+        return tensor_hash([reconstruct_t])
     return data_hash(f)

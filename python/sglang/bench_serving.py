@@ -25,6 +25,7 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
@@ -400,6 +401,7 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
+                                        output.text_chunks.append(content)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
@@ -614,7 +616,10 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            body = {
+                "activities": getattr(args, "profile_activities", []),
+            }
+            async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -990,7 +995,10 @@ async def get_mooncake_request_over_time(
             # Form the full prompt from history
             try:
                 full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history, tokenize=False, add_generation_prompt=True
+                    chat_history,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    return_dict=False,
                 )
             except Exception:
                 full_prompt_text = "\n".join(
@@ -1014,7 +1022,7 @@ async def get_mooncake_request_over_time(
 def sample_mmmu_requests(
     num_requests: int,
     processor: AutoProcessor | AutoTokenizer,
-    backend: str,
+    backend: str = "sglang",
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
@@ -1156,6 +1164,7 @@ def sample_sharegpt_requests(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 tokenize=False,
+                return_dict=False,
             )
             if tokenizer.bos_token:
                 prompt = prompt.replace(tokenizer.bos_token, "")
@@ -1369,12 +1378,16 @@ def create_mm_data_row(
         )["input_ids"].numel()
     except Exception:
         # Fallback: just tokenize the text prompt directly
-        text_prompt_len = len(processor.tokenizer.encode(text_prompt))
+        tokenizer_to_use = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
 
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
     use_raw_prompt = backend in [
+        "sglang",
         "sglang-oai",
         "sglang-oai-chat",
         "vllm",
@@ -1454,7 +1467,11 @@ def sample_image_requests(
     total_image_bytes = 0
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+        text_prompt = gen_mm_prompt(
+            processor.tokenizer,
+            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            int(input_lens[i]),
+        )
 
         # Generate image list
         images, images_base64, images_bytes = zip(
@@ -1481,9 +1498,24 @@ def sample_image_requests(
     return dataset
 
 
+@lru_cache(maxsize=1)
+def get_available_tokens(tokenizer):
+    """Get all available token ids from the tokenizer vocabulary."""
+    return list(tokenizer.get_vocab().values())
+
+
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
+    if image_pad_id:
+        all_available_tokens.remove(image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -1494,7 +1526,7 @@ def get_gen_prefix_cache_path(args, tokenizer):
 
     # Create a unique cache filename based on the generation parameters
     cache_key = (
-        f"gen_shared_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
+        f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
         f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
@@ -1740,6 +1772,8 @@ async def benchmark(
     max_concurrency: Optional[int],
     disable_tqdm: bool,
     lora_names: List[str],
+    lora_request_distribution: Optional[str],
+    lora_zipf_alpha: Optional[float],
     extra_request_body: Dict[str, Any],
     profile: bool,
     pd_separated: bool = False,
@@ -1880,11 +1914,30 @@ async def benchmark(
     else:
         request_generator = get_request(input_requests, request_rate)
 
+    # Prepare LoRA request distribution parameters
+    if lora_request_distribution == "distinct":
+        lora_idx = 0
+    elif lora_request_distribution == "skewed":
+        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
+        lora_probs = weights / np.sum(weights)
+    else:
+        lora_idx = None
+        lora_probs = None
+
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
-            idx = random.randint(0, len(lora_names) - 1)
-            lora_name = lora_names[idx]
+            if lora_request_distribution == "uniform":
+                lora_name = random.choice(lora_names)
+            elif lora_request_distribution == "distinct":
+                lora_name = lora_names[lora_idx]
+                lora_idx = (lora_idx + 1) % len(lora_names)
+            else:
+                assert (
+                    lora_request_distribution == "skewed"
+                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+
+                lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
             lora_name = None
 
@@ -2018,6 +2071,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+    print(
+        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
+    )
+    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
@@ -2025,6 +2084,9 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
+
+    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+    server_info = resp.json() if resp.status_code == 200 else None
 
     if (
         metrics.median_ttft_ms is not None
@@ -2042,6 +2104,8 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            # Information
+            "server_info": server_info,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -2053,6 +2117,7 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
+            "total_throughput": metrics.total_throughput,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
@@ -2158,6 +2223,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
+
+    if not hasattr(args, "served_model_name"):
+        args.served_model_name = None
 
     print(f"benchmark_args={args}")
 
@@ -2268,11 +2336,20 @@ def run_benchmark(args_: argparse.Namespace):
             not args.tokenize_prompt
         ), "`--tokenize-prompt` not compatible with image dataset"
 
+    if args.lora_request_distribution in ["distinct", "skewed"]:
+        assert (
+            args.lora_name is not None and len(args.lora_name) > 1
+        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+
+    assert (
+        args.lora_zipf_alpha > 1
+    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+
     print(f"{args}\n")
 
     # Read dataset
     backend = args.backend
-    model_id = args.model
+    model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
@@ -2280,6 +2357,17 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
+
+    # Prepare LoRA arguments
+    lora_request_distribution = (
+        args.lora_request_distribution if args.lora_name is not None else None
+    )
+
+    lora_zipf_alpha = (
+        args.lora_zipf_alpha
+        if args.lora_name is not None and args.lora_request_distribution == "skewed"
+        else None
+    )
 
     return asyncio.run(
         benchmark(
@@ -2293,6 +2381,8 @@ def run_benchmark(args_: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             disable_tqdm=args.disable_tqdm,
             lora_names=args.lora_name,
+            lora_request_distribution=lora_request_distribution,
+            lora_zipf_alpha=lora_zipf_alpha,
             extra_request_body=extra_request_body,
             profile=args.profile,
             pd_separated=args.pd_separated,
@@ -2370,6 +2460,11 @@ if __name__ == "__main__":
         "--model",
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        help="The name of the model as served by the serving service. If not set, this defaults to the value of --model.",
     )
     parser.add_argument(
         "--tokenizer",
@@ -2509,6 +2604,14 @@ if __name__ == "__main__":
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
+    # TODO unify all these
+    parser.add_argument(
+        "--profile-activities",
+        type=str,
+        nargs="+",
+        default=["CPU", "GPU"],
+        choices=["CPU", "GPU", "CUDA_PROFILER"],
+    )
     parser.add_argument(
         "--lora-name",
         type=str,
@@ -2516,6 +2619,27 @@ if __name__ == "__main__":
         default=None,
         action=LoRAPathAction,
         help="The names of LoRA adapters. You can provide a list of names in the format {name} {name} {name}...",
+    )
+    parser.add_argument(
+        "--lora-request-distribution",
+        type=str,
+        default="uniform",
+        choices=[
+            "uniform",
+            "distinct",
+            "skewed",
+        ],
+        help="What distribution to sample the LoRA adapters specified in --lora-name. Borrowed from the Punica paper. "
+        "'distinct' distribution means selecting a new LoRA adapter for every request. "
+        "'skewed' distribution follows the Zipf distribution, where the number of requests "
+        "to model i specified in --lora-name is α times the number of requests for model i+1, "
+        "where α > 1.",
+    )
+    parser.add_argument(
+        "--lora-zipf-alpha",
+        type=float,
+        default=1.5,
+        help="The parameter to use for the Zipf distribution when --lora-request-distribution='skewed'.",
     )
     parser.add_argument(
         "--prompt-suffix",

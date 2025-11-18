@@ -140,14 +140,14 @@ jobs:
         python3 -m pip --no-cache-dir install --upgrade pip
         python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
-        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.6.post1
+        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.7.post2
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
 
     - name: Build and install sgl-router
       run: |
         source "$HOME/.cargo/env"
         echo "Building sgl-router..."
-        cd sgl-router
+        cd sgl-router/bindings/python
         pip install maturin
         maturin build --release --out dist --features vendored-openssl
         pip install --force-reinstall dist/*.whl

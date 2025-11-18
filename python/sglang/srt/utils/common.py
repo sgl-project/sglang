@@ -69,6 +69,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from urllib.parse import urlparse
 
 import numpy as np
 import orjson
@@ -150,6 +151,12 @@ def is_host_cpu_x86() -> bool:
 
 def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+
+
+def is_float4_e2m1fn_x2(dtype) -> bool:
+    """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
+    target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    return is_cuda() and dtype == target_dtype
 
 
 def get_cuda_version():
@@ -260,7 +267,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+    return backend not in ["torch_native", "intel_amx"]
 
 
 try:
@@ -297,6 +304,7 @@ def xpu_has_xmx_support():
     return False
 
 
+@lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -645,6 +653,11 @@ def wait_cmo_stream():
     cur_stream.wait_stream(get_cmo_stream())
 
 
+@lru_cache(maxsize=1)
+def get_device_module():
+    return torch.get_device_module()
+
+
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)
@@ -938,7 +951,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif os.path.isfile(video_file):
+            # `urlparse` supports file:// paths, and so does VideoReader
+            elif os.path.isfile(urlparse(video_file).path):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
@@ -1348,6 +1362,29 @@ def get_zmq_socket(
             socket.connect(endpoint)
 
         return socket
+
+
+def get_zmq_socket_on_host(
+    context: zmq.Context,
+    socket_type: zmq.SocketType,
+    host: Optional[str] = None,
+) -> Tuple[int, zmq.Socket]:
+    """Create and configure a ZeroMQ socket.
+
+    Args:
+        context: ZeroMQ context to create the socket from.
+        socket_type: Type of ZeroMQ socket to create.
+        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
+
+    Returns:
+        Tuple of (port, socket) where port is the randomly assigned TCP port.
+    """
+    socket = context.socket(socket_type)
+    # Bind to random TCP port
+    config_socket(socket, socket_type)
+    bind_host = f"tcp://{host}" if host else "tcp://*"
+    port = socket.bind_to_random_port(bind_host)
+    return port, socket
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
@@ -1824,7 +1861,8 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
             "."
         )
-        major, minor = int(major), int(minor)
+        # Currently XPU version does not contain capability information.
+        major, minor = None, None
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         try:
@@ -2351,16 +2389,24 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     )
     server = uvicorn.Server(config=config)
 
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host}:{port}"
-        )
-        loop.create_task(server.serve())
+    # Run server in a background daemon thread with its own event loop
+    # This prevents blocking the main thread while still serving health checks
+    def run_server():
+        try:
+            asyncio.run(server.serve())
+        except Exception as e:
+            logger.error(f"Dummy health check server failed to start: {e}")
+            raise
+        finally:
+            logger.info(f"Dummy health check server stopped at {host}:{port}")
 
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host}:{port}")
-        server.run()
+    thread = threading.Thread(
+        target=run_server, daemon=True, name="health-check-server"
+    )
+    thread.start()
+    logger.info(
+        f"Dummy health check server started in background thread at {host}:{port}"
+    )
 
 
 def create_checksum(directory: str):
@@ -2371,7 +2417,9 @@ def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
-        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
+            f"{arch}{'a' if capability[0] >= 9 else ''}"
+        )
 
 
 def next_power_of_2(n: int):
@@ -2666,7 +2714,10 @@ class BumpAllocator:
 def log_info_on_rank0(logger, msg):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-    if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+    try:
+        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+            logger.info(msg)
+    except:
         logger.info(msg)
 
 
@@ -2963,7 +3014,7 @@ def configure_gc_logger():
 
 
 # COPIED FROM DeepGEMM
-def align(x: int, y: int) -> int:
+def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
@@ -3588,3 +3639,23 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+cached_device_index = -1
+
+
+def get_current_device_stream_fast():
+    global cached_device_index
+    if cached_device_index == -1:
+        cached_device_index = torch.get_device_module().current_device()
+    return torch.get_device_module().current_stream(cached_device_index)
+
+
+def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
+    if strict:
+        raise ValueError(message)
+    else:
+        count = getattr(obj, counter_name, 0)
+        if count % log_interval == 0:
+            logger.warning(message)
+        setattr(obj, counter_name, count + 1)
