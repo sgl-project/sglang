@@ -331,14 +331,14 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
     steps:
-      - name: Cleanup before checkout
-        run: |
-          # Kill any lingering Python processes that might be holding files
-          pkill -9 -f "python.*sglang" || true
-          pkill -9 -f "pytest" || true
-          sleep 2
-          # Remove logs directory
-          rm -rf "$GITHUB_WORKSPACE/python/sglang/logs" || true
+      # - name: Cleanup before checkout
+      #   run: |
+      #     # Kill any lingering Python processes that might be holding files
+      #     pkill -9 -f "python.*sglang" || true
+      #     pkill -9 -f "pytest" || true
+      #     sleep 2
+      #     # Remove logs directory
+      #     rm -rf "$GITHUB_WORKSPACE/python/sglang/logs" || true
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -353,11 +353,11 @@ jobs:
           cd python
           pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          # Remove logs directory to prevent NFS lock files
-          rm -rf python/sglang/logs || true
+      # - name: Cleanup logs directory
+      #   if: always()
+      #   run: |
+      #     # Remove logs directory to prevent NFS lock files
+      #     rm -rf python/sglang/logs || true
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
@@ -538,11 +538,6 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
@@ -575,11 +570,6 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -614,11 +604,6 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
@@ -963,11 +948,6 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu-deepep
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   unit-test-deepep-8-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
@@ -996,11 +976,6 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -1036,11 +1011,6 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 2 --timeout-per-file 1800
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
     if: always() && !failure() && !cancelled() &&
@@ -1071,11 +1041,6 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   pr-test-finish:
     needs:
