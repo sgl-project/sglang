@@ -387,7 +387,6 @@ class TestDiffusionPerformance:
             summary = validator.validate(perf_record, stage_metrics, case.num_frames)
         else:
             summary = validator.validate(perf_record, stage_metrics)
-        print(f"{is_baseline_generation_mode=}")
         if is_baseline_generation_mode:
             self._dump_baseline_scenario(case, summary)
             return
