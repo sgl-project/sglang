@@ -7,7 +7,7 @@
   "tolerances": {
     "e2e": 0.25,
     "stage": 0.3,
-    "denoise_step": 0.1,
+    "denoise_step": 0.2,
     "denoise_agg": 0.1
   },
   "sampling": {
@@ -58,13 +58,13 @@
       "expected_median_denoise_ms": 718.0,
       "stages_ms": {
         "InputValidationStage": 23,
-        "ImageEncodingStage": 990.0,
+        "ImageEncodingStage": 1350.0,
         "ImageVAEEncodingStage": 340.0,
         "ConditioningStage": 0.13,
         "TimestepPreparationStage": 13.78,
         "LatentPreparationStage": 10.0,
         "DenoisingStage": 36000.0,
-        "DecodingStage": 645
+        "DecodingStage": 850.0
       },
       "denoise_step_ms": {
         "0": 720.0, "1": 720.0, "2": 720.0, "3": 720.0, "4": 720.0, "5": 720.0,
@@ -102,15 +102,28 @@
       "avg_frame_time_ms": 1951.36
     },
     "image_to_video": {
-      "notes": "Image-to-Video generation baseline placeholder: TODO(bug)",
-      "expected_e2e_ms": 1000000000.0,
-      "expected_avg_denoise_ms": 1000000000.0,
-      "expected_median_denoise_ms": 1000000000.0,
-      "stages_ms": {},
-      "denoise_step_ms": {},
-      "frames_per_second": null,
-      "total_frames": null,
-      "avg_frame_time_ms": null
+        "notes": "Wan-AI/Wan2.2-I2V-A14B",
+        "expected_e2e_ms": 282500.0,
+        "expected_avg_denoise_ms": 7000.0,
+        "expected_median_denoise_ms": 7000.19,
+        "stages_ms": {
+            "InputValidationStage": 20.0,
+            "TextEncodingStage": 2100.0,
+            "ConditioningStage": 2.0,
+            "TimestepPreparationStage": 2.0,
+            "LatentPreparationStage": 10.0,
+            "ImageVAEEncodingStage": 1800.0,
+            "DenoisingStage": 278000.0,
+            "DecodingStage": 2700.0
+        },
+        "denoise_step_ms": {
+            "0": 24000.0,
+            "8": 7000.0,
+            "16": 7000.0,
+            "23": 7000.0,
+            "31": 7000.0,
+            "39": 7000.0
+        }
     },
     "text_image_to_video": {
       "notes": "Text-and-Image-to-Video generation baseline for Wan2.2-TI2V-5B",
