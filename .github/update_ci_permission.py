@@ -30,7 +30,7 @@ Permissions are assigned according to the following rules:
            "can_tag_run_ci_label": true,
            "can_rerun_failed_ci": true,
            "cooldown_interval_minutes": 60,
-           "reason": "old contributor"
+           "reason": "custom override"
        }
     - For all other cases, preserve the original configuration unchanged.
 3. All other users receive no permissions and a 120-minute cooldown (they are omitted from the file).
@@ -175,7 +175,7 @@ def main():
                 "can_tag_run_ci_label": True,
                 "can_rerun_failed_ci": True,
                 "cooldown_interval_minutes": 60,
-                "reason": "old contributor",
+                "reason": "custom override",
             }
         else:
             # Preserve custom overrides
