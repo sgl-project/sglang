@@ -31,8 +31,9 @@ __Note__: The permissions to trigger CI tests are defined separately according t
 ## Pull Request Merge Process
 1. The author submits a pull request (PR) and fills out the PR checklist.
 2. A bot assigns this PR to a Merge Oncall and @-mentions them. At the same time, GitHub will automatically request reviews from Codeowners.
-3. The Merge Oncall coordinates the review (e.g., asking people to review) and approves the PR; the relevant Codeowners also approve the PR. If the assigned Merge Oncall is not responsive, the author can ping other related Merge Oncalls and Reviewers in the list below.
-4. The code can now be merged:
+3. Someone tags the PR with a `run-ci` label. Then the author can trigger CI by pushing new commits. ([help](https://docs.sglang.ai/developer_guide/contribution_guide.html#how-to-trigger-ci-tests))
+4. The Merge Oncall coordinates the review (e.g., asking people to review) and approves the PR; the Codeowners also approve the PR. If the assigned Merge Oncall is not responsive, the author can ping other related Merge Oncalls and Reviewers in the list below.
+5. The code can now be merged:
    - **Ideal case:** For each modified file, one Codeowner has approved the PR. The PR has also passed the required CI tests. Then, anyone with write permission can merge the PR.
    - **Exception:** In cases where it is difficult to meet all requirements (due to flaky CI or slow responses), a Merge Oncall can bypass branch protection to merge the PR.
 
