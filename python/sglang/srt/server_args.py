@@ -579,6 +579,9 @@ class ServerArgs:
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
 
+    # For encoder dp
+    mm_enable_dp_encoder: bool = False
+
     # For forward hooks
     hooks: Optional[List[dict[str, Any]]] = None
 
@@ -3736,6 +3739,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
+        )
+        parser.add_argument(
+            "--mm-enable-dp-encoder",
+            action="store_true",
+            default=ServerArgs.mm_enable_dp_encoder,
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         )
 
         # For registering hooks
