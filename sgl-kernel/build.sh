@@ -142,7 +142,7 @@ docker run --rm \
    ccache -sV || true
    echo \"\"
 
-   yum install numactl-devel -y && \
+   yum install numactl-devel -y --nogpgcheck && \
    yum install libibverbs -y --nogpgcheck && \
    ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so && \
    ${PYTHON_ROOT_PATH}/bin/${TORCH_INSTALL} && \

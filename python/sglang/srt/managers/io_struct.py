@@ -80,18 +80,18 @@ class RequestTimingMetricsMixin:
     #   - Prefill instance (P): timestamp when prefill forward pass begins
     #   - Decode instance (D): timestamp when decode forward pass begins
     # Note: This is NOT the same as prefill_start_time. There may be a delay between
-    # forward_entry_time and prefill_start_time (see prefill_delay).
+    # forward_entry_time and prefill_start_time (see prefill_launch_delay).
     forward_entry_time: Optional[List[Optional[float]]]
 
-    # Prefill delay: time spent waiting between forward entry and prefill start.
+    # Prefill launch delay: time spent waiting between forward entry and prefill start.
     # Calculated as: prefill_start_time - forward_entry_time
     # This represents the delay between when the request enters the forward stage
     # and when prefill computation actually begins.
-    prefill_delay: Optional[List[Optional[float]]]
+    prefill_launch_delay: Optional[List[Optional[float]]]
 
-    # Prefill latency: time spent during prefill computation.
-    # Calculated as: prefill_end_time - prefill_start_time
-    prefill_latency: Optional[List[Optional[float]]]
+    # Prefill launch latency: time spent during prefill kernel launch.
+    # Calculated as: prefill_end_time_host - prefill_start_time_host
+    prefill_launch_latency: Optional[List[Optional[float]]]
 
 
 @dataclass
@@ -924,7 +924,7 @@ class BatchTokenIDOutput(
 
 
 @dataclass
-class BatchMultimodalDecodeReq(BaseBatchReq, RequestTimingMetricsMixin):
+class BatchMultimodalDecodeReq(BaseBatchReq):
     decoded_ids: List[int]
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
@@ -1003,7 +1003,7 @@ class BatchStrOutput(
 
 
 @dataclass
-class BatchMultimodalOutput(BaseBatchReq, RequestTimingMetricsMixin):
+class BatchMultimodalOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     decoded_ids: List[List[int]]

@@ -6,7 +6,7 @@ from typing import Any
 import zmq
 
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -42,9 +42,11 @@ class Scheduler:
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
         endpoint = server_args.scheduler_endpoint()
-        logger.info(f"Scheduler listening at endpoint: {endpoint}")
         if gpu_id == 0:
-            self.receiver = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+            self.receiver, actual_endpoint = get_zmq_socket(
+                self.context, zmq.REP, endpoint, True
+            )
+            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
         else:
             self.receiver = None
 

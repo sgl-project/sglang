@@ -401,6 +401,7 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
+                                        output.text_chunks.append(content)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
@@ -1382,6 +1383,7 @@ def create_mm_data_row(
     vision_prompt_len = prompt_len - text_prompt_len
 
     use_raw_prompt = backend in [
+        "sglang",
         "sglang-oai",
         "sglang-oai-chat",
         "vllm",
@@ -1461,7 +1463,11 @@ def sample_image_requests(
     total_image_bytes = 0
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+        text_prompt = gen_mm_prompt(
+            processor.tokenizer,
+            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            int(input_lens[i]),
+        )
 
         # Generate image list
         images, images_base64, images_bytes = zip(
@@ -1497,6 +1503,15 @@ def get_available_tokens(tokenizer):
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    if image_pad_id:
+        all_available_tokens.remove(image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -2052,6 +2067,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+    print(
+        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
+    )
+    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
@@ -2092,6 +2113,7 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
+            "total_throughput": metrics.total_throughput,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,

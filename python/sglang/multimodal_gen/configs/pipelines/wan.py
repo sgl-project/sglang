@@ -14,7 +14,10 @@ from sglang.multimodal_gen.configs.models.encoders import (
     T5Config,
 )
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, PipelineConfig
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -34,9 +37,26 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 
 
 @dataclass
+class WanI2VCommonConfig(PipelineConfig):
+    # for all wan i2v pipelines
+    def adjust_num_frames(self, num_frames):
+        vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
+        if num_frames % vae_scale_factor_temporal != 1:
+            logger.warning(
+                f"`num_frames - 1` has to be divisible by {vae_scale_factor_temporal}. Rounding to the nearest number."
+            )
+            num_frames = (
+                num_frames // vae_scale_factor_temporal * vae_scale_factor_temporal + 1
+            )
+            return num_frames
+        return num_frames
+
+
+@dataclass
 class WanT2V480PConfig(PipelineConfig):
     """Base configuration for Wan T2V 1.3B pipeline architecture."""
 
+    task_type: ModelTaskType = ModelTaskType.T2V
     # WanConfig-specific parameters with defaults
     # DiT
     dit_config: DiTConfig = field(default_factory=WanVideoConfig)
@@ -80,11 +100,11 @@ class WanT2V720PConfig(WanT2V480PConfig):
 
 
 @dataclass
-class WanI2V480PConfig(WanT2V480PConfig):
+class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     """Base configuration for Wan I2V 14B 480P pipeline architecture."""
 
     # WanConfig-specific parameters with defaults
-    i2v_task: bool = True
+    task_type: ModelTaskType = ModelTaskType.I2V
     # Precision for each component
     image_encoder_config: EncoderConfig = field(default_factory=CLIPVisionConfig)
     image_encoder_precision: str = "fp32"
@@ -127,9 +147,9 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
 
 
 @dataclass
-class Wan2_2_TI2V_5B_Config(WanT2V480PConfig):
+class Wan2_2_TI2V_5B_Config(WanT2V480PConfig, WanI2VCommonConfig):
     flow_shift: float | None = 5.0
-    ti2v_task: bool = True
+    task_type: ModelTaskType = ModelTaskType.TI2V
     expand_timesteps: bool = True
     # ti2v, 5B
     vae_stride = (4, 16, 16)
@@ -140,8 +160,7 @@ class Wan2_2_TI2V_5B_Config(WanT2V480PConfig):
         vae_stride = self.vae_stride
         oh = batch.height
         ow = batch.width
-        shape = (z_dim, F, oh // vae_stride[1], ow // vae_stride[2])
-
+        shape = (batch_size, z_dim, F, oh // vae_stride[1], ow // vae_stride[2])
         return shape
 
     def __post_init__(self) -> None:
