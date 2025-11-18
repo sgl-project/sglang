@@ -54,7 +54,6 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
-from contextlib import nullcontext
 
 import triton
 import triton.language as tl
@@ -840,12 +839,7 @@ class Qwen3NextModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            ctx = (
-                nullcontext()
-                if get_global_server_args().enable_piecewise_cuda_graph
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
-            with ctx:
+            with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
                     layer_id=i,
                     positions=positions,
