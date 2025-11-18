@@ -341,7 +341,13 @@ class ServerlessLLMModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        from sllm_store.torch import load_dict
+        try:
+            from sllm_store.torch import load_dict
+        except Exception as e:
+            logger.error(
+                f"Failed to import sllm_store.torch.load_dict: {e}, check whether sllm_store is installed correctly."
+            )
+            raise e
 
         from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -354,7 +360,13 @@ class ServerlessLLMModelLoader(BaseModelLoader):
             model = self._initialize_model_on_cpu(model_config)
 
             device_map = self._build_device_map(target_device)
-            sllm_state_dict = load_dict(model_id, device_map)
+            try:
+                sllm_state_dict = load_dict(model_id, device_map)
+            except Exception as e:
+                logger.error(
+                    f"Failed to load model from sllm_store: {e}, check whether sllm_store server is running."
+                )
+                raise e
 
             full_state_dict = model.state_dict()
             storage_to_keys = self._build_storage_to_keys(full_state_dict)
