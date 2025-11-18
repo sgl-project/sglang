@@ -333,6 +333,11 @@ jobs:
     steps:
       - name: Cleanup before checkout
         run: |
+          # Kill any lingering Python processes that might be holding files
+          pkill -9 -f "python.*sglang" || true
+          pkill -9 -f "pytest" || true
+          sleep 2
+          # Remove logs directory
           rm -rf "$GITHUB_WORKSPACE/python/sglang/logs" || true
 
       - name: Checkout code
