@@ -316,7 +316,7 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && export PATH="/root/.cargo/bin:${PATH}" \
     && rustc --version && cargo --version \
     && python3 -m pip install maturin \
-    && cd /sgl-workspace/sglang/sgl-router \
+    && cd /sgl-workspace/sglang/sgl-router/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
