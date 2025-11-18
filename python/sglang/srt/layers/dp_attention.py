@@ -404,11 +404,11 @@ def memcpy_cpu(dst, src, dim, offset, sz, offset_src):
     dst[dst_start : dst_start + actual_sz].copy_(src[src_start : src_start + actual_sz])
 
 
+memcpy_func = memcpy_cpu if _is_cpu else memcpy_triton
+
+
 def memcpy(dst, src, dim, offset, sz, offset_src):
-    if _is_cpu:
-        memcpy_cpu(dst, src, dim, offset, sz, offset_src)
-    else:
-        memcpy_triton(dst, src, dim, offset, sz, offset_src)
+    memcpy_func(dst, src, dim, offset, sz, offset_src)
 
 
 def _dp_gather_via_all_reduce(
