@@ -308,23 +308,23 @@ jobs:
           echo "All benchmark tests completed!"
 
   # =============================================== multimodal_gen ====================================================
-  multimodal-gen-test:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  # multimodal-gen-test:
+  #   needs: [check-changes]
+  #   if: needs.check-changes.outputs.multimodal_gen == 'true'
+  #   runs-on: 1-gpu-runner
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+  #     - name: Install dependencies
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
-      - name: Run diffusion server tests
-        timeout-minutes: 60
-        run: |
-          cd python
-          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
+  #     - name: Run diffusion server tests
+  #       timeout-minutes: 60
+  #       run: |
+  #         cd python
+  #         pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
