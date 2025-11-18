@@ -150,7 +150,7 @@ class MambaPool:
         size: int,
         cache_params: BaseLinearStateParams,
         device: str,
-        enable_memory_saver: bool,
+        enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
