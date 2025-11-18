@@ -2,6 +2,7 @@ import argparse
 import json
 import unittest
 
+import hooks_test_data as hooks_impl
 import torch
 import torch.nn as nn
 
@@ -9,24 +10,8 @@ from sglang.srt.model_executor.hook_manager import register_hooks
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
-
-def dummy_hook_factory(config):
-    """Factory that returns a forward hook capturing a tag from config."""
-    tag = config.get("tag", "default")
-
-    def hook(module, inputs, output):
-        # Use a global list to track calls, but we'll manage it per-test
-        if hasattr(dummy_hook_factory, "hook_calls"):
-            dummy_hook_factory.hook_calls.append(
-                {
-                    "module_type": type(module).__name__,
-                    "tag": tag,
-                    "shape": tuple(output.shape),
-                }
-            )
-        return output
-
-    return hook
+HOOK_MODULE = "hooks_test_data"
+HOOK_FACTORY = f"{HOOK_MODULE}:dummy_hook_factory"
 
 
 class TinyModel(nn.Module):
@@ -50,20 +35,24 @@ class TestAttachHooks(CustomTestCase):
     """Tests for ModelRunner.register_hooks / resolve_callable integration."""
 
     def setUp(self):
-        # Set up per-test hook calls tracking
-        dummy_hook_factory.hook_calls = []
+        # Per-test list and token to reset the contextvar in the impl module
+        self.hook_calls = []
+        self._token = hooks_impl.set_recorder(self.hook_calls.append)
+
+    def tearDown(self):
+        hooks_impl.reset_recorder(self._token)
 
     def test_hook_is_attached(self):
         """Hook from a factory string is registered and fired."""
         hook_specs = [
             {
                 "target_modules": ["outer.0", "outer.1"],
-                "hook_factory": "test_model_hooks:dummy_hook_factory",
+                "hook_factory": HOOK_FACTORY,
                 "config": {"tag": "forward-ok"},
             },
             {
                 "target_modules": ["inner.*"],
-                "hook_factory": "test_model_hooks:dummy_hook_factory",
+                "hook_factory": HOOK_FACTORY,
                 "config": {"tag": "forward-ok"},
             },
         ]
@@ -75,24 +64,21 @@ class TestAttachHooks(CustomTestCase):
         _ = model(x)
 
         self.assertEqual(
-            len(dummy_hook_factory.hook_calls),
+            len(self.hook_calls),
             4,
             "Forward hook was not called correct number of times",
         )
-        tags = {call["tag"] for call in dummy_hook_factory.hook_calls}
+        tags = {call["tag"] for call in self.hook_calls}
         self.assertIn("forward-ok", tags)
 
     def test_no_matching_modules_does_not_crash(self):
         """Hook spec with no matching modules should not crash."""
-        # For this test, we'll use the global hook factory but expect no calls
-        dummy_hook_factory.hook_calls = []
-
         model = TinyModel()
         hook_specs = [
             {
                 "name": "no_match",
                 "target_modules": ["does_not_exist.*"],
-                "hook_factory": "test_model_hooks:dummy_hook_factory",
+                "hook_factory": HOOK_FACTORY,
                 "config": {"tag": "unused"},
             }
         ]
@@ -102,7 +88,7 @@ class TestAttachHooks(CustomTestCase):
         x = torch.randn(3, 4)
         _ = model(x)
 
-        self.assertEqual(len(dummy_hook_factory.hook_calls), 0)
+        self.assertEqual(len(self.hook_calls), 0)
 
     def test_cli_hooks_reach_model(self):
         """
@@ -110,9 +96,6 @@ class TestAttachHooks(CustomTestCase):
         ServerArgs, passed to ModelRunner.register_hooks, and actually
         run during a forward pass.
         """
-        # Set up for CLI test
-        dummy_hook_factory.hook_calls = []
-
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
@@ -120,7 +103,7 @@ class TestAttachHooks(CustomTestCase):
             {
                 "name": "outer_and_inner_from_cli",
                 "target_modules": ["outer.0", "outer.1", "inner.*"],
-                "hook_factory": "test_model_hooks:dummy_hook_factory",
+                "hook_factory": HOOK_FACTORY,
                 "config": {"tag": "cli-hook"},
             }
         ]
@@ -145,12 +128,12 @@ class TestAttachHooks(CustomTestCase):
 
         # We expect hooks on outer.0, outer.1, inner.0, inner.1  => 4 calls
         self.assertEqual(
-            len(dummy_hook_factory.hook_calls),
+            len(self.hook_calls),
             4,
             "CLI-configured hooks did not fire expected number of times",
         )
 
-        tags = {call["tag"] for call in dummy_hook_factory.hook_calls}
+        tags = {call["tag"] for call in self.hook_calls}
         self.assertEqual(tags, {"cli-hook"})
 
 
