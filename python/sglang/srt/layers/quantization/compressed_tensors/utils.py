@@ -29,6 +29,7 @@ def should_ignore_layer(
     # layer_name = model.layers.0.self_attn.qkv_proj
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
+    fused_mapping = fused_mapping['model']
 
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
@@ -79,7 +80,7 @@ def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
     if target starts with 're:' to any target in list.
     """
     for target in targets:
-        if _is_equal_or_regex_match(layer_name, target):
+        if _is_equal_or_regex_match(layer_name, target, check_contains=True):
             return True
     return False
 
