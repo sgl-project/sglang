@@ -36,7 +36,9 @@ __Note__: Difference between Merge Oncall and Codeowner
 If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.ai/): #dev, #pull-request, and #ci-cd-build-release.
 
 ## The List of Merge Oncalls and Reviewers
-TODO
+
+Now we have many Merge Oncalls mainly because the CI is flaky and the CODEOWNERS is too coarse-grained.
+In the future, we hope the CI can be improved and we only need bypass rarely. After that, most Merge Oncalls can be converted back to Write and CODEOWNERS.
 
 This list is based on the current situation. If you or someone you know would like to take on more responsibility and are qualified, please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
 
