@@ -1,20 +1,8 @@
-# Expert Parallelism (EP)
+# Expert Parallelism
 
-## 1. Overview and Rationale
+## Overview and Rationale
 
-Expert Parallelism (EP) is a vital parallelization strategy in SGLang for high-performance serving of massive Mixture-of-Experts (MoE) Large Language Models (LLMs), such as DeepSeek-V3. MoE models are LLM architectures composed of multiple "experts" (small neural networks), where only a subset are activated per input token. While MoE models have a massive total parameter count (e.g., DeepSeek-V3 has 671B), only a small subset (e.g., 37B) are active per token.
-
-EP addresses the fundamental challenge of scaling these models by distributing the enormous expert weights across multiple GPUs, ensuring efficient operation with low latency and high throughput.
-
-| Feature | Expert Parallelism (EP) | Tensor Parallelism (TP) |
-|---|---|---|
-| **Target Layer** | Sparse FFN Experts | Dense Attention & FFN layers (These are the standard, always-active components of most transformer-based LLMs) |
-| **Primary Benefit** | Scalable Model Capacity (Removes memory bottleneck). | Computation Speedup (Splits large matrix operations). |
-| **Mechanism** | Experts are sharded across devices. | Weights are split and results are aggregated. |
-
-## 2. Technical Challenges & SGLang Solutions
-
-SGLang's EP implementation is specifically engineered to overcome two key challenges inherent to MoE serving:
+Expert Parallelism (EP) is a vital parallelization strategy in SGLang for high-performance serving of MoEs, such as DeepSeek-V3. SGLang's EP overcomes two key challenges inherent to MoE serving:
 
 ### Memory and Communication Bottlenecks
 
@@ -22,7 +10,7 @@ MoE models' vast expert weights exceed single GPU memory, and routing tokens acr
 
 ### Dynamic Expert Load Imbalance
 
-Real-world inference traffic often leads to uneven expert usage, causing GPU stalls. SGLang's Expert Parallelism Load Balancer ([EPLB](https://github.com/deepseek-ai/eplb)) dynamically monitors expert usage, reassigns experts to balance workload, and maximizes GPU utilization for consistent high performance.
+Real-world inference traffic often leads to uneven expert usage. SGLang's Expert Parallelism Load Balancer ([EPLB](https://github.com/deepseek-ai/eplb)) dynamically monitors expert usage, reassigns experts to balance workload, and maximizes GPU utilization for consistent high performance.
 
 ## 3. Synergy with Prefill-Decode (PD) Disaggregation
 
