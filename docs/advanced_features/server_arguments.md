@@ -156,6 +156,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--base-gpu-id` | The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine. | `0` | Type: int |
 | `--gpu-id-step` | The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,... | `1` | Type: int |
 | `--sleep-on-idle` | Reduce CPU usage when sglang is idle. | `False` | bool flag (set to enable) |
+| `--mm-process-config` | A JSON string for multimodal preprocessing configuration. It can contain keys: `image`, `video`, `audio`. | `{}` |
 
 ## Logging
 | Argument | Description | Defaults | Options |
@@ -396,6 +397,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |
 | `--enable-layerwise-nvtx-marker` | Enable layerwise NVTX profiling annotations for the model. This adds NVTX markers to every layer for detailed per-layer performance analysis with Nsight Systems. | `False` | bool flag (set to enable) |
 | `--enable-attn-tp-input-scattered` | Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.                                                                                                      | `False`  | bool flag (set to enable) |
+| `--enable-nsa-prefill-context-parallel` | Context parallelism used in the long sequence prefill phase of DeepSeek v3.2 | `False` | bool flag (set to enable) |
+
+## Forward hooks
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--hooks` | JSON-formatted list of hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
 
 ## Debug tensor dumps
 | Argument | Description | Defaults | Options |

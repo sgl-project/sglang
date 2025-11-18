@@ -3,6 +3,9 @@ on:
   push:
     tags:
       - "*" # Trigger on all tags and filterred by pep440 later
+    tags-ignore:
+      - "gateway-*" # Exclude gateway/router tags
+      - "router-*" # Exclude router tags
   workflow_dispatch:
   pull_request:
     branches:
