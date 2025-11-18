@@ -59,6 +59,8 @@ _is_sm100_supported = is_cuda() and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 
+if _use_aiter:
+    from aiter import rmsnorm2d_fwd_with_dynamicquant, rmsnorm2d_fwd_with_add_dynamicquant
 if _use_aiter and _is_gfx95_supported:
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
@@ -216,7 +218,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        qaunt_format: str = "",
+        quant_format: str = "",
     ):
         if hidden_states.shape[0] == 0:
             residual = hidden_states
@@ -235,7 +237,7 @@ class LayerCommunicator:
                 if residual is None:
                     residual = hidden_states
 
-                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
+                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
@@ -245,10 +247,22 @@ class LayerCommunicator:
                             None,
                             None,
                         )
+                    elif _use_aiter and ("fp8_e4m3fnuz" in quant_format):
+                        y_scale = torch.empty(hidden_states.shape[0], 1, dtype=torch.float32, device=hidden_states.device)
+                        output = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fnuz, device=hidden_states.device)
+                        rmsnorm2d_fwd_with_dynamicquant(
+                            output,
+                            hidden_states,
+                            y_scale,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
+                            use_model_sensitive_rmsnorm=0,
+                        )
+                        hidden_states = (output, y_scale)
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
-                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
+                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, residual = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
@@ -258,6 +272,21 @@ class LayerCommunicator:
                             None,
                             residual,
                         )
+                    elif _use_aiter and ("fp8_e4m3fnuz" in quant_format):
+                        y_scale = torch.empty(hidden_states.shape[0], 1, dtype=torch.float32, device=hidden_states.device)
+                        output = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fnuz, device=hidden_states.device)
+                        residual_out = torch.empty_like(residual)
+                        rmsnorm2d_fwd_with_add_dynamicquant(
+                            output,
+                            hidden_states,
+                            residual,
+                            residual_out,
+                            y_scale,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
+                            use_model_sensitive_rmsnorm=0,
+                        )
+                        hidden_states, residual = (output, y_scale), residual_out
                     else:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states, residual
