@@ -139,7 +139,7 @@ class RequestStage:
     ANONYMOUS = RequestStageConfig("")
 
 
-class SGLangStageContext(SGLangTraceReqContext):
+class TraceMetricContext(SGLangTraceReqContext):
     def __init__(
         self,
         rid,
@@ -240,7 +240,7 @@ class SGLangStageContext(SGLangTraceReqContext):
     metric_trace_slice = metric_trace_slice_end
 
 
-class NoOpStageContext:
+class NullContext:
     __slots__ = ()
 
     def __getattr__(self, name):
@@ -263,11 +263,11 @@ def metric_trace_slice_batch(
     stage: RequestStageConfig,
     reqs: List,
 ):
-    if not reqs or not reqs[0].stage_context.time_record_enable:
+    if not reqs or not reqs[0].trace_metric_ctx.time_record_enable:
         return
 
     for req in reqs:
-        req.stage_context.metric_trace_slice(
+        req.trace_metric_ctx.metric_trace_slice(
             stage,
             auto_next_anon=not req.finished(),
             thread_finish_flag=req.finished(),
@@ -280,7 +280,7 @@ def trace_event_batch(
     ts: Optional[int] = None,
     attrs: Dict[str, Any] = {},
 ):
-    if not reqs or not reqs[0].stage_context.tracing_enable:
+    if not reqs or not reqs[0].trace_metric_ctx.tracing_enable:
         return
 
     bid = uuid.uuid4().hex[:8]
@@ -288,23 +288,23 @@ def trace_event_batch(
     _attrs.update(attrs)
 
     for req in reqs:
-        req.stage_context.trace_event(name, ts=ts, attrs=_attrs)
+        req.trace_metric_ctx.trace_event(name, ts=ts, attrs=_attrs)
 
 
 """
-Used when the stage_context cannot be integrated into the request object.
+Used when the trace_metric_ctx cannot be integrated into the request object.
 
 format:
     {
         thread_id: {
-            "rid": SGLangStageContext
+            "rid": TraceMetricContext
         }
     }
 """
-global_stage_context_table: Dict[int, Dict[str, SGLangStageContext]] = {}
+global_trace_metric_ctx_table: Dict[int, Dict[str, TraceMetricContext]] = {}
 
 
-def global_init_stage_context(
+def global_init_trace_metric_ctx(
     rid,
     bootstrap_room,
     module_name,
@@ -316,7 +316,7 @@ def global_init_stage_context(
 ):
     pid = threading.get_native_id()
     rid = str(rid)
-    stage_context = SGLangStageContext(
+    trace_metric_ctx = TraceMetricContext(
         rid=rid,
         bootstrap_room=bootstrap_room,
         module_name=module_name,
@@ -327,43 +327,43 @@ def global_init_stage_context(
         role=role,
     )
 
-    global_stage_context_table.setdefault(pid, {})[rid] = stage_context
+    global_trace_metric_ctx_table.setdefault(pid, {})[rid] = trace_metric_ctx
 
-    return stage_context
+    return trace_metric_ctx
 
 
-def global_get_stage_context(rid) -> Union[SGLangStageContext, NoOpStageContext]:
+def global_get_trace_metric_ctx(rid) -> Union[TraceMetricContext, NullContext]:
     pid = threading.get_native_id()
     rid = str(rid)
-    if pid in global_stage_context_table:
-        if rid in global_stage_context_table[pid]:
-            return global_stage_context_table[pid][rid]
-    return NoOpStageContext()
+    if pid in global_trace_metric_ctx_table:
+        if rid in global_trace_metric_ctx_table[pid]:
+            return global_trace_metric_ctx_table[pid][rid]
+    return NullContext()
 
 
-def global_set_stage_context(stage_context):
+def global_set_trace_metric_ctx(trace_metric_ctx):
     pid = threading.get_native_id()
-    rid = stage_context.rid
-    global_stage_context_table.setdefault(pid, {})[rid] = stage_context
+    rid = trace_metric_ctx.rid
+    global_trace_metric_ctx_table.setdefault(pid, {})[rid] = trace_metric_ctx
 
 
-def global_del_stage_context(rid):
+def global_del_trace_metric_ctx(rid):
     pid = threading.get_native_id()
     rid = str(rid)
-    if pid in global_stage_context_table:
-        if rid in global_stage_context_table[pid]:
-            del global_stage_context_table[pid][rid]
+    if pid in global_trace_metric_ctx_table:
+        if rid in global_trace_metric_ctx_table[pid]:
+            del global_trace_metric_ctx_table[pid][rid]
 
 
 def trace_inject_propagate_context(obj):
-    if hasattr(obj, "stage_context"):
-        old_stage_context = obj.stage_context
-        obj.stage_context = obj.stage_context.trace_get_proc_propagate_context()
-        return old_stage_context
+    if hasattr(obj, "trace_metric_ctx"):
+        old_trace_metric_ctx = obj.trace_metric_ctx
+        obj.trace_metric_ctx = obj.trace_metric_ctx.trace_get_proc_propagate_context()
+        return old_trace_metric_ctx
     else:
         return None
 
 
-def trace_restore_stage_context(obj, old_stage_context):
-    if hasattr(obj, "stage_context"):
-        obj.stage_context = old_stage_context
+def trace_restore_trace_metric_ctx(obj, old_trace_metric_ctx):
+    if hasattr(obj, "trace_metric_ctx"):
+        obj.trace_metric_ctx = old_trace_metric_ctx

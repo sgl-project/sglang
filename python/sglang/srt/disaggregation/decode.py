@@ -60,7 +60,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.tracing.trace_metric_warpper import RequestStage, trace_event_batch
+from sglang.srt.tracing.trace_metric_wrapper import RequestStage, trace_event_batch
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -316,7 +316,7 @@ class DecodePreallocQueue:
                 prefill_dp_rank=req.data_parallel_rank,
             )
 
-            req.stage_context.metric_trace_slice_end(
+            req.trace_metric_ctx.metric_trace_slice_end(
                 RequestStage.DECODE_PREPARE, auto_next_anon=True
             )
             self.queue.append(
@@ -533,7 +533,7 @@ class DecodePreallocQueue:
                 time.perf_counter()
             )
 
-            decode_req.req.stage_context.metric_trace_slice_end(
+            decode_req.req.trace_metric_ctx.metric_trace_slice_end(
                 RequestStage.DECODE_BOOTSTRAP, auto_next_anon=True
             )
 
@@ -716,7 +716,7 @@ class DecodeTransferQueue:
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
-        decode_req.req.stage_context.metric_trace_slice_end(
+        decode_req.req.trace_metric_ctx.metric_trace_slice_end(
             RequestStage.DECODE_TRANSFERRED,
             auto_next_anon=True,
         )
@@ -905,7 +905,7 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                req.stage_context.metric_trace_slice_end(
+                req.trace_metric_ctx.metric_trace_slice_end(
                     RequestStage.DECODE_WAITING, auto_next_anon=True
                 )
                 req.init_next_round_input(self.tree_cache)

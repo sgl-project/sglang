@@ -42,7 +42,7 @@ from sglang.srt.server_args import (
     ServerArgs,
 )
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.tracing.trace_metric_warpper import RequestStage, SGLangStageContext
+from sglang.srt.tracing.trace_metric_wrapper import RequestStage, TraceMetricContext
 from sglang.srt.utils.common import (
     bind_port,
     configure_ipv6,
@@ -176,20 +176,20 @@ class DataParallelController:
             bootstrap_room = (
                 req.bootstrap_room if hasattr(req, "bootstrap_room") else None
             )
-            stage_context = SGLangStageContext(
+            trace_metric_ctx = TraceMetricContext(
                 req.rid,
                 bootstrap_room=bootstrap_room,
                 module_name="request",
                 server_args=self.server_args,
-                propagation_context=req.stage_context,
+                propagation_context=req.trace_metric_ctx,
             )
-            stage_context.metric_trace_slice_start(RequestStage.DC_DISPATCH)
-            req.stage_context = stage_context.trace_get_proc_propagate_context()
+            trace_metric_ctx.metric_trace_slice_start(RequestStage.DC_DISPATCH)
+            req.trace_metric_ctx = trace_metric_ctx.trace_get_proc_propagate_context()
 
         self.dispatching(req)
 
         if self.server_args.trace_level > 0:
-            stage_context.metric_trace_slice_end(
+            trace_metric_ctx.metric_trace_slice_end(
                 RequestStage.DC_DISPATCH, thread_finish_flag=True
             )
 

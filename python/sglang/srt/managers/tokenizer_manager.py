@@ -85,12 +85,12 @@ from sglang.srt.tracing.trace import (
     extract_trace_headers,
     trace_set_remote_propagate_context_batch,
 )
-from sglang.srt.tracing.trace_metric_warpper import (
+from sglang.srt.tracing.trace_metric_wrapper import (
     RequestStage,
-    SGLangStageContext,
-    global_del_stage_context,
-    global_get_stage_context,
-    global_set_stage_context,
+    TraceMetricContext,
+    global_del_trace_metric_ctx,
+    global_get_trace_metric_ctx,
+    global_set_trace_metric_ctx,
 )
 from sglang.srt.utils import (
     configure_gc_warning,
@@ -432,7 +432,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self._attach_multi_http_worker_info(obj)
 
         if self.server_args.trace_level > 0:
-            self._req_stage_context_init(obj, created_time, external_trace_header)
+            self._req_trace_metric_ctx_init(obj, created_time, external_trace_header)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -650,7 +650,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        global_get_stage_context(obj.rid).metric_trace_slice_end(RequestStage.TOKENIZE)
+        global_get_trace_metric_ctx(obj.rid).metric_trace_slice_end(RequestStage.TOKENIZE)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -876,7 +876,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
-            global_get_stage_context(req.rid).metric_trace_slice_end(
+            global_get_trace_metric_ctx(req.rid).metric_trace_slice_end(
                 RequestStage.TOKENIZE
             )
         logger.debug(f"Completed batch processing for {batch_size} requests")
@@ -935,17 +935,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         created_time: Optional[float] = None,
     ):
         if self.server_args.trace_level > 0:
-            stage_context = global_get_stage_context(obj.rid)
-            stage_context.metric_trace_slice_start(RequestStage.TOKENIZER_DISPATCH)
-            tokenized_obj.stage_context = (
-                stage_context.trace_get_proc_propagate_context()
+            trace_metric_ctx = global_get_trace_metric_ctx(obj.rid)
+            trace_metric_ctx.metric_trace_slice_start(RequestStage.TOKENIZER_DISPATCH)
+            tokenized_obj.trace_metric_ctx = (
+                trace_metric_ctx.trace_get_proc_propagate_context()
             )
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
         if self.server_args.trace_level > 0:
-            stage_context.metric_trace_slice_end(
+            trace_metric_ctx.metric_trace_slice_end(
                 RequestStage.TOKENIZER_DISPATCH, thread_finish_flag=True
             )
         return state
@@ -966,10 +966,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         if self.server_args.trace_level > 0:
             for tokenized_obj in tokenized_objs:
-                stage_context = global_get_stage_context(tokenized_obj.rid)
-                stage_context.metric_trace_slice_start(RequestStage.TOKENIZER_DISPATCH)
-                tokenized_obj.stage_context = (
-                    stage_context.trace_get_proc_propagate_context()
+                trace_metric_ctx = global_get_trace_metric_ctx(tokenized_obj.rid)
+                trace_metric_ctx.metric_trace_slice_start(RequestStage.TOKENIZER_DISPATCH)
+                tokenized_obj.trace_metric_ctx = (
+                    trace_metric_ctx.trace_get_proc_propagate_context()
                 )
 
         self.send_to_scheduler.send_pyobj(batch_req)
@@ -982,8 +982,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.rid_to_state[tmp_obj.rid] = state
 
             if self.server_args.trace_level > 0:
-                stage_context = global_get_stage_context(tokenized_obj.rid)
-                stage_context.metric_trace_slice_end(RequestStage.TOKENIZER_DISPATCH)
+                trace_metric_ctx = global_get_trace_metric_ctx(tokenized_obj.rid)
+                trace_metric_ctx.metric_trace_slice_end(RequestStage.TOKENIZER_DISPATCH)
 
     async def _wait_one_response(
         self,
@@ -1606,9 +1606,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 if self.enable_metrics:
                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
-                stage_context = global_get_stage_context(rid)
-                stage_context.trace_req_finish(ts=int(state.finished_time * 1e9))
-                global_del_stage_context(rid)
+                trace_metric_ctx = global_get_trace_metric_ctx(rid)
+                trace_metric_ctx.trace_req_finish(ts=int(state.finished_time * 1e9))
+                global_del_trace_metric_ctx(rid)
 
                 del self.rid_to_state[rid]
 
@@ -2356,7 +2356,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
             self.send_to_scheduler.send_pyobj(load_udpate_req)
 
-    def _req_stage_context_init(
+    def _req_trace_metric_ctx_init(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
@@ -2366,7 +2366,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             bootstrap_room = (
                 obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
             )
-            stage_context = SGLangStageContext(
+            trace_metric_ctx = TraceMetricContext(
                 rid=obj.rid,
                 bootstrap_room=bootstrap_room,
                 module_name="request",
@@ -2374,13 +2374,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ts=int(created_time * 1e9),
                 external_trace_header=external_trace_header,
             )
-            if not stage_context.tracing_enable:
+            if not trace_metric_ctx.tracing_enable:
                 return
 
             # store into global table,
-            # because stage_context can not be passed to _handle_batch_output
-            global_set_stage_context(stage_context)
-            stage_context.metric_trace_slice_start(
+            # because trace_metric_ctx can not be passed to _handle_batch_output
+            global_set_trace_metric_ctx(trace_metric_ctx)
+            trace_metric_ctx.metric_trace_slice_start(
                 RequestStage.ANONYMOUS, ts=int(created_time * 1e9)
             )
         else:
@@ -2390,7 +2390,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
                     else None
                 )
-                stage_context = SGLangStageContext(
+                trace_metric_ctx = TraceMetricContext(
                     rid=obj.rid[i],
                     bootstrap_room=bootstrap_room,
                     module_name="request",
@@ -2398,11 +2398,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     ts=int(created_time * 1e9),
                     external_trace_header=external_trace_header,
                 )
-                if not stage_context.tracing_enable:
+                if not trace_metric_ctx.tracing_enable:
                     return
 
-                global_set_stage_context(stage_context)
-                stage_context.metric_trace_slice_start(
+                global_set_trace_metric_ctx(trace_metric_ctx)
+                trace_metric_ctx.metric_trace_slice_start(
                     RequestStage.ANONYMOUS,
                     ts=int(created_time * 1e9),
                 )

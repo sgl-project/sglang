@@ -16,7 +16,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.tracing.trace_metric_warpper import RequestStage
+from sglang.srt.tracing.trace_metric_wrapper import RequestStage
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -45,13 +45,13 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.forward_entry_time = req.time_stats.completion_time = (
                     time.perf_counter()
                 )
-                req.stage_context.metric_trace_slice_end(
+                req.trace_metric_ctx.metric_trace_slice_end(
                     RequestStage.DECODE_QUICK_FINISH,
                     thread_finish_flag=True,
                 )
                 release_kv_cache(req, self.tree_cache)
             else:
-                req.stage_context.metric_trace_slice_end(
+                req.trace_metric_ctx.metric_trace_slice_end(
                     RequestStage.DECODE_FAKE_OUTPUT,
                     auto_next_anon=True,
                 )
@@ -166,7 +166,7 @@ class SchedulerOutputProcessorMixin:
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
-                    req.stage_context.metric_trace_slice(
+                    req.trace_metric_ctx.metric_trace_slice(
                         RequestStage.PREFILL_FORWARD,
                         auto_next_anon=not req.finished(),
                         thread_finish_flag=req.finished(),
@@ -200,7 +200,7 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
-                    req.stage_context.metric_trace_slice(
+                    req.trace_metric_ctx.metric_trace_slice(
                         RequestStage.PREFILL_CHUNKED_FORWARD,
                         auto_next_anon=(req.is_chunked != 0),
                     )
@@ -236,7 +236,7 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(0)
                     req.check_finished()
 
-                    req.stage_context.metric_trace_slice(
+                    req.trace_metric_ctx.metric_trace_slice(
                         RequestStage.PREFILL_FORWARD,
                         auto_next_anon=not req.finished(),
                         thread_finish_flag=req.finished(),
@@ -250,7 +250,7 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-                    req.stage_context.metric_trace_slice(
+                    req.trace_metric_ctx.metric_trace_slice(
                         RequestStage.PREFILL_CHUNKED_FORWARD,
                         auto_next_anon=(req.is_chunked != 0),
                     )

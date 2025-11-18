@@ -64,52 +64,52 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
     The "thread label" can be regarded as the name of the thread, used to distinguish different threads in the visualization view.
 
 2. Create a time recorder for a request
-    Each request needs to call `SGLangStageContext()` to initialize a time recorder, which is used to generate slice spans and request stage metrics. You can either store it within the request object or maintain it as a global variable. A set of APIs for managing the global time recorder is provided in `python/sglang/srt/tracing/trace_metric_warpper.py`.
+    Each request needs to call `TraceMetricContext()` to initialize a time recorder, which is used to generate slice spans and request stage metrics. You can either store it within the request object or maintain it as a global variable. A set of APIs for managing the global time recorder is provided in `python/sglang/srt/tracing/trace_metric_wrapper.py`.
 
 3. Mark the beginning and end of a request
     ```
     # The time recorder calls trace_req_start() by default when it is created.
-    stage_context.trace_req_finish()
+    trace_metric_ctx.trace_req_finish()
     ```
-    SGLangStageContext() and trace_req_finish() must be called within the same process, for example, in the tokenizer.
+    TraceMetricContext() and trace_req_finish() must be called within the same process, for example, in the tokenizer.
 
 4. Add tracing for a slice
 
     * Add slice tracing normally:
         ```python
-        stage_context.metric_trace_slice_start(RequestStage.TOKENIZER)
-        stage_context.metric_trace_slice_end(RequestStage.TOKENIZER)
+        trace_metric_ctx.metric_trace_slice_start(RequestStage.TOKENIZER)
+        trace_metric_ctx.metric_trace_slice_end(RequestStage.TOKENIZER)
         ```
 
     - Use the `ANONYMOUS` to not specify a slice name at the start of the slice, allowing the slice name to be determined by trace_slice_end.
     <br>Note: Anonymous slices must not be nested.
         ```python
-        stage_context.metric_trace_slice_start(RequestStage.ANONYMOUS)
-        stage_context.metric_trace_slice_end(RequestStage.TOKENIZER)
+        trace_metric_ctx.metric_trace_slice_start(RequestStage.ANONYMOUS)
+        trace_metric_ctx.metric_trace_slice_end(RequestStage.TOKENIZER)
         ```
 
     - In metric_trace_slice_end, use auto_next_anon to automatically create the next anonymous slice, which can reduce the number of instrumentation points needed.
         ```python
-        stage_context.metric_trace_slice_start(RequestStage.ANONYMOUS)
-        stage_context.metric_trace_slice_end(RequestStage.A, auto_next_anon = True)
-        stage_context.metric_trace_slice_end(RequestStage.B, auto_next_anon = True)
-        stage_context.metric_trace_slice_end(RequestStage.C, auto_next_anon = True)
-        stage_context.metric_trace_slice_end(RequestStage.D)
+        trace_metric_ctx.metric_trace_slice_start(RequestStage.ANONYMOUS)
+        trace_metric_ctx.metric_trace_slice_end(RequestStage.A, auto_next_anon = True)
+        trace_metric_ctx.metric_trace_slice_end(RequestStage.B, auto_next_anon = True)
+        trace_metric_ctx.metric_trace_slice_end(RequestStage.C, auto_next_anon = True)
+        trace_metric_ctx.metric_trace_slice_end(RequestStage.D)
         ```
     - The end of the last slice in a thread must be marked with thread_finish_flag=True; otherwise, the thread's span will not be properly generated.
         ```python
-        stage_context.metric_trace_slice_end(RequestStage.D, thread_finish_flag = True)
+        trace_metric_ctx.metric_trace_slice_end(RequestStage.D, thread_finish_flag = True)
         ```
 
 5. When the request execution flow transfers to another thread, the trace context needs to be explicitly propagated.
     - sender: Execute the following code before sending the request to another thread via ZMQ
         ```python
-        trace_context = stage_context.trace_get_proc_propagate_context(rid)
-        req.stage_context = trace_context
+        trace_context = trace_metric_ctx.trace_get_proc_propagate_context(rid)
+        req.trace_metric_ctx = trace_context
         ```
     - receiver: Execute the following code after receiving the request via ZMQ
         ```python
-        stage_context = SGLangStageContext(......,propagation_context = req.stage_context)
+        trace_metric_ctx = TraceMetricContext(......,propagation_context = req.trace_metric_ctx)
         ```
 
 6. When the request execution flow transfers to another node(PD disaggregation), the trace context needs to be explicitly propagated.
