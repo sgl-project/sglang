@@ -19,10 +19,10 @@ use rmcp::{
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::{
-    config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Tool},
+    config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport},
     connection_pool::McpConnectionPool,
     error::{McpError, McpResult},
-    inventory::ToolInventory,
+    inventory::{format_tool_name, CachedTool, ToolInventory},
     tool_args::ToolArgs,
 };
 
@@ -156,7 +156,7 @@ impl McpManager {
     }
 
     /// List all available tools from all servers (static only)
-    pub fn list_tools(&self) -> Vec<(String, String, Tool, String)> {
+    pub fn list_tools(&self) -> Vec<CachedTool> {
         self.inventory.list_tools()
     }
 
@@ -236,9 +236,13 @@ impl McpManager {
         args: impl Into<ToolArgs>,
     ) -> McpResult<CallToolResult> {
         // Get tool info and server URL from inventory
-        let (tool_info, server_url) = inventory
-            .get_tool(server_label, tool_name)
+        let formatted_name = format_tool_name(server_label, tool_name);
+        let cached_tool = inventory
+            .get_tool(&formatted_name)
             .ok_or_else(|| McpError::ToolNotFound(format!("{}::{}", server_label, tool_name)))?;
+
+        let tool_info = cached_tool.tool;
+        let server_url = cached_tool.server_url;
 
         // Convert args with type coercion based on schema
         let tool_schema = Some(serde_json::Value::Object((*tool_info.input_schema).clone()));

@@ -14,18 +14,18 @@ use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{from_str, json, to_string, to_value, Value};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::utils::event_types;
 use crate::{
-    mcp,
+    mcp::{
+        self,
+        inventory::{format_tool_name, TOOL_NAME_SEPARATOR},
+    },
     protocols::responses::{
         generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
     },
-    routers::{
-        common::{format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR},
-        header_utils::apply_request_headers,
-    },
+    routers::header_utils::apply_request_headers,
 };
 
 // ============================================================================
@@ -201,7 +201,7 @@ pub(super) async fn execute_streaming_tool_calls(
     active_mcp: &Arc<mcp::McpManager>,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     state: &mut ToolLoopState,
-    server_label: &str,
+    _server_label: &str,
     sequence_number: &mut u64,
     inventory: &mcp::ToolInventory,
 ) -> bool {
@@ -216,19 +216,21 @@ pub(super) async fn execute_streaming_tool_calls(
             continue;
         }
 
-        // Parse formatted name using regex: server_label__tool_name
+        // Look up tool in inventory to get server_label and tool_name
         let formatted_tool_name = &call.name;
-        let (call_server_label, original_tool_name) =
-            if let Some((server, tool)) = parse_tool_name(formatted_tool_name) {
-                (server, tool)
-            } else {
-                // Fallback: treat entire name as tool name (shouldn't happen with new format)
-                warn!(
-                    "Tool name '{}' not in expected format 'server_label{}tool_name'",
-                    formatted_tool_name, TOOL_NAME_SEPARATOR
+        let cached_tool = match inventory.get_tool(formatted_tool_name) {
+            Some(tool) => tool,
+            None => {
+                error!(
+                    "Tool '{}' not found in inventory for call_id '{}'",
+                    formatted_tool_name, call.call_id
                 );
-                ("unknown".to_string(), formatted_tool_name.clone())
-            };
+                continue;
+            }
+        };
+
+        let call_server_label = cached_tool.server_label.clone();
+        let original_tool_name = cached_tool.tool_name.clone();
 
         info!(
             "Executing tool call during streaming: {} (server: {}, tool: {}, id: {})",
@@ -283,7 +285,8 @@ pub(super) async fn execute_streaming_tool_calls(
             tx,
             &call,
             &output_str,
-            server_label,
+            &call_server_label,
+            &original_tool_name,
             success,
             error_msg.as_deref(),
             sequence_number,
@@ -337,13 +340,14 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         let mut tools_json = existing_function_tools;
 
         // Add MCP tools with formatted names (server_label__tool_name)
-        for (server_label, tool_name, tool, _server_url) in inventory.list_tools() {
-            let formatted_name = format_tool_name(&server_label, &tool_name);
-            let parameters = Value::Object((*tool.input_schema).clone());
+        for cached_tool in inventory.list_tools() {
+            let formatted_name =
+                format_tool_name(&cached_tool.server_label, &cached_tool.tool_name);
+            let parameters = Value::Object((*cached_tool.tool.input_schema).clone());
             let tool_json = serde_json::json!({
                 "type": event_types::ITEM_TYPE_FUNCTION,
                 "name": formatted_name,
-                "description": tool.description,
+                "description": cached_tool.tool.description,
                 "parameters": parameters
             });
             tools_json.push(tool_json);
@@ -511,27 +515,22 @@ pub(super) fn send_mcp_list_tools_events(
 
 /// Send mcp_call completion events after tool execution
 /// Returns false if client disconnected
+#[allow(clippy::too_many_arguments)]
 pub(super) fn send_mcp_call_completion_events_with_error(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     call: &FunctionCallInProgress,
     output: &str,
     server_label: &str,
+    original_tool_name: &str,
     success: bool,
     error_msg: Option<&str>,
     sequence_number: &mut u64,
 ) -> bool {
     let effective_output_index = call.effective_output_index();
 
-    // Strip server_label__ prefix from formatted name
-    let original_tool_name = if let Some((_, tool)) = parse_tool_name(&call.name) {
-        tool
-    } else {
-        call.name.clone()
-    };
-
     // Build mcp_call item
     let mcp_call_item = build_mcp_call_item(
-        &original_tool_name,
+        original_tool_name,
         &call.arguments_buffer,
         output,
         server_label,
@@ -715,19 +714,21 @@ pub(super) async fn execute_tool_loop(
                 );
             }
 
-            // Parse formatted name using regex: server_label__tool_name
+            // Look up tool in inventory to get server_label and tool_name
             let formatted_tool_name = &tool_name;
-            let (server_label_parsed, original_tool_name) =
-                if let Some((server, tool)) = parse_tool_name(formatted_tool_name) {
-                    (server, tool)
-                } else {
-                    // Fallback: treat entire name as tool name
-                    warn!(
-                        "Tool name '{}' not in expected format 'server_label{}tool_name'",
-                        formatted_tool_name, TOOL_NAME_SEPARATOR
+            let cached_tool = match inventory.get_tool(formatted_tool_name) {
+                Some(tool) => tool,
+                None => {
+                    error!(
+                        "Tool '{}' not found in inventory for call_id '{}'",
+                        formatted_tool_name, call_id
                     );
-                    ("unknown".to_string(), formatted_tool_name.clone())
-                };
+                    continue;
+                }
+            };
+
+            let server_label_parsed = cached_tool.server_label.clone();
+            let original_tool_name = cached_tool.tool_name.clone();
 
             debug!(
                 "Calling MCP tool '{}' (server: {}, tool: {}) with args: {}",
@@ -875,15 +876,12 @@ pub(super) fn build_incomplete_response(
                     .unwrap_or("{}");
 
                 // Strip server_label__ prefix from formatted name
-                let original_tool_name = if let Some((_, tool)) = parse_tool_name(tool_name) {
-                    tool
-                } else {
-                    tool_name.to_string()
-                };
+                let prefix = format!("{}{}", server_label, TOOL_NAME_SEPARATOR);
+                let original_tool_name = tool_name.strip_prefix(&prefix).unwrap_or(tool_name);
 
                 // Mark as incomplete - not executed
                 let mcp_call_item = build_mcp_call_item(
-                    &original_tool_name,
+                    original_tool_name,
                     args,
                     "", // No output - wasn't executed
                     server_label,
@@ -946,11 +944,11 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label
     let tools = mcp.list_tools();
     let tools_json: Vec<Value> = tools
         .iter()
-        .map(|(_server_label, _tool_name, tool, _server_url)| {
+        .map(|cached_tool| {
             json!({
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": Value::Object((*tool.input_schema).clone()),
+                "name": cached_tool.tool.name,
+                "description": cached_tool.tool.description,
+                "input_schema": Value::Object((*cached_tool.tool.input_schema).clone()),
                 "annotations": {
                     "read_only": false
                 }

@@ -27,7 +27,7 @@ fn has_tool(manager: &McpManager, tool_name: &str) -> bool {
     manager
         .list_tools()
         .iter()
-        .any(|(_, name, _, _)| name == tool_name)
+        .any(|cached_tool| cached_tool.tool_name == tool_name)
 }
 
 /// Helper function to get server_url for a tool
@@ -35,8 +35,8 @@ fn get_tool_server_url(manager: &McpManager, tool_name: &str) -> Option<String> 
     manager
         .list_tools()
         .iter()
-        .find(|(_, name, _, _)| name == tool_name)
-        .map(|(server_label, _, _, _)| server_label.clone())
+        .find(|cached_tool| cached_tool.tool_name == tool_name)
+        .map(|cached_tool| cached_tool.server_label.clone())
 }
 
 // Core MCP Server Tests
@@ -402,19 +402,19 @@ async fn test_tool_info_structure() {
     let tools = manager.list_tools();
     let brave_search = tools
         .iter()
-        .find(|(_, tool_name, _, _)| tool_name == "brave_web_search")
+        .find(|cached_tool| cached_tool.tool_name == "brave_web_search")
         .expect("Should have brave_web_search tool");
 
-    let (_server_label, tool_name, tool, _server_url) = brave_search;
-    assert_eq!(tool_name, "brave_web_search");
-    assert!(tool
+    assert_eq!(brave_search.tool_name, "brave_web_search");
+    assert!(brave_search
+        .tool
         .description
         .as_ref()
         .map(|d| d.contains("Mock web search"))
         .unwrap_or(false));
     // Note: server information is now maintained separately in the inventory,
     // not in the Tool type itself
-    assert!(!tool.input_schema.is_empty());
+    assert!(!brave_search.tool.input_schema.is_empty());
 }
 
 // SSE Parsing Tests (simplified since we don't expose parse_sse_event)

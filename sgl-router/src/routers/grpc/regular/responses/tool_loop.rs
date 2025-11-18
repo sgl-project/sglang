@@ -1,6 +1,7 @@
 //! MCP tool loop execution for /v1/responses endpoint
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -21,7 +22,7 @@ use uuid::Uuid;
 
 use super::conversions;
 use crate::{
-    mcp::{self, error::McpError, McpManager},
+    mcp::{self, error::McpError, inventory::format_tool_name, McpManager},
     protocols::{
         chat::{
             ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -35,9 +36,7 @@ use crate::{
         },
     },
     routers::{
-        common::{
-            extract_dynamic_mcp_servers, format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR,
-        },
+        common::extract_dynamic_mcp_servers,
         grpc::{
             common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
             error,
@@ -169,16 +168,14 @@ fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> Respo
     let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(
-            |(_server_label, _tool_name, tool, _server_url)| McpToolInfo {
-                name: tool.name.to_string(),
-                description: tool.description.as_ref().map(|d| d.to_string()),
-                input_schema: Value::Object((*tool.input_schema).clone()),
-                annotations: Some(json!({
-                    "read_only": false
-                })),
-            },
-        )
+        .map(|cached_tool| McpToolInfo {
+            name: cached_tool.tool.name.to_string(),
+            description: cached_tool.tool.description.as_ref().map(|d| d.to_string()),
+            input_schema: Value::Object((*cached_tool.tool.input_schema).clone()),
+            annotations: Some(json!({
+                "read_only": false
+            })),
+        })
         .collect();
 
     ResponseOutputItem::McpListTools {
@@ -262,11 +259,11 @@ pub(super) async fn execute_tool_loop(
 
     // Build MCP tools with formatted names: server_label__tool_name
     let mut mcp_tools = Vec::new();
-    for (server_label, tool_name, tool, _server_url) in request_inventory.list_tools() {
+    for cached_tool in request_inventory.list_tools() {
         // Format tool name using utility function
-        let formatted_name = format_tool_name(&server_label, &tool_name);
-        let mut tool_clone = tool.clone();
-        tool_clone.name = std::borrow::Cow::Owned(formatted_name);
+        let formatted_name = format_tool_name(&cached_tool.server_label, &cached_tool.tool_name);
+        let mut tool_clone = cached_tool.tool.clone();
+        tool_clone.name = Cow::Owned(formatted_name);
         mcp_tools.push(tool_clone);
     }
 
@@ -397,18 +394,21 @@ pub(super) async fn execute_tool_loop(
                     formatted_tool_name, call_id, args_json_str
                 );
 
-                // Parse formatted name using regex: server_label__tool_name
-                let (server_label, original_tool_name) =
-                    if let Some((server, tool)) = parse_tool_name(&formatted_tool_name) {
-                        (server, tool)
-                    } else {
-                        // Fallback: treat entire name as tool name (shouldn't happen)
-                        warn!(
-                            "Tool name '{}' not in expected format 'server_label{}tool_name'",
-                            formatted_tool_name, TOOL_NAME_SEPARATOR
+                // Look up tool in inventory to get server_label and tool_name
+                let cached_tool = match request_inventory.get_tool(&formatted_tool_name) {
+                    Some(tool) => tool,
+                    None => {
+                        error!(
+                            "Tool '{}' not found in inventory for call_id '{}'",
+                            formatted_tool_name, call_id
                         );
-                        ("unknown".to_string(), formatted_tool_name.clone())
-                    };
+                        // Skip this tool call and continue
+                        continue;
+                    }
+                };
+
+                let server_label = cached_tool.server_label.clone();
+                let original_tool_name = cached_tool.tool_name.clone();
 
                 // Parse arguments
                 let args_map = match from_str::<Value>(&args_json_str) {
@@ -686,11 +686,11 @@ async fn execute_tool_loop_streaming_internal(
 
     // Build MCP tools with formatted names: server_label__tool_name
     let mut mcp_tools = Vec::new();
-    for (server_label, tool_name, tool, _server_url) in request_inventory.list_tools() {
+    for cached_tool in request_inventory.list_tools() {
         // Format tool name using utility function
-        let formatted_name = format_tool_name(&server_label, &tool_name);
-        let mut tool_clone = tool.clone();
-        tool_clone.name = std::borrow::Cow::Owned(formatted_name);
+        let formatted_name = format_tool_name(&cached_tool.server_label, &cached_tool.tool_name);
+        let mut tool_clone = cached_tool.tool.clone();
+        tool_clone.name = Cow::Owned(formatted_name);
         mcp_tools.push(tool_clone);
     }
 
@@ -842,18 +842,21 @@ async fn execute_tool_loop_streaming_internal(
                     state.total_calls, state.total_calls, formatted_tool_name, call_id
                 );
 
-                // Parse formatted name using regex: server_label__tool_name
-                let (server_label, original_tool_name) =
-                    if let Some((server, tool)) = parse_tool_name(&formatted_tool_name) {
-                        (server, tool)
-                    } else {
-                        // Fallback: treat entire name as tool name (shouldn't happen)
-                        warn!(
-                            "Tool name '{}' not in expected format 'server_label{}tool_name'",
-                            formatted_tool_name, TOOL_NAME_SEPARATOR
+                // Look up tool in inventory to get server_label and tool_name
+                let cached_tool = match request_inventory.get_tool(&formatted_tool_name) {
+                    Some(tool) => tool,
+                    None => {
+                        error!(
+                            "Tool '{}' not found in inventory for call_id '{}'",
+                            formatted_tool_name, call_id
                         );
-                        ("unknown".to_string(), formatted_tool_name.clone())
-                    };
+                        // Emit error and continue to next iteration
+                        continue;
+                    }
+                };
+
+                let server_label = cached_tool.server_label.clone();
+                let original_tool_name = cached_tool.tool_name.clone();
 
                 // Allocate output_index for this mcp_call item
                 let (output_index, item_id) =

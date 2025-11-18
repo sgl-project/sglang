@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
-    mcp::{McpManager, ToolInventory},
+    mcp::{inventory::format_tool_name, McpManager, ToolInventory},
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
@@ -55,9 +55,7 @@ use crate::{
         },
     },
     routers::{
-        common::{
-            extract_dynamic_mcp_servers, format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR,
-        },
+        common::extract_dynamic_mcp_servers,
         grpc::{
             common::responses::{
                 build_sse_response, ensure_mcp_connection, persist_response_if_needed,
@@ -734,13 +732,14 @@ async fn execute_mcp_tool_loop_streaming(
     let tool_items: Vec<_> = request_inventory
         .list_tools()
         .into_iter()
-        .map(|(server_label, tool_name, tool, _server_url)| {
+        .map(|cached_tool| {
             // Use formatted name: server_label__tool_name
-            let formatted_name = format_tool_name(&server_label, &tool_name);
+            let formatted_name =
+                format_tool_name(&cached_tool.server_label, &cached_tool.tool_name);
             json!({
                 "name": formatted_name,
-                "description": tool.description,
-                "input_schema": Value::Object((*tool.input_schema).clone())
+                "description": cached_tool.tool.description,
+                "input_schema": Value::Object((*cached_tool.tool.input_schema).clone())
             })
         })
         .collect();
@@ -783,7 +782,7 @@ async fn execute_mcp_tool_loop_streaming(
     let tools_for_event: Vec<_> = request_inventory
         .list_tools()
         .into_iter()
-        .map(|(_, _, tool, _)| tool)
+        .map(|cached_tool| cached_tool.tool)
         .collect();
     let event = emitter.emit_mcp_list_tools_completed(output_index, &tools_for_event);
     if emitter.send_event(&event, tx).is_err() {
@@ -1210,17 +1209,22 @@ async fn execute_mcp_tools(
 
     for tool_call in tool_calls {
         let formatted_tool_name = &tool_call.function.name;
-        let (server_label, original_tool_name) =
-            if let Some((server, tool)) = parse_tool_name(formatted_tool_name) {
-                (server, tool)
-            } else {
-                // Fallback: treat entire name as tool name (shouldn't happen with new format)
-                warn!(
-                    "Tool name '{}' not in expected format 'server_label{}tool_name'",
-                    formatted_tool_name, TOOL_NAME_SEPARATOR
-                );
-                ("unknown".to_string(), formatted_tool_name.clone())
-            };
+
+        // Look up tool in inventory to get server_label and tool_name
+        let cached_tool = inventory.get_tool(formatted_tool_name).ok_or_else(|| {
+            error!(
+                formatted_tool_name = %formatted_tool_name,
+                call_id = %tool_call.id,
+                "Tool not found in inventory"
+            );
+            error::internal_error(format!(
+                "Tool '{}' not found in inventory",
+                formatted_tool_name
+            ))
+        })?;
+
+        let server_label = &cached_tool.server_label;
+        let original_tool_name = &cached_tool.tool_name;
 
         debug!(
             formatted_tool_name = %formatted_tool_name,
@@ -1255,7 +1259,7 @@ async fn execute_mcp_tools(
 
         // Call tool via inventory
         let (output, is_error) = match mcp_manager
-            .call_tool_from_inventory(inventory, &server_label, &original_tool_name, args_map)
+            .call_tool_from_inventory(inventory, server_label, original_tool_name, args_map)
             .await
         {
             Ok(result) => {
@@ -1440,22 +1444,23 @@ fn convert_inventory_to_response_tools(inventory: &ToolInventory) -> Vec<Respons
     inventory
         .list_tools()
         .into_iter()
-        .map(|(server_label, tool_name, tool_info, _server_url)| {
+        .map(|cached_tool| {
             // Format tool name using utility function
-            let formatted_name = format_tool_name(&server_label, &tool_name);
+            let formatted_name =
+                format_tool_name(&cached_tool.server_label, &cached_tool.tool_name);
 
             ResponseTool {
                 r#type: ResponseToolType::Mcp,
                 function: Some(Function {
                     name: formatted_name,
-                    description: tool_info.description.as_ref().map(|d| d.to_string()),
-                    parameters: Value::Object((*tool_info.input_schema).clone()),
+                    description: cached_tool.tool.description.as_ref().map(|d| d.to_string()),
+                    parameters: Value::Object((*cached_tool.tool.input_schema).clone()),
                     strict: None,
                 }),
                 server_url: None,
                 authorization: None,
-                server_label: Some(server_label),
-                server_description: tool_info.description.as_ref().map(|d| d.to_string()),
+                server_label: Some(cached_tool.server_label.clone()),
+                server_description: cached_tool.tool.description.as_ref().map(|d| d.to_string()),
                 require_approval: None,
                 allowed_tools: None,
             }
@@ -1484,16 +1489,14 @@ fn inject_mcp_metadata(
     let tools = mcp_manager.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(
-            |(_server_label, _tool_name, tool, _server_url)| McpToolInfo {
-                name: tool.name.to_string(),
-                description: tool.description.as_ref().map(|d| d.to_string()),
-                input_schema: Value::Object((*tool.input_schema).clone()),
-                annotations: Some(json!({
-                    "read_only": false
-                })),
-            },
-        )
+        .map(|cached_tool| McpToolInfo {
+            name: cached_tool.tool.name.to_string(),
+            description: cached_tool.tool.description.as_ref().map(|d| d.to_string()),
+            input_schema: Value::Object((*cached_tool.tool.input_schema).clone()),
+            annotations: Some(json!({
+                "read_only": false
+            })),
+        })
         .collect();
 
     let mcp_list_tools = ResponseOutputItem::McpListTools {
