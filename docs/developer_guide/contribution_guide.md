@@ -63,17 +63,24 @@ You can find additional accuracy eval examples in:
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
 
-## Request a review
-You can identify potential reviewers for your code by checking the [code owners](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and [reviewers](https://github.com/sgl-project/sglang/blob/main/.github/REVIEWERS.md) files.
-Another effective strategy is to review the file modification history and contact individuals who have frequently edited the files.
-If you modify files protected by code owners, their approval is required to merge the code.
+## Requesting a review for merge
+You can follow the pull request merge process described in [MAINTAINER.md](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md).
+You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals.
+Then your PR can be merged.
 
 ## How to trigger CI
+
 To trigger CI, the pull request must have the "run-ci" label.
 
-- If you have write access to sgl-project/sglang, your pull request will be automatically tagged by @sglang-bot.
-- If you have triage access to sgl-project/sglang, you can manually add the label by clicking "Labels" on the right side of your pull request page.
-- If you do not have the above access, please request a review and ask other maintainers to add the label for you.
+- The "run-ci" label is not added automatically to new pull requests.
+- Only collaborators with triage or higher permission can add the "run-ci" label.
+- If you have triage/write/maintain/admin access, you can manually add the label by clicking "Labels" on the right side of the pull request.
+- If you do not have triage or higher permission, please request a review and ask a collaborator to add the label for you.
+
+After the "run-ci" label is added, the PR author can trigger CI by:
+
+1. Pushing new commits, or
+2. Clicking "Re-run" / retrigger on the workflow page.
 
 ## General code style
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
