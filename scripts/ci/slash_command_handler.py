@@ -89,6 +89,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             continue
 
         if run.conclusion == "failure":
+            # DEBUG
             print(f"Rerunning failed workflow: {run.name} (ID: {run.id})")
             try:
                 # Use rerun_failed_jobs for efficiency on failures
