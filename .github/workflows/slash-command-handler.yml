@@ -2,7 +2,7 @@ name: Slash Command Handler
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
 
 permissions:
   contents: read
@@ -16,14 +16,13 @@ jobs:
     if: >
       github.event.issue.pull_request &&
       (startsWith(github.event.comment.body, '/tag-run-ci-label') ||
-       startsWith(github.event.comment.body, '/rerun-failed-ci'))
+       startsWith(github.event.comment.body, '/rerun-failed-ci') ||
+       startsWith(github.event.comment.body, '/tag-and-rerun-ci'))
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        # We checkout the current context to get the script,
-        # but the script will fetch permissions from main as requested.
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,7 +31,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests PyGithub
+          pip install PyGithub
 
       - name: Handle Slash Command
         env:
