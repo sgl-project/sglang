@@ -11,7 +11,6 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import LinearBase
 from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import add_prefix
@@ -55,6 +54,9 @@ class MockCausalLM(nn.Module):
 
 
 def init_weights(module):
+    # Avoid circular import
+    from sglang.srt.layers.linear import LinearBase
+
     if isinstance(module, LinearBase):
         torch.nn.init.uniform_(module.weight)
         if module.bias is not None:

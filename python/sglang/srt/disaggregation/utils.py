@@ -12,7 +12,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.managers.request_types import FINISH_ABORT
-from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -90,6 +89,8 @@ class MetadataBuffers:
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
+        from sglang.srt.utils import is_npu
+
         self.custom_mem_pool = custom_mem_pool
         device = "cpu"
         if is_npu():

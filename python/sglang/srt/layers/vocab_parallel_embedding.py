@@ -29,6 +29,11 @@ from sglang.srt.utils import (
     is_cpu,
     set_weight_attrs,
 )
+from sglang.utils import LazyImport
+
+UnquantizedEmbeddingMethod = LazyImport(
+    "sglang.srt.layers.quantization.unquant", "UnquantizedEmbeddingMethod"
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -261,7 +266,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         from sglang.srt.layers.quantization.base_config import (
             method_has_implemented_embedding,
         )
-        from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 
         quant_method = None
         if quant_config is not None:

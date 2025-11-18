@@ -228,6 +228,7 @@ class PrefillBootstrapQueue:
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+
         bootstrapped_reqs = []
         failed_reqs = []
         indices_to_remove = set()

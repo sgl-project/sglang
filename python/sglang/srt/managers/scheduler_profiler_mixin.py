@@ -7,9 +7,11 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.utils import LazyImport
+
+ForwardMode = LazyImport("sglang.srt.model_executor.forward_batch_info", "ForwardMode")
 
 _is_npu = is_npu()
 if _is_npu:

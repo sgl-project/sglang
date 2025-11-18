@@ -17,10 +17,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.utils import LazyImport
+
+TorchMemorySaverAdapter = LazyImport(
+    "sglang.srt.utils.torch_memory_saver_adapter", "TorchMemorySaverAdapter"
+)
 
 """
 Memory pool.
@@ -42,7 +44,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -52,6 +53,8 @@ from sglang.srt.mem_cache.utils import (
 from sglang.srt.utils import is_cuda, is_float4_e2m1fn_x2, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 
@@ -549,7 +552,7 @@ class MHATokenToKVPool(KVCache):
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
-            self.device_module.Stream() if _is_cuda and enable_alt_stream else None
+            self.device_module.Stream() if is_cuda() and enable_alt_stream else None
         )
 
         if enable_kv_cache_copy:
@@ -929,6 +932,8 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
     ):
+        from sglang.srt.utils.common import is_npu
+
         self.size = size
         self.dtype = dtype
         self.device = device
@@ -943,7 +948,7 @@ class HybridLinearKVPool(KVCache):
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
-            if _is_npu:
+            if is_npu():
                 TokenToKVPoolClass = AscendTokenToKVPool
             else:
                 TokenToKVPoolClass = MHATokenToKVPool
@@ -1508,6 +1513,8 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        from sgalng.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
+
         layer_id = layer.layer_id
 
         if self.use_nsa and self.nsa_kv_cache_store_fp8:
