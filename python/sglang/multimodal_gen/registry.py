@@ -428,9 +428,6 @@ def _register_configs():
         model_name="stable-diffusion-3-medium",
         sampling_param_cls=StableDiffusion3SamplingParams,
         pipeline_config_cls=StableDiffusion3PipelineConfig,
-        model_path_to_name_mappings={
-            "stabilityai/stable-diffusion-3-medium-diffusers": "stable-diffusion-3-medium",
-        },
     )
 
 
