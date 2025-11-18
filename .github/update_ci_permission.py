@@ -23,8 +23,7 @@ The format of `CI_PERMISSIONS.json` is as follows:
 Permissions are assigned according to the following rules:
 
 1. Add the top 50 contributors from the last 90 days with full permissions, no cooldown, and the reason "top contributor".
-2. Add all users with write access to the repository with full permissions, no cooldown, and the reason "write access".
-3. Load all users from the existing `CI_PERMISSIONS.json` file and update their entries as follows:
+2. Load all users from the existing `CI_PERMISSIONS.json` file and update their entries as follows:
    - If a user is already covered by rule 1 or rule 2, skip that user.
    - If the old reason of a user is "top contributor" or "write access" but they are not in the current top contributors or write access list, change their configuration to:
        {
@@ -34,7 +33,7 @@ Permissions are assigned according to the following rules:
            "reason": "old contributor"
        }
     - For all other cases, preserve the original configuration unchanged.
-4. All other users receive no permissions and a 120-minute cooldown (they are omitted from the file).
+3. All other users receive no permissions and a 120-minute cooldown (they are omitted from the file).
 
 Usage:
     export GH_TOKEN="your_github_token"
@@ -162,17 +161,7 @@ def main():
             "reason": "top contributor",
         }
 
-    # Rule 2: Add Write Access Users
-    for user in write_access_users:
-        if user not in new_permissions:
-            new_permissions[user] = {
-                "can_tag_run_ci_label": True,
-                "can_rerun_failed_ci": True,
-                "cooldown_interval_minutes": 0,
-                "reason": "write access",
-            }
-
-    # Rule 3: Process Existing Users (Merge Logic)
+    # Rule 2: Process Existing Users (Merge Logic)
     for user, config in old_permissions.items():
         if user in new_permissions:
             # Already handled by Rule 1 or 2
