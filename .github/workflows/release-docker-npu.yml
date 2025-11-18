@@ -54,8 +54,8 @@ jobs:
       - name: Get version
         id: get_version
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
-          echo "TAG=lmsysorg/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
+          version=$(cut -d'"' -f2 < python/sglang/version.py)
+          echo "TAG=lmsysorg/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         id: build-and-push

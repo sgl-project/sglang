@@ -43,9 +43,14 @@ jobs:
           KERNEL_VERSION="${{ steps.check_sync.outputs.kernel_version }}"
           BRANCH_NAME="bot/bump-kernel-version-to-sglang-${KERNEL_VERSION}-${RANDOM_SUFFIX}"
           git checkout -b "$BRANCH_NAME"
+<<<<<<< HEAD
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
           echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+=======
+          echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_ENV"
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
+>>>>>>> 26394a6cf (fix lint)
 
       - name: Run kernel version bump script
         if: steps.check_sync.outputs.needs_sync == 'true'

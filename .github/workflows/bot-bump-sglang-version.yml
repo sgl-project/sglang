@@ -40,8 +40,7 @@ jobs:
           RANDOM_SUFFIX=$(echo $RANDOM | md5sum | head -c 4)
           BRANCH_NAME="bot/bump-sglang-version-${{ github.event.inputs.new_version }}-${RANDOM_SUFFIX}"
           git checkout -b "$BRANCH_NAME"
-          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
-          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_ENV"
 
       - name: Run SGLang version bump script
         run: |

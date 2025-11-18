@@ -85,7 +85,7 @@ jobs:
     steps:
       - name: Cleanup
         run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
+          sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
       - uses: actions/checkout@v4
         with:
