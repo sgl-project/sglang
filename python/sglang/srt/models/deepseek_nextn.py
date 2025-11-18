@@ -25,7 +25,7 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
-    cp_all_gather_rerange_output,
+    cp_all_gather_rearrange_output,
     cp_split_and_rebuild_data,
     enable_prefill_cp,
     is_nsa_enable_prefill_cp,
@@ -175,7 +175,7 @@ class DeepseekModelNextN(nn.Module):
 
             if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
                 # allgather + rerrange
-                hidden_states = cp_all_gather_rerange_output(
+                hidden_states = cp_all_gather_rearrange_output(
                     hidden_states,
                     self.cp_size,
                     forward_batch,

@@ -10,21 +10,26 @@ from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
-from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.nsa.nsa_indexer import (
+    DUAL_STREAM_TOKEN_THRESHOLD,
+    BaseIndexerMetadata,
+)
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.nsa.utils import (
+    NSA_DUAL_STREAM,
     NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
     NSA_FUSE_TOPK,
     compute_nsa_seqlens,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 # from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
@@ -244,6 +249,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata: NSAMetadata
         self.device = model_runner.device
+        self.alt_stream = torch.cuda.Stream() if is_cuda() else None
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
@@ -1017,32 +1023,16 @@ class NativeSparseAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if k is not None:
-            assert v is not None
-            if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
-
         metadata = self.forward_metadata
         causal = not layer.is_cross_attention
         assert causal, "NSA is causal only"
 
-        # Do absorbed multi-latent attention
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
+            q_all = None
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
@@ -1057,9 +1047,51 @@ class NativeSparseAttnBackend(AttentionBackend):
                 page_size=1,
             )
 
+        def _prepare_kv_cache():
+            if k is not None:
+                assert v is not None
+                if save_kv_cache:
+                    cache_loc = (
+                        forward_batch.out_cache_loc
+                        if not layer.is_cross_attention
+                        else forward_batch.encoder_out_cache_loc
+                    )
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
+            # Do absorbed multi-latent attention
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            return kv_cache
+
+        enable_dual_stream = (
+            NSA_DUAL_STREAM
+            and self.alt_stream is not None
+            and get_is_capture_mode()
+            and q.shape[0] > 0
+            and q.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+        )
+
+        def _prepare_qkv(q_all, q_nope, q_rope):
+            if enable_dual_stream:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                kv_cache = _prepare_kv_cache()
+
+                with torch.cuda.stream(self.alt_stream):
+                    if q_rope is not None:
+                        q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                kv_cache = _prepare_kv_cache()
+                if q_rope is not None:
+                    q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+            return q_all, kv_cache
+
         if NSA_DECODE_IMPL == "flashmla_sparse":
-            if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+            q_all, kv_cache = _prepare_qkv(q_all, q_nope, q_rope)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1068,8 +1100,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 v_head_dim=layer.v_head_dim,
             )
         elif NSA_DECODE_IMPL == "flashmla_kv":
-            if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+            q_all, kv_cache = _prepare_qkv(q_all, q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1081,8 +1112,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 page_table_1=page_table_1,
             )
         elif NSA_DECODE_IMPL == "tilelang":
-            if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+            q_all, kv_cache = _prepare_qkv(q_all, q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1091,6 +1121,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 v_head_dim=layer.v_head_dim,
             )
         elif NSA_DECODE_IMPL == "fa3":
+            kv_cache = _prepare_kv_cache()
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -1106,6 +1137,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 page_size=1,
             )
         elif NSA_DECODE_IMPL == "aiter":
+            kv_cache = _prepare_kv_cache()
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
             return self._forward_aiter(
