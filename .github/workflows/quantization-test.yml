@@ -17,7 +17,7 @@ on:
       - "scripts/ci/**"
       - "test/**"
       - ".github/workflows/quantization-test.yml"
-    types: [synchronize, labeled]
+    types: [synchronize]
   workflow_dispatch:
 
 concurrency:

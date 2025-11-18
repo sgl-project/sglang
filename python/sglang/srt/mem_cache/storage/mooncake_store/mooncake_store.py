@@ -190,13 +190,32 @@ class MooncakeStore(HiCacheStorage):
             if self.config.check_server:
                 self.check_server()
 
+            # Handle JSON device_name configuration
+            device_name = self.config.device_name
+            if device_name and device_name.strip().startswith("{"):
+                try:
+                    device_config = json.loads(device_name)
+                    if storage_config and hasattr(storage_config, "tp_rank"):
+                        tp_rank = storage_config.tp_rank
+                        # Try both integer and string keys since JSON parsing may convert keys
+                        device_name = device_config.get(tp_rank, "")
+                        if not device_name:
+                            device_name = device_config.get(str(tp_rank), "")
+                    else:
+                        device_name = ""
+                except (json.JSONDecodeError, AttributeError):
+                    logger.warning(
+                        f"Failed to parse device_name as JSON: {device_name}"
+                    )
+                    device_name = ""
+
             ret_code = self.store.setup(
                 self.config.local_hostname,
                 self.config.metadata_server,
                 per_tp_global_segment_size,
                 per_tp_local_buffer_size,
                 self.config.protocol,
-                self.config.device_name,
+                device_name,
                 self.config.master_server_address,
             )
             if ret_code:
@@ -265,6 +284,7 @@ class MooncakeStore(HiCacheStorage):
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
+            "page_head",
         ], "mooncake store storage backend only support page first or page first direct layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
