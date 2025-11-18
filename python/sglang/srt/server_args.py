@@ -1612,6 +1612,14 @@ class ServerArgs:
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
             if (
+                self.speculative_num_draft_tokens is not None
+                and self.speculative_num_draft_tokens < self.speculative_num_steps + 1
+            ):
+                raise ValueError(
+                    "speculative_num_draft_tokens should >= speculative_num_steps + 1 to avoid useless draft token computing."
+                )
+
+            if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
                 and self.attention_backend != "flashinfer"
