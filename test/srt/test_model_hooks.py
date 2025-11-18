@@ -1,6 +1,7 @@
 import argparse
 import json
 import unittest
+
 import torch
 import torch.nn as nn
 
@@ -8,13 +9,14 @@ from sglang.srt.model_executor.hook_manager import register_hooks
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
+
 def dummy_hook_factory(config):
     """Factory that returns a forward hook capturing a tag from config."""
     tag = config.get("tag", "default")
 
     def hook(module, inputs, output):
         # Use a global list to track calls, but we'll manage it per-test
-        if hasattr(dummy_hook_factory, 'hook_calls'):
+        if hasattr(dummy_hook_factory, "hook_calls"):
             dummy_hook_factory.hook_calls.append(
                 {
                     "module_type": type(module).__name__,
@@ -84,7 +86,7 @@ class TestAttachHooks(CustomTestCase):
         """Hook spec with no matching modules should not crash."""
         # For this test, we'll use the global hook factory but expect no calls
         dummy_hook_factory.hook_calls = []
-        
+
         model = TinyModel()
         hook_specs = [
             {
@@ -110,7 +112,7 @@ class TestAttachHooks(CustomTestCase):
         """
         # Set up for CLI test
         dummy_hook_factory.hook_calls = []
-        
+
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
