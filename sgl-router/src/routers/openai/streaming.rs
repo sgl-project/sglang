@@ -1147,11 +1147,11 @@ pub(super) async fn handle_streaming_with_tool_interception(
         .map(|tools| extract_dynamic_mcp_servers(tools))
         .unwrap_or_default();
 
-    // Build tools map with (server_label, tool_name) -> (Tool, server_url)
-    let tools_map = active_mcp.list_tools_for_request(&dynamic_servers).await;
+    // Build per-request tool inventory (combines static + dynamic tools)
+    let request_inventory = Arc::new(active_mcp.build_request_inventory(&dynamic_servers).await);
 
     // Transform MCP tools to function tools in payload with formatted names
-    prepare_mcp_payload_for_streaming(&mut payload, &tools_map);
+    prepare_mcp_payload_for_streaming(&mut payload, &request_inventory);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let should_store = original_body.store.unwrap_or(false);
@@ -1164,7 +1164,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     let headers_opt = headers.cloned();
     let payload_clone = payload.clone();
     let active_mcp_clone = Arc::clone(active_mcp);
-    let tools_map_clone = tools_map.clone();
+    let inventory_clone = Arc::clone(&request_inventory);
 
     // Spawn the streaming loop task
     tokio::spawn(async move {
@@ -1456,7 +1456,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 &mut state,
                 server_label,
                 &mut sequence_number,
-                &tools_map_clone,
+                &inventory_clone,
             )
             .await
             {
