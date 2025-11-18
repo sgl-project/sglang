@@ -924,7 +924,6 @@ class HybridLinearKVPool(KVCache):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
-        enable_memory_saver: bool,
         mamba_pool: MambaPool,
         enable_memory_saver: bool = False,
         # TODO: refactor mla related args
