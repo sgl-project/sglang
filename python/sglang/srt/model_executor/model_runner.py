@@ -1203,24 +1203,28 @@ class ModelRunner:
             message = f"Failed to destroy custom process group: {e}."
             logger.error(message)
             return False, message
-        
-    def connect_to_weights_update_engine(self, remote_ip, remote_port):
+
+    def init_p2p_transfer_engine(self):
         """Establish connection to the weights update engine through p2p transfer engine
 
         Args:
             remote_ip: the IP address of the weights update engine.
             remote_port: the port of the weights update engine.
         """
-        self.p2p_transfer_engine = P2PTransferEngine(
-            hostname=get_local_ip_auto(),
-            gpu_id=self.gpu_id,
-            ib_device=self.server_args.p2p_transfer_ib_device,
-        )
-        self.p2p_transfer_engine.connect(remote_ip, remote_port)
+        try:
+            self.p2p_transfer_engine = P2PTransferEngine(
+                hostname=get_local_ip_auto(),
+                gpu_id=self.gpu_id,
+                ib_device=self.server_args.p2p_transfer_ib_device,
+            )
+        except Exception as e:
+            message = f"Failed to init p2p transfer engine: {e}."
+            logger.error(message)
+            return False, message
 
-        return True, "Succeeded to connect to weights update engine."
+        return True, "Succeeded to init p2p transfer engine."
 
-    def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
+    def update_weights_from_distributed(self, names, dtypes, shapes, group_name, session_id=None):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -1247,11 +1251,12 @@ class ModelRunner:
 
                 if (get_global_server_args().enable_p2p_transfer):
                     weight_length = weight.numel() * weight.element_size()
-                    self.p2p_transfer_engine.register(weight.data_ptr(), weight_length)
-                    self.p2p_transfer_engine.send_back_address(weight.data_ptr(), weight_length)
-                    handles.append(
-                        self.p2p_transfer_engine.recv_complete_signal()
+                    handle = self.p2p_transfer_engine.submit_transfer_task(
+                        session_id=session_id if session_id is not None else "",
+                        ptr=weight.data_ptr(),
+                        length=weight_length,
                     )
+                    handles.append(handle)
                 else:
                     handles.append(
                         torch.distributed.broadcast(
