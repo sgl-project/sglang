@@ -1,22 +1,13 @@
 import argparse
 import glob
-from dataclasses import dataclass
 from pathlib import Path
 
-from sglang.test.test_utils import run_unittest_files
-
-
-@dataclass
-class TestFile:
-    name: str
-    estimated_time: float = 60
-
+from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
-        TestFile("function_call/test_json_schema_constraint.py", 1),
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("hicache/test_hicache_variants.py", 393),
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
@@ -78,7 +69,6 @@ suites = {
         TestFile("test_flashmla.py", 230),
         TestFile("test_fp8_utils.py", 5),
         TestFile("rotary_embedding/test_mrope.py", 10),
-        TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 80),
         TestFile("test_gpt_oss_1gpu.py", 750),
         TestFile("test_harmony_parser.py", 20),
@@ -95,6 +85,7 @@ suites = {
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
         TestFile("test_mla_int8_deepseek_v3.py", 300),
+        TestFile("test_model_hooks.py", 1),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_ngram_speculative_decoding.py", 290),
@@ -185,6 +176,7 @@ suites = {
         # TODO: Add it back after the bug is fixed
         # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
+    "per-commit-8-gpu-b200": [],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
@@ -209,7 +201,6 @@ suites = {
     "nightly-1-gpu": [
         TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("lora/test_lora_qwen3_vl.py", 200),
         TestFile("lora/test_lora_radix_cache.py", 200),
         TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_openai_api.py", 30),
@@ -225,7 +216,9 @@ suites = {
         TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
         TestFile("test_fp4_moe.py", 300),
     ],
-    "nightly-8-gpu-b200": [],
+    "nightly-8-gpu-b200": [
+        TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
+    ],
     "nightly-4-gpu": [
         TestFile("test_qwen3_next_deterministic.py", 200),
     ],
@@ -247,7 +240,6 @@ suites = {
         TestFile("ep/test_hybrid_dp_ep_tp_mtp.py"),
         TestFile("ep/test_moe_deepep.py"),
         TestFile("ep/test_moe_deepep_eval_accuracy_large.py"),
-        TestFile("function_call/test_unknown_tool_name.py"),
         TestFile("hicache/test_disaggregation_hicache.py"),
         TestFile("hicache/test_hicache_storage_benchmark.py"),
         TestFile("hicache/test_hicache_storage_e2e.py"),
@@ -256,9 +248,7 @@ suites = {
         TestFile("lora/test_chunked_sgmv_backend.py"),
         TestFile("lora/test_lora_llama4.py"),
         TestFile("lora/test_lora_cuda_graph.py"),
-        TestFile("lora/test_lora_qwen3.py"),
-        TestFile("lora/test_lora_tp.py"),
-        TestFile("lora/test_lora_update.py"),
+        TestFile("lora/test_lora_qwen3_vl.py"),
         TestFile("models/test_clip_models.py"),
         TestFile("models/test_dummy_grok_models.py"),
         TestFile("models/test_falcon_h1_models.py"),
@@ -383,6 +373,7 @@ suites = {
         TestFile("test_w8a8_quantization.py"),
         TestFile("test_wave_attention_backend.py"),
         TestFile("test_weight_version.py"),
+        TestFile("test_deepseek_v32_cp_single_node.py", 275),
     ],
 }
 
@@ -390,7 +381,6 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
-        TestFile("function_call/test_json_schema_constraint.py", 1),
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
@@ -430,7 +420,6 @@ suite_amd = {
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_eval_fp8_accuracy.py", 303),
-        TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_input_embeddings.py", 38),
@@ -621,7 +610,7 @@ def _sanity_check_suites(suites):
     )
 
 
-if __name__ == "__main__":
+def main():
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument(
         "--timeout-per-file",
@@ -669,3 +658,7 @@ if __name__ == "__main__":
 
     exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
