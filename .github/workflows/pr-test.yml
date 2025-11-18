@@ -266,12 +266,6 @@ jobs:
         run: |
           cd python
           pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
-      - name: Run diffusion server tests
-        timeout-minutes: 60
-        run: |
-          cd python
-          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
-
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
