@@ -104,6 +104,16 @@ Parameter Explanation:
 * `master_server_address`: The network address of the `master service`. The default port is 50051.
 * `protocol`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
 * `device_name`: For `"rdma"`, you can leave this empty in most cases. Mooncake auto-discovers RDMA NICs by default. If you want to pin specific NICs (e.g., `mlx5_0,mlx5_1`), just set `device_name` accordingly. To list available devices, use `ibv_devices`.
+  - For tensor parallel deployments where different ranks should use different devices, you can specify device configurations using JSON format:
+    ```json
+    {
+    "device_name": "{0: \"ib0,ib1\", 1: \"ib2,ib3\", 2: \"ib4,ib5\"}"
+    }
+    ```
+  - Or in environment variables:
+    ```bash
+    MOONCAKE_DEVICE="{\"0\": \"ib0,ib1\", \"1\": \"ib2,ib3\", \"2\": \"ib4,ib5\"}"
+    ```
 * `global_segment_size`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a string with the `gb` suffix, e.g., `"16gb"`. A larger value allows Mooncake to cache more KV tensors.
 * `local_buffer_size`: Local buffer is used to do request operations such as `Get` or `Put`. In this case, it is set to 0 because the instance functions solely as a storage server, contributing memory to the global pool without issuing any request operations.
 
