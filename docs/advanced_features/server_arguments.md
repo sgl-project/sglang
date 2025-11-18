@@ -398,6 +398,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-attn-tp-input-scattered` | Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.                                                                                                      | `False`  | bool flag (set to enable) |
 | `--enable-nsa-prefill-context-parallel` | Context parallelism used in the long sequence prefill phase of DeepSeek v3.2 | `False` | bool flag (set to enable) |
 
+## Forward hooks
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--hooks` | JSON-formatted list of hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
+
 ## Debug tensor dumps
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |

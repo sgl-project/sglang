@@ -123,7 +123,7 @@ class InputValidationStage(PipelineStage):
         if isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
             height = None if batch.height_not_provided else batch.height
             width = None if batch.width_not_provided else batch.width
-            width, height = server_args.pipeline_config.set_width_and_height(
+            width, height = server_args.pipeline_config.adjust_size(
                 height, width, batch.pil_image
             )
             batch.width = width
