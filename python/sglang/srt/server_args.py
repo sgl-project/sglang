@@ -1097,15 +1097,22 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["Qwen3ForCausalLM"]:
-            if (
-                is_sm100_supported()
-                and self.quantization == "fp8"
-                and self.moe_runner_backend == "auto"
-            ):
-                self.moe_runner_backend = "flashinfer_trtllm"
-                logger.warning(
-                    "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3ForCausalLM"
+            if is_cuda() and is_sm100_supported():
+                quantization_config = getattr(hf_config, "quantization_config", None)
+                quant_method = (
+                    quantization_config.get("quant_method")
+                    if quantization_config is not None
+                    else None
                 )
+                if (
+                    (self.quantization == "fp8" or quant_method == "fp8")
+                    and self.moe_a2a_backend == "none"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.warning(
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3ForCausalLM"
+                    )
         elif model_arch in ["Qwen3NextForCausalLM"]:
             if not self.disable_radix_cache:
                 logger.warning(
@@ -1113,15 +1120,22 @@ class ServerArgs:
                     "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
                 )
                 self.disable_overlap_schedule = True
-            if (
-                is_sm100_supported()
-                and self.quantization == "fp8"
-                and self.moe_runner_backend == "auto"
-            ):
-                self.moe_runner_backend = "flashinfer_trtllm"
-                logger.warning(
-                    "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
+            if is_cuda() and is_sm100_supported():
+                quantization_config = getattr(hf_config, "quantization_config", None)
+                quant_method = (
+                    quantization_config.get("quant_method")
+                    if quantization_config is not None
+                    else None
                 )
+                if (
+                    (self.quantization == "fp8" or quant_method == "fp8")
+                    and self.moe_a2a_backend == "none"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.warning(
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
+                    )
         if is_deepseek_nsa(hf_config):
             if (
                 self.attention_backend is None
