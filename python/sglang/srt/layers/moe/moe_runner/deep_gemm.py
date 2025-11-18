@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_peo_up_deepgemm_num_sms, get_peo_down_deepgemm_num_sms
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
 from sglang.srt.utils.offloader import get_offloader
 
@@ -349,6 +349,159 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     @property
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.DEEP_GEMM
+
+
+class PeoDeepGemmRunnerCore(DeepGemmRunnerCore):
+    def __init__(self, config: MoeRunnerConfig):
+        super().__init__(config)
+        self.peo_up_deepgemm_num_sms = get_peo_up_deepgemm_num_sms()
+        self.peo_down_deepgemm_num_sms = get_peo_down_deepgemm_num_sms()
+
+    def _run_masked_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        return super()._run_masked_gemm(
+            runner_input, quant_info, running_state
+        )
+        # from sglang.srt.layers import deep_gemm_wrapper
+        # from sglang.srt.layers.moe.ep_moe.kernels import (
+        #     silu_and_mul_masked_post_quant_fwd,
+        # )
+        # from sglang.srt.layers.quantization.fp8_kernel import (
+        #     sglang_per_token_group_quant_8bit,
+        # )
+        #
+        # start_idx = running_state["start_idx"]
+        # end_idx = running_state["end_idx"]
+        # hidden_states = runner_input.hidden_states
+        # hidden_states_scale = runner_input.hidden_states_scale
+        # masked_m = runner_input.masked_m
+        # expected_m = runner_input.expected_m
+        #
+        # w13_weight = quant_info.w13_weight
+        # w2_weight = quant_info.w2_weight
+        # w13_scale = quant_info.w13_scale
+        # w2_scale = quant_info.w2_scale
+        # hidden_states_device = running_state["hidden_states_device"]
+        #
+        # # GroupGemm-0
+        # if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        #     if hidden_states_scale.dtype != torch.int:
+        #         b, s_mn, s_k = hidden_states_scale.shape
+        #         assert (
+        #             s_mn % 4 == 0 and s_k % 4 == 0
+        #         ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+        #         hidden_states_scale = _cast_to_e8m0_with_rounding_up(
+        #             hidden_states_scale
+        #         )
+        # else:
+        #     hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+        #         hidden_states_scale
+        #     )
+        #
+        # num_groups, m, k = hidden_states.shape
+        # n = w13_weight.size(1)
+        # gateup_output = torch.empty(
+        #     (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        # )
+        # with deep_gemm_wrapper.configure_deep_gemm_num_sms(self.peo_up_deepgemm_num_sms):
+        #     deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        #         (hidden_states[start_idx:end_idx], hidden_states_scale[start_idx:end_idx]),
+        #         (w13_weight[start_idx:end_idx], w13_scale[start_idx:end_idx]),
+        #         gateup_output[start_idx:end_idx],
+        #         masked_m[start_idx:end_idx],
+        #         expected_m,
+        #     )
+        # dispose_tensor(hidden_states[start_idx:end_idx])
+        # dispose_tensor(hidden_states_scale[start_idx:end_idx])
+        #
+        # # Act
+        # scale_block_size = 128
+        # if _MASKED_GEMM_FAST_ACT:
+        #     down_input, down_input_scale = sglang_per_token_group_quant_8bit(
+        #         x=gateup_output,
+        #         dst_dtype=torch.float8_e4m3fn,
+        #         group_size=scale_block_size,
+        #         masked_m=masked_m,
+        #         column_major_scales=True,
+        #         scale_tma_aligned=True,
+        #         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        #         fuse_silu_and_mul=True,
+        #         enable_v2=True,
+        #     )
+        # else:
+        #     down_input = torch.empty(
+        #         (
+        #             gateup_output.shape[0],
+        #             gateup_output.shape[1],
+        #             gateup_output.shape[2] // 2,
+        #         ),
+        #         device=hidden_states_device,
+        #         dtype=torch.float8_e4m3fn,
+        #     )
+        #     down_input_scale = torch.empty(
+        #         (
+        #             gateup_output.shape[0],
+        #             gateup_output.shape[1],
+        #             gateup_output.shape[2] // 2 // scale_block_size,
+        #         ),
+        #         device=hidden_states_device,
+        #         dtype=torch.float32,
+        #     )
+        #     silu_and_mul_masked_post_quant_fwd(
+        #         gateup_output[start_idx:end_idx],
+        #         down_input[start_idx:end_idx],
+        #         down_input_scale[start_idx:end_idx],
+        #         scale_block_size,
+        #         masked_m[start_idx:end_idx],
+        #         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        #     )
+        # del gateup_output
+        #
+        # # GroupGemm-1
+        # n = w2_weight.shape[1]
+        #
+        # if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        #     down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+        #         down_input_scale
+        #     )
+        #
+        # down_output = torch.empty(
+        #     (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        # )
+        #
+        # down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+        # if down_gemm_overlap_args is None:
+        #     gemm_overlap_args_dict = {}
+        # else:
+        #     down_gemm_overlap_args.start_event.record()
+        #     max_block_n = (
+        #         160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
+        #     )
+        #     gemm_overlap_args_dict = {
+        #         "overlap_args": down_gemm_overlap_args,
+        #         "max_block_n": max_block_n,
+        #     }
+        #
+        # with deep_gemm_wrapper.configure_deep_gemm_num_sms(self.peo_down_deepgemm_num_sms):
+        #     deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        #         (down_input[start_idx:end_idx], down_input_scale[start_idx:end_idx]),
+        #         (w2_weight[start_idx:end_idx], w2_scale[start_idx:end_idx]),
+        #         down_output[start_idx:end_idx],
+        #         masked_m[start_idx:end_idx],
+        #         expected_m,
+        #         **gemm_overlap_args_dict,
+        #     )
+        # meta_overlap_args = running_state.get("meta_overlap_args", None)
+        # if meta_overlap_args is not None:
+        #     block_m, threshold = deep_gemm_return_value
+        #     meta_overlap_args["block_m"] = block_m
+        #     meta_overlap_args["threshold"] = threshold
+        #
+        # return down_output
 
 
 @register_pre_permute("standard", "deep_gemm")

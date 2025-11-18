@@ -351,3 +351,7 @@ class BaseDispatcher(ABC):
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    @abstractmethod
+    def get_buffer(self):
+        pass

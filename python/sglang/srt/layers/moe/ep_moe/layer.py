@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
+import torch.distributed as dist
+from sglang.srt.batch_overlap.per_expert_overlap import PeoOverlapArgs
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
@@ -22,6 +24,14 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.utils import (
+    is_peo_enabled,
+    get_peo_overlap_method,
+    get_peo_num_rounds,
+    get_peo_deepep_num_sms,
+    get_peo_up_deepgemm_num_sms,
+    get_peo_down_deepgemm_num_sms,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -91,6 +101,7 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
+
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
@@ -549,9 +560,291 @@ class NpuFuseEPMoE(DeepEPMoE):
             )
 
 
+def get_num_device_sms():
+    assert torch.cuda.is_available()
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.multi_processor_count
+
+class PeoDeepEPMoE(DeepEPMoE):
+    gemm_stream = torch.cuda.Stream()
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(num_experts, top_k, hidden_size, intermediate_size,
+                         layer_id, num_fused_shared_experts, params_dtype, quant_config, prefix, activation,
+                         routed_scaling_factor, **kwargs)
+        self.overlap_method = get_peo_overlap_method()
+        self.num_rounds = get_peo_num_rounds()
+        self.num_device_sms = get_num_device_sms()
+        self.num_deepep_sms = get_peo_deepep_num_sms()
+        self.num_up_deepgemm_sms = get_peo_up_deepgemm_num_sms()
+        self.num_down_deepgemm_sms = get_peo_down_deepgemm_num_sms()
+        self.num_ranks = dist.get_world_size()
+
+        assert self.num_deepep_sms <= self.num_device_sms, f"num_deepep_sms {self.num_deepep_sms} > num_device_sms {self.num_device_sms}"
+        assert self.num_up_deepgemm_sms is None or self.num_up_deepgemm_sms <= self.num_device_sms, f"num_up_deepgemm_sms {self.num_up_deepgemm_sms} > num_device_sms {self.num_device_sms}"
+        assert self.num_down_deepgemm_sms is None or self.num_down_deepgemm_sms <= self.num_device_sms, f"num_down_deepgemm_sms {self.num_down_deepgemm_sms} > num_device_sms {self.num_device_sms}"
+
+        self.comm_stream = self.dispatcher.get_buffer().get_comm_stream()
+
+    def run_moe_core(
+        self,
+        dispatch_output: DispatchOutput,
+        start_idx: int,
+        end_idx: int,
+    ):
+        if self.deprecate_flag:
+            return FusedMoE.run_moe_core(
+                self,
+                dispatch_output,
+                start_idx=start_idx,
+                end_idx=end_idx,
+            )
+        else:
+            raise NotImplementedError("Not supported for PEO")
+
+    def forward_overlap_1(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        current_stream: torch.cuda.Stream,
+    ):
+        global combine_state, dispatch_output
+        states = list()
+        gemm_done_events = list()
+        moe_hidden_states = list()
+
+        # dispatch send
+        for round_id in range(self.num_rounds):
+            peo_overlap_args = PeoOverlapArgs(
+                use_expert_overlap=True,
+                num_rounds=self.num_rounds,
+                round_id=round_id,
+                send_num_sms=self.num_device_sms,
+                recv_num_sms=self.num_device_sms if round_id == 0 else self.num_deepep_sms,
+                hook_use_comm_stream=False,
+            )
+            state = self.dispatcher.dispatch_a_peo(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                peo_overlap_args=peo_overlap_args,
+            )
+            states.append(state)
+
+        # dispatch recv and GEMM
+        for round_id in range(self.num_rounds):
+            dispatch_output = self.dispatcher.dispatch_b_peo(
+                inner_state=states[round_id],
+            )
+
+            PeoDeepEPMoE.gemm_stream.wait_stream(current_stream)
+            with torch.cuda.stream(PeoDeepEPMoE.gemm_stream):
+                num_experts_per_round = self.num_experts // self.num_ranks // self.num_rounds
+                start_idx = num_experts_per_round * round_id
+                end_idx = start_idx + num_experts_per_round
+                moe_hidden_state = self.run_moe_core(dispatch_output, start_idx, end_idx)
+                moe_hidden_states.append(moe_hidden_state)
+                gemm_done_event = torch.cuda.Event()
+                PeoDeepEPMoE.gemm_stream.record_event(gemm_done_event)
+                gemm_done_events.append(gemm_done_event)
+
+        # combine send
+        for round_id in range(self.num_rounds):
+            current_stream.wait_event(gemm_done_events[round_id])
+            peo_overlap_args = PeoOverlapArgs(
+                use_expert_overlap=True,
+                num_rounds=self.num_rounds,
+                round_id=round_id,
+                send_num_sms=self.num_device_sms if round_id == (self.num_rounds - 1) else self.num_deepep_sms,
+                recv_num_sms=self.num_device_sms,
+                hook_use_comm_stream=False,
+                is_x_in_round=True,
+            )
+
+            combine_state = self.dispatcher.combine_a_peo(
+                combine_input=moe_hidden_states[round_id],
+                peo_overlap_args=peo_overlap_args,
+            )
+
+        # combine recv
+        combined_x = self.dispatcher.combine_b_peo(inner_state=combine_state)
+
+        current_stream.wait_stream(PeoDeepEPMoE.gemm_stream)
+        return combined_x
+
+    def forward_overlap_2_3(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        current_stream: torch.cuda.Stream,
+    ):
+        gemm_done_events = list()
+        moe_hidden_states = list()
+
+        global dispatch_output, combine_state
+        hook_use_default_stream = self.overlap_method == 2
+        # dispatch and GEMM
+        for round_id in range(self.num_rounds):
+            # dispatch send
+            peo_overlap_args = PeoOverlapArgs(
+                use_expert_overlap=True,
+                num_rounds=self.num_rounds,
+                round_id=round_id,
+                send_num_sms=self.num_device_sms,
+                recv_num_sms=self.num_device_sms if round_id == 0 else self.num_deepep_sms,
+                hook_use_comm_stream=not hook_use_default_stream,
+            )
+            state = self.dispatcher.dispatch_a_peo(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                peo_overlap_args=peo_overlap_args,
+            )
+
+            # dispatch recv
+            if hook_use_default_stream:
+                dispatch_output = self.dispatcher.dispatch_b_peo(
+                    inner_state=state,
+                )
+            else:
+                self.comm_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.comm_stream):
+                    dispatch_output = self.dispatcher.dispatch_b_peo(
+                        inner_state=state,
+                    )
+                PeoDeepEPMoE.gemm_stream.wait_stream(self.comm_stream)
+
+            # GEMM
+            PeoDeepEPMoE.gemm_stream.wait_stream(current_stream)
+            with torch.cuda.stream(PeoDeepEPMoE.gemm_stream):
+                num_experts_per_round = self.num_experts // self.num_ranks // self.num_rounds
+                start_idx = num_experts_per_round * round_id
+                end_idx = start_idx + num_experts_per_round
+                moe_hidden_state = self.run_moe_core(dispatch_output, start_idx, end_idx)
+                moe_hidden_states.append(moe_hidden_state)
+                gemm_done_event = torch.cuda.Event()
+                PeoDeepEPMoE.gemm_stream.record_event(gemm_done_event)
+                gemm_done_events.append(gemm_done_event)
+
+        # combine send
+        for round_id in range(self.num_rounds):
+            peo_overlap_args = PeoOverlapArgs(
+                use_expert_overlap=True,
+                num_rounds=self.num_rounds,
+                round_id=round_id,
+                send_num_sms=self.num_device_sms if round_id == (self.num_rounds - 1) else self.num_deepep_sms,
+                recv_num_sms=self.num_device_sms,
+                hook_use_comm_stream=False,
+                is_x_in_round=True,
+            )
+            current_stream.wait_event(gemm_done_events[round_id])
+            if not hook_use_default_stream:
+                current_stream.wait_stream(self.comm_stream)
+            combine_state = self.dispatcher.combine_a_peo(
+                combine_input=moe_hidden_states[round_id],
+                peo_overlap_args=peo_overlap_args,
+            )
+
+        # combine recv
+        if hook_use_default_stream:
+            combined_x = self.dispatcher.combine_b_peo(inner_state=combine_state)
+        else:
+            self.comm_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.comm_stream):
+                combined_x = self.dispatcher.combine_b_peo(inner_state=combine_state)
+            current_stream.wait_stream(self.comm_stream)
+
+        current_stream.wait_stream(PeoDeepEPMoE.gemm_stream)
+        return combined_x
+
+    def forward_overlap_4(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        current_stream: torch.cuda.Stream,
+    ):
+        gemm_done_events = list()
+        moe_hidden_states = list()
+        # dispatch
+        self.comm_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.comm_stream):
+            dispatch_output = self.dispatch(hidden_states, topk_output)
+
+            # current_stream.wait_stream(comm_stream)
+            for round_id in range(self.num_rounds):
+                num_experts_per_round = self.num_experts // self.num_ranks // self.num_rounds
+                start_idx = num_experts_per_round * round_id
+                end_idx = start_idx + num_experts_per_round
+                moe_hidden_state = self.run_moe_core(dispatch_output, start_idx, end_idx)
+                moe_hidden_states.append(moe_hidden_state)
+                gemm_done_event = torch.cuda.Event()
+                self.comm_stream.record_event(gemm_done_event)
+                gemm_done_events.append(gemm_done_event)
+
+        # combine send
+        with torch.cuda.stream(current_stream):
+            for round_id in range(self.num_rounds):
+                current_stream.wait_event(gemm_done_events[round_id])
+                peo_overlap_args = PeoOverlapArgs(
+                    use_expert_overlap=True,
+                    num_rounds=self.num_rounds,
+                    round_id=round_id,
+                    send_num_sms=self.num_device_sms if round_id == (self.num_rounds - 1) else self.num_deepep_sms,
+                    recv_num_sms=self.num_device_sms,
+                    hook_use_comm_stream=False,
+                    is_x_in_round=True,
+                )
+                combine_state = self.dispatcher.combine_a_peo(
+                    combine_input=moe_hidden_states[round_id],
+                    peo_overlap_args=peo_overlap_args,
+                )
+
+            # combine recv
+            combined_x = self.dispatcher.combine_b_peo(inner_state=combine_state)
+
+        current_stream.wait_stream(self.comm_stream)
+        return combined_x
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        forward_shared_experts=None,
+        alt_stream=None,
+        disable_sbo=False,
+    ):
+        current_stream = torch.cuda.current_stream()
+
+        with torch.cuda.stream(current_stream):
+            if self.overlap_method == 1:
+                return self.forward_overlap_1(hidden_states, topk_output, current_stream)
+            elif self.overlap_method == 2 or self.overlap_method == 3:
+                return self.forward_overlap_2_3(hidden_states, topk_output, current_stream)
+            elif self.overlap_method == 4:
+                return self.forward_overlap_4(hidden_states, topk_output, current_stream)
+            else:
+                raise ValueError(f"Invalid overlap_method: {self.overlap_method}")
+
+
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-        return DeepEPMoE
+        if is_peo_enabled():
+            return PeoDeepEPMoE
+        else:
+            return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
 

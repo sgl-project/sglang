@@ -4,15 +4,16 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+import torch
 from sglang.srt.layers.moe.moe_runner.base import (
     FusedOpPool,
     MoeRunnerConfig,
     PermuteMethodPool,
 )
-from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore, PeoDeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, is_peo_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -36,7 +37,10 @@ class MoeRunner:
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
-            self.runner_core = DeepGemmRunnerCore(config)
+            if is_peo_enabled():
+                self.runner_core = PeoDeepGemmRunnerCore(config)
+            else:
+                self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_marlin():
             self.runner_core = None  # Marlin only supports fused path
         else:
@@ -108,3 +112,44 @@ class MoeRunner:
         assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = None
         self.meta_overlap_args = None
+
+
+class PeoMoeRunner(MoeRunner):
+    def __init__(self, runner_backend: MoeRunnerBackend, config: MoeRunnerConfig):
+        super().__init__(runner_backend, config)
+
+    def run(
+        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
+    ) -> CombineInput:
+
+        if self.fused_func is not None:
+            return self.fused_func(dispatch_output, quant_info, self.config)
+
+        dispatch_format = dispatch_output.format.value
+        runner_format = self.runner_core.runner_backend.value
+        self.pre_permute_func = PermuteMethodPool.get_pre_permute(
+            dispatch_format, runner_format
+        )
+
+        running_state = {}
+        if self.down_gemm_overlap_args is not None:
+            running_state["down_gemm_overlap_args"] = self.down_gemm_overlap_args
+        if self.meta_overlap_args is not None:
+            running_state["meta_overlap_args"] = self.meta_overlap_args
+
+        runner_input = self.pre_permute_func(
+            dispatch_output, quant_info, self.config, running_state
+        )
+        runner_output = self.runner_core.run(runner_input, quant_info, running_state)
+
+        runner_format = self.runner_core.runner_backend.value
+        combine_format = dispatch_output.format.value
+        self.post_permute_func = PermuteMethodPool.get_post_permute(
+            runner_format, combine_format
+        )
+        combine_input = self.post_permute_func(
+            runner_output, quant_info, self.config, running_state
+        )
+
+        return combine_input
+

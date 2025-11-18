@@ -33,6 +33,10 @@ from sglang.srt.utils import (
     load_json_config,
 )
 
+from sglang.srt.batch_overlap.per_expert_overlap import PeoOverlapArgs
+
+from sglang.srt.layers.moe.utils import is_peo_enabled
+
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
@@ -341,6 +345,17 @@ class _DeepEPDispatcherImplBase:
     def dispatch_b(self, *args, **kwargs):
         raise NotImplementedError
 
+    def dispatch_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        peo_overlap_args: PeoOverlapArgs,
+    ):
+        raise NotImplementedError
+
+    def dispatch_b_peo(self, *args, **kwargs):
+        raise NotImplementedError
+
     def combine_a(
         self,
         hidden_states: torch.Tensor,
@@ -350,6 +365,18 @@ class _DeepEPDispatcherImplBase:
         raise NotImplementedError
 
     def combine_b(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def combine_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        peo_overlap_args: PeoOverlapArgs,
+    ):
+        raise NotImplementedError
+
+    def combine_b_peo(self, *args, **kwargs):
         raise NotImplementedError
 
     def _get_buffer(self):
@@ -719,6 +746,180 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_experts,
         )
 
+class _DeepEPDispatcherImplLowLatencyPEO(_DeepEPDispatcherImplLowLatency):
+    def __init__(self, return_recv_hook: bool, **kwargs):
+        super().__init__(return_recv_hook, **kwargs)
+
+        self.dispatch_x = None
+        self.masked_m = None
+        self.combined_x = None
+
+    def dispatch_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        peo_overlap_args: PeoOverlapArgs,
+    ):
+        buffer = self._get_buffer()
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
+        expected_m = (
+            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+            + self.num_experts
+        ) // self.num_experts
+        hidden_states, masked_m, event, hook = self._dispatch_core_peo(
+            hidden_states,
+            topk_ids,
+            peo_overlap_args,
+        )
+
+        return (
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            masked_m,
+            expected_m,
+            event,
+            hook,
+            peo_overlap_args.num_rounds,
+            peo_overlap_args.round_id,
+        )
+
+    def dispatch_b_peo(
+        self,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        masked_m,
+        expected_m,
+        event,
+        hook,
+        num_rounds,
+        round_id,
+    ):
+        hook() if self.return_recv_hook else event.current_stream_wait()
+
+        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+            masked_m
+        )
+
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+        deepep_output = DeepEPLLDispatchOutput(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            masked_m,
+            expected_m,
+        )
+
+        if round_id == num_rounds - 1:
+            del self.dispatch_x
+            del self.masked_m
+        return deepep_output
+
+    def _dispatch_core_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        peo_overlap_args: PeoOverlapArgs,
+    ):
+        use_nvfp4 = use_fp8 = False
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        if input_global_scale is not None:
+            use_nvfp4 = True
+        elif not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
+            use_fp8 = True
+
+        buffer = self._get_buffer()
+        tmp_packed_recv_x, packed_recv_count, tmp_handle, event, hook = (
+            buffer.low_latency_dispatch(
+                hidden_states,
+                topk_ids,
+                self.num_max_dispatch_tokens_per_rank,
+                self.num_experts,
+                use_fp8=use_fp8,
+                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
+                **(
+                    dict(x_global_scale=input_global_scale)
+                    if input_global_scale is not None
+                    else dict()
+                ),
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_expert_overlap=peo_overlap_args.use_expert_overlap,
+                num_rounds=peo_overlap_args.num_rounds,
+                round_id=peo_overlap_args.round_id,
+                send_num_sms=peo_overlap_args.send_num_sms,
+                recv_num_sms=peo_overlap_args.recv_num_sms,
+                hook_use_comm_stream=peo_overlap_args.hook_use_comm_stream
+            )
+        )
+        if peo_overlap_args.round_id == 0:
+            self.dispatch_x = tmp_packed_recv_x
+            self.masked_m = packed_recv_count
+            self.handle = tmp_handle
+        return self.dispatch_x, self.masked_m, event, hook
+
+    def combine_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        peo_overlap_args: PeoOverlapArgs,
+    ):
+        hidden_states, event, hook = self._combine_core_peo(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            peo_overlap_args,
+        )
+        return hidden_states, event, hook
+
+    def combine_b_peo(self, hidden_states, event, hook):
+        hook() if self.return_recv_hook else event.current_stream_wait()
+        return hidden_states
+
+    def _combine_core_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        peo_overlap_args: PeoOverlapArgs,
+    ):
+        buffer = self._get_buffer()
+
+        combined_hidden_states, event, hook = buffer.low_latency_combine(
+            x=hidden_states,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+            handle=self.handle,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            use_expert_overlap=peo_overlap_args.use_expert_overlap,
+            num_rounds=peo_overlap_args.num_rounds,
+            round_id=peo_overlap_args.round_id,
+            send_num_sms=peo_overlap_args.send_num_sms,
+            recv_num_sms=peo_overlap_args.recv_num_sms,
+            hook_use_comm_stream=peo_overlap_args.hook_use_comm_stream,
+            is_x_in_round=peo_overlap_args.is_x_in_round,
+        )
+
+        if peo_overlap_args.round_id == 0:
+            self.combined_x = combined_hidden_states
+        if peo_overlap_args.round_id == peo_overlap_args.num_rounds - 1:
+            del self.handle
+            self.handle = None
+
+        return self.combined_x, event, hook
+
 
 @dataclass
 class _Stage(Enum):
@@ -758,10 +959,16 @@ class DeepEPDispatcher(BaseDispatcher):
         )
 
         if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
-                return_recv_hook=return_recv_hook,
-                **common_kwargs,
-            )
+            if is_peo_enabled():
+                self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatencyPEO(
+                    return_recv_hook=return_recv_hook,
+                    **common_kwargs,
+                )
+            else:
+                self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+                    return_recv_hook=return_recv_hook,
+                    **common_kwargs,
+                )
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
                 async_finish=async_finish,
@@ -800,6 +1007,21 @@ class DeepEPDispatcher(BaseDispatcher):
         del self._dispatch_intermediate_state
         return self._get_impl().dispatch_b(*inner_state)
 
+    def dispatch_a_peo(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        peo_overlap_args: PeoOverlapArgs,
+    ):
+        return self._get_impl().dispatch_a_peo(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            peo_overlap_args=peo_overlap_args,
+        )
+
+    def dispatch_b_peo(self, inner_state):
+        return self._get_impl().dispatch_b_peo(*inner_state)
+
     def combine(
         self,
         combine_input: CombineInput,
@@ -826,6 +1048,23 @@ class DeepEPDispatcher(BaseDispatcher):
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
+
+    def combine_a_peo(
+        self,
+        combine_input: CombineInput,
+        peo_overlap_args: PeoOverlapArgs,
+    ):
+        hidden_states, topk_ids, topk_weights = combine_input
+        inner_state = self._get_impl().combine_a_peo(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            peo_overlap_args=peo_overlap_args,
+        )
+        return inner_state
+
+    def combine_b_peo(self, inner_state):
+        return self._get_impl().combine_b_peo(*inner_state)
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()
@@ -870,3 +1109,6 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)
+
+    def get_buffer(self):
+        return self._low_latency_dispatcher._get_buffer()

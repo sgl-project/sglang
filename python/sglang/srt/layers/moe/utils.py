@@ -4,6 +4,7 @@ import logging
 from contextlib import contextmanager
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
+from functools import lru_cache
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
@@ -133,6 +134,12 @@ TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
+IS_PEO_ENABLED: Optional[bool] = None
+PEO_OVERLAP_METHOD: Optional[int] = None
+PEO_NUM_ROUNDS: Optional[int] = None
+PEO_DEEPEP_NUM_SMS: Optional[int] = None
+PEO_UP_DEEPGEMM_NUM_SMS: Optional[int] = None
+PEO_DOWN_DEEPGEMM_NUM_SMS: Optional[int] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -147,6 +154,12 @@ def initialize_moe_config(server_args: ServerArgs):
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
+    global IS_PEO_ENABLED
+    global PEO_OVERLAP_METHOD
+    global PEO_NUM_ROUNDS
+    global PEO_DEEPEP_NUM_SMS
+    global PEO_UP_DEEPGEMM_NUM_SMS
+    global PEO_DOWN_DEEPGEMM_NUM_SMS
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -169,6 +182,12 @@ def initialize_moe_config(server_args: ServerArgs):
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
     MOE_QUANTIZATION = server_args.quantization
+    IS_PEO_ENABLED = server_args.enable_per_expert_overlap
+    PEO_OVERLAP_METHOD = server_args.peo_overlap_method
+    PEO_NUM_ROUNDS = server_args.peo_num_rounds
+    PEO_DEEPEP_NUM_SMS = server_args.peo_deepep_num_sms
+    PEO_UP_DEEPGEMM_NUM_SMS = server_args.peo_up_deepgemm_num_sms
+    PEO_DOWN_DEEPGEMM_NUM_SMS = server_args.peo_down_deepgemm_num_sms
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -249,6 +268,56 @@ def get_tbo_token_distribution_threshold() -> float:
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
 
 
+def is_peo_enabled() -> bool:
+    global IS_PEO_ENABLED
+    if IS_PEO_ENABLED is None:
+        IS_PEO_ENABLED = False
+    return IS_PEO_ENABLED
+
+def get_peo_overlap_method() -> int:
+    global PEO_OVERLAP_METHOD
+    if PEO_OVERLAP_METHOD is None:
+        logger.warning(
+            "PEO_OVERLAP_METHOD is not initialized, using 4"
+        )
+        PEO_OVERLAP_METHOD = 4
+    return PEO_OVERLAP_METHOD
+
+def get_peo_num_rounds() -> int:
+    global PEO_NUM_ROUNDS
+    if PEO_NUM_ROUNDS is None:
+        PEO_NUM_ROUNDS = 1
+    return PEO_NUM_ROUNDS
+
+def get_peo_deepep_num_sms() -> int:
+    global PEO_DEEPEP_NUM_SMS
+    if PEO_DEEPEP_NUM_SMS is None or PEO_DEEPEP_NUM_SMS < 1:
+        logger.warning(
+            "PEO_DEEPEP_NUM_SMS is not initialized, using 16"
+        )
+        PEO_DEEPEP_NUM_SMS = 16
+    return PEO_DEEPEP_NUM_SMS
+
+def get_peo_up_deepgemm_num_sms() -> int:
+    global PEO_UP_DEEPGEMM_NUM_SMS
+    if PEO_UP_DEEPGEMM_NUM_SMS is not None and PEO_UP_DEEPGEMM_NUM_SMS < 1:
+        logger.warning(
+            "PEO_UP_DEEPGEMM_NUM_SMS is not initialized, using None"
+        )
+        PEO_UP_DEEPGEMM_NUM_SMS = None
+    return PEO_UP_DEEPGEMM_NUM_SMS
+
+def get_peo_down_deepgemm_num_sms() -> int:
+    global PEO_DOWN_DEEPGEMM_NUM_SMS
+    if PEO_DOWN_DEEPGEMM_NUM_SMS is not None and PEO_DOWN_DEEPGEMM_NUM_SMS < 1:
+        logger.warning(
+            "PEO_DOWN_DEEPGEMM_NUM_SMS is not initialized, using None"
+        )
+        PEO_DOWN_DEEPGEMM_NUM_SMS = None
+    return PEO_DOWN_DEEPGEMM_NUM_SMS
+
+
+@lru_cache(maxsize=1)
 def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
