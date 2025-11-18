@@ -124,6 +124,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 layer.weight,
                 bias,
                 True,  # is_vnni
+                None,  # post mul
             )
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
