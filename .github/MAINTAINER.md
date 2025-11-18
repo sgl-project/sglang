@@ -40,6 +40,7 @@ __Note__: The permissions to trigger CI tests are defined separately according t
 If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.ai/): #dev, #pull-request, and #ci-cd-build-release.
 
 ## The List of Merge Oncalls and Reviewers
+The format is @github-username (Slack username).
 
 TODO: fill in the list.
 
