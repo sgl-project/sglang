@@ -8,19 +8,26 @@ Provides common functionality for:
 """
 
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import psutil
 import requests
 
 
 def get_kt_model_paths():
-    """Get model paths from environment variables"""
-    model_dir = os.getenv("SGLANG_CI_MODEL_DIR", "models")
-    kt_weight_dir = os.getenv("SGLANG_CI_KT_WEIGHT_DIR", "models")
+    """Get model paths from environment variables
+
+    Environment variables can be set in two ways:
+    1. Full path to model: SGLANG_CI_MODEL_DIR=/path/to/DeepSeek-R1-0528-GPU-weight
+    2. Directory containing models: SGLANG_CI_MODEL_DIR=/path/to/models (will append model name)
+    """
+    # Check if full model path is provided (ends with model name)
+    gpu_model_path = os.getenv("SGLANG_CI_MODEL_DIR")
+    cpu_model_path = os.getenv("SGLANG_CI_KT_WEIGHT_DIR")
 
     return {
-        "gpu_model_path": os.path.join(model_dir, "DeepSeek-R1-0528-GPU-weight"),
-        "cpu_model_path": os.path.join(kt_weight_dir, "DeepSeek-R1-0528-CPU-weight"),
+        "gpu_model_path": gpu_model_path,
+        "cpu_model_path": cpu_model_path,
         "served_model_name": os.getenv("SERVED_MODEL_NAME", "DeepSeek-R1-0528-FP8"),
     }
 

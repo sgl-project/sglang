@@ -6,19 +6,19 @@ Tests basic inference workflow with different GPU configurations.
 
 import unittest
 
-from utils import (
-    TEST_PROMPTS,
-    get_kt_env,
-    get_kt_model_paths,
-    get_kt_server_args,
-    run_inference,
-)
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
     popen_launch_server,
+)
+
+from .utils import (
+    TEST_PROMPTS,
+    get_kt_env,
+    get_kt_model_paths,
+    get_kt_server_args,
+    run_inference,
 )
 
 
@@ -49,6 +49,7 @@ class TestKTBasic1GPU(CustomTestCase):
             served_model_name=model_paths["served_model_name"],
             max_running_requests=40,
             max_total_tokens=40000,
+            additional_args=["--log-level", "error"],  # Only show errors
         )
 
         # Launch server
@@ -113,6 +114,7 @@ class TestKTBasic4GPU(CustomTestCase):
             served_model_name=model_paths["served_model_name"],
             max_running_requests=40,
             max_total_tokens=40000,
+            additional_args=["--log-level", "error"],  # Only show errors
         )
 
         # Launch server
@@ -177,6 +179,7 @@ class TestKTBasic8GPU(CustomTestCase):
             served_model_name=model_paths["served_model_name"],
             max_running_requests=40,
             max_total_tokens=40000,
+            additional_args=["--log-level", "error"],  # Only show errors
         )
 
         # Launch server

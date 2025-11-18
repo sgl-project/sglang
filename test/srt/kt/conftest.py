@@ -43,6 +43,8 @@ def pytest_collection_modifyitems(config, items):
         # Add markers based on test file name
         if "test_kt_basic" in item.nodeid:
             item.add_marker(pytest.mark.basic)
+        if "test_kt_long_context" in item.nodeid:
+            item.add_marker(pytest.mark.basic)
         if "test_kt_performance" in item.nodeid:
             item.add_marker(pytest.mark.performance)
         if "test_kt_correctness" in item.nodeid:
