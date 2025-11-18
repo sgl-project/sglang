@@ -259,7 +259,7 @@ class DiffGenerator:
         # TODO: simplify
         data_type = (
             DataType.IMAGE
-            if self.server_args.pipeline_config.task_type.is_image_task()
+            if self.server_args.pipeline_config.task_type.is_image_gen()
             or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )

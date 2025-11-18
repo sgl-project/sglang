@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post2 --build-arg GPU_ARCH=gfx942 -t v0.5.5.post2-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.5.post2-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post2 --build-arg GPU_ARCH=gfx950 -t v0.5.5.post2-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx942 -t v0.5.5.post3-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.5.post3-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx950 -t v0.5.5.post3-rocm700-mi35x -f rocm.Dockerfile .
 
 
 # Default base images
@@ -210,7 +210,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 
 # Build and install sgl-router
 RUN python3 -m pip install --no-cache-dir setuptools-rust \
-    && cd /sgl-workspace/sglang/sgl-router \
+    && cd /sgl-workspace/sglang/sgl-router/bindings/python \
     && cargo build --release \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache

@@ -1,4 +1,4 @@
-name: Release SGLang Router Docker Image
+name: Release SGLang Model Gateway Docker Image
 on:
   push:
     branches:

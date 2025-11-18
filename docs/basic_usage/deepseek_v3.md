@@ -1,4 +1,4 @@
-# DeepSeek Usage
+# DeepSeek V3/V3.1/R1 Usage
 
 SGLang provides many optimizations specifically designed for the DeepSeek models, making it the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended) from Day 0.
 

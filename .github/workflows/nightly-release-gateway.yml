@@ -1,6 +1,6 @@
-# Nightly release workflow for SGLang Router
+# Nightly release workflow for SGLang Model Gateway
 
-name: Nightly Release SGLang Router to PyPI
+name: Nightly Release SGLang Model Gateway to PyPI
 
 on:
   schedule:

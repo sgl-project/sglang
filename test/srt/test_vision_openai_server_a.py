@@ -6,7 +6,16 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_
 
 import unittest
 
+import openai
 from test_vision_openai_server_common import *
+from test_vision_openai_server_common import (  # DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,; DEFAULT_URL_FOR_TEST,; IMAGE_MAN_IRONING_URL,; popen_launch_server,
+    AudioOpenAITestMixin,
+    CustomTestCase,
+    ImageOpenAITestMixin,
+    OmniOpenAITestMixin,
+    TestOpenAIMLLMServerBase,
+    VideoOpenAITestMixin,
+)
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -207,12 +216,11 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
 
 
 if __name__ == "__main__":
-    # Note: Cannot delete mixin classes imported via * since they're not in local scope
-    # del (
-    #     TestOpenAIMLLMServerBase,
-    #     ImageOpenAITestMixin,
-    #     VideoOpenAITestMixin,
-    #     AudioOpenAITestMixin,
-    #     OmniOpenAITestMixin,
-    # )
+    del (
+        TestOpenAIMLLMServerBase,
+        ImageOpenAITestMixin,
+        VideoOpenAITestMixin,
+        AudioOpenAITestMixin,
+        OmniOpenAITestMixin,
+    )
     unittest.main()

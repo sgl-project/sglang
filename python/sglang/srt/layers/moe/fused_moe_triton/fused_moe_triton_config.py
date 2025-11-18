@@ -114,15 +114,24 @@ def get_moe_configs(
                 # If a configuration has been found, return it
                 return {int(key): val for key, val in json.load(f).items()}
 
-    # If no optimized configuration is available, we will use the default
-    # configuration
-    logger.warning(
-        (
-            "Using default MoE kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
-        ),
-        config_file_path,
-    )
+    # If no optimized configuration is available, we will use the default configuration when down_moe is False
+    # When down_moe is True, we will try to use the config for down_moe=False
+    if down_moe:
+        logger.warning(
+            (
+                "Using MoE kernel config with down_moe=False. Performance might be sub-optimal! "
+                "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
+            ),
+            config_file_path,
+        )
+    else:
+        logger.warning(
+            (
+                "Using default MoE kernel config. Performance might be sub-optimal! "
+                "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
+            ),
+            config_file_path,
+        )
     return None
 
 

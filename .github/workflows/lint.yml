@@ -5,10 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [synchronize, labeled]
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'run-ci')
     steps:
       - uses: actions/checkout@v4
 
