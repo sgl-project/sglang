@@ -94,7 +94,7 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
-        TestFile("test_piecewise_cuda_graph.py", 450),
+        TestFile("test_piecewise_cuda_graph.py", 600),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -124,7 +124,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 100),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 170),
-        # TestFile("test_vision_openai_server_a.py", 900),
+        TestFile("test_vision_openai_server_a.py", 900),
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_modelopt_export.py", 30),
@@ -365,7 +365,7 @@ suites = {
         TestFile("test_verl_engine_4_gpu.py"),
         TestFile("test_verl_engine_server.py"),
         TestFile("test_vertex_endpoint.py"),
-        TestFile("test_vision_openai_server_a.py"),  # TODO: Fix timeout
+        # TestFile("test_vision_openai_server_a.py"),  # TODO: Fix timeout
         TestFile("test_vision_openai_server_b.py"),
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_vlm_accuracy.py"),
