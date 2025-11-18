@@ -279,7 +279,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         video_metadata = None
         if base_output.videos:
             videos_processed = [
-                await preprocess_video(video, video_config=self.video_config) for video in base_output.videos
+                await preprocess_video(video, video_config=self.video_config)
+                for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
