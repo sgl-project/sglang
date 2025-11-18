@@ -68,10 +68,6 @@ class RocmPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        logger.info(
-            "Trying SGL_DIFFUSION_ATTENTION_BACKEND=%s",
-            envs.SGL_DIFFUSION_ATTENTION_BACKEND,
-        )
 
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")

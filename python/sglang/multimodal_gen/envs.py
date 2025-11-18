@@ -257,11 +257,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
-    "SGL_DIFFUSION_ATTENTION_CONFIG": lambda: (
-        None
-        if os.getenv("SGL_DIFFUSION_ATTENTION_CONFIG", None) is None
-        else os.path.expanduser(os.getenv("SGL_DIFFUSION_ATTENTION_CONFIG", "."))
-    ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGL_DIFFUSION_WORKER_MULTIPROC_METHOD": lambda: os.getenv(

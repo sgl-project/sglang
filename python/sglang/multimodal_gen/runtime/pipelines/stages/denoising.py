@@ -37,6 +37,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
 )
+
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
