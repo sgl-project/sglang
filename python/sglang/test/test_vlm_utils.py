@@ -71,6 +71,10 @@ class TestVLMModels(CustomTestCase):
         model_args = f'model_version="{model_version}",' f"tp={tp}"
 
         # -------- build command list --------
+        current_dir = os.path.dirname(os.path.abspath(_file_))
+
+        config_path = os.path.join(current_dir,'mmmu-val.yaml')
+        
         cmd = [
             "python3",
             "-m",
@@ -91,7 +95,7 @@ class TestVLMModels(CustomTestCase):
             "--limit",
             limit,
             "--config",
-            "/__w/sglang/sglang/python/sglang/test/mmmu-val.yaml",
+            config_path
         ]
 
         subprocess.run(
