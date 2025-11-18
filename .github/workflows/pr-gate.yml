@@ -17,13 +17,6 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      # 1. for commits on main: no gating needed
-      # 2. for workflow_dispatch: this can only be triggered by users with write access
-      - name: Skip PR-Gate for non-PR events
-        if: github.event_name != 'pull_request'
-        run: |
-          echo "Not a pull_request event; skipping PR-Gate checks."
-          exit 0
       - name: Fetch latest PR info
         id: pr
         uses: actions/github-script@v7
