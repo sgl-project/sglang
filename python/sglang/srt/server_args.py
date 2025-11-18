@@ -3918,6 +3918,9 @@ class ServerArgs:
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
 
+        if self.model_impl == "mindspore":
+            assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
