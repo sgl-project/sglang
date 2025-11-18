@@ -147,10 +147,18 @@ else
     CACHE_VOLUME=""
 fi
 
+PIP_CACHE_HOST=/home/runner/sgl-data/pip-cache
+if [[ -d "$HF_CACHE_HOST" ]]; then
+    PIP_CACHE_VOLUME="-v $PIP_CACHE_HOST:/pip-cache"
+else
+    PIP_CACHE_VOLUME=""
+fi
+
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
-  $CACHE_VOLUME \
+  $HF_CACHE_VOLUME \
+  $PIP_CACHE_VOLUME \
   --ipc=host --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
