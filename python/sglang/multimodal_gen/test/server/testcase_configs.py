@@ -95,9 +95,8 @@ class BaselineConfig:
 class DiffusionTestCase:
     """Configuration for a single model/scenario test case."""
 
-    id: str  # pytest test id
+    id: str  # pytest test id and scenario name
     model_path: str  # HF repo or local path
-    scenario_name: str  # key into BASELINE_CONFIG.scenarios
     modality: str = "image"  # "image" or "video" or "3d"
     output_size: str = "1024x1024"  # output image dimensions (or video resolution)
 
@@ -150,7 +149,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         id="qwen_image_t2i",
         model_path="Qwen/Qwen-Image",
-        scenario_name="text_to_image",
         modality="image",
         prompt="A futuristic cityscape at sunset with flying cars",
         output_size="1024x1024",
@@ -161,7 +159,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         id="flux_image_t2i",
         model_path="black-forest-labs/FLUX.1-dev",
-        scenario_name="text_to_image",
         modality="image",
         prompt="A futuristic cityscape at sunset with flying cars",
         output_size="1024x1024",
@@ -173,7 +170,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         id="qwen_image_edit_ti2i",
         model_path="Qwen/Qwen-Image-Edit",
-        scenario_name="image_edit",
         modality="image",
         prompt=None,  # not used for editing
         output_size="1024x1536",
@@ -187,7 +183,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         id="fastwan2_1_t2v",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-        scenario_name="text_to_video",
         modality="video",
         prompt="A curious raccoon",
         output_size="848x480",
@@ -201,7 +196,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         id="wan2_2_i2v",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        scenario_name="image_to_video",
         modality="video",
         prompt="generate",  # passing in something since failing if no prompt is passed
         warmup_text=0,  # warmups only for image gen models
@@ -217,7 +211,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         id="wan2_1_i2v_14b_480P",
         model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-        scenario_name="wan2_1_i2v_14b_480P",
         output_size="832x1104",
         modality="video",
         prompt="Animate this image",
@@ -232,7 +225,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         id="wan2_2_i2v_14b_720P",
         model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
-        scenario_name="wan2_2_i2v_14b_720P",
         modality="video",
         prompt="Animate this image",
         edit_prompt="Add dynamic motion to the scene",
@@ -247,7 +239,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         id="wan2_2_ti2v_5b",
         model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        scenario_name="wan2_2_ti2v_5b",
         modality="video",
         output_size="832x1104",
         prompt="Animate this image",

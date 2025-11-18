@@ -291,6 +291,8 @@ class WarmupRunner:
 class PerformanceValidator:
     """Validates performance metrics against expectations."""
 
+    is_video_gen: bool = False
+
     def __init__(
         self,
         scenario: ScenarioConfig,
@@ -302,6 +304,16 @@ class PerformanceValidator:
         self.step_fractions = step_fractions
         self.is_baseline_generation_mode = (
             os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
+        )
+
+    def _assert_le(self, name: str, actual: float, expected: float, tolerance: float):
+        """Assert that actual is less than or equal to expected within a tolerance."""
+        upper_bound = expected * (1 + tolerance)
+        assert actual <= upper_bound, (
+            f"Validation failed for '{name}'.\n"
+            f"  - Actual:   {actual:.2f}ms\n"
+            f"  - Expected: {expected:.2f}ms\n"
+            f"  - Limit:    {upper_bound:.2f}ms (tolerance: {tolerance:.1%})"
         )
 
     def validate(
@@ -360,28 +372,29 @@ class PerformanceValidator:
     def _validate_e2e(self, summary: PerformanceSummary) -> None:
         """Validate end-to-end performance."""
         assert summary.e2e_ms > 0, "E2E duration missing"
-        upper = self.scenario.expected_e2e_ms * (1 + self.tolerances.e2e)
-        assert (
-            summary.e2e_ms <= upper
-        ), f"E2E {summary.e2e_ms:.2f}ms exceeds {upper:.2f}ms"
+        self._assert_le(
+            "E2E Latency",
+            summary.e2e_ms,
+            self.scenario.expected_e2e_ms,
+            self.tolerances.e2e,
+        )
 
     def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
         """Validate aggregate denoising metrics."""
         assert summary.avg_denoise_ms > 0, "Denoising step timings missing"
 
-        avg_upper = self.scenario.expected_avg_denoise_ms * (
-            1 + self.tolerances.denoise_agg
+        self._assert_le(
+            "Average Denoise Step",
+            summary.avg_denoise_ms,
+            self.scenario.expected_avg_denoise_ms,
+            self.tolerances.denoise_agg,
         )
-        med_upper = self.scenario.expected_median_denoise_ms * (
-            1 + self.tolerances.denoise_agg
+        self._assert_le(
+            "Median Denoise Step",
+            summary.median_denoise_ms,
+            self.scenario.expected_median_denoise_ms,
+            self.tolerances.denoise_agg,
         )
-
-        assert (
-            summary.avg_denoise_ms <= avg_upper
-        ), f"Avg denoise {summary.avg_denoise_ms:.2f}ms exceeds {avg_upper:.2f}ms"
-        assert (
-            summary.median_denoise_ms <= med_upper
-        ), f"Median denoise {summary.median_denoise_ms:.2f}ms exceeds {med_upper:.2f}ms"
 
     def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
         """Validate individual denoising steps."""
@@ -389,23 +402,35 @@ class PerformanceValidator:
             expected = self.scenario.denoise_step_ms.get(idx)
             if expected is None:
                 continue
-            upper = expected * (1 + self.tolerances.denoise_step)
-            assert actual <= upper, f"Step {idx}: {actual:.2f}ms > {upper:.2f}ms"
+            self._assert_le(
+                f"Denoise Step {idx}",
+                actual,
+                expected,
+                self.tolerances.denoise_step,
+            )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
         """Validate stage-level metrics."""
         assert summary.stage_metrics, "Stage metrics missing"
 
         for stage, expected in self.scenario.stages_ms.items():
+            if stage == "per_frame_generation" and self.is_video_gen:
+                continue
             actual = summary.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
 
-            upper = expected * (1 + self.tolerances.stage)
-            assert actual <= upper, f"Stage {stage}: {actual:.2f}ms > {upper:.2f}ms"
+            self._assert_le(
+                f"Stage '{stage}'",
+                actual,
+                expected,
+                self.tolerances.stage,
+            )
 
 
 class VideoPerformanceValidator(PerformanceValidator):
     """Extended validator for video diffusion with frame-level metrics."""
+
+    is_video_gen = True
 
     def validate(
         self,
@@ -430,24 +455,12 @@ class VideoPerformanceValidator(PerformanceValidator):
         """Validate frame generation performance."""
         expected_frame_time = self.scenario.stages_ms.get("per_frame_generation")
         if expected_frame_time and summary.avg_frame_time_ms:
-            upper = expected_frame_time * (1 + self.tolerances.stage)
-            assert (
-                summary.avg_frame_time_ms <= upper
-            ), f"Avg frame time {summary.avg_frame_time_ms:.2f}ms exceeds {upper:.2f}ms"
-
-    def _validate_stages(self, stage_metrics: PerformanceSummary) -> None:
-        """Validate video-specific stages."""
-        assert stage_metrics, "Stage metrics missing"
-
-        for stage, expected in self.scenario.stages_ms.items():
-            if stage == "per_frame_generation":
-                continue
-
-            actual = stage_metrics.stage_metrics.get(stage)
-            assert actual is not None, f"Stage {stage} timing missing"
-
-            upper = expected * (1 + self.tolerances.stage)
-            assert actual <= upper, f"Stage {stage}: {actual:.2f}ms > {upper:.2f}ms"
+            self._assert_le(
+                "Average Frame Time",
+                summary.avg_frame_time_ms,
+                expected_frame_time,
+                self.tolerances.stage,
+            )
 
 
 # Registry of validators by name
