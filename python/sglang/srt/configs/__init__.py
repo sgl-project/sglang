@@ -9,6 +9,7 @@ ExaoneConfig = LazyImport("sglang.srt.configs.exaone", "ExaoneConfig")
 FalconH1Config = LazyImport("sglang.srt.configs.falcon_h1", "FalconH1Config")
 MultiModalityConfig = LazyImport("sglang.srt.configs.janus_pro", "MultiModalityConfig")
 JetNemotronConfig = LazyImport("sglang.srt.configs.jet_nemotron", "JetNemotronConfig")
+JetVLMConfig = LazyImport("sglang.srt.configs.jet_vlm", "JetVLMConfig")
 KimiLinearConfig = LazyImport("sglang.srt.configs.kimi_linear", "KimiLinearConfig")
 KimiVLConfig = LazyImport("sglang.srt.configs.kimi_vl", "KimiVLConfig")
 MoonViTConfig = LazyImport("sglang.srt.configs.kimi_vl_moonvit", "MoonViTConfig")
@@ -44,4 +45,5 @@ __all__ = [
     "FalconH1Config",
     "NemotronHConfig",
     "JetNemotronConfig",
+    "JetVLMConfig",
 ]

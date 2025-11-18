@@ -57,6 +57,7 @@ def _register_custom_configs():
         ExaoneConfig,
         FalconH1Config,
         JetNemotronConfig,
+        JetVLMConfig,
         KimiLinearConfig,
         KimiVLConfig,
         LongcatFlashConfig,
@@ -88,6 +89,7 @@ def _register_custom_configs():
         NemotronHConfig,
         DeepseekVLV2Config,
         JetNemotronConfig,
+        JetVLMConfig,
     ]
 
     _CONFIG_REGISTRY = {
