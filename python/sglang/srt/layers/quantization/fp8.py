@@ -1320,10 +1320,3 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
-
-
-if _is_cuda:
-
-    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
-    def _(mat_a, mat_b, scales_a, scales_b, out_dtype, bias):
-        return mat_a.new_empty((mat_a.shape[0], mat_b.shape[-1]), dtype=out_dtype)
