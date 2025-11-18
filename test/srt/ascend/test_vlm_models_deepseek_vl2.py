@@ -14,7 +14,7 @@ from sglang.test.test_vlm_utils import TestVLMModels
 class TestDeepseekvl2Models(TestVLMModels):
     models = [
         SimpleNamespace(
-            model="/root/.cache/modelscope/hub/models/deepseek-ai/deepseek-vl2",
+            model="deepseek-ai/deepseek-vl2",
             mmmu_accuracy=0.2,
         ),
     ]
