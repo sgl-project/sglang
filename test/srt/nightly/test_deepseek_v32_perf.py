@@ -18,11 +18,54 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096,32768"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
-        # Use default configuration (removed dp attention)
-        cls.other_args = [
-            "--trust-remote-code",
-            "--tp",
-            "8",
+        # Define variant configurations
+        cls.variants = [
+            {
+                "name": "basic",
+                "other_args": [
+                    "--trust-remote-code",
+                    "--tp",
+                    "8",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
+                ],
+            },
+            {
+                "name": "mtp",
+                "other_args": [
+                    "--trust-remote-code",
+                    "--tp",
+                    "8",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--mem-frac",
+                    "0.7",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
+                ],
+            },
+            {
+                "name": "nsa",
+                "other_args": [
+                    "--trust-remote-code",
+                    "--tp",
+                    "8",
+                    "--attention-backend",
+                    "nsa",
+                    "--nsa-prefill-backend",
+                    "flashmla_sparse",
+                    "--nsa-decode-backend",
+                    "flashmla_kv",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
+                ],
+            },
         ]
 
         cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
