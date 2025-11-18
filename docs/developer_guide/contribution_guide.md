@@ -71,11 +71,9 @@ Then your PR can be merged.
 ## How to Trigger CI Tests
 
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
+Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
-Users with permission are listed here:
-https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json
-
-For CI to run on a pull request, it must have the **run-ci** label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
+For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
 - `/tag-run-ci-label`: Tag the "run-ci" label. Every future commits will trigger CI.
 - `/rerun-failed-ci`: Rerun the failed/flaky tests of the last commit.
