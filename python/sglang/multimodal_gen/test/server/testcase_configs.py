@@ -232,7 +232,7 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         image_edit_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         startup_grace_seconds=30.0,
         custom_validator="video",
-        seconds=4,
+        seconds=1,
     ),
     # TODO: should we add `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` too?
 ]
