@@ -34,6 +34,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
 )
@@ -1426,6 +1427,8 @@ class ModelRunner:
         config = self.model_config.hf_config
         if isinstance(config, FalconH1Config | NemotronHConfig):
             return config
+        if isinstance(config, NemotronH_Nano_VL_V2_Config):
+            return config.llm_config
         return None
 
     @property

@@ -25,6 +25,7 @@ suites = {
         TestFile("models/test_encoder_embedding_models.py", 460),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 160),
+        TestFile("models/test_nvidia_nemotron_nano_v2_vl.py", 350),  # GSM8k + MMMU
         TestFile("models/test_qwen_models.py", 150),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
@@ -123,6 +124,7 @@ suites = {
         TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
         TestFile("test_triton_sliding_window.py", 100),
         TestFile("test_utils_update_weights.py", 48),
+        TestFile("test_video_utils.py", 5),
         TestFile("test_vision_chunked_prefill.py", 170),
         TestFile("test_vision_openai_server_a.py", 900),
         TestFile("test_vlm_input_format.py", 300),
