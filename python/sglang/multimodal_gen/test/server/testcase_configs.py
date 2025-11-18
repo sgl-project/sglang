@@ -7,6 +7,13 @@ pytest python/sglang/multimodal_gen/test/server/test_server_performance.py
 # for a single testcase, look for the name of the testcases in DIFFUSION_CASES
 pytest python/sglang/multimodal_gen/test/server/test_server_performance.py -k qwen_image_t2i
 
+
+To add a new testcase:
+1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_performance.py -k my_new_test_case_id`
+3.
+
+
 """
 
 from __future__ import annotations

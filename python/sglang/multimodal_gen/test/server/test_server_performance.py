@@ -1,6 +1,5 @@
 """
 Config-driven diffusion performance test with pytest parametrization.
-Adding a new model/scenario = adding one DiffusionCase entry in diffusion_config.py.
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
     DIFFUSION_CASES,
     DiffusionTestCase,
+    PerformanceSummary,
 )
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
@@ -138,6 +138,8 @@ class TestDiffusionPerformance:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
         prev_len = len(read_perf_records(log_path))
+        is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
+        log_wait_timeout = 3600.0 if is_baseline_generation_mode else 120.0
 
         generate_fn()
 
@@ -145,15 +147,23 @@ class TestDiffusionPerformance:
             "total_inference_time",
             prev_len,
             log_path,
+            timeout=log_wait_timeout,
         )
 
-        scenario = BASELINE_CONFIG.scenarios[case.scenario_name]
-        stage_metrics, _ = wait_for_stage_metrics(
-            perf_record.get("request_id", ""),
-            prev_len,
-            len(scenario.stages_ms),
-            log_path,
-        )
+        stage_metrics = {}
+        if perf_record:
+            # When generating baselines, a scenario may not exist yet, so we pass
+            # a dummy value for num_stages, which is only used for logging.
+            scenario = BASELINE_CONFIG.scenarios.get(case.scenario_name)
+            num_stages = len(scenario.stages_ms) if scenario else 0
+
+            stage_metrics, _ = wait_for_stage_metrics(
+                perf_record.get("request_id", ""),
+                prev_len,
+                num_stages,
+                log_path,
+                timeout=log_wait_timeout,
+            )
 
         return perf_record, stage_metrics
 
@@ -192,20 +202,34 @@ class TestDiffusionPerformance:
             job = client.videos.create(**create_kwargs)  # type: ignore[attr-defined]
             video_id = job.id
 
-            deadline = time.time() + 600
+            job_completed = False
+            is_baseline_generation_mode = (
+                os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
+            )
+            timeout = 3600.0 if is_baseline_generation_mode else 600.0
+            deadline = time.time() + timeout
             while True:
                 page = client.videos.list()  # type: ignore[attr-defined]
                 item = next((v for v in page.data if v.id == video_id), None)
 
                 if item and getattr(item, "status", None) == "completed":
+                    job_completed = True
                     break
 
                 if time.time() > deadline:
-                    pytest.fail(
-                        f"{case.id}: video job {video_id} did not complete in time"
-                    )
+                    break
 
                 time.sleep(5)
+
+            if not job_completed:
+                if is_baseline_generation_mode:
+                    logger.warning(
+                        f"{case.id}: video job {video_id} timed out during baseline generation. "
+                        "Attempting to collect performance data anyway."
+                    )
+                    return b""
+
+                pytest.fail(f"{case.id}: video job {video_id} did not complete in time")
 
             # download video
             resp = client.videos.download_content(video_id=video_id)  # type: ignore[attr-defined]
@@ -338,8 +362,18 @@ class TestDiffusionPerformance:
         stage_metrics: dict,
     ) -> None:
         """Validate metrics and record results."""
-        scenario = BASELINE_CONFIG.scenarios[case.scenario_name]
+        is_baseline_generation_mode = os.environ.get("SGL_GEN_BASELINE", "0") == "1"
 
+        # When generating baselines, a scenario may not exist yet,
+        # so we pass a dummy to the validator.
+        scenario = BASELINE_CONFIG.scenarios.get(case.scenario_name)
+        if scenario is None:
+            if is_baseline_generation_mode:
+                scenario = {}  # Dummy scenario
+            else:
+                pytest.fail(
+                    f"Scenario '{case.scenario_name}' not in perf_baselines.json"
+                )
         validator_name = case.custom_validator or "default"
         validator_class = VALIDATOR_REGISTRY.get(validator_name, PerformanceValidator)
 
@@ -353,6 +387,10 @@ class TestDiffusionPerformance:
             summary = validator.validate(perf_record, stage_metrics, case.num_frames)
         else:
             summary = validator.validate(perf_record, stage_metrics)
+
+        if is_baseline_generation_mode:
+            self._dump_baseline_scenario(case, summary)
+            return
 
         if case.modality == "video" and summary.frames_per_second:
             logger.info(
@@ -427,6 +465,41 @@ class TestDiffusionPerformance:
                 case.id,
                 summary.avg_frame_time_ms,
             )
+
+    def _dump_baseline_scenario(
+        self, case: DiffusionTestCase, summary: "PerformanceSummary"
+    ) -> None:
+        """Dump performance metrics as a JSON scenario for baselines."""
+        import json
+
+        denoise_steps_formatted = {
+            str(k): round(v, 2) for k, v in summary.sampled_steps.items()
+        }
+        stages_formatted = {k: round(v, 2) for k, v in summary.stage_metrics.items()}
+
+        baseline = {
+            "stages_ms": stages_formatted,
+            "denoise_step_ms": denoise_steps_formatted,
+            "expected_e2e_ms": round(summary.e2e_ms, 2),
+            "expected_avg_denoise_ms": round(summary.avg_denoise_ms, 2),
+            "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
+        }
+
+        # Video-specific metrics
+        if case.modality == "video":
+            if "per_frame_generation" not in baseline["stages_ms"]:
+                baseline["stages_ms"]["per_frame_generation"] = round(
+                    summary.avg_frame_time_ms, 2
+                )
+
+        output = f"""
+To add this baseline, copy the following JSON snippet into
+the "scenarios" section of perf_baselines.json:
+
+"{case.scenario_name}": {json.dumps(baseline, indent=4)}
+
+"""
+        print(output)
 
     def test_diffusion_perf(
         self,

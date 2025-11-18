@@ -172,6 +172,11 @@ def wait_for_perf_record(
                 if rec.get("tag") == tag:
                     return rec, len(records)
         time.sleep(0.5)
+
+    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+        records = read_perf_records(log_path)
+        return {}, len(records)
+
     raise AssertionError(
         f"Timeout waiting for perf log entry '{tag}' (start_len={prev_len})"
     )
@@ -200,6 +205,10 @@ def wait_for_stage_metrics(
         if len(metrics) >= expected_count:
             return metrics, len(records)
         time.sleep(0.5)
+
+    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+        records = read_perf_records(log_path)
+        return {}, len(records)
     raise AssertionError(
         f"Timeout waiting for stage metrics for request {request_id} "
         f"(collected={len(metrics)} expected={expected_count})"
