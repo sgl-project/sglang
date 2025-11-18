@@ -10,7 +10,6 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.labels.*.name)
     steps:
       - uses: actions/checkout@v4
 
