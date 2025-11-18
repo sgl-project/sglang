@@ -79,7 +79,7 @@ class TestGemm(CustomTestCase):
             ):
                 self._bf16_gemm(*params)
 
-    def _fp32_gemm(self, M, N, K, has_bias, use_post_sigmul):
+    def _bf16_gemm_with_small_oc(self, M, N, K, has_bias, use_post_sigmul):
         use_post_sigmul = use_post_sigmul and N == 1
         mat_mul = (
             None if not use_post_sigmul else torch.randn(M, 2 * K, dtype=torch.bfloat16)
@@ -110,7 +110,7 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
-    def test_fp32_gemm(self):
+    def test_bf16_gemm_with_small_oc(self):
         for params in itertools.product(
             [1, 8, 32, 1024], [12, 1], self.K, self.has_bias, [False, True]
         ):
@@ -121,7 +121,7 @@ class TestGemm(CustomTestCase):
                 has_bias=params[3],
                 use_post_sigmul=params[4],
             ):
-                self._fp32_gemm(*params)
+                self._bf16_gemm_with_small_oc(*params)
 
     def _int8_gemm(self, M, N, K, has_bias):
         dtype = torch.bfloat16
