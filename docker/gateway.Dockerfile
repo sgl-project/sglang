@@ -57,7 +57,8 @@ WORKDIR /opt/sglang/sgl-router
 # install maturin and build the wheel with vendored OpenSSL
 RUN uv pip install maturin \
     && cargo clean \
-    && rm -rf dist/ \
+    && rm -rf bindings/python/dist/ \
+    && cd bindings/python \
     && maturin build --release --features vendored-openssl --out dist \
     && rm -rf /root/.cache
 
@@ -65,7 +66,7 @@ RUN uv pip install maturin \
 FROM base AS router-image
 
 # Copy the built package from the build image
-COPY --from=build-image /opt/sglang/sgl-router/dist/*.whl dist/
+COPY --from=build-image /opt/sglang/sgl-router/bindings/python/dist/*.whl dist/
 
 # Build the package and install
 RUN uv pip install --force-reinstall dist/*.whl
