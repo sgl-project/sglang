@@ -13,7 +13,6 @@ on:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
       - 'sgl-router/**'
-    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:

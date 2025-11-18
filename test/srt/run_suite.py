@@ -220,6 +220,7 @@ suites = {
         TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
     ],
     "nightly-4-gpu": [
+        TestFile("nightly/test_encoder_dp.py", 500),
         TestFile("test_qwen3_next_deterministic.py", 200),
     ],
     "nightly-8-gpu": [],
