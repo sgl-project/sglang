@@ -33,6 +33,7 @@ else:
 
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
+    from aiter import rope_cached_2c_fwd
 
 if is_npu():
     import torch_npu
@@ -1948,9 +1949,39 @@ def apply_rotary_pos_emb_npu(
     k_embed = k_embed.squeeze(0)
     return q_embed, k_embed
 
+def apply_rotary_pos_emb_aiter(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim=1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if (
+        q.dim() != 3
+        or k.dim() != 3
+        or cos.dim() != 2
+        or sin.dim() != 2
+    ):
+        print(
+            f"q shape {q.shape} or k shape {k.shape} or cos shape {cos.shape} or sin shape {sin.shape} not valid for aiter"
+            f"fallback to native"
+        )       
+        return apply_rotary_pos_emb_native(q, k, cos, sin, unsqueeze_dim)
+    T, B, H = q.shape
+    q = q.view(T, 1, B, H)
+    k = k.view(T, 1, B, H)
+    cos = cos.view(T, 1, 1, H)
+    sin = sin.view(T, 1, 1, H)
+    q_embed, k_embed = rope_cached_2c_fwd(q, k, cos, sin, False, False, 0)
+    q_embed = q_embed.view(T, B, H)
+    k_embed = k_embed.view(T, B, H)
+
+    return q_embed, k_embed
 
 if _is_npu:
     apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+elif _use_aiter:
+    apply_rotary_pos_emb = apply_rotary_pos_emb_aiter
 else:
     apply_rotary_pos_emb = apply_rotary_pos_emb_native
 
