@@ -1,5 +1,12 @@
 """
 Configuration and data structures for diffusion performance tests.
+
+Usage:
+
+pytest python/sglang/multimodal_gen/test/server/test_server_performance.py
+# for a single testcase, look for the name of the testcases in DIFFUSION_CASES
+pytest python/sglang/multimodal_gen/test/server/test_server_performance.py -k qwen_image_t2i
+
 """
 
 from __future__ import annotations
@@ -78,7 +85,7 @@ class BaselineConfig:
 
 
 @dataclass(frozen=True)
-class DiffusionCase:
+class DiffusionTestCase:
     """Configuration for a single model/scenario test case."""
 
     id: str  # pytest test id
@@ -128,9 +135,9 @@ IMAGE_INPUT_FILE = Path(__file__).resolve().parents[1] / "test_files" / "girl.jp
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
-DIFFUSION_CASES: list[DiffusionCase] = [
+DIFFUSION_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
-    DiffusionCase(
+    DiffusionTestCase(
         id="qwen_image_t2i",
         model_path="Qwen/Qwen-Image",
         scenario_name="text_to_image",
@@ -141,7 +148,7 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         warmup_edit=0,
         startup_grace_seconds=30.0,
     ),
-    DiffusionCase(
+    DiffusionTestCase(
         id="flux_image_t2i",
         model_path="black-forest-labs/FLUX.1-dev",
         scenario_name="text_to_image",
@@ -153,7 +160,7 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         startup_grace_seconds=30.0,
     ),
     # === Text and Image to Image (TI2I) ===
-    DiffusionCase(
+    DiffusionTestCase(
         id="qwen_image_edit_ti2i",
         model_path="Qwen/Qwen-Image-Edit",
         scenario_name="image_edit",
@@ -167,7 +174,7 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         startup_grace_seconds=30.0,
     ),
     # === Text to Video (T2V) ===
-    DiffusionCase(
+    DiffusionTestCase(
         id="fastwan2_1_t2v",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         scenario_name="text_to_video",
@@ -181,7 +188,7 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         custom_validator="video",
     ),
     # === Image to Video (I2V) ===
-    DiffusionCase(
+    DiffusionTestCase(
         id="wan2_2_i2v",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
         scenario_name="image_to_video",
@@ -197,7 +204,7 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         seconds=1,
     ),
     # === Text and Image to Video (TI2V) ===
-    DiffusionCase(
+    DiffusionTestCase(
         id="wan2_2_ti2v_5b",
         model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         scenario_name="text_image_to_video",
@@ -212,6 +219,22 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         custom_validator="video",
         seconds=4,
     ),
+    DiffusionTestCase(
+        id="wan2_1_i2v_14b_480P",
+        model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        scenario_name="text_image_to_video",
+        modality="video",
+        prompt="Animate this image",
+        output_size="832x1104",
+        warmup_text=0,  # warmups only for image gen models
+        warmup_edit=0,
+        image_edit_prompt="Add dynamic motion to the scene",
+        image_edit_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        startup_grace_seconds=30.0,
+        custom_validator="video",
+        seconds=4,
+    ),
+    # TODO: should we add `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` too?
 ]
 
 

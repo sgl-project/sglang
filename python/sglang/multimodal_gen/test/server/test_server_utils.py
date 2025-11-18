@@ -20,7 +20,7 @@ from openai import OpenAI
 
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.diffusion_config import (
+from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
