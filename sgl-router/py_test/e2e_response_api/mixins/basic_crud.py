@@ -5,14 +5,16 @@ This module provides base test classes that can be reused across different backe
 (OpenAI, XAI, gRPC) with common test logic.
 """
 
-import json
+from __future__ import annotations
+
 import sys
 import time
 import unittest
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
-import requests
+import openai
+from openai.types import conversations, responses
 
 # Add current directory for local imports
 _TEST_DIR = Path(__file__).parent
@@ -28,44 +30,11 @@ class ResponseAPIBaseTest(CustomTestCase):
     base_url: str = None
     api_key: str = None
     model: str = None
-
-    def make_request(
-        self,
-        endpoint: str,
-        method: str = "POST",
-        json_data: Optional[dict] = None,
-        params: Optional[dict] = None,
-    ) -> requests.Response:
-        """
-        Make HTTP request to router.
-
-        Args:
-            endpoint: Endpoint path (e.g., "/v1/responses")
-            method: HTTP method (GET, POST, DELETE)
-            json_data: JSON body for POST requests
-            params: Query parameters
-
-        Returns:
-            requests.Response object
-        """
-        url = f"{self.base_url}{endpoint}"
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        if method == "POST":
-            resp = requests.post(url, json=json_data, headers=headers, params=params)
-        elif method == "GET":
-            resp = requests.get(url, headers=headers, params=params)
-        elif method == "DELETE":
-            resp = requests.delete(url, headers=headers, params=params)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        return resp
+    client: openai.OpenAI = None
 
     def create_response(
         self,
-        input_text: str,
+        input: Union[str, responses.ResponseInputParam],
         instructions: Optional[str] = None,
         stream: bool = False,
         max_output_tokens: Optional[int] = None,
@@ -75,12 +44,12 @@ class ResponseAPIBaseTest(CustomTestCase):
         tools: Optional[list] = None,
         background: bool = False,
         **kwargs,
-    ) -> requests.Response:
+    ) -> responses.Response | openai.Stream[responses.ResponseStreamEvent]:
         """
         Create a response via POST /v1/responses.
 
         Args:
-            input_text: User input
+            input: User input
             instructions: Optional system instructions
             stream: Whether to stream response
             max_output_tokens: Optional max tokens to generate
@@ -92,178 +61,128 @@ class ResponseAPIBaseTest(CustomTestCase):
             **kwargs: Additional request parameters
 
         Returns:
-            requests.Response object
+            Response object for non-stream request
+            ResponseStreamEvent for stream request
         """
-        data = {
+        params = {
             "model": self.model,
-            "input": input_text,
+            "input": input,
             "stream": stream,
             **kwargs,
         }
 
         if instructions:
-            data["instructions"] = instructions
+            params["instructions"] = instructions
 
         if max_output_tokens is not None:
-            data["max_output_tokens"] = max_output_tokens
+            params["max_output_tokens"] = max_output_tokens
 
         if temperature is not None:
-            data["temperature"] = temperature
+            params["temperature"] = temperature
 
         if previous_response_id:
-            data["previous_response_id"] = previous_response_id
+            params["previous_response_id"] = previous_response_id
 
         if conversation:
-            data["conversation"] = conversation
+            params["conversation"] = conversation
 
         if tools:
-            data["tools"] = tools
+            params["tools"] = tools
 
         if background:
-            data["background"] = background
+            params["background"] = background
 
-        if stream:
-            # For streaming, we need to handle SSE
-            return self._create_streaming_response(data)
-        else:
-            return self.make_request("/v1/responses", "POST", data)
+        return self.client.responses.create(**params)
 
-    def _create_streaming_response(self, data: dict) -> requests.Response:
-        """Handle streaming response creation."""
-        url = f"{self.base_url}/v1/responses"
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        # Return response object with stream=True
-        return requests.post(url, json=data, headers=headers, stream=True)
-
-    def get_response(self, response_id: str) -> requests.Response:
+    def get_response(
+        self, response_id: str
+    ) -> responses.Response | openai.Stream[responses.ResponseStreamEvent]:
         """Get response by ID via GET /v1/responses/{response_id}."""
-        return self.make_request(f"/v1/responses/{response_id}", "GET")
+        return self.client.responses.retrieve(response_id=response_id)
 
-    def delete_response(self, response_id: str) -> requests.Response:
+    def delete_response(self, response_id: str) -> None:
         """Delete response by ID via DELETE /v1/responses/{response_id}."""
-        return self.make_request(f"/v1/responses/{response_id}", "DELETE")
+        return self.client.responses.delete(response_id=response_id)
 
-    def cancel_response(self, response_id: str) -> requests.Response:
+    def cancel_response(self, response_id: str) -> responses.Response:
         """Cancel response by ID via POST /v1/responses/{response_id}/cancel."""
-        return self.make_request(f"/v1/responses/{response_id}/cancel", "POST", {})
+        return self.client.responses.cancel(response_id=response_id)
 
-    def get_response_input_items(self, response_id: str) -> requests.Response:
+    def get_response_input_items(
+        self, response_id: str
+    ) -> openai.pagination.SyncCursorPage[responses.ResponseItem]:
         """Get response input items via GET /v1/responses/{response_id}/input_items."""
-        return self.make_request(f"/v1/responses/{response_id}/input_items", "GET")
+        return self.client.responses.input_items.list(response_id=response_id)
 
-    def create_conversation(self, metadata: Optional[dict] = None) -> requests.Response:
+    def create_conversation(
+        self, metadata: Optional[dict] = None
+    ) -> conversations.Conversation:
         """Create conversation via POST /v1/conversations."""
-        data = {}
+        params = {}
         if metadata:
-            data["metadata"] = metadata
-        return self.make_request("/v1/conversations", "POST", data)
+            params["metadata"] = metadata
+        return self.client.conversations.create(**params)
 
-    def get_conversation(self, conversation_id: str) -> requests.Response:
+    def get_conversation(self, conversation_id: str) -> conversations.Conversation:
         """Get conversation by ID via GET /v1/conversations/{conversation_id}."""
-        return self.make_request(f"/v1/conversations/{conversation_id}", "GET")
+        return self.client.conversations.retrieve(conversation_id=conversation_id)
 
     def update_conversation(
         self, conversation_id: str, metadata: dict
-    ) -> requests.Response:
+    ) -> conversations.Conversation:
         """Update conversation via POST /v1/conversations/{conversation_id}."""
-        return self.make_request(
-            f"/v1/conversations/{conversation_id}", "POST", {"metadata": metadata}
+        return self.client.conversations.update(
+            conversation_id=conversation_id, metadata=metadata
         )
 
-    def delete_conversation(self, conversation_id: str) -> requests.Response:
+    def delete_conversation(
+        self, conversation_id: str
+    ) -> conversations.ConversationDeletedResource:
         """Delete conversation via DELETE /v1/conversations/{conversation_id}."""
-        return self.make_request(f"/v1/conversations/{conversation_id}", "DELETE")
+        return self.client.conversations.delete(conversation_id=conversation_id)
 
     def list_conversation_items(
         self,
         conversation_id: str,
         limit: Optional[int] = None,
         after: Optional[str] = None,
-        before: Optional[str] = None,
         order: str = "asc",
-    ) -> requests.Response:
+    ) -> openai.pagination.SyncConversationCursorPage[conversations.ConversationItem]:
         """List conversation items via GET /v1/conversations/{conversation_id}/items."""
-        params = {"order": order}
+        params = {"conversation_id": conversation_id, "order": order}
         if limit:
             params["limit"] = limit
         if after:
             params["after"] = after
-        if before:
-            params["before"] = before
-        return self.make_request(
-            f"/v1/conversations/{conversation_id}/items", "GET", params=params
-        )
+        return self.client.conversations.items.list(**params)
 
     def create_conversation_items(
         self, conversation_id: str, items: list
-    ) -> requests.Response:
+    ) -> conversations.ConversationItemList:
         """Create conversation items via POST /v1/conversations/{conversation_id}/items."""
-        return self.make_request(
-            f"/v1/conversations/{conversation_id}/items", "POST", {"items": items}
+        return self.client.conversations.items.create(
+            conversation_id=conversation_id, items=items
         )
 
     def get_conversation_item(
         self, conversation_id: str, item_id: str
-    ) -> requests.Response:
+    ) -> conversations.ConversationItem:
         """Get conversation item via GET /v1/conversations/{conversation_id}/items/{item_id}."""
-        return self.make_request(
-            f"/v1/conversations/{conversation_id}/items/{item_id}", "GET"
+        return self.client.conversations.items.retrieve(
+            conversation_id=conversation_id, item_id=item_id
         )
 
     def delete_conversation_item(
         self, conversation_id: str, item_id: str
-    ) -> requests.Response:
+    ) -> conversations.Conversation:
         """Delete conversation item via DELETE /v1/conversations/{conversation_id}/items/{item_id}."""
-        return self.make_request(
-            f"/v1/conversations/{conversation_id}/items/{item_id}", "DELETE"
+        return self.client.conversations.items.delete(
+            conversation_id=conversation_id, item_id=item_id
         )
-
-    def parse_sse_events(self, response: requests.Response) -> list:
-        """
-        Parse Server-Sent Events from streaming response.
-
-        Args:
-            response: requests.Response with stream=True
-
-        Returns:
-            List of event dictionaries with 'event' and 'data' keys
-        """
-        events = []
-        current_event = None
-
-        for line in response.iter_lines():
-            if not line:
-                # Empty line signals end of event
-                if current_event and current_event.get("data"):
-                    events.append(current_event)
-                current_event = None
-                continue
-
-            line = line.decode("utf-8")
-
-            if line.startswith("event:"):
-                current_event = {"event": line[6:].strip()}
-            elif line.startswith("data:"):
-                if current_event is None:
-                    current_event = {}
-                data_str = line[5:].strip()
-                try:
-                    current_event["data"] = json.loads(data_str)
-                except json.JSONDecodeError:
-                    current_event["data"] = data_str
-
-        # Don't forget the last event if stream ends without empty line
-        if current_event and current_event.get("data"):
-            events.append(current_event)
-
-        return events
 
     def wait_for_background_task(
         self, response_id: str, timeout: int = 30, poll_interval: float = 0.5
-    ) -> dict:
+    ) -> responses.Response:
         """
         Wait for background task to complete.
 
@@ -283,17 +202,15 @@ class ResponseAPIBaseTest(CustomTestCase):
 
         while time.time() - start_time < timeout:
             resp = self.get_response(response_id)
-            self.assertEqual(resp.status_code, 200)
+            self.assertIsNone(resp.error)
+            self.assertEqual(resp.id, response_id)
 
-            data = resp.json()
-            status = data.get("status")
+            status = resp.status
 
             if status == "completed":
-                return data
+                return resp
             elif status == "failed":
-                raise AssertionError(
-                    f"Background task failed: {data.get('error', 'Unknown error')}"
-                )
+                raise AssertionError(f"Background task failed: {resp.error}")
             elif status == "cancelled":
                 raise AssertionError("Background task was cancelled")
 
@@ -310,31 +227,29 @@ class StateManagementBaseTest(ResponseAPIBaseTest):
     def test_basic_response_creation(self):
         """Test basic response creation without state."""
         resp = self.create_response("What is 2+2?", max_output_tokens=50)
-        self.assertEqual(resp.status_code, 200)
 
-        data = resp.json()
-        self.assertIn("id", data)
-        self.assertIn("output", data)
-        self.assertEqual(data["status"], "completed")
-        self.assertIn("usage", data)
+        self.assertIsNotNone(resp.id)
+        self.assertIsNone(resp.error)
+        self.assertEqual(resp.status, "completed")
+        self.assertGreater(len(resp.output_text), 0)
+        self.assertGreater(resp.usage.input_tokens, 0)
+        self.assertGreater(resp.usage.output_tokens, 0)
+        self.assertGreater(resp.usage.total_tokens, 0)
 
     def test_streaming_response(self):
         """Test streaming response."""
         resp = self.create_response("Count to 5", stream=True, max_output_tokens=50)
-        self.assertEqual(resp.status_code, 200)
-
-        events = self.parse_sse_events(resp)
-        self.assertGreater(len(events), 0)
 
         # Check for response.created event
-        created_events = [e for e in events if e.get("event") == "response.created"]
+        events = [event for event in resp]
+        created_events = [event for event in events if event.type == "response.created"]
         self.assertGreater(len(created_events), 0)
 
         # Check for final completed event or in_progress events
         self.assertTrue(
             any(
-                e.get("event") in ["response.completed", "response.in_progress"]
-                for e in events
+                event.type in ["response.completed", "response.in_progress"]
+                for event in events
             )
         )
 
@@ -346,41 +261,40 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
         """Test creating response and retrieving it."""
         # Create response
         create_resp = self.create_response("Hello, world!")
-        self.assertEqual(create_resp.status_code, 200)
-
-        create_data = create_resp.json()
-        response_id = create_data["id"]
+        self.assertIsNotNone(create_resp.id)
+        self.assertIsNone(create_resp.error)
+        self.assertEqual(create_resp.status, "completed")
+        self.assertGreater(len(create_resp.output_text), 0)
+        response_id = create_resp.id
 
         # Get response
         get_resp = self.get_response(response_id)
-        self.assertEqual(get_resp.status_code, 200)
+        self.assertIsNone(get_resp.error)
+        self.assertEqual(get_resp.id, response_id)
+        self.assertEqual(get_resp.status, "completed")
 
-        get_data = get_resp.json()
-        self.assertEqual(get_data["id"], response_id)
-        self.assertEqual(get_data["status"], "completed")
-
-        input_resp = self.get_response_input_items(get_data["id"])
-        self.assertEqual(input_resp.status_code, 200)
-        input_data = input_resp.json()
-        self.assertIn("data", input_data)
-        self.assertGreater(len(input_data["data"]), 0)
+        input_resp = self.get_response_input_items(get_resp.id)
+        self.assertIsNotNone(input_resp.data)
+        self.assertGreater(len(input_resp.data), 0)
 
     @unittest.skip("TODO: Add delete response feature")
     def test_delete_response(self):
         """Test deleting response."""
         # Create response
-        create_resp = self.create_response("Test deletion", max_output_tokens=50)
-        self.assertEqual(create_resp.status_code, 200)
+        create_resp = self.create_response("Test deletion")
+        self.assertIsNotNone(create_resp.id)
+        self.assertIsNone(create_resp.error)
+        self.assertEqual(create_resp.status, "completed")
+        self.assertGreater(len(create_resp.output_text), 0)
 
-        response_id = create_resp.json()["id"]
+        response_id = create_resp.id
 
         # Delete response
-        delete_resp = self.delete_response(response_id)
-        self.assertEqual(delete_resp.status_code, 200)
+        self.delete_response(response_id)
 
         # Verify it's deleted (should return 404)
-        get_resp = self.get_response(response_id)
-        self.assertEqual(get_resp.status_code, 404)
+        with self.assertRaises(openai.NotFoundError):
+            self.get_response(response_id)
 
     @unittest.skip("TODO: Add background response feature")
     def test_background_response(self):
@@ -389,15 +303,15 @@ class ResponseCRUDBaseTest(ResponseAPIBaseTest):
         create_resp = self.create_response(
             "Write a short story", background=True, max_output_tokens=100
         )
-        self.assertEqual(create_resp.status_code, 200)
+        self.assertIsNotNone(create_resp.id)
+        self.assertIsNone(create_resp.error)
+        self.assertIn(create_resp.status, ["in_progress", "queued"])
 
-        create_data = create_resp.json()
-        response_id = create_data["id"]
-        self.assertEqual(create_data["status"], "in_progress")
+        response_id = create_resp.id
 
         # Wait for completion
         final_data = self.wait_for_background_task(response_id, timeout=60)
-        self.assertEqual(final_data["status"], "completed")
+        self.assertEqual(final_data.status, "completed")
 
 
 class ConversationCRUDBaseTest(ResponseAPIBaseTest):
@@ -407,72 +321,88 @@ class ConversationCRUDBaseTest(ResponseAPIBaseTest):
         """Test creating and retrieving conversation."""
         # Create conversation
         create_resp = self.create_conversation(metadata={"user": "test_user"})
-        self.assertEqual(create_resp.status_code, 200)
+        self.assertIsNotNone(create_resp.id)
+        self.assertIsNotNone(create_resp.created_at)
 
-        create_data = create_resp.json()
-        conversation_id = create_data["id"]
-        self.assertEqual(create_data["metadata"]["user"], "test_user")
+        create_data = create_resp.metadata
+        self.assertEqual(create_data["user"], "test_user")
+        conversation_id = create_resp.id
 
         # Get conversation
         get_resp = self.get_conversation(conversation_id)
-        self.assertEqual(get_resp.status_code, 200)
+        self.assertIsNotNone(get_resp.id)
+        self.assertIsNotNone(get_resp.created_at)
 
-        get_data = get_resp.json()
-        self.assertEqual(get_data["id"], conversation_id)
-        self.assertEqual(get_data["metadata"]["user"], "test_user")
+        get_data = get_resp.metadata
+        self.assertEqual(get_resp.id, conversation_id)
+        self.assertEqual(get_data["user"], "test_user")
 
     def test_update_conversation(self):
         """Test updating conversation metadata."""
         # Create conversation
         create_resp = self.create_conversation(metadata={"key1": "value1"})
-        self.assertEqual(create_resp.status_code, 200)
-        conversation_id = create_resp.json()["id"]
+        self.assertIsNotNone(create_resp.id)
+        self.assertIsNotNone(create_resp.created_at)
+
+        create_data = create_resp.metadata
+        self.assertEqual(create_data["key1"], "value1")
+        self.assertNotIn("key2", create_data)
+        conversation_id = create_resp.id
 
         # Update conversation
         update_resp = self.update_conversation(
             conversation_id, metadata={"key1": "value1", "key2": "value2"}
         )
-        self.assertEqual(update_resp.status_code, 200)
+        self.assertEqual(update_resp.id, conversation_id)
+        update_data = update_resp.metadata
+        self.assertEqual(update_data["key1"], "value1")
+        self.assertEqual(update_data["key2"], "value2")
 
         # Verify update
         get_resp = self.get_conversation(conversation_id)
-        get_data = get_resp.json()
-        self.assertEqual(get_data["metadata"]["key2"], "value2")
+        get_data = get_resp.metadata
+        self.assertEqual(get_data["key1"], "value1")
+        self.assertEqual(get_data["key2"], "value2")
 
     def test_delete_conversation(self):
         """Test deleting conversation."""
         # Create conversation
         create_resp = self.create_conversation()
-        self.assertEqual(create_resp.status_code, 200)
-        conversation_id = create_resp.json()["id"]
+        self.assertIsNotNone(create_resp.id)
+        self.assertIsNotNone(create_resp.created_at)
+        conversation_id = create_resp.id
 
         # Delete conversation
         delete_resp = self.delete_conversation(conversation_id)
-        self.assertEqual(delete_resp.status_code, 200)
+        self.assertIsNotNone(delete_resp.id)
+        self.assertTrue(delete_resp.deleted)
 
         # Verify deletion
-        get_resp = self.get_conversation(conversation_id)
-        self.assertEqual(get_resp.status_code, 404)
+        with self.assertRaises(openai.NotFoundError):
+            self.get_conversation(conversation_id)
 
     def test_list_conversation_items(self):
         """Test listing conversation items."""
         # Create conversation
         conv_resp = self.create_conversation()
-        conversation_id = conv_resp.json()["id"]
+        self.assertIsNotNone(conv_resp.id)
+        conversation_id = conv_resp.id
 
         # Create response with conversation
-        self.create_response(
+        resp1 = self.create_response(
             "First message", conversation=conversation_id, max_output_tokens=50
         )
-        self.create_response(
+        self.assertIsNone(resp1.error)
+        resp2 = self.create_response(
             "Second message", conversation=conversation_id, max_output_tokens=50
         )
+        self.assertIsNone(resp2.error)
 
         # List items
         list_resp = self.list_conversation_items(conversation_id)
-        self.assertEqual(list_resp.status_code, 200)
+        self.assertIsNotNone(list_resp)
+        self.assertIsNotNone(list_resp.data)
 
-        list_data = list_resp.json()
-        self.assertIn("data", list_data)
+        list_data = list_resp.data
         # Should have at least 4 items (2 inputs + 2 outputs)
-        self.assertGreaterEqual(len(list_data["data"]), 4)
+        self.assertGreaterEqual(len(list_data), 4)

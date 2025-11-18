@@ -130,7 +130,17 @@ def generate_markdown_report(trace_dir, results: List["BenchmarkResult"]) -> str
     """Generate a markdown report from a list of BenchmarkResult object from a single run."""
     import os
 
-    summary = f"### {results[0].model_path}\n"
+    # Build model header with run_name if it's not "default"
+    model_header = results[0].model_path
+    if results[0].run_name and results[0].run_name != "default":
+        model_header += f" ({results[0].run_name})"
+
+    # Include GPU config in model header if available
+    gpu_config = os.getenv("GPU_CONFIG", "")
+    if gpu_config:
+        model_header += f" [{gpu_config}]"
+
+    summary = f"### {model_header}\n"
 
     # summary += (
     #     f"Input lens: {result.input_len}. Output lens: {result.output_len}.\n"

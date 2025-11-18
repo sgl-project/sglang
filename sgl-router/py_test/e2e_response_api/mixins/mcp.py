@@ -56,24 +56,19 @@ class MCPTests(ResponseAPIBaseTest):
         )
 
         # Should successfully make the request
-        self.assertEqual(resp.status_code, 200)
-
-        data = resp.json()
+        self.assertIsNone(resp.error)
 
         # Basic response structure
-        self.assertIn("id", data)
-        self.assertIn("status", data)
-        self.assertEqual(data["status"], "completed")
-        self.assertIn("output", data)
-        self.assertIn("model", data)
+        self.assertIsNotNone(resp.id)
+        self.assertEqual(resp.status, "completed")
+        self.assertIsNotNone(resp.model)
+        self.assertIsNotNone(resp.output)
 
         # Verify output array is not empty
-        output = data["output"]
-        self.assertIsInstance(output, list)
-        self.assertGreater(len(output), 0)
+        self.assertGreater(len(resp.output_text), 0)
 
         # Check for MCP-specific output types
-        output_types = [item.get("type") for item in output]
+        output_types = [item.type for item in resp.output]
 
         # Should have mcp_list_tools - tools are listed before calling
         self.assertIn(
@@ -81,40 +76,38 @@ class MCPTests(ResponseAPIBaseTest):
         )
 
         # Should have at least one mcp_call
-        mcp_calls = [item for item in output if item.get("type") == "mcp_call"]
+        mcp_calls = [item for item in resp.output if item.type == "mcp_call"]
         self.assertGreater(
             len(mcp_calls), 0, "Response should contain at least one mcp_call"
         )
 
         # Verify mcp_call structure
         for mcp_call in mcp_calls:
-            self.assertIn("id", mcp_call)
-            self.assertIn("status", mcp_call)
-            self.assertEqual(mcp_call["status"], "completed")
-            self.assertIn("server_label", mcp_call)
-            self.assertEqual(mcp_call["server_label"], "brave")
-            self.assertIn("name", mcp_call)
-            self.assertIn("arguments", mcp_call)
-            self.assertIn("output", mcp_call)
+            self.assertIsNotNone(mcp_call.id)
+            self.assertEqual(mcp_call.status, "completed")
+            self.assertEqual(mcp_call.server_label, "brave")
+            self.assertIsNotNone(mcp_call.name)
+            self.assertIsNotNone(mcp_call.arguments)
+            self.assertIsNotNone(mcp_call.output)
 
         # Strict mode: additional validation for HTTP backends
         if self.mcp_validation_mode == "strict":
             # Should have final message output
-            messages = [item for item in output if item.get("type") == "message"]
+            messages = [item for item in resp.output if item.type == "message"]
             self.assertGreater(
                 len(messages), 0, "Response should contain at least one message"
             )
             # Verify message structure
             for msg in messages:
-                self.assertIn("content", msg)
-                self.assertIsInstance(msg["content"], list)
+                self.assertIsNotNone(msg.content)
+                self.assertIsInstance(msg.content, list)
 
                 # Check content has text
-                for content_item in msg["content"]:
-                    if content_item.get("type") == "output_text":
-                        self.assertIn("text", content_item)
-                        self.assertIsInstance(content_item["text"], str)
-                        self.assertGreater(len(content_item["text"]), 0)
+                for content_item in msg.content:
+                    if content_item.type == "output_text":
+                        self.assertIsNotNone(content_item.text)
+                        self.assertIsInstance(content_item.text, str)
+                        self.assertGreater(len(content_item.text), 0)
 
     def test_mcp_basic_tool_call_streaming(self):
         """Test basic MCP tool call (streaming).
@@ -130,13 +123,10 @@ class MCPTests(ResponseAPIBaseTest):
         )
 
         # Should successfully make the request
-        self.assertEqual(resp.status_code, 200)
-
-        events = self.parse_sse_events(resp)
+        events = [event for event in resp]
         self.assertGreater(len(events), 0)
 
-        event_types = [e.get("event") for e in events]
-
+        event_types = [event.type for event in events]
         # Check for lifecycle events
         self.assertIn(
             "response.created", event_types, "Should have response.created event"
@@ -185,31 +175,31 @@ class MCPTests(ResponseAPIBaseTest):
         )
 
         # Verify final completed event has full response
-        completed_events = [e for e in events if e.get("event") == "response.completed"]
+        completed_events = [e for e in events if e.type == "response.completed"]
         self.assertEqual(len(completed_events), 1)
 
-        final_response = completed_events[0].get("data", {}).get("response", {})
-        self.assertIn("id", final_response)
-        self.assertEqual(final_response.get("status"), "completed")
-        self.assertIn("output", final_response)
+        final_response = completed_events[0].response
+        self.assertIsNotNone(final_response.id)
+        self.assertEqual(final_response.status, "completed")
+        self.assertIsNotNone(final_response.output)
 
         # Verify final output contains expected items
-        final_output = final_response.get("output", [])
-        final_output_types = [item.get("type") for item in final_output]
+        final_output = final_response.output
+        final_output_types = [item.type for item in final_output]
 
         self.assertIn("mcp_list_tools", final_output_types)
         self.assertIn("mcp_call", final_output_types)
 
         # Verify mcp_call items in final output
-        mcp_calls = [item for item in final_output if item.get("type") == "mcp_call"]
+        mcp_calls = [item for item in final_output if item.type == "mcp_call"]
         self.assertGreater(len(mcp_calls), 0)
 
         for mcp_call in mcp_calls:
-            self.assertEqual(mcp_call.get("status"), "completed")
-            self.assertEqual(mcp_call.get("server_label"), "brave")
-            self.assertIn("name", mcp_call)
-            self.assertIn("arguments", mcp_call)
-            self.assertIn("output", mcp_call)
+            self.assertEqual(mcp_call.status, "completed")
+            self.assertEqual(mcp_call.server_label, "brave")
+            self.assertIsNotNone(mcp_call.name)
+            self.assertIsNotNone(mcp_call.arguments)
+            self.assertIsNotNone(mcp_call.output)
 
         # Strict mode: additional validation for HTTP backends
         if self.mcp_validation_mode == "strict":
@@ -239,19 +229,17 @@ class MCPTests(ResponseAPIBaseTest):
 
             # Verify text deltas combine to final message
             text_deltas = [
-                e.get("data", {}).get("delta", "")
-                for e in events
-                if e.get("event") == "response.output_text.delta"
+                e.delta for e in events if e.type == "response.output_text.delta"
             ]
             self.assertGreater(len(text_deltas), 0, "Should have text deltas")
 
             # Get final text from output_text.done event
             text_done_events = [
-                e for e in events if e.get("event") == "response.output_text.done"
+                e for e in events if e.type == "response.output_text.done"
             ]
             self.assertGreater(len(text_done_events), 0)
 
-            final_text = text_done_events[0].get("data", {}).get("text", "")
+            final_text = text_done_events[0].text
             self.assertGreater(len(final_text), 0, "Final text should not be empty")
 
     def test_mixed_mcp_and_function_tools(self):
@@ -264,38 +252,33 @@ class MCPTests(ResponseAPIBaseTest):
         )
 
         # Should successfully make the request
-        self.assertEqual(resp.status_code, 200)
-
-        data = resp.json()
+        self.assertIsNone(resp.error)
 
         # Basic response structure
-        self.assertIn("id", data)
-        self.assertIn("status", data)
-        self.assertIn("output", data)
+        self.assertIsNotNone(resp.id)
+        self.assertIsNotNone(resp.status)
+        self.assertIsNotNone(resp.output)
 
         # Verify output array is not empty
-        output = data["output"]
+        output = resp.output
         self.assertIsInstance(output, list)
         self.assertGreater(len(output), 0)
 
         # Check for function_call (not mcp_call for get_weather)
-        function_calls = [
-            item for item in output if item.get("type") == "function_call"
-        ]
+        function_calls = [item for item in output if item.type == "function_call"]
         self.assertGreater(
             len(function_calls), 0, "Response should contain at least one function_call"
         )
 
         # Verify function_call structure for get_weather
         weather_call = function_calls[0]
-        self.assertIn("name", weather_call)
-        self.assertEqual(weather_call["name"], "get_weather")
-        self.assertIn("call_id", weather_call)
-        self.assertIn("arguments", weather_call)
-        self.assertIn("status", weather_call)
+        self.assertEqual(weather_call.name, "get_weather")
+        self.assertIsNotNone(weather_call.call_id)
+        self.assertIsNotNone(weather_call.arguments)
+        self.assertIsNotNone(weather_call.status)
 
         # Parse and verify arguments
-        args = json.loads(weather_call["arguments"])
+        args = json.loads(weather_call.arguments)
         self.assertIn("location", args)
         self.assertIn("seattle", args["location"].lower())
 
@@ -309,12 +292,10 @@ class MCPTests(ResponseAPIBaseTest):
         )
 
         # Should successfully make the request
-        self.assertEqual(resp.status_code, 200)
-
-        events = self.parse_sse_events(resp)
+        events = [event for event in resp]
         self.assertGreater(len(events), 0)
 
-        event_types = [e.get("event") for e in events]
+        event_types = [e.type for e in events]
 
         # Check for lifecycle events
         self.assertIn(
@@ -345,8 +326,8 @@ class MCPTests(ResponseAPIBaseTest):
         mcp_call_arg_events = [
             e
             for e in events
-            if e.get("event") == "response.mcp_call_arguments.delta"
-            and "get_weather" in str(e.get("data", {}))
+            if e.type == "response.mcp_call_arguments.delta"
+            and "get_weather" in str(e.delta)
         ]
         self.assertEqual(
             len(mcp_call_arg_events),
@@ -356,9 +337,7 @@ class MCPTests(ResponseAPIBaseTest):
 
         # Verify function_call_arguments.delta event structure
         func_arg_deltas = [
-            e
-            for e in events
-            if e.get("event") == "response.function_call_arguments.delta"
+            e for e in events if e.type == "response.function_call_arguments.delta"
         ]
         self.assertGreater(
             len(func_arg_deltas), 0, "Should have function_call_arguments.delta events"
@@ -367,8 +346,7 @@ class MCPTests(ResponseAPIBaseTest):
         # Check that at least one delta event contains location arguments
         has_location = False
         for event in func_arg_deltas:
-            data = event.get("data", {})
-            delta = data.get("delta", "")
+            delta = event.delta
             if "location" in delta.lower() or "seattle" in delta.lower():
                 has_location = True
                 break

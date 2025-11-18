@@ -37,7 +37,7 @@ class ModelTaskType(Enum):
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
 
-    def is_image_task(self):
+    def is_image_gen(self):
         return self == ModelTaskType.T2I or self == ModelTaskType.I2I
 
 
@@ -134,11 +134,14 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def set_width_and_height(self, width, height, image):
+    def adjust_size(self, width, height, image):
         """
         image: input image
         """
         return width, height
+
+    def adjust_num_frames(self, num_frames):
+        return num_frames
 
     # called in ImageEncodingStage, preprocess the image
     def preprocess_image(self, image, image_processor: VaeImageProcessor):
@@ -351,13 +354,14 @@ class PipelineConfig:
 
         # 2. Instantiate PipelineConfig
         if model_info is None:
-            logger.warning(
-                "Couldn't find model info for %s. Using the default pipeline config.",
-                model_path,
+            # The error is already logged in get_model_info.
+            # We raise an exception here to stop the execution.
+            raise ValueError(
+                f"Failed to get model info for '{model_path}'. "
+                "Please check the model path and ensure it is registered correctly."
             )
-            pipeline_config = cls()
-        else:
-            pipeline_config = model_info.pipeline_config_cls()
+
+        pipeline_config = model_info.pipeline_config_cls()
 
         # 3. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):

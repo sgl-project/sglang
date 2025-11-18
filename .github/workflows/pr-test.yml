@@ -118,6 +118,9 @@ jobs:
               - "sgl-kernel/**"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+              - "python/sglang/cli/**"
+              - "python/*.toml"
+              - ".github/workflows/pr-test.yml"
 
   # =============================================== sgl-kernel ====================================================
 
@@ -305,17 +308,23 @@ jobs:
           echo "All benchmark tests completed!"
 
   # =============================================== multimodal_gen ====================================================
-  multimodal-gen-test:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Run placeholder test
-        run: |
-          echo "Running multimodal_gen tests..."
-          echo "This is a placeholder for future tests."
+  # multimodal-gen-test:
+  #   needs: [check-changes]
+  #   if: needs.check-changes.outputs.multimodal_gen == 'true'
+  #   runs-on: 1-gpu-runner
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Install dependencies
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+
+  #     - name: Run diffusion server tests
+  #       timeout-minutes: 60
+  #       run: |
+  #         cd python
+  #         pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
@@ -350,7 +359,7 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  unit-test-frontend:
+  stage-a-test-1:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
@@ -376,11 +385,13 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          cd test/lang
-          python3 run_suite.py --suite per-commit
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-a-test-1
+          # temporarily put backend-independent cpu tests here
+          python3 run_suite.py --hw cpu --suite default
 
   unit-test-backend-1-gpu:
-    needs: [check-changes, unit-test-frontend, sgl-kernel-build-wheels]
+    needs: [check-changes, stage-a-test-1, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -547,7 +558,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -608,7 +619,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
   performance-test-1-gpu-part-2:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -661,7 +672,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-1-gpu-part-3:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -694,6 +705,18 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_batch_scaling
+
+      - name: Benchmark Embeddings online latency and throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_latency_throughput
+
+      - name: Benchmark Embeddings online latency and throughput (batch size scaling)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -755,7 +778,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -885,6 +908,9 @@ jobs:
       RUNNER_LABELS: 4-gpu-b200
     strategy:
       fail-fast: false
+      matrix:
+        part: [0, 1]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -902,10 +928,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 2 --timeout-per-file 1800
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
@@ -948,12 +974,13 @@ jobs:
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
 
-        multimodal-gen-test,
+        # multimodal-gen-test,
 
-        unit-test-frontend,
+        stage-a-test-1,
         unit-test-backend-1-gpu,
         unit-test-backend-2-gpu,
         unit-test-backend-4-gpu,
+        unit-test-backend-8-gpu-h20,
         unit-test-backend-8-gpu-h200,
         performance-test-1-gpu-part-1,
         performance-test-1-gpu-part-2,
@@ -990,7 +1017,6 @@ jobs:
               exit 1
             fi
           done
-
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0

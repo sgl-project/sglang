@@ -58,7 +58,7 @@ class TestDeepseekV32MTP(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=8,
+            num_shots=20,
             data_path=None,
             num_questions=1400,
             parallel=1400,
@@ -81,7 +81,7 @@ class TestDeepseekV32MTP(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(metrics["accuracy"], 0.94)
             self.assertGreater(avg_spec_accept_length, 2.7)
 
     def test_bs_1_speed(self):

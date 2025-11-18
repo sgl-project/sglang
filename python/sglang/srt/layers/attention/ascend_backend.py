@@ -161,9 +161,25 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
-        metadata.actual_seq_lengths_q = torch.tensor(
-            [1 + i * 1 for i in range(bs)], dtype=torch.int32, device=seq_lens.device
-        )
+        if (
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+            or forward_mode.is_draft_extend()
+        ):
+            metadata.actual_seq_lengths_q = torch.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens
+                + bs * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+        else:
+            metadata.actual_seq_lengths_q = torch.tensor(
+                [1 + i * 1 for i in range(bs)],
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
 
         self.graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -193,7 +209,8 @@ class AscendAttnBackend(AttentionBackend):
         )
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
-
+        if forward_mode.is_target_verify():
+            seq_lens = seq_lens + self.speculative_num_draft_tokens
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         self.forward_metadata = metadata
@@ -217,7 +234,12 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor = None,
     ):
 
-        is_prefill = forward_batch.forward_mode.is_extend()
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_draft_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        )
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -232,9 +254,30 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0)
         else:
             if self.forward_metadata.actual_seq_lengths_q is None:
-                actual_seq_qlen = (
-                    torch.arange(1, q.shape[0] + 1).to(q.device).to(torch.int32)
-                )
+                if (
+                    forward_batch.forward_mode.is_draft_extend_v2()
+                    or forward_batch.forward_mode.is_target_verify()
+                ):
+                    actual_seq_qlen = (
+                        torch.arange(
+                            self.speculative_num_draft_tokens,
+                            self.speculative_num_draft_tokens + q.shape[0],
+                            self.speculative_num_draft_tokens,
+                            dtype=torch.int32,
+                        )
+                        .to(q.device)
+                        .to(torch.int32)
+                    )
+                elif forward_batch.forward_mode.is_draft_extend():
+                    actual_seq_qlen = (
+                        forward_batch.extend_seq_lens.cumsum()
+                        .to(q.device)
+                        .to(torch.int32)
+                    )
+                else:
+                    actual_seq_qlen = (
+                        torch.arange(1, q.shape[0] + 1).to(q.device).to(torch.int32)
+                    )
             else:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
         if self.forward_metadata.seq_lens_cpu_int is None:
@@ -477,7 +520,7 @@ class AscendAttnBackend(AttentionBackend):
             -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
         )
 
-        q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank)
+        q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
         q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
         if not self.graph_mode:
             num_token_padding = q.shape[0]
@@ -919,7 +962,7 @@ class AscendAttnMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
-                seq_lens_cpu=None,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
         self.common_template(forward_batch, call_fn)

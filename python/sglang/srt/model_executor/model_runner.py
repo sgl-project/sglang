@@ -112,6 +112,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.hook_manager import register_hooks
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -149,6 +150,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -496,6 +498,9 @@ class ModelRunner:
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
+        if server_args.hooks:
+            register_hooks(self.model, server_args.hooks)
+
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
@@ -756,9 +761,12 @@ class ModelRunner:
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
 
+        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
+            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
+        )
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
-            enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
+            enable_cpu_backup=enable_cpu_backup,
         ):
             self.model = get_model(
                 model_config=self.model_config,
@@ -768,6 +776,11 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state(reverse=True)
 
         get_offloader().post_init()
+
+        # Register model for layerwise NVTX profiling if enabled
+        if self.server_args.enable_layerwise_nvtx_marker:
+            self.pyt_hooks = PytHooks()
+            self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -1325,6 +1338,24 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                # kv_scale_buffer
+                scale_block_size = 16
+
+                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                k = self.model_config.head_dim
+                cell_size = (cell_size // 2) + (
+                    (
+                        n
+                        * k
+                        * num_layers
+                        * 2
+                        * torch._utils._element_size(self.kv_cache_dtype)
+                    )
+                    // scale_block_size
+                )
+
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -1810,6 +1841,7 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     **extra_args,
                 )
@@ -2200,6 +2232,8 @@ class ModelRunner:
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
+        else:
+            forward_batch.prepare_attn_tp_scatter_input(self)
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
@@ -2213,7 +2247,7 @@ class ModelRunner:
                 reinit_attn_backend=reinit_attn_backend,
                 forward_count=split_forward_count,
             )
-        elif forward_batch.forward_mode.is_extend():
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
