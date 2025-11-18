@@ -9,16 +9,26 @@ import torch
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
 
-try:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+from sglang.multimodal_gen.runtime.utils.common import (
+        get_bool_env_var,
+        is_cpu,
+        is_cuda,
+        is_hip,
+        is_npu,
+        is_xpu,
+        )
 
-    # flash_attn 3 no longer have a different API, see following commit:
-    # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
-    flash_attn_func = flash_attn_varlen_func
-except ImportError as e:
-    print("error fa3")
-    #raise e
+_is_cuda = is_cuda()
 
+if _is_cuda:
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        # flash_attn 3 no longer have a different API, see following commit:
+        # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
+        flash_attn_func = flash_attn_varlen_func
+    except ImportError as e:
+        raise e
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -107,6 +117,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.attention_metadata = FlashAttentionMetadata()
+        assert _is_cuda
 
     def forward(
         self,

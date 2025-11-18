@@ -19,8 +19,19 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sglang.multimodal_gen.runtime.utils.common import (
+        get_bool_env_var,
+        is_cpu,
+        is_cuda,
+        is_hip,
+        is_npu,
+        is_xpu,
+        )
+
+_is_cuda = is_cuda()
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+if _is_cuda:
+    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass

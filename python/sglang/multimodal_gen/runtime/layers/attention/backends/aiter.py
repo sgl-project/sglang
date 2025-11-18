@@ -33,7 +33,7 @@ class AITerBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        raise NotImplementedError("AITer backend does not have a metadata builder.")
+        return None
 
 
 class AITerImpl(AttentionImpl):

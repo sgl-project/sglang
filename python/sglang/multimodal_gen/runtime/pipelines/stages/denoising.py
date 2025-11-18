@@ -34,9 +34,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-#from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-#    FlashAttentionBackend,
-#)
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionBackend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
@@ -993,9 +993,9 @@ class DenoisingStage(PipelineStage):
             The attention metadata, or None if not applicable.
         """
         attn_metadata = None
-        #self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
-        #if self.attn_metadata_builder_cls:
-        #    self.attn_metadata_builder = self.attn_metadata_builder_cls()
+        self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        if self.attn_metadata_builder_cls:
+            self.attn_metadata_builder = self.attn_metadata_builder_cls()
         if (st_attn_available and self.attn_backend == SlidingTileAttentionBackend) or (
             vsa_available and self.attn_backend == VideoSparseAttentionBackend
         ):
@@ -1017,10 +1017,10 @@ class DenoisingStage(PipelineStage):
                     "device": get_local_torch_device(),
                 }
             )
-#        elif self.attn_backend == FlashAttentionBackend:
-#            attn_metadata = self.attn_metadata_builder.build(
-#                raw_latent_shape=batch.raw_latent_shape
-#            )
+        elif self.attn_backend == FlashAttentionBackend:
+            attn_metadata = self.attn_metadata_builder.build(
+                raw_latent_shape=batch.raw_latent_shape
+            )
         else:
             return None
 
