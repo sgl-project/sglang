@@ -15,12 +15,7 @@ from openai import OpenAI
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
-from sglang.multimodal_gen.test.server.diffusion_config import (
-    BASELINE_CONFIG,
-    DIFFUSION_CASES,
-    DiffusionCase,
-)
-from sglang.multimodal_gen.test.server.diffusion_server import (
+from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
     ServerContext,
@@ -28,6 +23,11 @@ from sglang.multimodal_gen.test.server.diffusion_server import (
     VideoPerformanceValidator,
     WarmupRunner,
     download_image_from_url,
+)
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    BASELINE_CONFIG,
+    DIFFUSION_CASES,
+    DiffusionTestCase,
 )
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
@@ -42,13 +42,13 @@ logger = init_logger(__name__)
 
 
 @pytest.fixture(params=DIFFUSION_CASES, ids=lambda c: c.id)
-def case(request) -> DiffusionCase:
-    """Provide a DiffusionCase for each test."""
+def case(request) -> DiffusionTestCase:
+    """Provide a DiffusionTestCase for each test."""
     return request.param
 
 
 @pytest.fixture
-def diffusion_server(case: DiffusionCase) -> ServerContext:
+def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
@@ -132,7 +132,7 @@ class TestDiffusionPerformance:
     def _run_and_collect(
         self,
         ctx: ServerContext,
-        case: DiffusionCase,
+        case: DiffusionTestCase,
         generate_fn: Callable[[], None],
     ) -> tuple[dict, dict]:
         """Run generation and collect performance records."""
@@ -160,7 +160,7 @@ class TestDiffusionPerformance:
     def _generate_for_case(
         self,
         ctx: ServerContext,
-        case: DiffusionCase,
+        case: DiffusionTestCase,
     ) -> Callable[[], None]:
         """Return appropriate generation function for the case."""
         client = self._client(ctx)
@@ -333,7 +333,7 @@ class TestDiffusionPerformance:
 
     def _validate_and_record(
         self,
-        case: DiffusionCase,
+        case: DiffusionTestCase,
         perf_record: dict,
         stage_metrics: dict,
     ) -> None:
@@ -430,7 +430,7 @@ class TestDiffusionPerformance:
 
     def test_diffusion_perf(
         self,
-        case: DiffusionCase,
+        case: DiffusionTestCase,
         diffusion_server: ServerContext,
     ):
         """Single parametrized test that runs for all cases.
