@@ -30,6 +30,7 @@ jobs:
             core.setOutput("draft", pr.data.draft);
             core.setOutput("user", pr.data.user.login);
 
+
       - name: Block draft PR
         if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
         run: |
