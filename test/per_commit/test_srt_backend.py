@@ -1,12 +1,7 @@
-"""
-Usage:
-python3 -m unittest test_srt_backend.TestSRTBackend.test_gen_min_new_tokens
-python3 -m unittest test_srt_backend.TestSRTBackend.test_hellaswag_select
-"""
-
 import unittest
 
 import sglang as sgl
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_programs import (
     test_decode_int,
     test_decode_json_regex,
@@ -23,6 +18,8 @@ from sglang.test.test_programs import (
     test_tool_use,
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
+
+register_cuda_ci(est_time=80, suite="stage-a-test-1")
 
 
 class TestSRTBackend(CustomTestCase):
