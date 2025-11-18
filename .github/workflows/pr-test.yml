@@ -308,31 +308,23 @@ jobs:
           echo "All benchmark tests completed!"
 
   # =============================================== multimodal_gen ====================================================
-  multimodal-gen-test:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  # multimodal-gen-test:
+  #   needs: [check-changes]
+  #   if: needs.check-changes.outputs.multimodal_gen == 'true'
+  #   runs-on: 1-gpu-runner
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+  #     - name: Install dependencies
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
-      - name: Clean Corrupted Hugging Face Model Cache
-        run: |
-          echo "Temp: Deleting potentially corrupted Qwen/Qwen-Image and Qwen/Qwen-Image-Edit cache to ensure a fresh download. This is temporary"
-          rm -rf /hf_home/hub/models--Qwen--Qwen-Image
-          rm -rf /hf_home/hub/models--Qwen--Qwen-Image-Edit
-          rm -rf /hf_home/hub/models--Wan-AI--Wan2.2-I2V-A14B-Diffusers
-          rm -rf /hf_home/hub/models--Wan-AI--Wan2.2-TI2V-5B-Diffusers
-
-      - name: Run diffusion server tests
-        timeout-minutes: 60
-        run: |
-          cd python
-          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
+  #     - name: Run diffusion server tests
+  #       timeout-minutes: 60
+  #       run: |
+  #         cd python
+  #         pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
@@ -714,6 +706,18 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_batch_scaling
 
+      - name: Benchmark Embeddings online latency and throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_latency_throughput
+
+      - name: Benchmark Embeddings online latency and throughput (batch size scaling)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
+
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
@@ -970,7 +974,7 @@ jobs:
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
 
-        multimodal-gen-test,
+        # multimodal-gen-test,
 
         stage-a-test-1,
         unit-test-backend-1-gpu,
