@@ -100,7 +100,6 @@ class ConditioningStage(PipelineStage):
                 batch.negative_prompt_embeds = [negative_prompt_embeds]
                 batch.neg_pooled_embeds = [negative_pooled_prompt_embeds]
 
-
             return batch
         # TODO!!
         if not batch.do_classifier_free_guidance:
