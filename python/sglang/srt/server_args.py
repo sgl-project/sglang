@@ -3915,8 +3915,6 @@ class ServerArgs:
         ), "schedule_conservativeness must be non-negative"
 
     def check_lora_server_args(self):
-        from sglang.srt.lora.lora_registry import LoRARef
-
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.

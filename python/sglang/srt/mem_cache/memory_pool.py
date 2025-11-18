@@ -552,7 +552,7 @@ class MHATokenToKVPool(KVCache):
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
-            self.device_module.Stream() if is_cuda() and enable_alt_stream else None
+            self.device_module.Stream() if _is_cuda and enable_alt_stream else None
         )
 
         if enable_kv_cache_copy:
@@ -932,8 +932,6 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
     ):
-        from sglang.srt.utils.common import is_npu
-
         self.size = size
         self.dtype = dtype
         self.device = device
@@ -948,7 +946,7 @@ class HybridLinearKVPool(KVCache):
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
-            if is_npu():
+            if _is_npu:
                 TokenToKVPoolClass = AscendTokenToKVPool
             else:
                 TokenToKVPoolClass = MHATokenToKVPool
