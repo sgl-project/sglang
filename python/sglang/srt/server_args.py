@@ -1096,8 +1096,8 @@ class ServerArgs:
                 f"Disabling Radix Cache for {model_arch} as it is not yet supported."
             )
             self.disable_radix_cache = True
-        elif model_arch in ["Qwen3ForCausalLM"]:
-            if is_cuda() and is_sm100_supported():
+        elif model_arch in ["Qwen3MoeForCausalLM"]:
+            if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
@@ -1120,7 +1120,7 @@ class ServerArgs:
                     "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
                 )
                 self.disable_overlap_schedule = True
-            if is_cuda() and is_sm100_supported():
+            if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
