@@ -69,7 +69,7 @@ jobs:
             const curRun = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id: context.runId
             });
-            const triggeringActor = curRun.data.triggering_actor?.login || context.actor;
+            let triggeringActor = curRun.data.triggering_actor?.login || context.actor;
             if (triggeringActor === "github-actions[bot]") {
               let prAuthor = null;
               if (Array.isArray(curRun.data.pull_requests) && curRun.data.pull_requests.length > 0) {
