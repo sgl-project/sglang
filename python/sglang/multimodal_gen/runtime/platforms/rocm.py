@@ -76,6 +76,10 @@ class RocmPlatform(Platform):
         elif selected_backend in (AttentionBackendEnum.FA, None):
             pass
 
+        elif selected_backend in (AttentionBackendEnum.AITER, None):
+            logger.info("Using AITER backend.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
