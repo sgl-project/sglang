@@ -1,16 +1,9 @@
-import math
-import os
 import re
 import time
 from typing import List, Union
 
-import numpy as np
 import torch
-import torchvision
-from PIL import Image
-from torchvision.transforms import InterpolationMode
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
@@ -22,6 +15,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.utils import logger
+
 
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(SGLangBaseProcessor):
