@@ -289,11 +289,11 @@ impl OpenAIRouter {
                 .map(|tools| extract_dynamic_mcp_servers(tools))
                 .unwrap_or_default();
 
-            // Build tools map with (server_label, tool_name) -> (Tool, server_url)
-            let tools_map = mcp.list_tools_for_request(&dynamic_servers).await;
+            // Build per-request tool inventory (combines static + dynamic tools)
+            let request_inventory = mcp.build_request_inventory(&dynamic_servers).await;
 
             // Transform MCP tools to function tools with formatted names
-            prepare_mcp_payload_for_streaming(&mut payload, &tools_map);
+            prepare_mcp_payload_for_streaming(&mut payload, &request_inventory);
 
             match execute_tool_loop(
                 &self.client,
@@ -303,7 +303,7 @@ impl OpenAIRouter {
                 original_body,
                 mcp,
                 &config,
-                &tools_map,
+                &request_inventory,
             )
             .await
             {

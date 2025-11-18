@@ -1,45 +1,23 @@
-//! MCP tool, prompt, and resource inventory.
+//! MCP tool inventory.
 //!
-//! Thread-safe cache for MCP capabilities across all connected servers.
+//! Thread-safe cache for MCP tools with composite keys to prevent name collisions.
 
 use dashmap::DashMap;
 
-use crate::mcp::config::{Prompt, RawResource, Tool};
+use crate::mcp::config::Tool;
 
-/// Cached tool with metadata
-#[derive(Clone)]
-pub struct CachedTool {
-    pub server_name: String,
-    pub tool: Tool,
-}
-
-/// Cached prompt with metadata
-#[derive(Clone)]
-pub struct CachedPrompt {
-    pub server_name: String,
-    pub prompt: Prompt,
-}
-
-/// Cached resource with metadata
-#[derive(Clone)]
-pub struct CachedResource {
-    pub server_name: String,
-    pub resource: RawResource,
-}
-
-/// Tool inventory with periodic refresh
+/// Tool inventory with composite key support
 ///
-/// Provides thread-safe caching of MCP tools, prompts, and resources.
-/// Entries are refreshed periodically by background tasks.
+/// Provides thread-safe caching of MCP tools using composite keys (server_label, tool_name).
+/// This prevents name collisions across multiple MCP servers and enables per-request
+/// dynamic tool management.
+///
+/// Architecture:
+/// - **Static tools**: One shared inventory for tools from config (persists for server lifetime)
+/// - **Dynamic tools**: Per-request inventory for tools from request MCP servers (request lifetime only)
 pub struct ToolInventory {
-    /// Map of tool_name -> cached tool
-    tools: DashMap<String, CachedTool>,
-
-    /// Map of prompt_name -> cached prompt
-    prompts: DashMap<String, CachedPrompt>,
-
-    /// Map of resource_uri -> cached resource
-    resources: DashMap<String, CachedResource>,
+    /// Map of (server_label, tool_name) -> (Tool, server_url)
+    tools: DashMap<(String, String), (Tool, String)>,
 }
 
 impl ToolInventory {
@@ -47,8 +25,88 @@ impl ToolInventory {
     pub fn new() -> Self {
         Self {
             tools: DashMap::new(),
-            prompts: DashMap::new(),
-            resources: DashMap::new(),
+        }
+    }
+
+    /// Get a tool by composite key
+    ///
+    /// Returns (Tool, server_url) if found.
+    pub fn get_tool(&self, server_label: &str, tool_name: &str) -> Option<(Tool, String)> {
+        self.tools
+            .get(&(server_label.to_string(), tool_name.to_string()))
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Check if tool exists by composite key
+    pub fn has_tool(&self, server_label: &str, tool_name: &str) -> bool {
+        self.tools
+            .contains_key(&(server_label.to_string(), tool_name.to_string()))
+    }
+
+    /// Insert or update a tool
+    ///
+    /// # Arguments
+    /// * `server_label` - Server label (e.g., "weather-api", "database")
+    /// * `tool_name` - Tool name (e.g., "get_weather", "query")
+    /// * `tool` - Tool definition from MCP server
+    /// * `server_url` - MCP server URL for routing tool calls
+    pub fn insert_tool(
+        &self,
+        server_label: String,
+        tool_name: String,
+        tool: Tool,
+        server_url: String,
+    ) {
+        self.tools
+            .insert((server_label, tool_name), (tool, server_url));
+    }
+
+    /// List all tools
+    ///
+    /// Returns Vec of (server_label, tool_name, Tool, server_url)
+    pub fn list_tools(&self) -> Vec<(String, String, Tool, String)> {
+        self.tools
+            .iter()
+            .map(|entry| {
+                let ((server_label, tool_name), (tool, server_url)) = entry.pair();
+                (
+                    server_label.clone(),
+                    tool_name.clone(),
+                    tool.clone(),
+                    server_url.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Clear all tools for a specific server
+    ///
+    /// Used when LRU evicts a client or when cleaning up after a request.
+    pub fn clear_server_tools(&self, server_label: &str) {
+        self.tools.retain(|(label, _), _| label != server_label);
+    }
+
+    /// Get count of cached tools
+    pub fn count(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Clear all cached tools
+    pub fn clear_all(&self) {
+        self.tools.clear();
+    }
+
+    /// Merge another inventory into this one
+    ///
+    /// Used to combine static and dynamic tools for request processing.
+    /// Entries from `other` will overwrite entries with the same key.
+    pub fn merge(&self, other: &ToolInventory) {
+        for entry in other.tools.iter() {
+            let ((server_label, tool_name), (tool, server_url)) = entry.pair();
+            self.tools.insert(
+                (server_label.clone(), tool_name.clone()),
+                (tool.clone(), server_url.clone()),
+            );
         }
     }
 }
@@ -59,169 +117,13 @@ impl Default for ToolInventory {
     }
 }
 
-impl ToolInventory {
-    // ============================================================================
-    // Tool Methods
-    // ============================================================================
-
-    /// Get a tool if it exists
-    pub fn get_tool(&self, tool_name: &str) -> Option<(String, Tool)> {
-        self.tools
-            .get(tool_name)
-            .map(|entry| (entry.server_name.clone(), entry.tool.clone()))
-    }
-
-    /// Check if tool exists
-    pub fn has_tool(&self, tool_name: &str) -> bool {
-        self.tools.contains_key(tool_name)
-    }
-
-    /// Insert or update a tool
-    pub fn insert_tool(&self, tool_name: String, server_name: String, tool: Tool) {
-        self.tools
-            .insert(tool_name, CachedTool { server_name, tool });
-    }
-
-    /// Get all tools
-    pub fn list_tools(&self) -> Vec<(String, String, Tool)> {
-        self.tools
-            .iter()
-            .map(|entry| {
-                let (name, cached) = entry.pair();
-                (
-                    name.clone(),
-                    cached.server_name.clone(),
-                    cached.tool.clone(),
-                )
-            })
-            .collect()
-    }
-
-    // ============================================================================
-    // Prompt Methods
-    // ============================================================================
-
-    /// Get a prompt if it exists
-    pub fn get_prompt(&self, prompt_name: &str) -> Option<(String, Prompt)> {
-        self.prompts
-            .get(prompt_name)
-            .map(|entry| (entry.server_name.clone(), entry.prompt.clone()))
-    }
-
-    /// Check if prompt exists
-    pub fn has_prompt(&self, prompt_name: &str) -> bool {
-        self.prompts.contains_key(prompt_name)
-    }
-
-    /// Insert or update a prompt
-    pub fn insert_prompt(&self, prompt_name: String, server_name: String, prompt: Prompt) {
-        self.prompts.insert(
-            prompt_name,
-            CachedPrompt {
-                server_name,
-                prompt,
-            },
-        );
-    }
-
-    /// Get all prompts
-    pub fn list_prompts(&self) -> Vec<(String, String, Prompt)> {
-        self.prompts
-            .iter()
-            .map(|entry| {
-                let (name, cached) = entry.pair();
-                (
-                    name.clone(),
-                    cached.server_name.clone(),
-                    cached.prompt.clone(),
-                )
-            })
-            .collect()
-    }
-
-    // ============================================================================
-    // Resource Methods
-    // ============================================================================
-
-    /// Get a resource if it exists
-    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, RawResource)> {
-        self.resources
-            .get(resource_uri)
-            .map(|entry| (entry.server_name.clone(), entry.resource.clone()))
-    }
-
-    /// Check if resource exists
-    pub fn has_resource(&self, resource_uri: &str) -> bool {
-        self.resources.contains_key(resource_uri)
-    }
-
-    /// Insert or update a resource
-    pub fn insert_resource(
-        &self,
-        resource_uri: String,
-        server_name: String,
-        resource: RawResource,
-    ) {
-        self.resources.insert(
-            resource_uri,
-            CachedResource {
-                server_name,
-                resource,
-            },
-        );
-    }
-
-    /// Get all resources
-    pub fn list_resources(&self) -> Vec<(String, String, RawResource)> {
-        self.resources
-            .iter()
-            .map(|entry| {
-                let (uri, cached) = entry.pair();
-                (
-                    uri.clone(),
-                    cached.server_name.clone(),
-                    cached.resource.clone(),
-                )
-            })
-            .collect()
-    }
-
-    // ============================================================================
-    // Server Management Methods
-    // ============================================================================
-
-    /// Clear all cached items for a specific server (called when LRU evicts client)
-    pub fn clear_server_tools(&self, server_name: &str) {
-        self.tools
-            .retain(|_, cached| cached.server_name != server_name);
-        self.prompts
-            .retain(|_, cached| cached.server_name != server_name);
-        self.resources
-            .retain(|_, cached| cached.server_name != server_name);
-    }
-
-    /// Get count of cached items
-    pub fn counts(&self) -> (usize, usize, usize) {
-        (self.tools.len(), self.prompts.len(), self.resources.len())
-    }
-
-    /// Clear all cached items
-    pub fn clear_all(&self) {
-        self.tools.clear();
-        self.prompts.clear();
-        self.resources.clear();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::config::{Prompt, RawResource, Tool};
+    use std::{borrow::Cow, sync::Arc};
 
     // Helper to create a test tool
     fn create_test_tool(name: &str) -> Tool {
-        use std::{borrow::Cow, sync::Arc};
-
         let schema_obj = serde_json::json!({
             "type": "object",
             "properties": {}
@@ -244,43 +146,24 @@ mod tests {
         }
     }
 
-    // Helper to create a test prompt
-    fn create_test_prompt(name: &str) -> Prompt {
-        Prompt {
-            name: name.to_string(),
-            title: None,
-            description: Some(format!("Test prompt: {}", name)),
-            arguments: None,
-            icons: None,
-        }
-    }
-
-    // Helper to create a test resource
-    fn create_test_resource(uri: &str) -> RawResource {
-        RawResource {
-            uri: uri.to_string(),
-            name: uri.to_string(),
-            title: None,
-            description: Some(format!("Test resource: {}", uri)),
-            mime_type: Some("text/plain".to_string()),
-            size: None,
-            icons: None,
-        }
-    }
-
     #[test]
     fn test_tool_insert_and_get() {
         let inventory = ToolInventory::new();
         let tool = create_test_tool("test_tool");
 
-        inventory.insert_tool("test_tool".to_string(), "server1".to_string(), tool.clone());
+        inventory.insert_tool(
+            "server1".to_string(),
+            "test_tool".to_string(),
+            tool.clone(),
+            "http://server1:8000".to_string(),
+        );
 
-        let result = inventory.get_tool("test_tool");
+        let result = inventory.get_tool("server1", "test_tool");
         assert!(result.is_some());
 
-        let (server_name, retrieved_tool) = result.unwrap();
-        assert_eq!(server_name, "server1");
+        let (retrieved_tool, server_url) = result.unwrap();
         assert_eq!(retrieved_tool.name, "test_tool");
+        assert_eq!(server_url, "http://server1:8000");
     }
 
     #[test]
@@ -288,11 +171,49 @@ mod tests {
         let inventory = ToolInventory::new();
         let tool = create_test_tool("check_tool");
 
-        assert!(!inventory.has_tool("check_tool"));
+        assert!(!inventory.has_tool("server1", "check_tool"));
 
-        inventory.insert_tool("check_tool".to_string(), "server1".to_string(), tool);
+        inventory.insert_tool(
+            "server1".to_string(),
+            "check_tool".to_string(),
+            tool,
+            "http://server1:8000".to_string(),
+        );
 
-        assert!(inventory.has_tool("check_tool"));
+        assert!(inventory.has_tool("server1", "check_tool"));
+    }
+
+    #[test]
+    fn test_composite_key_prevents_collisions() {
+        let inventory = ToolInventory::new();
+        let tool1 = create_test_tool("weather");
+        let tool2 = create_test_tool("weather");
+
+        // Same tool name, different servers - should not collide
+        inventory.insert_tool(
+            "server1".to_string(),
+            "weather".to_string(),
+            tool1,
+            "http://server1:8000".to_string(),
+        );
+        inventory.insert_tool(
+            "server2".to_string(),
+            "weather".to_string(),
+            tool2,
+            "http://server2:8000".to_string(),
+        );
+
+        let result1 = inventory.get_tool("server1", "weather");
+        let result2 = inventory.get_tool("server2", "weather");
+
+        assert!(result1.is_some());
+        assert!(result2.is_some());
+
+        let (_, url1) = result1.unwrap();
+        let (_, url2) = result2.unwrap();
+
+        assert_eq!(url1, "http://server1:8000");
+        assert_eq!(url2, "http://server2:8000");
     }
 
     #[test]
@@ -300,23 +221,34 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
+            "server1".to_string(),
             "tool1".to_string(),
-            "server1".to_string(),
             create_test_tool("tool1"),
+            "http://server1:8000".to_string(),
         );
         inventory.insert_tool(
-            "tool2".to_string(),
             "server1".to_string(),
+            "tool2".to_string(),
             create_test_tool("tool2"),
+            "http://server1:8000".to_string(),
         );
         inventory.insert_tool(
-            "tool3".to_string(),
             "server2".to_string(),
+            "tool3".to_string(),
             create_test_tool("tool3"),
+            "http://server2:8000".to_string(),
         );
 
         let tools = inventory.list_tools();
         assert_eq!(tools.len(), 3);
+
+        // Verify all entries have correct structure
+        for (server_label, tool_name, tool, server_url) in tools {
+            assert!(!server_label.is_empty());
+            assert!(!tool_name.is_empty());
+            assert_eq!(tool.name, tool_name);
+            assert!(server_url.starts_with("http://"));
+        }
     }
 
     #[test]
@@ -324,65 +256,90 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
-            "tool1".to_string(),
             "server1".to_string(),
+            "tool1".to_string(),
             create_test_tool("tool1"),
+            "http://server1:8000".to_string(),
         );
         inventory.insert_tool(
+            "server1".to_string(),
             "tool2".to_string(),
-            "server2".to_string(),
             create_test_tool("tool2"),
+            "http://server1:8000".to_string(),
+        );
+        inventory.insert_tool(
+            "server2".to_string(),
+            "tool3".to_string(),
+            create_test_tool("tool3"),
+            "http://server2:8000".to_string(),
         );
 
-        assert_eq!(inventory.list_tools().len(), 2);
+        assert_eq!(inventory.count(), 3);
 
         inventory.clear_server_tools("server1");
 
-        let tools = inventory.list_tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].0, "tool2");
+        assert_eq!(inventory.count(), 1);
+        assert!(!inventory.has_tool("server1", "tool1"));
+        assert!(!inventory.has_tool("server1", "tool2"));
+        assert!(inventory.has_tool("server2", "tool3"));
     }
 
     #[test]
-    fn test_prompt_operations() {
-        let inventory = ToolInventory::new();
-        let prompt = create_test_prompt("test_prompt");
+    fn test_merge_inventories() {
+        let static_inventory = ToolInventory::new();
+        let dynamic_inventory = ToolInventory::new();
 
-        inventory.insert_prompt(
-            "test_prompt".to_string(),
-            "server1".to_string(),
-            prompt.clone(),
+        // Add static tools
+        static_inventory.insert_tool(
+            "static-server".to_string(),
+            "tool1".to_string(),
+            create_test_tool("tool1"),
+            "http://static:8000".to_string(),
         );
 
-        assert!(inventory.has_prompt("test_prompt"));
+        // Add dynamic tools
+        dynamic_inventory.insert_tool(
+            "dynamic-server".to_string(),
+            "tool2".to_string(),
+            create_test_tool("tool2"),
+            "http://dynamic:8000".to_string(),
+        );
 
-        let result = inventory.get_prompt("test_prompt");
-        assert!(result.is_some());
+        // Merge dynamic into static
+        static_inventory.merge(&dynamic_inventory);
 
-        let (server_name, retrieved_prompt) = result.unwrap();
-        assert_eq!(server_name, "server1");
-        assert_eq!(retrieved_prompt.name, "test_prompt");
+        // Should have both tools
+        assert_eq!(static_inventory.count(), 2);
+        assert!(static_inventory.has_tool("static-server", "tool1"));
+        assert!(static_inventory.has_tool("dynamic-server", "tool2"));
     }
 
     #[test]
-    fn test_resource_operations() {
-        let inventory = ToolInventory::new();
-        let resource = create_test_resource("file:///test.txt");
+    fn test_merge_overwrites_duplicates() {
+        let inventory1 = ToolInventory::new();
+        let inventory2 = ToolInventory::new();
 
-        inventory.insert_resource(
-            "file:///test.txt".to_string(),
+        // Add same key to both
+        inventory1.insert_tool(
             "server1".to_string(),
-            resource.clone(),
+            "tool1".to_string(),
+            create_test_tool("tool1"),
+            "http://old-url:8000".to_string(),
         );
 
-        assert!(inventory.has_resource("file:///test.txt"));
+        inventory2.insert_tool(
+            "server1".to_string(),
+            "tool1".to_string(),
+            create_test_tool("tool1"),
+            "http://new-url:8000".to_string(),
+        );
 
-        let result = inventory.get_resource("file:///test.txt");
-        assert!(result.is_some());
+        // Merge inventory2 into inventory1
+        inventory1.merge(&inventory2);
 
-        let (server_name, retrieved_resource) = result.unwrap();
-        assert_eq!(server_name, "server1");
-        assert_eq!(retrieved_resource.uri, "file:///test.txt");
+        // Should have new URL
+        let (_, url) = inventory1.get_tool("server1", "tool1").unwrap();
+        assert_eq!(url, "http://new-url:8000");
     }
 
     #[tokio::test]
@@ -397,7 +354,12 @@ mod tests {
             let inv = Arc::clone(&inventory);
             let handle = tokio::spawn(async move {
                 let tool = create_test_tool(&format!("tool_{}", i));
-                inv.insert_tool(format!("tool_{}", i), format!("server_{}", i % 3), tool);
+                inv.insert_tool(
+                    format!("server_{}", i % 3),
+                    format!("tool_{}", i),
+                    tool,
+                    format!("http://server{}:8000", i % 3),
+                );
             });
             handles.push(handle);
         }
@@ -408,8 +370,7 @@ mod tests {
         }
 
         // Should have 10 tools
-        let (tools, _, _) = inventory.counts();
-        assert_eq!(tools, 10);
+        assert_eq!(inventory.count(), 10);
     }
 
     #[test]
@@ -417,31 +378,22 @@ mod tests {
         let inventory = ToolInventory::new();
 
         inventory.insert_tool(
+            "server1".to_string(),
             "tool1".to_string(),
-            "server1".to_string(),
             create_test_tool("tool1"),
+            "http://server1:8000".to_string(),
         );
-        inventory.insert_prompt(
-            "prompt1".to_string(),
-            "server1".to_string(),
-            create_test_prompt("prompt1"),
-        );
-        inventory.insert_resource(
-            "res1".to_string(),
-            "server1".to_string(),
-            create_test_resource("res1"),
+        inventory.insert_tool(
+            "server2".to_string(),
+            "tool2".to_string(),
+            create_test_tool("tool2"),
+            "http://server2:8000".to_string(),
         );
 
-        let (tools, prompts, resources) = inventory.counts();
-        assert_eq!(tools, 1);
-        assert_eq!(prompts, 1);
-        assert_eq!(resources, 1);
+        assert_eq!(inventory.count(), 2);
 
         inventory.clear_all();
 
-        let (tools, prompts, resources) = inventory.counts();
-        assert_eq!(tools, 0);
-        assert_eq!(prompts, 0);
-        assert_eq!(resources, 0);
+        assert_eq!(inventory.count(), 0);
     }
 }

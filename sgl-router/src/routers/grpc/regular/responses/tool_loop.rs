@@ -169,14 +169,16 @@ fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> Respo
     let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|t| McpToolInfo {
-            name: t.name.to_string(),
-            description: t.description.as_ref().map(|d| d.to_string()),
-            input_schema: Value::Object((*t.input_schema).clone()),
-            annotations: Some(json!({
-                "read_only": false
-            })),
-        })
+        .map(
+            |(_server_label, _tool_name, tool, _server_url)| McpToolInfo {
+                name: tool.name.to_string(),
+                description: tool.description.as_ref().map(|d| d.to_string()),
+                input_schema: Value::Object((*tool.input_schema).clone()),
+                annotations: Some(json!({
+                    "read_only": false
+                })),
+            },
+        )
         .collect();
 
     ResponseOutputItem::McpListTools {
@@ -252,17 +254,17 @@ pub(super) async fn execute_tool_loop(
         .map(|tools| extract_dynamic_mcp_servers(tools))
         .unwrap_or_default();
 
-    // Get all tools with their server labels and URLs
-    let tools_map = ctx
+    // Build per-request tool inventory (combines static + dynamic tools)
+    let request_inventory = ctx
         .mcp_manager
-        .list_tools_for_request(&dynamic_servers)
+        .build_request_inventory(&dynamic_servers)
         .await;
 
-    // Build MCP tools with formatted names: server_label/tool_name
+    // Build MCP tools with formatted names: server_label__tool_name
     let mut mcp_tools = Vec::new();
-    for ((server_label, tool_name), (tool, _server_url)) in &tools_map {
+    for (server_label, tool_name, tool, _server_url) in request_inventory.list_tools() {
         // Format tool name using utility function
-        let formatted_name = format_tool_name(server_label, tool_name);
+        let formatted_name = format_tool_name(&server_label, &tool_name);
         let mut tool_clone = tool.clone();
         tool_clone.name = std::borrow::Cow::Owned(formatted_name);
         mcp_tools.push(tool_clone);
@@ -408,47 +410,37 @@ pub(super) async fn execute_tool_loop(
                         ("unknown".to_string(), formatted_tool_name.clone())
                     };
 
-                // Look up tool in map and execute
-                let (output_str, success, error) = match tools_map
-                    .get(&(server_label.clone(), original_tool_name.clone()))
-                {
-                    Some((_tool, server_url)) => {
-                        let args_map = match from_str::<Value>(&args_json_str) {
-                            Ok(Value::Object(map)) => Some(map),
-                            _ => None,
-                        };
+                // Parse arguments
+                let args_map = match from_str::<Value>(&args_json_str) {
+                    Ok(Value::Object(map)) => Some(map),
+                    _ => None,
+                };
 
-                        // Call tool via manager
-                        match ctx
-                            .mcp_manager
-                            .call_tool_by_url(server_url, &original_tool_name, args_map)
-                            .await
-                        {
-                            Ok(result) => match to_string(&result) {
-                                Ok(output) => (output, true, None),
-                                Err(e) => {
-                                    let err_msg = format!("Failed to serialize tool result: {}", e);
-                                    warn!("{}", err_msg);
-                                    let error_json = json!({ "error": &err_msg }).to_string();
-                                    (error_json, false, Some(err_msg))
-                                }
-                            },
-                            Err(e) => {
-                                let err_msg = e.to_string();
-                                warn!("MCP tool execution failed: {}", err_msg);
-                                let error_json = json!({ "error": &err_msg }).to_string();
-                                (error_json, false, Some(err_msg))
-                            }
+                // Call tool via inventory
+                let (output_str, success, error) = match ctx
+                    .mcp_manager
+                    .call_tool_from_inventory(
+                        &request_inventory,
+                        &server_label,
+                        &original_tool_name,
+                        args_map,
+                    )
+                    .await
+                {
+                    Ok(result) => match to_string(&result) {
+                        Ok(output) => (output, true, None),
+                        Err(e) => {
+                            let err_msg = format!("Failed to serialize tool result: {}", e);
+                            warn!("{}", err_msg);
+                            let error_json = json!({ "error": &err_msg }).to_string();
+                            (error_json, false, Some(err_msg))
                         }
-                    }
-                    None => {
-                        let err_str = format!(
-                            "Tool '{}' (server: {}, tool: {}) not found in tool map",
-                            formatted_tool_name, server_label, original_tool_name
-                        );
-                        warn!("{}", err_str);
-                        let error_json = json!({ "error": &err_str }).to_string();
-                        (error_json, false, Some(err_str))
+                    },
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        warn!("MCP tool execution failed: {}", err_msg);
+                        let error_json = json!({ "error": &err_msg }).to_string();
+                        (error_json, false, Some(err_msg))
                     }
                 };
 
@@ -683,17 +675,17 @@ async fn execute_tool_loop_streaming_internal(
         .map(|tools| extract_dynamic_mcp_servers(tools))
         .unwrap_or_default();
 
-    // Get all tools with their server labels and URLs
-    let tools_map = ctx
+    // Build per-request tool inventory (combines static + dynamic tools)
+    let request_inventory = ctx
         .mcp_manager
-        .list_tools_for_request(&dynamic_servers)
+        .build_request_inventory(&dynamic_servers)
         .await;
 
     // Build MCP tools with formatted names: server_label__tool_name
     let mut mcp_tools = Vec::new();
-    for ((server_label, tool_name), (tool, _server_url)) in &tools_map {
+    for (server_label, tool_name, tool, _server_url) in request_inventory.list_tools() {
         // Format tool name using utility function
-        let formatted_name = format_tool_name(server_label, tool_name);
+        let formatted_name = format_tool_name(&server_label, &tool_name);
         let mut tool_clone = tool.clone();
         tool_clone.name = std::borrow::Cow::Owned(formatted_name);
         mcp_tools.push(tool_clone);
@@ -892,47 +884,39 @@ async fn execute_tool_loop_streaming_internal(
                     emitter.emit_mcp_call_arguments_done(output_index, &item_id, &args_json_str);
                 emitter.send_event(&event, &tx)?;
 
-                // Look up tool in map and execute
+                // Look up tool in inventory and execute
                 debug!(
                     "Calling MCP tool '{}' (server: {}, tool: {}) with args: {}",
                     formatted_tool_name, server_label, original_tool_name, args_json_str
                 );
 
-                // Look up tool in map
-                let call_result = match tools_map
-                    .get(&(server_label.clone(), original_tool_name.clone()))
-                {
-                    Some((_tool, server_url)) => {
-                        let args_map = match from_str::<Value>(&args_json_str) {
-                            Ok(Value::Object(map)) => Some(map),
-                            _ => None,
-                        };
-
-                        // Call tool via manager using server URL
-                        ctx.mcp_manager
-                            .call_tool_by_url(server_url, &original_tool_name, args_map)
-                            .await
-                            .and_then(|result| {
-                                to_string(&result).map_err(|e| {
-                                    let err_msg = format!("Failed to serialize tool result: {}", e);
-                                    warn!("{}", err_msg);
-                                    McpError::ToolExecution(err_msg)
-                                })
-                            })
-                            .map_err(|e| {
-                                warn!("MCP tool execution failed: {}", e);
-                                e.to_string()
-                            })
-                    }
-                    None => {
-                        let err_str = format!(
-                            "Tool '{}' (server: {}, tool: {}) not found in tool map",
-                            formatted_tool_name, server_label, original_tool_name
-                        );
-                        warn!("{}", err_str);
-                        Err(err_str)
-                    }
+                // Parse arguments
+                let args_map = match from_str::<Value>(&args_json_str) {
+                    Ok(Value::Object(map)) => Some(map),
+                    _ => None,
                 };
+
+                // Call tool via inventory
+                let call_result = ctx
+                    .mcp_manager
+                    .call_tool_from_inventory(
+                        &request_inventory,
+                        &server_label,
+                        &original_tool_name,
+                        args_map,
+                    )
+                    .await
+                    .and_then(|result| {
+                        to_string(&result).map_err(|e| {
+                            let err_msg = format!("Failed to serialize tool result: {}", e);
+                            warn!("{}", err_msg);
+                            McpError::ToolExecution(err_msg)
+                        })
+                    })
+                    .map_err(|e| {
+                        warn!("MCP tool execution failed: {}", e);
+                        e.to_string()
+                    });
 
                 let (output_str, success, error) = match call_result {
                     Ok(result) => {

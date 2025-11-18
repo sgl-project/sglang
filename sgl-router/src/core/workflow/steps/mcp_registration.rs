@@ -129,10 +129,16 @@ impl StepExecutor for DiscoverMcpInventoryStep {
 
         let inventory = mcp_manager.inventory();
 
-        // Use the public load_server_inventory method
-        McpManager::load_server_inventory(&inventory, &config_request.name, &mcp_client).await;
+        // Compute server URL from config (for URL-based caching)
+        let server_url = McpManager::server_key(&config_request.config);
 
-        info!("Completed inventory discovery for {}", config_request.name);
+        // Use the public load_server_inventory method
+        McpManager::load_server_inventory(&inventory, &server_url, &mcp_client).await;
+
+        info!(
+            "Completed inventory discovery for '{}' (URL: {})",
+            config_request.name, server_url
+        );
 
         Ok(StepResult::Success)
     }
@@ -175,10 +181,16 @@ impl StepExecutor for RegisterMcpServerStep {
                     message: "MCP manager not initialized".to_string(),
                 })?;
 
-        // Register the client in the manager's client map
-        mcp_manager.register_static_server(config_request.name.clone(), mcp_client);
+        // Compute server URL from config (for URL-based caching)
+        let server_url = McpManager::server_key(&config_request.config);
 
-        info!("Registered MCP server: {}", config_request.name);
+        // Register the client in the manager's client map (by URL)
+        mcp_manager.register_static_server(server_url.clone(), mcp_client);
+
+        info!(
+            "Registered MCP server '{}' at URL: {}",
+            config_request.name, server_url
+        );
 
         Ok(StepResult::Success)
     }
