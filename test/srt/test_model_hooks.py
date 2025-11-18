@@ -1,6 +1,6 @@
 import argparse
 import json
-
+import unittest
 import torch
 import torch.nn as nn
 
@@ -8,21 +8,20 @@ from sglang.srt.model_executor.hook_manager import register_hooks
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
-HOOK_CALLS = []
-
-
 def dummy_hook_factory(config):
     """Factory that returns a forward hook capturing a tag from config."""
     tag = config.get("tag", "default")
 
     def hook(module, inputs, output):
-        HOOK_CALLS.append(
-            {
-                "module_type": type(module).__name__,
-                "tag": tag,
-                "shape": tuple(output.shape),
-            }
-        )
+        # Use a global list to track calls, but we'll manage it per-test
+        if hasattr(dummy_hook_factory, 'hook_calls'):
+            dummy_hook_factory.hook_calls.append(
+                {
+                    "module_type": type(module).__name__,
+                    "tag": tag,
+                    "shape": tuple(output.shape),
+                }
+            )
         return output
 
     return hook
@@ -49,7 +48,8 @@ class TestAttachHooks(CustomTestCase):
     """Tests for ModelRunner.register_hooks / resolve_callable integration."""
 
     def setUp(self):
-        HOOK_CALLS.clear()
+        # Set up per-test hook calls tracking
+        dummy_hook_factory.hook_calls = []
 
     def test_hook_is_attached(self):
         """Hook from a factory string is registered and fired."""
@@ -73,15 +73,18 @@ class TestAttachHooks(CustomTestCase):
         _ = model(x)
 
         self.assertEqual(
-            len(HOOK_CALLS),
+            len(dummy_hook_factory.hook_calls),
             4,
             "Forward hook was not called correct number of times",
         )
-        tags = {call["tag"] for call in HOOK_CALLS}
+        tags = {call["tag"] for call in dummy_hook_factory.hook_calls}
         self.assertIn("forward-ok", tags)
 
     def test_no_matching_modules_does_not_crash(self):
         """Hook spec with no matching modules should not crash."""
+        # For this test, we'll use the global hook factory but expect no calls
+        dummy_hook_factory.hook_calls = []
+        
         model = TinyModel()
         hook_specs = [
             {
@@ -97,8 +100,7 @@ class TestAttachHooks(CustomTestCase):
         x = torch.randn(3, 4)
         _ = model(x)
 
-        # No hooks should have fired
-        self.assertEqual(len(HOOK_CALLS), 0)
+        self.assertEqual(len(dummy_hook_factory.hook_calls), 0)
 
     def test_cli_hooks_reach_model(self):
         """
@@ -106,6 +108,9 @@ class TestAttachHooks(CustomTestCase):
         ServerArgs, passed to ModelRunner.register_hooks, and actually
         run during a forward pass.
         """
+        # Set up for CLI test
+        dummy_hook_factory.hook_calls = []
+        
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
@@ -138,15 +143,14 @@ class TestAttachHooks(CustomTestCase):
 
         # We expect hooks on outer.0, outer.1, inner.0, inner.1  => 4 calls
         self.assertEqual(
-            len(HOOK_CALLS),
+            len(dummy_hook_factory.hook_calls),
             4,
             "CLI-configured hooks did not fire expected number of times",
         )
 
-        tags = {call["tag"] for call in HOOK_CALLS}
+        tags = {call["tag"] for call in dummy_hook_factory.hook_calls}
         self.assertEqual(tags, {"cli-hook"})
 
 
 if __name__ == "__main__":
-    pass
-    # unittest.main()
+    unittest.main()
