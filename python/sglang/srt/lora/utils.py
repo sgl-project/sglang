@@ -5,7 +5,7 @@ from typing import Iterable, Optional, Set, Tuple
 
 import torch
 
-from sglang.srt.hf_transformers_utils import AutoConfig
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
 @dataclass
@@ -31,11 +31,11 @@ class LoRABatchInfo:
     # scaling of each lora adapter, in shape (lora_num,)
     scalings: torch.Tensor
 
-    # Lengths of each segments in shape (num_segments,)
-    seg_lens: Optional[torch.Tensor]
-
     # Maximum segment length of current batch
     max_len: Optional[int]
+
+    # Lengths of each segments in shape (num_segments,)
+    seg_lens: Optional[torch.Tensor]
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]
@@ -98,6 +98,7 @@ def get_normalized_target_modules(
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
+    Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
     """
     params_mapping = {
         "q_proj": "qkv_proj",
@@ -109,7 +110,8 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
-        normalized_name = params_mapping.get(name, name)
+        base_name = name.split(".")[-1]
+        normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
 

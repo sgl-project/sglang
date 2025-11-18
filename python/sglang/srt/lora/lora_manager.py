@@ -16,28 +16,36 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
-    LoRABatchInfo,
     LoRAType,
     get_layer_id,
     get_normalized_target_modules,
     get_target_module_name,
 )
-from sglang.srt.managers.io_struct import LoRAUpdateResult
+from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import replace_submodule
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_npu, replace_submodule
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+if is_npu():
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it to True
+    torch.cuda.is_available = lambda: False
+
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +64,7 @@ class LoRAManager:
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
+        server_args: Optional[ServerArgs] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -66,12 +75,16 @@ class LoRAManager:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
 
+        # Store eviction policy from server args
+        self.eviction_policy = server_args.lora_eviction_policy
+
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
         self.lora_backend: BaseLoRABackend = backend_type(
             max_loras_per_batch=max_loras_per_batch,
             device=self.device,
+            server_args=server_args,
         )
 
         # Initialize mutable internal state of the LoRAManager.
@@ -81,31 +94,19 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+    def init_cuda_graph_batch_info(
+        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+    ):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        with torch.device("cuda"):
-            self.cuda_graph_batch_info = LoRABatchInfo(
-                bs=max_bs_in_cuda_graph,
-                use_cuda_graph=True,
-                num_segments=None,
-                seg_lens=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
-                max_len=1,
-                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
-                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
-            )
-
         self.lora_backend.init_cuda_graph_batch_info(
-            cuda_graph_batch_info=self.cuda_graph_batch_info,
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+            num_tokens_per_bs=num_tokens_per_bs,
         )
 
     def create_lora_update_result(
         self, success: bool, error_message: str = ""
-    ) -> LoRAUpdateResult:
-        return LoRAUpdateResult(
+    ) -> LoRAUpdateOutput:
+        return LoRAUpdateOutput(
             success=success,
             error_message=error_message,
             loaded_adapters={
@@ -114,7 +115,7 @@ class LoRAManager:
             },
         )
 
-    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
+    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from the specified path.
 
@@ -127,6 +128,16 @@ class LoRAManager:
         assert (
             lora_ref.lora_id not in self.loras
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+
+        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
+            return self.create_lora_update_result(
+                success=False,
+                error_message=(
+                    f"Already have {self.num_pinned_loras} pinned adapters, "
+                    f"max allowed is {self.max_loras_per_batch - 1} (reserving 1 slot for dynamic use). "
+                    f"Please unpin some adapters or increase max_loras_per_batch."
+                ),
+            )
 
         try:
             # load configs
@@ -153,6 +164,15 @@ class LoRAManager:
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
 
+        # Check if this LoRA adapter is already loaded
+        if any(
+            lora_ref.lora_name == existing_lora_ref.lora_name
+            for existing_lora_ref in self.lora_refs.values()
+        ):
+            raise ValueError(
+                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+            )
+
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
@@ -171,7 +191,7 @@ class LoRAManager:
                 "`--max-loras-per-batch` or load it as unpinned LoRA adapters."
             )
 
-    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
+    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
@@ -264,7 +284,7 @@ class LoRAManager:
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,
             scalings=scalings,
-            batch_info=self.cuda_graph_batch_info if use_cuda_graph else None,
+            use_cuda_graph=use_cuda_graph,
         )
 
     def update_lora_info(self):
@@ -408,6 +428,7 @@ class LoRAManager:
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
+            eviction_policy=self.eviction_policy,
         )
 
     def set_lora_module(self, module_name, module):

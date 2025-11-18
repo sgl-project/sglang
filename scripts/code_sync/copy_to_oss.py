@@ -43,13 +43,16 @@ folder_names = [
     "docker",
     "docs",
     "examples",
-    "sgl-kernel",
-    "README.md",
     "python/sglang/lang",
     "python/sglang/srt",
     "python/sglang/test",
+    "python/sglang/utils.py",
+    "python/sglang/README.md",
+    "sgl-kernel",
     "test/lang",
     "test/srt",
+    "test/README.md",
+    "README.md",
 ]
 
 # --- Configuration End ---
@@ -395,9 +398,10 @@ def main():
         pr_title = f"[Auto Sync] Update {filename_list_str} ({current_date})"
         pr_body = (
             f"Sync changes from commit `{short_hash}`.\n\n"
-            f"**Relevant Files Changed:**\n{file_list_str}"
-            "\n\n---\n\n"
-            "*This is an automated PR created by a script.*"
+            f"**Files Changed:**\n{file_list_str}\n\n"
+            f"Author: {author_name} <{author_email}>"
+            f"\n\n---\n\n"
+            f"*This is an automated PR created by scripts/copy_from_oss.py.*"
         )
 
         # 5. Create branch, apply patch, and push

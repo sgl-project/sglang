@@ -23,7 +23,7 @@ The case of a server being too conservative can happen when users send many requ
 
 On the other hand, if you see `token usage` very high and you frequently see warnings like
 `KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
-If you see `KV cache pool is full. Retract requests.` occasionally but not frequently, it is okay.
+If you see `KV cache pool is full. Retract requests.` occasionally but not frequently (~1 time per minute), it is okay.
 
 ### Tune `--mem-fraction-static` to increase KV cache pool capacity
 SGLang allocates memory as follows:

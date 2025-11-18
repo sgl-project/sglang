@@ -7,7 +7,7 @@ from typing import List
 import torch
 from tqdm import tqdm
 
-from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
+from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import Hf3fsUsrBioClient
 
 
 def print_stats(x: List[int]):
@@ -29,7 +29,7 @@ def test():
     file_size = 1 << 40
     bytes_per_page = 16 << 20
     entries = 32
-    file_ops = Hf3fsClient(file_path, file_size, bytes_per_page, entries)
+    file_ops = Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries)
 
     print("test batch_read / batch_write")
     num_pages = 128
@@ -74,7 +74,7 @@ def bench():
     numel = bytes_per_page // dtype.itemsize
 
     file_ops = [
-        Hf3fsClient(file_path, file_size, bytes_per_page, entries)
+        Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries)
         for _ in range(numjobs)
     ]
 

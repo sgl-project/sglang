@@ -65,6 +65,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
 
         self.max_parallel = args.max_parallel
         self.logfile = args.log_file
+        self.enable_round_barrier = False
 
     def response_handler(self):
         while True:

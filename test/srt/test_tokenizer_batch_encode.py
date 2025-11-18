@@ -10,12 +10,10 @@ python3 -m unittest test_tokenizer_batch_encode.TestTokenizerBatchEncodeUnit.tes
 python3 -m unittest test_tokenizer_batch_encode.TestTokenizerBatchEncodeLogic.test_batch_processing_path
 """
 
-import asyncio
 import unittest
-from typing import List
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import Mock, patch
 
-from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -34,7 +32,9 @@ class TestTokenizerBatchEncode(unittest.TestCase):
 
         with patch("zmq.asyncio.Context"), patch(
             "sglang.srt.utils.get_zmq_socket"
-        ), patch("sglang.srt.hf_transformers_utils.get_tokenizer") as mock_tokenizer:
+        ), patch(
+            "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+        ) as mock_tokenizer:
 
             mock_tokenizer.return_value = Mock(vocab_size=32000)
             self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)

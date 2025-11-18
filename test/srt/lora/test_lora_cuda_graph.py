@@ -62,7 +62,6 @@ class TestLoRACudaGraph(CustomTestCase):
                     model_case,
                     torch_dtype,
                     max_new_tokens=32,
-                    backend="triton",
                     disable_cuda_graph=True,
                     test_tag="without_cuda_graph",
                 )
@@ -77,7 +76,6 @@ class TestLoRACudaGraph(CustomTestCase):
                     model_case,
                     torch_dtype,
                     max_new_tokens=32,
-                    backend="triton",
                     disable_cuda_graph=False,
                     test_tag="cuda_graph_padding",
                 )

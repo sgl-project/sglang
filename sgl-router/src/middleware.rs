@@ -1,21 +1,70 @@
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
 use axum::{
-    extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
-    response::IntoResponse, response::Response,
+    body::Body,
+    extract::{Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use rand::Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
+use crate::{metrics::RouterMetrics, server::AppState};
 
-use crate::metrics::RouterMetrics;
-use crate::server::AppState;
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub api_key: Option<String>,
+}
+
+/// Middleware to validate Bearer token against configured API key
+/// Only active when router has an API key configured
+pub async fn auth_middleware(
+    State(auth_config): State<AuthConfig>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(expected_key) = &auth_config.api_key {
+        // Extract Authorization header
+        let auth_header = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok());
+
+        match auth_header {
+            Some(header_value) if header_value.starts_with("Bearer ") => {
+                let token = &header_value[7..]; // Skip "Bearer "
+                                                // Use constant-time comparison to prevent timing attacks
+                let token_bytes = token.as_bytes();
+                let expected_bytes = expected_key.as_bytes();
+
+                // Check if lengths match first (this is not constant-time but necessary)
+                if token_bytes.len() != expected_bytes.len() {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+
+                // Constant-time comparison of the actual values
+                if token_bytes.ct_eq(expected_bytes).unwrap_u8() != 1 {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
+    Ok(next.run(request).await)
+}
 
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
@@ -25,6 +74,8 @@ fn generate_request_id(path: &str) -> String {
         "cmpl-"
     } else if path.contains("/generate") {
         "gnt-"
+    } else if path.contains("/responses") {
+        "resp-"
     } else {
         "req-"
     };
@@ -113,38 +164,14 @@ where
 
         let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
-        // Insert request ID into request extensions
+        // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
-
-        // Create a span with the request ID for this request
-        let span = tracing::info_span!(
-            "http_request",
-            method = %req.method(),
-            uri = %req.uri(),
-            version = ?req.version(),
-            request_id = %request_id
-        );
-
-        // Log within the span
-        let _enter = span.enter();
-        tracing::info!(
-            target: "sglang_router_rs::request",
-            "started processing request"
-        );
-        drop(_enter);
-
-        // Capture values we need in the async block
-        let method = req.method().clone();
-        let uri = req.uri().clone();
-        let version = req.version();
 
         // Call the inner service
         let future = self.inner.call(req);
 
         Box::pin(async move {
-            let start_time = Instant::now();
             let mut response = future.await?;
-            let latency = start_time.elapsed();
 
             // Add request ID to response headers
             response.headers_mut().insert(
@@ -153,42 +180,10 @@ where
                     .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
             );
 
-            // Log the response with proper request ID in span
-            let status = response.status();
-            let span = tracing::info_span!(
-                "http_request",
-                method = %method,
-                uri = %uri,
-                version = ?version,
-                request_id = %request_id,
-                status = %status,
-                latency = ?latency
-            );
-
-            let _enter = span.enter();
-            if status.is_server_error() {
-                tracing::error!(
-                    target: "sglang_router_rs::response",
-                    "request failed with server error"
-                );
-            } else if status.is_client_error() {
-                tracing::warn!(
-                    target: "sglang_router_rs::response",
-                    "request failed with client error"
-                );
-            } else {
-                tracing::info!(
-                    target: "sglang_router_rs::response",
-                    "finished processing request"
-                );
-            }
-
             Ok(response)
         })
     }
 }
-
-// ============= Logging Middleware =============
 
 /// Custom span maker that includes request ID
 #[derive(Clone, Debug)]
@@ -225,7 +220,11 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
-        // Don't log here - we already log in RequestIdService with the proper request_id
+        // Log the request start
+        info!(
+            target: "sglang_router_rs::request",
+            "started processing request"
+        );
     }
 }
 
@@ -244,14 +243,31 @@ impl Default for ResponseLogger {
 }
 
 impl<B> OnResponse<B> for ResponseLogger {
-    fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
+    fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
         let status = response.status();
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status.as_u16());
         span.record("latency", format!("{:?}", latency));
 
-        // Don't log here - RequestIdService handles all logging with proper request IDs
+        // Log the response completion
+        let _enter = span.enter();
+        if status.is_server_error() {
+            error!(
+                target: "sglang_router_rs::response",
+                "request failed with server error"
+            );
+        } else if status.is_client_error() {
+            warn!(
+                target: "sglang_router_rs::response",
+                "request failed with client error"
+            );
+        } else {
+            info!(
+                target: "sglang_router_rs::response",
+                "finished processing request"
+            );
+        }
     }
 }
 
@@ -325,8 +341,6 @@ pub fn log_request(entry: RequestLogEntry) {
     }
 }
 
-// ============ Concurrency Limiting with Queue Support ============
-
 /// Request queue entry
 pub struct QueuedRequest {
     /// Time when the request was queued
@@ -338,10 +352,10 @@ pub struct QueuedRequest {
 /// Queue metrics for monitoring
 #[derive(Debug, Default)]
 pub struct QueueMetrics {
-    pub total_queued: std::sync::atomic::AtomicU64,
-    pub current_queued: std::sync::atomic::AtomicU64,
-    pub total_timeout: std::sync::atomic::AtomicU64,
-    pub total_rejected: std::sync::atomic::AtomicU64,
+    pub total_queued: AtomicU64,
+    pub current_queued: AtomicU64,
+    pub total_timeout: AtomicU64,
+    pub total_rejected: AtomicU64,
 }
 
 /// Queue processor that handles queued requests
@@ -417,22 +431,23 @@ pub struct ConcurrencyLimiter {
 impl ConcurrencyLimiter {
     /// Create new concurrency limiter with optional queue
     pub fn new(
-        token_bucket: Arc<TokenBucket>,
+        token_bucket: Option<Arc<TokenBucket>>,
         queue_size: usize,
         queue_timeout: Duration,
     ) -> (Self, Option<QueueProcessor>) {
-        if queue_size > 0 {
-            let (queue_tx, queue_rx) = mpsc::channel(queue_size);
-            let processor = QueueProcessor::new(token_bucket, queue_rx, queue_timeout);
-
-            (
-                Self {
-                    queue_tx: Some(queue_tx),
-                },
-                Some(processor),
-            )
-        } else {
-            (Self { queue_tx: None }, None)
+        match (token_bucket, queue_size) {
+            (None, _) => (Self { queue_tx: None }, None),
+            (Some(bucket), size) if size > 0 => {
+                let (queue_tx, queue_rx) = mpsc::channel(size);
+                let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
+                (
+                    Self {
+                        queue_tx: Some(queue_tx),
+                    },
+                    Some(processor),
+                )
+            }
+            (Some(_), _) => (Self { queue_tx: None }, None),
         }
     }
 }
@@ -440,15 +455,22 @@ impl ConcurrencyLimiter {
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
-    request: Request<axum::body::Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
+    let token_bucket = match &app_state.context.rate_limiter {
+        Some(bucket) => bucket.clone(),
+        None => {
+            // Rate limiting disabled, pass through immediately
+            return next.run(request).await;
+        }
+    };
+
     // Static counter for embeddings queue size
     static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
 
     // Identify if this is an embeddings request based on path
     let is_embeddings = request.uri().path().contains("/v1/embeddings");
-    let token_bucket = app_state.context.rate_limiter.clone();
 
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {

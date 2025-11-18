@@ -21,7 +21,13 @@ python3 -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 4
 Add arguments `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
 
 ``` bash
-python3 -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 4 --speculative-num-steps 3  --speculative-eagle-topk 1  --speculative-num-draft-tokens 4 --speculative-algo NEXTN
+python3 -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Instruct \
+  --tp 4 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-algo NEXTN
 ```
 
 Details can be seen in [this PR](https://github.com/sgl-project/sglang/pull/10233).

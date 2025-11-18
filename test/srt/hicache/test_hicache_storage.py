@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -39,6 +40,7 @@ class TestHiCache(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        time.sleep(5)
 
     def test_mmlu(self):
         args = SimpleNamespace(

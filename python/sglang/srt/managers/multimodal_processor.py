@@ -12,8 +12,7 @@ logger = logging.getLogger(__name__)
 PROCESSOR_MAPPING = {}
 
 
-def import_processors():
-    package_name = "sglang.srt.multimodal.processors"
+def import_processors(package_name: str):
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:

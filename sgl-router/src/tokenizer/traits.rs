@@ -1,6 +1,9 @@
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+
 use anyhow::Result;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Type alias for token IDs
 pub type TokenIdType = u32;
@@ -22,6 +25,9 @@ pub trait Tokenizer: Encoder + Decoder {
     fn get_special_tokens(&self) -> &SpecialTokens;
     fn token_to_id(&self, token: &str) -> Option<TokenIdType>;
     fn id_to_token(&self, id: TokenIdType) -> Option<String>;
+
+    /// Enable downcasting to concrete types
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Contains the results of tokenizing text: token IDs, string tokens, and their spans

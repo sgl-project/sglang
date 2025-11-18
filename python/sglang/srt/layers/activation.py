@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -59,6 +60,11 @@ logger = logging.getLogger(__name__)
 
 
 class SiluAndMul(CustomOp):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if get_global_server_args().rl_on_policy_target is not None:
+            self._forward_method = self.forward_native
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
@@ -224,12 +230,13 @@ class XIELU(CustomOp):
                 self._xielu_cuda_fn = self._xielu_cuda
             logger.warning_once(msg)
         except Exception as err:
-            logger.warning_once(
-                "CUDA-fused xIELU not available (%s) –"
-                " falling back to a Python version.\n"
-                "For CUDA xIELU (experimental), `pip install git+https://github.com/nickjbrowning/XIELU`",
-                str(err),
-            )
+            pass
+            # logger.warning_once(
+            #     "CUDA-fused xIELU not available (%s) –"
+            #     " falling back to a Python version.\n"
+            #     "For CUDA xIELU (experimental), `pip install git+https://github.com/nickjbrowning/XIELU`",
+            #     str(err),
+            # )
 
     def _xielu_python(self, x: torch.Tensor) -> torch.Tensor:
         alpha_p = nn.functional.softplus(self.alpha_p)
@@ -379,4 +386,7 @@ if not (
     logger.info(
         "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
-    from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
+    from vllm.model_executor.layers.activation import (  # noqa: F401
+        GeluAndMul,
+        SiluAndMul,
+    )

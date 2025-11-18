@@ -9,28 +9,22 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
-import os
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
-if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
-    import logging
-
-    torch._logging.set_logs(dynamo=logging.ERROR)
-    torch._dynamo.config.suppress_errors = True
-
-from sglang.global_config import global_config
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
@@ -38,9 +32,18 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.flashinfer_mla_backend import (
+        FlashInferMlaAttnBackend,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.spec_info import SpecInput
+
+if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
+    import logging
+
+    torch._logging.set_logs(dynamo=logging.ERROR)
+    torch._dynamo.config.suppress_errors = True
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -66,7 +69,7 @@ global_workspace_buffer = None
 
 class FlashInferMhaChunkKVRunner:
     def __init__(
-        self, model_runner: ModelRunner, attn_backend: "FlashInferMlaAttnBackend"
+        self, model_runner: ModelRunner, attn_backend: FlashInferMlaAttnBackend
     ):
         # Parse Constants
         self.num_local_heads = (
@@ -80,6 +83,7 @@ class FlashInferMhaChunkKVRunner:
 
         # Buffers and wrappers
         self.qo_indptr = attn_backend.qo_indptr
+        self.kv_indptr = attn_backend.kv_indptr
         self.workspace_buffer = attn_backend.workspace_buffer
         self.fmha_backend = attn_backend.fmha_backend
 
@@ -130,9 +134,14 @@ class FlashInferMhaChunkKVRunner:
             )
         # ragged prefill
         if not disable_flashinfer_ragged:
+            kv_indptr = (
+                qo_indptr
+                if not forward_batch.mha_one_shot
+                else self.kv_indptr[: bs + 1]
+            )
             self.ragged_wrapper.begin_forward(
                 qo_indptr=qo_indptr,
-                kv_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
                 num_qo_heads=self.num_local_heads,
                 num_kv_heads=self.num_local_heads,
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -154,7 +163,7 @@ class FlashInferMhaChunkKVRunner:
             chunk_idx = forward_batch.prefix_chunk_idx
             assert chunk_idx >= 0
             wrapper = self.chunk_ragged_wrappers[chunk_idx]
-            o1, s1 = wrapper.forward_return_lse(
+            o = wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -163,7 +172,12 @@ class FlashInferMhaChunkKVRunner:
                 logits_soft_cap=logits_soft_cap,
             )
         else:
-            o1, s1 = self.ragged_wrapper.forward_return_lse(
+            forward = (
+                self.ragged_wrapper.forward_return_lse
+                if forward_batch.mha_return_lse
+                else self.ragged_wrapper.forward
+            )
+            o = forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -171,8 +185,7 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
-
-        return o1, s1
+        return o
 
 
 class FlashInferMLAAttnBackend(AttentionBackend):
@@ -193,9 +206,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.enable_chunk_kv = (
             not skip_prefill
-            and global_server_args_dict["disaggregation_mode"] != "decode"
-            and not global_server_args_dict["disable_chunked_prefix_cache"]
-            and not global_server_args_dict["flashinfer_mla_disable_ragged"]
+            and get_global_server_args().disaggregation_mode != "decode"
+            and not get_global_server_args().disable_chunked_prefix_cache
+            and not get_global_server_args().flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
@@ -204,7 +217,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         if global_workspace_buffer is None:
             # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size,
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
@@ -230,9 +243,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        self.fmha_backend = "auto"
         if is_sm100_supported():
             self.fmha_backend = "cutlass"
+        else:
+            self.fmha_backend = "auto"
+
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
@@ -306,8 +321,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not global_server_args_dict["flashinfer_mla_disable_ragged"]
+                not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
+                # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
+                and not is_in_piecewise_cuda_graph()
             )
 
             self.indices_updater_prefill.update(
@@ -361,7 +378,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrapper = BatchMLAPagedAttentionWrapper(
@@ -441,7 +458,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
@@ -510,15 +527,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if (
-            forward_batch.attn_attend_prefix_cache is not None
-            and forward_batch.mha_return_lse
+        if forward_batch.attn_attend_prefix_cache is not None and any(
+            forward_batch.extend_prefix_lens_cpu
         ):  # MHA Chunk
             assert self.enable_chunk_kv
             assert q_rope is None
             assert k_rope is None
-            o1, s1 = self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
-            return o1, s1
+            return self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
 
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
@@ -663,7 +678,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrapper: BatchMLAPagedAttentionWrapper,
         init_metadata_replay: bool = False,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
         **fast_decode_kwargs,
     ):
         decode_wrapper = decode_wrapper or self.decode_wrapper
@@ -688,7 +703,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         q_indptr: torch.Tensor,
         kv_indptr: torch.Tensor,
         init_metadata_replay: bool = False,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
         **fast_decode_kwargs,
     ):
         bs = len(req_pool_indices)
@@ -776,7 +791,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -811,7 +826,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -838,9 +853,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
-            assert isinstance(spec_info, EagleDraftInput) or isinstance(
-                spec_info, EagleVerifyInput
-            )
+            assert isinstance(spec_info, SpecInput)
             # TODO: Support topk > 1 with custom mask
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -894,7 +907,7 @@ class FlashInferMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         if topk > 1:
             raise ValueError(
@@ -918,7 +931,7 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashInferMLAAttnBackend(
                     model_runner,
@@ -963,7 +976,7 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
@@ -983,8 +996,6 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         def call_fn(i, forward_batch):
-            assert forward_batch.spec_info is not None
-            assert isinstance(forward_batch.spec_info, EagleDraftInput)
             forward_batch.spec_info.kv_indptr = (
                 forward_batch.spec_info.kv_indptr.clone()
             )
@@ -1002,7 +1013,7 @@ class FlashInferMLAMultiStepDraftBackend:
             device="cuda",
         )
 
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
@@ -1064,7 +1075,7 @@ def fast_mla_decode_plan(
 
     try:
         # Standard version with just the required arguments (no use_profiler)
-        self._cached_module.plan.default(
+        self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
