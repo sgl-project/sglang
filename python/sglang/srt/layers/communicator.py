@@ -580,12 +580,19 @@ class LayerCommunicator:
         if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
             return False
 
+        enable_flashinfer_fusion = (
+            get_global_server_args().enable_flashinfer_allreduce_fusion
+            and _is_flashinfer_available
+        )
+        enable_aiter_fusion = (
+            _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion
+        )
+
         static_conditions_met = (
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
             and not is_dp_attention_enabled()
-            and get_global_server_args().enable_flashinfer_allreduce_fusion
-            and _is_flashinfer_available
+            and (enable_flashinfer_fusion or enable_aiter_fusion)
         )
 
         if not static_conditions_met:
