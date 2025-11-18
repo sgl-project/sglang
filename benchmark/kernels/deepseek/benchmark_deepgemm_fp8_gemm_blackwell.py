@@ -17,6 +17,7 @@ BLOCK_SIZE = 128
 
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
+    assert BLOCK_SIZE == 128
     m, n = x.shape
     x_padded = torch.zeros(
         (ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device
