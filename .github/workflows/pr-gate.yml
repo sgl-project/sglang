@@ -30,6 +30,16 @@ jobs:
             core.setOutput("draft", pr.data.draft);
             core.setOutput("user", pr.data.user.login);
 
+      - name: Log PR info
+        run: |
+          echo "===== PR Info ====="
+          echo "PR Event: ${{ github.event_name }}"
+          echo "PR Labels: ${{ steps.pr.outputs.labels }}"
+          echo "PR Draft: ${{ steps.pr.outputs.draft }}"
+          echo "PR User: ${{ steps.pr.outputs.user }}"
+          echo "Require run-ci: ${{ inputs.require-run-ci }}"
+          echo "Rate limit hours: ${{ inputs.rate-limit-hours }}"
+          echo "==================="
 
       - name: Block draft PR
         if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
@@ -38,11 +48,9 @@ jobs:
           exit 1
 
       - name: Require run-ci label (optional)
-        if: github.event_name == 'pull_request' && inputs.require-run-ci == 'true'
+        if: github.event_name == 'pull_request' && inputs.require-run-ci == true
         run: |
           labels='${{ steps.pr.outputs.labels }}'
-          echo "Require run-ci: ${{ inputs.require-run-ci }}"
-          echo "Labels: $labels"
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
             echo "Missing required label 'run-ci'."
             exit 1
