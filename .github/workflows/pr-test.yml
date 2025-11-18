@@ -88,6 +88,8 @@ jobs:
         run: |
           cd sgl-kernel
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+        env:
+          USE_CCACHE: 1
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -127,6 +129,8 @@ jobs:
         run: |
           cd sgl-kernel
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+        env:
+          USE_CCACHE: 1
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
