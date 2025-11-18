@@ -1,5 +1,14 @@
 on:
   workflow_call:
+    inputs:
+      require-run-ci:
+        description: "Whether the PR must have the run-ci label"
+        type: boolean
+        default: true
+      rate-limit-hours:
+        description: "Rate limit window size in hours; 0 disables rate limiting"
+        type: number
+        default: 2
 
 jobs:
   pr-gate:
@@ -21,29 +30,39 @@ jobs:
             core.setOutput("draft", pr.data.draft);
             core.setOutput("user", pr.data.user.login);
 
+      - name: Log PR info
+        run: |
+          echo "===== PR Info ====="
+          echo "PR Event: ${{ github.event_name }}"
+          echo "PR Labels: ${{ steps.pr.outputs.labels }}"
+          echo "PR Draft: ${{ steps.pr.outputs.draft }}"
+          echo "PR User: ${{ steps.pr.outputs.user }}"
+          echo "Require run-ci: ${{ inputs.require-run-ci }}"
+          echo "Rate limit hours: ${{ inputs.rate-limit-hours }}"
+          echo "==================="
+
       - name: Block draft PR
         if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
         run: |
           echo "PR is draft. Blocking CI."
           exit 1
 
-      - name: Require run-ci label
-        if: github.event_name == 'pull_request'
+      - name: Require run-ci label (optional)
+        if: github.event_name == 'pull_request' && inputs.require-run-ci == true
         run: |
           labels='${{ steps.pr.outputs.labels }}'
-          echo "Labels: $labels"
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
             echo "Missing required label 'run-ci'."
             exit 1
           fi
 
-      - name: Enforce rate limit for low-permission actors
-        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+      - name: Enforce rate limit for low-permission actors (optional)
+        if: (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && inputs.rate-limit-hours != 0
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const HOURS = 2;
+            const HOURS = Number("${{ inputs.rate-limit-hours }}");
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
