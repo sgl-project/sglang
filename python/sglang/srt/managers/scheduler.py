@@ -924,8 +924,6 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
 
     def init_overlap(self):
-        from sglang.srt.managers.overlap_utils import FutureMap
-
         self.future_map = None
 
         if not self.enable_overlap:
