@@ -326,38 +326,38 @@ jobs:
           rm -rf python/sglang/logs || true
 
   # =============================================== multimodal_gen ====================================================
-#   multimodal-gen-test:
-#     needs: [check-changes]
-#     if: needs.check-changes.outputs.multimodal_gen == 'true'
-#     runs-on: 1-gpu-runner
-#     steps:
-#       # - name: Cleanup before checkout
-#       #   run: |
-#       #     # Kill any lingering Python processes that might be holding files
-#       #     pkill -9 -f "python.*sglang" || true
-#       #     pkill -9 -f "pytest" || true
-#       #     sleep 2
-#       #     # Remove logs directory
-#       #     rm -rf "$GITHUB_WORKSPACE/python/sglang/logs" || true
+  multimodal-gen-test:
+   needs: [check-changes]
+   if: needs.check-changes.outputs.multimodal_gen == 'true'
+   runs-on: 1-gpu-runner
+   steps:
+     # - name: Cleanup before checkout
+     #   run: |
+     #     # Kill any lingering Python processes that might be holding files
+     #     pkill -9 -f "python.*sglang" || true
+     #     pkill -9 -f "pytest" || true
+     #     sleep 2
+     #     # Remove logs directory
+     #     rm -rf "$GITHUB_WORKSPACE/python/sglang/logs" || true
 
-#       - name: Checkout code
-#         uses: actions/checkout@v4
+     - name: Checkout code
+       uses: actions/checkout@v4
 
-  #     - name: Install dependencies
-  #       run: |
-  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+     - name: Install dependencies
+       run: |
+         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
-  #     - name: Run diffusion server tests
-  #       timeout-minutes: 60
-  #       run: |
-  #         cd python
-  #         pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
+     - name: Run diffusion server tests
+       timeout-minutes: 60
+       run: |
+         cd python
+         pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
-      # - name: Cleanup logs directory
-      #   if: always()
-      #   run: |
-      #     # Remove logs directory to prevent NFS lock files
-      #     rm -rf python/sglang/logs || true
+     - name: Cleanup logs directory
+       if: always()
+       run: |
+         # Remove logs directory to prevent NFS lock files
+         rm -rf python/sglang/logs || true
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI

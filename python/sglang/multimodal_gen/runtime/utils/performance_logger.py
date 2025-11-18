@@ -12,6 +12,32 @@ from dateutil.tz import UTC
 
 from sglang.utils import is_in_ci
 
+_perf_logger_initialized = False
+
+
+def _initialize_perf_logger():
+    """Initialize the performance logger with a file handler."""
+    global _perf_logger_initialized
+    if _perf_logger_initialized or not LOG_DIR:
+        return
+
+    try:
+        # Ensure the logs directory exists
+        if not os.path.exists(LOG_DIR):
+            os.makedirs(LOG_DIR)
+
+        # Set up a file handler for the performance logger
+        handler = logging.FileHandler(os.path.join(LOG_DIR, "performance.log"))
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        perf_logger.addHandler(handler)
+    except (OSError, PermissionError) as e:
+        perf_logger.warning(f"Failed to initialize performance logger: {e}")
+        # Disable file logging if initialization fails
+        globals()["LOG_DIR"] = ""
+    finally:
+        _perf_logger_initialized = True
+
+
 # Configure a specific logger for performance metrics
 perf_logger = logging.getLogger("performance")
 perf_logger.setLevel(logging.INFO)
@@ -22,20 +48,27 @@ if not is_in_ci():
     LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
     if LOG_DIR:
         LOG_DIR = os.path.abspath(LOG_DIR)
-    else:
+    elif LOG_DIR is None:  # Not set
         project_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../../")
         )
         LOG_DIR = os.path.join(project_root, "logs")
+    # if LOG_DIR is an empty string, it will remain so, disabling logging.
 
-    # Ensure the logs directory exists
-    if not os.path.exists(LOG_DIR):
-        os.makedirs(LOG_DIR)
+    if LOG_DIR:
+        try:
+            # Ensure the logs directory exists
+            if not os.path.exists(LOG_DIR):
+                os.makedirs(LOG_DIR)
 
-    # Set up a file handler for the performance logger
-    handler = logging.FileHandler(os.path.join(LOG_DIR, "performance.log"))
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    perf_logger.addHandler(handler)
+            # Set up a file handler for the performance logger
+            handler = logging.FileHandler(os.path.join(LOG_DIR, "performance.log"))
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            perf_logger.addHandler(handler)
+        except (OSError, PermissionError) as e:
+            perf_logger.warning(
+                f"Failed to initialize performance logger file handler: {e}"
+            )
 
 
 def get_git_commit_hash() -> str:
@@ -75,6 +108,7 @@ class PerformanceLogger:
 
     def log_total_duration(self, tag: str):
         """Logs the total duration of the operation and all recorded steps."""
+        _initialize_perf_logger()
         total_duration = time.monotonic() - self.start_time
         log_entry = {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -88,6 +122,7 @@ class PerformanceLogger:
 
     def log_stage_metric(self, stage_name: str, duration_ms: float):
         """Logs a single pipeline stage timing entry."""
+        _initialize_perf_logger()
         log_entry = {
             "timestamp": datetime.now(UTC).isoformat(),
             "request_id": self.request_id,
@@ -106,6 +141,7 @@ class PerformanceLogger:
             stages: Either a PipelineLoggingInfo instance or any object exposing
                 a mapping of stage metadata via a `stages` attribute/dict.
         """
+        _initialize_perf_logger()
         if stages is None:
             return
 
