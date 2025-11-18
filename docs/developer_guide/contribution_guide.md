@@ -81,6 +81,7 @@ For CI to run on a pull request, it must have the **run-ci** label. Authorized u
 - `/rerun-failed-ci`: Rerun the failed/flaky tests of the last commit.
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash_command_handler.yml) will execute your command and react with a 👍 on your comment. It may take up to several minutes to react. Here is a usage [example](https://github.com/sgl-project/sglang/pull/13498#issuecomment-3547552157).
+To avoid too many `rerun-failed-ci` comments in a PR, you can also trigger a command by editing an existing comment by appending any suffix (e.g., `/rerun-failed-ci try again`)
 
 If you don’t have permission, please ask maintainers to trigger CI for you.
 
