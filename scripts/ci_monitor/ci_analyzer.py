@@ -631,7 +631,9 @@ class SGLangCIAnalyzer:
             print(f"  Warning: Could not fetch logs for job {job_id}: {e}")
             return None
 
-    def parse_metrics_from_logs(self, logs: str, job_name: str) -> Dict[str, List[float]]:
+    def parse_metrics_from_logs(
+        self, logs: str, job_name: str
+    ) -> Dict[str, List[float]]:
         """Parse performance metrics from job logs"""
         metrics = defaultdict(list)
 
@@ -752,7 +754,11 @@ class SGLangCIAnalyzer:
                     job_stat["success"] += 1
 
                     # For successful performance/accuracy jobs, fetch metrics
-                    if "perf" in job_name.lower() or "accuracy" in job_name.lower() or "eval" in job_name.lower():
+                    if (
+                        "perf" in job_name.lower()
+                        or "accuracy" in job_name.lower()
+                        or "eval" in job_name.lower()
+                    ):
                         logs = self.get_job_logs(job_id)
                         if logs:
                             metrics = self.parse_metrics_from_logs(logs, job_name)
@@ -786,8 +792,12 @@ class SGLangCIAnalyzer:
                 # Track duration
                 if started_at and completed_at:
                     try:
-                        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-                        end = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+                        start = datetime.fromisoformat(
+                            started_at.replace("Z", "+00:00")
+                        )
+                        end = datetime.fromisoformat(
+                            completed_at.replace("Z", "+00:00")
+                        )
                         duration_minutes = (end - start).total_seconds() / 60
                         job_stat["durations"].append(duration_minutes)
                     except:
