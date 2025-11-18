@@ -79,17 +79,17 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         )
         warmup.run_text_warmups(case.warmup_text)
 
-        if case.warmup_edit > 0 and case.image_edit_prompt and case.image_edit_path:
+        if case.warmup_edit > 0 and case.edit_prompt and case.image_path:
             # Handle URL or local path
-            image_path = case.image_edit_path
+            image_path = case.image_path
             if case.is_image_url():
-                image_path = download_image_from_url(str(case.image_edit_path))
+                image_path = download_image_from_url(str(case.image_path))
             else:
-                image_path = Path(case.image_edit_path)
+                image_path = Path(case.image_path)
 
             warmup.run_edit_warmups(
                 count=case.warmup_edit,
-                edit_prompt=case.image_edit_prompt,
+                edit_prompt=case.edit_prompt,
                 image_path=image_path,
             )
     except Exception as exc:
@@ -259,14 +259,14 @@ class TestDiffusionPerformance:
 
         def generate_image_edit():
             """TI2I: Text + Image ? Image edit."""
-            if not case.image_edit_prompt or not case.image_edit_path:
+            if not case.edit_prompt or not case.image_path:
                 pytest.skip(f"{case.id}: no edit config")
 
             # Handle URL or local path
             if case.is_image_url():
-                image_path = download_image_from_url(str(case.image_edit_path))
+                image_path = download_image_from_url(str(case.image_path))
             else:
-                image_path = Path(case.image_edit_path)
+                image_path = Path(case.image_path)
                 if not image_path.exists():
                     pytest.skip(f"{case.id}: file missing: {image_path}")
 
@@ -274,7 +274,7 @@ class TestDiffusionPerformance:
                 result = client.images.edit(
                     model=case.model_path,
                     image=fh,
-                    prompt=case.image_edit_prompt,
+                    prompt=case.edit_prompt,
                     n=1,
                     size=case.output_size,
                     response_format="b64_json",
@@ -299,21 +299,21 @@ class TestDiffusionPerformance:
 
         def generate_image_to_video():
             """I2V: Image ? Video (optional prompt)."""
-            if not case.image_edit_path:
+            if not case.image_path:
                 pytest.skip(f"{case.id}: no input image configured")
 
             # Handle URL or local path
             if case.is_image_url():
-                image_path = download_image_from_url(str(case.image_edit_path))
+                image_path = download_image_from_url(str(case.image_path))
             else:
-                image_path = Path(case.image_edit_path)
+                image_path = Path(case.image_path)
                 if not image_path.exists():
                     pytest.skip(f"{case.id}: file missing: {image_path}")
 
             with image_path.open("rb") as fh:
                 _create_and_download_video(
                     model=case.model_path,
-                    prompt=case.image_edit_prompt,
+                    prompt=case.edit_prompt,
                     size=case.output_size,
                     seconds=video_seconds,
                     input_reference=fh,
@@ -321,36 +321,36 @@ class TestDiffusionPerformance:
 
         def generate_text_image_to_video():
             """TI2V: Text + Image ? Video."""
-            if not case.image_edit_prompt or not case.image_edit_path:
+            if not case.edit_prompt or not case.image_path:
                 pytest.skip(f"{case.id}: no edit config")
 
             # Handle URL or local path
             if case.is_image_url():
-                image_path = download_image_from_url(str(case.image_edit_path))
+                image_path = download_image_from_url(str(case.image_path))
             else:
-                image_path = Path(case.image_edit_path)
+                image_path = Path(case.image_path)
                 if not image_path.exists():
                     pytest.skip(f"{case.id}: file missing: {image_path}")
 
             with image_path.open("rb") as fh:
                 _create_and_download_video(
                     model=case.model_path,
-                    prompt=case.image_edit_prompt,
+                    prompt=case.edit_prompt,
                     size=case.output_size,
                     seconds=video_seconds,
                     input_reference=fh,
                 )
 
         if case.modality == "video":
-            if case.image_edit_path and case.image_edit_prompt:
+            if case.image_path and case.edit_prompt:
                 return generate_text_image_to_video
-            elif case.image_edit_path:
+            elif case.image_path:
                 return generate_image_to_video
             else:
                 return generate_video
 
         # Image modality
-        if case.image_edit_prompt and case.image_edit_path:
+        if case.edit_prompt and case.image_path:
             return generate_image_edit
 
         return generate_image
@@ -362,7 +362,7 @@ class TestDiffusionPerformance:
         stage_metrics: dict,
     ) -> None:
         """Validate metrics and record results."""
-        is_baseline_generation_mode = os.environ.get("SGL_GEN_BASELINE", "0") == "1"
+        is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
 
         # When generating baselines, a scenario may not exist yet,
         # so we pass a dummy to the validator.
@@ -387,7 +387,7 @@ class TestDiffusionPerformance:
             summary = validator.validate(perf_record, stage_metrics, case.num_frames)
         else:
             summary = validator.validate(perf_record, stage_metrics)
-
+        print(f"{is_baseline_generation_mode=}")
         if is_baseline_generation_mode:
             self._dump_baseline_scenario(case, summary)
             return
@@ -488,8 +488,10 @@ class TestDiffusionPerformance:
         # Video-specific metrics
         if case.modality == "video":
             if "per_frame_generation" not in baseline["stages_ms"]:
-                baseline["stages_ms"]["per_frame_generation"] = round(
-                    summary.avg_frame_time_ms, 2
+                baseline["stages_ms"]["per_frame_generation"] = (
+                    round(summary.avg_frame_time_ms, 2)
+                    if summary.avg_frame_time_ms
+                    else None
                 )
 
         output = f"""
