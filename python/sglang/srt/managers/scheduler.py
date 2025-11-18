@@ -286,6 +286,8 @@ class Scheduler(
 
         # Init model config
         self.model_config = ModelConfig.from_server_args(server_args)
+        if server_args.disable_hybrid_swa_memory:
+            self.model_config.is_hybrid = None
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)

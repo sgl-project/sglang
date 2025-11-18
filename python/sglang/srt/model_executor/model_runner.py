@@ -409,6 +409,8 @@ class ModelRunner:
             architectures = self.model_config.hf_config.architectures
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
+        elif self.server_args.disable_hybrid_swa_memory:
+            self.is_hybrid = self.model_config.is_hybrid = None
 
         if config := self.mamba2_config:
             class_name = config.__class__.__name__
@@ -427,7 +429,6 @@ class ModelRunner:
                 self.model_config.num_attention_layers,
             )
         )
-        # TODO 在config.json里加num_nextn_predict_layers字段，复用上面的逻辑
         if (
             self.model_config.hf_config.architectures[0]
             == "HybridSWACompressedForCausalLMNextN"
@@ -1874,6 +1875,9 @@ class ModelRunner:
                     **extra_args,
                 )
             else:
+                v_head_dim = getattr(
+                    self.model_config.hf_text_config, "v_head_dim", None
+                )
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1891,6 +1895,7 @@ class ModelRunner:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
+                    v_head_dim=v_head_dim,
                 )
 
         # Initialize token_to_kv_pool_allocator

@@ -997,7 +997,15 @@ class ServerArgs:
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
             self.disable_hybrid_swa_memory = True
-
+        elif (
+            "HybridSWACompressedForCausalLM" in model_arch
+            and self.enable_hierarchical_cache
+        ):
+            # when hybrid model deploy with hierarchical cache, we need to disable hybrid swa memory
+            self.disable_hybrid_swa_memory = True
+            logger.info(
+                "Disable hybrid SWA memory for HybridSWACompressedForCausalLM model with hierarchical cache"
+            )
         elif "Llama4" in model_arch and self.device != "cpu":
             assert self.attention_backend in {
                 "fa3",

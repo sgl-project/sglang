@@ -268,11 +268,26 @@ class MooncakeStore(HiCacheStorage):
         ], "mooncake store storage backend only support page first or page first direct layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
-            buffer_ptr = buffer.data_ptr()
-            buffer_size = buffer.numel() * buffer.element_size()
-            ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
-            if ret_code:
-                logger.error(f"failed to register buffer, error code: {ret_code}")
+            # If k and v head dim are inconsistent, host_k_buffer and host_v_buffer are two separate memory addresses when allocating memory, so they need to be registered separately
+            if self.mem_pool_host.head_dim != self.mem_pool_host.v_head_dim:
+                k_buffer = buffer[0]
+                v_buffer = buffer[1]
+                k_buffer_ptr = k_buffer.data_ptr()
+                v_buffer_ptr = v_buffer.data_ptr()
+                k_buffer_size = k_buffer.numel() * k_buffer.element_size()
+                v_buffer_size = v_buffer.numel() * v_buffer.element_size()
+                ret_code = self.store.register_buffer(k_buffer_ptr, k_buffer_size)
+                if ret_code:
+                    logger.error(f"failed to register k buffer, error code: {ret_code}")
+                ret_code = self.store.register_buffer(v_buffer_ptr, v_buffer_size)
+                if ret_code:
+                    logger.error(f"failed to register v buffer, error code: {ret_code}")
+            else:
+                buffer_ptr = buffer.data_ptr()
+                buffer_size = buffer.numel() * buffer.element_size()
+                ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
+                if ret_code:
+                    logger.error(f"failed to register buffer, error code: {ret_code}")
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
