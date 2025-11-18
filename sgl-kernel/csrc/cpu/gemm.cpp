@@ -85,26 +85,6 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 }
 
 template <typename scalar_t>
-inline void copy_up_stub(const scalar_t* __restrict__ input, float* __restrict__ out, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0, data1;
-    bVec b_vec = bVec::loadu(input);
-    std::tie(data0, data1) = at::vec::convert_to_float(b_vec);
-    data0.store(out + d);
-    data1.store(out + d + fVec::size());
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<float>(input[d]);
-  }
-}
-
-template <typename scalar_t>
 inline void copy_add_stub(
     scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
