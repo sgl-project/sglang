@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -75,6 +76,7 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
+    SEL = "sel"  # shortest extend length first
 
 
 class SchedulePolicy:
@@ -87,12 +89,18 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        sel_length_ratio: float = 0.9,
+        sel_waiting_time_ratio: float = 0.1,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
+
+        # It is used by CacheAgnosticPolicy.SEL policy
+        self.sel_length_ratio = sel_length_ratio
+        self.sel_waiting_time_ratio = sel_waiting_time_ratio
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache(
@@ -137,6 +145,10 @@ class SchedulePolicy:
                 )
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
+            elif policy == CacheAgnosticPolicy.SEL:
+                SchedulePolicy._sort_by_shortest_extend_length(
+                    waiting_queue, self.sel_length_ratio, self.sel_waiting_time_ratio
+                )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
@@ -212,6 +224,28 @@ class SchedulePolicy:
                         torch.empty(len(prefix_ids), dtype=torch.bool),
                     )
         return temporary_deprioritized
+
+    @staticmethod
+    def _sort_by_shortest_extend_length(
+        waiting_queue: List[Req], length_ratio: float, waiting_time_ratio: float
+    ) -> None:
+        """Sorts the waiting queue based on the shortest extend length."""
+        if not waiting_queue:
+            return
+        start_time = time.time()
+        max_length = max(req.extend_input_len for req in waiting_queue)
+        max_waiting_time = max(
+            start_time - req.time_stats.wait_queue_entry_time for req in waiting_queue
+        )
+        eps = 1e-10
+        waiting_queue.sort(
+            key=lambda r: (
+                length_ratio * (r.extend_input_len / (max_length + eps))
+                - waiting_time_ratio
+                * (start_time - r.time_stats.wait_queue_entry_time)
+                / (max_waiting_time + eps)
+            )
+        )
 
     @staticmethod
     def _sort_by_longest_prefix(
