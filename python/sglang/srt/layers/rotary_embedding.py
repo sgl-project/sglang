@@ -2068,6 +2068,7 @@ def get_rope_wrapper(
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
     device: Optional[str] = None,
+    dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
 ):
     if device != "cpu":
         wrapper = aiter_get_rope if _use_aiter else get_rope
@@ -2080,6 +2081,7 @@ def get_rope_wrapper(
             rope_scaling,
             dtype,
             partial_rotary_factor,
+            dual_chunk_attention_config,
         )
 
     return get_rope_cpu(
