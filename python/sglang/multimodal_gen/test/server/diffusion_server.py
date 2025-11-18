@@ -7,7 +7,9 @@ from __future__ import annotations
 import os
 import statistics
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +76,7 @@ class ServerContext:
     perf_log_path: Path
     log_dir: Path
     _stdout_fh: Any = field(repr=False)
+    _log_thread: threading.Thread | None = field(default=None, repr=False)
 
     def cleanup(self) -> None:
         """Clean up server resources."""
@@ -133,12 +136,35 @@ class ServerManager:
         stdout_fh = stdout_path.open("w", encoding="utf-8", buffering=1)
         process = subprocess.Popen(
             command,
-            stdout=stdout_fh,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
             env=env,
         )
+
+        log_thread = None
+        if process.stdout:
+
+            def _log_pipe(pipe: Any, file: Any) -> None:
+                """Read from pipe and write to file and stdout."""
+                try:
+                    with pipe:
+                        for line in iter(pipe.readline, ""):
+                            sys.stdout.write(line)
+                            file.write(line)
+                            file.flush()
+                except Exception as e:
+                    logger.error("Log pipe thread error: %s", e)
+                finally:
+                    file.close()
+                    logger.debug("Log pipe thread finished.")
+
+            log_thread = threading.Thread(
+                target=_log_pipe, args=(process.stdout, stdout_fh)
+            )
+            log_thread.daemon = True
+            log_thread.start()
 
         logger.info(
             "[server-test] Starting server pid=%s, model=%s, log=%s",
@@ -157,6 +183,7 @@ class ServerManager:
             perf_log_path=perf_log_path,
             log_dir=log_dir,
             _stdout_fh=stdout_fh,
+            _log_thread=log_thread,
         )
 
     def _wait_for_ready(self, process: subprocess.Popen, stdout_path: Path) -> None:
