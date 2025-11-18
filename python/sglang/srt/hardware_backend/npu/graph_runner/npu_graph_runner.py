@@ -27,7 +27,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, get_bool_env_var
 
 is_npu = is_npu()
 
@@ -63,6 +63,7 @@ class NPUGraphRunner(CudaGraphRunner):
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
         }
+        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
@@ -78,11 +79,15 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self, model_runner):
+        if self.use_fia:
+            return "actual_seq_lengths_kv"
         if self.bs < get_attention_tp_size():
             return self.attr_name[AttentionArch.MLA]
         return self.attr_name[model_runner.model_config.attention_arch]
 
     def _get_update_attr_type(self, model_runner):
+        if self.use_fia:
+            return []
         if self.bs < get_attention_tp_size():
             return self.attr_type[AttentionArch.MLA]
         return self.attr_type[model_runner.model_config.attention_arch]

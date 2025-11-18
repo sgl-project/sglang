@@ -28,13 +28,6 @@ class AscendKVManager(MooncakeKVManager):
             disaggregation_mode=self.disaggregation_mode,
         )
 
-    def register_buffer_to_engine(self):
-        self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
-        # The Ascend backend optimize batch registration for small memory blocks.
-        self.engine.batch_register(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-        )
-
     def send_kvcache(
         self,
         mooncake_session_id: str,

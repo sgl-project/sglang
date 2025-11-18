@@ -204,11 +204,22 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     or runner.server_args.attention_backend == "trtllm_mha"
                 ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
             if is_npu():
+                from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+                    AscendGDNAttnBackend,
+                )
+
                 assert (
                     runner.server_args.attention_backend == "ascend"
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
-            logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
-            linear_attn_backend = GDNAttnBackend(runner)
+                logger.info(
+                    f"Using hybrid linear attention backend for hybrid GDN models. Using Ascend GDN attention backend for linear attention."
+                )
+                linear_attn_backend = AscendGDNAttnBackend(runner)
+            else:
+                logger.info(
+                    f"Using hybrid linear attention backend for hybrid GDN models."
+                )
+                linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:

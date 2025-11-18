@@ -246,7 +246,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_size=projection_size_ba,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
@@ -452,7 +452,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         z = z.reshape(-1, z.shape[-1])
 
         # Add padding for DP-Attn
-        if is_dp_attention_enabled():
+        if _is_npu or is_dp_attention_enabled():
             core_attn_out_pad = torch.zeros_like(z)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
@@ -922,8 +922,8 @@ class Qwen3NextForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
