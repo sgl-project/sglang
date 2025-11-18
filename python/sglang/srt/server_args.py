@@ -59,7 +59,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.utils import LazyImport, is_in_ci
 
-ConnectorType = LazyImport("sglang.srt.managers.connector", "ConnectorType")
+ConnectorType = LazyImport("sglang.srt.connector", "ConnectorType")
 FunctionCallParser = LazyImport(
     "sglang.srt.function_call.function_call_parser", "FunctionCallParser"
 )
