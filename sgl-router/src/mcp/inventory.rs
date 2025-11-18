@@ -119,8 +119,9 @@ impl Default for ToolInventory {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{borrow::Cow, sync::Arc};
+
+    use super::*;
 
     // Helper to create a test tool
     fn create_test_tool(name: &str) -> Tool {

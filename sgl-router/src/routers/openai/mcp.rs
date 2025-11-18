@@ -18,11 +18,14 @@ use tracing::{debug, info, warn};
 
 use super::utils::event_types;
 use crate::{
-    mcp::{self, format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR},
+    mcp,
     protocols::responses::{
         generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
     },
-    routers::header_utils::apply_request_headers,
+    routers::{
+        common::{format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR},
+        header_utils::apply_request_headers,
+    },
 };
 
 // ============================================================================

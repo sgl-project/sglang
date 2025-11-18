@@ -21,9 +21,7 @@ use uuid::Uuid;
 
 use super::conversions;
 use crate::{
-    mcp::{
-        self, error::McpError, format_tool_name, parse_tool_name, McpManager, TOOL_NAME_SEPARATOR,
-    },
+    mcp::{self, error::McpError, McpManager},
     protocols::{
         chat::{
             ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -37,7 +35,9 @@ use crate::{
         },
     },
     routers::{
-        common::extract_dynamic_mcp_servers,
+        common::{
+            extract_dynamic_mcp_servers, format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR,
+        },
         grpc::{
             common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
             error,

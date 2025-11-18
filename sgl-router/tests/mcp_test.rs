@@ -22,6 +22,23 @@ async fn create_mock_server() -> MockMCPServer {
         .expect("Failed to start mock MCP server")
 }
 
+/// Helper function to check if a tool exists in the inventory
+fn has_tool(manager: &McpManager, tool_name: &str) -> bool {
+    manager
+        .list_tools()
+        .iter()
+        .any(|(_, name, _, _)| name == tool_name)
+}
+
+/// Helper function to get server_url for a tool
+fn get_tool_server_url(manager: &McpManager, tool_name: &str) -> Option<String> {
+    manager
+        .list_tools()
+        .iter()
+        .find(|(_, name, _, _)| name == tool_name)
+        .map(|(server_label, _, _, _)| server_label.clone())
+}
+
 // Core MCP Server Tests
 
 #[tokio::test]
@@ -72,13 +89,14 @@ async fn test_server_connection_with_mock() {
 
     let servers = manager.list_servers();
     assert_eq!(servers.len(), 1);
-    assert!(servers.contains(&"mock_server".to_string()));
+    // Server list now contains URLs, not names
+    assert!(servers[0].starts_with("http://"), "Server should be a URL");
 
     let tools = manager.list_tools();
     assert_eq!(tools.len(), 2, "Should have 2 tools from mock server");
 
-    assert!(manager.has_tool("brave_web_search"));
-    assert!(manager.has_tool("brave_local_search"));
+    assert!(has_tool(&manager, "brave_web_search"));
+    assert!(has_tool(&manager, "brave_local_search"));
 
     manager.shutdown().await;
 }
@@ -107,7 +125,7 @@ async fn test_tool_availability_checking() {
 
     let test_tools = vec!["brave_web_search", "brave_local_search", "calculator"];
     for tool in test_tools {
-        let available = manager.has_tool(tool);
+        let available = has_tool(&manager, tool);
         match tool {
             "brave_web_search" | "brave_local_search" => {
                 assert!(
@@ -199,18 +217,20 @@ async fn test_tool_execution_with_mock() {
 
     let manager = McpManager::with_defaults(config).await.unwrap();
 
+    let inventory = manager.inventory();
+    let server_url =
+        get_tool_server_url(&manager, "brave_web_search").expect("Should have server URL for tool");
+
     let result = manager
-        .call_tool(
+        .call_tool_from_inventory(
+            &inventory,
+            &server_url,
             "brave_web_search",
-            Some(
-                json!({
-                    "query": "rust programming",
-                    "count": 1
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            ),
+            json!({
+                "query": "rust programming",
+                "count": 1
+            })
+            .to_string(),
         )
         .await;
 
@@ -256,6 +276,8 @@ async fn test_concurrent_tool_execution() {
 
     let manager = McpManager::with_defaults(config).await.unwrap();
 
+    let inventory = manager.inventory();
+
     // Execute tools sequentially (true concurrent execution would require Arc<Mutex>)
     let tool_calls = vec![
         ("brave_web_search", json!({"query": "test1"})),
@@ -263,8 +285,11 @@ async fn test_concurrent_tool_execution() {
     ];
 
     for (tool_name, args) in tool_calls {
+        let server_url = get_tool_server_url(&manager, tool_name)
+            .unwrap_or_else(|| panic!("Should have server URL for tool {}", tool_name));
+
         let result = manager
-            .call_tool(tool_name, Some(args.as_object().unwrap().clone()))
+            .call_tool_from_inventory(&inventory, &server_url, tool_name, args.to_string())
             .await;
 
         assert!(result.is_ok(), "Tool {} should succeed", tool_name);
@@ -299,15 +324,19 @@ async fn test_tool_execution_errors() {
 
     let manager = McpManager::with_defaults(config).await.unwrap();
 
+    let inventory = manager.inventory();
+    let server_url =
+        get_tool_server_url(&manager, "brave_web_search").expect("Should have server URL");
+
     // Try to call unknown tool
     let result = manager
-        .call_tool("unknown_tool", Some(serde_json::Map::new()))
+        .call_tool_from_inventory(&inventory, &server_url, "unknown_tool", "{}".to_string())
         .await;
     assert!(result.is_err(), "Should fail for unknown tool");
 
     match result.unwrap_err() {
         McpError::ToolNotFound(name) => {
-            assert_eq!(name, "unknown_tool");
+            assert!(name.contains("unknown_tool"));
         }
         _ => panic!("Expected ToolNotFound error"),
     }
@@ -373,18 +402,19 @@ async fn test_tool_info_structure() {
     let tools = manager.list_tools();
     let brave_search = tools
         .iter()
-        .find(|t| t.name.as_ref() == "brave_web_search")
+        .find(|(_, tool_name, _, _)| tool_name == "brave_web_search")
         .expect("Should have brave_web_search tool");
 
-    assert_eq!(brave_search.name.as_ref(), "brave_web_search");
-    assert!(brave_search
+    let (_server_label, tool_name, tool, _server_url) = brave_search;
+    assert_eq!(tool_name, "brave_web_search");
+    assert!(tool
         .description
         .as_ref()
         .map(|d| d.contains("Mock web search"))
         .unwrap_or(false));
     // Note: server information is now maintained separately in the inventory,
     // not in the Tool type itself
-    assert!(!brave_search.input_schema.is_empty());
+    assert!(!tool.input_schema.is_empty());
 }
 
 // SSE Parsing Tests (simplified since we don't expose parse_sse_event)
@@ -494,30 +524,33 @@ async fn test_complete_workflow() {
     // 3. Verify server connection
     let servers = manager.list_servers();
     assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0], "integration_test");
+    // Server list now contains URLs, not names
+    assert!(servers[0].starts_with("http://"), "Server should be a URL");
 
     // 4. Check available tools
     let tools = manager.list_tools();
     assert_eq!(tools.len(), 2);
 
     // 5. Verify specific tools exist
-    assert!(manager.has_tool("brave_web_search"));
-    assert!(manager.has_tool("brave_local_search"));
-    assert!(!manager.has_tool("nonexistent_tool"));
+    assert!(has_tool(&manager, "brave_web_search"));
+    assert!(has_tool(&manager, "brave_local_search"));
+    assert!(!has_tool(&manager, "nonexistent_tool"));
 
     // 6. Execute a tool
+    let inventory = manager.inventory();
+    let server_url =
+        get_tool_server_url(&manager, "brave_web_search").expect("Should have server URL for tool");
+
     let result = manager
-        .call_tool(
+        .call_tool_from_inventory(
+            &inventory,
+            &server_url,
             "brave_web_search",
-            Some(
-                json!({
-                    "query": "SGLang router MCP integration",
-                    "count": 1
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            ),
+            json!({
+                "query": "SGLang router MCP integration",
+                "count": 1
+            })
+            .to_string(),
         )
         .await;
 

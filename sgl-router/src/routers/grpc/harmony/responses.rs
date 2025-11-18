@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
-    mcp::{format_tool_name, parse_tool_name, McpManager, ToolInventory, TOOL_NAME_SEPARATOR},
+    mcp::{McpManager, ToolInventory},
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
@@ -55,7 +55,9 @@ use crate::{
         },
     },
     routers::{
-        common::extract_dynamic_mcp_servers,
+        common::{
+            extract_dynamic_mcp_servers, format_tool_name, parse_tool_name, TOOL_NAME_SEPARATOR,
+        },
         grpc::{
             common::responses::{
                 build_sse_response, ensure_mcp_connection, persist_response_if_needed,

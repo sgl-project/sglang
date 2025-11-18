@@ -8,8 +8,7 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
 use rmcp::{
-    model::CallToolRequestParam,
-    model::CallToolResult,
+    model::{CallToolRequestParam, CallToolResult},
     service::RunningService,
     transport::{
         sse_client::SseClientConfig, streamable_http_client::StreamableHttpClientTransportConfig,
