@@ -1314,6 +1314,35 @@ class SWAKVPool(KVCache):
                 layer_id_override=layer_id_pool,
             )
 
+    def get_cpu_copy(self, indices):
+        # For SWA, we need to copy KV cache from both full and SWA pools
+        # The indices are for the full pool, and we use mapping to get SWA indices
+        full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+
+        # Get SWA indices through the mapping
+        # Note: SWA allocation always creates 1:1 mapping, so no need to filter
+        if self.full_to_swa_index_mapping is not None:
+            swa_indices = self.full_to_swa_index_mapping[indices]
+            swa_kv_cpu = self.swa_kv_pool.get_cpu_copy(swa_indices)
+        else:
+            swa_kv_cpu = None
+
+        return {"full": full_kv_cpu, "swa": swa_kv_cpu}
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        # Load KV cache back from CPU to both full and SWA pools
+        # Note: indices here are NEW indices (newly allocated), different from get_cpu_copy indices
+        full_kv_cpu = kv_cache_cpu["full"]
+        swa_kv_cpu = kv_cache_cpu["swa"]
+
+        # Load full KV cache to the new indices
+        self.full_kv_pool.load_cpu_copy(full_kv_cpu, indices)
+
+        # Load SWA KV cache if it exists
+        if swa_kv_cpu is not None and self.full_to_swa_index_mapping is not None:
+            swa_indices = self.full_to_swa_index_mapping[indices]
+            self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)
+
 
 class MLATokenToKVPool(KVCache):
     def __init__(
