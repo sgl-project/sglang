@@ -1,11 +1,11 @@
+import json
 import os
 import sys
 
-import requests
-from github import Github
+from github import Auth, Github
 
 # Configuration
-PERMISSIONS_FILE_URL = "https://raw.githubusercontent.com/sgl-project/sglang/main/.github/CI_PERMISSIONS.json"
+PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
 
 def get_env_var(name):
@@ -18,15 +18,18 @@ def get_env_var(name):
 
 def load_permissions(user_login):
     """
-    Downloads the permissions JSON from the main branch and returns
+    Reads the permissions JSON from the local file system and returns
     the permissions dict for the specific user.
     """
     try:
-        print(f"Fetching permissions from {PERMISSIONS_FILE_URL}...")
-        response = requests.get(PERMISSIONS_FILE_URL)
-        response.raise_for_status()
+        print(f"Loading permissions from {PERMISSIONS_FILE_PATH}...")
+        if not os.path.exists(PERMISSIONS_FILE_PATH):
+            print(f"Error: Permissions file not found at {PERMISSIONS_FILE_PATH}")
+            return None
 
-        data = response.json()
+        with open(PERMISSIONS_FILE_PATH, "r") as f:
+            data = json.load(f)
+
         user_perms = data.get(user_login)
 
         if not user_perms:
@@ -78,8 +81,13 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms):
         # We only care about completed runs that failed
         if run.status == "completed" and run.conclusion == "failure":
             print(f"Rerunning workflow: {run.name} (ID: {run.id})")
-            run.rerun_failed()
-            rerun_count += 1
+            try:
+                # PyGithub uses rerun_failed_jobs() or rerun() depending on version/intent
+                # The traceback suggested rerun_failed_jobs
+                run.rerun_failed_jobs()
+                rerun_count += 1
+            except Exception as e:
+                print(f"Failed to rerun workflow {run.id}: {e}")
 
     if rerun_count > 0:
         comment.create_reaction("+1")
@@ -97,13 +105,15 @@ def main():
     comment_body = get_env_var("COMMENT_BODY").strip()
     user_login = get_env_var("USER_LOGIN")
 
-    # 2. Initialize GitHub API
-    g = Github(token)
+    # 2. Initialize GitHub API with Auth
+    auth = Auth.Token(token)
+    g = Github(auth=auth)
+
     repo = g.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
-    # 3. Load Permissions (Remote Check)
+    # 3. Load Permissions (Local Check)
     user_perms = load_permissions(user_login)
 
     if not user_perms:

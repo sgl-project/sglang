@@ -80,7 +80,7 @@ For CI to run on a pull request, it must have the **run-ci** label. Authorized u
 - `/tag-run-ci-label`: Tag the "run-ci" label. Every future commits will trigger CI.
 - `/rerun-failed-ci`: Rerun the failed/flaky tests of the last commit.
 
-If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash_command_handler.yml) will execute your command and react with a 👍 on your comment.
+If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash_command_handler.yml) will execute your command and react with a 👍 on your comment. It may take up to several minutes to react.
 
 If you don’t have permission, please ask maintainers to trigger CI for you.
 
