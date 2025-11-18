@@ -133,7 +133,6 @@ pub const TOOL_NAME_SEPARATOR: &str = "__";
 static TOOL_NAME_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^([^_]+(?:_[^_]+)*)__(.+)$").unwrap());
 
-
 pub fn format_tool_name(server_label: &str, tool_name: &str) -> String {
     format!("{}{}{}", server_label, TOOL_NAME_SEPARATOR, tool_name)
 }
