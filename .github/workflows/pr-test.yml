@@ -245,23 +245,6 @@ jobs:
           echo "All benchmark tests completed!"
 
   # =============================================== multimodal_gen ====================================================
-  multimodal-gen-test:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
-
-      - name: Run diffusion server tests
-        timeout-minutes: 60
-        run: |
-          cd python
-          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
@@ -331,6 +314,33 @@ jobs:
         if: always()
         run: |
           rm -rf python/sglang/logs || true
+
+
+  multimodal-gen-test:
+    needs: [check-changes, stage-a-test-1, sgl-kernel-build-wheels]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion server tests
+        timeout-minutes: 60
+        run: |
+          cd python
+          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   unit-test-backend-1-gpu:
     needs: [check-changes, stage-a-test-1, sgl-kernel-build-wheels]
