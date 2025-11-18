@@ -68,21 +68,23 @@ You can follow the pull request merge process described in [MAINTAINER.md](https
 You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals.
 Then your PR can be merged.
 
-## How to trigger CI
+## How to Trigger CI Tests
 
-To trigger CI, the pull request must have the "run-ci" label.
+We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
 
-- The "run-ci" label is not added automatically to new pull requests.
-- Only collaborators with triage or higher permission can add the "run-ci" label.
-- If you have triage/write/maintain/admin access, you can manually add the label by clicking "Labels" on the right side of the pull request.
-- If you do not have triage or higher permission, please request a review and ask a collaborator to add the label for you.
+Users with permission are listed here:
+https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json
 
-After the "run-ci" label is added, the PR author can trigger CI by:
+For CI to run on a pull request, it must have the **run-ci** label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
-1. Pushing new commits, or
-2. Clicking "Re-run" / retrigger on the workflow page.
+- `/tag-run-ci-label`: Tag the "run-ci" label. Every future commits will trigger CI.
+- `/rerun-failed-ci`: Rerun the failed/flaky tests of the last commit.
 
-## General code style
+If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash_command_handler.yml) will execute your command and react with a 👍 on your comment. It may take up to several minutes to react. Here is a usage [example](https://github.com/sgl-project/sglang/pull/13498#issuecomment-3547552157).
+
+If you don’t have permission, please ask maintainers to trigger CI for you.
+
+## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
