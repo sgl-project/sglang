@@ -206,7 +206,6 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
-            print(self.transformer.__class__.__name__)
             if self.server_args.enable_torch_compile and hasattr(
                 self.transformer, "forward"
             ):
