@@ -263,7 +263,6 @@ class SchedulerOutputProcessorMixin:
         """Resolve the padding next token ids for speculative decoding with overlap."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
-        assert result.allocate_lens.is_cpu
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
@@ -300,8 +299,6 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_v2_eagle:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
-            allocate_lens_list = result.allocate_lens.tolist()
-            accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():

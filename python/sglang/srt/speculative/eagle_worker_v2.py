@@ -720,7 +720,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
-            allocate_lens=cur_allocate_lens,
         )
 
     def move_accepted_tokens_to_target_kvcache(
