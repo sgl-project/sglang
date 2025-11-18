@@ -141,6 +141,9 @@ def main(args, server_args):
                     if steps * topk + 1 < num_draft_tokens:
                         continue
 
+                    if num_draft_tokens < steps + 1:
+                        continue
+
                     if (steps == 0 or topk == 0 or num_draft_tokens == 0) and (
                         steps + topk + num_draft_tokens != 0
                     ):
