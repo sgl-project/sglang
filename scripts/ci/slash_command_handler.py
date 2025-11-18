@@ -75,8 +75,6 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms):
 
     # List all workflow runs for this commit
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
-    print(f"Found {runs.totalCount} workflow runs for the commit.")
-    print(f"?{runs=}")
 
     rerun_count = 0
     for run in runs:
