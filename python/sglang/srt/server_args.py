@@ -410,6 +410,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -1066,6 +1067,13 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
+            elif is_hip():
+                if not self.enable_dp_attention and self.nnodes == 1:
+                    # TODO (Hubert): Put this back later
+                    # self.enable_aiter_allreduce_fusion = True
+                    logger.info(
+                        "Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM"
+                    )
 
         elif model_arch in ["GptOssForCausalLM"]:
             if (
@@ -1098,6 +1106,12 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
                     )
+            if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
+                # TODO (Hubert): Put this back later
+                # self.enable_aiter_allreduce_fusion = True
+                logger.info(
+                    "Enable Aiter AllReduce Fusion for GptOssForCausalLM"
+                )
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
@@ -3057,6 +3071,11 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+        parser.add_argument(
+            "--enable-aiter-allreduce-fusion",
+            action="store_true",
+            help="Enable Aiter AllReduce Fusion.",
         )
         parser.add_argument(
             "--deepep-mode",
