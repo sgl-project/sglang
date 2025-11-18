@@ -60,7 +60,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import get_pp_group, get_world_group, get_dcp_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -1660,18 +1660,19 @@ class Scheduler(
         else:
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
-            memory_leak = (available_size + evictable_size) != (
-                # self.max_total_num_tokens
-                # if not self.enable_hierarchical_cache
-                # else self.max_total_num_tokens - protected_size
-                self.max_total_num_tokens
-                - protected_size
-            )
+            real_available_size = available_size + evictable_size
+            real_total_num_tokens = self.max_total_num_tokens - protected_size
+            dcp_world_size = get_dcp_world_size()
+            # TODO(wh): currently, enable_dcp with get more avalibale_size, check later
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+            if dcp_world_size > 1:
+                memory_leak = real_available_size < real_total_num_tokens
+            else:
+                memory_leak = real_available_size != real_total_num_tokens
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-            #raise ValueError(msg)
+            raise ValueError(msg)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
