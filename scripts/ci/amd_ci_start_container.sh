@@ -6,7 +6,7 @@ SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if version.py is found
 
 TMP_VERSION_FILE=$(mktemp)
-if git fetch origin main --quiet; then
+if git fetch --depth=1 origin main; then
   if git show origin/main:python/sglang/version.py >"$TMP_VERSION_FILE" 2>/dev/null; then
     VERSION_FROM_FILE="v$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)"
     if [ -n "$VERSION_FROM_FILE" ]; then
