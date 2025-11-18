@@ -83,9 +83,12 @@ from sglang.srt.layers.attention.attention_registry import (
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
     get_attention_tp_group,
     get_attention_tp_size,
     initialize_dp_attention,
+    set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
@@ -120,8 +123,16 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.cuda_graph_runner import (
+    CudaGraphRunner,
+    set_torch_compile_config,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
@@ -156,6 +167,9 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_tp_gather,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
@@ -526,6 +540,7 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
+            self.kernel_warmup()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
@@ -2090,6 +2105,312 @@ class ModelRunner:
                 .contiguous()
                 .cuda()
             )
+
+    def kernel_warmup(self):
+        """Warmup and tune kernels before cuda graph capture."""
+        if self.device != "cuda":
+            return
+
+        if self._should_run_flashinfer_autotune():
+            self._flashinfer_autotune()
+
+    def _should_run_flashinfer_autotune(self) -> bool:
+        """Check if flashinfer autotune should be run."""
+        backend_str = self.server_args.attention_backend
+        if backend_str not in ["flashinfer", "trtllm_mla", "trtllm_mha"]:
+            return False
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 9:
+            return False
+
+        if (
+            self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_ngram()
+        ):
+            return not self.is_draft_worker
+
+        return True
+
+    def _flashinfer_autotune(self):
+        """Run flashinfer autotune."""
+        from flashinfer.autotuner import autotune
+
+        logger.info("Running FlashInfer autotune...")
+
+        with torch.inference_mode(), autotune():
+            self._dummy_run(batch_size=self.req_to_token_pool.size)
+
+        logger.info("FlashInfer autotune completed.")
+
+    def _dummy_run(self, batch_size: int):
+        """Run a dummy forward pass for warmup/profiling."""
+        if self.is_generation:
+            capture_forward_mode = ForwardMode.DECODE
+        else:
+            capture_forward_mode = ForwardMode.EXTEND
+        capture_hidden_mode = CaptureHiddenMode.NULL
+        num_tokens_per_bs = 1
+        if (
+            self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_ngram()
+        ):
+            if self.is_draft_worker:
+                raise RuntimeError("This should not happen")
+            else:
+                capture_forward_mode = ForwardMode.TARGET_VERIFY
+                num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+
+        if self.server_args.enable_return_hidden_states:
+            capture_hidden_mode = CaptureHiddenMode.FULL
+
+        num_tokens = batch_size * num_tokens_per_bs
+
+        seq_len_fill_value = self.attn_backend.get_cuda_graph_seq_len_fill_value()
+        seq_lens_cpu = torch.full((batch_size,), seq_len_fill_value, dtype=torch.int32)
+
+        if not self.is_generation:
+            extend_prefix_lens_cpu = [0] * batch_size
+            extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
+        else:
+            extend_prefix_lens_cpu = None
+            extend_seq_lens_cpu = None
+
+        if self.server_args.enable_torch_compile:
+            set_torch_compile_config()
+
+        with torch.device(self.device):
+            input_ids = torch.zeros((num_tokens,), dtype=torch.int64)
+            req_pool_indices = torch.zeros((batch_size,), dtype=torch.int32)
+            seq_lens = torch.full((batch_size,), seq_len_fill_value, dtype=torch.int32)
+            out_cache_loc = torch.zeros((num_tokens,), dtype=torch.int64)
+            positions = torch.zeros((num_tokens,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, num_tokens), dtype=torch.int64)
+            num_token_non_padded = torch.tensor([num_tokens], dtype=torch.int32)
+
+            if self.server_args.pp_size > 1:
+                pp_proxy_tensors = {
+                    "hidden_states": torch.zeros(
+                        (batch_size, self.model_config.hidden_size),
+                        dtype=torch.bfloat16,
+                    ),
+                    "residual": torch.zeros(
+                        (batch_size, self.model_config.hidden_size),
+                        dtype=torch.bfloat16,
+                    ),
+                }
+                pp_proxy_tensors = PPProxyTensors(
+                    {k: v[:num_tokens] for k, v in pp_proxy_tensors.items()}
+                )
+
+            if self.spec_algorithm.is_eagle3():
+                self.model.set_eagle3_layers_to_capture()
+
+            if self.model_config.is_encoder_decoder:
+                encoder_lens = torch.zeros((batch_size,), dtype=torch.int32)
+            else:
+                encoder_lens = None
+
+            if require_gathered_buffer(self.server_args):
+                if require_mlp_tp_gather(self.server_args):
+                    global_num_tokens_gpu = torch.zeros(
+                        (self.server_args.dp_size,), dtype=torch.int32
+                    )
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
+                        (self.server_args.dp_size,), dtype=torch.int32
+                    )
+                else:
+                    assert require_attn_tp_gather(self.server_args)
+                    global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
+                        (1,), dtype=torch.int32
+                    )
+            else:
+                global_num_tokens_gpu = None
+                global_num_tokens_for_logprob_gpu = None
+
+            custom_mask = torch.ones(
+                ((seq_lens.sum().item() + num_tokens) * num_tokens_per_bs),
+                dtype=torch.bool,
+            )
+
+            next_token_logits_buffer = torch.zeros(
+                (num_tokens, self.model_config.vocab_size),
+                dtype=torch.float,
+            )
+
+            if require_mlp_tp_gather(self.server_args):
+                global_num_tokens_gpu.copy_(
+                    torch.tensor(
+                        [num_tokens] * self.server_args.dp_size,
+                        dtype=torch.int32,
+                    )
+                )
+                global_num_tokens_for_logprob_gpu.copy_(
+                    torch.tensor(
+                        [num_tokens] * self.server_args.dp_size,
+                        dtype=torch.int32,
+                    )
+                )
+                global_dp_buffer_len = num_tokens * self.server_args.dp_size
+            elif require_attn_tp_gather(self.server_args):
+                global_num_tokens_gpu.copy_(
+                    torch.tensor(
+                        [num_tokens],
+                        dtype=torch.int32,
+                    )
+                )
+                global_num_tokens_for_logprob_gpu.copy_(
+                    torch.tensor(
+                        [num_tokens],
+                        dtype=torch.int32,
+                    )
+                )
+                global_dp_buffer_len = num_tokens
+            else:
+                global_dp_buffer_len = None
+
+            if not self.is_generation:
+                extend_num_tokens = num_tokens
+                extend_seq_lens = torch.full(
+                    (batch_size,), seq_len_fill_value, dtype=torch.int32
+                )
+                extend_prefix_lens = torch.zeros((batch_size,), dtype=torch.int32)
+                extend_start_loc = torch.arange(
+                    0, num_tokens, num_tokens_per_bs, dtype=torch.int32
+                )
+            else:
+                extend_num_tokens = None
+                extend_seq_lens = None
+                extend_prefix_lens = None
+                extend_start_loc = None
+
+        def get_spec_info():
+            spec_info = None
+            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+                from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+                if self.is_draft_worker:
+                    raise RuntimeError("This should not happen.")
+                else:
+                    spec_info = EagleVerifyInput(
+                        draft_token=None,
+                        custom_mask=custom_mask,
+                        positions=None,
+                        retrive_index=None,
+                        retrive_next_token=None,
+                        retrive_next_sibling=None,
+                        retrive_cum_len=None,
+                        spec_steps=self.server_args.speculative_num_steps,
+                        topk=self.server_args.speculative_eagle_topk,
+                        draft_token_num=self.server_args.speculative_num_draft_tokens,
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        seq_lens_sum=None,
+                        seq_lens_cpu=None,
+                    )
+
+            elif self.spec_algorithm.is_ngram():
+                from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+                spec_info = NgramVerifyInput(
+                    draft_token=None,
+                    tree_mask=custom_mask,
+                    positions=None,
+                    retrive_index=None,
+                    retrive_next_token=None,
+                    retrive_next_sibling=None,
+                    draft_token_num=num_tokens_per_bs,
+                )
+                spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+            return spec_info
+
+        spec_info = get_spec_info()
+        if capture_hidden_mode != CaptureHiddenMode.FULL:
+            capture_hidden_mode = (
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            )
+
+        if self.server_args.enable_lora:
+            lora_ids = [None] * batch_size
+        else:
+            lora_ids = None
+
+        forward_batch = ForwardBatch(
+            forward_mode=capture_forward_mode,
+            batch_size=batch_size,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            attn_backend=self.attn_backend,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens.sum().item(),
+            encoder_lens=encoder_lens,
+            return_logprob=False,
+            positions=positions,
+            extend_num_tokens=extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
+            mrope_positions=mrope_positions,
+            spec_algorithm=self.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=capture_hidden_mode,
+            num_token_non_padded=num_token_non_padded,
+            global_forward_mode=capture_forward_mode,
+            lora_ids=lora_ids,
+        )
+
+        if lora_ids is not None:
+            self.lora_manager.prepare_lora_batch(forward_batch)
+
+        self.attn_backend.init_forward_metadata(forward_batch)
+
+        def run_once():
+            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+            )
+            set_is_extend_in_batch(False)
+
+            kwargs = {}
+            if (
+                self.server_args.pp_size > 1
+                and "pp_proxy_tensors"
+                in inspect.signature(self.model.forward).parameters
+            ):
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                )
+            if not self.is_generation:
+                kwargs["get_embedding"] = True
+
+            logits_output_or_pp_proxy_tensors = self.model.forward(
+                input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+            return logits_output_or_pp_proxy_tensors
+
+        torch.get_device_module(self.device).synchronize()
+        self.tp_group.barrier()
+        run_once()
 
     def init_device_graphs(self):
         """Capture device graphs."""
