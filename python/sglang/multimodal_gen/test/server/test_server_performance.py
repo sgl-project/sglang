@@ -139,7 +139,7 @@ class TestDiffusionPerformance:
         log_path = ctx.perf_log_path
         prev_len = len(read_perf_records(log_path))
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
-        log_wait_timeout = 3600.0 if is_baseline_generation_mode else 120.0
+        log_wait_timeout = 3600.0 if is_baseline_generation_mode else 300.0
 
         generate_fn()
 

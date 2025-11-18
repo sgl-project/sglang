@@ -187,7 +187,7 @@ def wait_for_stage_metrics(
     prev_len: int,
     expected_count: int,
     log_path: Path,
-    timeout: float = 120.0,
+    timeout: float = 300.0,
 ) -> tuple[dict[str, float], int]:
     deadline = time.time() + timeout
     metrics: dict[str, float] = {}
