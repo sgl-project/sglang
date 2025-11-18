@@ -212,7 +212,7 @@ class ServerArgs:
     model_path: str
 
     # Attention
-    attention_backend: str = "torch_sdpa"
+    attention_backend: str = None
 
     # Running mode
     mode: ExecutionMode = ExecutionMode.INFERENCE

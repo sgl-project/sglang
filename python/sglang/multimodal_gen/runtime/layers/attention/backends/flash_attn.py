@@ -16,8 +16,7 @@ try:
     # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
     flash_attn_func = flash_attn_varlen_func
 except ImportError as e:
-    print("error fa3")
-    #raise e
+    raise e
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
