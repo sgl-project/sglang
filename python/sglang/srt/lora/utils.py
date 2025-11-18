@@ -46,16 +46,6 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
-def get_layer_id(name: str) -> int:
-    """
-    Extract integer id of layer from its name in string.
-    """
-    match = re.search(r"layers\.(\d+)\.", name)
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
 def get_hidden_dim(
     module_name: str, config: AutoConfig, base_model: torch.nn.Module, layer_idx: int
 ) -> Tuple[int]:
