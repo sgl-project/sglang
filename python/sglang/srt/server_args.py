@@ -1071,11 +1071,7 @@ class ServerArgs:
                 assert (
                     self.model_config.hf_config.mlp_hidden_act == "relu2"
                 )
-                assert (
-                    self.model_config.quantization != "model_opt_fp4", 
-                    "NemotronH model does not support modelopt_fp4 quantization yet."
-                )
-                self.quantization = "modelopt_fp4"if self.model_config.hf_config.quantization_config["quant_algo"] == "NVFP4" else "modelopt_fp8"
+                self.quantization = self.model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
 
         if is_deepseek_nsa(hf_config):
