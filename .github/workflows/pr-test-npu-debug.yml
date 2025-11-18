@@ -3,9 +3,9 @@ name: PR Test For Innersource (DEBUG)
 on:
   workflow_dispatch:
   pull_request:
-    branches: [ upstream/251031 ]
+    branches: [ main ]
     paths:
-      - "test/**"
+      - ".github/workflows/pr-test-npu-debug.yml"
 
 concurrency:
   group: pr-test-npu-debug-${{ github.ref }}
