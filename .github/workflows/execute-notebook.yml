@@ -6,7 +6,7 @@ on:
     paths:
       - "python/sglang/**"
       - "docs/**"
-    types: [synchronize, labeled]
+    types: [synchronize]
   workflow_dispatch:
 
 

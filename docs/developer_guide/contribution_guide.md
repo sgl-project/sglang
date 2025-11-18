@@ -69,11 +69,18 @@ You will need to work with the Merge Oncall, Codeowner, and other reviewers to g
 Then your PR can be merged.
 
 ## How to trigger CI
+
 To trigger CI, the pull request must have the "run-ci" label.
 
-- If you have write access to sgl-project/sglang, your pull request will be automatically tagged by @sglang-bot.
-- If you have triage access to sgl-project/sglang, you can manually add the label by clicking "Labels" on the right side of your pull request page.
-- If you do not have the above access, please request a review and ask other maintainers to add the label for you.
+- The "run-ci" label is not added automatically to new pull requests.
+- Only collaborators with triage or higher permission can add the "run-ci" label.
+- If you have triage/write/maintain/admin access, you can manually add the label by clicking "Labels" on the right side of the pull request.
+- If you do not have triage or higher permission, please request a review and ask a collaborator to add the label for you.
+
+After the "run-ci" label is added, the PR author can trigger CI by:
+
+1. Pushing new commits, or
+2. Clicking "Re-run" / retrigger on the workflow page.
 
 ## General code style
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.

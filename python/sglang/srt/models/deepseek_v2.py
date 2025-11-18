@@ -93,6 +93,7 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -674,6 +675,7 @@ class DeepseekV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
+            routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -3254,13 +3256,20 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                )
+        else:
+            # ranks other than the last rank will have a placeholder layer
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
         self._routed_experts_weights_of_layer = LazyValue(

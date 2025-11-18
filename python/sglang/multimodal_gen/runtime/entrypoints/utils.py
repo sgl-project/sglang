@@ -45,12 +45,12 @@ def prepare_sampling_params(
     # Validate dimensions
     if sampling_params.num_frames <= 0:
         raise ValueError(
-            f"Height, width, and num_frames must be positive integers, got "
+            f"height, width, and num_frames must be positive integers, got "
             f"height={sampling_params.height}, width={sampling_params.width}, "
             f"num_frames={sampling_params.num_frames}"
         )
 
-    if pipeline_config.task_type.is_image_task():
+    if pipeline_config.task_type.is_image_gen():
         # settle num_frames
         logger.debug(f"Setting num_frames to 1 because this is a image-gen model")
         sampling_params.num_frames = 1
@@ -103,6 +103,10 @@ def prepare_sampling_params(
                 server_args.num_gpus,
             )
             sampling_params.num_frames = new_num_frames
+
+        sampling_params.num_frames = server_args.pipeline_config.adjust_num_frames(
+            sampling_params.num_frames
+        )
 
     sampling_params.set_output_file_ext()
     sampling_params.log(server_args=server_args)
