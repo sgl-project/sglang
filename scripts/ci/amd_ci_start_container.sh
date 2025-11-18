@@ -142,9 +142,9 @@ docker pull "${IMAGE}"
 
 HF_CACHE_HOST=/home/runner/sgl-data/hf-cache
 if [[ -d "$HF_CACHE_HOST" ]]; then
-    CACHE_VOLUME="-v $HF_CACHE_HOST:/hf_home"
+    HF_CACHE_VOLUME="-v $HF_CACHE_HOST:/hf_home"
 else
-    CACHE_VOLUME=""
+    HF_CACHE_VOLUME=""
 fi
 
 PIP_CACHE_HOST=/home/runner/sgl-data/pip-cache
