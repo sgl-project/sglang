@@ -629,17 +629,11 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 // bias : [N]
 // out  : [M, N]
 //
-at::Tensor weight_packed_linear(
-    at::Tensor& mat1,
-    at::Tensor& mat2,
-    const std::optional<at::Tensor>& bias,
-    bool is_vnni,
-    const std::optional<at::Tensor>& post_mul_mat) {
+at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
-
-  const bool has_post_mul = post_mul_mat.has_value();
   bool use_fma_gemm = false;
   if (packed_w.scalar_type() == at::kFloat) {
     use_fma_gemm = true;
@@ -655,22 +649,16 @@ at::Tensor weight_packed_linear(
   CHECK_DIM(2, mat2);
   if (!use_fma_gemm) {
     CHECK_EQ(mat1.size(1), K);
-    TORCH_CHECK(!has_post_mul, "post_mul_mat is supported when using fma GEMM (OC < 16)")
   }
 
-  // strides
-  int64_t out_strideM = has_post_mul ? post_mul_mat.value().size(1) : N;
-  int64_t mat1_strideM = mat1.stride(0);
   auto dispatch_type = mat1.scalar_type();
-  auto out = at::empty({M, out_strideM}, mat1.options());
+  auto out = at::empty({M, N}, mat1.options());
+  // strides
+  int64_t out_strideM = out.stride(0);
+  int64_t mat1_strideM = mat1.stride(0);
 
   if (use_fma_gemm) {
     mat1 = mat1.to(at::kFloat);
-    if (has_post_mul) {
-      TORCH_CHECK(
-          N == 1 && out_strideM % 32 == 0,
-          "post_mul_mat tensor size(1) should be 32 dividable, and the mat2 OC=1 (Mx1 as linear output shape)")
-    }
   }
 
   const bool has_bias = bias.has_value();
@@ -681,17 +669,13 @@ at::Tensor weight_packed_linear(
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(dispatch_type, "weight_packed_linear_kernel_impl", [&] {
-    const scalar_t* post_mul_data = nullptr;
-    if (has_post_mul) {
-      post_mul_data = post_mul_mat.value().data_ptr<scalar_t>();
-    }
     if (use_fma_gemm) {
       weight_packed_linear_kernel_impl<scalar_t>(
           out.data_ptr<scalar_t>(),
           mat1.data_ptr<float>(),
           packed_w.data_ptr<float>(),
           bias_data,
-          post_mul_data,
+          nullptr,
           M,
           N,
           K,
@@ -709,6 +693,66 @@ at::Tensor weight_packed_linear(
           mat1_strideM,
           out_strideM);
     }
+  });
+
+  return out;
+}
+
+// mat1         : [M, K]
+// mat2         : [K, 1]
+// post_mul_mat : [M, K]
+// bias         : [N]
+// out          : [M, N]
+//
+at::Tensor fused_linear_sigmoid_mul(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    const at::Tensor& post_mul_mat) {
+  RECORD_FUNCTION("sgl-kernel::fused_linear_sigmoid_mul", std::vector<c10::IValue>({mat1, mat2, bias, post_mul_mat}));
+
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+  TORCH_CHECK(packed_w.scalar_type() == at::kFloat, "fused_linear_sigmoid_mul requires packed float weight")
+
+  int64_t M = mat1.size(0);
+  int64_t K = mat1.size(1);
+  int64_t N = mat2.size(1);
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
+  CHECK_INPUT(mat2);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+
+  int64_t out_strideM = post_mul_mat.size(1);
+  int64_t mat1_strideM = mat1.stride(0);
+  auto dispatch_type = mat1.scalar_type();
+  auto out = at::empty({M, out_strideM}, mat1.options());
+  mat1 = mat1.to(at::kFloat);
+
+  TORCH_CHECK(
+      N == 1 && out_strideM % 32 == 0,
+      "post_mul_mat tensor size(1) should be 32 dividable, and the mat2 OC=1 (Mx1 as linear output shape)")
+
+  const bool has_bias = bias.has_value();
+  const float* bias_data = nullptr;
+  if (has_bias) {
+    CHECK_EQ(bias.value().size(0), N);
+    bias_data = bias.value().data_ptr<float>();
+  }
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(dispatch_type, "fused_linear_sigmoid_mul", [&] {
+    weight_packed_linear_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        mat1.data_ptr<float>(),
+        packed_w.data_ptr<float>(),
+        bias_data,
+        post_mul_mat.data_ptr<scalar_t>(),
+        M,
+        N,
+        K,
+        mat1_strideM,
+        out_strideM);
   });
 
   return out;

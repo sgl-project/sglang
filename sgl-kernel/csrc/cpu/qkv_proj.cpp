@@ -385,12 +385,8 @@ void rotary_emb_kernel_impl(
 
 }  // anonymous namespace
 
-extern at::Tensor weight_packed_linear(
-    at::Tensor& mat1,
-    at::Tensor& mat2,
-    const std::optional<at::Tensor>& bias,
-    bool is_vnni,
-    const std::optional<at::Tensor>& post_mul_mat);
+extern at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
 
 extern at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
@@ -600,7 +596,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     qb = fp8_scaled_mm_cpu(
         qa, q_b_proj_weight, q_b_proj_scale.value(), block_size.value(), bias, at::kBFloat16, is_vnni);
   } else {
-    qb = weight_packed_linear(qa, q_b_proj_weight, bias, is_vnni, std::nullopt);
+    qb = weight_packed_linear(qa, q_b_proj_weight, bias, is_vnni);
   }
   qb.as_strided_({num_seqs, num_heads, qk_head_dim}, {num_heads * qk_head_dim, qk_head_dim, 1});
 

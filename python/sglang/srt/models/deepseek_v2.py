@@ -578,7 +578,6 @@ class MoEGate(nn.Module):
                 self.weight,
                 None,  # bias
                 True,  # is_vnni
-                None,  # post mul
             )
 
         if get_global_server_args().enable_deterministic_inference:

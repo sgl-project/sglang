@@ -52,12 +52,12 @@ class TestGemm(CustomTestCase):
         ref = ref.bfloat16()
 
         out = torch.ops.sgl_kernel.weight_packed_linear(
-            mat1, mat2, bias if has_bias else None, False, None
+            mat1, mat2, bias if has_bias else None, False
         )
 
         packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)
         out2 = torch.ops.sgl_kernel.weight_packed_linear(
-            mat1, packed_mat2, bias if has_bias else None, True, None
+            mat1, packed_mat2, bias if has_bias else None, True
         )
 
         atol = rtol = precision[ref.dtype]
@@ -91,16 +91,22 @@ class TestGemm(CustomTestCase):
         if has_bias:
             bias = torch.randn(N, dtype=torch.float32)
             ref.add_(bias)
-
         if use_post_sigmul:
             ref = torch.nn.functional.sigmoid(ref) * mat_mul
-        out = torch.ops.sgl_kernel.weight_packed_linear(
-            mat1,
-            torch.ops.sgl_kernel.convert_weight_packed(mat2),
-            bias if has_bias else None,
-            True,
-            mat_mul if use_post_sigmul else None,
-        )
+            out = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
+                mat1,
+                torch.ops.sgl_kernel.convert_weight_packed(mat2),
+                bias if has_bias else None,
+                True,
+                mat_mul if use_post_sigmul else None,
+            )
+        else:
+            out = torch.ops.sgl_kernel.weight_packed_linear(
+                mat1,
+                torch.ops.sgl_kernel.convert_weight_packed(mat2),
+                bias if has_bias else None,
+                True,
+            )
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 

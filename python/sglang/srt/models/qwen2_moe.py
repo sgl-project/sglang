@@ -230,7 +230,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 if use_intel_amx_backend(self.shared_expert_gate):
-                    shared_output = torch.ops.sgl_kernel.weight_packed_linear(
+                    shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
                         hidden_states,
                         self.shared_expert_gate.weight,
                         self.shared_expert_gate.bias,
