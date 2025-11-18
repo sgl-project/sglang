@@ -26,8 +26,10 @@ env:
 
 jobs:
   call-gate:
-    uses: sgl-project/sglang/.github/workflows/pr-gate.yml@main
+    uses: ./.github/workflows/pr-gate.yml@main
     secrets: inherit
+    with:
+      require-run-ci: false
   # =============================================== check changes ====================================================
   check-changes:
     needs: [call-gate]
