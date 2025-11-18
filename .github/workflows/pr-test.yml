@@ -21,9 +21,6 @@ concurrency:
   group: pr-test-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  SGLANG_IS_IN_CI: true
-
 jobs:
   call-gate:
     uses: ./.github/workflows/pr-gate.yml
@@ -169,11 +166,6 @@ jobs:
           cd sgl-kernel
           pytest tests/
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   sgl-kernel-mla-test:
     needs: [check-changes, sgl-kernel-build-wheels]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -204,11 +196,6 @@ jobs:
         run: |
           cd test/srt
           python3 test_mla_deepseek_v3.py
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   sgl-kernel-benchmark-test:
     needs: [check-changes, sgl-kernel-build-wheels]
@@ -254,35 +241,24 @@ jobs:
 
           echo "All benchmark tests completed!"
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   # =============================================== multimodal_gen ====================================================
   multimodal-gen-test:
-   needs: [check-changes]
-   if: needs.check-changes.outputs.multimodal_gen == 'true'
-   runs-on: 1-gpu-runner
-   steps:
-     - name: Checkout code
-       uses: actions/checkout@v4
+    needs: [check-changes]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-     - name: Install dependencies
-       run: |
-         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
-     - name: Run diffusion server tests
-       timeout-minutes: 60
-       run: |
-         cd python
-         pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
-
-     - name: Cleanup logs directory
-       if: always()
-       run: |
-         # Remove logs directory to prevent NFS lock files
-         rm -rf python/sglang/logs || true
+      - name: Run diffusion server tests
+        timeout-minutes: 60
+        run: |
+          cd python
+          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
@@ -387,11 +363,6 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   unit-test-backend-2-gpu:
     needs: [check-changes, unit-test-backend-1-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
@@ -424,11 +395,6 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   unit-test-backend-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -591,11 +557,6 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   performance-test-1-gpu-part-2:
     needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
@@ -648,11 +609,6 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   performance-test-1-gpu-part-3:
     needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
@@ -765,11 +721,6 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   accuracy-test-1-gpu:
     needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
@@ -802,11 +753,6 @@ jobs:
           cd test/srt
           python3 test_eval_accuracy_large.py
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   accuracy-test-2-gpu:
     needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
@@ -838,11 +784,6 @@ jobs:
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -978,7 +919,7 @@ jobs:
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
 
-        # multimodal-gen-test,
+        multimodal-gen-test,
 
         stage-a-test-1,
         unit-test-backend-1-gpu,
