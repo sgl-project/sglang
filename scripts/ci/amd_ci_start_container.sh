@@ -148,7 +148,7 @@ else
 fi
 
 PIP_CACHE_HOST=/home/runner/sgl-data/pip-cache
-if [[ -d "$HF_CACHE_HOST" ]]; then
+if [[ -d "$PIP_CACHE_HOST" ]]; then
     PIP_CACHE_VOLUME="-v $PIP_CACHE_HOST:/pip-cache"
 else
     PIP_CACHE_VOLUME=""
