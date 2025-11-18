@@ -188,7 +188,10 @@ class TestVLMModels(CustomTestCase):
             self.run_mmmu_eval(model.model, output_path, limit)
 
             # Get the result file
-            result_file_path = glob.glob(f"{output_path}/*.json")[0]
+            result_files = glob.glob(f"{output_path}/*.json")
+            if not result_files:
+                self.fail(f"No result JSON file found in {output_path}")
+            result_file_path = result_files[0]
 
             with open(result_file_path, "r") as f:
                 result = json.load(f)
