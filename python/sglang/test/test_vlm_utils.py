@@ -71,7 +71,7 @@ class TestVLMModels(CustomTestCase):
         model_args = f'model_version="{model_version}",' f"tp={tp}"
 
         # -------- build command list --------
-        current_dir = os.path.dirname(os.path.abspath(_file_))
+        current_dir = os.path.dirname(os.path.abspath(__file__))
 
         config_path = os.path.join(current_dir,'mmmu-val.yaml')
         
