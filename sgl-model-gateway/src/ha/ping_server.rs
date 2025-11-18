@@ -14,6 +14,7 @@ use tracing::instrument;
 
 use super::{
     crdt::SKey,
+    flow_control::{BackpressureController, MessageSizeError, MessageSizeValidator},
     gossip::{
         self,
         gossip_server::{Gossip, GossipServer},
@@ -294,8 +295,12 @@ impl Gossip for GossipService {
         let stores = self.stores.clone();
         let sync_manager = self.sync_manager.clone();
 
-        // Create output stream
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamMessage, Status>>(128);
+        // Create output stream with flow control
+        const CHANNEL_CAPACITY: usize = 128;
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<StreamMessage, Status>>(CHANNEL_CAPACITY);
+        let backpressure = BackpressureController::new(CHANNEL_CAPACITY, 25);
+        let size_validator = MessageSizeValidator::default();
 
         // Create incremental update collector if stores are available
         let collector = if let Some(stores) = &stores {
@@ -311,6 +316,8 @@ impl Gossip for GossipService {
         if let Some(collector) = collector {
             let tx_incremental = tx.clone();
             let self_name_incremental = self_name.clone();
+            let backpressure_clone = backpressure.clone();
+            let size_validator_clone = size_validator.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5)); // Send every 5 seconds
                 let mut sequence_counter: u64 = 0;
@@ -333,6 +340,16 @@ impl Gossip for GossipService {
                             sequence_counter += 1;
                             let batch_size: usize = updates.iter().map(|u| u.value.len()).sum();
 
+                            // Validate message size
+                            if let Err(e) = size_validator_clone.validate(batch_size) {
+                                log::warn!(
+                                    "Incremental update too large, skipping: {} (max: {} bytes)",
+                                    e,
+                                    size_validator_clone.max_size()
+                                );
+                                continue;
+                            }
+
                             let incremental_update = StreamMessage {
                                 message_type: StreamMessageType::IncrementalUpdate as i32,
                                 payload: Some(gossip::stream_message::Payload::Incremental(
@@ -346,15 +363,28 @@ impl Gossip for GossipService {
                                 peer_id: self_name_incremental.clone(),
                             };
 
-                            // Record metrics
-                            record_batch_sent(&self_name_incremental, batch_size);
-
-                            // Mark as sent after successful transmission
-                            collector.mark_sent(store_type, &updates);
-
-                            if tx_incremental.send(Ok(incremental_update)).await.is_err() {
-                                log::warn!("Failed to send incremental update, stream closed");
-                                break;
+                            // Check backpressure using try_send (mpsc::Sender doesn't have len())
+                            match tx_incremental.try_send(Ok(incremental_update)) {
+                                Ok(_) => {
+                                    // Successfully queued
+                                    // Record metrics
+                                    record_batch_sent(&self_name_incremental, batch_size);
+                                    // Mark as sent after successful transmission
+                                    collector.mark_sent(store_type, &updates);
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    log::debug!(
+                                        "Backpressure: channel full, skipping send (will retry next interval)"
+                                    );
+                                    // Don't mark as sent, will retry next interval
+                                    continue;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    log::warn!(
+                                        "Channel closed, stopping incremental update sender"
+                                    );
+                                    break;
+                                }
                             }
 
                             log::debug!(
@@ -442,6 +472,36 @@ impl Gossip for GossipService {
                                 if let Some(gossip::stream_message::Payload::Incremental(update)) =
                                     &msg.payload
                                 {
+                                    // Validate message size
+                                    let msg_size: usize =
+                                        update.updates.iter().map(|u| u.value.len()).sum();
+                                    if let Err(e) = size_validator.validate(msg_size) {
+                                        log::warn!(
+                                            "Received oversized incremental update from {}: {} (max: {} bytes), rejecting",
+                                            peer_id, e, size_validator.max_size()
+                                        );
+                                        let nack = StreamMessage {
+                                            message_type: StreamMessageType::Nack as i32,
+                                            payload: Some(gossip::stream_message::Payload::Ack(
+                                                StreamAck {
+                                                    sequence: msg.sequence,
+                                                    success: false,
+                                                    error_message: format!(
+                                                        "Message too large: {}",
+                                                        e
+                                                    ),
+                                                },
+                                            )),
+                                            sequence,
+                                            peer_id: self_name.clone(),
+                                        };
+                                        if tx.send(Ok(nack)).await.is_err() {
+                                            break;
+                                        }
+                                        record_nack(&peer_id);
+                                        continue;
+                                    }
+
                                     let store_type = LocalStoreType::from_proto(update.store);
                                     log::info!("Received incremental update from {}: store={:?}, {} updates", 
                                         peer_id, store_type, update.updates.len());
@@ -561,8 +621,31 @@ impl Gossip for GossipService {
                                             c.total_chunks = total_chunks;
                                         }
 
-                                        if tx.send(Ok(chunk_msg)).await.is_err() {
-                                            break;
+                                        // Check backpressure using try_send
+                                        match tx.try_send(Ok(chunk_msg)) {
+                                            Ok(_) => {
+                                                // Successfully queued
+                                            }
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                                msg,
+                                            )) => {
+                                                log::debug!(
+                                                    "Backpressure: channel full, waiting for drain"
+                                                );
+                                                // Wait a bit for channel to drain, then use blocking send
+                                                tokio::time::sleep(Duration::from_millis(100))
+                                                    .await;
+                                                if tx.send(msg).await.is_err() {
+                                                    log::warn!("Backpressure: channel closed, stopping snapshot");
+                                                    break;
+                                                }
+                                            }
+                                            Err(
+                                                tokio::sync::mpsc::error::TrySendError::Closed(_),
+                                            ) => {
+                                                log::warn!("Channel closed, stopping snapshot");
+                                                break;
+                                            }
                                         }
                                     }
 

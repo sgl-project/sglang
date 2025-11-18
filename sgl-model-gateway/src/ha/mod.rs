@@ -1,6 +1,7 @@
 pub mod controller;
 pub mod crdt;
 pub mod endpoints;
+pub mod flow_control;
 pub mod incremental;
 pub mod metrics;
 pub mod mtls;

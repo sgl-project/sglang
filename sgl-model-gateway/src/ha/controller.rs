@@ -10,6 +10,7 @@ use tracing as log;
 use tracing::instrument;
 
 use super::{
+    flow_control::RetryManager,
     gossip::{gossip_message, NodeState, NodeStatus, Ping, PingReq, StateSync},
     service::{broadcast_node_states, try_ping},
     ClusterState,
@@ -43,6 +44,10 @@ impl HAController {
         let read_state = self.state.clone();
         let mut cnt: u64 = 0;
 
+        // Track retry managers for each peer
+        use std::collections::HashMap;
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+
         loop {
             log::info!("Round {} Status:{:?}", cnt, read_state.read());
             let peer = if cnt == 0 {
@@ -74,8 +79,43 @@ impl HAController {
 
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     if let Some(peer) = peer {
-                        if let Err(e) = self.connect_to_peer(peer.clone()).await {
-                            log::warn!("Error connecting to peer {}: {}", peer.name, e);
+                        let peer_name = peer.name.clone();
+
+                        // Get or create retry manager for this peer
+                        let retry_manager = retry_managers
+                            .entry(peer_name.clone())
+                            .or_insert_with(RetryManager::default);
+
+                        // Check if we should retry based on backoff
+                        if retry_manager.should_retry() {
+                            match self.connect_to_peer(peer.clone()).await {
+                                Ok(_) => {
+                                    // Success - reset retry state
+                                    retry_manager.reset();
+                                    log::info!("Successfully connected to peer {}", peer_name);
+                                }
+                                Err(e) => {
+                                    // Failure - record attempt and calculate next delay
+                                    retry_manager.record_attempt();
+                                    let next_delay = retry_manager.next_delay();
+                                    let attempt = retry_manager.attempt_count();
+                                    log::warn!(
+                                        "Error connecting to peer {} (attempt {}): {}. Next retry in {:?}",
+                                        peer_name,
+                                        attempt,
+                                        e,
+                                        next_delay
+                                    );
+                                }
+                            }
+                        } else {
+                            // Still in backoff period, skip this attempt
+                            let next_delay = retry_manager.next_delay();
+                            log::debug!(
+                                "Skipping connection to peer {} (backoff: {:?} remaining)",
+                                peer_name,
+                                next_delay
+                            );
                         }
                     } else {
                         log::info!("No peer address available to connect");
