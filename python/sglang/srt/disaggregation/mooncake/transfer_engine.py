@@ -1,9 +1,66 @@
+import json
 import logging
 from typing import List, Optional
 
 from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
+
+
+def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
+    """
+    Parse IB device string and get IB devices for a specific GPU ID.
+
+    Supports both formats:
+    1. Old format: "ib0, ib1, ib2"
+    2. New format: {0: "ib0, ib1", 1: "ib2, ib3", 2: "ib4"}
+
+    Args:
+        ib_device_str: The original IB device string
+        gpu_id: The GPU ID to get devices for
+
+    Returns:
+        IB devices string for the GPU, or None if not available
+    """
+    if ib_device_str is None or not ib_device_str.strip():
+        return None
+
+    ib_device_str = ib_device_str.strip()
+
+    # Check if it's JSON format (new format)
+    try:
+        parsed_json = json.loads(ib_device_str)
+        if isinstance(parsed_json, dict):
+            # Validate format - keys should be integers (or string rep), values should be strings
+            gpu_mapping = {}
+            for gpu_key, ib_devices in parsed_json.items():
+                if (
+                    isinstance(gpu_key, str)
+                    and gpu_key.isdigit()
+                    and isinstance(ib_devices, str)
+                ):
+                    gpu_mapping[int(gpu_key)] = ib_devices.strip()
+                elif isinstance(gpu_key, int) and isinstance(ib_devices, str):
+                    gpu_mapping[gpu_key] = ib_devices.strip()
+                else:
+                    raise ValueError(
+                        f"Invalid format: keys must be integers (or string representations of integers) and values must be strings"
+                    )
+
+            if not gpu_mapping:
+                raise ValueError("No valid GPU mappings found in JSON")
+
+            # Return devices for specific GPU
+            if gpu_id in gpu_mapping:
+                return gpu_mapping[gpu_id]
+            else:
+                raise ValueError(
+                    f"No IB devices configured for GPU {gpu_id}. Available GPUs: {list(gpu_mapping.keys())}"
+                )
+
+    except json.JSONDecodeError:
+        # Not JSON format, treat as old format - return same devices for all GPUs
+        return ib_device_str
 
 
 class MooncakeTransferEngine:
@@ -21,7 +78,7 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
         self.hostname = hostname
         self.gpu_id = gpu_id
-        self.ib_device = ib_device
+        self.ib_device = get_ib_devices_for_gpu(ib_device, gpu_id)
 
         self.initialize(
             hostname=self.hostname,

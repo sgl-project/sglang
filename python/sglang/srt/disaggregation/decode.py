@@ -879,8 +879,7 @@ class SchedulerDisaggregationDecodeMixin:
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
-            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
-            trace_event_batch("schedule", ret.reqs, attrs=attrs)
+            trace_event_batch("schedule", ret.reqs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -931,7 +930,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        new_batch.process_prebuilt(self.server_args, self.model_config)
+        new_batch.process_prebuilt(self.server_args, self.future_map)
 
         return new_batch
 

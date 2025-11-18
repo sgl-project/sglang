@@ -28,12 +28,13 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
     int rank,
     uint8_t** dbuffer_list,
     uint32_t data_offset,
-    uint32_t flag_color) {
+    uint32_t flag_color,
+    int64_t data_size_per_phase) {
   int block = blockIdx.x;
   int grid = gridDim.x;
 
   while (block < num_blocks) {
-    AllReduceKernel::run(A, B, N, block, rank, dbuffer_list, data_offset, flag_color);
+    AllReduceKernel::run(A, B, N, block, rank, dbuffer_list, data_offset, flag_color, data_size_per_phase);
     block += grid;
     flag_color++;
   }
@@ -56,7 +57,8 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        flag_color);                                                      \
+        flag_color,                                                       \
+        this->kMaxProblemSize);                                           \
   } else if (world_size == 4) {                                           \
     using LineCodec = __codec<T, 4>;                                      \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>; \
@@ -73,7 +75,8 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        flag_color);                                                      \
+        flag_color,                                                       \
+        this->kMaxProblemSize);                                           \
   } else if (world_size == 8) {                                           \
     using LineCodec = __codec<T, 8>;                                      \
     using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>; \
@@ -90,7 +93,8 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        flag_color);                                                      \
+        flag_color,                                                       \
+        this->kMaxProblemSize);                                           \
   }
 
 enum QuickReduceQuantLevel {

@@ -4,7 +4,7 @@
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
-from enum import Enum
+from enum import Enum, auto
 from typing import Any
 
 import torch
@@ -26,6 +26,19 @@ from sglang.multimodal_gen.utils import (
 )
 
 logger = init_logger(__name__)
+
+
+# NOTE: possible duplication with DataType, WorkloadType
+# this may focus on the model's original ability
+class ModelTaskType(Enum):
+    I2V = auto()  # Image to Video
+    T2V = auto()  # Text to Video
+    TI2V = auto()  # Text and Image to Video
+    T2I = auto()  # Text to Image
+    I2I = auto()  # Image to Image
+
+    def is_image_gen(self):
+        return self == ModelTaskType.T2I or self == ModelTaskType.I2I
 
 
 class STA_Mode(str, Enum):
@@ -51,10 +64,10 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
 class PipelineConfig:
     """Base configuration for all pipeline architectures."""
 
+    task_type: ModelTaskType
+
     model_path: str = ""
     pipeline_config_path: str | None = None
-
-    is_image_gen: bool = False
 
     # generation parameters
     # controls the timestep embedding generation
@@ -113,9 +126,6 @@ class PipelineConfig:
     dmd_denoising_steps: list[int] | None = field(default=None)
 
     # Wan2.2 TI2V parameters
-    ti2v_task: bool = False
-    i2v_task: bool = False
-    ti2i_task: bool = False
     boundary_ratio: float | None = None
 
     # Compilation
@@ -124,11 +134,14 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def set_width_and_height(self, width, height, image):
+    def adjust_size(self, width, height, image):
         """
         image: input image
         """
         return width, height
+
+    def adjust_num_frames(self, num_frames):
+        return num_frames
 
     # called in ImageEncodingStage, preprocess the image
     def preprocess_image(self, image, image_processor: VaeImageProcessor):
@@ -341,13 +354,14 @@ class PipelineConfig:
 
         # 2. Instantiate PipelineConfig
         if model_info is None:
-            logger.warning(
-                "Couldn't find model info for %s. Using the default pipeline config.",
-                model_path,
+            # The error is already logged in get_model_info.
+            # We raise an exception here to stop the execution.
+            raise ValueError(
+                f"Failed to get model info for '{model_path}'. "
+                "Please check the model path and ensure it is registered correctly."
             )
-            pipeline_config = cls()
-        else:
-            pipeline_config = model_info.pipeline_config_cls()
+
+        pipeline_config = model_info.pipeline_config_cls()
 
         # 3. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
