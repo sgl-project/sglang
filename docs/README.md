@@ -1,15 +1,13 @@
 # SGLang Documentation
 
-We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
+We recommend new contributors start from writing documentation, which helps you quickly understand the SGLang codebase.
 Most documentation files are located under the `docs/` folder.
 
 ## Docs Workflow
 
 ### Install Dependency
 
-#### System Dependencies
-
-These are the system-level tools required for documentation compilation. `pandoc` is a universal document converter and is not a Python package, so it cannot be installed via `pip`.
+**Install `pandoc`**
 
 ```bash
 # Debian/Ubuntu
@@ -27,9 +25,7 @@ sudo yum install -y pandoc parallel retry
 sudo dnf install -y pandoc parallel retry
 ```
 
-#### Python Dependencies
-
-These are the Python packages required for the project, specified in `requirements.txt`.
+**Install Python dependencies**
 
 ```bash
 pip install -r requirements.txt
