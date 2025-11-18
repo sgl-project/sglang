@@ -481,6 +481,14 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         self.enable_talker = False
         self.pad_input_ids = self.thinker.pad_input_ids
         self.forward = self.thinker.forward
+        self.get_audio_feature = self.thinker.get_audio_feature
+        self.get_image_feature = self.thinker.get_image_feature
+        self.get_video_feature = self.thinker.get_video_feature
+        self.get_input_embeddings = self.thinker.get_input_embeddings
+        self.post_process = self.thinker.post_process
+
+    def get_input_embeddings(self):
+        return self.thinker.model.embed_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

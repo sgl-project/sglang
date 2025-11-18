@@ -264,8 +264,6 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--disable-radix-cache",
-                "--pp-size",
-                "2",
             ],
         )
 

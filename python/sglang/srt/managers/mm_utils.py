@@ -818,24 +818,39 @@ def resolve_language_model(multimodal_model: nn.Module) -> Optional[nn.Module]:
 
 
 def should_use_external_mm_preprocess(multimodal_model: nn.Module) -> bool:
-    """Decide whether we should use our generic `multimodal_preprocess_routine`.
+    """Decide whether we should use our generic "multimodal_preprocess_routine".
+
+    We are adapting VLM for piecewise CUDA graph. Since the encoder's forward
+    pass cannot be executed within the model's forward pass, we need to
+    precompute image embeddings using the encoder within the model runner.
+    For models that have already been adjusted, there is a member called
+    should_use_external_mm_preprocess, which is set to True. In practice,
+    the multimodal_preprocess_routine function will be called in the
+    model_runner.forward_extend to handle multimodal inputs.
+
+    For models that have not yet been adapted, the general_mm_embed_routine
+    will still be called in the model class's forward function for processing.
 
     Current strategy:
         - Llava family (models with vision_tower + multi_modal_projector):
         Their forward already calls general_mm_embed_routine and includes
         built-in multimodal processing. If we run it again in ModelRunner,
         it will conflict with the internal logic, so we skip it here.
-        - Others (such as Qwen2_5_VL / Qwen3VL): use the generic preprocessing.
+        - Others (such as Qwen2-VL / Qwen2.5-VL / Qwen3-VL): use the
+        multimodal preprocessing.
     """
 
-    # Llava series model, exists vision_tower and multi_modal_projector
-    if hasattr(multimodal_model, "vision_tower") and hasattr(
-        multimodal_model, "multi_modal_projector"
-    ):
-        return False
+    cls_name = multimodal_model.__class__.__name__
 
-    # Other models like Qwen2_5_VL / Qwen3VL
-    return True
+    qwen_vl_classes = {
+        "Qwen2VLForConditionalGeneration",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3OmniMoeForConditionalGeneration",
+    }
+
+    return cls_name in qwen_vl_classes
 
 
 def multimodal_preprocess_routine(
@@ -850,7 +865,6 @@ def multimodal_preprocess_routine(
     Args:
         input_ids: Input token IDs tensor
         forward_batch: Batch information for model forward pass
-        language_model: Base language model to use
         data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
         **kwargs: Additional arguments passed to language model
     Returns:
@@ -860,6 +874,11 @@ def multimodal_preprocess_routine(
         return forward_batch
 
     language_model = resolve_language_model(multimodal_model)
+    if language_model is None:
+        raise ValueError(
+            f"Cannot resolve language model from {type(multimodal_model).__name__}. "
+            f"Please ensure the model has 'model' or 'language_model' attribute."
+        )
 
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
@@ -884,7 +903,7 @@ def multimodal_preprocess_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
-            inputs_embeds, forward_batch = embed_mm_inputs(
+            input_embeds, forward_batch = embed_mm_inputs(
                 forward_batch=forward_batch,
                 mm_inputs_list=mm_inputs_list,
                 extend_prefix_lens=extend_prefix_lens,
@@ -900,7 +919,7 @@ def multimodal_preprocess_routine(
         else:
             # NOTE: This may reduce the performance for only-text inputs.
             # Using a fixed-address buffer might be better, though it could be a bit dirty.
-            inputs_embeds = embed_tokens(input_ids)
+            input_embeds = embed_tokens(input_ids)
             # only for qwen3vl
             if getattr(multimodal_model, "use_deepstack", False):
                 forward_batch.input_deepstack_embeds = torch.zeros(
@@ -909,11 +928,11 @@ def multimodal_preprocess_routine(
                         multimodal_model.config.hidden_size
                         * len(multimodal_model.deepstack_visual_indexes),
                     ),
-                    device=inputs_embeds.device,
-                    dtype=inputs_embeds.dtype,
+                    device=input_embeds.device,
+                    dtype=input_embeds.dtype,
                 )
 
-        forward_batch.input_embeds = inputs_embeds
+        forward_batch.input_embeds = input_embeds
     else:
         forward_batch.input_embeds = None
 
