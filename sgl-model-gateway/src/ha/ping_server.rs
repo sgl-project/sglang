@@ -27,6 +27,8 @@ use super::{
         record_snapshot_duration, record_snapshot_trigger, update_peer_connections,
         ConvergenceTracker,
     },
+    node_state_machine::NodeStateMachine,
+    partition::PartitionDetector,
     stores::{StateStores, StoreType as LocalStoreType},
     sync::HASyncManager,
     try_ping, ClusterState,
@@ -37,8 +39,10 @@ pub struct GossipService {
     state: ClusterState,
     self_addr: SocketAddr,
     self_name: String,
-    stores: Option<StateStores>, // Optional state stores for CRDT-based sync
+    stores: Option<Arc<StateStores>>, // Optional state stores for CRDT-based sync
     sync_manager: Option<Arc<HASyncManager>>, // Optional sync manager for applying remote updates
+    state_machine: Option<Arc<NodeStateMachine>>,
+    partition_detector: Option<Arc<PartitionDetector>>,
 }
 
 impl GossipService {
@@ -48,7 +52,7 @@ impl GossipService {
         store_type: LocalStoreType,
         chunk_size: usize,
     ) -> Vec<SnapshotChunk> {
-        let stores = match &self.stores {
+        let stores = match self.stores.as_ref() {
             Some(s) => s,
             None => {
                 log::warn!("State stores not available for snapshot generation");
@@ -193,11 +197,21 @@ impl GossipService {
             self_name: self_name.to_string(),
             stores: None,
             sync_manager: None,
+            state_machine: None,
+            partition_detector: None,
         }
     }
 
-    pub fn with_stores(mut self, stores: StateStores) -> Self {
-        self.stores = Some(stores);
+    pub fn with_stores(mut self, stores: Arc<StateStores>) -> Self {
+        self.stores = Some(stores.clone());
+        // Create state machine if stores are provided
+        if self.state_machine.is_none() {
+            use super::node_state_machine::ConvergenceConfig;
+            self.state_machine = Some(Arc::new(NodeStateMachine::new(
+                stores,
+                ConvergenceConfig::default(),
+            )));
+        }
         self
     }
 

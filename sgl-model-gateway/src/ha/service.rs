@@ -20,7 +20,12 @@ use gossip::{
     StateSync,
 };
 
-use crate::ha::{controller::HAController, ping_server::GossipService};
+use crate::ha::{
+    controller::HAController,
+    node_state_machine::{ConvergenceConfig, NodeStateMachine},
+    partition::{PartitionConfig, PartitionDetector},
+    ping_server::GossipService,
+};
 
 pub type ClusterState = Arc<RwLock<BTreeMap<String, NodeState>>>;
 
@@ -39,6 +44,8 @@ pub struct HAServerHandler {
     pub self_name: String,
     _self_addr: SocketAddr,
     signal_tx: tokio::sync::watch::Sender<()>,
+    partition_detector: Option<Arc<PartitionDetector>>,
+    state_machine: Option<Arc<NodeStateMachine>>,
 }
 
 impl HAServerHandler {
@@ -53,7 +60,57 @@ impl HAServerHandler {
             self_name: self_name.to_string(),
             _self_addr: self_addr,
             signal_tx,
+            partition_detector: None,
+            state_machine: None,
         }
+    }
+
+    /// Create with partition detector and state machine
+    pub fn with_partition_and_state_machine(
+        state: ClusterState,
+        self_name: &str,
+        self_addr: SocketAddr,
+        signal_tx: tokio::sync::watch::Sender<()>,
+        stores: Option<Arc<super::stores::StateStores>>,
+    ) -> Self {
+        let partition_detector = Some(Arc::new(PartitionDetector::default()));
+        let state_machine =
+            stores.map(|s| Arc::new(NodeStateMachine::new(s, ConvergenceConfig::default())));
+
+        Self {
+            state,
+            self_name: self_name.to_string(),
+            _self_addr: self_addr,
+            signal_tx,
+            partition_detector,
+            state_machine,
+        }
+    }
+
+    /// Get partition detector
+    pub fn partition_detector(&self) -> Option<&Arc<PartitionDetector>> {
+        self.partition_detector.as_ref()
+    }
+
+    /// Get state machine
+    pub fn state_machine(&self) -> Option<&Arc<NodeStateMachine>> {
+        self.state_machine.as_ref()
+    }
+
+    /// Check if node is ready
+    pub fn is_ready(&self) -> bool {
+        self.state_machine
+            .as_ref()
+            .map(|sm| sm.is_ready())
+            .unwrap_or(true) // If no state machine, consider ready
+    }
+
+    /// Check if we should serve (have quorum)
+    pub fn should_serve(&self) -> bool {
+        self.partition_detector
+            .as_ref()
+            .map(|pd| pd.should_serve())
+            .unwrap_or(true) // If no partition detector, consider should serve
     }
 
     /// Shutdown immediately without graceful shutdown
@@ -170,6 +227,13 @@ impl HAServerBuilder {
     }
 
     pub fn build(&self) -> (HAServer, HAServerHandler) {
+        self.build_with_stores(None)
+    }
+
+    pub fn build_with_stores(
+        &self,
+        stores: Option<Arc<super::stores::StateStores>>,
+    ) -> (HAServer, HAServerHandler) {
         let (signal_tx, signal_rx) = tokio::sync::watch::channel(());
         (
             HAServer::new(
@@ -179,11 +243,12 @@ impl HAServerBuilder {
                 self.init_peer,
                 signal_rx,
             ),
-            HAServerHandler::new(
+            HAServerHandler::with_partition_and_state_machine(
                 self.state.clone(),
                 &self.self_name,
                 self.self_addr,
                 signal_tx,
+                stores,
             ),
         )
     }

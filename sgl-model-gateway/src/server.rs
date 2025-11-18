@@ -731,29 +731,49 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     let (ha_handler, ha_sync_manager) = if let Some(ha_server_config) = &config.ha_server_config {
-        let handler = ha_run!(
-            ha_server_config.self_name.clone(),
-            ha_server_config.self_addr,
-            ha_server_config.init_peer
-        );
-
-        // Create HA sync manager with stores
-        use crate::ha::stores::StateStores;
+        // Create HA sync manager with stores first
+        use crate::ha::{partition::PartitionDetector, stores::StateStores, sync::HASyncManager};
         let stores = Arc::new(StateStores::with_self_name(
             ha_server_config.self_name.clone(),
         ));
-        let sync_manager = Some(Arc::new(HASyncManager::new(
+        let sync_manager = Arc::new(HASyncManager::new(
             stores.clone(),
             ha_server_config.self_name.clone(),
-        )));
+        ));
+
+        // Create partition detector
+        let partition_detector = Arc::new(PartitionDetector::default());
 
         // Initialize rate-limit hash ring with current membership
-        sync_manager
-            .as_ref()
-            .unwrap()
-            .update_rate_limit_membership();
+        sync_manager.update_rate_limit_membership();
 
-        (Some(Arc::new(handler)), sync_manager)
+        // Create HA server builder and build with stores
+        use crate::ha::service::HAServerBuilder;
+        let builder = HAServerBuilder::new(
+            ha_server_config.self_name.clone(),
+            ha_server_config.self_addr,
+            ha_server_config.init_peer,
+        );
+        let (ha_server, handler) = builder.build_with_stores(Some(stores.clone()));
+
+        // Spawn the HA server with stores and partition detector
+        let stores_for_server = stores.clone();
+        let sync_manager_for_server = sync_manager.clone();
+        let partition_detector_for_server = partition_detector.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ha_server
+                .start_serve_with_stores(
+                    Some(stores_for_server),
+                    Some(sync_manager_for_server),
+                    Some(partition_detector_for_server),
+                )
+                .await
+            {
+                tracing::error!("HA server failed: {}", e);
+            }
+        });
+
+        (Some(Arc::new(handler)), Some(sync_manager))
     } else {
         (None, None)
     };

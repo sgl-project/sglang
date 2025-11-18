@@ -6,6 +6,8 @@ pub mod flow_control;
 pub mod incremental;
 pub mod metrics;
 pub mod mtls;
+pub mod node_state_machine;
+pub mod partition;
 mod ping_server;
 pub mod service;
 pub mod stores;
