@@ -157,9 +157,6 @@ class MambaPool:
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
-        self.size = size
-        self.device = device
-        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )

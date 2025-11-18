@@ -1840,8 +1840,8 @@ class ModelRunner:
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     **extra_args,
                 )
