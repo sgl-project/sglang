@@ -35,7 +35,10 @@ use super::{
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     protocols::responses::{ResponseToolType, ResponsesRequest},
-    routers::header_utils::{apply_request_headers, preserve_response_headers},
+    routers::{
+        common::extract_dynamic_mcp_servers,
+        header_utils::{apply_request_headers, preserve_response_headers},
+    },
 };
 
 // ============================================================================
@@ -1138,8 +1141,6 @@ pub(super) async fn handle_streaming_with_tool_interception(
     original_previous_response_id: Option<String>,
     active_mcp: &Arc<crate::mcp::McpManager>,
 ) -> Response {
-    use crate::routers::openai::mcp::extract_dynamic_mcp_servers;
-
     // Extract all dynamic MCP servers from request
     let dynamic_servers: Vec<(String, String)> = original_body
         .tools

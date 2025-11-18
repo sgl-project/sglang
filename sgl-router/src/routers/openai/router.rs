@@ -56,7 +56,7 @@ use crate::{
             ResponseToolType, ResponsesGetParams, ResponsesRequest,
         },
     },
-    routers::header_utils::apply_request_headers,
+    routers::{common::extract_dynamic_mcp_servers, header_utils::apply_request_headers},
 };
 
 // ============================================================================
@@ -278,8 +278,6 @@ impl OpenAIRouter {
 
         // If MCP is active, execute tool loop
         if let Some(mcp) = active_mcp {
-            use crate::routers::openai::mcp::extract_dynamic_mcp_servers;
-
             let config = McpLoopConfig::default();
 
             // Extract all dynamic MCP servers from request

@@ -130,51 +130,6 @@ impl FunctionCallInProgress {
 // MCP Manager Integration
 // ============================================================================
 
-/// Ensure a dynamic MCP client exists for request-scoped tools.
-///
-/// Extract all dynamic MCP servers from request tools
-///
-/// Returns a deduplicated list of (server_label, server_url) pairs for all MCP tools
-/// with valid server URLs in the request.
-///
-/// # Arguments
-/// * `tools` - Request tools to extract MCP servers from
-///
-/// # Returns
-/// Vec of (server_label, server_url) tuples, deduplicated by server_label
-pub fn extract_dynamic_mcp_servers(tools: &[ResponseTool]) -> Vec<(String, String)> {
-    use std::collections::HashMap;
-
-    tools
-        .iter()
-        .filter_map(|t| {
-            if matches!(t.r#type, ResponseToolType::Mcp) {
-                let url = t.server_url.as_ref()?.trim().to_string();
-
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    warn!("Ignoring MCP server_url with unsupported scheme: {}", url);
-                    return None;
-                }
-
-                let label = t.server_label.clone().unwrap_or_else(|| {
-                    format!(
-                        "mcp_{}",
-                        url.chars()
-                            .filter(|c| c.is_alphanumeric())
-                            .take(8)
-                            .collect::<String>()
-                    )
-                });
-                Some((label, url))
-            } else {
-                None
-            }
-        })
-        .collect::<HashMap<String, String>>() // Dedupe by label
-        .into_iter()
-        .collect()
-}
-
 /// This function parses request tools to extract MCP server configuration,
 /// then ensures a dynamic client exists in the McpManager via `get_or_create_client()`.
 /// The McpManager itself is returned (cloned Arc) for convenience, though the main

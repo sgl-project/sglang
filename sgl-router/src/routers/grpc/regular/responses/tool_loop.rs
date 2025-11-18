@@ -36,12 +36,12 @@ use crate::{
             ResponsesResponse,
         },
     },
-    routers::grpc::{
-        common::responses::{
-            streaming::{OutputItemType, ResponseStreamEventEmitter},
-            utils::extract_dynamic_mcp_servers,
+    routers::{
+        common::extract_dynamic_mcp_servers,
+        grpc::{
+            common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+            error,
         },
-        error,
     },
 };
 

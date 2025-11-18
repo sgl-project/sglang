@@ -54,16 +54,18 @@ use crate::{
             StringOrContentParts,
         },
     },
-    routers::grpc::{
-        common::responses::{
-            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
-            streaming::{OutputItemType, ResponseStreamEventEmitter},
-            utils::extract_dynamic_mcp_servers,
+    routers::{
+        common::extract_dynamic_mcp_servers,
+        grpc::{
+            common::responses::{
+                build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+                streaming::{OutputItemType, ResponseStreamEventEmitter},
+            },
+            context::SharedComponents,
+            error,
+            harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
+            pipeline::RequestPipeline,
         },
-        context::SharedComponents,
-        error,
-        harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
-        pipeline::RequestPipeline,
     },
 };
 
