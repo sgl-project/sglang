@@ -169,8 +169,8 @@ def main():
 
         old_reason = config.get("reason", "")
 
-        # If they fell off the top contributor/write access lists
-        if old_reason in ["top contributor", "write access"]:
+        # If they fell off the top contributor list
+        if old_reason in ["top contributor"]:
             new_permissions[user] = {
                 "can_tag_run_ci_label": True,
                 "can_rerun_failed_ci": True,
