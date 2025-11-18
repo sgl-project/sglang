@@ -131,6 +131,19 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="openvla",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("SYSTEM:", "\n"),
+            "user": ("USER:", "\n"),
+            "assistant": ("ASSISTANT:", "\n"),
+        },
+        image_token="",
+    )
+)
+
 # There is default system prompt for qwen
 # reference: https://modelscope.cn/models/qwen/Qwen2-72B-Instruct/file/view/master?fileName=tokenizer_config.json&status=1
 # The chat template is: "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
@@ -612,6 +625,12 @@ def match_chat_yi(model_path: str):
 def match_gemma_it(model_path: str):
     if re.search(r"gemma.*it", model_path, re.IGNORECASE):
         return "gemma-it"
+
+
+@register_chat_template_matching_function
+def match_openvla(model_path: str):
+    if re.search(r"openvla", model_path, re.IGNORECASE):
+        return "openvla"
 
 
 @register_chat_template_matching_function
