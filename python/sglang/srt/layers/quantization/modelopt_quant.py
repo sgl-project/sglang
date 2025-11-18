@@ -1801,3 +1801,52 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ),
         )
         return out
+
+    def apply_without_routing_weights_peo(
+        self,
+        layer: FusedMoE,
+        x: tuple[torch.Tensor, Optional[torch.Tensor]],
+        masked_m: torch.Tensor,
+        moe_runner_config: MoeRunnerConfig,
+        down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
+        start_idx: torch.Tensor,
+        end_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        assert (
+            moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        assert self.enable_flashinfer_cutedsl_moe, "only support flashinfer cutedsl moe"
+        assert (
+            not moe_runner_config.apply_router_weight_on_input
+        ), "apply_router_weight_on_input is not supported for Flashinfer"
+
+        from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+            flashinfer_cutedsl_moe_masked,
+        )
+
+        out = flashinfer_cutedsl_moe_masked(
+            hidden_states=x[start_idx:end_idx],
+            input_global_scale=(
+                None if CUTEDSL_MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant[start_idx:end_idx]
+            ),
+            w1=layer.w13_weight[start_idx:end_idx],
+            w1_blockscale=layer.w13_blockscale_swizzled[start_idx:end_idx],
+            w1_alpha=layer.g1_alphas[start_idx:end_idx],
+            w2=layer.w2_weight[start_idx:end_idx],
+            a2_global_scale=layer.w2_input_scale_quant[start_idx:end_idx],
+            w2_blockscale=layer.w2_blockscale_swizzled[start_idx:end_idx],
+            w2_alpha=layer.g2_alphas[start_idx:end_idx],
+            masked_m=masked_m[start_idx:end_idx],
+            **(
+                dict(
+                    down_sm_count=down_gemm_overlap_args.num_sms,
+                    down_signals=down_gemm_overlap_args.signal,
+                    down_start_event=down_gemm_overlap_args.start_event,
+                    up_sm_count=down_gemm_overlap_args.num_sms,
+                )
+                if down_gemm_overlap_args is not None
+                else {}
+            ),
+        )
+        return out

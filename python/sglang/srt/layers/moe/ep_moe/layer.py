@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt import single_batch_overlap
 from sglang.srt.layers import deep_gemm_wrapper
@@ -24,6 +25,8 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+
+from python.sglang.srt.layers.moe.utils import is_sbo_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -306,7 +309,7 @@ class DeepEPMoE(FusedMoE):
             dispatch_output=dispatch_output,
         )
 
-    def forward_cutlass_w4afp8_masked(
+    def forward_cutlass_w4afp8_masked_peo(
         self,
         dispatch_output: DeepEPLLDispatchOutput,
     ):
@@ -492,9 +495,145 @@ class DeepEPMoE(FusedMoE):
             raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
 
 
+def get_num_device_sms():
+    assert torch.cuda.is_available()
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.multi_processor_count
+
+class PeoDeepEPMoE(DeepEPMoE):
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        # peo params
+        num_rounds: int = 2,
+        overlap_method: int = 4,
+        num_deepep_send_sms: int = -1,
+        num_deepep_recv_sms: int = -1,
+        num_up_deepgemm_sms: int = -1,
+        num_down_deepgemm_sms: int = -1,
+    ):
+        super().__init__(num_experts, top_k, hidden_size, intermediate_size,
+                         layer_id, num_fused_shared_experts, params_dtype, quant_config, prefix, activation,
+                         routed_scaling_factor)
+        self.overlap_method = overlap_method
+
+        self.num_rounds = num_rounds
+        self.num_device_sms = get_num_device_sms()
+        self.num_deepep_send_sms = get_peo_deepep_send_num_sms()
+        self.num_deepep_recv_sms = get_peo_deepep_recv_num_sms()
+        self.num_up_deepgemm_sms = get_peo_up_deepgemm_num_sms()
+        self.num_down_deepgemm_sms = get_peo_down_deepgemm_num_sms()
+        self.num_ranks = dist.get_world_size()
+
+        assert self.num_deepep_send_sms <= self.num_device_sms, f"num_deepep_send_sms {self.num_deepep_send_sms} > num_device_sms {self.num_device_sms}"
+        assert self.num_deepep_recv_sms <= self.num_device_sms, f"num_deepep_recv_sms {self.num_deepep_recv_sms} > num_device_sms {self.num_device_sms}"
+        assert self.num_up_deepgemm_sms <= self.num_device_sms, f"num_up_deepgemm_sms {self.num_up_deepgemm_sms} > num_device_sms {self.num_device_sms}"
+        assert self.num_down_deepgemm_sms <= self.num_device_sms, f"num_down_deepgemm_sms {self.num_down_deepgemm_sms} > num_device_sms {self.num_device_sms}"
+
+        self.gateup_output: torch.Tensor = None
+        self.down_input: torch.Tensor = None
+        self.down_input_scale: torch.Tensor = None
+        self.down_output: torch.Tensor = None
+
+    def run_moe_core(
+        self,
+        dispatch_output: DispatchOutput,
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
+        start_idx: torch.Tensor = None,
+        end_idx: torch.Tensor = None,
+    ):
+
+        if self.deprecate_flag:
+            assert down_gemm_overlap_args is None
+            return super().run_moe_core(
+                dispatch_output,
+            )
+
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if _use_aiter:
+            raise NotImplementedError("Not supported for AITER")
+        elif _is_npu:
+            raise NotImplementedError("Not supported for NPU")
+        elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
+        elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            if (
+                get_moe_runner_backend().is_flashinfer_cutedsl()
+                and self.quant_config.get_name() == "modelopt_fp4"
+            ):
+                output = self.forward_flashinfer_cutedsl_peo(
+                    dispatch_output,
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                )
+            elif self.use_w4afp8:
+                output = self.forward_cutlass_w4afp8_masked_peo(dispatch_output)
+            else:
+                assert False, "forward_deepgemm_masked is deprecated"
+
+        combine_input_wrapper = (
+            DeepEPNormalCombineInput
+            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
+            else DeepEPLLCombineInput
+        )
+        return combine_input_wrapper(
+            hidden_states=output,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
+
+    def forward_flashinfer_cutedsl_peo(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
+        start_idx: torch.Tensor,
+        end_idx: torch.Tensor,
+    ):
+        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+
+        output = self.quant_method.apply_without_routing_weights_peo(
+            layer=self,
+            x=(hidden_states, hidden_states_scale),
+            masked_m=masked_m,
+            moe_runner_config=self.moe_runner_config,
+            down_gemm_overlap_args=down_gemm_overlap_args,
+            start_idx=start_idx,
+            end_idx=end_idx,
+        )
+        return output
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        forward_shared_experts=None,
+        alt_stream=None,
+        disable_sbo=False,
+    ):
+        return per_expert_overlap.execute_peo(self, hidden_states, topk_output)
+
+
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-        return DeepEPMoE
+        if is_sbo_enabled():
+            return PeoDeepEPMoE
+        else:
+            return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP
