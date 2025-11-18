@@ -10,14 +10,46 @@ from typing import Any
 
 from dateutil.tz import UTC
 
-from sglang.utils import is_in_ci
-
-_perf_logger_initialized = False
+LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
+if LOG_DIR:
+    LOG_DIR = os.path.abspath(LOG_DIR)
+elif LOG_DIR is None:  # Not set
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+    LOG_DIR = os.path.join(project_root, "logs")
+# if LOG_DIR is "", it will remain "", disabling file logging.
 
 # Configure a specific logger for performance metrics
 perf_logger = logging.getLogger("performance")
 perf_logger.setLevel(logging.INFO)
 perf_logger.propagate = False  # Prevent perf logs from going to the main logger
+
+_perf_logger_initialized = False
+
+
+class OnDemandFileHandler(logging.Handler):
+    """
+    A logging handler that opens the file for each log record, writes, and closes it.
+    This is less performant than FileHandler but avoids long-lived file handles,
+    which can be problematic on certain filesystems like NFS.
+    """
+
+    def __init__(self, filename: str, mode: str = "a", encoding: str | None = None):
+        super().__init__()
+        self.baseFilename = os.path.abspath(filename)
+        self.mode = mode
+        self.encoding = encoding
+        self.terminator = "\n"
+
+    def emit(self, record: logging.LogRecord):
+        """Emit a record."""
+        try:
+            msg = self.format(record)
+            with open(
+                self.baseFilename, self.mode, encoding=self.encoding, errors="replace"
+            ) as f:
+                f.write(msg + self.terminator)
+        except Exception:
+            self.handleError(record)
 
 
 def _initialize_perf_logger():
@@ -32,7 +64,7 @@ def _initialize_perf_logger():
             os.makedirs(LOG_DIR)
 
         # Set up a file handler for the performance logger
-        handler = logging.FileHandler(os.path.join(LOG_DIR, "performance.log"))
+        handler = OnDemandFileHandler(os.path.join(LOG_DIR, "performance.log"))
         handler.setFormatter(logging.Formatter("%(message)s"))
         perf_logger.addHandler(handler)
     except (OSError, PermissionError) as e:
@@ -41,34 +73,6 @@ def _initialize_perf_logger():
         globals()["LOG_DIR"] = ""
     finally:
         _perf_logger_initialized = True
-
-
-# Only set up file logging if NOT in CI
-if not is_in_ci():
-    LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
-    if LOG_DIR:
-        LOG_DIR = os.path.abspath(LOG_DIR)
-    elif LOG_DIR is None:  # Not set
-        project_root = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../../")
-        )
-        LOG_DIR = os.path.join(project_root, "logs")
-    # if LOG_DIR is an empty string, it will remain so, disabling logging.
-
-    if LOG_DIR:
-        try:
-            # Ensure the logs directory exists
-            if not os.path.exists(LOG_DIR):
-                os.makedirs(LOG_DIR)
-
-            # Set up a file handler for the performance logger
-            handler = logging.FileHandler(os.path.join(LOG_DIR, "performance.log"))
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            perf_logger.addHandler(handler)
-        except (OSError, PermissionError) as e:
-            perf_logger.warning(
-                f"Failed to initialize performance logger file handler: {e}"
-            )
 
 
 def get_git_commit_hash() -> str:
