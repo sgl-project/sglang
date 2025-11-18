@@ -24,8 +24,8 @@ Permissions are assigned according to the following rules:
 
 1. Add the top 50 contributors from the last 90 days with full permissions, no cooldown, and the reason "top contributor".
 2. Load all users from the existing `CI_PERMISSIONS.json` file and update their entries as follows:
-   - If a user is already covered by rule 1 or rule 2, skip that user.
-   - If the old reason of a user is "top contributor" or "write access" but they are not in the current top contributors or write access list, change their configuration to:
+   - If a user is already covered by rule 1, skip that user.
+   - If the old reason of a user is "top contributor" but they are not in the current top contributors list, change their configuration to:
        {
            "can_tag_run_ci_label": true,
            "can_rerun_failed_ci": true,
