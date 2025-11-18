@@ -1110,7 +1110,7 @@ class ServerArgs:
                     and self.moe_runner_backend == "auto"
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.warning(
+                    logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3ForCausalLM"
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
@@ -1133,7 +1133,7 @@ class ServerArgs:
                     and self.moe_runner_backend == "auto"
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
-                    logger.warning(
+                    logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
         if is_deepseek_nsa(hf_config):
