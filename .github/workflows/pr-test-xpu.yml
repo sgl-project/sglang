@@ -57,9 +57,10 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image
+        env:
+          PR_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF: ${{ github.head_ref }}
         run: |
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
           docker build \
             ${PR_REPO:+--build-arg SG_LANG_REPO=$PR_REPO} \
             ${PR_HEAD_REF:+--build-arg SG_LANG_BRANCH=$PR_HEAD_REF} \

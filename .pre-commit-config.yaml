@@ -74,3 +74,7 @@ repos:
         args:
           - '--keep-output'
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.4
+    hooks:
+      - id: actionlint

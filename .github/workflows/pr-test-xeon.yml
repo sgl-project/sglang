@@ -54,11 +54,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and Push
+        env:
+          PR_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF: ${{ github.head_ref }}
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           tag=v${version}-xeon
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
 
           docker build \
             ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
