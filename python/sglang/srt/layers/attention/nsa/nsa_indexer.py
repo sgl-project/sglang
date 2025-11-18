@@ -168,7 +168,8 @@ class Indexer(CustomOp):
         self.softmax_scale = self.head_dim**-0.5
 
     @torch.compile(dynamic=True)
-    def _get_logits_head_gate(self, weights: torch.Tensor, q_scale: torch.Tensor):
+    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
+        weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -782,8 +783,7 @@ class Indexer(CustomOp):
             index_k_scale=k_scale,
         )
 
-        weights, _ = self.weights_proj(x.float())
-        weights = self._get_logits_head_gate(weights, q_scale)
+        weights = self._get_logits_head_gate(x, q_scale)
 
         if is_cuda():
             assert forward_batch.seq_lens_cpu is not None
