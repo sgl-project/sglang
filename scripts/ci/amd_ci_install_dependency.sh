@@ -12,6 +12,7 @@ else
 fi
 
 # Install the required dependencies in CI.
+docker exec ci_sglang chown -R root:root /sgl-data/pip-cache
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 docker exec ci_sglang pip uninstall sgl-kernel -y || true
 docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
