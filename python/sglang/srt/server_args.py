@@ -297,6 +297,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    mm_process_config: Optional[Dict[str, Any]] = None
 
     # Logging
     log_level: str = "info"
@@ -578,6 +579,9 @@ class ServerArgs:
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
 
+    # For encoder dp
+    mm_enable_dp_encoder: bool = False
+
     # For forward hooks
     hooks: Optional[List[dict[str, Any]]] = None
 
@@ -682,6 +686,8 @@ class ServerArgs:
             self.device = get_device()
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
+        if self.mm_process_config is None:
+            self.mm_process_config = {}
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -2351,6 +2357,12 @@ class ServerArgs:
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
         )
+        parser.add_argument(
+            "--mm-process-config",
+            type=json.loads,
+            default=ServerArgs.mm_process_config,
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+        )
 
         # Logging
         parser.add_argument(
@@ -3727,6 +3739,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
+        )
+        parser.add_argument(
+            "--mm-enable-dp-encoder",
+            action="store_true",
+            default=ServerArgs.mm_enable_dp_encoder,
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         )
 
         # For registering hooks
