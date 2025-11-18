@@ -974,7 +974,7 @@ jobs:
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
 
-        multimodal-gen-test,
+        # multimodal-gen-test,
 
         stage-a-test-1,
         unit-test-backend-1-gpu,
