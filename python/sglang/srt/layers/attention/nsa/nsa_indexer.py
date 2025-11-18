@@ -168,7 +168,7 @@ class Indexer(CustomOp):
             max_position=max_position_embeddings,
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
-            is_neox_style=False,
+            is_neox_style=True,
             device=get_global_server_args().device,
         )
         self.block_size = block_size
