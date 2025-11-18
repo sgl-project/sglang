@@ -898,10 +898,11 @@ impl StepExecutor for ActivateWorkerStep {
 pub fn create_worker_registration_workflow(
     router_config: &crate::config::RouterConfig,
 ) -> WorkflowDefinition {
-    // Use health check timeout from config with 30 second buffer as workflow-level upper bound
-    let detect_timeout = Duration::from_secs(router_config.health_check.timeout_secs + 30);
+    // Use startup timeout from config for worker registration
+    // This is separate from health_check.timeout_secs which is for individual HTTP requests
+    let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
 
-    // Calculate max_attempts to match the detect_timeout
+    // Calculate max_attempts to match the startup_timeout
     // With Linear backoff (increment 1s, max 5s):
     // - Attempts 1-5: 0s, 1s, 2s, 3s, 4s = 10s total
     // - Attempts 6+: 5s each

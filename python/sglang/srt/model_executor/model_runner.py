@@ -32,6 +32,7 @@ import torch.distributed as dist
 from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
+    JetVLMConfig,
     KimiLinearConfig,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -1416,7 +1417,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig):
             return config
         return None
 

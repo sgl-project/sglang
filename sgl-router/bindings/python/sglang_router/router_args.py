@@ -26,7 +26,7 @@ class RouterArgs:
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
-    worker_startup_timeout_secs: int = 600
+    worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
@@ -209,7 +209,7 @@ class RouterArgs:
             f"--{prefix}worker-startup-timeout-secs",
             type=int,
             default=RouterArgs.worker_startup_timeout_secs,
-            help="Timeout in seconds for worker startup",
+            help="Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes). Large models can take significant time to load into GPU memory.",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-check-interval",
