@@ -22,6 +22,7 @@ class EPLBManager:
             self._server_args.eplb_rebalance_layers_per_chunk
         )
         self._rebalance_num_iterations = self._server_args.eplb_rebalance_num_iterations
+        self._enable_eplb_async_d2d = self._server_args.enable_eplb_async_d2d
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -52,7 +53,7 @@ class EPLBManager:
     def rebalance(self):
         logger.info("[EPLBManager] rebalance start")
 
-        enable_timing = self._rebalance_layers_per_chunk is None
+        enable_timing = self._rebalance_layers_per_chunk is None and not self._enable_eplb_async_d2d
 
         if enable_timing:
             torch.get_device_module().synchronize()
@@ -78,7 +79,8 @@ class EPLBManager:
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
             if len(update_layer_ids_chunks) > 1:
                 yield
-            self._model_runner.update_expert_location(
+            
+            yield from self._model_runner.update_expert_location(
                 expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )

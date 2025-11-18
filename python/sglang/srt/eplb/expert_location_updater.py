@@ -52,7 +52,7 @@ class ExpertLocationUpdater:
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
 
-        _update_expert_weights(
+        yield from _update_expert_weights(
             routed_experts_weights_of_layer=routed_experts_weights_of_layer,
             old_expert_location_metadata=old_expert_location_metadata,
             new_expert_location_metadata=new_expert_location_metadata,
@@ -60,10 +60,12 @@ class ExpertLocationUpdater:
             nnodes=nnodes,
             rank=rank,
         )
-        old_expert_location_metadata.update(
-            new_expert_location_metadata,
-            update_layer_ids=update_layer_ids,
-        )
+
+        if not get_global_server_args().enable_eplb_async_d2d:
+            old_expert_location_metadata.update(
+                new_expert_location_metadata,
+                update_layer_ids=update_layer_ids,
+            )
 
 
 def _update_expert_weights(**kwargs):
@@ -140,7 +142,7 @@ def _update_expert_weights_raw(
     num_gpu_per_node = world_size // nnodes
 
     for layer_id in update_layer_ids:
-        update_expert_weights_single_layer(
+        yield from update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[
@@ -156,6 +158,11 @@ def _update_expert_weights_raw(
             log_metrics=log_metrics,
         )
 
+        if get_global_server_args().enable_eplb_async_d2d:
+            old_expert_location_metadata.update(
+                new_expert_location_metadata,
+                update_layer_ids=[layer_id],
+            )
 
 def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
@@ -205,6 +212,8 @@ def update_expert_weights_single_layer(
         (rank + 1) * num_local_physical_experts,
     )
 
+    enable_eplb_async_d2d = get_global_server_args().enable_eplb_async_d2d
+
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
@@ -213,7 +222,7 @@ def update_expert_weights_single_layer(
 
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
-        _execute_p2p_ops(p2p_op_infos)
+        yield from _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
         if log_metrics:
@@ -441,6 +450,10 @@ def update_expert_weights_single_layer(
             return
 
         reqs = torch.distributed.batch_isend_irecv(p2p_ops)
+
+        if enable_eplb_async_d2d:
+            yield
+
         for req in reqs:
             req.wait()
 
@@ -465,7 +478,7 @@ def update_expert_weights_single_layer(
         )
         return expert_location % num_local_physical_experts
 
-    _entrypoint()
+    yield from _entrypoint()
 
     return output_logs
 
