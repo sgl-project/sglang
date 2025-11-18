@@ -12,7 +12,6 @@ jobs:
   label:
     runs-on: ubuntu-latest
     steps:
-      # Step 1: Add category labels based on file changes
       - name: Auto-label by file changes
         uses: actions/labeler@v5
         with:
