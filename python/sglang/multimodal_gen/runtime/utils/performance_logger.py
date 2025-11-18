@@ -14,6 +14,11 @@ from sglang.utils import is_in_ci
 
 _perf_logger_initialized = False
 
+# Configure a specific logger for performance metrics
+perf_logger = logging.getLogger("performance")
+perf_logger.setLevel(logging.INFO)
+perf_logger.propagate = False  # Prevent perf logs from going to the main logger
+
 
 def _initialize_perf_logger():
     """Initialize the performance logger with a file handler."""
@@ -37,11 +42,6 @@ def _initialize_perf_logger():
     finally:
         _perf_logger_initialized = True
 
-
-# Configure a specific logger for performance metrics
-perf_logger = logging.getLogger("performance")
-perf_logger.setLevel(logging.INFO)
-perf_logger.propagate = False  # Prevent perf logs from going to the main logger
 
 # Only set up file logging if NOT in CI
 if not is_in_ci():
