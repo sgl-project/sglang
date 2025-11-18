@@ -105,20 +105,20 @@ def main():
     comment_body = get_env_var("COMMENT_BODY").strip()
     user_login = get_env_var("USER_LOGIN")
 
-    # 2. Initialize GitHub API with Auth
+    # 2. Load Permissions (Local Check)
+    user_perms = load_permissions(user_login)
+
+    if not user_perms:
+        print(f"User {user_login} does not have any configured permissions. Exiting.")
+        return
+
+    # 3. Initialize GitHub API with Auth
     auth = Auth.Token(token)
     g = Github(auth=auth)
 
     repo = g.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
-
-    # 3. Load Permissions (Local Check)
-    user_perms = load_permissions(user_login)
-
-    if not user_perms:
-        print(f"User {user_login} does not have any configured permissions. Exiting.")
-        return
 
     # 4. Parse Command and Execute
     # split lines to handle cases where there might be text after the command
