@@ -117,6 +117,7 @@ jobs:
                 owner,
                 repo,
                 path: ".github/CI_PERMISSIONS.json",
+                ref: "main",
               });
 
               if (!Array.isArray(contentResp.data) && contentResp.data && "content" in contentResp.data) {
