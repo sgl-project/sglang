@@ -85,6 +85,22 @@ To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also t
 
 If you don’t have permission, please ask maintainers to trigger CI for you.
 
+### CI rate limits
+
+We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
+
+Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default rate limit window is 2 hours, and each workflow can override it via the `rate-limit-hours` input parameter:
+
+```yaml
+rate-limit-hours:
+  description: "Rate limit window size in hours; 0 disables rate limiting"
+  type: number
+  default: 2
+```
+
+Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
+
+
 ## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
