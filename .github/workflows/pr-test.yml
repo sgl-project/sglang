@@ -21,6 +21,9 @@ concurrency:
   group: pr-test-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
+
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
@@ -312,8 +315,6 @@ jobs:
     needs: [check-changes]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
-    env:
-      SGLANG_IS_IN_CI: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
