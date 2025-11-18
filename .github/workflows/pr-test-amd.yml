@@ -19,7 +19,7 @@ on:
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
-    types: [synchronize, labeled]
+    types: [synchronize]
   workflow_dispatch:
 
 concurrency:
@@ -27,7 +27,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  call-gate:
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
   check-changes:
+    needs: [call-gate]
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
@@ -35,19 +39,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Fail if the PR does not have the 'run-ci' label
-        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
-        run: |
-          echo "This pull request does not have the 'run-ci' label. Failing the workflow."
-          exit 1
-
-      - name: Fail if the PR is a draft
-        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
-        run: |
-          echo "This pull request is a draft. Failing the workflow."
-          exit 1
-
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
@@ -416,6 +407,7 @@ jobs:
   pr-test-amd-finish:
     needs:
       [
+        call-gate,
         check-changes,
 
         sgl-kernel-unit-test-amd,
