@@ -435,7 +435,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 summary.avg_frame_time_ms <= upper
             ), f"Avg frame time {summary.avg_frame_time_ms:.2f}ms exceeds {upper:.2f}ms"
 
-    def _validate_stages(self, stage_metrics: dict) -> None:
+    def _validate_stages(self, stage_metrics: PerformanceSummary) -> None:
         """Validate video-specific stages."""
         assert stage_metrics, "Stage metrics missing"
 
@@ -443,7 +443,7 @@ class VideoPerformanceValidator(PerformanceValidator):
             if stage == "per_frame_generation":
                 continue
 
-            actual = stage_metrics.get(stage)
+            actual = stage_metrics.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
 
             upper = expected * (1 + self.tolerances.stage)
