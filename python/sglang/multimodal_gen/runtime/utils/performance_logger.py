@@ -14,7 +14,7 @@ LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
 if LOG_DIR:
     LOG_DIR = os.path.abspath(LOG_DIR)
 elif LOG_DIR is None:  # Not set
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "~/.cache/sglang"))
     LOG_DIR = os.path.join(project_root, "logs")
 # if LOG_DIR is "", it will remain "", disabling file logging.
 
