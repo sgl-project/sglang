@@ -14,9 +14,15 @@ jobs:
   pr-gate:
     runs-on: ubuntu-latest
     steps:
+      # 1. for commits on main: no gating needed
+      # 2. for workflow_dispatch: this can only be triggered by users with write access
+      - name: Skip PR-Gate for non-PR events
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Not a pull_request event; skipping PR-Gate checks."
+          exit 0
       - name: Fetch latest PR info
         id: pr
-        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -42,13 +48,13 @@ jobs:
           echo "==================="
 
       - name: Block draft PR
-        if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
+        if: fromJson(steps.pr.outputs.draft)
         run: |
           echo "PR is draft. Blocking CI."
           exit 1
 
       - name: Require run-ci label (optional)
-        if: github.event_name == 'pull_request' && inputs.require-run-ci == true
+        if: inputs.require-run-ci == true
         run: |
           labels='${{ steps.pr.outputs.labels }}'
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
@@ -57,7 +63,6 @@ jobs:
           fi
 
       - name: Enforce rate limit for low-permission actors (optional)
-        if: (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && inputs.rate-limit-hours != 0
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -71,26 +76,10 @@ jobs:
             });
             let triggeringActor = curRun.data.triggering_actor?.login || context.actor;
             if (triggeringActor === "github-actions[bot]") {
-              let prAuthor = null;
-              if (Array.isArray(curRun.data.pull_requests) && curRun.data.pull_requests.length > 0) {
-                const prInfo = curRun.data.pull_requests[0];
-                prAuthor = prInfo?.user?.login || null;
-              }
-
-              if (!prAuthor && context.eventName === "pull_request") {
-                prAuthor = context.payload.pull_request?.user?.login || null;
-              }
-
-              if (prAuthor) {
-                core.info(
-                  `triggering_actor is github-actions[bot], substituting PR author '${prAuthor}'.`
-                );
-                triggeringActor = prAuthor;
-              } else {
-                core.info(
-                  `triggering_actor is github-actions[bot], but PR author not found; using default actor.`
-                );
-              }
+              triggeringActor = steps.pr.outputs.user;
+              core.info(
+                `triggering_actor is github-actions[bot]; substituting PR author '${triggeringActor}'.`
+              );
             }
 
             async function hasHighPermission(username) {
