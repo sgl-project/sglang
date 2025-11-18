@@ -62,7 +62,7 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const HOURS = Number("${{ inputs.rate-limit-hours }}");
+            const DEFAULT_HOURS = Number("${{ inputs.rate-limit-hours }}");
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
@@ -70,6 +70,28 @@ jobs:
               owner, repo, run_id: context.runId
             });
             const triggeringActor = curRun.data.triggering_actor?.login || context.actor;
+            if (triggeringActor === "github-actions[bot]") {
+              let prAuthor = null;
+              if (Array.isArray(curRun.data.pull_requests) && curRun.data.pull_requests.length > 0) {
+                const prInfo = curRun.data.pull_requests[0];
+                prAuthor = prInfo?.user?.login || null;
+              }
+
+              if (!prAuthor && context.eventName === "pull_request") {
+                prAuthor = context.payload.pull_request?.user?.login || null;
+              }
+
+              if (prAuthor) {
+                core.info(
+                  `triggering_actor is github-actions[bot], substituting PR author '${prAuthor}'.`
+                );
+                triggeringActor = prAuthor;
+              } else {
+                core.info(
+                  `triggering_actor is github-actions[bot], but PR author not found; using default actor.`
+                );
+              }
+            }
 
             async function hasHighPermission(username) {
               try {
@@ -87,8 +109,54 @@ jobs:
               return;
             }
 
-            const cutoff = new Date(Date.now() - HOURS * 60 * 60 * 1000);
-            core.info(`Checking for workflow runs since ${cutoff.toISOString()} (last ${HOURS} hours) for event '${eventName}'.`);
+            let effectiveCooldownMinutes = DEFAULT_HOURS > 0 ? DEFAULT_HOURS * 60 : 0;
+            let perUserCooldownMinutes = null;
+
+            try {
+              const contentResp = await github.rest.repos.getContent({
+                owner,
+                repo,
+                path: ".github/CI_PERMISSIONS.json",
+              });
+
+              if (!Array.isArray(contentResp.data) && contentResp.data && "content" in contentResp.data) {
+                const raw = Buffer.from(
+                  contentResp.data.content,
+                  contentResp.data.encoding || "base64"
+                ).toString();
+                const ciPermissions = JSON.parse(raw);
+
+                const userPerm = ciPermissions[triggeringActor];
+                if (userPerm && typeof userPerm.cooldown_interval_minutes === "number") {
+                  perUserCooldownMinutes = userPerm.cooldown_interval_minutes;
+                  core.info(
+                    `Per-user cooldown for '${triggeringActor}' from CI_PERMISSIONS.json: ${perUserCooldownMinutes} minutes.`
+                  );
+                } else {
+                  core.info(`No per-user cooldown found for '${triggeringActor}' in CI_PERMISSIONS.json.`);
+                }
+              } else {
+                core.info("CI_PERMISSIONS.json content response is not a file; skipping per-user cooldown.");
+              }
+            } catch (e) {
+              core.info(`CI_PERMISSIONS.json not found or unreadable: ${e.message}. Using default rate limit only.`);
+            }
+
+            if (perUserCooldownMinutes !== null) {
+              effectiveCooldownMinutes = Math.min(effectiveCooldownMinutes, perUserCooldownMinutes);
+            }
+
+            if (effectiveCooldownMinutes <= 0) {
+              core.info(
+                `Effective cooldown for '${triggeringActor}' is 0 minutes; no rate limit enforced for this user.`
+              );
+              return;
+            }
+
+            const cutoff = new Date(Date.now() - effectiveCooldownMinutes * 60 * 1000);
+            core.info(
+              `Checking for workflow runs since ${cutoff.toISOString()} (last ${effectiveCooldownMinutes} minutes) for event '${eventName}'.`
+            );
 
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
@@ -108,8 +176,10 @@ jobs:
             if (recentFound) {
               core.setFailed(
                 `User '${triggeringActor}' already triggered '${context.workflow}' via '${eventName}' at ${recentFound.created_at}. ` +
-                `Please wait ${HOURS} hours before triggering again.`
+                `Please wait ${effectiveCooldownMinutes} minutes before triggering again.`
               );
             } else {
-              core.info(`No recent runs detected within the last ${HOURS} hours; proceeding.`);
+              core.info(
+                `No recent runs detected for '${triggeringActor}' within the last ${effectiveCooldownMinutes} minutes; proceeding.`
+              );
             }
