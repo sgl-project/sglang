@@ -1116,7 +1116,8 @@ class ServerArgs:
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3ForCausalLM"
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for "
+                        f"{model_arch}"
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
             if not self.disable_radix_cache:
