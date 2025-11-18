@@ -1209,7 +1209,6 @@ async fn execute_mcp_tools(
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
-        // Parse formatted name using regex: server_label__tool_name
         let formatted_tool_name = &tool_call.function.name;
         let (server_label, original_tool_name) =
             if let Some((server, tool)) = parse_tool_name(formatted_tool_name) {

@@ -16,12 +16,6 @@ use crate::{
 /// Extract dynamic MCP servers from request tools
 ///
 /// Parses tools to find MCP servers with URLs and labels, deduplicating by server_label.
-///
-/// # Arguments
-/// * `tools` - Request tools to extract MCP servers from
-///
-/// # Returns
-/// Vec of (server_label, server_url) tuples, deduplicated by server_label
 pub fn extract_dynamic_mcp_servers(tools: &[ResponseTool]) -> Vec<(String, String)> {
     tools
         .iter()
@@ -59,9 +53,6 @@ pub fn extract_dynamic_mcp_servers(tools: &[ResponseTool]) -> Vec<(String, Strin
 /// then ensures a dynamic client exists in the McpManager via `get_or_create_client()`.
 /// The McpManager itself is returned (cloned Arc) for convenience, though the main
 /// purpose is the side effect of registering the dynamic client.
-///
-/// Returns Some(manager) if a dynamic MCP tool was found and client was created/retrieved,
-/// None if no MCP tools were found or connection failed.
 pub async fn ensure_request_mcp_client(
     mcp_manager: &Arc<McpManager>,
     tools: &[ResponseTool],
@@ -113,9 +104,6 @@ pub async fn ensure_request_mcp_client(
 }
 
 /// Persist conversation items (delegates to openai::conversations module)
-///
-/// This is a convenience wrapper that delegates to the internal implementation
-/// in the openai::conversations module.
 pub async fn persist_conversation_items(
     conversation_storage: Arc<dyn ConversationStorage>,
     item_storage: Arc<dyn ConversationItemStorage>,
@@ -145,7 +133,7 @@ pub const TOOL_NAME_SEPARATOR: &str = "__";
 static TOOL_NAME_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^([^_]+(?:_[^_]+)*)__(.+)$").unwrap());
 
-/// Format tool name: `server_label__tool_name`
+
 pub fn format_tool_name(server_label: &str, tool_name: &str) -> String {
     format!("{}{}{}", server_label, TOOL_NAME_SEPARATOR, tool_name)
 }

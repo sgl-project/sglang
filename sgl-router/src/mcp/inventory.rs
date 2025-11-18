@@ -28,28 +28,17 @@ impl ToolInventory {
         }
     }
 
-    /// Get a tool by composite key
-    ///
-    /// Returns (Tool, server_url) if found.
     pub fn get_tool(&self, server_label: &str, tool_name: &str) -> Option<(Tool, String)> {
         self.tools
             .get(&(server_label.to_string(), tool_name.to_string()))
             .map(|entry| entry.value().clone())
     }
 
-    /// Check if tool exists by composite key
     pub fn has_tool(&self, server_label: &str, tool_name: &str) -> bool {
         self.tools
             .contains_key(&(server_label.to_string(), tool_name.to_string()))
     }
 
-    /// Insert or update a tool
-    ///
-    /// # Arguments
-    /// * `server_label` - Server label (e.g., "weather-api", "database")
-    /// * `tool_name` - Tool name (e.g., "get_weather", "query")
-    /// * `tool` - Tool definition from MCP server
-    /// * `server_url` - MCP server URL for routing tool calls
     pub fn insert_tool(
         &self,
         server_label: String,
@@ -61,9 +50,6 @@ impl ToolInventory {
             .insert((server_label, tool_name), (tool, server_url));
     }
 
-    /// List all tools
-    ///
-    /// Returns Vec of (server_label, tool_name, Tool, server_url)
     pub fn list_tools(&self) -> Vec<(String, String, Tool, String)> {
         self.tools
             .iter()
