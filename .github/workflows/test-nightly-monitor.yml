@@ -38,7 +38,7 @@ jobs:
 
       - name: Run Nightly Test Monitor
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
