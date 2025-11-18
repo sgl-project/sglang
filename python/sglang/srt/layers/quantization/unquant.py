@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
+    xpu_has_xmx_support,
 )
 
 if TYPE_CHECKING:
@@ -467,6 +468,40 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 x,
                 topk_output,
                 moe_runner_config,
+            )
+            return StandardCombineInput(hidden_states=output)
+
+    def forward_xpu(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
+
+        assert (
+            moe_runner_config.activation == "silu"
+        ), f"activation = {moe_runner_config.activation} is not supported."
+
+        if xpu_has_xmx_support():
+            from sgl_kernel import fused_experts
+
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+            topk_weights, topk_ids, _ = topk_output
+            x, topk_weights = apply_topk_weights_cpu(
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
+            )
+            output = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
             )
             return StandardCombineInput(hidden_states=output)
 

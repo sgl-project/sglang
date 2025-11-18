@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 
 def extract_page_table(
@@ -613,12 +613,20 @@ class XPUAttentionBackend(AttentionBackend):
                     assert forward_batch.mha_return_lse
                     output = flash_attn_with_kvcache(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                        v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                        k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(
+                            q.dtype
+                        ),
+                        v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(
+                            q.dtype
+                        ),
                         cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k=torch.diff(forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]),
+                        cu_seqlens_k=torch.diff(
+                            forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
+                        ),
                         max_seqlen_q=metadata.max_seq_len_q,
-                        page_table=torch.arange(0, metadata.cu_seqlens_q.numel(), device=self.device),
+                        page_table=torch.arange(
+                            0, metadata.cu_seqlens_q.numel(), device=self.device
+                        ),
                         max_seqlen_k=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
                         softmax_scale=layer.scaling,
                         causal=False,
@@ -629,13 +637,19 @@ class XPUAttentionBackend(AttentionBackend):
                     # MHA for extend part of sequence without attending prefix kv cache
                     output = flash_attn_with_kvcache(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                        v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                        k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(
+                            q.dtype
+                        ),
+                        v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(
+                            q.dtype
+                        ),
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=torch.diff(metadata.cu_seqlens_q),
                         max_seqlen_q=metadata.max_seq_len_q,
                         max_seqlen_k=metadata.max_seq_len_q,
-                        page_table=torch.arange(0, metadata.cu_seqlens_q.numel(), device=self.device),
+                        page_table=torch.arange(
+                            0, metadata.cu_seqlens_q.numel(), device=self.device
+                        ),
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
