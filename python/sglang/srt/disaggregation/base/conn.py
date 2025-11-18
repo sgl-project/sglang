@@ -75,7 +75,7 @@ class BaseKVSender(ABC):
     @abstractmethod
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         """
-        Set req's index metadata locally or notify the decoder server about the kv indices and aux index.
+        Set req's index metadata locally or notify the decoder server about the kv indices length and aux index.
         """
         ...
 
