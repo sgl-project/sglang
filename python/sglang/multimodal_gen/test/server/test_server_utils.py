@@ -437,8 +437,6 @@ class VideoPerformanceValidator(PerformanceValidator):
 
     def _validate_stages(self, stage_metrics: dict) -> None:
         """Validate video-specific stages."""
-        # The base validator receives a summary, but here we get raw metrics.
-        # This is a bit inconsistent and could be refactored.
         assert stage_metrics, "Stage metrics missing"
 
         for stage, expected in self.scenario.stages_ms.items():

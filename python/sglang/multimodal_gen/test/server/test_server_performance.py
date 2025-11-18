@@ -152,8 +152,6 @@ class TestDiffusionPerformance:
 
         stage_metrics = {}
         if perf_record:
-            # When generating baselines, a scenario may not exist yet, so we pass
-            # a dummy value for num_stages, which is only used for logging.
             scenario = BASELINE_CONFIG.scenarios.get(case.scenario_name)
             num_stages = len(scenario.stages_ms) if scenario else 0
 
@@ -364,8 +362,6 @@ class TestDiffusionPerformance:
         """Validate metrics and record results."""
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
 
-        # When generating baselines, a scenario may not exist yet,
-        # so we pass a dummy to the validator.
         scenario = BASELINE_CONFIG.scenarios.get(case.scenario_name)
         if scenario is None:
             if is_baseline_generation_mode:
