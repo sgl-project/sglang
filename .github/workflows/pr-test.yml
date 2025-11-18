@@ -331,6 +331,10 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
     steps:
+      - name: Cleanup before checkout
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/python/sglang/logs" || true
+
       - name: Checkout code
         uses: actions/checkout@v4
 
