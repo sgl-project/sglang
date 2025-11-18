@@ -25,14 +25,10 @@ use tracing::warn;
 // Import from sibling modules
 use super::conversations::{
     create_conversation, create_conversation_items, delete_conversation, delete_conversation_item,
-    get_conversation, get_conversation_item, list_conversation_items, persist_conversation_items,
-    update_conversation,
+    get_conversation, get_conversation_item, list_conversation_items, update_conversation,
 };
 use super::{
-    mcp::{
-        ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
-        McpLoopConfig,
-    },
+    mcp::{execute_tool_loop, prepare_mcp_payload_for_streaming, McpLoopConfig},
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
     utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
@@ -56,7 +52,12 @@ use crate::{
             ResponseToolType, ResponsesGetParams, ResponsesRequest,
         },
     },
-    routers::{common::extract_dynamic_mcp_servers, header_utils::apply_request_headers},
+    routers::{
+        common::{
+            ensure_request_mcp_client, extract_dynamic_mcp_servers, persist_conversation_items,
+        },
+        header_utils::apply_request_headers,
+    },
 };
 
 // ============================================================================

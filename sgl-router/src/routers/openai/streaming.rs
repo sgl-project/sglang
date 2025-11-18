@@ -22,12 +22,11 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 // Import from sibling modules
-use super::conversations::persist_conversation_items;
 use super::{
     mcp::{
-        build_resume_payload, ensure_request_mcp_client, execute_streaming_tool_calls,
-        inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
-        send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
+        build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
+        prepare_mcp_payload_for_streaming, send_mcp_list_tools_events, McpLoopConfig,
+        ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
     utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
@@ -36,7 +35,9 @@ use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     protocols::responses::{ResponseToolType, ResponsesRequest},
     routers::{
-        common::extract_dynamic_mcp_servers,
+        common::{
+            ensure_request_mcp_client, extract_dynamic_mcp_servers, persist_conversation_items,
+        },
         header_utils::{apply_request_headers, preserve_response_headers},
     },
 };
