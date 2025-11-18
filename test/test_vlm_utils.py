@@ -30,6 +30,7 @@ class TestVLMModels(CustomTestCase):
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
         os.environ["OPENAI_API_KEY"] = cls.api_key
         os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
+        os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = 0
 
     def _detect_eviction_in_logs(self, log_output):
         """Detect if eviction events occurred in the log output."""
