@@ -663,6 +663,7 @@ class ModelConfig:
             "qoq",
             "w4afp8",
             "petit_nvfp4",
+            "quark",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -954,6 +955,7 @@ multimodal_model_archs = [
     "NVILAForConditionalGeneration",
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
+    "JetVLMForConditionalGeneration",
 ]
 
 
