@@ -82,7 +82,7 @@ After the "run-ci" label is added, the PR author can trigger CI by:
 1. Pushing new commits, or
 2. Clicking "Re-run" / retrigger on the workflow page.
 
-## General code style
+## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
