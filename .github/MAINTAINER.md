@@ -25,6 +25,9 @@ __Note__: Difference between Merge Oncall and Codeowner
 - The Codeowner is a passive protection role provided by GitHub; it prevents accidental changes to critical code.
 - The list of Merge Oncalls is attached below. The list of Codeowners is in the [CODEOWNERS](./CODEOWNERS) file.
 
+__Note__: The permissions to trigger CI tests are defined separately according to these [rules](https://docs.sglang.ai/developer_guide/contribution_guide.html#how-to-trigger-ci).
+
+
 ## Pull Request Merge Process
 1. The author submits a pull request (PR) and fills out the PR checklist.
 2. A bot assigns this PR to a Merge Oncall and @-mentions them. At the same time, GitHub will automatically request reviews from Codeowners.
