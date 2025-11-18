@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   call-gate:
-    uses: sgl-project/sglang/.github/workflows/pr-gate.yml@main
+    uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
   check-changes:
     needs: [call-gate]

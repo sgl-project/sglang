@@ -26,7 +26,7 @@ env:
 
 jobs:
   call-gate:
-    uses: ./.github/workflows/pr-gate.yml@main
+    uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
     with:
       require-run-ci: false
