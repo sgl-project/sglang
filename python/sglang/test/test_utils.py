@@ -844,6 +844,79 @@ def run_bench_serving(
     return res
 
 
+async def _run_api_benchmark_requests(
+    base_url: str,
+    endpoint: str,
+    test_requests: List[dict],
+    num_requests: int,
+    response_validator: Callable[[dict], bool],
+):
+    """
+    Helper function to run API benchmark requests and collect metrics.
+
+    Args:
+        base_url: The base URL of the server
+        endpoint: The API endpoint to test (e.g., "/v1/score", "/v1/embeddings")
+        test_requests: List of request payloads to send
+        num_requests: Total number of requests expected
+        response_validator: Function to validate if response contains expected data
+
+    Returns:
+        Dictionary with benchmark metrics
+    """
+    start_time = time.monotonic()
+    successful_requests = 0
+    total_latency = 0
+    latencies = []
+
+    async with aiohttp.ClientSession() as session:
+        for request_data in test_requests:
+            try:
+                request_start = time.monotonic()
+                async with session.post(
+                    f"{base_url}{endpoint}",
+                    json=request_data,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status == 200:
+                        response_data = await response.json()
+                        request_end = time.monotonic()
+
+                        if response_validator(response_data):
+                            latency_ms = (request_end - request_start) * 1000
+                            latencies.append(latency_ms)
+                            total_latency += latency_ms
+                            successful_requests += 1
+            except Exception:
+                continue
+
+    end_time = time.monotonic()
+    total_time = end_time - start_time
+
+    if successful_requests > 0:
+        throughput = successful_requests / total_time
+        avg_latency = total_latency / successful_requests
+        p95_latency = np.percentile(latencies, 95) if latencies else 0
+
+        return {
+            "completed": successful_requests,
+            "total_requests": num_requests,
+            "throughput": throughput,
+            "avg_latency_ms": avg_latency,
+            "p95_latency_ms": p95_latency,
+            "successful_requests": successful_requests,
+        }
+    else:
+        return {
+            "completed": 0,
+            "total_requests": num_requests,
+            "throughput": 0,
+            "avg_latency_ms": 0,
+            "p95_latency_ms": 0,
+            "successful_requests": 0,
+        }
+
+
 def run_score_benchmark(
     model,
     num_requests=100,
@@ -929,58 +1002,109 @@ def run_score_benchmark(
             }
             test_requests.append(score_data)
 
-        start_time = time.monotonic()
-        successful_requests = 0
-        total_latency = 0
-        latencies = []
+        # Run benchmark requests using shared helper
+        return await _run_api_benchmark_requests(
+            base_url=base_url,
+            endpoint="/v1/score",
+            test_requests=test_requests,
+            num_requests=num_requests,
+            response_validator=lambda resp: "scores" in resp or "logprobs" in resp,
+        )
 
-        async with aiohttp.ClientSession() as session:
-            for request_data in test_requests:
+    try:
+        res = asyncio.run(_run_benchmark())
+    finally:
+        kill_process_tree(process.pid)
+
+    assert res["completed"] == res["successful_requests"]
+    return res
+
+
+def run_embeddings_benchmark(
+    model,
+    num_requests=100,
+    batch_size=1,
+    input_tokens=500,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """Embeddings API benchmark function compatible with run_bench_serving pattern"""
+    if other_server_args is None:
+        other_server_args = []
+
+    if device == "auto":
+        device = auto_config_device()
+
+    # Add --is-embedding flag for embedding models
+    server_args = ["--is-embedding"] + other_server_args
+
+    # Launch the server (consistent with run_bench_serving)
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=server_args,
+    )
+
+    async def _run_benchmark():
+
+        # Load tokenizer for generating test data
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+
+        def generate_text_with_token_count(num_tokens):
+            """Generate text with precise token count using special tokens."""
+            # Use a token that reliably produces 1 token
+            special_token = "<|im_start|>"
+            # Verify it's a single token
+            test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
+            text = special_token * num_tokens
+            return text
+
+        # Generate input text
+        input_text = generate_text_with_token_count(input_tokens)
+
+        if need_warmup:
+            warmup_data = {
+                "input": input_text,
+                "model": model,
+            }
+
+            async with aiohttp.ClientSession() as session:
                 try:
-                    request_start = time.monotonic()
-                    async with session.post(
-                        f"{base_url}/v1/score",
-                        json=request_data,
+                    await session.post(
+                        f"{base_url}/v1/embeddings",
+                        json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
-                    ) as response:
-                        if response.status == 200:
-                            response_data = await response.json()
-                            request_end = time.monotonic()
+                    )
+                except:
+                    pass  # Ignore warmup errors
 
-                            if "scores" in response_data or "logprobs" in response_data:
-                                latency_ms = (request_end - request_start) * 1000
-                                latencies.append(latency_ms)
-                                total_latency += latency_ms
-                                successful_requests += 1
-                except Exception:
-                    continue
+        test_requests = []
+        for i in range(num_requests):
+            if batch_size == 1:
+                input_data = input_text
+            else:
+                input_data = [input_text for _ in range(batch_size)]
 
-        end_time = time.monotonic()
-        total_time = end_time - start_time
-
-        if successful_requests > 0:
-            throughput = successful_requests / total_time
-            avg_latency = total_latency / successful_requests
-            latencies.sort()
-            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
-
-            return {
-                "completed": successful_requests,
-                "total_requests": num_requests,
-                "throughput": throughput,
-                "avg_latency_ms": avg_latency,
-                "p95_latency_ms": p95_latency,
-                "successful_requests": successful_requests,
+            embeddings_data = {
+                "input": input_data,
+                "model": model,
             }
-        else:
-            return {
-                "completed": 0,
-                "total_requests": num_requests,
-                "throughput": 0,
-                "avg_latency_ms": 0,
-                "p95_latency_ms": 0,
-                "successful_requests": 0,
-            }
+
+            test_requests.append(embeddings_data)
+
+        # Run benchmark requests using shared helper
+        return await _run_api_benchmark_requests(
+            base_url=base_url,
+            endpoint="/v1/embeddings",
+            test_requests=test_requests,
+            num_requests=num_requests,
+            response_validator=lambda resp: "data" in resp,
+        )
 
     try:
         res = asyncio.run(_run_benchmark())
