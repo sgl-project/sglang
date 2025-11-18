@@ -53,12 +53,12 @@ class TestGemm(CustomTestCase):
         ref = ref.bfloat16()
 
         out = torch.ops.sgl_kernel.weight_packed_linear(
-            mat1, mat2, bias if has_bias else None, False
+            mat1, mat2, bias if has_bias else None, False, None
         )
 
         packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)
         out2 = torch.ops.sgl_kernel.weight_packed_linear(
-            mat1, packed_mat2, bias if has_bias else None, True
+            mat1, packed_mat2, bias if has_bias else None, True, None
         )
 
         atol = rtol = precision[ref.dtype]
@@ -82,6 +82,9 @@ class TestGemm(CustomTestCase):
 
     def _fp32_gemm(self, M, N, K, has_bias, use_post_sigmul):
         use_post_sigmul = use_post_sigmul and N == 1
+        mat_mul = (
+            None if not use_post_sigmul else torch.randn(M, 2 * K, dtype=torch.bfloat16)
+        )
         mat1 = torch.randn(M, K, dtype=torch.bfloat16)
         mat2 = torch.randn(N, K, dtype=torch.bfloat16)
 
@@ -91,27 +94,27 @@ class TestGemm(CustomTestCase):
             ref.add_(bias)
 
         if use_post_sigmul:
-            ref  = torch.nn.functional.sigmoid(ref) * mat1
-        out = torch.ops.sgl_kernel.fma_linear(
-            mat1, mat2.t().contiguous(), bias if has_bias else None, mat1 if use_post_sigmul else None
+            ref = torch.nn.functional.sigmoid(ref) * mat_mul
+        out = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1,
+            torch.ops.sgl_kernel.convert_weight_packed(mat2),
+            bias if has_bias else None,
+            True,
+            mat_mul if use_post_sigmul else None,
         )
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
     def test_fp32_gemm(self):
         for params in itertools.product(
-            [1, 8 , 32, 1024],
-            [12, 1],
-            self.K,
-            self.has_bias,
-            [True, False]
+            [1, 8, 32, 1024], [12, 1], self.K, self.has_bias, [False, True]
         ):
             with self.subTest(
                 M=params[0],
                 N=params[1],
                 K=params[2],
                 has_bias=params[3],
-                use_post_sigmul = params[4],
+                use_post_sigmul=params[4],
             ):
                 self._fp32_gemm(*params)
 

@@ -104,11 +104,12 @@ at::Tensor convert_weight_packed(at::Tensor& weight);
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 
 // gemm
-at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
-
-at::Tensor
-fma_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, const std::optional<at::Tensor>& post_mul);
+at::Tensor weight_packed_linear(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    const std::optional<at::Tensor>& post_mul_mat);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -294,12 +295,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
 
   // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor? post_mul_mat) -> Tensor");
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
-
-  // gemm
-  m.def("fma_linear(Tensor mat1, Tensor mat2, Tensor? bias, Tensor? post_mul) -> Tensor");
-  m.impl("fma_linear", torch::kCPU, &fma_linear);
 
   // igemm
   m.def(

@@ -393,9 +393,6 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def _compile_ba(self, hidden_states: torch.Tensor):
-        return torch.ops.sgl_kernel.fma_linear(hidden_states, self.in_proj_ba.weight, None, None)
-
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         DUAL_STREAM_TOKEN_THRESHOLD = 1024 if not _is_npu else 0
         seq_len, _ = hidden_states.shape
@@ -408,10 +405,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             current_stream.wait_stream(self.alt_stream)
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            if self.in_proj_ba.use_intel_amx_backend:
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
-            else:
-                projected_states_ba = self._compile_ba(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
     def forward(

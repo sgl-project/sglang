@@ -17,15 +17,17 @@ def amx_process_weight_after_loading(weight):
 
 
 # TODO: currently gemm kernel has the below requirements:
-# OC % TILE_N == 0, where TILE_N = 16
-# IC % TILE_K == 0, where TILE_K = 32
+# OC: OC % TILE_N == 0 or OC < TILE_N, where TILE_N = 16
+# IC: IC % TILE_K == 0, where TILE_K = 32
 def dim_is_supported(weight):
     TILE_N = 16
     TILE_K = 32
     ndim = weight.ndim
     OC = weight.size(1) if ndim == 3 else weight.size(0)
     IC = weight.size(2) if ndim == 3 else weight.size(1)
-    return OC % TILE_N == 0 and IC % TILE_K == 0
+    is_oc_support = OC < TILE_N or OC % TILE_N == 0
+    is_ic_support = IC % TILE_K == 0
+    return is_oc_support and is_ic_support
 
 
 def _amx_process_weight_after_loading(
@@ -54,13 +56,6 @@ def _amx_process_weight_after_loading(
                 f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
             )
             module.use_intel_amx_backend = False
-            if weight_tensor.dim() == 2:
-                packed_weight = torch.nn.Parameter(weight_tensor.t().contiguous(), requires_grad=False)
-                packed_weight.__dict__ = weight_tensor.__dict__
-                setattr(module, weight_name, packed_weight)
-                logger.warning(
-                    f"Using transposed plain for shape {weight_tensor.shape} in {module}. "
-                )
             return
 
         packed_weight = torch.nn.Parameter(
