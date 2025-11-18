@@ -1018,6 +1018,10 @@ class Scheduler(
                 self.self_check_during_idle()
 
             self.launch_batch_sample_if_needed(batch_result)
+
+            # if self.last_batch is None and batch:
+            #     batch_result.copy_done.synchronize()
+
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
@@ -1583,6 +1587,11 @@ class Scheduler(
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
+            self.chunked_req.mamba_pool_copy_current_idx = (
+                0
+                if self.chunked_req.mamba_pool_copy_current_idx is None
+                else 1 - self.chunked_req.mamba_pool_copy_current_idx
+            )
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
             if self.tp_worker.model_runner.mambaish_config is not None:

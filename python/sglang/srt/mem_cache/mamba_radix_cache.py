@@ -385,7 +385,8 @@ class MambaRadixCache(BasePrefixCache):
                 assert copy_index is not None, "Can not alloc mamba cache"
             # rank0_log(f"DEBUG: match_prefix, {req.rid=}, {copy_index=}")
             req.mamba_pool_copy_ping_pong_idx = copy_index
-            req.mamba_pool_copy_next_idx = req.mamba_pool_copy_current_idx = 0
+            req.mamba_pool_copy_next_idx = 0
+            req.mamba_pool_copy_current_idx = None
 
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -402,10 +403,6 @@ class MambaRadixCache(BasePrefixCache):
 
         # copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
-            assert req.req_pool_idx is None  # req_pool_idx is uninitialed
-            ping_pong_idx = req.mamba_pool_copy_ping_pong_idx[
-                req.mamba_pool_copy_next_idx
-            ].unsqueeze(-1)
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
@@ -418,13 +415,11 @@ class MambaRadixCache(BasePrefixCache):
                     assert dst_index is not None, "Can not alloc mamba cache"
                 src_index = last_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, ping_pong_idx)
                 req.mamba_pool_idx = dst_index[0]
             else:
                 src_index = last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, ping_pong_idx)
 
         if value:
             value = torch.cat(value)
@@ -461,15 +456,6 @@ class MambaRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        cache_len = req.mamba_pool_copy_last_seqlen
-        if cache_len is None:
-            cache_len = 0
-        if cache_len != len(token_ids):
-            free_start_idx = max(cache_len, len(req.prefix_indices))
-            self.token_to_kv_pool_allocator.free(kv_indices[free_start_idx:])
-            token_ids = token_ids[:cache_len]
-            kv_indices = kv_indices[:cache_len]
-
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
@@ -478,10 +464,6 @@ class MambaRadixCache(BasePrefixCache):
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-
-        assert (
-            cache_len == page_aligned_len
-        ), f"It is required {cache_len=}, {page_aligned_len=}, ping @hanming if you see this"
 
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
@@ -513,6 +495,7 @@ class MambaRadixCache(BasePrefixCache):
             .unsqueeze(-1)
             .clone()
         )
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         self.req_to_token_pool.mamba_pool.free(mamba_value_other)
         # TODO: these set to None seems not necessary?
         req.mamba_pool_copy_ping_pong_idx = None
@@ -561,7 +544,6 @@ class MambaRadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
-        assert req.mamba_pool_copy_current_idx is not None
         mamba_value = (
             req.mamba_pool_copy_ping_pong_idx[req.mamba_pool_copy_current_idx]
             .unsqueeze(-1)

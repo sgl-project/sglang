@@ -18,6 +18,151 @@ from sglang.srt.layers.attention.fla.utils import is_nvidia_hopper
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 
 
+@triton.jit
+def _chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
+    k,
+    g,
+    intermediate_state,
+    intermediate_len,
+    intermediate_positions,
+    boi,
+    bos,
+    b_v_new,
+    b_h1,
+    b_h2,
+    b_h3,
+    b_h4,
+    i_t,
+    i_h,
+    i_v,
+    stride_k,
+    stride_h,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+    USE_G: tl.constexpr,
+):
+    for i_i in range(intermediate_len):
+        intermediate_position = tl.load(
+            intermediate_positions + (boi + i_i)
+        ).to(tl.int32)
+
+        if intermediate_position > i_t * BT and intermediate_position <= (i_t + 1) * BT:
+            offset = intermediate_position - i_t * BT
+            mask = tl.arange(0, BT)[:, None] < offset
+
+            if USE_G:
+                last_idx = intermediate_position - 1
+                b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
+                p_g = tl.make_block_ptr(
+                    g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+                )
+                b_g = tl.load(p_g, boundary_check=(0,))
+                b_v_new_masked = b_v_new * safe_exp(b_g_last - b_g)[:, None]
+                b_g_last = exp(b_g_last)
+                b_h1_i = b_h1 * b_g_last
+                if K > 64:
+                    b_h2_i = b_h2 * b_g_last
+                if K > 128:
+                    b_h3_i = b_h3 * b_g_last
+                if K > 192:
+                    b_h4_i = b_h4 * b_g_last
+            else:
+                b_v_new_masked = b_v_new
+                b_h1_i = b_h1
+                if K > 64:
+                    b_h2_i = b_h2
+                if K > 128:
+                    b_h3_i = b_h3
+                if K > 192:
+                    b_h4_i = b_h4
+
+            b_v_new_masked = tl.where(mask, b_v_new_masked, 0.0).to(
+                k.dtype.element_ty
+            )  # [BT, BV]
+
+            p_k = tl.make_block_ptr(
+                k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))  # [64, BT]
+            b_h1_i += tl.dot(b_k, b_v_new_masked)  # [64, BV]
+
+            intermediate_offset = i_i * stride_h
+            p_intermediate = tl.make_block_ptr(
+                intermediate_state + intermediate_offset,
+                (K, V),
+                (V, 1),
+                (0, i_v * BV),
+                (64, BV),
+                (1, 0),
+            )
+            tl.store(
+                p_intermediate,
+                b_h1_i.to(p_intermediate.dtype.element_ty),
+                boundary_check=(0, 1),
+            )
+            if K > 64:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
+                )
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_h2_i += tl.dot(b_k, b_v_new_masked)
+                p_intermediate = tl.make_block_ptr(
+                    intermediate_state + intermediate_offset,
+                    (K, V),
+                    (V, 1),
+                    (64, i_v * BV),
+                    (64, BV),
+                    (1, 0),
+                )
+                tl.store(
+                    p_intermediate,
+                    b_h2_i.to(p_intermediate.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+            if K > 128:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
+                )
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_h3_i += tl.dot(b_k, b_v_new_masked)
+                p_intermediate = tl.make_block_ptr(
+                    intermediate_state + intermediate_offset,
+                    (K, V),
+                    (V, 1),
+                    (128, i_v * BV),
+                    (64, BV),
+                    (1, 0),
+                )
+                tl.store(
+                    p_intermediate,
+                    b_h3_i.to(p_intermediate.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+            if K > 192:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+                )
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_h4_i += tl.dot(b_k, b_v_new_masked)
+
+                p_intermediate = tl.make_block_ptr(
+                    intermediate_state + intermediate_offset,
+                    (K, V),
+                    (V, 1),
+                    (192, i_v * BV),
+                    (64, BV),
+                    (1, 0),
+                )
+                tl.store(
+                    p_intermediate,
+                    b_h4_i.to(p_intermediate.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -96,15 +241,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             intermediate_cu_seqlens + i_n + 1
         ).to(tl.int32)
         intermediate_len = eoi - boi
-
-        b_h1_i = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 64:
-            b_h2_i = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 128:
-            b_h3_i = tl.zeros([64, BV], dtype=tl.float32)
-        if K > 192:
-            b_h4_i = tl.zeros([64, BV], dtype=tl.float32)
-
         intermediate_state += (boi * H + i_h) * K * V
 
     # calculate offset
@@ -210,137 +346,32 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             )
 
         if STORE_INTERMEDIATE:
-            for i_i in range(intermediate_len):
-                intermediate_position = tl.load(
-                    intermediate_positions + (boi + i_i)
-                ).to(tl.int32)
-
-                if intermediate_position >= 0 and (
-                    (
-                        intermediate_position % BT != 0
-                        and intermediate_position // BT == i_t
-                    )
-                    or (
-                        intermediate_position % BT == 0
-                        and intermediate_position // BT == i_t + 1
-                    )
-                ):
-                    offset = intermediate_position % BT
-                    if (
-                        intermediate_position // BT == i_t + 1
-                        and intermediate_position % BT == 0
-                    ):
-                        offset = BT
-                    mask = tl.arange(0, BT)[:, None] < offset
-
-                    if USE_G:
-                        last_idx = intermediate_position - 1
-                        b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
-                        p_g = tl.make_block_ptr(
-                            g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-                        )
-                        b_g = tl.load(p_g, boundary_check=(0,))
-                        b_v_new_masked = b_v_new * safe_exp(b_g_last - b_g)[:, None]
-                        b_g_last = exp(b_g_last)
-                        b_h1_i = b_h1 * b_g_last
-                        if K > 64:
-                            b_h2_i = b_h2 * b_g_last
-                        if K > 128:
-                            b_h3_i = b_h3 * b_g_last
-                        if K > 192:
-                            b_h4_i = b_h4 * b_g_last
-                    else:
-                        b_v_new_masked = b_v_new
-                        b_h1_i = b_h1
-                        if K > 64:
-                            b_h2_i = b_h2
-                        if K > 128:
-                            b_h3_i = b_h3
-                        if K > 192:
-                            b_h4_i = b_h4
-
-                    b_v_new_masked = tl.where(mask, b_v_new_masked, 0.0).to(
-                        k.dtype.element_ty
-                    )  # [BT, BV]
-
-                    p_k = tl.make_block_ptr(
-                        k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
-                    )
-                    b_k = tl.load(p_k, boundary_check=(0, 1))  # [64, BT]
-                    b_h1_i += tl.dot(b_k, b_v_new_masked)  # [64, BV]
-
-                    intermediate_offset = i_i * stride_h
-                    p_intermediate = tl.make_block_ptr(
-                        intermediate_state + intermediate_offset,
-                        (K, V),
-                        (V, 1),
-                        (0, i_v * BV),
-                        (64, BV),
-                        (1, 0),
-                    )
-                    tl.store(
-                        p_intermediate,
-                        b_h1_i.to(p_intermediate.dtype.element_ty),
-                        boundary_check=(0, 1),
-                    )
-                    if K > 64:
-                        p_k = tl.make_block_ptr(
-                            k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
-                        )
-                        b_k = tl.load(p_k, boundary_check=(0, 1))
-                        b_h2_i += tl.dot(b_k, b_v_new_masked)
-                        p_intermediate = tl.make_block_ptr(
-                            intermediate_state + intermediate_offset,
-                            (K, V),
-                            (V, 1),
-                            (64, i_v * BV),
-                            (64, BV),
-                            (1, 0),
-                        )
-                        tl.store(
-                            p_intermediate,
-                            b_h2_i.to(p_intermediate.dtype.element_ty),
-                            boundary_check=(0, 1),
-                        )
-                    if K > 128:
-                        p_k = tl.make_block_ptr(
-                            k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
-                        )
-                        b_k = tl.load(p_k, boundary_check=(0, 1))
-                        b_h3_i += tl.dot(b_k, b_v_new_masked)
-                        p_intermediate = tl.make_block_ptr(
-                            intermediate_state + intermediate_offset,
-                            (K, V),
-                            (V, 1),
-                            (128, i_v * BV),
-                            (64, BV),
-                            (1, 0),
-                        )
-                        tl.store(
-                            p_intermediate,
-                            b_h3_i.to(p_intermediate.dtype.element_ty),
-                            boundary_check=(0, 1),
-                        )
-                    if K > 192:
-                        p_k = tl.make_block_ptr(
-                            k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
-                        )
-                        b_k = tl.load(p_k, boundary_check=(0, 1))
-                        b_h4_i += tl.dot(b_k, b_v_new_masked)
-
-                        p_intermediate = tl.make_block_ptr(
-                            intermediate_state + intermediate_offset,
-                            (K, V),
-                            (V, 1),
-                            (192, i_v * BV),
-                            (64, BV),
-                            (1, 0),
-                        )
-                        tl.store(
-                            p_intermediate,
-                            b_h4_i.to(p_intermediate.dtype.element_ty),
-                            boundary_check=(0, 1),
-                        )
+            _chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
+                k,
+                g,
+                intermediate_state,
+                intermediate_len,
+                intermediate_positions,
+                boi,
+                bos,
+                b_v_new,
+                b_h1,
+                b_h2 if K > 64 else None,
+                b_h3 if K > 128 else None,
+                b_h4 if K > 192 else None,
+                i_t,
+                i_h,
+                i_v,
+                stride_k,
+                stride_h,
+                T,
+                H,
+                K,
+                V,
+                BT,
+                BV,
+                USE_G,
+            )
 
         if USE_G:
             last_idx = min((i_t + 1) * BT, T) - 1

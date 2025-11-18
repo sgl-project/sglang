@@ -100,19 +100,18 @@ class SchedulerOutputProcessorMixin:
                 if req.is_retracted:
                     continue
 
-                # Update Mamba
-                seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-                if req.mamba_pool_copy_ping_pong_idx is not None:
-                    page_size = get_global_server_args().page_size
-                    paged_aligned_seq_len = seq_len // page_size * page_size
-                    req.mamba_pool_copy_current_idx = req.mamba_pool_copy_next_idx
-                    req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
-                    req.mamba_pool_copy_last_seqlen = paged_aligned_seq_len
 
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
+
+                    if req.mamba_pool_copy_ping_pong_idx is not None:
+                        req.mamba_pool_copy_current_idx = (
+                            0
+                            if req.mamba_pool_copy_current_idx is None
+                            else 1 - req.mamba_pool_copy_current_idx
+                        )
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -342,9 +341,11 @@ class SchedulerOutputProcessorMixin:
                 req.mamba_pool_copy_ping_pong_idx is not None
                 and seq_len % page_size == 0
             ):
-                req.mamba_pool_copy_current_idx = req.mamba_pool_copy_next_idx
-                req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
-                req.mamba_pool_copy_last_seqlen = seq_len
+                req.mamba_pool_copy_current_idx = (
+                    0
+                    if req.mamba_pool_copy_current_idx is None
+                    else 1 - req.mamba_pool_copy_current_idx
+                )
 
             if req.finished():
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():

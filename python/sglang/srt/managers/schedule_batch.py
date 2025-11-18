@@ -489,9 +489,6 @@ class Req:
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
         self.mamba_pool_copy_ping_pong_idx: Optional[torch.Tensor] = None  # shape (2)
         self.mamba_pool_copy_next_idx: Optional[int] = None  # 0 or 1
-        self.mamba_pool_copy_last_seqlen: Optional[int] = (
-            None  # seq len of the last cached mamba state
-        )
         self.mamba_pool_copy_current_idx: Optional[int] = None  # 0 or 1
 
         # Check finish
@@ -1369,6 +1366,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
+            for req in self.reqs:
+                req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
+
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
@@ -1619,6 +1619,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.bool,
                 device=self.device,
             )
+
+            for req in self.reqs:
+                req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
