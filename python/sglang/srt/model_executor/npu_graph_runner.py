@@ -100,7 +100,8 @@ class NPUGraphRunner(CudaGraphRunner):
             )
 
     def _capture_graph(self, graph, pool, stream, run_once_fn, bs: int):
-        if self.enable_torch_compile:
+        if self.enable_torch_compile and (not self.compile_bs or bs in self.compile_bs):
+            self.model_runner.attn_backend.enable_torch_compile = True
             compiler = NpuGraphCompiler(
                 run_once_fn, self.model_runner.model_config.dtype
             )
@@ -133,6 +134,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 compiled_function(*args)
 
         else:
+            self.model_runner.attn_backend.enable_torch_compile = False
             with torch.npu.graph(
                 graph,
                 pool=pool,
@@ -143,7 +145,9 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _update_inputs(self, seq_lens):
-        if self.enable_torch_compile:
+        if self.enable_torch_compile and (
+            not self.compile_bs or self.bs in self.compile_bs
+        ):
             if self.use_mla:
                 self.graphs[self.bs].update(
                     cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
@@ -202,7 +206,9 @@ class NPUGraphRunner(CudaGraphRunner):
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        if self.enable_torch_compile:
+        if self.enable_torch_compile and (
+            not self.compile_bs or self.bs in self.compile_bs
+        ):
             seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                 self.bs - self.raw_bs
             )
