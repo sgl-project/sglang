@@ -43,29 +43,36 @@ def load_permissions(user_login):
         sys.exit(1)
 
 
-def handle_tag_run_ci(gh_repo, pr, comment, user_perms):
+def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /tag-run-ci-label command.
+    Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_tag_run_ci_label", False):
         print("Permission denied: can_tag_run_ci_label is false.")
-        return
+        return False
 
     print("Permission granted. Adding 'run-ci' label.")
     pr.add_to_labels("run-ci")
 
     # React to the comment with +1
-    comment.create_reaction("+1")
-    print("Label added and comment reacted.")
+    if react_on_success:
+        comment.create_reaction("+1")
+        print("Label added and comment reacted.")
+    else:
+        print("Label added (reaction suppressed).")
+
+    return True
 
 
-def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms):
+def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
+    Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
-        return
+        return False
 
     print("Permission granted. Triggering rerun of failed workflows.")
 
@@ -83,17 +90,19 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms):
             print(f"Rerunning workflow: {run.name} (ID: {run.id})")
             try:
                 # PyGithub uses rerun_failed_jobs() or rerun() depending on version/intent
-                # The traceback suggested rerun_failed_jobs
                 run.rerun_failed_jobs()
                 rerun_count += 1
             except Exception as e:
                 print(f"Failed to rerun workflow {run.id}: {e}")
 
     if rerun_count > 0:
-        comment.create_reaction("+1")
         print(f"Triggered rerun for {rerun_count} failed workflows.")
+        if react_on_success:
+            comment.create_reaction("+1")
+        return True
     else:
         print("No failed workflows found to rerun.")
+        return False
 
 
 def main():
@@ -129,6 +138,26 @@ def main():
 
     elif first_line.startswith("/rerun-failed-ci"):
         handle_rerun_failed_ci(repo, pr, comment, user_perms)
+
+    elif first_line.startswith("/tag-and-rerun-ci"):
+        # Perform both actions, but suppress individual reactions to avoid duplicates/spam
+        print("Processing combined command: /tag-and-rerun-ci")
+
+        tagged = handle_tag_run_ci(
+            repo, pr, comment, user_perms, react_on_success=False
+        )
+        rerun = handle_rerun_failed_ci(
+            repo, pr, comment, user_perms, react_on_success=False
+        )
+
+        # If at least one action was successful, add the reaction here
+        if tagged or rerun:
+            comment.create_reaction("+1")
+            print("Combined command processed successfully; reaction added.")
+        else:
+            print(
+                "Combined command finished, but no actions were taken (permissions denied or nothing to rerun)."
+            )
 
     else:
         print(f"Unknown or ignored command: {first_line}")
