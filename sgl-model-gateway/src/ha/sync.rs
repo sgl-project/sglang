@@ -8,7 +8,8 @@ use tracing::debug;
 
 use super::{
     crdt::SKey,
-    stores::{PolicyState, StateStores, WorkerState},
+    gossip::NodeStatus,
+    stores::{MembershipState, PolicyState, StateStores, WorkerState},
 };
 
 /// HA sync manager for coordinating state synchronization
@@ -188,6 +189,85 @@ impl HASyncManager {
                 state.model_id, state.version, current_version
             );
         }
+    }
+
+    /// Update rate-limit hash ring with current membership
+    pub fn update_rate_limit_membership(&self) {
+        // Get all alive nodes from membership store
+        let all_members = self.stores.membership.all();
+        let alive_nodes: Vec<String> = all_members
+            .values()
+            .filter(|m| m.status == NodeStatus::Alive as i32)
+            .map(|m| m.name.clone())
+            .collect();
+
+        self.stores.rate_limit.update_membership(&alive_nodes);
+        debug!(
+            "Updated rate-limit hash ring with {} alive nodes",
+            alive_nodes.len()
+        );
+    }
+
+    /// Handle node failure and transfer rate-limit ownership
+    pub fn handle_node_failure(&self, failed_nodes: &[String]) {
+        if failed_nodes.is_empty() {
+            return;
+        }
+
+        debug!("Handling node failure for rate-limit: {:?}", failed_nodes);
+
+        // Check which keys need ownership transfer
+        let affected_keys = self
+            .stores
+            .rate_limit
+            .check_ownership_transfer(failed_nodes);
+
+        if !affected_keys.is_empty() {
+            debug!(
+                "Ownership transfer needed for {} rate-limit keys",
+                affected_keys.len()
+            );
+
+            // Update membership to reflect node failures
+            self.update_rate_limit_membership();
+
+            // For each affected key, we may need to initialize counters if we're now an owner
+            for key in &affected_keys {
+                if self.stores.rate_limit.is_owner(key) {
+                    debug!("This node is now owner of rate-limit key: {}", key);
+                    // Counter will be created on first inc() call
+                }
+            }
+        }
+    }
+
+    /// Sync rate-limit counter increment (only if this node is an owner)
+    pub fn sync_rate_limit_inc(&self, key: String, delta: i64) {
+        if !self.stores.rate_limit.is_owner(&key) {
+            // Not an owner, skip
+            return;
+        }
+
+        self.stores
+            .rate_limit
+            .inc(key.clone(), self.self_name.clone(), delta);
+        debug!("Synced rate-limit increment: key={}, delta={}", key, delta);
+    }
+
+    /// Apply remote rate-limit counter update (merge CRDT)
+    pub fn apply_remote_rate_limit_counter(
+        &self,
+        key: String,
+        counter: &super::crdt::SyncPNCounter,
+    ) {
+        // Merge counter regardless of ownership (for CRDT consistency)
+        self.stores.rate_limit.merge_counter(key.clone(), counter);
+        debug!("Applied remote rate-limit counter update: key={}", key);
+    }
+
+    /// Get rate-limit value (aggregate from all owners)
+    pub fn get_rate_limit_value(&self, key: &str) -> Option<i64> {
+        self.stores.rate_limit.value(key)
     }
 }
 

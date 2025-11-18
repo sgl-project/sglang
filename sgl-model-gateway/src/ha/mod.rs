@@ -1,3 +1,4 @@
+pub mod consistent_hash;
 pub mod controller;
 pub mod crdt;
 pub mod endpoints;

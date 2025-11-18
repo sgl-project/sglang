@@ -739,11 +739,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
         // Create HA sync manager with stores
         use crate::ha::stores::StateStores;
-        let stores = Arc::new(StateStores::new());
+        let stores = Arc::new(StateStores::with_self_name(
+            ha_server_config.self_name.clone(),
+        ));
         let sync_manager = Some(Arc::new(HASyncManager::new(
-            stores,
+            stores.clone(),
             ha_server_config.self_name.clone(),
         )));
+
+        // Initialize rate-limit hash ring with current membership
+        sync_manager
+            .as_ref()
+            .unwrap()
+            .update_rate_limit_membership();
 
         (Some(Arc::new(handler)), sync_manager)
     } else {

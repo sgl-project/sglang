@@ -6,11 +6,16 @@
 //! - WorkerStore: Worker status, load, health
 //! - PolicyStore: Routing policy internal state
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
-use super::crdt::{SKey, SyncCRDTMap, SyncPNCounter};
+use super::{
+    consistent_hash::ConsistentHashRing,
+    crdt::{SKey, SyncCRDTMap, SyncPNCounter},
+};
 
 /// Store type identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -305,42 +310,124 @@ impl Default for PolicyStore {
     }
 }
 
-/// Rate-limit counter store (using PNCounter)
+/// Rate-limit counter store (using PNCounter with consistent hashing)
 #[derive(Debug, Clone)]
 pub struct RateLimitStore {
-    counters: BTreeMap<String, SyncPNCounter>, // key -> counter
+    counters: Arc<RwLock<BTreeMap<String, SyncPNCounter>>>, // key -> counter
+    hash_ring: Arc<RwLock<ConsistentHashRing>>,
+    self_name: String,
 }
 
 impl RateLimitStore {
-    pub fn new() -> Self {
+    pub fn new(self_name: String) -> Self {
         Self {
-            counters: BTreeMap::new(),
+            counters: Arc::new(RwLock::new(BTreeMap::new())),
+            hash_ring: Arc::new(RwLock::new(ConsistentHashRing::new())),
+            self_name,
         }
     }
 
-    pub fn get_or_create_counter(&mut self, key: String) -> &mut SyncPNCounter {
-        self.counters
+    /// Update the hash ring with current membership
+    pub fn update_membership(&self, nodes: &[String]) {
+        let mut ring = self.hash_ring.write();
+        ring.update_membership(nodes);
+        debug!("Updated rate-limit hash ring with {} nodes", nodes.len());
+    }
+
+    /// Check if this node is an owner of a key
+    pub fn is_owner(&self, key: &str) -> bool {
+        let ring = self.hash_ring.read();
+        ring.is_owner(key, &self.self_name)
+    }
+
+    /// Get owners for a key
+    pub fn get_owners(&self, key: &str) -> Vec<String> {
+        let ring = self.hash_ring.read();
+        ring.get_owners(key)
+    }
+
+    /// Get or create counter (only if this node is an owner)
+    fn get_or_create_counter_internal(&self, key: String) -> Option<SyncPNCounter> {
+        if !self.is_owner(&key) {
+            return None;
+        }
+
+        let mut counters = self.counters.write();
+        Some(
+            counters
+                .entry(key.clone())
+                .or_insert_with(SyncPNCounter::new)
+                .clone(),
+        )
+    }
+
+    pub fn get_counter(&self, key: &str) -> Option<SyncPNCounter> {
+        if !self.is_owner(key) {
+            return None;
+        }
+        let counters = self.counters.read();
+        counters.get(key).cloned()
+    }
+
+    /// Increment counter (only if this node is an owner)
+    pub fn inc(&self, key: String, actor: String, delta: i64) {
+        if !self.is_owner(&key) {
+            // Not an owner, skip
+            return;
+        }
+
+        let mut counters = self.counters.write();
+        let counter = counters
             .entry(key.clone())
-            .or_insert_with(SyncPNCounter::new)
-    }
-
-    pub fn get_counter(&self, key: &str) -> Option<&SyncPNCounter> {
-        self.counters.get(key)
-    }
-
-    pub fn inc(&mut self, key: String, actor: String, delta: i64) {
-        let counter = self.get_or_create_counter(key);
+            .or_insert_with(SyncPNCounter::new);
         counter.inc(actor, delta);
     }
 
+    /// Get counter value (aggregate from all owners via CRDT merge)
     pub fn value(&self, key: &str) -> Option<i64> {
-        self.counters.get(key).map(|c| c.value())
+        let counters = self.counters.read();
+        counters.get(key).map(|c| c.value())
+    }
+
+    /// Merge counter from another node (for CRDT synchronization)
+    pub fn merge_counter(&self, key: String, other: &SyncPNCounter) {
+        let mut counters = self.counters.write();
+        let counter = counters.entry(key).or_insert_with(SyncPNCounter::new);
+        // Get the inner CRDTPNCounter from other SyncPNCounter
+        let other_inner = other.snapshot();
+        counter.merge(&other_inner);
+    }
+
+    /// Get all counter keys
+    pub fn keys(&self) -> Vec<String> {
+        let counters = self.counters.read();
+        counters.keys().cloned().collect()
+    }
+
+    /// Check if we need to transfer ownership due to node failure
+    pub fn check_ownership_transfer(&self, failed_nodes: &[String]) -> Vec<String> {
+        let mut affected_keys = Vec::new();
+        let ring = self.hash_ring.read();
+        let counters = self.counters.read();
+
+        for key in counters.keys() {
+            let owners = ring.get_owners(key);
+            // Check if any owner has failed
+            if owners.iter().any(|owner| failed_nodes.contains(owner)) {
+                // Check if we are now an owner
+                if ring.is_owner(key, &self.self_name) {
+                    affected_keys.push(key.clone());
+                }
+            }
+        }
+
+        affected_keys
     }
 }
 
 impl Default for RateLimitStore {
     fn default() -> Self {
-        Self::new()
+        Self::new("default".to_string())
     }
 }
 
@@ -361,7 +448,17 @@ impl StateStores {
             app: AppStore::new(),
             worker: WorkerStore::new(),
             policy: PolicyStore::new(),
-            rate_limit: RateLimitStore::new(),
+            rate_limit: RateLimitStore::new("default".to_string()),
+        }
+    }
+
+    pub fn with_self_name(self_name: String) -> Self {
+        Self {
+            membership: MembershipStore::new(),
+            app: AppStore::new(),
+            worker: WorkerStore::new(),
+            policy: PolicyStore::new(),
+            rate_limit: RateLimitStore::new(self_name),
         }
     }
 }
