@@ -112,17 +112,26 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            full_graph = False
-            self.transformer = torch.compile(
-                self.transformer, mode="max-autotune", fullgraph=full_graph
+            try:
+                import torch._inductor.config as _inductor_cfg
+
+                _inductor_cfg.reorder_for_compute_comm_overlap = True
+            except Exception:
+                pass
+            mode = os.environ.get(
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
             )
-            self.transformer_2 = (
-                torch.compile(
-                    self.transformer_2, mode="max-autotune", fullgraph=full_graph
+            # Only compile when it's a module-like object (has forward). Wrap forward like xDiT.
+            if hasattr(self.transformer, "forward"):
+                compiled_forward = torch.compile(
+                    getattr(self.transformer, "forward"), mode=mode
                 )
-                if transformer_2 is not None
-                else None
-            )
+                setattr(self.transformer, "forward", compiled_forward)
+            if transformer_2 is not None and hasattr(self.transformer_2, "forward"):
+                compiled_forward_2 = torch.compile(
+                    getattr(self.transformer_2, "forward"), mode=mode
+                )
+                setattr(self.transformer_2, "forward", compiled_forward_2)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -197,10 +206,23 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
+            print(self.transformer.__class__.__name__)
+            if self.server_args.enable_torch_compile and hasattr(
+                self.transformer, "forward"
+            ):
+                try:
+                    import torch._inductor.config as _inductor_cfg
+
+                    _inductor_cfg.reorder_for_compute_comm_overlap = True
+                except Exception:
+                    pass
+                mode = os.environ.get(
+                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
                 )
+                compiled_forward = torch.compile(
+                    getattr(self.transformer, "forward"), mode=mode
+                )
+                setattr(self.transformer, "forward", compiled_forward)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
@@ -407,7 +429,7 @@ class DenoisingStage(PipelineStage):
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
+            getattr(self.transformer, "forward", self.transformer),
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
@@ -416,7 +438,7 @@ class DenoisingStage(PipelineStage):
         )
 
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
+            getattr(self.transformer, "forward", self.transformer),
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
@@ -431,7 +453,7 @@ class DenoisingStage(PipelineStage):
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
-                self.transformer.forward,
+                getattr(self.transformer, "forward", self.transformer),
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
@@ -924,9 +946,29 @@ class DenoisingStage(PipelineStage):
             The prepared kwargs.
         """
         extra_step_kwargs = {}
+        accepted_params: set[str] = set()
+        # Try to inspect the callable directly
+        try:
+            accepted_params |= set(inspect.signature(func).parameters.keys())
+        except Exception:
+            pass
+        # If it's a module-like object, also try its forward
+        try:
+            forward_fn = getattr(func, "forward", None)
+            if callable(forward_fn):
+                accepted_params |= set(inspect.signature(forward_fn).parameters.keys())
+        except Exception:
+            pass
+        # Fallback: if still empty, conservatively pass through known optional keys only
+        if not accepted_params:
+            accepted_params = {
+                "encoder_hidden_states_image",
+                "mask_strategy",
+                "encoder_hidden_states_2",
+                "encoder_attention_mask",
+            }
         for k, v in kwargs.items():
-            accepts = k in set(inspect.signature(func).parameters.keys())
-            if accepts:
+            if k in accepted_params:
                 extra_step_kwargs[k] = v
         return extra_step_kwargs
 
