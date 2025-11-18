@@ -779,10 +779,6 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_batch_scaling
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
       - name: Benchmark Embeddings online latency and throughput
         timeout-minutes: 10
         run: |
@@ -794,6 +790,11 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
+
+      - name: Cleanup logs directory
+        if: always()
+        run: |
+          rm -rf python/sglang/logs || true
 
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
