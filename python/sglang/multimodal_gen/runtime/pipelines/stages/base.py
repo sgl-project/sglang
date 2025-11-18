@@ -187,7 +187,7 @@ class PipelineStage(ABC):
         # Execute the actual stage logic
         logging_info = getattr(batch, "logging_info", None)
 
-        if envs.SGL_DIFFUSION_STAGE_LOGGING:
+        if envs.SGLANG_DIFFUSION_STAGE_LOGGING:
             logger.info("[%s] Starting execution", stage_name)
             start_time = time.perf_counter()
 

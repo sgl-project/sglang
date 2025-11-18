@@ -30,6 +30,7 @@ def get_diffusion_perf_log_dir() -> str:
     if log_dir is None:
         # Not set, use default
         sglang_path = Path(sglang.__file__).resolve()
+        # .gitignore
         target_path = (sglang_path.parent / "../../.cache/logs").resolve()
         return str(target_path)
     # Is set, but is an empty string

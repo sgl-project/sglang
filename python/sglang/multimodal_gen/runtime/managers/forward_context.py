@@ -19,11 +19,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # TODO(will): check if this is needed
-# track_batchsize: bool = envs.SGL_DIFFUSION_LOG_BATCHSIZE_INTERVAL >= 0
+# track_batchsize: bool = envs.SGLANG_DIFFUSION_LOG_BATCHSIZE_INTERVAL >= 0
 track_batchsize: bool = False
 last_logging_time: float = 0
 forward_start_time: float = 0
-# batchsize_logging_interval: float = envs.SGL_DIFFUSION_LOG_BATCHSIZE_INTERVAL
+# batchsize_logging_interval: float = envs.SGLANG_DIFFUSION_LOG_BATCHSIZE_INTERVAL
 batchsize_logging_interval: float = 1000
 batchsize_forward_time: defaultdict = defaultdict(list)
 

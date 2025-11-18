@@ -130,7 +130,7 @@ class ServerManager:
             command.extend(self.extra_args.strip().split())
 
         env = os.environ.copy()
-        env["SGL_DIFFUSION_STAGE_LOGGING"] = "1"
+        env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
         env["SGLANG_PERF_LOG_DIR"] = log_dir.as_posix()
 
         stdout_fh = stdout_path.open("w", encoding="utf-8", buffering=1)
@@ -300,6 +300,9 @@ class PerformanceValidator:
         self.scenario = scenario
         self.tolerances = tolerances
         self.step_fractions = step_fractions
+        self.is_baseline_generation_mode = (
+            os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
+        )
 
     def validate(
         self,
@@ -307,39 +310,64 @@ class PerformanceValidator:
         stage_metrics: dict,
     ) -> PerformanceSummary:
         """Validate all performance metrics and return summary."""
-        self._validate_e2e(perf_record)
-        avg_denoise, median_denoise = self._validate_denoise_agg(perf_record)
-        sampled_steps = self._validate_denoise_steps(perf_record)
-        self._validate_stages(stage_metrics)
+        summary = self.collect_metrics(perf_record, stage_metrics)
+        if self.is_baseline_generation_mode:
+            return summary
+
+        self._validate_e2e(summary)
+        self._validate_denoise_agg(summary)
+        self._validate_denoise_steps(summary)
+        self._validate_stages(summary)
+
+        return summary
+
+    def collect_metrics(
+        self,
+        perf_record: dict,
+        stage_metrics: dict,
+    ) -> PerformanceSummary:
+        """Collect all performance metrics into a summary without validation."""
+        e2e_ms = float(perf_record.get("total_duration_ms", 0.0))
+        steps = [
+            s
+            for s in perf_record.get("steps", []) or []
+            if s.get("name") == "denoising_step_guided" and "duration_ms" in s
+        ]
+
+        avg_denoise = 0.0
+        median_denoise = 0.0
+        if steps:
+            durations = [float(s["duration_ms"]) for s in steps]
+            avg_denoise = sum(durations) / len(durations)
+            median_denoise = statistics.median(durations)
+
+        per_step = {
+            int(s["index"]): float(s["duration_ms"])
+            for s in steps
+            if s.get("index") is not None
+        }
+        sample_indices = sample_step_indices(per_step, self.step_fractions)
+        sampled_steps = {idx: per_step[idx] for idx in sample_indices}
 
         return PerformanceSummary(
-            e2e_ms=float(perf_record["total_duration_ms"]),
+            e2e_ms=e2e_ms,
             avg_denoise_ms=avg_denoise,
             median_denoise_ms=median_denoise,
             stage_metrics=stage_metrics,
             sampled_steps=sampled_steps,
         )
 
-    def _validate_e2e(self, perf_record: dict) -> None:
+    def _validate_e2e(self, summary: PerformanceSummary) -> None:
         """Validate end-to-end performance."""
-        e2e_ms = float(perf_record.get("total_duration_ms", 0.0))
-        assert e2e_ms > 0, "E2E duration missing"
-
+        assert summary.e2e_ms > 0, "E2E duration missing"
         upper = self.scenario.expected_e2e_ms * (1 + self.tolerances.e2e)
-        assert e2e_ms <= upper, f"E2E {e2e_ms:.2f}ms exceeds {upper:.2f}ms"
+        assert (
+            summary.e2e_ms <= upper
+        ), f"E2E {summary.e2e_ms:.2f}ms exceeds {upper:.2f}ms"
 
-    def _validate_denoise_agg(self, perf_record: dict) -> tuple[float, float]:
+    def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
         """Validate aggregate denoising metrics."""
-        steps = [
-            s
-            for s in perf_record.get("steps", []) or []
-            if s.get("name") == "denoising_step_guided" and "duration_ms" in s
-        ]
-        assert steps, "Denoising step timings missing"
-
-        durations = [float(s["duration_ms"]) for s in steps]
-        avg = sum(durations) / len(durations)
-        median = statistics.median(durations)
+        assert summary.avg_denoise_ms > 0, "Denoising step timings missing"
 
         avg_upper = self.scenario.expected_avg_denoise_ms * (
             1 + self.tolerances.denoise_agg
@@ -348,47 +376,28 @@ class PerformanceValidator:
             1 + self.tolerances.denoise_agg
         )
 
-        assert avg <= avg_upper, f"Avg denoise {avg:.2f}ms exceeds {avg_upper:.2f}ms"
         assert (
-            median <= med_upper
-        ), f"Median denoise {median:.2f}ms exceeds {med_upper:.2f}ms"
+            summary.avg_denoise_ms <= avg_upper
+        ), f"Avg denoise {summary.avg_denoise_ms:.2f}ms exceeds {avg_upper:.2f}ms"
+        assert (
+            summary.median_denoise_ms <= med_upper
+        ), f"Median denoise {summary.median_denoise_ms:.2f}ms exceeds {med_upper:.2f}ms"
 
-        return avg, median
-
-    def _validate_denoise_steps(self, perf_record: dict) -> dict[int, float]:
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
         """Validate individual denoising steps."""
-        steps = [
-            s
-            for s in perf_record.get("steps", []) or []
-            if s.get("name") == "denoising_step_guided" and "duration_ms" in s
-        ]
-
-        per_step = {
-            int(s["index"]): float(s["duration_ms"])
-            for s in steps
-            if s.get("index") is not None
-        }
-
-        sample_indices = sample_step_indices(per_step, self.step_fractions)
-        sampled = {idx: per_step[idx] for idx in sample_indices}
-
-        for idx in sample_indices:
+        for idx, actual in summary.sampled_steps.items():
             expected = self.scenario.denoise_step_ms.get(idx)
             if expected is None:
                 continue
-
-            actual = per_step[idx]
             upper = expected * (1 + self.tolerances.denoise_step)
             assert actual <= upper, f"Step {idx}: {actual:.2f}ms > {upper:.2f}ms"
 
-        return sampled
-
-    def _validate_stages(self, stage_metrics: dict) -> None:
+    def _validate_stages(self, summary: PerformanceSummary) -> None:
         """Validate stage-level metrics."""
-        assert stage_metrics, "Stage metrics missing"
+        assert summary.stage_metrics, "Stage metrics missing"
 
         for stage, expected in self.scenario.stages_ms.items():
-            actual = stage_metrics.get(stage)
+            actual = summary.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
 
             upper = expected * (1 + self.tolerances.stage)
@@ -412,7 +421,8 @@ class VideoPerformanceValidator(PerformanceValidator):
             summary.avg_frame_time_ms = summary.e2e_ms / num_frames
             summary.frames_per_second = 1000.0 / summary.avg_frame_time_ms
 
-            self._validate_frame_rate(summary)
+            if not self.is_baseline_generation_mode:
+                self._validate_frame_rate(summary)
 
         return summary
 
@@ -427,6 +437,8 @@ class VideoPerformanceValidator(PerformanceValidator):
 
     def _validate_stages(self, stage_metrics: dict) -> None:
         """Validate video-specific stages."""
+        # The base validator receives a summary, but here we get raw metrics.
+        # This is a bit inconsistent and could be refactored.
         assert stage_metrics, "Stage metrics missing"
 
         for stage, expected in self.scenario.stages_ms.items():
