@@ -39,5 +39,6 @@ class TestTritonDeterministic(TestDeterministicBase):
         args.extend(["--attention-backend", "triton", "--tp", "4"])
         return args
 
+
 if __name__ == "__main__":
     unittest.main()
