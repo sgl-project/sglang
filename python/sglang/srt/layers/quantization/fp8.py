@@ -16,23 +16,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
-    )
-
-    MARLIN_FP8_AVAILABLE = True
-except ImportError:
-    MARLIN_FP8_AVAILABLE = False
-
-    def dummy_func(*args, **kwargs):
-        raise ImportError(
-            "marlin FP8 requires some operators from vllm. Please install vllm."
-        )
-
-    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
-
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
