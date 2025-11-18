@@ -773,11 +773,12 @@ class ForwardBatch:
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
+        self.use_pin_memory = not _is_cpu
         global_num_tokens_pinned = torch.tensor(
-            global_num_tokens, pin_memory=not _is_cpu
+            global_num_tokens, pin_memory=self.use_pin_memory
         )
         self.global_num_tokens_gpu.copy_(
-            global_num_tokens_pinned, non_blocking=not _is_cpu
+            global_num_tokens_pinned, non_blocking=self.use_pin_memory
         )
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):

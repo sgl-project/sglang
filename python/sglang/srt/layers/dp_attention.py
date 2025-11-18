@@ -464,11 +464,11 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+memcpy_func = memcpy_cpu if _is_cpu else memcpy_triton
+
+
 def memcpy(dst, src, dim, offset, sz, offset_src):
-    if _is_cpu:
-        memcpy_cpu(dst, src, dim, offset, sz, offset_src)
-    else:
-        memcpy_triton(dst, src, dim, offset, sz, offset_src)
+    memcpy_func(dst, src, dim, offset, sz, offset_src)
 
 
 def _dp_gather_via_all_reduce(
