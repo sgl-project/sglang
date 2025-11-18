@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
-from typing import Dict, List
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
 import requests
 
@@ -25,6 +27,33 @@ class SGLangCIAnalyzer:
         }
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+
+        # Nightly workflow files to monitor
+        self.nightly_workflows = [
+            "nightly-test.yml",
+            "nightly-test-nvidia.yml",
+            "nightly-test-amd.yml",
+            "nightly-test-intel.yml",
+        ]
+
+        # Performance metric patterns for parsing logs
+        self.perf_patterns = {
+            "output_throughput": re.compile(
+                r"Output token throughput \(tok/s\):\s*([\d.]+)"
+            ),
+            "input_throughput": re.compile(
+                r"Input token throughput \(tok/s\):\s*([\d.]+)"
+            ),
+            "latency": re.compile(r"Median E2E Latency \(ms\):\s*([\d.]+)"),
+            "ttft": re.compile(r"Median TTFT \(ms\):\s*([\d.]+)"),
+            "accept_length": re.compile(r"Accept length:\s*([\d.]+)"),
+            "accuracy": re.compile(r"Accuracy:\s*([\d.]+)"),
+            "gsm8k_score": re.compile(r"GSM8K Score:\s*([\d.]+)"),
+        }
+
+        # Historical data repository
+        self.data_repo = "sglang-bot/sglang-ci-data"
+        self.data_branch = "main"
 
     def get_recent_runs(self, limit: int = 100, branch: str = None) -> List[Dict]:
         branch_info = f" from branch '{branch}'" if branch else ""
@@ -542,20 +571,397 @@ class SGLangCIAnalyzer:
         except Exception as e:
             print(f"Failed to generate GitHub Actions summary: {e}")
 
+    def get_nightly_runs(self, days: int = 7) -> List[Dict]:
+        """Get nightly test workflow runs from the last N days"""
+        print(f"Fetching nightly test runs from the last {days} days...")
+
+        since_date = (datetime.now() - timedelta(days=days)).isoformat()
+        all_runs = []
+
+        for workflow_file in self.nightly_workflows:
+            print(f"  Fetching from {workflow_file}...")
+            page = 1
+            per_page = 100
+            workflow_runs = []
+
+            while True:
+                url = f"{self.base_url}/repos/{self.repo}/actions/runs"
+                params = {
+                    "workflow_id": workflow_file,
+                    "per_page": per_page,
+                    "page": page,
+                    "created": f">={since_date}",
+                }
+
+                try:
+                    response = self.session.get(url, params=params)
+                    response.raise_for_status()
+                    data = response.json()
+
+                    if not data.get("workflow_runs"):
+                        break
+
+                    runs = data["workflow_runs"]
+                    workflow_runs.extend(runs)
+
+                    if len(runs) < per_page:
+                        break
+
+                    page += 1
+                    time.sleep(0.1)
+
+                except requests.exceptions.RequestException as e:
+                    print(f"    Warning: Error fetching from {workflow_file}: {e}")
+                    break
+
+            print(f"    Fetched {len(workflow_runs)} runs from {workflow_file}")
+            all_runs.extend(workflow_runs)
+
+        print(f"Total nightly runs fetched: {len(all_runs)}")
+        return all_runs
+
+    def get_job_logs(self, job_id: int) -> Optional[str]:
+        """Get logs for a specific job"""
+        url = f"{self.base_url}/repos/{self.repo}/actions/jobs/{job_id}/logs"
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.RequestException as e:
+            print(f"  Warning: Could not fetch logs for job {job_id}: {e}")
+            return None
+
+    def parse_metrics_from_logs(self, logs: str, job_name: str) -> Dict[str, List[float]]:
+        """Parse performance metrics from job logs"""
+        metrics = defaultdict(list)
+
+        if not logs:
+            return metrics
+
+        for line in logs.split("\n"):
+            for metric_name, pattern in self.perf_patterns.items():
+                match = pattern.search(line)
+                if match:
+                    try:
+                        value = float(match.group(1))
+                        metrics[metric_name].append(value)
+                    except (ValueError, IndexError):
+                        continue
+
+        return dict(metrics)
+
+    def analyze_nightly_with_metrics(self, runs: List[Dict]) -> Dict:
+        """Analyze nightly test runs including performance metrics"""
+        print("Analyzing nightly test data with performance metrics...")
+
+        # Get nightly job names from the existing job categories
+        nightly_jobs = [
+            # New NVIDIA job names (nightly-test-nvidia.yml)
+            "nightly-test-general-1-gpu-runner",
+            "nightly-test-general-4-gpu-h100",
+            "nightly-test-general-8-gpu-h200",
+            "nightly-test-general-8-gpu-h20",
+            "nightly-test-text-accuracy-2-gpu-runner",
+            "nightly-test-text-perf-2-gpu-runner",
+            "nightly-test-vlm-accuracy-2-gpu-runner",
+            "nightly-test-vlm-perf-2-gpu-runner",
+            "nightly-test-perf-4-gpu-b200",
+            "nightly-test-perf-8-gpu-b200",
+            # AMD job names (nightly-test-amd.yml)
+            "nightly-test",
+            # Intel job names (nightly-test-intel.yml)
+            "placeholder",
+            # Old job names (kept for backwards compatibility)
+            "nightly-test-eval-text-models",
+            "nightly-test-perf-text-models",
+            "nightly-test-eval-vlms",
+            "nightly-test-perf-vlms",
+            "nightly-test-1-gpu",
+            "nightly-test-4-gpu",
+            "nightly-test-8-gpu-h200",
+            "nightly-test-8-gpu-h20",
+            "nightly-test-4-gpu-b200",
+            "nightly-test-8-gpu-b200",
+        ]
+
+        stats = {
+            "total_runs": len(runs),
+            "successful_runs": 0,
+            "failed_runs": 0,
+            "cancelled_runs": 0,
+            "job_stats": defaultdict(
+                lambda: {
+                    "total": 0,
+                    "success": 0,
+                    "failure": 0,
+                    "recent_failures": [],
+                    "avg_duration_minutes": 0,
+                    "durations": [],
+                    "performance_metrics": defaultdict(list),
+                }
+            ),
+            "daily_stats": defaultdict(
+                lambda: {
+                    "total": 0,
+                    "success": 0,
+                    "failure": 0,
+                }
+            ),
+        }
+
+        for i, run in enumerate(runs, 1):
+            if i % 10 == 0:
+                print(f"Processed {i}/{len(runs)} runs...")
+
+            run_status = run.get("conclusion", "unknown")
+            run_id = run.get("id")
+            run_number = run.get("run_number")
+            created_at = run.get("created_at")
+            run_url = f"https://github.com/{self.repo}/actions/runs/{run_id}"
+
+            # Track daily stats
+            date_str = created_at.split("T")[0] if created_at else "unknown"
+            stats["daily_stats"][date_str]["total"] += 1
+
+            if run_status == "success":
+                stats["successful_runs"] += 1
+                stats["daily_stats"][date_str]["success"] += 1
+            elif run_status == "failure":
+                stats["failed_runs"] += 1
+                stats["daily_stats"][date_str]["failure"] += 1
+            elif run_status == "cancelled":
+                stats["cancelled_runs"] += 1
+
+            # Analyze individual jobs
+            jobs = self._get_job_details(run_id)
+            for job in jobs:
+                job_name = job.get("name", "Unknown")
+                job_conclusion = job.get("conclusion", "unknown")
+                job_id = job.get("id")
+                started_at = job.get("started_at")
+                completed_at = job.get("completed_at")
+
+                # Only track nightly test jobs
+                if job_name not in nightly_jobs:
+                    continue
+
+                job_stat = stats["job_stats"][job_name]
+                job_stat["total"] += 1
+
+                if job_conclusion == "success":
+                    job_stat["success"] += 1
+
+                    # For successful performance/accuracy jobs, fetch metrics
+                    if "perf" in job_name.lower() or "accuracy" in job_name.lower() or "eval" in job_name.lower():
+                        logs = self.get_job_logs(job_id)
+                        if logs:
+                            metrics = self.parse_metrics_from_logs(logs, job_name)
+                            for metric_name, values in metrics.items():
+                                if values:
+                                    job_stat["performance_metrics"][metric_name].extend(
+                                        [
+                                            {
+                                                "value": v,
+                                                "timestamp": created_at,
+                                                "run_id": run_id,
+                                                "job_name": job_name,
+                                            }
+                                            for v in values
+                                        ]
+                                    )
+
+                elif job_conclusion == "failure":
+                    job_stat["failure"] += 1
+
+                    if len(job_stat["recent_failures"]) < 5:
+                        job_stat["recent_failures"].append(
+                            {
+                                "run_url": run_url,
+                                "run_number": run_number,
+                                "created_at": created_at,
+                                "job_url": job.get("html_url"),
+                            }
+                        )
+
+                # Track duration
+                if started_at and completed_at:
+                    try:
+                        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                        end = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+                        duration_minutes = (end - start).total_seconds() / 60
+                        job_stat["durations"].append(duration_minutes)
+                    except:
+                        pass
+
+            time.sleep(0.1)
+
+        # Calculate average durations
+        for job_name, job_stat in stats["job_stats"].items():
+            if job_stat["durations"]:
+                job_stat["avg_duration_minutes"] = sum(job_stat["durations"]) / len(
+                    job_stat["durations"]
+                )
+                del job_stat["durations"]
+
+        return stats
+
+    def generate_nightly_report(self, stats: Dict, output_file: str = None):
+        """Generate a report for nightly test analysis"""
+        print("\n" + "=" * 80)
+        print("NIGHTLY TEST MONITOR REPORT")
+        print("=" * 80)
+        print(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Total Runs Analyzed: {stats['total_runs']}")
+        print(
+            f"Successful: {stats['successful_runs']} "
+            f"({stats['successful_runs']/max(1, stats['total_runs'])*100:.1f}%)"
+        )
+        print(
+            f"Failed: {stats['failed_runs']} "
+            f"({stats['failed_runs']/max(1, stats['total_runs'])*100:.1f}%)"
+        )
+        print(f"Cancelled: {stats['cancelled_runs']}")
+        print("=" * 80)
+
+        # Daily trend
+        print("\nDAILY TRENDS:")
+        print("-" * 80)
+        daily_stats = sorted(stats["daily_stats"].items(), reverse=True)[:7]
+        for date, day_stats in daily_stats:
+            success_rate = (day_stats["success"] / max(1, day_stats["total"])) * 100
+            print(
+                f"{date}: {day_stats['total']} runs, {day_stats['success']} success "
+                f"({success_rate:.1f}%), {day_stats['failure']} failed"
+            )
+
+        # Job statistics
+        print("\nJOB STATISTICS:")
+        print("-" * 80)
+        print(
+            f"{'Job Name':<50} {'Total':<8} {'Success':<8} {'Failed':<8} "
+            f"{'Rate':<8} {'Avg Duration'}"
+        )
+        print("-" * 80)
+
+        job_stats_sorted = sorted(
+            stats["job_stats"].items(), key=lambda x: x[1]["failure"], reverse=True
+        )
+
+        for job_name, job_stat in job_stats_sorted:
+            total = job_stat["total"]
+            success = job_stat["success"]
+            failure = job_stat["failure"]
+            success_rate = (success / max(1, total)) * 100
+            avg_duration = job_stat["avg_duration_minutes"]
+
+            print(
+                f"{job_name:<50} {total:<8} {success:<8} {failure:<8} "
+                f"{success_rate:>6.1f}% {avg_duration:>7.1f}m"
+            )
+
+            # Show performance metrics if available
+            if job_stat.get("performance_metrics"):
+                perf_metrics = job_stat["performance_metrics"]
+                print(f"  Performance metrics:")
+
+                for metric_name, metric_data in perf_metrics.items():
+                    if metric_data:
+                        values = [m["value"] for m in metric_data]
+                        avg_value = sum(values) / len(values)
+                        print(f"    - {metric_name}: {avg_value:.2f} (n={len(values)})")
+
+            # Show recent failures
+            if job_stat["recent_failures"]:
+                print(f"  Recent failures:")
+                for failure in job_stat["recent_failures"][:3]:
+                    print(f"    - Run #{failure['run_number']}: {failure['run_url']}")
+
+        print("=" * 80)
+
+        # Save to file if requested
+        if output_file:
+            with open(output_file, "w") as f:
+                json.dump(stats, f, indent=2, default=str)
+            print(f"\nDetailed stats saved to: {output_file}")
+
+    def detect_nightly_regressions(self, stats: Dict) -> List[Dict]:
+        """Detect regressions in nightly tests"""
+        regressions = []
+
+        for job_name, job_stat in stats["job_stats"].items():
+            total = job_stat["total"]
+            failure = job_stat["failure"]
+
+            if total > 0:
+                failure_rate = (failure / total) * 100
+
+                # Flag jobs with high failure rates
+                if failure_rate > 30:
+                    regressions.append(
+                        {
+                            "job_name": job_name,
+                            "type": "high_failure_rate",
+                            "failure_rate": failure_rate,
+                            "total_runs": total,
+                            "failures": failure,
+                        }
+                    )
+
+                # Flag jobs with recent consecutive failures
+                recent_failures = len(job_stat["recent_failures"])
+                if recent_failures >= 3:
+                    regressions.append(
+                        {
+                            "job_name": job_name,
+                            "type": "consecutive_failures",
+                            "recent_failure_count": recent_failures,
+                        }
+                    )
+
+        if regressions:
+            print("\n" + "=" * 80)
+            print("REGRESSIONS DETECTED:")
+            print("=" * 80)
+            for regression in regressions:
+                print(f"\nJob: {regression['job_name']}")
+                if regression["type"] == "high_failure_rate":
+                    print(
+                        f"  High failure rate: {regression['failure_rate']:.1f}% "
+                        f"({regression['failures']}/{regression['total_runs']})"
+                    )
+                elif regression["type"] == "consecutive_failures":
+                    print(
+                        f"  {regression['recent_failure_count']} recent consecutive failures"
+                    )
+            print("=" * 80)
+
+        return regressions
+
 
 def main():
     parser = argparse.ArgumentParser(description="SGLang CI Analyzer")
     parser.add_argument("--token", required=True, help="GitHub Personal Access Token")
     parser.add_argument(
+        "--mode",
+        choices=["ci", "nightly"],
+        default="ci",
+        help="Analysis mode: 'ci' for general CI analysis, 'nightly' for nightly test monitoring (default: ci)",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=100,
-        help="Number of runs to analyze (default: 100)",
+        help="Number of runs to analyze (for ci mode, default: 100)",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Number of days to analyze (for nightly mode, default: 7)",
     )
     parser.add_argument(
         "--output",
-        default="ci_analysis.json",
-        help="Output file (default: ci_analysis.json)",
+        help="Output file for detailed stats (JSON)",
     )
     parser.add_argument(
         "--branch",
@@ -568,20 +974,40 @@ def main():
     analyzer = SGLangCIAnalyzer(args.token)
 
     try:
-        branch = args.branch if args.branch else None
-        runs = analyzer.get_recent_runs(args.limit, branch)
+        if args.mode == "nightly":
+            # Nightly test monitoring mode
+            runs = analyzer.get_nightly_runs(days=args.days)
 
-        if not runs:
-            print("No CI run data found")
-            return
+            if not runs:
+                print("No nightly test runs found in the specified time period.")
+                sys.exit(1)
 
-        stats = analyzer.analyze_ci_failures(runs)
+            stats = analyzer.analyze_nightly_with_metrics(runs)
+            analyzer.generate_nightly_report(stats, args.output)
+            regressions = analyzer.detect_nightly_regressions(stats)
 
-        analyzer.generate_report(stats)
+            # Exit with error code if regressions detected
+            if regressions:
+                sys.exit(1)
+            else:
+                print("\n✓ No significant regressions detected")
+                sys.exit(0)
 
-        analyzer.save_detailed_report(stats, args.output)
+        else:
+            # Regular CI analysis mode
+            branch = args.branch if args.branch else None
+            runs = analyzer.get_recent_runs(args.limit, branch)
 
-        analyzer.generate_github_summary(stats)
+            if not runs:
+                print("No CI run data found")
+                return
+
+            stats = analyzer.analyze_ci_failures(runs)
+            analyzer.generate_report(stats)
+
+            output_file = args.output or "ci_analysis.json"
+            analyzer.save_detailed_report(stats, output_file)
+            analyzer.generate_github_summary(stats)
 
     except Exception as e:
         print(f"Error during analysis: {e}")

@@ -46,8 +46,9 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           cd scripts/ci_monitor
-          python nightly_monitor.py \
+          python ci_analyzer.py \
             --token $GITHUB_TOKEN \
+            --mode nightly \
             --days ${{ inputs.days || '7' }} \
             --output nightly_monitor_$(date +%Y%m%d_%H%M%S).json
         continue-on-error: true
