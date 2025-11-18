@@ -39,6 +39,7 @@
 /sgl-model-gateway/src/core @slin1237
 /sgl-model-gateway/src/data_connector @key4ng
 /sgl-model-gateway/src/grpc_client @CatherineSue @slin1237
+/sgl-model-gateway/src/ha @tonyluj @llfl
 /sgl-model-gateway/src/mcp @key4ng @slin1237
 /sgl-model-gateway/src/policies @slin1237 @ByronHsu
 /sgl-model-gateway/src/proto @CatherineSue @slin1237
