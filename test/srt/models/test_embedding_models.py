@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 
 if is_npu():
     MODELS = [
-        ("Alibaba-NLP/gte_Qwen2-1.5B-instruct", 1, 1e-5),
+        ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
         ("Qwen/Qwen3-Embedding-8B", 1, 1e-5),
     ]
 else:
