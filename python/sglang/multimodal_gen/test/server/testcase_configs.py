@@ -11,7 +11,7 @@ pytest python/sglang/multimodal_gen/test/server/test_server_performance.py -k qw
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_performance.py -k my_new_test_case_id`
-3.
+3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
 
 """
@@ -99,27 +99,30 @@ class DiffusionTestCase:
     model_path: str  # HF repo or local path
     scenario_name: str  # key into BASELINE_CONFIG.scenarios
     modality: str = "image"  # "image" or "video" or "3d"
-    prompt: str | None = None  # text prompt for generation
     output_size: str = "1024x1024"  # output image dimensions (or video resolution)
+
+    # inputs and conditioning
+    prompt: str | None = None  # text prompt for generation
+    edit_prompt: str | None = None  # prompt for editing
+    image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+
+    # duration
+    seconds: int = 4  # for video: duration in seconds
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
+
     warmup_text: int = 1  # number of text-to-image/video warmups
     warmup_edit: int = 0  # number of image/video-edit warmups
-    image_edit_prompt: str | None = None  # prompt for editing
-    image_edit_path: Path | str | None = (
-        None  # input image/video for editing (Path or URL)
-    )
     startup_grace_seconds: float = 0.0  # wait time after server starts
     custom_validator: str | None = None  # optional custom validator name
-    seconds: int = 4  # for video: duration in seconds
 
     def is_image_url(self) -> bool:
         """Check if image_edit_path is a URL."""
-        if self.image_edit_path is None:
+        if self.image_path is None:
             return False
-        return isinstance(self.image_edit_path, str) and (
-            self.image_edit_path.startswith("http://")
-            or self.image_edit_path.startswith("https://")
+        return isinstance(self.image_path, str) and (
+            self.image_path.startswith("http://")
+            or self.image_path.startswith("https://")
         )
 
 
@@ -176,8 +179,8 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         output_size="1024x1536",
         warmup_text=0,
         warmup_edit=1,
-        image_edit_prompt="Convert 2D style to 3D style",
-        image_edit_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        edit_prompt="Convert 2D style to 3D style",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         startup_grace_seconds=30.0,
     ),
     # === Text to Video (T2V) ===
@@ -204,46 +207,59 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         warmup_text=0,  # warmups only for image gen models
         warmup_edit=0,
         output_size="832x1104",
-        image_edit_prompt="generate",
-        image_edit_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
+        edit_prompt="generate",
+        image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
         startup_grace_seconds=30.0,
         custom_validator="video",
         seconds=1,
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
-        id="wan2_2_ti2v_5b",
-        model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        scenario_name="text_image_to_video",
-        modality="video",
-        prompt="Animate this image",
-        output_size="832x1104",
-        warmup_text=0,  # warmups only for image gen models
-        warmup_edit=0,
-        image_edit_prompt="Add dynamic motion to the scene",
-        image_edit_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        startup_grace_seconds=30.0,
-        custom_validator="video",
-        seconds=4,
-    ),
-    DiffusionTestCase(
         id="wan2_1_i2v_14b_480P",
         model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-        scenario_name="text_image_to_video",
+        scenario_name="wan2_1_i2v_14b_480P",
+        output_size="832x1104",
         modality="video",
         prompt="Animate this image",
-        output_size="832x1104",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         warmup_text=0,  # warmups only for image gen models
         warmup_edit=0,
-        image_edit_prompt="Add dynamic motion to the scene",
-        image_edit_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         startup_grace_seconds=30.0,
         custom_validator="video",
         seconds=1,
     ),
-    # TODO: should we add `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` too?
+    DiffusionTestCase(
+        id="wan2_2_i2v_14b_720P",
+        model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        scenario_name="wan2_2_i2v_14b_720P",
+        modality="video",
+        prompt="Animate this image",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        output_size="832x1104",
+        warmup_text=0,  # warmups only for image gen models
+        warmup_edit=0,
+        startup_grace_seconds=30.0,
+        custom_validator="video",
+        seconds=1,
+    ),
+    DiffusionTestCase(
+        id="wan2_2_ti2v_5b",
+        model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        scenario_name="wan2_2_ti2v_5b",
+        modality="video",
+        output_size="832x1104",
+        prompt="Animate this image",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        warmup_text=0,  # warmups only for image gen models
+        warmup_edit=0,
+        startup_grace_seconds=30.0,
+        custom_validator="video",
+        seconds=1,
+    ),
 ]
-
 
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
