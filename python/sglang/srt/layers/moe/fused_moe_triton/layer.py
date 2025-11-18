@@ -955,11 +955,12 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+    def run_moe_core(self, dispatch_output: DispatchOutput, **kwargs) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
+            **kwargs
         )
 
     @classmethod

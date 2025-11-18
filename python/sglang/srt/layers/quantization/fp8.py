@@ -16,10 +16,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig, PeoMoeRunner
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import get_moe_runner_backend, is_peo_enabled
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -183,7 +183,10 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            return Fp8MoEMethod(self)
+            if is_peo_enabled():
+                return PeoFp8MoEMethod(self)
+            else:
+                return Fp8MoEMethod(self)
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
         return None
@@ -1496,6 +1499,197 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     expert_mask=layer.expert_mask_gpu,
                 )
         return None
+
+
+class PeoFp8MoEMethod(Fp8MoEMethod):
+    """MoE method for FP8.
+    Supports loading FP8 checkpoints with static weight scale and
+    dynamic/static activation scale.
+
+    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
+    activation scaling. The weight scaling factor will be initialized after
+    the model weights are loaded.
+
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __init__(self, quant_config: Fp8Config):
+        super().__init__(quant_config)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
+
+        if moe_runner_backend.is_auto():
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            ):
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            else:
+                moe_runner_backend = MoeRunnerBackend.TRITON
+        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
+            if is_peo_enabled():
+                self.runner = PeoMoeRunner(moe_runner_backend, moe_runner_config)
+            else:
+                self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO(cwan): refactor other backends
+            pass
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: DispatchOutput,
+        start_idx: int,
+        end_idx: int,
+    ) -> CombineInput:
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        moe_runner_config = self.moe_runner_config
+
+        if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            x, topk_weights = apply_topk_weights_cpu(
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
+            )
+
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                True,  # use_fp8_w8a16
+                layer.w13_weight_scale_inv,  # w1_scale
+                layer.w2_weight_scale_inv,  # w2_scale
+                self.quant_config.weight_block_size,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        if _is_hip:
+            ret = self.maybe_apply_hip_fused_experts(
+                layer,
+                x,
+                dispatch_output.topk_output,
+                moe_runner_config.activation,
+                moe_runner_config.no_combine,
+            )
+            if ret is not None:
+                return StandardCombineInput(hidden_states=ret)
+
+        if get_moe_runner_backend().is_cutlass():
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty_like(x)
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            output = cutlass_fused_experts_fp8(
+                x,
+                layer.w13_weight.transpose(1, 2),
+                layer.w2_weight.transpose(1, 2),
+                layer.w13_weight_scale_inv.transpose(1, 2),
+                layer.w2_weight_scale_inv.transpose(1, 2),
+                topk_weights,
+                topk_ids,
+                self.ab_strides1,
+                self.c_strides1,
+                self.ab_strides2,
+                self.c_strides2,
+                self.workspace,
+                self.a_ptr,
+                self.b_ptr,
+                self.out_ptr,
+                self.a_scales_ptr,
+                self.b_scales_ptr,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                use_fp8_blockscale=True,
+                output=symm_output,
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        if self.runner.runner_backend.is_deep_gemm():
+
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
+            if self.block_quant:
+                block_shape = self.quant_config.weight_block_size
+                w13_scale = layer.w13_weight_scale_inv
+                w2_scale = layer.w2_weight_scale_inv
+            else:
+                # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
+                scale_block_size = 128
+                block_shape = [scale_block_size, scale_block_size]
+                w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+                w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+                w13_scale = (
+                    layer.w13_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w13_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w13_scale_k, dim=2)
+                )
+                w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+                w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+                w2_scale = (
+                    layer.w2_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w2_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w2_scale_k, dim=2)
+                )
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=True,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                block_shape=block_shape,
+            )
+        elif self.runner.runner_backend.is_triton():
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8_w8a8=True,
+                w13_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.quant_config.weight_block_size,
+            )
+        else:
+            raise NotImplementedError(
+                "Unsupported runner backend: %s" % self.runner.runner_backend
+            )
+
+        return self.runner.run(dispatch_output, quant_info, start_idx, end_idx)
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
