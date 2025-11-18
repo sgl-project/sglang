@@ -792,7 +792,6 @@ def invoke_fused_moe_kernel(
             filter_expert=filter_expert,
             **config,
         )
-
 from typing import Dict, Any
 import json
 import pathlib
@@ -804,7 +803,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "BLOCK_DIM": 2048,
     "NUM_STAGE": 1,
     "num_warps": 16,
-    "evict_policy": "evict_last"
+    "evict_policy": "evict_last",
 }
 
 
@@ -816,15 +815,19 @@ def _dev_tag() -> str:
 def _load_db(topk: int, hidden: int, dtype: str) -> dict:
     dtype_clean = str(dtype).replace("torch.", "").strip()
     file_name = f"moe_sum_reduce_{_dev_tag()}_t{topk}_h{hidden}_{dtype_clean}.json"
-    #file_path = pathlib.Path(__file__).with_name(file_name)
-    file_path = pathlib.Path(__file__).parent / "configs" /"triton_3_4_0" / file_name
+    # file_path = pathlib.Path(__file__).with_name(file_name)
+    file_path = pathlib.Path(__file__).parent / "configs" / "triton_3_4_0" / file_name
     if not file_path.exists():
-        warnings.warn(f"Config file '{file_name}' not found → use default.", UserWarning)
+        warnings.warn(
+            f"Config file '{file_name}' not found → use default.", UserWarning
+        )
         return {}
     return json.loads(file_path.read_text())
 
 
-def select_config(config_map: Dict[str, Dict[str, Any]], num_tokens: int) -> Dict[str, Any]:
+def select_config(
+    config_map: Dict[str, Dict[str, Any]], num_tokens: int
+) -> Dict[str, Any]:
     if num_tokens == 0:
         key = "1"
     else:
@@ -849,7 +852,7 @@ def get_config(token_num: int, topk: int, hidden: int, dtype: str) -> Dict[str, 
     return select_config(sub, token_num)
 
 
-# _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
+# _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py 
 @triton.jit
 def _moe_sum_reduce_kernel(
     input_ptr,
@@ -866,7 +869,7 @@ def _moe_sum_reduce_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
-    EVICTION_POLICY: tl.constexpr=None,
+    EVICTION_POLICY: tl.constexpr = None,
 ):
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
@@ -905,11 +908,11 @@ def moe_sum_reduce_triton(
     token_num, topk_num, hidden_dim = input.shape
     assert output.shape[0] == token_num and output.shape[1] == hidden_dim
     cfg = get_config(token_num, topk_num, hidden_dim, str(input.dtype))
-    bm   = cfg["BLOCK_M"]
-    bd   = cfg["BLOCK_DIM"]
-    ns   = cfg["NUM_STAGE"]
-    nw   = cfg["num_warps"]
-    policy   = cfg["evict_policy"]
+    bm = cfg["BLOCK_M"]
+    bd = cfg["BLOCK_DIM"]
+    ns = cfg["NUM_STAGE"]
+    nw = cfg["num_warps"]
+    policy = cfg["evict_policy"]
     grid = (
         triton.cdiv(token_num, bm),
         triton.cdiv(hidden_dim, bd),
