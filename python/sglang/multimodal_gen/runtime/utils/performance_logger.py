@@ -10,11 +10,7 @@ from typing import Any
 
 from dateutil.tz import UTC
 
-
-def _is_in_ci() -> bool:
-    """Check if running in CI environment."""
-    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("true", "1", "yes")
-
+from sglang.utils import is_in_ci
 
 # Configure a specific logger for performance metrics
 perf_logger = logging.getLogger("performance")
@@ -22,7 +18,7 @@ perf_logger.setLevel(logging.INFO)
 perf_logger.propagate = False  # Prevent perf logs from going to the main logger
 
 # Only set up file logging if NOT in CI
-if not _is_in_ci():
+if not is_in_ci():
     LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
     if LOG_DIR:
         LOG_DIR = os.path.abspath(LOG_DIR)
