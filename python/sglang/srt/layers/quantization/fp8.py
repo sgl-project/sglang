@@ -1210,9 +1210,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else topk_config.correction_bias.to(x.dtype)
         )
 
-        routing_method_type = getattr(
-            layer, "routing_method_type", RoutingMethodType.DeepSeekV3
-        )
+        routing_method_type = getattr(layer, "routing_method_type")
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1322,10 +1320,3 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
-
-
-if _is_cuda:
-
-    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
-    def _(mat_a, mat_b, scales_a, scales_b, out_dtype, bias):
-        return mat_a.new_empty((mat_a.shape[0], mat_b.shape[-1]), dtype=out_dtype)

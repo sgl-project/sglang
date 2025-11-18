@@ -19,7 +19,8 @@ else
 endif
 
 .PHONY: help build test clean docs check fmt dev-setup pre-commit setup-sccache sccache-stats sccache-clean sccache-stop \
-        python-dev python-build python-build-release python-install python-clean python-test python-check
+        python-dev python-build python-build-release python-install python-clean python-test python-check \
+        release-notes
 
 help: ## Show this help message
 	@echo "Model Gateway Development Commands"
@@ -132,3 +133,27 @@ python-check: ## Check Python package with twine
 dev: python-dev ## Quick development setup (build Python bindings in dev mode)
 
 install: python-install ## Build and install everything
+
+# Release management
+release-notes: ## Generate release notes for gateway (usage: make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0)
+	@if [ -z "$(PREV)" ] || [ -z "$(CURR)" ]; then \
+		echo "Usage: make release-notes PREV=<previous-tag> CURR=<current-tag>"; \
+		echo "Example: make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0"; \
+		echo ""; \
+		echo "Options:"; \
+		echo "  OUTPUT=<file>     Save to file (default: stdout)"; \
+		echo "  CREATE_RELEASE=1  Create GitHub draft release via gh CLI (default: draft)"; \
+		echo "  DRAFT=0           Publish release immediately (skip draft)"; \
+		exit 1; \
+	fi
+	@ARGS="$(PREV) $(CURR)"; \
+	if [ -n "$(OUTPUT)" ]; then \
+		ARGS="$$ARGS --output $(OUTPUT)"; \
+	fi; \
+	if [ "$(CREATE_RELEASE)" = "1" ]; then \
+		ARGS="$$ARGS --create-release"; \
+		if [ "$(DRAFT)" = "0" ]; then \
+			ARGS="$$ARGS --no-draft"; \
+		fi; \
+	fi; \
+	./scripts/generate_gateway_release_notes.sh $$ARGS

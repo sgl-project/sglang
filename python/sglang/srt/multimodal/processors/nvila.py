@@ -6,6 +6,7 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.models.jet_vlm import JetVLMForConditionalGeneration
 from sglang.srt.models.nvila import NVILAForConditionalGeneration
 from sglang.srt.models.nvila_lite import NVILALiteForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -21,6 +22,7 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
     models: list[type[nn.Module]] = [
         NVILAForConditionalGeneration,
         NVILALiteForConditionalGeneration,
+        JetVLMForConditionalGeneration,
     ]
 
     def __init__(
