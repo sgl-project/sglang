@@ -1096,6 +1096,12 @@ class ServerArgs:
                 f"Disabling Radix Cache for {model_arch} as it is not yet supported."
             )
             self.disable_radix_cache = True
+        elif model_arch in ["Qwen3ForCausalLM"]:
+            if self.quantization == "fp8" and self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+                logger.warning(
+                    "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3ForCausalLM"
+                )
         elif model_arch in ["Qwen3NextForCausalLM"]:
             if not self.disable_radix_cache:
                 logger.warning(
@@ -1103,7 +1109,11 @@ class ServerArgs:
                     "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
                 )
                 self.disable_overlap_schedule = True
-
+            if self.quantization == "fp8" and self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+                logger.warning(
+                    "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
+                )
         if is_deepseek_nsa(hf_config):
             if (
                 self.attention_backend is None
