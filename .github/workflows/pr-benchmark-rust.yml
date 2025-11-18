@@ -9,7 +9,7 @@ on:
     branches: [ main ]
     paths:
       - "sgl-router/**"
-    types: [synchronize, labeled]
+    types: [synchronize]
   workflow_dispatch:
 
 concurrency:
