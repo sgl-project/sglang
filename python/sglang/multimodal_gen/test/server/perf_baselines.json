@@ -25,7 +25,7 @@
         }
     },
     "scenarios": {
-        "text_to_image": {
+        "qwen_image_t2i": {
             "notes": "Single-image generation using the default prompt",
             "expected_e2e_ms": 74500.0,
             "expected_avg_denoise_ms": 422.42,
@@ -92,7 +92,7 @@
                 "49": 410.42
             }
         },
-        "image_edit": {
+        "qwen_image_edit_ti2i": {
             "notes": "single uploaded reference image, Qwen/Qwen-Image-Edit",
             "expected_e2e_ms": 138500.0,
             "expected_avg_denoise_ms": 720.0,
@@ -103,7 +103,7 @@
                 "ImageVAEEncodingStage": 340.0,
                 "ConditioningStage": 0.13,
                 "TimestepPreparationStage": 13.78,
-                "LatentPreparationStage": 10.0,
+                "LatentPreparationStage": 15.0,
                 "DenoisingStage": 36000.0,
                 "DecodingStage": 850.0
             },
@@ -160,7 +160,7 @@
                 "49": 720.0
             }
         },
-        "text_to_video": {
+        "fastwan2_1_t2v": {
             "notes": "Single-video generation using the default prompt",
             "expected_e2e_ms": 95616.59,
             "expected_avg_denoise_ms": 1798.77,
@@ -186,7 +186,7 @@
             "total_frames": 49,
             "avg_frame_time_ms": 1951.36
         },
-        "image_to_video": {
+        "wan2_2_i2v": {
             "notes": "Wan-AI/Wan2.2-I2V-A14B",
             "expected_e2e_ms": 282500.0,
             "expected_avg_denoise_ms": 7000.0,

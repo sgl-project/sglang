@@ -138,8 +138,7 @@ class TestDiffusionPerformance:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
         prev_len = len(read_perf_records(log_path))
-        is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
-        log_wait_timeout = 3600.0 if is_baseline_generation_mode else 300.0
+        log_wait_timeout = 1200
 
         generate_fn()
 
@@ -152,7 +151,7 @@ class TestDiffusionPerformance:
 
         stage_metrics = {}
         if perf_record:
-            scenario = BASELINE_CONFIG.scenarios.get(case.scenario_name)
+            scenario = BASELINE_CONFIG.scenarios.get(case.id)
             num_stages = len(scenario.stages_ms) if scenario else 0
 
             stage_metrics, _ = wait_for_stage_metrics(
@@ -362,14 +361,12 @@ class TestDiffusionPerformance:
         """Validate metrics and record results."""
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
 
-        scenario = BASELINE_CONFIG.scenarios.get(case.scenario_name)
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
         if scenario is None:
             if is_baseline_generation_mode:
                 scenario = {}  # Dummy scenario
             else:
-                pytest.fail(
-                    f"Scenario '{case.scenario_name}' not in perf_baselines.json"
-                )
+                pytest.fail(f"Testcase '{case.id}' not in perf_baselines.json")
         validator_name = case.custom_validator or "default"
         validator_class = VALIDATOR_REGISTRY.get(validator_name, PerformanceValidator)
 
@@ -379,13 +376,21 @@ class TestDiffusionPerformance:
             step_fractions=BASELINE_CONFIG.step_fractions,
         )
 
-        if isinstance(validator, VideoPerformanceValidator):
-            summary = validator.validate(perf_record, stage_metrics, case.num_frames)
-        else:
-            summary = validator.validate(perf_record, stage_metrics)
         if is_baseline_generation_mode:
+            summary = validator.collect_metrics(perf_record, stage_metrics)
             self._dump_baseline_scenario(case, summary)
             return
+
+        try:
+            if isinstance(validator, VideoPerformanceValidator):
+                summary = validator.validate(
+                    perf_record, stage_metrics, case.num_frames
+                )
+            else:
+                summary = validator.validate(perf_record, stage_metrics)
+        except AssertionError:
+            self._dump_baseline_scenario(case, summary)
+            raise
 
         if case.modality == "video" and summary.frames_per_second:
             logger.info(
@@ -493,7 +498,7 @@ class TestDiffusionPerformance:
 To add this baseline, copy the following JSON snippet into
 the "scenarios" section of perf_baselines.json:
 
-"{case.scenario_name}": {json.dumps(baseline, indent=4)}
+"{case.id}": {json.dumps(baseline, indent=4)}
 
 """
         print(output)
