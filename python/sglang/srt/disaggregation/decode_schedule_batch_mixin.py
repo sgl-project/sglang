@@ -9,6 +9,12 @@ import torch
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.utils import LazyImport
+
+ForwardMode = LazyImport("sglang.srt.model_executor.forward_batch_info", "ForwardMode")
+CaptureHiddenMode = LazyImport(
+    "sglang.srt.model_executor.forward_batch_info", "CaptureHiddenMode"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +27,6 @@ if TYPE_CHECKING:
 class ScheduleBatchDisaggregationDecodeMixin:
 
     def prepare_for_prebuilt(self: ScheduleBatch):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
         """
         Prepare a prebuilt extend by populate metadata
         Adapted from .prepare_for_extend().
@@ -108,8 +112,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
         server_args: ServerArgs,
         future_map: FutureMap,
     ):
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
         """Assign the buffered last input id to schedule batch"""
         self.output_ids = []
         for req in self.reqs:

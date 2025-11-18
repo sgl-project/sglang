@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, List, Optional, Type, Union
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -47,9 +46,6 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.request_types import FINISH_ABORT, RequestStage
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -61,13 +57,19 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.utils import LazyImport
+
+ScheduleBatch = LazyImport("sglang.srt.managers.schedule_batch", "ScheduleBatch")
+GenerationBatchResult = LazyImport("sglang.srt.managers.utils", "GenerationBatchResult")
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.configs.mamba_utils import Mamba2CacheParams
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
 
@@ -728,6 +730,8 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
     def pop_transferred(self) -> List[Req]:
+        from sglang.srt.mem_cache.common import release_kv_cache
+
         if not self.queue:
             return []
         polls = poll_and_all_reduce(
@@ -838,8 +842,6 @@ class SchedulerDisaggregationDecodeMixin:
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:
-        from sglang.srt.managers.utils import GenerationBatchResult
-
         if batch.inner_idle_batch is not None:
             idle_batch = batch.inner_idle_batch
             # Reset the inner idle batch to avoid reusing it.
@@ -891,8 +893,6 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
-
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 

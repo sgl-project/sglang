@@ -5,8 +5,13 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.utils import LazyImport
+
+ScheduleBatch = LazyImport("sglang.srt.managers.schedule_batch", "ScheduleBatch")
+TboDPAttentionPreparer = LazyImport(
+    "sglang.srt.two_batch_overlap", "TboDPAttentionPreparer"
+)
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -101,8 +106,6 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
 ):
-    from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
-
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
         num_tokens = 0

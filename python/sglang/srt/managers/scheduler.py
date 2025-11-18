@@ -45,9 +45,6 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-    DecodeKVCacheOffloadManager,
-)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -62,8 +59,6 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -188,7 +183,13 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.utils import LazyImport, TypeBasedDispatcher, get_exception_traceback
+
+FutureMap = LazyImport("sglang.srt.managers.overlap_utils", "FutureMap")
+DecodeKVCacheOffloadManager = LazyImport(
+    "sglang.srt.disaggregation.decode_kvcache_offload_manager",
+    "DecodeKVCacheOffloadManager",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,8 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
 
         # Distributed rank info
+        from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -957,6 +960,8 @@ class Scheduler(
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
     def init_moe_config(self):
+        from sglang.srt.layers.moe import initialize_moe_config
+
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 

@@ -83,7 +83,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -95,6 +94,9 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.utils import LazyImport
+
+ORJSONResponse = LazyImport("fastapi.responses", "ORJSONResponse")
 
 if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below

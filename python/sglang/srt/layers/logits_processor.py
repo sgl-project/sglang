@@ -13,9 +13,11 @@
 # ==============================================================================
 """Logits processing."""
 
+from __future__ import annotations
+
 import dataclasses
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -40,14 +42,20 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu, use_intel_amx_backend
+from sglang.utils import LazyImport
+
+CaptureHiddenMode = LazyImport(
+    "sglang.srt.model_executor.forward_batch_info", "CaptureHiddenMode"
+)
+ForwardBatch = LazyImport(
+    "sglang.srt.model_executor.forward_batch_info", "ForwardBatch"
+)
+ForwardMode = LazyImport("sglang.srt.model_executor.forward_batch_info", "ForwardMode")
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 logger = logging.getLogger(__name__)
 

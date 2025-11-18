@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
+from sglang.utils import LazyImport
+
+LogitsProcessorOutput = LazyImport(
+    "sglang.srt.layers.logits_processor", "LogitsProcessorOutput"
+)
+PPProxyTensors = LazyImport(
+    "sglang.srt.model_executor.forward_batch_info", "PPProxyTensors"
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler

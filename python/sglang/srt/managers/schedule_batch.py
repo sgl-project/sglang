@@ -84,17 +84,21 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.utils import LazyImport
+
+CaptureHiddenMode = LazyImport(
+    "sglang.srt.model_executor.forward_batch_info", "CaptureHiddenMode"
+)
+ForwardBatch = LazyImport(
+    "sglang.srt.model_executor.forward_batch_info", "ForwardBatch"
+)
+ForwardMode = LazyImport("sglang.srt.model_executor.forward_batch_info", "ForwardMode")
 
 _is_npu = is_npu()
 

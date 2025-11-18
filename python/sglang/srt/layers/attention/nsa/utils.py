@@ -6,7 +6,6 @@ from typing import List
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
 
@@ -100,6 +99,8 @@ def enable_prefill_cp(forward_batch, nsa_enable_prefill_cp):
 def cp_attn_tp_all_gather_reorganazied_into_tensor(
     input_: torch.Tensor, total_len, attn_tp_size, forward_batch, stream_op
 ):
+    from sglang.srt.layers.dp_attention import get_attention_tp_group
+
     """
     Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
     This implementation mainly consists of three parts:

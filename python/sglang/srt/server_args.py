@@ -22,7 +22,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 
@@ -57,10 +57,14 @@ from sglang.srt.utils.common import (
     wait_port_available,
     xpu_has_xmx_support,
 )
-from sglang.utils import is_in_ci
+from sglang.utils import LazyImport, is_in_ci
 
-if TYPE_CHECKING:
-    from sglang.srt.lora.lora_registry import LoRARef
+ConnectorType = LazyImport("sglang.srt.managers.connector", "ConnectorType")
+FunctionCallParser = LazyImport(
+    "sglang.srt.function_call.function_call_parser", "FunctionCallParser"
+)
+ReasoningParser = LazyImport("sglang.srt.parser.reasoning_parser", "ReasoningParser")
+LoRARef = LazyImport("sglang.srt.lora.lora_registry", "LoRARef")
 
 logger = logging.getLogger(__name__)
 
@@ -927,7 +931,6 @@ class ServerArgs:
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
-        from sglang.srt.connector import ConnectorType
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
@@ -1904,7 +1907,6 @@ class ServerArgs:
             )
 
     def _handle_deterministic_inference(self):
-        from sglang.srt.connector import ConnectorType
 
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -2024,9 +2026,6 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
-        from sglang.srt.parser.reasoning_parser import ReasoningParser
-
         # Model and tokenizer
         parser.add_argument(
             "--model-path",

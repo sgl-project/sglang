@@ -6,10 +6,9 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.server_args import ServerArgs
-
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.server_args import ServerArgs
 
 
 class KVArgs:

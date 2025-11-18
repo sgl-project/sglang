@@ -13,16 +13,19 @@
 # ==============================================================================
 """The baseclass of a backend for grammar-guided constrained decoding."""
 
+from __future__ import annotations
+
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from threading import Event
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.server_args import ServerArgs
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
