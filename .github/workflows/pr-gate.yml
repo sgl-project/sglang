@@ -98,7 +98,7 @@ jobs:
               return;
             }
 
-            let effectiveCooldownMinutes = DEFAULT_HOURS > 0 ? DEFAULT_HOURS * 60 : 0;
+            let effectiveCooldownMinutes = DEFAULT_HOURS * 60;
             let perUserCooldownMinutes = null;
 
             try {
