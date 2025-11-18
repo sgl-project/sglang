@@ -12,7 +12,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | text                       | `Optional[Union[List[str], str]] = None`                                     | The input prompt. Can be a single prompt or a batch of prompts.                                                                                                 |
 | input_ids                  | `Optional[Union[List[List[int]], List[int]]] = None`                         | The token IDs for text; one can specify either text or input_ids.                                                                                               |
 | input_embeds               | `Optional[Union[List[List[List[float]]], List[List[float]]]] = None`         | The embeddings for input_ids; one can specify either text, input_ids, or input_embeds.                                                                          |
-| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Can be an image instance, file name, URL, or base64 encoded string. Can be a single image, list of images, or list of lists of images. |
+| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Supports three formats: (1) **Raw images**: PIL Image, file path, URL, or base64 string; (2) **Processor output**: Dict with `format: "processor_output"` containing HuggingFace processor outputs; (3) **Precomputed embeddings**: Dict with `format: "precomputed_embedding"` and `feature` containing pre-calculated visual embeddings. Can be a single image, list of images, or list of lists of images. See [Multimodal Input Formats](#multimodal-input-formats) for details. |
 | audio_data                 | `Optional[Union[List[AudioDataItem], AudioDataItem]] = None`                 | The audio input. Can be a file name, URL, or base64 encoded string.                                                                                             |
 | sampling_params            | `Optional[Union[List[Dict], Dict]] = None`                                   | The sampling parameters as described in the sections below.                                                                                                     |
 | rid                        | `Optional[Union[List[str], str]] = None`                                     | The request ID.                                                                                                                                                 |
@@ -190,6 +190,141 @@ The `image_data` can be a file name, a URL, or a base64 encoded string. See also
 Streaming is supported in a similar manner as [above](#streaming).
 
 Detailed example in [OpenAI API Vision](openai_api_vision.ipynb).
+
+#### Multimodal Input Formats
+
+SGLang supports three different formats for `image_data` to accommodate various use cases:
+
+##### 1. Raw Images (Basic Usage)
+
+The simplest way to pass images - SGLang will handle all preprocessing automatically.
+
+```python
+import requests
+from PIL import Image
+
+# File path
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "<image>\nWhat's in this image?",
+        "image_data": "example_image.png",
+    },
+)
+
+# URL
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "<image>\nWhat's in this image?",
+        "image_data": "https://example.com/image.jpg",
+    },
+)
+
+# Multiple images
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "<image><image>\nCompare these two images.",
+        "image_data": ["image1.png", "image2.png"],
+    },
+)
+```
+
+**Use case**: Quick prototyping, simple applications, when you don't need fine control over preprocessing.
+
+##### 2. Processor Output (Advanced)
+
+Pass the output from a HuggingFace processor directly, bypassing SGLang's preprocessing.
+
+```python
+import requests
+from transformers import AutoProcessor
+from PIL import Image
+
+processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+image = Image.open("example.png")
+text = "<image>\nDescribe this image."
+
+# Preprocess with HuggingFace processor
+processor_output = processor(images=[image], text=text, return_tensors="pt")
+
+# Pass processor output directly to SGLang
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "input_ids": processor_output["input_ids"][0].tolist(),
+        "image_data": [dict(processor_output, format="processor_output")],
+    },
+)
+```
+
+**Use case**: When you need precise control over image preprocessing, custom image transformations, or when integrating with existing preprocessing pipelines.
+
+**Note**: When using `processor_output` format:
+- You must pass `input_ids` instead of `text`
+- The processor output must include all required fields (e.g., `pixel_values`, `image_grid_thw` for Qwen-VL)
+- Use exactly one dict per batch (don't mix with other formats)
+
+##### 3. Precomputed Embeddings (High Performance)
+
+Pre-calculate visual embeddings to avoid redundant vision encoder computation, ideal for caching or serving the same image multiple times.
+
+```python
+import requests
+import torch
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from PIL import Image
+
+# Load vision encoder once
+processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+vision_encoder = model.visual.cuda().eval()
+
+# Precompute embeddings (can be cached)
+image = Image.open("example.png")
+processor_output = processor(images=[image], text="<image>\n", return_tensors="pt")
+
+with torch.inference_mode():
+    precomputed_embeddings = vision_encoder(
+        processor_output["pixel_values"].cuda(),
+        processor_output["image_grid_thw"].cuda()
+    )
+
+# Use precomputed embeddings for inference
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "input_ids": processor_output["input_ids"][0].tolist(),
+        "image_data": [dict(
+            processor_output,
+            format="precomputed_embedding",
+            feature=precomputed_embeddings.cpu().tolist(),  # Convert to list for JSON
+        )],
+    },
+)
+```
+
+**Use case**: 
+- High-throughput serving with repeated image queries
+- Caching visual embeddings for frequently used images
+- Reducing latency when the same image is used across multiple requests
+- Multi-turn conversations with the same image
+
+**Performance benefits**:
+- Avoids redundant vision encoder computation (can save 30-50% of total inference time)
+- Enables efficient caching strategies
+- Reduces GPU memory usage during inference
+
+**Format Comparison**:
+
+| Format | Preprocessing | Vision Encoding | Use Case |
+|--------|--------------|-----------------|----------|
+| Raw Images | Automatic | Automatic | Simple usage, prototyping |
+| Processor Output | Manual | Automatic | Custom preprocessing pipelines |
+| Precomputed Embeddings | Manual | Pre-computed | High performance, caching |
+
+For detailed examples and model-specific usage, see [VLM Query Guide](../advanced_features/vlm_query.ipynb).
 
 ### Structured Outputs (JSON, Regex, EBNF)
 
