@@ -487,7 +487,7 @@ def _compute_logical_to_rank_dispatch_physical_map(
         # Phase 1: same-GPU assignment (greedy by minimal local load)
         for g in range(num_gpus):
             best = -1
-            best_load = 2147483647
+            best_load = np.iinfo(np.int32).max
             for j in range(k):
                 if cand_gpu[j] == g:
                     lj = cand_loads[j]
@@ -499,13 +499,12 @@ def _compute_logical_to_rank_dispatch_physical_map(
                 cand_loads[best] += 1
 
         # Phase 2: same-Node assignment (respecting threshold)
-        num_gpus_per_node = num_gpus_per_node
         for g in range(num_gpus):
             if dispatch_map[g, layer, logical] != -1:
                 continue
             node_id = g // num_gpus_per_node
             best = -1
-            best_load = 2147483647
+            best_load = np.iinfo(np.int32).max
             for j in range(k):
                 if cand_node[j] == node_id:
                     lj = cand_loads[j]
@@ -550,8 +549,8 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_local_node_phys = num_physical_experts // num_nodes
     num_gpus_per_node = num_gpus // num_nodes
 
-    phys_to_gpu = (np.arange(num_physical_experts, dtype=np.int32) // num_local_gpu_phys).astype(np.int32)
-    phys_to_node = (np.arange(num_physical_experts, dtype=np.int32) // num_local_node_phys).astype(np.int32)
+    phys_to_gpu = (np.arange(num_physical_experts, dtype=np.int32) // num_local_gpu_phys)
+    phys_to_node = (np.arange(num_physical_experts, dtype=np.int32) // num_local_node_phys)
 
     l2p_map = logical_to_all_physical_map.cpu().numpy().astype(np.int32)
     dispatch_map = np.full((num_gpus, num_layers, num_logical_experts), -1, dtype=np.int32)
@@ -561,7 +560,7 @@ def compute_logical_to_rank_dispatch_physical_map(
 
     dispatch_map = torch.from_numpy(dispatch_map).to(dtype).to(device)
 
-    assert torch.all(dispatch_map != -1) and dispatch_map.max() < num_physical_experts and dispatch_map.min() >= 0
+    assert dispatch_map.min() >= 0 and dispatch_map.max() < num_physical_experts
 
     return dispatch_map[ep_rank, :, :]
 
