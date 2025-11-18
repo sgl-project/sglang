@@ -650,7 +650,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        global_get_trace_metric_ctx(obj.rid).metric_trace_slice_end(RequestStage.TOKENIZE)
+        global_get_trace_metric_ctx(obj.rid).metric_trace_slice_end(
+            RequestStage.TOKENIZE
+        )
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -967,7 +969,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if self.server_args.trace_level > 0:
             for tokenized_obj in tokenized_objs:
                 trace_metric_ctx = global_get_trace_metric_ctx(tokenized_obj.rid)
-                trace_metric_ctx.metric_trace_slice_start(RequestStage.TOKENIZER_DISPATCH)
+                trace_metric_ctx.metric_trace_slice_start(
+                    RequestStage.TOKENIZER_DISPATCH
+                )
                 tokenized_obj.trace_metric_ctx = (
                     trace_metric_ctx.trace_get_proc_propagate_context()
                 )

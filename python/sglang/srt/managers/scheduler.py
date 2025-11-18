@@ -1314,7 +1314,9 @@ class Scheduler(
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             req.trace_metric_ctx = (
-                recv_req.trace_metric_ctx if recv_req.trace_metric_ctx else NullContext()
+                recv_req.trace_metric_ctx
+                if recv_req.trace_metric_ctx
+                else NullContext()
             )
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
