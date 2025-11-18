@@ -75,8 +75,9 @@ Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com
 
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
-- `/tag-run-ci-label`: Tag the "run-ci" label. Every future commits will trigger CI.
-- `/rerun-failed-ci`: Rerun the failed/flaky tests of the last commit.
+- `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI.
+- `/rerun-failed-ci`: Reruns the failed or flaky tests from the most recent commit.
+- `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash_command_handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/13498#issuecomment-3547552157).
 
