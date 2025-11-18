@@ -1259,9 +1259,10 @@ async fn execute_mcp_tools(
             .await
         {
             Ok(result) => {
+                let tool_is_error = result.is_error.unwrap_or(false);
                 // Convert CallToolResult to Value
                 match to_value(&result) {
-                    Ok(output_value) => (output_value, false),
+                    Ok(output_value) => (output_value, tool_is_error),
                     Err(e) => {
                         warn!("Failed to serialize tool result: {}", e);
                         (

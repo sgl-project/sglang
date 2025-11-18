@@ -258,15 +258,18 @@ pub(super) async fn execute_streaming_tool_calls(
             .call_tool_from_inventory(inventory, &call_server_label, &original_tool_name, args_map)
             .await
         {
-            Ok(result) => match to_string(&result) {
-                Ok(output) => (output, true, None),
-                Err(e) => {
-                    let err_msg = format!("Failed to serialize tool result: {}", e);
-                    warn!("{}", err_msg);
-                    let error_json = json!({ "error": &err_msg }).to_string();
-                    (error_json, false, Some(err_msg))
+            Ok(result) => {
+                let success = !result.is_error.unwrap_or(false);
+                match to_string(&result) {
+                    Ok(output) => (output, success, None),
+                    Err(e) => {
+                        let err_msg = format!("Failed to serialize tool result: {}", e);
+                        warn!("{}", err_msg);
+                        let error_json = json!({ "error": &err_msg }).to_string();
+                        (error_json, false, Some(err_msg))
+                    }
                 }
-            },
+            }
             Err(e) => {
                 let err_msg = e.to_string();
                 warn!("MCP tool execution failed: {}", err_msg);
@@ -1011,9 +1014,10 @@ pub(super) fn build_executed_mcp_call_items(
                 .and_then(|o| o.get("output").and_then(|v| v.as_str()))
                 .unwrap_or("{}");
 
-            // Check if output contains error by parsing JSON
+            // Check if output indicates error by checking isError field
             let is_error = from_str::<Value>(output_str)
-                .map(|v| v.get("error").is_some())
+                .ok()
+                .and_then(|v| v.get("isError").and_then(|e| e.as_bool()))
                 .unwrap_or(false);
 
             let mcp_call_item = build_mcp_call_item(
