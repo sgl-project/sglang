@@ -53,7 +53,7 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           cd scripts/ci_monitor
-          python ci_analyzer.py --token $GITHUB_TOKEN --mode nightly --days 2 --output nightly_analysis_$(date +%Y%m%d_%H%M%S).json
+          python ci_analyzer.py --token "$GITHUB_TOKEN" --mode nightly --days 2 --output "nightly_analysis_$(date +%Y%m%d_%H%M%S).json"
 
       - name: Run Performance Analysis
         env:

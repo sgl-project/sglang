@@ -65,7 +65,7 @@ jobs:
             echo "| main_package   | ${{ steps.filter.outputs.main_package }} |"
             echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel }} |"
             echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen }} |"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================== sgl-kernel ====================================================
 

@@ -77,7 +77,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cut -d'"' -f2 < sgl-kernel/python/sgl_kernel/version.py)"
             echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
           else
             echo "tag_name=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
@@ -164,7 +164,7 @@ jobs:
         id: set_tag_name
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            TAG_NAME="v$(cut -d'"' -f2 < sgl-kernel/python/sgl_kernel/version.py)"
             echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
           else
             echo "tag_name=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
