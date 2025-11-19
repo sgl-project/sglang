@@ -8,11 +8,7 @@ use std::{sync::Arc, time::Duration};
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
 use rmcp::{
-    model::{
-        CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult,
-        ReadResourceRequestParam, ReadResourceResult, SubscribeRequestParam,
-        UnsubscribeRequestParam,
-    },
+    model::{CallToolRequestParam, CallToolResult},
     service::RunningService,
     transport::{
         sse_client::SseClientConfig, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -20,11 +16,10 @@ use rmcp::{
     },
     RoleClient, ServiceExt,
 };
-use serde_json::Map;
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::{
-    config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Prompt, RawResource, Tool},
+    config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Tool},
     connection_pool::McpConnectionPool,
     error::{McpError, McpResult},
     inventory::ToolInventory,
@@ -208,79 +203,6 @@ impl McpManager {
             .map(|(_server_label, tool_info)| tool_info)
     }
 
-    /// Get a prompt by name
-    pub async fn get_prompt(
-        &self,
-        prompt_name: &str,
-        args: Option<Map<String, serde_json::Value>>,
-    ) -> McpResult<GetPromptResult> {
-        // Get server that owns this prompt
-        let (server_label, _prompt_info) = self
-            .inventory
-            .get_prompt(prompt_name)
-            .ok_or_else(|| McpError::PromptNotFound(prompt_name.to_string()))?;
-
-        // Get client for that server
-        let client = self
-            .get_client(&server_label)
-            .await
-            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
-
-        // Get the prompt
-        let request = GetPromptRequestParam {
-            name: prompt_name.to_string(),
-            arguments: args,
-        };
-
-        client
-            .get_prompt(request)
-            .await
-            .map_err(|e| McpError::Transport(format!("Failed to get prompt: {}", e)))
-    }
-
-    /// List all available prompts
-    pub fn list_prompts(&self) -> Vec<Prompt> {
-        self.inventory
-            .list_prompts()
-            .into_iter()
-            .map(|(_prompt_name, _server_name, prompt_info)| prompt_info)
-            .collect()
-    }
-
-    /// Read a resource by URI
-    pub async fn read_resource(&self, uri: &str) -> McpResult<ReadResourceResult> {
-        // Get server that owns this resource
-        let (server_label, _resource_info) = self
-            .inventory
-            .get_resource(uri)
-            .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
-
-        // Get client for that server
-        let client = self
-            .get_client(&server_label)
-            .await
-            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
-
-        // Read the resource
-        let request = ReadResourceRequestParam {
-            uri: uri.to_string(),
-        };
-
-        client
-            .read_resource(request)
-            .await
-            .map_err(|e| McpError::Transport(format!("Failed to read resource: {}", e)))
-    }
-
-    /// List all available resources
-    pub fn list_resources(&self) -> Vec<RawResource> {
-        self.inventory
-            .list_resources()
-            .into_iter()
-            .map(|(_resource_uri, _server_name, resource_info)| resource_info)
-            .collect()
-    }
-
     /// Refresh inventory for a specific server
     pub async fn refresh_server_inventory(&self, server_name: &str) -> McpResult<()> {
         let client = self
@@ -339,62 +261,6 @@ impl McpManager {
         self.inventory.has_tool(name)
     }
 
-    /// Get prompt info by name
-    pub fn get_prompt_info(&self, name: &str) -> Option<Prompt> {
-        self.inventory.get_prompt(name).map(|(_server, info)| info)
-    }
-
-    /// Get resource info by URI
-    pub fn get_resource_info(&self, uri: &str) -> Option<RawResource> {
-        self.inventory.get_resource(uri).map(|(_server, info)| info)
-    }
-
-    /// Subscribe to resource changes
-    pub async fn subscribe_resource(&self, uri: &str) -> McpResult<()> {
-        let (server_label, _resource_info) = self
-            .inventory
-            .get_resource(uri)
-            .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
-
-        let client = self
-            .get_client(&server_label)
-            .await
-            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
-
-        debug!("Subscribing to '{}' on '{}'", uri, server_label);
-
-        client
-            .peer()
-            .subscribe(SubscribeRequestParam {
-                uri: uri.to_string(),
-            })
-            .await
-            .map_err(|e| McpError::ToolExecution(format!("Failed to subscribe: {}", e)))
-    }
-
-    /// Unsubscribe from resource changes
-    pub async fn unsubscribe_resource(&self, uri: &str) -> McpResult<()> {
-        let (server_label, _resource_info) = self
-            .inventory
-            .get_resource(uri)
-            .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
-
-        let client = self
-            .get_client(&server_label)
-            .await
-            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
-
-        debug!("Unsubscribing from '{}' on '{}'", uri, server_label);
-
-        client
-            .peer()
-            .unsubscribe(UnsubscribeRequestParam {
-                uri: uri.to_string(),
-            })
-            .await
-            .map_err(|e| McpError::ToolExecution(format!("Failed to unsubscribe: {}", e)))
-    }
-
     /// List all connected servers (static + dynamic)
     pub fn list_servers(&self) -> Vec<String> {
         let mut servers = Vec::new();
@@ -442,13 +308,10 @@ impl McpManager {
 
     /// Get statistics about the manager
     pub fn stats(&self) -> McpManagerStats {
-        let (tools, prompts, resources) = self.inventory.counts();
         McpManagerStats {
             static_server_count: self.static_clients.len(),
             pool_stats: self.connection_pool.stats(),
-            tool_count: tools,
-            prompt_count: prompts,
-            resource_count: resources,
+            tool_count: self.inventory.count(),
         }
     }
 
@@ -486,28 +349,6 @@ impl McpManager {
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
         }
-
-        // Prompts
-        match client.peer().list_all_prompts().await {
-            Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_key);
-                for p in ps {
-                    inventory.insert_prompt(p.name.clone(), server_key.to_string(), p);
-                }
-            }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_key, e),
-        }
-
-        // Resources
-        match client.peer().list_all_resources().await {
-            Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_key);
-                for r in rs {
-                    inventory.insert_resource(r.uri.clone(), server_key.to_string(), r.raw);
-                }
-            }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_key, e),
-        }
     }
 
     /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
@@ -522,30 +363,6 @@ impl McpManager {
                 }
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
-        }
-
-        // Prompts
-        match client.peer().list_all_prompts().await {
-            Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_name);
-                for p in ps {
-                    self.inventory
-                        .insert_prompt(p.name.clone(), server_name.to_string(), p);
-                }
-            }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
-        }
-
-        // Resources
-        match client.peer().list_all_resources().await {
-            Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_name);
-                for r in rs {
-                    self.inventory
-                        .insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
-                }
-            }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
         }
     }
 
@@ -756,10 +573,6 @@ pub struct McpManagerStats {
     pub pool_stats: crate::mcp::connection_pool::PoolStats,
     /// Number of cached tools
     pub tool_count: usize,
-    /// Number of cached prompts
-    pub prompt_count: usize,
-    /// Number of cached resources
-    pub resource_count: usize,
 }
 
 #[cfg(test)]
