@@ -353,7 +353,7 @@ class HFRunner:
                     scores = []
                     for conv in prompts:
                         conv_formatted = self.tokenizer.apply_chat_template(
-                            conv, tokenize=False
+                            conv, tokenize=False, return_dict=False
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
@@ -528,6 +528,8 @@ class SRTRunner:
         speculative_num_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_ngram_min_match_window_size: Optional[int] = None,
+        speculative_ngram_max_match_window_size: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
         torchao_config: Optional[str] = None,
@@ -539,6 +541,7 @@ class SRTRunner:
         max_loaded_loras: Optional[int] = None,
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
+        enable_deterministic_inference: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -554,6 +557,14 @@ class SRTRunner:
             spec_kwargs["speculative_num_steps"] = speculative_num_steps
             spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk
             spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
+        elif speculative_algorithm == "NGRAM":
+            spec_kwargs["speculative_algorithm"] = speculative_algorithm
+            spec_kwargs["speculative_ngram_min_match_window_size"] = (
+                speculative_ngram_min_match_window_size
+            )
+            spec_kwargs["speculative_ngram_max_match_window_size"] = (
+                speculative_ngram_max_match_window_size
+            )
 
         self.engine = Engine(
             model_path=model_path,
@@ -594,6 +605,7 @@ class SRTRunner:
                 else "{}"
             ),
             lora_eviction_policy=lora_eviction_policy,
+            enable_deterministic_inference=enable_deterministic_inference,
             **spec_kwargs,
         )
 

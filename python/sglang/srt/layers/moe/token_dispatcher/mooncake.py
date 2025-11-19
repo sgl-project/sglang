@@ -21,13 +21,6 @@ from sglang.srt.utils import get_int_env_var
 if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import CombineOverlapArgs
 
-try:
-    from mooncake.mooncake_ep_buffer import Buffer
-
-    use_mooncake_ep = True
-except ImportError:
-    use_mooncake_ep = False
-
 from enum import Enum, auto
 
 import torch
@@ -86,6 +79,9 @@ class EPBuffer:
         if cls._buffer is not None:
             return cls._buffer
 
+        # Lazy import Buffer to avoid creating CUDA context at module import time
+        from mooncake.mooncake_ep_buffer import Buffer
+
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
@@ -122,7 +118,9 @@ class _MooncakeEPDispatcherImpl:
         return_recv_hook: bool,
         deepep_mode: DeepEPMode,
     ):
-        if not use_mooncake_ep:
+        try:
+            from mooncake.mooncake_ep_buffer import Buffer  # noqa: F401
+        except ImportError:
             raise ImportError(
                 "Mooncake EP is not installed. Please install Mooncake package at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "

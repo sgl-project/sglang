@@ -167,6 +167,92 @@ class TestBatchInvariantOps(CustomTestCase):
             )
             print(f"Without batch-invariant mode, we get diffs: {difflist}")
 
+    def _test_bmm_batch_invariance(self, B, M, K, N, dtype):
+        """
+        Test that BMM operations produce identical results for:
+        - Method 1: BMM with subset of batches
+        - Method 2: BMM with all batches, then slice
+        """
+        a = torch.linspace(-100, 100, B * M * K, dtype=dtype).reshape(B, M, K)
+        b = torch.linspace(-100, 100, B * K * N, dtype=dtype).reshape(B, K, N)
+
+        # Method 1: BMM with subset (first 2 batches)
+        subset_size = min(2, B)
+        out1 = torch.bmm(a[:subset_size], b[:subset_size])
+
+        # Method 2: BMM with all batches, then slice
+        out2_pre = torch.bmm(a, b)
+        out2 = out2_pre[:subset_size]
+
+        # Check if results are identical
+        diff = (out1 - out2).abs().max()
+        return diff.item()
+
+    def _run_bmm_multiple_iterations(self, iters, B, M, K, N, dtype):
+        """Run multiple BMM iterations and collect diff statistics"""
+        difflist = []
+        for _ in range(iters):
+            diff = self._test_bmm_batch_invariance(B, M, K, N, dtype)
+            difflist.append(diff)
+        return difflist
+
+    def test_bmm_small_matrices(self):
+        """Test BMM batch invariance with small matrix sizes"""
+        test_cases = [
+            ("BMM-Small-1", 4, 8, 64, 128),
+            ("BMM-Small-2", 8, 16, 128, 256),
+            ("BMM-Small-3", 6, 4, 32, 64),
+        ]
+
+        for name, B, M, K, N in test_cases:
+            with self.subTest(name=name, B=B, M=M, K=K, N=N):
+                for dtype in [torch.float32, torch.bfloat16]:
+                    with self.subTest(dtype=dtype):
+                        # Run with batch-invariant mode
+                        with set_batch_invariant_mode(True):
+                            difflist = self._run_bmm_multiple_iterations(
+                                iters=5, B=B, M=M, K=K, N=N, dtype=dtype
+                            )
+                            self._assert_batch_invariant_results(difflist, dtype, name)
+
+    def test_bmm_medium_matrices(self):
+        """Test BMM batch invariance with medium matrix sizes"""
+        test_cases = [
+            ("BMM-Medium-1", 8, 32, 128, 1024),
+            ("BMM-Medium-2", 16, 64, 512, 2048),
+            ("BMM-Medium-3", 12, 24, 192, 768),
+        ]
+
+        for name, B, M, K, N in test_cases:
+            with self.subTest(name=name, B=B, M=M, K=K, N=N):
+                for dtype in [torch.float32, torch.bfloat16]:
+                    with self.subTest(dtype=dtype):
+                        # Run with batch-invariant mode
+                        with set_batch_invariant_mode(True):
+                            difflist = self._run_bmm_multiple_iterations(
+                                iters=5, B=B, M=M, K=K, N=N, dtype=dtype
+                            )
+                            self._assert_batch_invariant_results(difflist, dtype, name)
+
+    def test_bmm_large_matrices(self):
+        """Test BMM batch invariance with large matrix sizes"""
+        test_cases = [
+            ("BMM-Large-1", 16, 128, 1024, 4096),
+            ("BMM-Large-2", 32, 256, 2048, 8192),
+            ("BMM-Large-3", 24, 96, 768, 3072),
+        ]
+
+        for name, B, M, K, N in test_cases:
+            with self.subTest(name=name, B=B, M=M, K=K, N=N):
+                for dtype in [torch.float32, torch.bfloat16]:
+                    with self.subTest(dtype=dtype):
+                        # Run with batch-invariant mode
+                        with set_batch_invariant_mode(True):
+                            difflist = self._run_bmm_multiple_iterations(
+                                iters=5, B=B, M=M, K=K, N=N, dtype=dtype
+                            )
+                            self._assert_batch_invariant_results(difflist, dtype, name)
+
 
 if __name__ == "__main__":
     unittest.main()
