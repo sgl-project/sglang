@@ -41,6 +41,7 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
+            enable_memory_saver=False,
             mamba_pool=None,
         )
         assert pool._transfer_full_attention_id(global_interval - 1) == 0
@@ -173,6 +174,7 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
+            enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
         )
 
@@ -320,8 +322,8 @@ class TestMamba(unittest.TestCase):
         kv_indices, last_node = result.device_indices, result.last_device_node
         assert req9.mamba_pool_idx is not None
         assert torch.all(
-            mamba_pool.mamba_cache.conv[:, req9.mamba_pool_idx]
-            == mamba_pool.mamba_cache.conv[:, last_node.mamba_value]
+            mamba_pool.mamba_cache.conv[0][:, req9.mamba_pool_idx]
+            == mamba_pool.mamba_cache.conv[0][:, last_node.mamba_value]
         )
         assert torch.all(
             mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]
