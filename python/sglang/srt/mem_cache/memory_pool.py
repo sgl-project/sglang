@@ -150,12 +150,16 @@ class MambaPool:
         size: int,
         cache_params: BaseLinearStateParams,
         device: str,
+        enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
         num_mamba_layers = len(cache_params.layers)
 
         self.size = size
@@ -166,7 +170,7 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        with (
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.enable_custom_mem_pool
             else nullcontext()
@@ -337,16 +341,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+        self.enable_memory_saver = enable_memory_saver
+        self._init_mamba_pool(
+            size=mamba_size,
+            cache_params=cache_params,
+            device=device,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
-        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self._init_mamba_pool(
-                size=mamba_size,
-                cache_params=cache_params,
-                device=device,
-                speculative_num_draft_tokens=speculative_num_draft_tokens,
-            )
 
     def _init_mamba_pool(
         self,
@@ -359,6 +360,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             size=size,
             cache_params=cache_params,
             device=device,
+            enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
