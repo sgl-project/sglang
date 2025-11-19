@@ -79,7 +79,6 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
-from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -370,6 +369,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 return
             else:
                 # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
+                from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
                 if should_deepgemm_weight_requant_ue8m0(
                     weight_block_size=getattr(
                         self.quant_config, "weight_block_size", None

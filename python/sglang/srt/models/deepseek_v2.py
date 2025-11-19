@@ -105,7 +105,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
-    inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
@@ -3453,17 +3452,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
-                    if should_deepgemm_weight_requant_ue8m0(
-                        weight_block_size=getattr(
-                            self.quant_config, "weight_block_size", None
-                        )
-                    ):
-                        # When deepgemm is enabled, the scales have been transformed to ue8m0 format in load_weights
-                        # So we need an inverse transform to get the original scale
-                        weight_scale = inverse_transform_scale_ue8m0(
-                            weight_scale, mn=weight.shape[-2]
-                        )
-
                     if (
                         _is_cuda
                         and weight_block_size[0] == 128
@@ -3592,6 +3580,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             self._transform_scale_nextn_moe_ue8m0()
 
     def _moe_weight_requant_ue8m0(self, is_nextn=False):
+        # Dense fp8 layers will be processed in Fp8LinearMethod.process_weights_after_loading
+        # So we only need to process sparse MoE layers here
         weight_block_size = self.quant_config.weight_block_size
 
         moe_layers = list(
@@ -3611,16 +3601,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 layer = self.model.layers[layer_id]
 
             if layer_id in moe_layers or is_nextn:
-                shared_experts = getattr(layer.mlp, "shared_experts", None)
-                if shared_experts is not None:
-                    for module in [
-                        shared_experts.gate_up_proj,
-                        shared_experts.down_proj,
-                    ]:
-                        requant_weight_ue8m0_inplace(
-                            module.weight, module.weight_scale_inv, weight_block_size
-                        )
-
                 experts = layer.mlp.experts
                 if isinstance(experts, DeepEPMoE):
                     for w in [
@@ -3628,16 +3608,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         (experts.w2_weight, experts.w2_weight_scale_inv),
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
-            else:
-                mlp = layer.mlp
-                assert isinstance(mlp, DeepseekV2MLP)
-                for module in [
-                    mlp.gate_up_proj,
-                    mlp.down_proj,
-                ]:
-                    requant_weight_ue8m0_inplace(
-                        module.weight, module.weight_scale_inv, weight_block_size
-                    )
+
 
     # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
     def _transform_scale_ue8m0(self, is_nextn=False):
