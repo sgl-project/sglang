@@ -425,10 +425,9 @@ class Qwen3MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if _use_aiter and self.rope_scaling is not None and "aiter_rope_fused_qknorm" in self.rope_scaling:
             assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
-            self.rotary_emb(
+            q, k, v = self.rotary_emb(
                 qkv,
                 self.q_norm.weight,
                 self.k_norm.weight,
@@ -438,6 +437,7 @@ class Qwen3MoeAttention(nn.Module):
                 self.k_norm.variance_epsilon,
             )
         else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._apply_qk_norm(q, k)
             q, k = self.rotary_emb(
                 positions,
