@@ -635,7 +635,7 @@ class SGLangCIAnalyzer:
         except Exception as e:
             print(f"Failed to generate GitHub Actions summary: {e}")
 
-    def get_nightly_runs(self, days: int = 7) -> List[Dict]:
+    def get_nightly_runs(self, days: int = 2) -> List[Dict]:
         """Get nightly test workflow runs from the last N days"""
         print(f"Fetching nightly test runs from the last {days} days...")
 
@@ -645,10 +645,11 @@ class SGLangCIAnalyzer:
         for workflow_file in self.nightly_workflows:
             print(f"  Fetching from {workflow_file}...")
             page = 1
-            per_page = 100
+            per_page = 10  # Nightly runs once per day, so 10 runs covers ~10 days max
             workflow_runs = []
+            max_runs_per_workflow = days * 5  # Allow up to 5 runs per day per workflow
 
-            while True:
+            while len(workflow_runs) < max_runs_per_workflow:
                 url = f"{self.base_url}/repos/{self.repo}/actions/runs"
                 params = {
                     "workflow_id": workflow_file,
