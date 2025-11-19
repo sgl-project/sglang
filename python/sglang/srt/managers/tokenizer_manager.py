@@ -39,8 +39,8 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
-from python.sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
