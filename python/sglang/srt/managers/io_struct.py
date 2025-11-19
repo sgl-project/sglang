@@ -542,10 +542,10 @@ class GenerateReqInput(BaseReq):
     def _validate_custom_logit_processor(self):
         """Validate the provided custom_logit_processor parameter."""
         # Check the custom_logit_processor is a validate class path
-        if not self.custom_logit_processor is None:
+        if self.custom_logit_processor is not None:
             if isinstance(self.custom_logit_processor, list):
                 for clp in self.custom_logit_processor:
-                    if not clp is None:
+                    if clp is not None:
                         self._validate_single_custom_logit_processor(clp)
             elif isinstance(self.custom_logit_processor, str):
                 self._validate_single_custom_logit_processor(
