@@ -326,26 +326,19 @@ class SGLangFailuresAnalyzer:
             ):
                 if runner_had_failure[runner_key]:
                     runner_current_streak[runner_key] += 1
-
-                    # Track if this is the first failure in a new streak
-                    if runner_current_streak[runner_key] == 1:
-                        failure_info = {
-                            **run_info,
-                            "runner_key": runner_key,
-                        }
-                        # Include job URL if we have it
-                        if runner_key in runner_first_failed_job:
-                            failure_info.update(runner_first_failed_job[runner_key])
-                        runner_first_failure_in_streak[runner_key] = failure_info
-
-                    # Always update last failure to the most recent one
                     failure_info = {
                         **run_info,
                         "runner_key": runner_key,
                     }
+
                     # Include job URL if we have it
                     if runner_key in runner_first_failed_job:
                         failure_info.update(runner_first_failed_job[runner_key])
+
+                    # Track if this is the first failure in a new streak
+                    if runner_current_streak[runner_key] == 1:
+                        runner_first_failure_in_streak[runner_key] = failure_info
+                    # Always update last failure to the most recent one
                     runner_last_failure_in_streak[runner_key] = failure_info
 
                     # Update max streak
@@ -576,11 +569,11 @@ class SGLangFailuresAnalyzer:
             runner_instance_streak_data,
         )
 
-    def _extract_error_signature(self, job: Dict) -> Optional[str]:
+    def _extract_error_signature(self, job: Dict) -> str:
         """
         Extract error signature from a failed job.
 
-        Returns a simplified error type string, or None if unable to extract.
+        Returns a simplified error type string.
         """
         # Check if job has steps with failures
         steps = job.get("steps", [])
