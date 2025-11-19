@@ -1095,7 +1095,7 @@ class FlashInferFP4MoE(FusedMoE):
             symm_output = torch.empty(
                 num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
             )
-        
+
         # Some dtype or value requirements for the flashinfer trtllm kernels.
         router_logits = (
             router_logits.to(torch.float32)
