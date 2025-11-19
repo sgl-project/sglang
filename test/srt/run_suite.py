@@ -220,6 +220,7 @@ suites = {
         TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
     ],
     "nightly-4-gpu": [
+        TestFile("nightly/test_encoder_dp.py", 500),
         TestFile("test_qwen3_next_deterministic.py", 200),
     ],
     "nightly-8-gpu": [],
@@ -384,7 +385,7 @@ suite_amd = {
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
-        TestFile("lora/test_lora.py", 150),
+        TestFile("lora/test_lora.py", 665),
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
@@ -534,6 +535,9 @@ suite_ascend = {
     "per-commit-16-ascend-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
         TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+    ],
+    "__not_in_ascend_ci__": [
+        TestFile("ascend/test_mindspore_models.py"),
     ],
 }
 
