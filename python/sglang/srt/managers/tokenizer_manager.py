@@ -69,6 +69,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
 from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -82,6 +83,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
+    extract_trace_headers,
     trace_get_proc_propagate_context,
     trace_req_finish,
     trace_req_start,
@@ -140,8 +142,8 @@ class ReqState:
     finished_time_perf: float = 0.0
     first_token_time_perf: float = 0.0
 
-    request_scheduled_ts: float = 0.0
-    response_sent_ts: float = 0.0
+    request_sent_to_scheduler_ts: float = 0.0
+    response_sent_to_client_ts: float = 0.0
 
     # For streaming output
     last_output_offset: int = 0
@@ -322,6 +324,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
+        # Initialize performance metrics loggers with proper skip names
+        _, obj_skip_names, out_skip_names = self.log_request_metadata
+        self.request_metrics_exporter_manager = RequestMetricsExporterManager(
+            self.server_args, obj_skip_names, out_skip_names
+        )
+
         # Session
         self.session_futures = {}  # session_id -> asyncio event
 
@@ -411,14 +419,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        if request and "trace_context" in request.headers:
-            trace_set_remote_propagate_context(request.headers["trace_context"])
+        external_trace_header = None
+        if request:
+            if "trace_context" in request.headers:
+                trace_set_remote_propagate_context(request.headers["trace_context"])
+            else:
+                external_trace_header = extract_trace_headers(request.headers)
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
         if self.enable_trace:
-            self._trace_request_start(obj, created_time)
+            self._trace_request_start(obj, created_time, external_trace_header)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -922,7 +934,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
-        state.request_scheduled_ts = time.time()
+        state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
         trace_slice_end(
             RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
@@ -980,11 +992,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             state.out_list = []
             if state.finished:
-                # For non-streaming cases, response has not been sent yet (`response_sent_ts` has not been set yet).
+                # For non-streaming cases, response has not been sent yet (`response_sent_to_client_ts` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
-                if not state.response_sent_ts:
-                    state.response_sent_ts = time.time()
-                    out["meta_info"]["response_sent_ts"] = state.response_sent_ts
+                if not state.response_sent_to_client_ts:
+                    state.response_sent_to_client_ts = time.time()
+                    out["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.response_sent_to_client_ts
                 if self.log_requests:
                     max_length, skip_names, out_skip_names = self.log_request_metadata
                     if self.model_config.is_multimodal_gen:
@@ -992,6 +1006,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     else:
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
+
+                if self.request_metrics_exporter_manager.exporter_enabled():
+                    # Asynchronously write metrics for this request using the exporter manager.
+                    asyncio.create_task(
+                        self.request_metrics_exporter_manager.write_record(obj, out)
+                    )
 
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
@@ -1036,9 +1056,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if obj.stream:
                 # Record response sent time right before we send response.
-                if not state.response_sent_ts:
-                    state.response_sent_ts = time.time()
-                    out["meta_info"]["response_sent_ts"] = state.response_sent_ts
+                if not state.response_sent_to_client_ts:
+                    state.response_sent_to_client_ts = time.time()
+                    out["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.response_sent_to_client_ts
                 yield out
             else:
                 if (
@@ -1168,7 +1190,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def pause_generation(self):
         async with self.is_pause_cond:
             self.is_pause = True
-            self.abort_request(abort_all=True)
+            # we are using the model_update_lock to check if there is still on-going requests.
+            while True:
+                # TODO: maybe make it async instead of fire-and-forget
+                self.abort_request(abort_all=True)
+                is_locked = await self.model_update_lock.is_locked()
+                if not is_locked:
+                    break
+                await asyncio.sleep(1.0)
 
     async def continue_generation(self):
         async with self.is_pause_cond:
@@ -1194,7 +1223,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
-                return await self._wait_for_model_update_from_disk(obj)
+                success, message, num_paused_requests = (
+                    await self._wait_for_model_update_from_disk(obj)
+                )
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message, num_paused_requests
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
@@ -1420,6 +1457,28 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
 
+    def _add_metric_if_present(
+        self,
+        recv_obj: Any,
+        attr_name: str,
+        meta_info: Dict[str, Any],
+        index: int,
+    ) -> None:
+        """Add a metric to meta_info if it exists and is not None.
+
+        Args:
+            recv_obj: The received object that may contain the metric attribute
+            attr_name: The name of the attribute to check
+            meta_info: The dictionary to add the metric to
+            index: The index to access the metric value in the attribute list
+        """
+        if (
+            hasattr(recv_obj, attr_name)
+            and getattr(recv_obj, attr_name)
+            and getattr(recv_obj, attr_name)[index] is not None
+        ):
+            meta_info[attr_name] = getattr(recv_obj, attr_name)[index]
+
     def _handle_batch_output(
         self,
         recv_obj: Union[
@@ -1446,26 +1505,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 "total_retractions": recv_obj.retraction_counts[i],
             }
 
-            if (
-                hasattr(recv_obj, "queue_time")
-                and recv_obj.queue_time
-                and recv_obj.queue_time[i] is not None
-            ):
-                meta_info["queue_time"] = recv_obj.queue_time[i]
-
-            if (
-                hasattr(recv_obj, "prefill_delay")
-                and recv_obj.prefill_delay
-                and recv_obj.prefill_delay[i] is not None
-            ):
-                meta_info["prefill_delay"] = recv_obj.prefill_delay[i]
-
-            if (
-                hasattr(recv_obj, "prefill_latency")
-                and recv_obj.prefill_latency
-                and recv_obj.prefill_latency[i] is not None
-            ):
-                meta_info["prefill_latency"] = recv_obj.prefill_latency[i]
+            if self.enable_metrics:
+                self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
+                self._add_metric_if_present(
+                    recv_obj, "prefill_launch_delay", meta_info, i
+                )
+                self._add_metric_if_present(
+                    recv_obj, "prefill_launch_latency", meta_info, i
+                )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -1535,8 +1582,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
-                # Calculate timing metrics
-                self._calculate_timing_metrics(meta_info, state, recv_obj, i)
+                if self.enable_metrics:
+                    self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
                 trace_req_finish(rid, ts=int(state.finished_time * 1e9))
 
@@ -1739,6 +1786,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
+                meta_info["spec_accept_token_num"] = accepted_tokens
+                meta_info["spec_draft_token_num"] = total_draft_tokens
+                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
     def _calculate_timing_metrics(
         self,
@@ -1756,16 +1806,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Request timing timestamps.
         if state.created_time > 0:
             meta_info["request_received_ts"] = state.created_time
-        if state.request_scheduled_ts > 0:
-            meta_info["request_scheduled_ts"] = state.request_scheduled_ts
+        if state.request_sent_to_scheduler_ts > 0:
+            meta_info["request_sent_to_scheduler_ts"] = (
+                state.request_sent_to_scheduler_ts
+            )
         # For embeddings, there's no separate prefill phase, so omit `prefill_finished_ts`.
         if (
             not isinstance(recv_obj, BatchEmbeddingOutput)
             and state.first_token_time > 0
         ):
             meta_info["prefill_finished_ts"] = state.first_token_time
-        if state.response_sent_ts > 0:
-            meta_info["response_sent_ts"] = state.response_sent_ts
+        if state.response_sent_to_client_ts > 0:
+            meta_info["response_sent_to_client_ts"] = state.response_sent_to_client_ts
         if state.finished_time > 0:
             meta_info["decode_finished_ts"] = state.finished_time
 
@@ -1776,8 +1828,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             and recv_obj.forward_entry_time[i] is not None
             and state.finished_time_perf > 0.0
         ):
-            forward_time = state.finished_time_perf - recv_obj.forward_entry_time[i]
-            meta_info["forward_time"] = forward_time
+            inference_time = state.finished_time_perf - recv_obj.forward_entry_time[i]
+            meta_info["inference_time"] = inference_time
 
         # Decode throughput, time per token calculation. Only calculated if TTFT is available.
         if (
@@ -1789,7 +1841,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             decode_time = state.finished_time_perf - state.first_token_time_perf
             completion_tokens = recv_obj.completion_tokens[i]
             meta_info["decode_throughput"] = completion_tokens / decode_time
-            meta_info["time_per_token"] = decode_time / completion_tokens
 
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
@@ -2286,6 +2337,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
+        external_trace_header: Optional[Dict] = None,
     ):
         if obj.is_single:
             bootstrap_room = (
@@ -2296,6 +2348,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 bootstrap_room,
                 ts=int(created_time * 1e9),
                 role=self.server_args.disaggregation_mode,
+                external_trace_header=external_trace_header,
             )
             trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
         else:
@@ -2310,6 +2363,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     bootstrap_room,
                     ts=int(created_time * 1e9),
                     role=self.server_args.disaggregation_mode,
+                    external_trace_header=external_trace_header,
                 )
                 trace_slice_start(
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True

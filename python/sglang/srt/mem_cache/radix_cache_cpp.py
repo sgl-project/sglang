@@ -44,7 +44,7 @@ class RadixCacheCpp(BasePrefixCache):
         disable: bool,
         use_hicache: bool,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: BaseTokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         hicache_ratio: float,
@@ -61,7 +61,7 @@ class RadixCacheCpp(BasePrefixCache):
         assert (
             enable_kv_cache_events is False
         ), "HiRadixCache does not support kv cache events yet"
-        self.kv_cache = token_to_kv_pool.get_kvcache()
+        self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
 
         # record the nodes with ongoing write through
         self.ongoing_write_through: Set[IOHandle] = set()
@@ -71,8 +71,8 @@ class RadixCacheCpp(BasePrefixCache):
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
         )
-        self.device = token_to_kv_pool.device
-        self.token_to_kv_pool = token_to_kv_pool
+        self.device = token_to_kv_pool_allocator.device
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.req_to_token_pool = req_to_token_pool
         self.page_size = page_size
 
@@ -146,12 +146,10 @@ class RadixCacheCpp(BasePrefixCache):
         start_time = time.perf_counter()
         evicted_device_indices = self.tree.evict(num_tokens)
         for indice in evicted_device_indices:
-            self.token_to_kv_pool.free(indice)
-        if evicted_device_indices and self.metrics_collector is not None:
-            self.metrics_collector.observe_eviction_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_eviction_num_tokens(num_tokens)
+            self.token_to_kv_pool_allocator.free(indice)
+
+        # FIXME: not sure about the real evict length here
+        self.update_eviction_metrics(num_tokens, start_time)
 
     def evictable_size(self):
         return self.tree.evictable_size()
@@ -165,15 +163,16 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
-        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
-        overall_len = len(token_ids)  # prefill + decode
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :overall_len]
+        kv_committed_len = req.pop_committed_kv_cache()
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        page_aligned_overall_len = overall_len // self.page_size * self.page_size
+        page_aligned_overall_len = kv_committed_len // self.page_size * self.page_size
 
         if is_insert:
             new_prefix_len = self._insert(
@@ -183,16 +182,18 @@ class RadixCacheCpp(BasePrefixCache):
             assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
             # Free duplicates that were already in the pool
             if old_prefix_len < new_prefix_len:
-                self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[old_prefix_len:new_prefix_len]
+                )
         else:
-            self.token_to_kv_pool.free(
+            self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_overall_len]
             )
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if page_aligned_overall_len < overall_len:
+        if page_aligned_overall_len < kv_committed_len:
             # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
-            self.token_to_kv_pool.free(kv_indices[page_aligned_overall_len:])
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -203,7 +204,9 @@ class RadixCacheCpp(BasePrefixCache):
         assert req.req_pool_idx is not None
         token_ids = req.fill_ids
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :prefill_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :prefill_len
+        ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
@@ -224,7 +227,9 @@ class RadixCacheCpp(BasePrefixCache):
         # KVCache between old & new is newly generated, but already exists in the pool
         # we need to free this newly generated kv indices and reuse the indices in the pool
         if old_prefix_len < new_prefix_len:
-            self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:new_prefix_len]
+            )
             reused_indices = new_indices[old_prefix_len:new_prefix_len]
             self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, old_prefix_len:new_prefix_len

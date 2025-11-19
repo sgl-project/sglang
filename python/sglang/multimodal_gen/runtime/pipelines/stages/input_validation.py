@@ -10,6 +10,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipelines import WanI2V480PConfig
+from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
 )
@@ -122,14 +123,14 @@ class InputValidationStage(PipelineStage):
         if isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
             height = None if batch.height_not_provided else batch.height
             width = None if batch.width_not_provided else batch.width
-            width, height = server_args.pipeline_config.set_width_and_height(
+            width, height = server_args.pipeline_config.adjust_size(
                 height, width, batch.pil_image
             )
             batch.width = width
             batch.height = height
         elif (
-            server_args.pipeline_config.ti2v_task
-            or server_args.pipeline_config.ti2i_task
+            server_args.pipeline_config.task_type == ModelTaskType.TI2V
+            or server_args.pipeline_config.task_type == ModelTaskType.I2I
         ) and batch.pil_image is not None:
             # further processing for ti2v task
             img = batch.pil_image

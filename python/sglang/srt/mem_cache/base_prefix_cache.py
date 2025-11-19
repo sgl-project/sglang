@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
@@ -59,6 +60,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         self.metrics_collector = RadixCacheMetricsCollector(
             labels={"cache_type": self.__class__.__name__}
         )
+
+    def update_eviction_metrics(self, num_evicted: int, start_time: float):
+        if self.metrics_collector is not None and num_evicted > 0:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     @abstractmethod
     def reset(self):
