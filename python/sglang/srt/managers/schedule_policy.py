@@ -251,7 +251,6 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_longest_output(
-        self,
         waiting_queue: List[Req],
         enable_priority_scheduling: bool,
         priority_sign: int,
@@ -271,7 +270,7 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_priority_and_fcfs(
-        self, waiting_queue: List[Req], priority_sign: int
+        waiting_queue: List[Req], priority_sign: int
     ) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
         waiting_queue.sort(
