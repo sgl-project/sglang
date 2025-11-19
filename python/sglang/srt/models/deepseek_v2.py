@@ -677,6 +677,7 @@ class DeepseekV2MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
+            alt_stream=alt_stream,
         )
 
         self.topk = TopK(

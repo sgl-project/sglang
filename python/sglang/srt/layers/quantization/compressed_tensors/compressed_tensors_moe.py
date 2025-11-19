@@ -8,7 +8,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 try:
-    from sgl_kernel import fused_marlin_moe
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 
     FUSED_MARLIN_MOE_AVAILABLE = True
 except ImportError:
@@ -57,7 +57,7 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fused_marlin_moe
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 
 logger = logging.getLogger(__name__)
 
@@ -664,5 +664,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             is_k_full=self.is_k_full,
             expert_map=torch.empty(1, device=x.device),
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            alt_stream=layer.alt_stream,
         )
         return StandardCombineInput(hidden_states=output)

@@ -55,7 +55,9 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle
+    from sgl_kernel import gptq_gemm, gptq_marlin_repack, gptq_shuffle
+
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 
 
 logger = logging.getLogger(__name__)
