@@ -49,9 +49,9 @@ class CustomLogitProcessor(ABC):
                 return clz()
             except Exception as from_cache_error:
                 raise ValueError(
-                    f"Failed to load custom logits processor. \
-                        The custom_logit_processor parameter should be a valid built-in class path or a serialized string of a class. \
-                            Please check the errors:\n {from_class_path_error}\n {from_cache_error}"
+                    "Failed to load custom logits processor. "
+                    "The custom_logit_processor parameter should be a valid built-in class path or a serialized string of a class. "
+                    f"Please check the errors:\n{from_class_path_error}\n{from_cache_error}"
                 )
 
     @classmethod
