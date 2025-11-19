@@ -417,6 +417,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         created_time = time.time()
         self.auto_create_handle_loop()
+
+        obj.validate()
         obj.normalize_batch_and_arguments()
 
         external_trace_header = None
