@@ -112,7 +112,7 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_hybrid_gdn_or_mamba2:
+        elif self.is_ssm_model:
             (
                 full_num_used,
                 _,
@@ -166,7 +166,7 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
-            if self.is_hybrid_gdn_or_mamba2:
+            if self.is_ssm_model:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
@@ -238,7 +238,7 @@ class SchedulerMetricsMixin:
                 f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_hybrid_gdn_or_mamba2:
+        elif self.is_ssm_model:
             (
                 full_num_used,
                 mamba_used,
@@ -315,7 +315,7 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
-            if self.is_hybrid_gdn_or_mamba2:
+            if self.is_ssm_model:
                 self.stats.mamba_usage = mamba_usage
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
