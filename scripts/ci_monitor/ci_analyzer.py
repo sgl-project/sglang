@@ -1060,8 +1060,8 @@ def main():
     )
     parser.add_argument(
         "--branch",
-        default="main",
-        help="Filter runs by branch (default: 'main'). Set to empty string '' to analyze all branches.",
+        default=None,
+        help="Filter runs by branch (default: None - all branches). Specify branch name to filter.",
     )
 
     args = parser.parse_args()
