@@ -1,7 +1,7 @@
 import unittest
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_programs import (
     test_decode_int,
     test_decode_json_regex,
@@ -20,6 +20,7 @@ from sglang.test.test_programs import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=80, suite="stage-a-test-1")
+register_amd_ci(est_time=120, suite="stage-a-test-1")
 
 
 class TestSRTBackend(CustomTestCase):

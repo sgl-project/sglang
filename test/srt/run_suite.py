@@ -385,7 +385,7 @@ suite_amd = {
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
-        TestFile("lora/test_lora.py", 150),
+        TestFile("lora/test_lora.py", 665),
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
@@ -514,25 +514,26 @@ suite_xpu = {
 }
 
 # Add Ascend NPU tests
+# TODO: Set accurate estimate time
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
-    "per-commit-1-ascend-npu": [
+    "per-commit-1-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
+        TestFile("ascend/test_ascend_tp1_bf16.py", 400),
     ],
-    "per-commit-2-ascend-npu": [
+    "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
         TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
         TestFile("ascend/test_ascend_tp2_bf16.py", 400),
         TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
     ],
-    "per-commit-4-ascend-npu": [
+    "per-commit-4-npu-a2": [
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
-    "per-commit-16-ascend-a3": [
+    "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
         TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
