@@ -68,7 +68,6 @@ class TransferInfo:
     engine_key: str
     dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
-    dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
 
@@ -89,8 +88,6 @@ class TransferInfo:
         else:
             dst_aux_index = -1
 
-        dst_state_indices: List[int] = []
-
         required_dst_info_num = (
             int(payload[7].decode("ascii")) if len(payload) > 7 else 1
         )
@@ -102,7 +99,6 @@ class TransferInfo:
             engine_key=engine_key,
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
-            dst_state_indices=dst_state_indices,
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
         )
@@ -446,11 +442,7 @@ class MoriKVManager(CommonKVManager):
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
         dst_total_layers = len(dst_mem_descs) // 2
-        if (
-            len(dst_mem_descs) < 2
-            or end_layer > dst_total_layers
-            or (dst_total_layers + end_layer) > len(dst_mem_descs)
-        ):
+        if len(dst_mem_descs) < 2 or end_layer > dst_total_layers:
             raise ValueError(
                 "Destination KV descriptors do not match prefill pp configuration"
             )
@@ -690,17 +682,16 @@ class MoriKVSender(CommonKVSender):
 
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status == KVPoll.Bootstrapping:
-            if self.init_time is not None:
-                elapsed = time.time() - self.init_time
-                if elapsed >= getattr(self.kv_mgr, "bootstrap_timeout", 300):
-                    reason = (
-                        f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-                        "waiting for decode handshake"
-                    )
-                    self.kv_mgr.record_failure(self.bootstrap_room, reason)
-                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                    self._finalize_failure(reason)
-                    return KVPoll.Failed
+            elapsed = time.time() - self.init_time
+            if elapsed >= getattr(self.kv_mgr, "bootstrap_timeout", 300):
+                reason = (
+                    f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+                    "waiting for decode handshake"
+                )
+                self.kv_mgr.record_failure(self.bootstrap_room, reason)
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self._finalize_failure(reason)
+                return KVPoll.Failed
             return status
 
         if status == KVPoll.Failed:
