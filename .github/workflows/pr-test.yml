@@ -343,7 +343,7 @@ jobs:
           pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   unit-test-backend-1-gpu:
-    needs: [stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -375,7 +375,7 @@ jobs:
           python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
   unit-test-backend-2-gpu:
-    needs: [unit-test-backend-1-gpu]
+    needs: [check-changes, unit-test-backend-1-gpu]
     runs-on: 2-gpu-runner
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -406,7 +406,7 @@ jobs:
           python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-4-gpu:
-    needs: [unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu]
     runs-on: 4-gpu-h100
     env:
       RUNNER_LABELS: 4-gpu-h100
@@ -437,7 +437,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu-h200:
-    needs: [unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu]
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
@@ -468,7 +468,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-backend-8-gpu-h20:
-    needs: [unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu]
     runs-on: 8-gpu-h20
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
@@ -500,7 +500,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
-    needs: [stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -559,7 +559,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
   performance-test-1-gpu-part-2:
-    needs: [stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -610,7 +610,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-1-gpu-part-3:
-    needs: [stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -660,7 +660,7 @@ jobs:
           rm -rf python/sglang/logs || true
 
   performance-test-2-gpu:
-    needs: [unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu]
     runs-on: 2-gpu-runner
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -717,7 +717,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
-    needs: [stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -747,7 +747,7 @@ jobs:
           python3 test_eval_accuracy_large.py
 
   accuracy-test-2-gpu:
-    needs: [accuracy-test-1-gpu]
+    needs: [check-changes, accuracy-test-1-gpu]
     runs-on: 2-gpu-runner
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -777,7 +777,7 @@ jobs:
           python3 test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
-    needs: [unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu]
     runs-on: 4-gpu-h100
     env:
       RUNNER_LABELS: 4-gpu-h100
@@ -804,7 +804,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep
 
   unit-test-deepep-8-gpu:
-    needs: [unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu]
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
@@ -831,7 +831,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
 
   unit-test-backend-4-gpu-b200:
-    needs: [unit-test-backend-2-gpu]
+    needs: [check-changes, unit-test-backend-2-gpu]
     runs-on: 4-gpu-b200
     env:
       RUNNER_LABELS: 4-gpu-b200
@@ -863,7 +863,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 2 --timeout-per-file 1800
 
   unit-test-backend-4-gpu-gb200:
-    needs: [unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-gb200
