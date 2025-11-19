@@ -100,7 +100,7 @@
                 "InputValidationStage": 0.08,
                 "TextEncodingStage": 87.36,
                 "ConditioningStage": 0.01,
-                "TimestepPreparationStage": 1.98,
+                "TimestepPreparationStage": 2.31,
                 "LatentPreparationStage": 4.95,
                 "DenoisingStage": 8161.97,
                 "DecodingStage": 378.21
