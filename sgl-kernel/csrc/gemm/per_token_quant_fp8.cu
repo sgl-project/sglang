@@ -17,12 +17,14 @@ __global__ void per_token_quant_fp8_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
     float* __restrict__ output_s,
+    float const* __restrict__ scale_ub,
     const int64_t hidden_dim,
     const int64_t num_tokens) {
   const int warp_id = threadIdx.x / kWarpSize;        // 0‑7  (8 warps)
   const int lane_id = threadIdx.x & (kWarpSize - 1);  // 0‑31
   const int token_id = blockIdx.x * kTokensPerCTA + warp_id;
   if (token_id >= num_tokens) return;
+  float const min_scaling_factor = 1.0f / (FP8_E4M3_MAX * 512.f);
 
   // Global tensors for this token
   const T* token_input = input + token_id * hidden_dim;
@@ -49,7 +51,14 @@ __global__ void per_token_quant_fp8_kernel(
   float warp_max = warpReduceMax(max_value);
 
   __shared__ float scale;
-  scale = warp_max / FP8_E4M3_MAX;
+
+  if (scale_ub) {
+    scale = min(warp_max, *scale_ub);
+  } else {
+    scale = warp_max;
+  }
+
+  scale = max(scale / FP8_E4M3_MAX, min_scaling_factor);
   // Broadcast scale
   if (lane_id == 0) {
     token_scale[0] = scale;
@@ -94,6 +103,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
     float* __restrict__ output_s,
+    float const* __restrict__ scale_ub,
     const int64_t hidden_dim,
     const int64_t num_tokens) {
   const int token_idx = blockIdx.x;
@@ -101,6 +111,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
 
   const int tid = threadIdx.x;
   const int block_dim = blockDim.x;
+  float const min_scaling_factor = 1.0f / (FP8_E4M3_MAX * 512.f);
 
   const T* token_input = input + token_idx * hidden_dim;
   DST_DTYPE* token_output = output_q + token_idx * hidden_dim;
@@ -127,7 +138,13 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
 
   __shared__ float scale;
   if (tid == 0) {
-    scale = max_value / FP8_E4M3_MAX;
+    if (scale_ub) {
+      scale = min(max_value, *scale_ub);
+    } else {
+      scale = max_value;
+    }
+    // token scale computation
+    scale = max(scale / FP8_E4M3_MAX, min_scaling_factor);
     output_s[token_idx] = scale;
   }
   __syncthreads();
@@ -163,7 +180,11 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   }
 }
 
-void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s) {
+void sgl_per_token_quant_fp8(
+    torch::Tensor const& input,
+    torch::Tensor& output_q,
+    torch::Tensor& output_s,
+    std::optional<at::Tensor> const& scale_ub) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
@@ -191,6 +212,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
+            scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
             hidden_dim,
             num_tokens);
       } else if (use_vec8) {
@@ -198,6 +220,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
+            scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
             hidden_dim,
             num_tokens);
       } else {
@@ -219,6 +242,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
+            scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
             hidden_dim,
             num_tokens);
       } else if (use_vec8) {
@@ -226,6 +250,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
+            scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
             hidden_dim,
             num_tokens);
       } else {
