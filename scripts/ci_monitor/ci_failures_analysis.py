@@ -55,6 +55,8 @@ class SGLangFailuresAnalyzer:
             "check-changes",
             "pr-test-finish",  # Nvidia workflow teardown
             "pr-test-amd-finish",  # AMD workflow teardown
+            "call-gate",
+            "pr-gate",
         ]
 
     def get_recent_runs(self, limit: int = 500) -> List[Dict]:
@@ -639,6 +641,8 @@ class SGLangFailuresAnalyzer:
                         job_first_failure_in_streak[job_name] = {
                             **run_info,
                             "job_name": job_name,
+                            "job_id": job.get("id"),
+                            "job_url": job.get("html_url", run_info["url"]),
                             "conclusion": conclusion,
                         }
 
@@ -646,6 +650,8 @@ class SGLangFailuresAnalyzer:
                     job_last_failure_in_streak[job_name] = {
                         **run_info,
                         "job_name": job_name,
+                        "job_id": job.get("id"),
+                        "job_url": job.get("html_url", run_info["url"]),
                         "conclusion": conclusion,
                     }
 
@@ -1321,13 +1327,13 @@ class SGLangFailuresAnalyzer:
 
                         first_failure = alert.get("first_failure")
                         if first_failure:
-                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure['url']})"
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
                         else:
                             first_failure_str = "N/A"
 
                         last_failure = alert.get("last_failure")
                         if last_failure:
-                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure['url']})"
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
                         else:
                             last_failure_str = "N/A"
 
@@ -1472,13 +1478,13 @@ class SGLangFailuresAnalyzer:
                     # Get first and last failure info
                     first_failure = data.get("first_failure_in_streak")
                     if first_failure:
-                        first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure['url']})"
+                        first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
                     else:
                         first_failure_str = "N/A"
 
                     last_failure = data.get("last_failure_in_streak")
                     if last_failure:
-                        last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure['url']})"
+                        last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
                     else:
                         last_failure_str = "N/A"
 
