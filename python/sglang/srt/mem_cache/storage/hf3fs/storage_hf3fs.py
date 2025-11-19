@@ -120,7 +120,12 @@ def synchronized():
 
 
 def create_hf3fs_client(
-    path: str, size: int, bytes_per_page: int, entries: int, client_timeout: int, use_mock: bool = False
+    path: str,
+    size: int,
+    bytes_per_page: int,
+    entries: int,
+    client_timeout: int,
+    use_mock: bool = False,
 ) -> Hf3fsClient:
     """Factory function to create appropriate HF3FS client.
 
@@ -328,7 +333,7 @@ class HiCacheHF3FS(HiCacheStorage):
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
             entries=int(config["entries"]),
-            client_timeout=config.get('client_timeout', 5),
+            client_timeout=config.get("client_timeout", 5),
             dtype=dtype,
             metadata_client=metadata_client,
             is_mla_model=is_mla_model,
@@ -336,7 +341,6 @@ class HiCacheHF3FS(HiCacheStorage):
             use_mock_client=use_mock_client,
         )
 
-    
     def _batch_get(
         self,
         keys: List[str],
@@ -384,7 +388,6 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
-    
     def _batch_set(
         self,
         keys: List[str],
@@ -491,7 +494,6 @@ class HiCacheHF3FS(HiCacheStorage):
             logger.error(f"close HiCacheHF3FS: {e}")
         logger.info("close HiCacheHF3FS")
 
-   
     def get_stats(self):
         storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
