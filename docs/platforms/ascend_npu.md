@@ -46,54 +46,72 @@ conda create --name sglang_npu python=3.11
 conda activate sglang_npu
 ```
 
+#### CANN
+
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC1 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/softwareinst/instg/instg_0008.html?OS=openEuler&Software=cannToolKit)
+
 #### MemFabric Adaptor
 
-_TODO: MemFabric is still a working project yet open sourced til August/September, 2025. We will release it as prebuilt wheel package for now._
+_TODO: MemFabric is still a working project yet open sourced. We will release it as prebuilt wheel package for now._
 
-_Notice: Prebuilt wheel package is based on `aarch64`, please leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) to let us know the requests for `amd64` build._
-
-MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
+If you want to use PD disaggregation mode, you need to install MemFabric Adaptor. MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
+PLATFORRM can be "aarch64" or "x86_64"
 
 ```shell
-MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl"
+PLATFORM="aarch64"
+MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_${PLATFORM}.whl"
 MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
 wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
-Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release by the end of September, 2025.
+Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation.
 
 ```shell
 PYTORCH_VERSION=2.6.0
 TORCHVISION_VERSION=0.21.0
+TORCH_NPU_VERSION=2.6.0.post3
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
-
-PTA_VERSION="v7.1.0.1-pytorch2.6.0"
-PTA_NAME="torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
-PTA_URL="https://gitee.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
-wget -O "${PTA_NAME}" "${PTA_URL}" && pip install "./${PTA_NAME}"
+pip install torch_npu==$TORCH_NPU_VERSION
 ```
 
 #### vLLM
 
-vLLM is still a major prerequisite on Ascend NPU. Because of `torch==2.6.0` limitation, only vLLM v0.8.5 is supported.
+vLLM is still a major prerequisite on Ascend NPU.
 
 ```shell
-VLLM_TAG=v0.8.5
+VLLM_TAG=v0.11.1
 git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
-(cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
+(cd vllm && python use_existing_torch.py && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
 ```
 
 #### Triton on Ascend
+```shell
+BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64.run"
+BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${BISHENG_NAME}"
+wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
+```
+```shell
+pip install triton-ascend==3.2.0rc4
+```
+If you want to install Triton on Ascend nightly build or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
-_Notice:_ We recommend installing triton-ascend from source due to its rapid development, the version on PYPI can't keep up for know. This problem will be solved on Sep. 2025, afterwards `pip install` would be the one and only installing method.
-
-Please follow Triton-on-Ascend's [installation guide from source](https://gitee.com/ascend/triton-ascend#2%E6%BA%90%E4%BB%A3%E7%A0%81%E5%AE%89%E8%A3%85-triton-ascend) to install the latest `triton-ascend` package.
+#### SGLang Kernels NPU
+For installation of SGLang Kernels NPU check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
 
 #### DeepEP-compatible Library
-
 We are also providing a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+
+### CustomOps
+_TODO: to be removed once merged into sgl-kernel-npu
+```shell
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
+chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
+./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+```
 
 #### Installing SGLang from source
 
