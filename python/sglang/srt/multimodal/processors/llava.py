@@ -125,51 +125,59 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
         if isinstance(image_data, list) and len(image_data) > 0:
             if "multi-images" in modalities or "video" in modalities:
-                # Multiple images
-                aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
-                pixel_values, data_hashes, image_sizes = [], [], []
-                res = []
-                for img_data in image_data:
-                    res.append(
+                # 多图：强制 pad；逐图处理并逐图返回一个 item
+                aspect_ratio = "pad"
+                res = await asyncio.gather(
+                    *[
                         self._process_single_image(
                             img_data, aspect_ratio, grid_pinpoints
                         )
+                        for img_data in image_data
+                    ]
+                )
+                pixel_values_list, data_hashes, image_sizes = [], [], []
+                for pv, h, s in res:
+                    pixel_values_list.append(pv)  # 每张图的 pixel_values
+                    data_hashes.append(h)
+                    image_sizes.append(s)
+
+                # 构造逐图的 mm_items（关键：original_index）
+                mm_items = []
+                for idx, (pv, sz) in enumerate(zip(pixel_values_list, image_sizes)):
+                    # LLaVA 编码前是 numpy；encoder 内部会处理
+                    mm_items.append(
+                        MultimodalDataItem(
+                            feature=pv,
+                            model_specific_data={
+                                "image_sizes": [sz],
+                                "original_index": idx,  # ★ 关键：与 image_offsets 对齐
+                            },
+                            modality=(
+                                Modality.MULTI_IMAGES
+                                if "multi-images" in modalities
+                                else Modality.VIDEO
+                            ),
+                        )
                     )
-
-                res = await asyncio.gather(*res)
-                for pixel_v, image_h, image_s in res:
-                    pixel_values.append(pixel_v)
-                    data_hashes.append(image_h)
-                    image_sizes.append(image_s)
-
-                if isinstance(pixel_values[0], np.ndarray):
-                    pixel_values = np.stack(pixel_values, axis=0)
             else:
-                # A single image
+                # 单图：原逻辑
                 pixel_values, image_hash, image_size = await self._process_single_image(
                     image_data[0], aspect_ratio, grid_pinpoints
                 )
-                image_sizes = [image_size]
+                mm_items = [
+                    MultimodalDataItem(
+                        feature=pixel_values,
+                        model_specific_data={
+                            "image_sizes": [image_size],
+                            "original_index": 0,
+                        },
+                        modality=Modality.IMAGE,
+                    )
+                ]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
-        modality = Modality.IMAGE
-        if isinstance(request_obj.modalities, list):
-            if request_obj.modalities[0] == "multi-images":
-                modality = Modality.MULTI_IMAGES
-            elif request_obj.modalities[0] == "video":
-                modality = Modality.VIDEO
 
-        return {
-            "mm_items": [
-                MultimodalDataItem(
-                    feature=pixel_values,
-                    model_specific_data={
-                        "image_sizes": image_sizes,
-                    },
-                    modality=modality,
-                )
-            ],
-        }
+        return {"mm_items": mm_items}
 
 
 class LlavaMultimodalProcessor(BaseMultimodalProcessor):

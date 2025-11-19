@@ -152,26 +152,20 @@ class LlavaBaseForCausalLM(nn.Module):
         self,
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
-        forward_batch: ForwardBatch,
+        forward_batch,
     ) -> torch.Tensor:
         image_inputs = forward_batch.mm_inputs
 
         if forward_batch.forward_mode.is_extend():
-            # Clamp input ids. This is because the input_ids for the image tokens are
-            # filled with the hash values of the image for the prefix matching in the radix attention.
-            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+            # 图片占位的哈希 token 需要 clamp；真正的视觉特征稍后会覆盖
             input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
-            # Embed text inputs
+            # 文本嵌入；稍后把视觉特征 scatter 回到这里
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            # Got List[List[str]] extend it to List[str]
-            # The length of the List should be equal to batch size
-            modalities_list = []
+            # 计算哪些样本在本 step 需要填入视觉特征
             max_image_offset = []
             for im in image_inputs:
-                if im:
-                    modalities_list.extend([item.modality for item in im.mm_items])
                 if im and im.image_offsets:
                     max_image_offset.append(
                         np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
@@ -181,211 +175,353 @@ class LlavaBaseForCausalLM(nn.Module):
 
             start_positions = positions[forward_batch.extend_start_loc].cpu().numpy()
             need_vision = start_positions <= np.array(max_image_offset)
+            need_indices = [
+                i for i in range(forward_batch.batch_size) if need_vision[i]
+            ]
+
+            print(
+                f"[llava.forward] extend step: bs={forward_batch.batch_size} "
+                f"start_pos={start_positions.tolist()} "
+                f"max_image_offset={max_image_offset} "
+                f"need_indices={need_indices}"
+            )
 
             if need_vision.any():
                 bs = forward_batch.batch_size
+
+                # 每个需要视觉的请求包含的图片数（用于 split 分组）
+                per_req_img_counts = [
+                    len(image_inputs[i].mm_items) for i in range(bs) if need_vision[i]
+                ]
+                print(
+                    f"[llava.forward] per-req image counts (need only)={per_req_img_counts}"
+                )
+
+                # 扁平化像素与尺寸；encode 后再按请求还原二维分组结构 List[req][img]
                 pixel_values = flatten_nested_list(
                     [
                         [item.feature for item in image_inputs[i].mm_items]
-                        for i in range(bs)
-                        if need_vision[i]
+                        for i in need_indices
                     ]
                 )
-                image_sizes = [
+                image_sizes_grouped = [
                     flatten_nested_list(
                         [item.image_sizes for item in image_inputs[i].mm_items]
                     )
-                    for i in range(bs)
-                    if need_vision[i]
+                    for i in need_indices
                 ]
 
-                ########## Encode Image ########
+                if len(pixel_values) == 0:
+                    print("[llava.forward] no pixel_values -> fall back to LM only")
+                    return self.language_model(
+                        input_ids, positions, forward_batch, input_embeds=input_embeds
+                    )
 
-                if pixel_values[0].ndim == 4:
-                    # llava-hd: BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
-                    np.concatenate(pixel_values, axis=0)
-                    # ndim=4
+                # ---- 尺寸解析小工具：从 [(H,W)] / [[(H,W)]] 等结构里剥到 (H,W)
+                def _resolve_img_size(s):
+                    cur = s
+                    for _ in range(4):
+                        if isinstance(cur, (list, tuple)):
+                            if len(cur) == 0:
+                                break
+                            if isinstance(cur[0], (int, float)) and len(cur) >= 2:
+                                return int(cur[0]), int(cur[1])
+                            cur = cur[0]
+                        else:
+                            break
+                    return None
+
+                # ---- 统一二维化，避免 cat 时报维度不一致
+                def _to_2d(t: torch.Tensor) -> torch.Tensor:
+                    if t is None:
+                        return t
+                    if t.dim() == 2:
+                        return t
+                    if t.dim() == 3:
+                        # (#tiles_or_frames, H*W, hidden) -> (tiles*H*W, hidden)
+                        return t.flatten(0, 1)
+                    if t.dim() == 4:
+                        # 比如 (N, C, H, W) 等，将前 3 维合并为 tokens，最后一维作为 hidden
+                        return t.flatten(0, 2)
+                    # 其它情况：保留最后一维为 hidden，前面合并
+                    return t.view(-1, t.shape[-1])
+
+                ########## 1) 编码图片：保持 List[req][img] 结构 ##########
+                if pixel_values[0] is None:
+                    print(
+                        "[llava.forward] pixel_values[0] is None -> fall back to LM only"
+                    )
+                    return self.language_model(
+                        input_ids, positions, forward_batch, input_embeds=input_embeds
+                    )
+
+                if getattr(pixel_values[0], "ndim", None) == 4:
+                    # HD：每张图为 (num_patch, C=3, H, W)
+                    per_img_patch_counts = [img.shape[0] for img in pixel_values]
+                    print(
+                        f"[llava.forward] HD path: per_img_patch_counts={per_img_patch_counts}"
+                    )
                     concat_images = torch.tensor(
                         np.concatenate(pixel_values, axis=0),
                         device=self.vision_tower.device,
                     )
-                    image_features = self.encode_images(concat_images)
-                    split_sizes = [image.shape[0] for image in pixel_values]
-                    image_features = torch.split(image_features, split_sizes, dim=0)
-                    # hd image_features: BS, num_patch, 576, 4096
+                    flat_feats = self.encode_images(
+                        concat_images
+                    )  # (sum_patches, hidden)
+                    # 先按每张图的 patch 数拆，再按请求聚合
+                    per_img_feats = list(
+                        torch.split(flat_feats, per_img_patch_counts, dim=0)
+                    )
+                    image_features = []
+                    cursor = 0
+                    for cnt in per_req_img_counts:
+                        image_features.append(per_img_feats[cursor : cursor + cnt])
+                        cursor += cnt
+                    # 记录每张图编码后 tokens
+                    enc_tokens = [f.shape[0] for f in per_img_feats]
+                    print(f"[llava.forward] HD enc per-image tokens={enc_tokens}")
                 else:
-                    # normal pixel: BS, C=3, H=336, W=336
-                    pixel_values = torch.tensor(
+                    # normal：每张图 (3, H, W)，encode 输出 (sum_imgs, T, hidden)（通常 T=576）
+                    print(
+                        f"[llava.forward] normal path: num_images={len(pixel_values)} "
+                        f"sample_feature_shape={getattr(pixel_values[0], 'shape', None)}"
+                    )
+                    pixel_values_tensor = torch.tensor(
                         np.array(pixel_values), device=self.vision_tower.device
                     )
-                    image_features = self.encode_images(pixel_values)
-                    # image_features: BS, 576, 4096
+                    flat_feats = self.encode_images(
+                        pixel_values_tensor
+                    )  # (sum_imgs, T, hidden)
+                    per_req_feats = list(
+                        torch.split(flat_feats, per_req_img_counts, dim=0)
+                    )
+                    image_features = [
+                        list(req_feat) for req_feat in per_req_feats
+                    ]  # List[req][img]
+                    # 记录每张图编码后 tokens
+                    enc_tokens = (
+                        [f.shape[1] for f in flat_feats]
+                        if flat_feats.dim() == 3
+                        else []
+                    )
+                    if not enc_tokens:
+                        # 逐图统计
+                        tmp = []
+                        for req_feat in per_req_feats:
+                            for f in req_feat:
+                                tmp.append(
+                                    f.shape[0]
+                                    if f.dim() == 2
+                                    else (f.shape[1] if f.dim() == 3 else -1)
+                                )
+                        enc_tokens = tmp
+                    print(f"[llava.forward] normal enc per-image tokens={enc_tokens}")
 
+                ########## 2) 空间合并 / anyres / video 等后处理（严格使用 req_idx,image_idx 的尺寸） ##########
                 if self.mm_patch_merge_type.startswith("spatial"):
-                    new_image_features = []
                     height = width = self.num_patches_per_side
-                    for image_idx, image_feature in enumerate(image_features):
-                        if modalities_list[image_idx] == Modality.IMAGE:
-                            image_aspect_ratio = (
-                                self.config.image_aspect_ratio
-                            )  # single image
-                        elif (
-                            modalities_list[image_idx] == Modality.MULTI_IMAGES
-                            or modalities_list[image_idx] == Modality.VIDEO
-                        ):
-                            image_aspect_ratio = "pad"  # multi image
-                        # image_aspect_ratio = (
-                        #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
-                        # )
-                        if (
-                            image_feature.shape[0] > 1
-                            and "anyres" in image_aspect_ratio
-                            and modalities_list[image_idx] == Modality.IMAGE
-                        ):
-                            base_image_feature = image_feature[0]
-                            image_feature = image_feature[1:]
-                            assert height * width == base_image_feature.shape[0]
-
-                            if "anyres_max" in image_aspect_ratio:
-                                matched_anyres_max_num_patches = re.match(
-                                    r"anyres_max_(\d+)", image_aspect_ratio
-                                )
-                                if matched_anyres_max_num_patches:
-                                    max_num_patches = int(
-                                        matched_anyres_max_num_patches.group(1)
-                                    )
-
-                            if (
-                                image_aspect_ratio == "anyres"
-                                or "anyres_max" in image_aspect_ratio
-                            ):
-                                vision_tower_image_size = self.image_size
-                                try:
-                                    num_patch_width, num_patch_height = (
-                                        get_anyres_image_grid_shape(
-                                            image_sizes[image_idx][0],
-                                            self.config.image_grid_pinpoints,
-                                            vision_tower_image_size,
-                                        )
-                                    )
-                                except Exception as e:
-                                    print(f"Error: {e}")
-                                    num_patch_width, num_patch_height = 2, 2
-                                image_feature = image_feature.view(
-                                    num_patch_height, num_patch_width, height, width, -1
-                                )
-                            else:
-                                image_feature = image_feature.view(
-                                    2, 2, height, width, -1
-                                )
-
-                            # (
-                            #     num_patch_width,
-                            #     num_patch_height,
-                            # ) = get_anyres_image_grid_shape(
-                            #     image_sizes[image_idx][0],
-                            #     self.image_grid_pinpoints,
-                            #     self.vision_tower.config.image_size,
-                            # )
-
-                            # image_feature = image_feature.view(
-                            #     num_patch_height, num_patch_width, height, width, -1
-                            # )
-
-                            if "unpad" in self.mm_patch_merge_type:
-                                unit = image_feature.shape[2]
-                                image_feature = image_feature.permute(
-                                    4, 0, 2, 1, 3
-                                ).contiguous()
-                                image_feature = image_feature.flatten(1, 2).flatten(
-                                    2, 3
-                                )
-                                image_feature = unpad_image(
-                                    image_feature, image_sizes[image_idx][0]
-                                )
-                                if (
-                                    "anyres_max" in image_aspect_ratio
-                                    and matched_anyres_max_num_patches
-                                ):
-                                    c, h, w = image_feature.shape
-                                    times = math.sqrt(
-                                        h * w / (max_num_patches * unit**2)
-                                    )
-                                    if times > 1.1:
-                                        image_feature = image_feature[None]
-                                        image_feature = nn.functional.interpolate(
-                                            image_feature,
-                                            [int(h // times), int(w // times)],
-                                            mode="bilinear",
-                                        )[0]
-                                image_feature = torch.cat(
-                                    (
-                                        image_feature,
-                                        self.language_model.model.image_newline[
-                                            :, None, None
-                                        ].expand(*image_feature.shape[:-1], 1),
-                                    ),
-                                    dim=-1,
-                                )
-                                image_feature = image_feature.flatten(1, 2).transpose(
-                                    0, 1
-                                )
-                            else:
-                                image_feature = image_feature.permute(
-                                    0, 2, 1, 3, 4
-                                ).contiguous()
-                                image_feature = image_feature.flatten(0, 3)
-                            image_feature = torch.cat(
-                                (base_image_feature, image_feature), dim=0
+                    grouped_merged = []
+                    for req_idx, per_req in enumerate(image_features):
+                        merged_per_req = []
+                        for image_idx, image_feat in enumerate(per_req):
+                            # 当前图片的 modality 与尺寸（逐图取，不要用 0 号）
+                            modality = (
+                                image_inputs[need_indices[req_idx]]
+                                .mm_items[image_idx]
+                                .modality
                             )
-                            image_feature = image_feature.unsqueeze(0)
-                        else:
-                            if modalities_list[image_idx] == Modality.VIDEO:  # video
-                                # 2x2 pooling
-                                num_of_frames = image_feature.shape[0]
-                                image_feature = image_feature.view(
-                                    num_of_frames, height, width, -1
+                            raw_size = None
+                            if req_idx < len(image_sizes_grouped) and image_idx < len(
+                                image_sizes_grouped[req_idx]
+                            ):
+                                raw_size = _resolve_img_size(
+                                    image_sizes_grouped[req_idx][image_idx]
                                 )
-                                image_feature = image_feature.permute(
-                                    0, 3, 1, 2
-                                ).contiguous()  # N, C, H, W
-                                height, weight = image_feature.shape[2:]
-                                scaled_shape = [
-                                    math.ceil(height / 2),
-                                    math.ceil(weight / 2),
-                                ]
-                                image_feature = nn.functional.interpolate(
-                                    image_feature, size=scaled_shape, mode="bilinear"
-                                )
-                                image_feature = (
-                                    image_feature.flatten(2)
-                                    .transpose(1, 2)
-                                    .contiguous()
-                                )  # N, C, H*W
-                            if "unpad" in self.mm_patch_merge_type:
-                                image_feature = torch.cat(
-                                    (
-                                        image_feature,
-                                        # Expand to (bs, 1, hidden_dim) and concat at the end of the image tokens
-                                        self.language_model.model.image_newline[
-                                            None, None
-                                        ].expand(
-                                            image_feature.shape[0],
-                                            1,
-                                            image_feature.shape[-1],
+
+                            # multi-images / video 统一按 pad；单图走 config
+                            if modality == Modality.IMAGE:
+                                image_aspect_ratio = self.config.image_aspect_ratio
+                            elif modality in (Modality.MULTI_IMAGES, Modality.VIDEO):
+                                image_aspect_ratio = "pad"
+                            else:
+                                image_aspect_ratio = self.config.image_aspect_ratio
+
+                            print(
+                                f"[llava.forward] postproc req={need_indices[req_idx]} img={image_idx} "
+                                f"modality={modality} aspect={image_aspect_ratio} raw_size={raw_size} "
+                                f"feat_shape={tuple(image_feat.shape)}"
+                            )
+
+                            # ---- anyres 分支（仅单图 IMAGE 才会走）
+                            if (
+                                image_feat.shape[0] > 1
+                                and "anyres" in image_aspect_ratio
+                                and modality == Modality.IMAGE
+                            ):
+                                base_image_feature = _to_2d(
+                                    image_feat[0]
+                                )  # (H*W, hidden)
+                                tiles_feature = image_feat[
+                                    1:
+                                ]  # (tiles, H*W, hidden) 3D
+
+                                matched_anyres_max_num_patches = None
+                                if "anyres_max" in image_aspect_ratio:
+                                    matched_anyres_max_num_patches = re.match(
+                                        r"anyres_max_(\d+)", image_aspect_ratio
+                                    )
+                                    if matched_anyres_max_num_patches:
+                                        max_num_patches = int(
+                                            matched_anyres_max_num_patches.group(1)
+                                        )
+
+                                if (
+                                    image_aspect_ratio == "anyres"
+                                    or "anyres_max" in image_aspect_ratio
+                                ):
+                                    vision_tower_image_size = self.image_size
+                                    try:
+                                        if raw_size is None:
+                                            num_patch_width, num_patch_height = 2, 2
+                                        else:
+                                            num_patch_width, num_patch_height = (
+                                                get_anyres_image_grid_shape(
+                                                    raw_size,
+                                                    self.config.image_grid_pinpoints,
+                                                    vision_tower_image_size,
+                                                )
+                                            )
+                                    except Exception as e:
+                                        print(
+                                            f"[llava.forward][anyres] grid shape error: {e}"
+                                        )
+                                        num_patch_width, num_patch_height = 2, 2
+                                    # (tiles, H*W, hidden) -> (H_tiles, W_tiles, H, W, hidden)
+                                    tiles_feature = tiles_feature.view(
+                                        num_patch_height,
+                                        num_patch_width,
+                                        height,
+                                        width,
+                                        -1,
+                                    )
+                                else:
+                                    tiles_feature = tiles_feature.view(
+                                        2, 2, height, width, -1
+                                    )
+
+                                if "unpad" in self.mm_patch_merge_type:
+                                    unit = tiles_feature.shape[2]
+                                    tiles_feature = tiles_feature.permute(
+                                        4, 0, 2, 1, 3
+                                    ).contiguous()
+                                    tiles_feature = tiles_feature.flatten(1, 2).flatten(
+                                        2, 3
+                                    )
+                                    if raw_size is not None:
+                                        tiles_feature = unpad_image(
+                                            tiles_feature, raw_size
+                                        )
+                                    if (
+                                        "anyres_max" in image_aspect_ratio
+                                        and matched_anyres_max_num_patches
+                                    ):
+                                        c, h, w = tiles_feature.shape
+                                        times = math.sqrt(
+                                            h * w / (max_num_patches * unit * unit)
+                                        )
+                                        if times > 1.1:
+                                            tiles_feature = tiles_feature[None]
+                                            tiles_feature = nn.functional.interpolate(
+                                                tiles_feature,
+                                                [int(h // times), int(w // times)],
+                                                mode="bilinear",
+                                            )[0]
+                                    tiles_feature = torch.cat(
+                                        (
+                                            tiles_feature,
+                                            self.language_model.model.image_newline[
+                                                :, None, None
+                                            ].expand(*tiles_feature.shape[:-1], 1),
                                         ),
+                                        dim=-1,
+                                    )
+                                    tiles_feature = tiles_feature.flatten(
+                                        1, 2
+                                    ).transpose(
+                                        0, 1
+                                    )  # -> (tokens, hidden)
+                                else:
+                                    # non-unpad：拍平到 2D
+                                    tiles_feature = tiles_feature.permute(
+                                        0, 2, 1, 3, 4
+                                    ).contiguous()
+                                    tiles_feature = tiles_feature.flatten(
+                                        0, 3
+                                    )  # -> (tiles*H*W, hidden)
+
+                                # ✅ 保证 2D 再 cat
+                                tiles_feature = _to_2d(tiles_feature)
+                                base_image_feature = _to_2d(base_image_feature)
+                                image_feat = torch.cat(
+                                    (base_image_feature, tiles_feature), dim=0
+                                )  # (tokens, hidden)
+
+                            else:
+                                # ---- 非 anyres：保持 (tokens, hidden)；video 做 2x2 下采样后转 2D
+                                if modality == Modality.VIDEO:
+                                    num_of_frames = image_feat.shape[0]
+                                    image_feat = image_feat.view(
+                                        num_of_frames, height, width, -1
+                                    )
+                                    image_feat = image_feat.permute(
+                                        0, 3, 1, 2
+                                    ).contiguous()  # N,C,H,W
+                                    hh, ww = image_feat.shape[2:]
+                                    scaled = [math.ceil(hh / 2), math.ceil(ww / 2)]
+                                    image_feat = nn.functional.interpolate(
+                                        image_feat, size=scaled, mode="bilinear"
+                                    )
+                                    image_feat = (
+                                        image_feat.flatten(2)
+                                        .transpose(1, 2)
+                                        .contiguous()
+                                    )  # N, H*W, C
+
+                                image_feat = _to_2d(image_feat)  # ✅ 强制 2D
+
+                            # 统一在这里（按需）追加 newline（spatial-unpad 分支已经追加过）
+                            if "unpad" in self.mm_patch_merge_type:
+                                image_feat = torch.cat(
+                                    (
+                                        image_feat,
+                                        self.language_model.model.image_newline[
+                                            None, :
+                                        ].expand(1, image_feat.shape[-1]),
                                     ),
-                                    dim=1,
+                                    dim=0,
                                 )
 
-                        new_image_features.append(image_feature)
-                    image_features = new_image_features
+                            print(
+                                f"[llava.forward] postproc out req={need_indices[req_idx]} img={image_idx} "
+                                f"tokens={image_feat.shape[0]}"
+                            )
+                            merged_per_req.append(image_feat)  # (tokens, hidden)
+                        grouped_merged.append(merged_per_req)
+                    image_features = (
+                        grouped_merged  # List[req][img], each (tokens, hidden)
+                    )
 
-                # Fill in the placeholder for the image
+                ########## 3) 把每张图的 tokens scatter 回本 step 的 input_embeds ##########
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
                 extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
                 prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-                pt = 0
+
+                print(
+                    f"[llava.forward] scatter window: start={extend_start_loc_cpu.tolist()} "
+                    f"seqlen={extend_seq_lens.tolist()} prefix={prefix_lens_cpu}"
+                )
+
+                pt = 0  # 指向 image_features 中“第几个需要视觉的请求”
                 for i in range(bs):
                     if not need_vision[i]:
                         continue
@@ -394,46 +530,126 @@ class LlavaBaseForCausalLM(nn.Module):
                     seq_len = extend_seq_lens[i]
                     prefix_len = prefix_lens_cpu[i]
 
-                    # Multiple images
+                    if pt >= len(image_features):
+                        print(
+                            f"[llava.forward] pt({pt}) >= len(image_features)({len(image_features)}), break"
+                        )
+                        break  # 安全保护
+
+                    # === 基于 model_specific_data.original_index 构建取数映射 ===
+                    mm_items_i = getattr(image_inputs[i], "mm_items", []) or []
+                    index_by_orig = {}
+                    for j, it in enumerate(mm_items_i):
+                        msd = getattr(it, "model_specific_data", None) or {}
+                        orig = msd.get("original_index", j)
+                        index_by_orig[orig] = j
+
+                    # 逐图 scatter
                     for image_idx, image_offset in enumerate(
                         image_inputs[i].image_offsets
                     ):
-                        if (
-                            image_offset + image_inputs[i].image_pad_len[image_idx]
-                            <= prefix_len
-                        ):
+                        fetch_idx = index_by_orig.get(image_idx, image_idx)
+
+                        if fetch_idx >= len(image_features[pt]):
+                            print(
+                                f"[llava.forward][skip] req={i} img={image_idx} fetch_idx={fetch_idx} "
+                                f">= len(image_features[{pt}])={len(image_features[pt])}"
+                            )
+                            continue  # 安全保护
+
+                        placeholder_len = image_inputs[i].image_pad_len[image_idx]
+
+                        # 完全在 prefix 左侧或右侧则跳过
+                        if (image_offset + placeholder_len) <= prefix_len:
+                            print(
+                                f"[llava.forward][skip-left] req={i} img={image_idx} "
+                                f"offset={image_offset} placeholder={placeholder_len} prefix={prefix_len}"
+                            )
                             continue
                         if image_offset >= prefix_len + seq_len:
+                            print(
+                                f"[llava.forward][skip-right] req={i} img={image_idx} "
+                                f"offset={image_offset} seq_end={prefix_len + seq_len}"
+                            )
                             break
 
-                        tmp_image_feature = image_features[pt][image_idx]
-                        pad_len = tmp_image_feature.shape[0]
+                        tmp_image_feature = image_features[pt][
+                            fetch_idx
+                        ]  # (tokens, hidden)
+                        if tmp_image_feature.dim() != 2:
+                            tmp_image_feature = _to_2d(tmp_image_feature)
+                            if tmp_image_feature.dim() != 2:
+                                print(
+                                    f"[llava.forward][skip-shape] req={i} img={image_idx} "
+                                    f"feat_dim={tmp_image_feature.dim()}"
+                                )
+                                continue
 
+                        enc_len = tmp_image_feature.shape[0]
                         input_offset = image_offset - prefix_len
                         left_idx = start_idx + input_offset
-                        right_idx = left_idx + pad_len
-                        assert right_idx > start_idx
-                        if input_offset < 0:
-                            left_idx = start_idx
-                            tmp_image_feature = tmp_image_feature[-input_offset:]
+                        right_idx = left_idx + enc_len
+
+                        print(
+                            f"[llava.forward] scatter req={i} img={image_idx} "
+                            f"fetch_idx={fetch_idx} offset={image_offset} "
+                            f"pad_len(placeholder)={placeholder_len} pad_len(enc)={enc_len} "
+                            f"window=[{start_idx},{start_idx+seq_len}) "
+                            f"write=[{left_idx},{right_idx})"
+                        )
+
+                        # 左裁剪
+                        if left_idx < start_idx:
+                            cut = start_idx - left_idx
+                            if cut < enc_len:
+                                tmp_image_feature = tmp_image_feature[cut:]
+                                left_idx = start_idx
+                            else:
+                                print(
+                                    f"[llava.forward][skip-cut-left] req={i} img={image_idx} cut={cut} >= enc_len={enc_len}"
+                                )
+                                continue
+
+                        # 右裁剪
                         if right_idx > start_idx + seq_len:
-                            tmp_image_feature = tmp_image_feature[
-                                : start_idx + seq_len - right_idx
-                            ]
-                            right_idx = start_idx + seq_len
-                        try:
-                            input_embeds[left_idx:right_idx] = tmp_image_feature
-                        except RuntimeError as e:
-                            print(f"RuntimeError in image encoding: {e}")
-                            print(f"{input_embeds.shape=}, {tmp_image_feature.shape=}")
+                            cut = right_idx - (start_idx + seq_len)
+                            if cut < tmp_image_feature.shape[0]:
+                                tmp_image_feature = tmp_image_feature[:-cut]
+                                right_idx = start_idx + seq_len
+                            else:
+                                print(
+                                    f"[llava.forward][skip-cut-right] req={i} img={image_idx} cut={cut} >= cur_len={tmp_image_feature.shape[0]}"
+                                )
+                                continue
+
+                        if right_idx > left_idx and tmp_image_feature.numel() > 0:
+                            try:
+                                input_embeds[left_idx:right_idx] = tmp_image_feature
+                                print(
+                                    f"[llava.forward] scatter OK req={i} img={image_idx} "
+                                    f"final_write=[{left_idx},{right_idx}) tokens={tmp_image_feature.shape[0]}"
+                                )
+                            except RuntimeError as e:
+                                print(f"[llava.forward][scatter-failed] {e}")
+                                print(
+                                    f"{input_embeds.shape=}, {tmp_image_feature.shape=}"
+                                )
+                                print(
+                                    f"{start_idx=}, {image_offset=}, {prefix_len=}, {enc_len=}"
+                                )
+                        else:
                             print(
-                                f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
+                                f"[llava.forward][skip-empty] req={i} img={image_idx} "
+                                f"write=[{left_idx},{right_idx})"
                             )
+
                     pt += 1
 
+            # 进入语言模型
             return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
+
         elif forward_batch.forward_mode.is_decode():
             return self.language_model(input_ids, positions, forward_batch)
 

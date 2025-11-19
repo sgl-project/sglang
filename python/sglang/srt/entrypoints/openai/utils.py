@@ -1,9 +1,13 @@
-import io
+import base64
 import logging
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Union
 
 import requests
 from PIL import Image
+
+logger = logging.getLogger(__name__)
+
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -166,125 +170,295 @@ def process_hidden_states_from_ret(
     return hidden_states
 
 
-def _download_bytes(url: str, timeout: float = 10.0) -> bytes:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.content
-
-
-def _image_from_url(url: str) -> Image.Image:
-    raw = _download_bytes(url)
-    return Image.open(io.BytesIO(raw)).convert("RGB")
-
-
-def _audio_wave_from_url(url: str, target_sr: int = 16000):
-    """Return (wave: torch.FloatTensor[1, T], sr) or (None, None) on fatal error."""
-    if torch is None:
-        return None, None
-
-    # 1) try soundfile
-    try:
-        import soundfile as sf  # type: ignore
-
-        raw = _download_bytes(url)
-        data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
-        if data.ndim == 2:
-            data = data.mean(axis=1)  # mono
-        wave = torch.from_numpy(data).unsqueeze(0)  # [1, T]
-        if sr != target_sr:
-            import librosa  # type: ignore
-
-            data_rs = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
-            wave = torch.from_numpy(data_rs).unsqueeze(0)
-            sr = target_sr
-        return wave.contiguous(), sr
-    except Exception as e:
-        logger.warning(f"[openai.adapter] soundfile decode failed: {e}")
-
-    # 2) try torchaudio (http stream → bytes)
-    try:
-        import torchaudio  # type: ignore
-
-        raw = _download_bytes(url)
-        wav, sr = torchaudio.load(io.BytesIO(raw))
-        if wav.dim() == 2 and wav.size(0) > 1:
-            wav = wav.mean(dim=0, keepdim=True)  # mono [1,T]
-        if sr != target_sr:
-            wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
-            sr = target_sr
-        return wav.contiguous().float(), sr
-    except Exception as e:
-        logger.warning(f"[openai.adapter] torchaudio decode failed: {e}")
-
-    return None, None
-
-
-def build_mm_inputs_from_openai_messages(
+def normalize_openai_messages_for_mm(
     messages: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
-    Parse OpenAI-style chat messages and build SGLang mm_inputs list.
-    Only image/audio parts are materialized here; text is handled by prompt builder.
-
-    Returns: List[MultimodalDataItem-like dict]
+    规范化多模态消息的 content 顺序：
+      - 把每条 message 中的图片段(image_url/input_image)移到文本段之后
+      - 为所有图片段补充 modalities="multi-images"（用于下游选择 pad 策略/占位策略）
+      - 严格保留“出现顺序”→ 注入 model_specific_data.original_index（若缺失）
+    这样，后续按 content 顺序插入 <image> 占位时，offset 将位于文本之后（>= prefix_len）。
     """
-    mm_items: List[Dict[str, Any]] = []
+    normed = []
     for msg in messages:
         content = msg.get("content", None)
         if not isinstance(content, list):
+            normed.append(msg)
             continue
+
+        text_parts, image_parts, other_parts = [], [], []
+        local_img_idx = 0
         for part in content:
             ptype = part.get("type")
-            # ---------- image ----------
             if ptype in ("image_url", "input_image"):
+                # 标注 multi-images
+                part = dict(part)
+                part.setdefault("modalities", "multi-images")
+                # 注入 original_index，用于与 mm_items 对齐（如果上层没给）
+                msd = part.setdefault("model_specific_data", {})
+                msd.setdefault("original_index", local_img_idx)
+                image_parts.append(part)
+                local_img_idx += 1
+            elif ptype == "text":
+                text_parts.append(part)
+            else:
+                other_parts.append(part)
+
+        # 文本优先，其次其它（如tool等），最后图片
+        new_content = text_parts + other_parts + image_parts
+        new_msg = dict(msg)
+        new_msg["content"] = new_content
+        normed.append(new_msg)
+    return normed
+
+
+def build_mm_inputs_from_openai_messages(messages: List[dict]) -> List[dict]:
+    """
+    从（可能是 dict+Pydantic 混合）的 messages 中提取图片/音频条目，返回统一的 mm_items：
+      - {"format":"image","image":PIL.Image,"model_specific_data":{"original_index":i}}
+      - 或 {"format":"image_url","url":...}
+      - 音频保留为 {"format":"audio","feature":None}
+    """
+    from io import BytesIO
+
+    import requests
+    from PIL import Image  # type: ignore
+
+    mm_items: List[dict] = []
+
+    for msg in messages or []:
+        content = _get(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+
+        local_img_idx = 0
+        for part in content:
+            ptype = _get(part, "type", None)
+
+            if ptype in ("image_url", "input_image"):
+                image_url_obj = _get(part, "image_url", None) or _get(part, "url", None)
+                url = (
+                    _get_url_from_image_obj(image_url_obj)
+                    if image_url_obj
+                    else _get(part, "url", None)
+                )
+                if not url:
+                    continue
+                # 优先尝试下载→PIL（离线失败则 URL 透传）
                 try:
-                    url = (
-                        part["image_url"]["url"]
-                        if "image_url" in part
-                        else part.get("url")
-                    )
-                    img = _image_from_url(url)
+                    resp = requests.get(url, timeout=10)
+                    resp.raise_for_status()
+                    img = Image.open(BytesIO(resp.content)).convert("RGB")
                     mm_items.append(
                         {
                             "format": "image",
-                            "image": img,  # schedule_batch.py 会识别 PIL.Image
+                            "image": img,
+                            "model_specific_data": {"original_index": local_img_idx},
                         }
                     )
-                except Exception as e:
-                    logger.warning(f"[openai.adapter] image_url load failed: {e}")
-            # ---------- audio ----------
+                except Exception:
+                    mm_items.append(
+                        {
+                            "format": "image_url",
+                            "url": url,
+                            "model_specific_data": {"original_index": local_img_idx},
+                        }
+                    )
+                local_img_idx += 1
+
             elif ptype in ("audio_url", "input_audio"):
-                url = None
-                if "audio_url" in part and isinstance(part["audio_url"], dict):
-                    url = part["audio_url"].get("url")
-                elif "url" in part:
-                    url = part["url"]
-                if url is None:
-                    logger.warning("[openai.adapter] audio part missing url")
-                    continue
-
-                wave, sr = _audio_wave_from_url(url, target_sr=16000)
-                if wave is None:
-                    # minimal placeholder to keep pipeline alive
-                    if torch is not None:
-                        wave = torch.zeros(1, 16000, dtype=torch.float32)
-                        sr = 16000
-                        logger.warning(
-                            "[openai.adapter] use zero-audio placeholder(1s@16k)"
-                        )
-                    else:
-                        logger.warning(
-                            "[openai.adapter] torch not available; skip audio item"
-                        )
-                        continue
-
-                mm_items.append(
-                    {
-                        "format": "audio",
-                        # 关键字段：调度器需要能“看见一个张量”，用于 pad / dtype 判断
-                        "feature": wave,  # shape [1, T], float32
-                        "sampling_rate": sr,
-                    }
+                # 不在这里解码音频，交给后端；避免误入 image 分支
+                url = _get_nested(part, "audio_url", "url", default=None) or _get(
+                    part, "url", None
                 )
-            # text 等别的类型留给 prompt 侧处理
+                if url:
+                    mm_items.append(
+                        {"format": "audio", "feature": None, "model_specific_data": {}}
+                    )
+
     return mm_items
+
+
+def split_text_and_images_messages(messages):
+    """
+    将形如 [{role, content=[{type:text},{type:image_url},...]}, ...]
+    规范化为：每条 user/assistant 消息最多两条：
+      1) 纯文本 message（把所有 text 拼在一起）
+      2) 纯图片 message（把所有 image_url 聚合，保留顺序）
+    其它 role 原样返回。
+    返回：List[dict]，可直接交给 generate_chat_conv 使用。
+    """
+    out = []
+    for msg in messages or []:
+        role = _get(msg, "role", "user")
+        content = _get(msg, "content", None)
+
+        # 纯文本字符串直接透传
+        if isinstance(content, str):
+            out.append(_ensure_openai_message(role, content))
+            continue
+
+        # 结构化 content（list）
+        if isinstance(content, list):
+            text_chunks = []
+            image_parts = []
+            local_img_idx = 0
+
+            for part in _iter_structured_content(content):
+                ptype = _get(part, "type", None)
+
+                if ptype == "text":
+                    t = _get(part, "text", "")
+                    if t:
+                        text_chunks.append(t)
+
+                elif ptype in ("image_url", "input_image"):
+                    image_url_obj = _get(part, "image_url", None) or _get(
+                        part, "url", None
+                    )
+                    url = (
+                        _get_url_from_image_obj(image_url_obj)
+                        if image_url_obj
+                        else _get(part, "url", None)
+                    )
+                    if url:
+                        # 保持 openai 结构
+                        image_parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": url},
+                                # modalities 字段可选留在 part 上层；这里不强行加
+                            }
+                        )
+                        local_img_idx += 1
+                else:
+                    # 其它类型可以按需扩展；此处忽略
+                    pass
+
+            # 输出顺序：文本在前、图片在后
+            if text_chunks:
+                out.append(_ensure_openai_message(role, "\n".join(text_chunks)))
+            if image_parts:
+                out.append(_ensure_openai_message(role, image_parts))
+            # 如果两者都没有（例如奇怪的空结构），也给一个空文本
+            if not text_chunks and not image_parts:
+                out.append(_ensure_openai_message(role, ""))
+
+        else:
+            # content 既不是 str 也不是 list，尽量 to_dict 再兜底成空文本
+            out.append(
+                _ensure_openai_message(
+                    role, str(content) if content is not None else ""
+                )
+            )
+
+    return out
+
+
+def normalize_openai_messages_for_mm(messages):
+    """轻量重排：把每条 message 内部的图片段移到文本之后（不拆 message）"""
+    normed = []
+    for msg in messages:
+        content = msg.get("content", None)
+        if not isinstance(content, list):
+            normed.append(msg)
+            continue
+        text_parts, image_parts, other_parts = [], [], []
+        local_img_idx = 0
+        for part in content:
+            t = part.get("type")
+            if t in ("image_url", "input_image"):
+                part = dict(part)
+                part.setdefault("modalities", "multi-images")
+                msd = part.setdefault("model_specific_data", {})
+                msd.setdefault("original_index", local_img_idx)
+                image_parts.append(part)
+                local_img_idx += 1
+            elif t == "text":
+                text_parts.append(part)
+            else:
+                other_parts.append(part)
+        new_msg = dict(msg)
+        new_msg["content"] = text_parts + other_parts + image_parts
+        normed.append(new_msg)
+    return normed
+
+
+def _maybe_to_dict(obj):
+    if isinstance(obj, dict):
+        return obj
+    # pydantic v2
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump()
+        except Exception:
+            pass
+    # pydantic v1
+    if hasattr(obj, "dict"):
+        try:
+            return obj.dict()
+        except Exception:
+            pass
+    return None
+
+
+def _get(obj, key, default=None):
+    """Safe get for dict/Pydantic/attrs-like objects."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    # attribute access
+    try:
+        val = getattr(obj, key)
+        return val if val is not None else default
+    except Exception:
+        pass
+    # fallback to dict-like
+    d = _maybe_to_dict(obj)
+    if isinstance(d, dict):
+        return d.get(key, default)
+    return default
+
+
+def _get_nested(obj, *keys, default=None):
+    cur = obj
+    for k in keys:
+        cur = _get(cur, k, default=None)
+        if cur is None:
+            return default
+    return cur
+
+
+def _ensure_openai_message(role, content):
+    """Return a minimal OpenAI-style message dict."""
+    return {"role": role, "content": content}
+
+
+def _iter_structured_content(content):
+    """Yield parts from a content that is either list[dict/obj] or a single str."""
+    if isinstance(content, list):
+        for p in content:
+            yield p
+    return
+
+
+def _get_url_from_image_obj(image_obj):
+    """
+    image_obj could be:
+      - {"url": "..."} dict
+      - Pydantic object with .url
+    """
+    if image_obj is None:
+        return None
+    if isinstance(image_obj, dict):
+        return image_obj.get("url", None)
+    # attr style
+    try:
+        return getattr(image_obj, "url", None)
+    except Exception:
+        pass
+    # fallback to dict()
+    d = _maybe_to_dict(image_obj)
+    if isinstance(d, dict):
+        return d.get("url", None)
+    return None
