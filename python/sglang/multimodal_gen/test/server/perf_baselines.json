@@ -5,10 +5,13 @@
         "description": "Reference numbers captured from the CI diffusion server baseline run"
     },
     "tolerances": {
-        "e2e": 0.25,
-        "stage": 0.3,
-        "denoise_step": 0.2,
-        "denoise_agg": 0.1
+        "e2e": 0.05,
+        "stage": 0.05,
+        "denoise_step": 0.15,
+        "denoise_agg": 0.08
+    },
+    "improvement_reporting": {
+        "threshold": 0.2
     },
     "sampling": {
         "step_fractions": [
@@ -91,6 +94,29 @@
                 "48": 412.72,
                 "49": 410.42
             }
+        },
+
+        "flux_image_t2i": {
+            "stages_ms": {
+                "InputValidationStage": 0.08,
+                "TextEncodingStage": 59.78,
+                "ConditioningStage": 0.01,
+                "TimestepPreparationStage": 1.98,
+                "LatentPreparationStage": 4.95,
+                "DenoisingStage": 8161.97,
+                "DecodingStage": 378.21
+            },
+            "denoise_step_ms": {
+                "0": 56.16,
+                "10": 163.54,
+                "20": 165.94,
+                "29": 165.26,
+                "39": 165.16,
+                "49": 165.36
+            },
+            "expected_e2e_ms": 8764.73,
+            "expected_avg_denoise_ms": 160.79,
+            "expected_median_denoise_ms": 165.14
         },
         "qwen_image_edit_ti2i": {
             "notes": "single uploaded reference image, Qwen/Qwen-Image-Edit",
@@ -188,26 +214,26 @@
         },
         "wan2_2_i2v": {
             "notes": "Wan-AI/Wan2.2-I2V-A14B",
-            "expected_e2e_ms": 254253.08,
-            "expected_avg_denoise_ms": 6183.21,
-            "expected_median_denoise_ms": 4901.28,
+            "expected_e2e_ms": 282500.0,
+            "expected_avg_denoise_ms": 7000.0,
+            "expected_median_denoise_ms": 7000.19,
             "stages_ms": {
-                "InputValidationStage": 25.39,
-                "TextEncodingStage": 2188.5,
-                "ConditioningStage": 0.01,
-                "TimestepPreparationStage": 1.58,
-                "LatentPreparationStage": 7.04,
-                "ImageVAEEncodingStage": 1917.29,
-                "DenoisingStage": 247414.31,
-                "DecodingStage": 2678.0
+                "InputValidationStage": 20.0,
+                "TextEncodingStage": 2200.0,
+                "ConditioningStage": 2.0,
+                "TimestepPreparationStage": 2.0,
+                "LatentPreparationStage": 10.0,
+                "ImageVAEEncodingStage": 1800.0,
+                "DenoisingStage": 278000.0,
+                "DecodingStage": 2700.0
             },
             "denoise_step_ms": {
-                "0": 19102.95,
-                "8": 4908.81,
-                "16": 4904.12,
-                "23": 4897.77,
-                "31": 4898.52,
-                "39": 4892.75
+                "0": 24000.0,
+                "8": 7000.0,
+                "16": 7000.0,
+                "23": 7000.0,
+                "31": 7000.0,
+                "39": 7000.0
             }
         },
         "wan2_1_i2v_14b_480P": {
