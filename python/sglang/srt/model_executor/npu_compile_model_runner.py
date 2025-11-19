@@ -43,6 +43,7 @@ class NPUCompileModelRunner:
     def __init__(self, model_runner: ModelRunner):
         self.model_runner = model_runner
         _, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture()
 
     def capture(self) -> None:
         # Reverse the order to enable better memory sharing across cuda graphs.
