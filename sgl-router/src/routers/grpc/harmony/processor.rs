@@ -10,10 +10,10 @@ use crate::{
     grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-        common::{ToolCall, Usage},
+        common::{CompletionTokensDetails, ToolCall, Usage},
         responses::{
-            ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
-            ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+            OutputTokensDetails, ResponseContentPart, ResponseOutputItem, ResponseReasoningContent,
+            ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
     routers::grpc::{
@@ -117,10 +117,9 @@ impl HarmonyResponseProcessor {
 
         // Add reasoning token count from parsed analysis/commentary channels
         if total_reasoning_tokens > 0 {
-            usage.completion_tokens_details =
-                Some(crate::protocols::common::CompletionTokensDetails {
-                    reasoning_tokens: Some(total_reasoning_tokens),
-                });
+            usage.completion_tokens_details = Some(CompletionTokensDetails {
+                reasoning_tokens: Some(total_reasoning_tokens),
+            });
         }
 
         // Final ChatCompletionResponse
@@ -250,10 +249,9 @@ impl HarmonyResponseProcessor {
 
         // Add reasoning token count from parsed analysis/commentary channels
         if parsed.reasoning_token_count > 0 {
-            usage.completion_tokens_details =
-                Some(crate::protocols::common::CompletionTokensDetails {
-                    reasoning_tokens: Some(parsed.reasoning_token_count),
-                });
+            usage.completion_tokens_details = Some(CompletionTokensDetails {
+                reasoning_tokens: Some(parsed.reasoning_token_count),
+            });
         }
 
         // Check for tool calls in commentary channel
@@ -310,10 +308,8 @@ impl HarmonyResponseProcessor {
                 total_tokens: usage.total_tokens,
                 input_tokens_details: None,
                 output_tokens_details: usage.completion_tokens_details.as_ref().and_then(|d| {
-                    d.reasoning_tokens.map(|tokens| {
-                        crate::protocols::responses::OutputTokensDetails {
-                            reasoning_tokens: tokens,
-                        }
+                    d.reasoning_tokens.map(|tokens| OutputTokensDetails {
+                        reasoning_tokens: tokens,
                     })
                 }),
             }))

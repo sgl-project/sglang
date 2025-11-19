@@ -23,8 +23,10 @@ use crate::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
         },
-        common::{FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
-        responses::{ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage},
+        common::{CompletionTokensDetails, FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
+        responses::{
+            OutputTokensDetails, ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage,
+        },
     },
     routers::grpc::{
         common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
@@ -1075,7 +1077,7 @@ impl HarmonyStreamingProcessor {
                         completion_tokens,
                         total_tokens: prompt_tokens + completion_tokens,
                         completion_tokens_details: if reasoning_token_count > 0 {
-                            Some(crate::protocols::common::CompletionTokensDetails {
+                            Some(CompletionTokensDetails {
                                 reasoning_tokens: Some(reasoning_token_count),
                             })
                         } else {
@@ -1100,7 +1102,7 @@ impl HarmonyStreamingProcessor {
                         total_tokens: prompt_tokens + completion_tokens,
                         input_tokens_details: None,
                         output_tokens_details: if reasoning_token_count > 0 {
-                            Some(crate::protocols::responses::OutputTokensDetails {
+                            Some(OutputTokensDetails {
                                 reasoning_tokens: reasoning_token_count,
                             })
                         } else {
@@ -1114,7 +1116,7 @@ impl HarmonyStreamingProcessor {
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
                 completion_tokens_details: if reasoning_token_count > 0 {
-                    Some(crate::protocols::common::CompletionTokensDetails {
+                    Some(CompletionTokensDetails {
                         reasoning_tokens: Some(reasoning_token_count),
                     })
                 } else {
