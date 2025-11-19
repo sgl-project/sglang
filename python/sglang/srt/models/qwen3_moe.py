@@ -67,6 +67,8 @@ from sglang.srt.models.utils import (
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
+    is_hip,
+    get_bool_env_var,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
 )
@@ -77,7 +79,8 @@ _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
-
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
@@ -415,7 +418,10 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if hidden_states.shape[0] == 0:
+        if (
+            (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] == 0)
+             or (isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] == 0)
+        ):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -557,12 +563,21 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _use_aiter and self.self_attn.qkv_proj.weight.dtype == getattr(torch, "float8_e4m3fnuz", None):
+            quant_format = "fp8_e4m3fnuz"
+        else:
+            quant_format = ""
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            quant_format,
         )
-
-        if hidden_states.shape[0] != 0:
+        if (
+            (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] != 0)
+             or (isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] != 0)
+        ):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
