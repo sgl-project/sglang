@@ -20,6 +20,6 @@ pub use config::{
 pub use connection_pool::{CachedConnection, McpConnectionPool, PoolStats};
 pub use error::{McpError, McpResult};
 pub use inventory::ToolInventory;
-pub use manager::{McpManager, McpManagerStats};
+pub use manager::{McpManager, McpManagerStats, McpRequestContext};
 pub use proxy::{create_http_client, resolve_proxy_config};
 pub use tool_args::ToolArgs;

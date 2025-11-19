@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
-    mcp::{inventory::format_tool_name, McpManager, ToolInventory},
+    mcp::{inventory::format_tool_name, McpManager, McpRequestContext},
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
@@ -54,18 +54,15 @@ use crate::{
             StringOrContentParts,
         },
     },
-    routers::{
-        common::extract_dynamic_mcp_servers,
-        grpc::{
-            common::responses::{
-                build_sse_response, ensure_mcp_connection, persist_response_if_needed,
-                streaming::{OutputItemType, ResponseStreamEventEmitter},
-            },
-            context::SharedComponents,
-            error,
-            harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
-            pipeline::RequestPipeline,
+    routers::grpc::{
+        common::responses::{
+            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+            streaming::{OutputItemType, ResponseStreamEventEmitter},
         },
+        context::SharedComponents,
+        error,
+        harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
+        pipeline::RequestPipeline,
     },
 };
 
@@ -266,12 +263,12 @@ pub async fn serve_harmony_responses(
     // Load previous conversation history if previous_response_id is set
     let current_request = load_previous_messages(ctx, request).await?;
 
-    // Check MCP connection and get whether MCP tools are present
-    let has_mcp_tools =
+    // Check MCP connection and get MCP context if tools exist
+    let mcp_context_opt =
         ensure_mcp_connection(&ctx.mcp_manager, current_request.tools.as_deref()).await?;
 
-    let response = if has_mcp_tools {
-        execute_with_mcp_loop(ctx, current_request).await?
+    let response = if let Some(mcp_context) = mcp_context_opt {
+        execute_with_mcp_loop(ctx, current_request, mcp_context).await?
     } else {
         // No MCP tools - execute pipeline once (may have function tools or no tools)
         execute_without_mcp_loop(ctx, current_request).await?
@@ -296,26 +293,20 @@ pub async fn serve_harmony_responses(
 async fn execute_with_mcp_loop(
     ctx: &HarmonyResponsesContext,
     mut current_request: ResponsesRequest,
+    mcp_context: McpRequestContext,
 ) -> Result<ResponsesResponse, Response> {
     let mut iteration_count = 0;
 
-    // Extract all dynamic MCP servers from request
-    let dynamic_servers: Vec<(String, String)> = current_request
+    // Use first server label for backward compatibility with tracking
+    let server_label = current_request
         .tools
         .as_ref()
-        .map(|tools| extract_dynamic_mcp_servers(tools))
-        .unwrap_or_default();
-
-    // Build per-request tool inventory (combines static + dynamic tools)
-    let request_inventory = ctx
-        .mcp_manager
-        .build_request_inventory(&dynamic_servers)
-        .await;
-
-    // Use first server label for backward compatibility with tracking
-    let server_label = dynamic_servers
-        .first()
-        .map(|(label, _)| label.clone())
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                .and_then(|t| t.server_label.clone())
+        })
         .unwrap_or_else(|| "sglang-mcp".to_string());
     let mut mcp_tracking = McpCallTracking::new(server_label.clone());
 
@@ -323,15 +314,15 @@ async fn execute_with_mcp_loop(
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
     // Add MCP tools with formatted names (server_label__tool_name) to the request
-    if request_inventory.count() > 0 {
-        let mcp_response_tools = convert_inventory_to_response_tools(&request_inventory);
+    if mcp_context.count() > 0 {
+        let mcp_response_tools = convert_inventory_to_response_tools(&mcp_context);
 
         let mut all_tools = current_request.tools.clone().unwrap_or_default();
         all_tools.extend(mcp_response_tools);
         current_request.tools = Some(all_tools);
 
         debug!(
-            mcp_tool_count = request_inventory.count(),
+            mcp_tool_count = mcp_context.count(),
             total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
             "MCP client available - added MCP tools with server_label__tool_name format to Harmony Responses request"
         );
@@ -442,7 +433,7 @@ async fn execute_with_mcp_loop(
 
                     // Inject MCP metadata if any calls were executed
                     if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                        inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_context);
                     }
 
                     return Ok(response);
@@ -450,13 +441,7 @@ async fn execute_with_mcp_loop(
 
                 // Execute MCP tools (if any)
                 let mcp_results = if !mcp_tool_calls.is_empty() {
-                    execute_mcp_tools(
-                        &ctx.mcp_manager,
-                        &mcp_tool_calls,
-                        &mut mcp_tracking,
-                        &request_inventory,
-                    )
-                    .await?
+                    execute_mcp_tools(&mcp_tool_calls, &mut mcp_tracking, &mcp_context).await?
                 } else {
                     Vec::new()
                 };
@@ -484,7 +469,7 @@ async fn execute_with_mcp_loop(
 
                     // Inject MCP metadata for all executed calls
                     if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                        inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_context);
                     }
 
                     return Ok(response);
@@ -517,7 +502,7 @@ async fn execute_with_mcp_loop(
                 );
 
                 // Inject MCP metadata into final response
-                inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_context);
 
                 debug!(
                     mcp_calls = mcp_tracking.total_calls(),
@@ -603,10 +588,10 @@ pub async fn serve_harmony_responses_stream(
         Err(err_response) => return err_response,
     };
 
-    // Check MCP connection BEFORE starting stream and get whether MCP tools are present
-    let has_mcp_tools =
+    // Check MCP connection BEFORE starting stream and get MCP context if tools exist
+    let mcp_context_opt =
         match ensure_mcp_connection(&ctx.mcp_manager, current_request.tools.as_deref()).await {
-            Ok(has_mcp) => has_mcp,
+            Ok(context) => context,
             Err(response) => return response,
         };
 
@@ -642,9 +627,16 @@ pub async fn serve_harmony_responses_stream(
             return;
         }
 
-        if has_mcp_tools {
-            execute_mcp_tool_loop_streaming(ctx, current_request, &request, &mut emitter, &tx)
-                .await;
+        if let Some(mcp_context) = mcp_context_opt {
+            execute_mcp_tool_loop_streaming(
+                ctx,
+                current_request,
+                &request,
+                &mut emitter,
+                &tx,
+                mcp_context,
+            )
+            .await;
         } else {
             execute_without_mcp_streaming(ctx, &current_request, &request, &mut emitter, &tx).await;
         }
@@ -668,24 +660,18 @@ async fn execute_mcp_tool_loop_streaming(
     original_request: &ResponsesRequest,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    mcp_context: McpRequestContext,
 ) {
-    // Extract all dynamic MCP servers from request
-    let dynamic_servers: Vec<(String, String)> = current_request
+    // Use first server label for backward compatibility
+    let server_label = current_request
         .tools
         .as_ref()
-        .map(|tools| extract_dynamic_mcp_servers(tools))
-        .unwrap_or_default();
-
-    // Build per-request tool inventory (combines static + dynamic tools)
-    let request_inventory = ctx
-        .mcp_manager
-        .build_request_inventory(&dynamic_servers)
-        .await;
-
-    // Use first server label for backward compatibility
-    let server_label = dynamic_servers
-        .first()
-        .map(|(label, _)| label.clone())
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                .and_then(|t| t.server_label.clone())
+        })
         .unwrap_or_else(|| "sglang-mcp".to_string());
 
     // Set server label in emitter for MCP call items
@@ -698,14 +684,14 @@ async fn execute_mcp_tool_loop_streaming(
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
     // Add MCP tools with formatted names (server_label__tool_name) to the request
-    if request_inventory.count() > 0 {
-        let mcp_response_tools = convert_inventory_to_response_tools(&request_inventory);
+    if mcp_context.count() > 0 {
+        let mcp_response_tools = convert_inventory_to_response_tools(&mcp_context);
         let mut all_tools = current_request.tools.clone().unwrap_or_default();
         all_tools.extend(mcp_response_tools);
         current_request.tools = Some(all_tools);
 
         debug!(
-            mcp_tool_count = request_inventory.count(),
+            mcp_tool_count = mcp_context.count(),
             total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
             "MCP client available - added MCP tools to Harmony Responses streaming request"
         );
@@ -728,8 +714,8 @@ async fn execute_mcp_tool_loop_streaming(
     // Emit mcp_list_tools on first iteration
     let (output_index, item_id) = emitter.allocate_output_index(OutputItemType::McpListTools);
 
-    // Build tools list for item structure from request_inventory
-    let tool_items: Vec<_> = request_inventory
+    // Build tools list for item structure from mcp_context
+    let tool_items: Vec<_> = mcp_context
         .list_tools()
         .into_iter()
         .map(|cached_tool| {
@@ -778,8 +764,8 @@ async fn execute_mcp_tool_loop_streaming(
         return;
     }
 
-    // Emit mcp_list_tools.completed (convert request_inventory to Vec<mcp::Tool> for emitter)
-    let tools_for_event: Vec<_> = request_inventory
+    // Emit mcp_list_tools.completed (convert mcp_context to Vec<mcp::Tool> for emitter)
+    let tools_for_event: Vec<_> = mcp_context
         .list_tools()
         .into_iter()
         .map(|cached_tool| cached_tool.tool)
@@ -796,7 +782,7 @@ async fn execute_mcp_tool_loop_streaming(
     }
 
     debug!(
-        tool_count = request_inventory.count(),
+        tool_count = mcp_context.count(),
         "Emitted mcp_list_tools on first iteration"
     );
 
@@ -915,13 +901,7 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // Execute MCP tools (if any)
                 let mcp_results = if !mcp_tool_calls.is_empty() {
-                    match execute_mcp_tools(
-                        &ctx.mcp_manager,
-                        &mcp_tool_calls,
-                        &mut mcp_tracking,
-                        &request_inventory,
-                    )
-                    .await
+                    match execute_mcp_tools(&mcp_tool_calls, &mut mcp_tracking, &mcp_context).await
                     {
                         Ok(results) => results,
                         Err(err_response) => {
@@ -1200,18 +1180,17 @@ fn build_tool_response(
 ///
 /// Vector of tool results (one per tool call)
 async fn execute_mcp_tools(
-    mcp_manager: &Arc<McpManager>,
     tool_calls: &[ToolCall],
     tracking: &mut McpCallTracking,
-    inventory: &ToolInventory,
+    mcp_context: &McpRequestContext,
 ) -> Result<Vec<ToolResult>, Response> {
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
         let formatted_tool_name = &tool_call.function.name;
 
-        // Look up tool in inventory to get server_label and tool_name
-        let cached_tool = inventory.get_tool(formatted_tool_name).ok_or_else(|| {
+        // Look up tool in context to get server_label and tool_name
+        let cached_tool = mcp_context.get_tool(formatted_tool_name).ok_or_else(|| {
             error!(
                 formatted_tool_name = %formatted_tool_name,
                 call_id = %tool_call.id,
@@ -1257,9 +1236,9 @@ async fn execute_mcp_tools(
             None
         };
 
-        // Call tool via inventory
-        let (output, is_error) = match mcp_manager
-            .call_tool_from_inventory(inventory, server_label, original_tool_name, args_map)
+        // Call tool via context
+        let (output, is_error) = match mcp_context
+            .call_tool(server_label, original_tool_name, args_map)
             .await
         {
             Ok(result) => {
@@ -1440,8 +1419,8 @@ pub(crate) struct ToolResult {
 ///
 /// This function formats tool names as `server_label__tool_name` to prevent name collisions
 /// across multiple MCP servers and enable server-specific tool routing.
-fn convert_inventory_to_response_tools(inventory: &ToolInventory) -> Vec<ResponseTool> {
-    inventory
+fn convert_inventory_to_response_tools(mcp_context: &McpRequestContext) -> Vec<ResponseTool> {
+    mcp_context
         .list_tools()
         .into_iter()
         .map(|cached_tool| {
@@ -1479,14 +1458,14 @@ fn convert_inventory_to_response_tools(inventory: &ToolInventory) -> Vec<Respons
 ///
 /// * `response` - Final response to modify
 /// * `tracking` - MCP call tracking data
-/// * `mcp_manager` - MCP manager for listing tools
+/// * `mcp_context` - MCP request context for listing tools
 fn inject_mcp_metadata(
     response: &mut ResponsesResponse,
     tracking: &McpCallTracking,
-    mcp_manager: &Arc<McpManager>,
+    mcp_context: &McpRequestContext,
 ) {
     // Build mcp_list_tools item
-    let tools = mcp_manager.list_tools();
+    let tools = mcp_context.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|cached_tool| McpToolInfo {

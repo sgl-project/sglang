@@ -18,12 +18,15 @@ use rmcp::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::mcp::{
-    config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport},
-    connection_pool::McpConnectionPool,
-    error::{McpError, McpResult},
-    inventory::{format_tool_name, CachedTool, ToolInventory},
-    tool_args::ToolArgs,
+use crate::{
+    mcp::{
+        config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport},
+        connection_pool::McpConnectionPool,
+        error::{McpError, McpResult},
+        inventory::{format_tool_name, CachedTool, ToolInventory},
+        tool_args::ToolArgs,
+    },
+    protocols::responses::{ResponseTool, ResponseToolType},
 };
 
 /// Type alias for MCP client
@@ -216,6 +219,71 @@ impl McpManager {
         }
 
         request_inventory
+    }
+
+    /// Create a per-request context with tools from static config and dynamic request
+    ///
+    /// This is the primary API for working with MCP tools in a request.
+    /// It encapsulates the tool inventory and provides a clean interface.
+    ///
+    /// # Arguments
+    /// * `request_tools` - Tools from the request (may include dynamic MCP servers)
+    ///
+    /// # Returns
+    /// A context object that provides access to all available tools for this request
+    pub async fn create_request_context(
+        self: &Arc<Self>,
+        request_tools: &[ResponseTool],
+    ) -> McpRequestContext {
+        // Extract dynamic MCP servers from request tools
+        let dynamic_servers = Self::extract_dynamic_mcp_servers(request_tools);
+
+        // Build the inventory (static + dynamic)
+        let inventory = self.build_request_inventory(&dynamic_servers).await;
+
+        McpRequestContext {
+            inventory,
+            manager: Arc::clone(self),
+        }
+    }
+
+    /// Extract dynamic MCP servers from request tools
+    ///
+    /// Parses tools to find MCP servers with URLs and labels, deduplicating by server_label.
+    fn extract_dynamic_mcp_servers(tools: &[ResponseTool]) -> Vec<(String, String)> {
+        tools
+            .iter()
+            .filter_map(|t| {
+                if matches!(t.r#type, ResponseToolType::Mcp) {
+                    let url = t.server_url.as_ref()?.trim().to_string();
+
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        warn!("Ignoring MCP server_url with unsupported scheme: {}", url);
+                        return None;
+                    }
+
+                    let label = t.server_label.clone().unwrap_or_else(|| {
+                        format!(
+                            "mcp_{}",
+                            url.split('/')
+                                .next_back()
+                                .unwrap_or("server")
+                                .replace('.', "_")
+                        )
+                    });
+
+                    Some((label, url))
+                } else {
+                    None
+                }
+            })
+            .fold(Vec::new(), |mut acc, (label, url)| {
+                // Deduplicate by server_label
+                if !acc.iter().any(|(l, _)| l == &label) {
+                    acc.push((label, url));
+                }
+                acc
+            })
     }
 
     /// Call a tool by server_label and tool_name from an inventory
@@ -651,6 +719,58 @@ pub struct McpManagerStats {
     pub pool_stats: crate::mcp::connection_pool::PoolStats,
     /// Number of cached tools
     pub tool_count: usize,
+}
+
+// ============================================================================
+// Request Context - Encapsulates per-request tool inventory
+// ============================================================================
+
+/// Per-request context that encapsulates the tool inventory.
+///
+/// This type hides the internal `ToolInventory` from router code,
+/// providing a clean API for working with tools in a request.
+pub struct McpRequestContext {
+    inventory: ToolInventory,
+    manager: Arc<McpManager>,
+}
+
+impl McpRequestContext {
+    /// List all tools available in this request context (static + dynamic)
+    pub fn list_tools(&self) -> Vec<CachedTool> {
+        self.inventory.list_tools()
+    }
+
+    /// Get the number of tools available in this context
+    pub fn count(&self) -> usize {
+        self.inventory.count()
+    }
+
+    /// Call a tool by server_label and tool_name
+    ///
+    /// # Arguments
+    /// * `server_label` - Server label identifying which server owns the tool
+    /// * `tool_name` - Name of the tool to call
+    /// * `args` - Tool arguments (JSON string or Map)
+    pub async fn call_tool(
+        &self,
+        server_label: &str,
+        tool_name: &str,
+        args: impl Into<ToolArgs>,
+    ) -> McpResult<CallToolResult> {
+        self.manager
+            .call_tool_from_inventory(&self.inventory, server_label, tool_name, args)
+            .await
+    }
+
+    /// Get a tool by its formatted name (server_label__tool_name)
+    pub fn get_tool(&self, formatted_name: &str) -> Option<CachedTool> {
+        self.inventory.get_tool(formatted_name)
+    }
+
+    /// Check if a tool exists by its formatted name
+    pub fn has_tool(&self, formatted_name: &str) -> bool {
+        self.inventory.has_tool(formatted_name)
+    }
 }
 
 #[cfg(test)]

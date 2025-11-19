@@ -198,12 +198,11 @@ pub async fn ensure_request_mcp_client(
 /// Returns false if client disconnected during execution
 pub(super) async fn execute_streaming_tool_calls(
     pending_calls: Vec<FunctionCallInProgress>,
-    active_mcp: &Arc<mcp::McpManager>,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     state: &mut ToolLoopState,
     _server_label: &str,
     sequence_number: &mut u64,
-    inventory: &mcp::ToolInventory,
+    mcp_context: &mcp::McpRequestContext,
 ) -> bool {
     // Execute all pending tool calls (sequential, as PR3 is skipped)
     for call in pending_calls {
@@ -216,13 +215,13 @@ pub(super) async fn execute_streaming_tool_calls(
             continue;
         }
 
-        // Look up tool in inventory to get server_label and tool_name
+        // Look up tool in context to get server_label and tool_name
         let formatted_tool_name = &call.name;
-        let cached_tool = match inventory.get_tool(formatted_tool_name) {
+        let cached_tool = match mcp_context.get_tool(formatted_tool_name) {
             Some(tool) => tool,
             None => {
                 error!(
-                    "Tool '{}' not found in inventory for call_id '{}'",
+                    "Tool '{}' not found in context for call_id '{}'",
                     formatted_tool_name, call.call_id
                 );
                 continue;
@@ -250,14 +249,14 @@ pub(super) async fn execute_streaming_tool_calls(
             _ => None,
         };
 
-        // Call tool via inventory
+        // Call tool via context
         debug!(
             "Calling MCP tool '{}' with args: {}",
             formatted_tool_name, args_str
         );
 
-        let (output_str, success, error_msg) = match active_mcp
-            .call_tool_from_inventory(inventory, &call_server_label, &original_tool_name, args_map)
+        let (output_str, success, error_msg) = match mcp_context
+            .call_tool(&call_server_label, &original_tool_name, args_map)
             .await
         {
             Ok(result) => {
@@ -315,7 +314,7 @@ pub(super) async fn execute_streaming_tool_calls(
 /// Formats tool names as `server_label__tool_name` to support multiple MCP servers.
 pub(super) fn prepare_mcp_payload_for_streaming(
     payload: &mut Value,
-    inventory: &mcp::ToolInventory,
+    mcp_context: &mcp::McpRequestContext,
 ) {
     if let Some(obj) = payload.as_object_mut() {
         // Remove any non-function tools from outgoing payload (keeps existing function tools)
@@ -340,7 +339,7 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         let mut tools_json = existing_function_tools;
 
         // Add MCP tools with formatted names (server_label__tool_name)
-        for cached_tool in inventory.list_tools() {
+        for cached_tool in mcp_context.list_tools() {
             let formatted_name =
                 format_tool_name(&cached_tool.server_label, &cached_tool.tool_name);
             let parameters = Value::Object((*cached_tool.tool.input_schema).clone());
@@ -429,12 +428,12 @@ pub(super) fn build_resume_payload(
 /// Returns false if client disconnected
 pub(super) fn send_mcp_list_tools_events(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
-    mcp: &Arc<mcp::McpManager>,
+    mcp_context: &mcp::McpRequestContext,
     server_label: &str,
     output_index: usize,
     sequence_number: &mut u64,
 ) -> bool {
-    let tools_item_full = build_mcp_list_tools_item(mcp, server_label);
+    let tools_item_full = build_mcp_list_tools_item(mcp_context, server_label);
     let item_id = tools_item_full
         .get("id")
         .and_then(|v| v.as_str())
@@ -587,7 +586,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 pub(super) fn inject_mcp_metadata_streaming(
     response: &mut Value,
     state: &ToolLoopState,
-    mcp: &Arc<mcp::McpManager>,
+    mcp_context: &mcp::McpRequestContext,
     server_label: &str,
 ) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
@@ -595,7 +594,7 @@ pub(super) fn inject_mcp_metadata_streaming(
             item.get("type").and_then(|t| t.as_str()) != Some(event_types::ITEM_TYPE_MCP_LIST_TOOLS)
         });
 
-        let list_tools_item = build_mcp_list_tools_item(mcp, server_label);
+        let list_tools_item = build_mcp_list_tools_item(mcp_context, server_label);
         output_array.insert(0, list_tools_item);
 
         let mcp_call_items =
@@ -607,7 +606,7 @@ pub(super) fn inject_mcp_metadata_streaming(
         }
     } else if let Some(obj) = response.as_object_mut() {
         let mut output_items = Vec::new();
-        output_items.push(build_mcp_list_tools_item(mcp, server_label));
+        output_items.push(build_mcp_list_tools_item(mcp_context, server_label));
         output_items.extend(build_executed_mcp_call_items(
             &state.conversation_history,
             server_label,
@@ -628,9 +627,8 @@ pub(super) async fn execute_tool_loop(
     headers: Option<&HeaderMap>,
     initial_payload: Value,
     original_body: &ResponsesRequest,
-    active_mcp: &Arc<mcp::McpManager>,
     config: &McpLoopConfig,
-    inventory: &mcp::ToolInventory,
+    mcp_context: &mcp::McpRequestContext,
 ) -> Result<Value, String> {
     let mut state = ToolLoopState::new(original_body.input.clone());
 
@@ -709,18 +707,18 @@ pub(super) async fn execute_tool_loop(
                     response_json,
                     state,
                     "max_tool_calls",
-                    active_mcp,
+                    mcp_context,
                     original_body,
                 );
             }
 
-            // Look up tool in inventory to get server_label and tool_name
+            // Look up tool in context to get server_label and tool_name
             let formatted_tool_name = &tool_name;
-            let cached_tool = match inventory.get_tool(formatted_tool_name) {
+            let cached_tool = match mcp_context.get_tool(formatted_tool_name) {
                 Some(tool) => tool,
                 None => {
                     error!(
-                        "Tool '{}' not found in inventory for call_id '{}'",
+                        "Tool '{}' not found in context for call_id '{}'",
                         formatted_tool_name, call_id
                     );
                     continue;
@@ -741,14 +739,9 @@ pub(super) async fn execute_tool_loop(
                 _ => None,
             };
 
-            // Call tool via inventory
-            let output_str = match active_mcp
-                .call_tool_from_inventory(
-                    inventory,
-                    &server_label_parsed,
-                    &original_tool_name,
-                    args_map,
-                )
+            // Call tool via context
+            let output_str = match mcp_context
+                .call_tool(&server_label_parsed, &original_tool_name, args_map)
                 .await
             {
                 Ok(result) => match to_string(&result) {
@@ -801,7 +794,7 @@ pub(super) async fn execute_tool_loop(
                     .unwrap_or("mcp");
 
                 // Build mcp_list_tools item
-                let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+                let list_tools_item = build_mcp_list_tools_item(mcp_context, server_label);
 
                 // Insert at beginning of output array
                 if let Some(output_array) = response_json
@@ -833,7 +826,7 @@ pub(super) fn build_incomplete_response(
     mut response: Value,
     state: ToolLoopState,
     reason: &str,
-    active_mcp: &Arc<mcp::McpManager>,
+    mcp_context: &mcp::McpRequestContext,
     original_body: &ResponsesRequest,
 ) -> Result<Value, String> {
     let obj = response
@@ -894,7 +887,7 @@ pub(super) fn build_incomplete_response(
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !mcp_call_items.is_empty() {
-            let list_tools_item = build_mcp_list_tools_item(active_mcp, server_label);
+            let list_tools_item = build_mcp_list_tools_item(mcp_context, server_label);
             output_array.insert(0, list_tools_item);
 
             // Add mcp_call items for executed calls using helper
@@ -940,8 +933,11 @@ pub(super) fn build_incomplete_response(
 // ============================================================================
 
 /// Build an mcp_list_tools output item
-pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label: &str) -> Value {
-    let tools = mcp.list_tools();
+pub(super) fn build_mcp_list_tools_item(
+    mcp_context: &mcp::McpRequestContext,
+    server_label: &str,
+) -> Value {
+    let tools = mcp_context.list_tools();
     let tools_json: Vec<Value> = tools
         .iter()
         .map(|cached_tool| {

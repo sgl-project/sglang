@@ -147,9 +147,9 @@ async fn route_responses_internal(
     let modified_request = load_conversation_history(ctx, &request).await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
-    let has_mcp_tools = ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await?;
+    let mcp_context = ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await?;
 
-    let responses_response = if has_mcp_tools {
+    let responses_response = if let Some(context) = mcp_context {
         debug!("MCP tools detected, using tool loop");
 
         // Execute with MCP tool loop
@@ -160,6 +160,7 @@ async fn route_responses_internal(
             headers,
             model_id,
             response_id.clone(),
+            context,
         )
         .await?
     } else {
@@ -201,18 +202,25 @@ async fn route_responses_streaming(
         Err(response) => return response, // Already a Response with proper status code
     };
 
-    // 2. Check MCP connection and get whether MCP tools are present
-    let has_mcp_tools =
-        match ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await {
-            Ok(has_mcp) => has_mcp,
-            Err(response) => return response,
-        };
+    // 2. Check MCP connection and get MCP context if tools exist
+    let mcp_context = match ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await
+    {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
 
-    if has_mcp_tools {
+    if let Some(context) = mcp_context {
         debug!("MCP tools detected in streaming mode, using streaming tool loop");
 
-        return execute_tool_loop_streaming(ctx, modified_request, &request, headers, model_id)
-            .await;
+        return execute_tool_loop_streaming(
+            ctx,
+            modified_request,
+            &request,
+            headers,
+            model_id,
+            context,
+        )
+        .await;
     }
 
     // 3. Convert ResponsesRequest → ChatCompletionRequest

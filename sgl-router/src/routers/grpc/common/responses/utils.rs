@@ -12,7 +12,7 @@ use tracing::{debug, error, warn};
 use crate::{
     core::WorkerRegistry,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
-    mcp::McpManager,
+    mcp::{McpManager, McpRequestContext},
     protocols::{
         common::Tool,
         responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
@@ -25,12 +25,16 @@ use crate::{
 
 /// Ensure MCP connection succeeds if MCP tools are declared
 ///
-/// Checks if request declares MCP tools, and if so, validates that
-/// the MCP client can be created and connected.
+/// Returns the MCP request context if MCP tools exist and connection succeeds.
+///
+/// # Returns
+/// - `Ok(Some(context))` - MCP tools exist and connection succeeded
+/// - `Ok(None)` - No MCP tools declared
+/// - `Err(response)` - MCP tools exist but connection failed
 pub async fn ensure_mcp_connection(
     mcp_manager: &Arc<McpManager>,
     tools: Option<&[ResponseTool]>,
-) -> Result<bool, Response> {
+) -> Result<Option<McpRequestContext>, Response> {
     let has_mcp_tools = tools
         .map(|t| {
             t.iter()
@@ -40,22 +44,22 @@ pub async fn ensure_mcp_connection(
 
     if has_mcp_tools {
         if let Some(tools) = tools {
-            if ensure_request_mcp_client(mcp_manager, tools)
-                .await
-                .is_none()
-            {
-                error!(
-                    function = "ensure_mcp_connection",
-                    "Failed to connect to MCP server"
-                );
-                return Err(error::failed_dependency(
-                    "Failed to connect to MCP server. Check server_url and authorization.",
-                ));
+            match ensure_request_mcp_client(mcp_manager, tools).await {
+                Some(context) => return Ok(Some(context)),
+                None => {
+                    error!(
+                        function = "ensure_mcp_connection",
+                        "Failed to connect to MCP server"
+                    );
+                    return Err(error::failed_dependency(
+                        "Failed to connect to MCP server. Check server_url and authorization.",
+                    ));
+                }
             }
         }
     }
 
-    Ok(has_mcp_tools)
+    Ok(None)
 }
 
 /// Validate that workers are available for the requested model

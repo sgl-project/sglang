@@ -45,16 +45,18 @@ pub fn extract_dynamic_mcp_servers(tools: &[ResponseTool]) -> Vec<(String, Strin
         .collect()
 }
 
-/// Ensure a dynamic MCP client exists for request-scoped tools
+/// Create a request context for MCP tools, ensuring dynamic clients are registered.
 ///
-/// This function parses request tools to extract MCP server configuration,
-/// then ensures a dynamic client exists in the McpManager via `get_or_create_client()`.
-/// The McpManager itself is returned (cloned Arc) for convenience, though the main
-/// purpose is the side effect of registering the dynamic client.
+/// This function:
+/// 1. Checks if there are MCP tools in the request
+/// 2. Ensures dynamic MCP clients are created for any MCP tools
+/// 3. Returns a context encapsulating all available tools (static + dynamic)
+///
+/// Returns `None` if there are no MCP tools or if client creation fails.
 pub async fn ensure_request_mcp_client(
     mcp_manager: &Arc<McpManager>,
     tools: &[ResponseTool],
-) -> Option<Arc<McpManager>> {
+) -> Option<mcp::McpRequestContext> {
     let tool = tools
         .iter()
         .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
@@ -93,7 +95,10 @@ pub async fn ensure_request_mcp_client(
 
     // Use McpManager to get or create dynamic client
     match mcp_manager.get_or_create_client(server_config).await {
-        Ok(_client) => Some(mcp_manager.clone()),
+        Ok(_client) => {
+            // Create and return request context
+            Some(mcp_manager.create_request_context(tools).await)
+        }
         Err(err) => {
             warn!("Failed to get/create MCP connection: {}", err);
             None

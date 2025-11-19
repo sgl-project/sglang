@@ -35,9 +35,7 @@ use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     protocols::responses::{ResponseToolType, ResponsesRequest},
     routers::{
-        common::{
-            ensure_request_mcp_client, extract_dynamic_mcp_servers, persist_conversation_items,
-        },
+        common::{ensure_request_mcp_client, persist_conversation_items},
         header_utils::{apply_request_headers, preserve_response_headers},
     },
 };
@@ -909,7 +907,7 @@ pub(super) fn send_final_response_event(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
     state: &ToolLoopState,
-    active_mcp: Option<&Arc<crate::mcp::McpManager>>,
+    mcp_context: Option<&crate::mcp::McpRequestContext>,
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     server_label: &str,
@@ -928,8 +926,8 @@ pub(super) fn send_final_response_event(
         }
     }
 
-    if let Some(mcp) = active_mcp {
-        inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label);
+    if let Some(ctx) = mcp_context {
+        inject_mcp_metadata_streaming(&mut final_response, state, ctx, server_label);
     }
 
     mask_tools_as_mcp(&mut final_response, original_request);
@@ -1140,20 +1138,10 @@ pub(super) async fn handle_streaming_with_tool_interception(
     mut payload: Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
-    active_mcp: &Arc<crate::mcp::McpManager>,
+    mcp_context: Arc<crate::mcp::McpRequestContext>,
 ) -> Response {
-    // Extract all dynamic MCP servers from request
-    let dynamic_servers: Vec<(String, String)> = original_body
-        .tools
-        .as_ref()
-        .map(|tools| extract_dynamic_mcp_servers(tools))
-        .unwrap_or_default();
-
-    // Build per-request tool inventory (combines static + dynamic tools)
-    let request_inventory = Arc::new(active_mcp.build_request_inventory(&dynamic_servers).await);
-
     // Transform MCP tools to function tools in payload with formatted names
-    prepare_mcp_payload_for_streaming(&mut payload, &request_inventory);
+    prepare_mcp_payload_for_streaming(&mut payload, &mcp_context);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let should_store = original_body.store.unwrap_or(false);
@@ -1165,8 +1153,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     let url_clone = url.clone();
     let headers_opt = headers.cloned();
     let payload_clone = payload.clone();
-    let active_mcp_clone = Arc::clone(active_mcp);
-    let inventory_clone = Arc::clone(&request_inventory);
+    let mcp_context_clone = Arc::clone(&mcp_context);
 
     // Spawn the streaming loop task
     tokio::spawn(async move {
@@ -1310,7 +1297,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                                         handler.allocate_synthetic_output_index();
                                                     if !send_mcp_list_tools_events(
                                                         &tx,
-                                                        &active_mcp_clone,
+                                                        &mcp_context_clone,
                                                         server_label,
                                                         list_tools_index,
                                                         &mut sequence_number,
@@ -1372,7 +1359,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     &tx,
                     &mut sequence_number,
                     &state,
-                    Some(&active_mcp_clone),
+                    Some(&mcp_context_clone),
                     &original_request,
                     previous_response_id.as_deref(),
                     server_label,
@@ -1395,7 +1382,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     inject_mcp_metadata_streaming(
                         &mut response_json,
                         &state,
-                        &active_mcp_clone,
+                        &mcp_context_clone,
                         server_label,
                     );
 
@@ -1453,12 +1440,11 @@ pub(super) async fn handle_streaming_with_tool_interception(
             // Execute all pending tool calls
             if !execute_streaming_tool_calls(
                 pending_calls,
-                &active_mcp_clone,
                 &tx,
                 &mut state,
                 server_label,
                 &mut sequence_number,
-                &inventory_clone,
+                &mcp_context_clone,
             )
             .await
             {
@@ -1515,35 +1501,14 @@ pub(super) async fn handle_streaming_response(
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
 ) -> Response {
-    // Check if MCP is active for this request
-    // Ensure dynamic client is created if needed
-    if let (Some(manager), Some(ref tools)) = (mcp_manager, &original_body.tools) {
-        ensure_request_mcp_client(manager, tools.as_slice()).await;
-    }
+    // Create MCP request context if available (encapsulates client creation + tool inventory)
+    let mcp_context_opt = match (mcp_manager, &original_body.tools) {
+        (Some(manager), Some(tools)) => ensure_request_mcp_client(manager, tools.as_slice()).await,
+        _ => None,
+    };
 
-    // Use the tool loop if the manager has any tools available (static or dynamic).
-    // Check both inventory (static) and request tools (dynamic MCP)
-    let active_mcp = mcp_manager.and_then(|mgr| {
-        let has_static_tools = !mgr.list_tools().is_empty();
-        let has_dynamic_mcp = original_body
-            .tools
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
-            })
-            .unwrap_or(false);
-
-        if has_static_tools || has_dynamic_mcp {
-            Some(mgr)
-        } else {
-            None
-        }
-    });
-
-    // If no MCP is active, use simple pass-through streaming
-    if active_mcp.is_none() {
+    // If no MCP context, use simple pass-through streaming
+    let Some(mcp_context) = mcp_context_opt else {
         return handle_simple_streaming_passthrough(
             client,
             circuit_breaker,
@@ -1557,9 +1522,7 @@ pub(super) async fn handle_streaming_response(
             original_previous_response_id,
         )
         .await;
-    }
-
-    let active_mcp = active_mcp.unwrap();
+    };
 
     // MCP is active - transform tools and set up interception
     handle_streaming_with_tool_interception(
@@ -1572,7 +1535,7 @@ pub(super) async fn handle_streaming_response(
         payload,
         original_body,
         original_previous_response_id,
-        active_mcp,
+        Arc::new(mcp_context),
     )
     .await
 }

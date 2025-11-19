@@ -53,9 +53,7 @@ use crate::{
         },
     },
     routers::{
-        common::{
-            ensure_request_mcp_client, extract_dynamic_mcp_servers, persist_conversation_items,
-        },
+        common::{ensure_request_mcp_client, persist_conversation_items},
         header_utils::apply_request_headers,
     },
 };
@@ -281,18 +279,13 @@ impl OpenAIRouter {
         if let Some(mcp) = active_mcp {
             let config = McpLoopConfig::default();
 
-            // Extract all dynamic MCP servers from request
-            let dynamic_servers: Vec<(String, String)> = original_body
-                .tools
-                .as_ref()
-                .map(|tools| extract_dynamic_mcp_servers(tools))
-                .unwrap_or_default();
-
-            // Build per-request tool inventory (combines static + dynamic tools)
-            let request_inventory = mcp.build_request_inventory(&dynamic_servers).await;
+            // Create per-request context (encapsulates static + dynamic tools)
+            let mcp_context = mcp
+                .create_request_context(original_body.tools.as_deref().unwrap_or(&[]))
+                .await;
 
             // Transform MCP tools to function tools with formatted names
-            prepare_mcp_payload_for_streaming(&mut payload, &request_inventory);
+            prepare_mcp_payload_for_streaming(&mut payload, &mcp_context);
 
             match execute_tool_loop(
                 &self.client,
@@ -300,9 +293,8 @@ impl OpenAIRouter {
                 headers,
                 payload,
                 original_body,
-                mcp,
                 &config,
-                &request_inventory,
+                &mcp_context,
             )
             .await
             {

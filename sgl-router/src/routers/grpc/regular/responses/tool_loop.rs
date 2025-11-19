@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::conversions;
 use crate::{
-    mcp::{self, error::McpError, inventory::format_tool_name, McpManager},
+    mcp::{self, error::McpError, inventory::format_tool_name},
     protocols::{
         chat::{
             ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -35,12 +35,9 @@ use crate::{
             ResponsesResponse,
         },
     },
-    routers::{
-        common::extract_dynamic_mcp_servers,
-        grpc::{
-            common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
-            error,
-        },
+    routers::grpc::{
+        common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+        error,
     },
 };
 
@@ -164,8 +161,11 @@ fn generate_mcp_id(prefix: &str) -> String {
 }
 
 /// Build mcp_list_tools output item
-fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> ResponseOutputItem {
-    let tools = mcp.list_tools();
+fn build_mcp_list_tools_item(
+    mcp_context: &mcp::McpRequestContext,
+    server_label: &str,
+) -> ResponseOutputItem {
+    let tools = mcp_context.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|cached_tool| McpToolInfo {
@@ -220,6 +220,7 @@ pub(super) async fn execute_tool_loop(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     response_id: Option<String>,
+    mcp_context: mcp::McpRequestContext,
 ) -> Result<ResponsesResponse, Response> {
     // Get server label from original request tools
     let server_label = original_request
@@ -244,22 +245,9 @@ pub(super) async fn execute_tool_loop(
         server_label, max_tool_calls, MAX_ITERATIONS
     );
 
-    // Extract all MCP servers with their labels and URLs from request
-    let dynamic_servers: Vec<(String, String)> = original_request
-        .tools
-        .as_ref()
-        .map(|tools| extract_dynamic_mcp_servers(tools))
-        .unwrap_or_default();
-
-    // Build per-request tool inventory (combines static + dynamic tools)
-    let request_inventory = ctx
-        .mcp_manager
-        .build_request_inventory(&dynamic_servers)
-        .await;
-
     // Build MCP tools with formatted names: server_label__tool_name
     let mut mcp_tools = Vec::new();
-    for cached_tool in request_inventory.list_tools() {
+    for cached_tool in mcp_context.list_tools() {
         // Format tool name using utility function
         let formatted_name = format_tool_name(&cached_tool.server_label, &cached_tool.tool_name);
         let mut tool_clone = cached_tool.tool.clone();
@@ -395,7 +383,7 @@ pub(super) async fn execute_tool_loop(
                 );
 
                 // Look up tool in inventory to get server_label and tool_name
-                let cached_tool = match request_inventory.get_tool(&formatted_tool_name) {
+                let cached_tool = match mcp_context.get_tool(&formatted_tool_name) {
                     Some(tool) => tool,
                     None => {
                         error!(
@@ -417,14 +405,8 @@ pub(super) async fn execute_tool_loop(
                 };
 
                 // Call tool via inventory
-                let (output_str, success, error) = match ctx
-                    .mcp_manager
-                    .call_tool_from_inventory(
-                        &request_inventory,
-                        &server_label,
-                        &original_tool_name,
-                        args_map,
-                    )
+                let (output_str, success, error) = match mcp_context
+                    .call_tool(&server_label, &original_tool_name, args_map)
                     .await
                 {
                     Ok(result) => {
@@ -542,7 +524,7 @@ pub(super) async fn execute_tool_loop(
             // Inject MCP metadata into output
             if state.total_calls > 0 {
                 // Prepend mcp_list_tools item
-                let mcp_list_tools = build_mcp_list_tools_item(&ctx.mcp_manager, &server_label);
+                let mcp_list_tools = build_mcp_list_tools_item(&mcp_context, &server_label);
                 responses_response.output.insert(0, mcp_list_tools);
 
                 // Append all mcp_call items at the end
@@ -570,6 +552,7 @@ pub(super) async fn execute_tool_loop_streaming(
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
+    mcp_context: mcp::McpRequestContext,
 ) -> Response {
     // Create SSE channel for client
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
@@ -587,6 +570,7 @@ pub(super) async fn execute_tool_loop_streaming(
             headers,
             model_id,
             tx.clone(),
+            mcp_context,
         )
         .await;
 
@@ -638,6 +622,7 @@ async fn execute_tool_loop_streaming_internal(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    mcp_context: mcp::McpRequestContext,
 ) -> Result<(), String> {
     // Extract server label from original request tools
     let server_label = original_request
@@ -671,22 +656,9 @@ async fn execute_tool_loop_streaming_internal(
     let event = emitter.emit_in_progress();
     emitter.send_event(&event, &tx)?;
 
-    // Extract all MCP servers with their labels and URLs from request
-    let dynamic_servers: Vec<(String, String)> = original_request
-        .tools
-        .as_ref()
-        .map(|tools| extract_dynamic_mcp_servers(tools))
-        .unwrap_or_default();
-
-    // Build per-request tool inventory (combines static + dynamic tools)
-    let request_inventory = ctx
-        .mcp_manager
-        .build_request_inventory(&dynamic_servers)
-        .await;
-
     // Build MCP tools with formatted names: server_label__tool_name
     let mut mcp_tools = Vec::new();
-    for cached_tool in request_inventory.list_tools() {
+    for cached_tool in mcp_context.list_tools() {
         // Format tool name using utility function
         let formatted_name = format_tool_name(&cached_tool.server_label, &cached_tool.tool_name);
         let mut tool_clone = cached_tool.tool.clone();
@@ -843,7 +815,7 @@ async fn execute_tool_loop_streaming_internal(
                 );
 
                 // Look up tool in inventory to get server_label and tool_name
-                let cached_tool = match request_inventory.get_tool(&formatted_tool_name) {
+                let cached_tool = match mcp_context.get_tool(&formatted_tool_name) {
                     Some(tool) => tool,
                     None => {
                         error!(
@@ -903,14 +875,8 @@ async fn execute_tool_loop_streaming_internal(
                 };
 
                 // Call tool via inventory
-                let call_result = ctx
-                    .mcp_manager
-                    .call_tool_from_inventory(
-                        &request_inventory,
-                        &server_label,
-                        &original_tool_name,
-                        args_map,
-                    )
+                let call_result = mcp_context
+                    .call_tool(&server_label, &original_tool_name, args_map)
                     .await
                     .and_then(|result| {
                         to_string(&result).map_err(|e| {
