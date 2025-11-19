@@ -12,6 +12,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import openai
+
 # Add e2e_response_api directory for imports
 _TEST_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_TEST_DIR))
@@ -39,6 +41,7 @@ class TestOracleStore(ResponseCRUDBaseTest, ConversationCRUDBaseTest):
         )
 
         cls.base_url = cls.cluster["base_url"]
+        cls.client = openai.Client(api_key=cls.api_key, base_url=cls.base_url + "/v1")
 
     @classmethod
     def tearDownClass(cls):

@@ -61,11 +61,21 @@ class TimeStats:
     # TODO: correct set them
     bootstrap_duration: float = 0.0
     alloc_waiting_duration: float = 0.0
-    prefill_start_time: float = 0.0
-    prefill_end_time: float = 0.0
+    prefill_start_time_host: float = 0.0
+    prefill_end_time_host: float = 0.0
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
+
+    def get_prefill_launch_delay(self) -> Optional[float]:
+        if self.prefill_start_time_host > 0.0:
+            return self.prefill_start_time_host - self.forward_entry_time
+        return None
+
+    def get_prefill_launch_latency(self) -> Optional[float]:
+        if self.prefill_start_time_host > 0.0 and self.prefill_end_time_host > 0.0:
+            return self.prefill_end_time_host - self.prefill_start_time_host
+        return None
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:

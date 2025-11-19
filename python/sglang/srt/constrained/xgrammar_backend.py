@@ -105,7 +105,7 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         device_type = logits.device.type
-        if device_type == "cuda":
+        if device_type == "cuda" or device_type == "npu":
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:

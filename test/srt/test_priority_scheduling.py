@@ -2,7 +2,7 @@ import asyncio
 import os
 import re
 import unittest
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (

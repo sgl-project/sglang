@@ -2,7 +2,6 @@ import itertools
 import unittest
 from typing import Optional, Tuple, Union
 
-import sgl_kernel
 import torch
 from utils import make_non_contiguous, precision
 

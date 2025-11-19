@@ -19,7 +19,7 @@ import torch.profiler
 from einops import rearrange
 from tqdm.auto import tqdm
 
-from sglang.multimodal_gen.configs.pipelines.base import STA_Mode
+from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -135,7 +135,7 @@ class DenoisingStage(PipelineStage):
                 AttentionBackendEnum.SLIDING_TILE_ATTN,
                 AttentionBackendEnum.VIDEO_SPARSE_ATTN,
                 AttentionBackendEnum.VMOBA_ATTN,
-                AttentionBackendEnum.FA3,
+                AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN_THREE,
             },  # hack
@@ -269,7 +269,10 @@ class DenoisingStage(PipelineStage):
             None,
         )
         # FIXME: should probably move to latent preparation stage, to handle with offload
-        if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
+        if (
+            server_args.pipeline_config.task_type == ModelTaskType.TI2V
+            and batch.pil_image is not None
+        ):
             # Wan2.2 TI2V directly replaces the first frame of the latent with
             # the image latent instead of appending along the channel dim
             assert batch.image_latent is None, "TI2V task should not have image latents"
@@ -334,7 +337,7 @@ class DenoisingStage(PipelineStage):
 
         # Shard z and reserved_frames_mask for TI2V if SP is enabled
         if (
-            server_args.pipeline_config.ti2v_task
+            server_args.pipeline_config.task_type == ModelTaskType.TI2V
             and batch.pil_image is not None
             and get_sp_world_size() > 1
         ):
@@ -681,7 +684,10 @@ class DenoisingStage(PipelineStage):
     ):
         bsz = batch.raw_latent_shape[0]
         # expand timestep
-        if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
+        if (
+            server_args.pipeline_config.task_type == ModelTaskType.TI2V
+            and batch.pil_image is not None
+        ):
             # Explicitly cast t_device to the target float type at the beginning.
             # This ensures any precision-based rounding (e.g., float32(999.0) -> bfloat16(1000.0))
             # is applied consistently *before* it's used by any rank.
@@ -723,7 +729,10 @@ class DenoisingStage(PipelineStage):
         """
         For Wan2.2 ti2v task, global first frame should be replaced with encoded image after each timestep
         """
-        if server_args.pipeline_config.ti2v_task and batch.pil_image is not None:
+        if (
+            server_args.pipeline_config.task_type == ModelTaskType.TI2V
+            and batch.pil_image is not None
+        ):
             # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
             # This ensures the first frame is always the condition image after each step.
             # This is only applied on rank 0, where z is not None.
@@ -814,7 +823,8 @@ class DenoisingStage(PipelineStage):
                     latent_model_input = latents.to(target_dtype)
                     if batch.image_latent is not None:
                         assert (
-                            not server_args.pipeline_config.ti2v_task
+                            not server_args.pipeline_config.task_type
+                            == ModelTaskType.TI2V
                         ), "image latents should not be provided for TI2V task"
                         latent_model_input = torch.cat(
                             [latent_model_input, batch.image_latent], dim=1
