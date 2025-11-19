@@ -229,20 +229,20 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         ret = response.json()
         return ret
 
-    def run_update_weights(self, named_tensors, non_blocking=False):
+    def run_update_weights(self, named_tensors, force=False):
         response = requests.post(
             self.base_url + "/update_weights_from_tensor",
             json={
                 "serialized_named_tensors": [
                     MultiprocessingSerializer.serialize(named_tensors, output_str=True)
                 ],
-                "non_blocking": non_blocking,
+                "force": force,
             },
         )
         ret = response.json()
         return ret
 
-    def test_update_weights_non_blocking(self):
+    def test_update_weights_force(self):
         num_requests = 32
         with ThreadPoolExecutor(num_requests) as executor:
             futures = [
@@ -257,7 +257,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
             named_tensors = [(x, new_tensor) for x in param_names]
 
             ret = self.pause_generation()
-            ret = self.run_update_weights(named_tensors, non_blocking=True)
+            ret = self.run_update_weights(named_tensors, force=True)
             self.assertTrue(ret["success"])
             ret = self.continue_generation()
 

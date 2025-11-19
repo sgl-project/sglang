@@ -2612,9 +2612,7 @@ class Scheduler(
         if recv_req.retract_all:
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_decode(
-                    self.server_args, retract_all=True
-                )
+                retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 

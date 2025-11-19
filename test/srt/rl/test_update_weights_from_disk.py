@@ -267,12 +267,12 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         print(json.dumps(response.json()))
         return model_path
 
-    def run_update_weights(self, model_path, non_blocking=False):
+    def run_update_weights(self, model_path, force=False):
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
             json={
                 "model_path": model_path,
-                "non_blocking": non_blocking,
+                "force": force,
             },
         )
         ret = response.json()
@@ -294,7 +294,7 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         ret = response.json()
         return ret
 
-    def test_update_weights_non_blocking(self):
+    def test_update_weights_force(self):
         origin_model_path = self.get_model_info()
         print(f"[Server Mode] origin_model_path: {origin_model_path}")
 
@@ -309,7 +309,7 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
 
             new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
             ret = self.pause_generation()
-            ret = self.run_update_weights(new_model_path, non_blocking=True)
+            ret = self.run_update_weights(new_model_path, force=True)
             self.assertTrue(ret["success"])
             ret = self.continue_generation()
 
