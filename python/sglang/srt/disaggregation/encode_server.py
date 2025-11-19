@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 import aiohttp
+import numpy as np
 import torch
 import uvicorn
 import zmq
@@ -33,45 +34,17 @@ from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
 logger = logging.getLogger(__name__)
 
 
-class EmbeddingData:
-    def __init__(self, req_id, num_parts, part_idx, image_grid_dim, embedding=None):
-        self.req_id = req_id
-        self.num_parts = num_parts
-        self.part_idx = part_idx
-        self.image_grid_dim = image_grid_dim
-        self.embedding = embedding
-
-        # aggregated data
-        self.ready_list = [i == self.part_idx for i in range(self.num_parts)]
-        self.embedding_list = [
-            embedding if i == self.part_idx else None for i in range(self.num_parts)
-        ]
-        self.image_grid_dim_list = [
-            self.image_grid_dim if i == self.part_idx else None
-            for i in range(self.num_parts)
-        ]
-
-    def add(self, embedding_data):
-        assert self.req_id == embedding_data.req_id
-        assert not self.ready_list[embedding_data.part_idx]
-        self.ready_list[embedding_data.part_idx] = True
-        self.image_grid_dim_list[embedding_data.part_idx] = (
-            embedding_data.image_grid_dim
-        )
-        self.embedding_list[embedding_data.part_idx] = embedding_data.embedding
-
-    def get_embedding(self):
-        return torch.concatenate(self.embedding_list)
-
-    def get_img_grid(self):
-        return torch.concatenate(self.image_grid_dim_list)
-
-    @property
-    def ready(self):
-        return sum(self.ready_list) == self.num_parts
-
-    def __repr__(self):
-        return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx})"
+def _convert(data):
+    if type(data) == torch.Tensor:
+        return data
+    elif type(data) == np.ndarray:
+        return torch.tensor(data)
+    elif type(data) == list and type(data[0]) == np.ndarray:
+        return torch.tensor(np.array(data))
+    elif type(data) == list and type(data[0]) in [int, float]:
+        return torch.tensor(data)
+    else:
+        return data
 
 
 _image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
@@ -92,7 +65,9 @@ class ImageEncoder:
         set_global_server_args_for_scheduler(server_args)
 
         self.image_processor = AutoImageProcessor.from_pretrained(
-            server_args.model_path, trust_remote_code=server_args.trust_remote_code
+            server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            use_fast=True,
         )
 
         self.model_config = ModelConfig.from_server_args(
@@ -146,13 +121,17 @@ class ImageEncoder:
         images = load_images(mm_items)
 
         images_input = self.image_processor(images=images)
+        feature = images_input["pixel_values"]
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": Modality.IMAGE,
-                "feature": images_input["pixel_values"],
+                "feature": _convert(feature),
             }
         )
-        mm_item.set("image_grid_thw", images_input["image_grid_thw"])
+        for k, v in images_input.items():
+            if k == "pixel_values":
+                continue
+            mm_item.set(k, _convert(v))
         mm_embedding = self.model.get_image_feature([mm_item])
         if len(mm_embedding.shape) != 2:
             mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
