@@ -1993,6 +1993,13 @@ class ModelRunner:
         if self.device not in ["cpu", "npu"] and self.server_args.disable_cuda_graph:
             return
 
+        if (
+            self.device == "npu"
+            and self.server_args.disable_cuda_graph
+            and not self.server_args.enable_torch_compile
+        ):
+            return
+
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
