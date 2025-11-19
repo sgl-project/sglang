@@ -6,6 +6,7 @@ from typing import List
 
 
 class HWBackend(Enum):
+    CPU = auto()
     CUDA = auto()
     AMD = auto()
 
@@ -14,19 +15,24 @@ class HWBackend(Enum):
 class CIRegistry:
     backend: HWBackend
     filename: str
-    estimation_time: float
-    stage: str
+    est_time: float
+    suite: str
 
 
-def register_cuda_ci(estimation_time: float, ci_stage: str):
+def register_cpu_ci(est_time: float, suite: str):
     pass
 
 
-def register_amd_ci(estimation_time: float, ci_stage: str):
+def register_cuda_ci(est_time: float, suite: str):
+    pass
+
+
+def register_amd_ci(est_time: float, suite: str):
     pass
 
 
 REGISTER_MAPPING = {
+    "register_cpu_ci": HWBackend.CPU,
     "register_cuda_ci": HWBackend.CUDA,
     "register_amd_ci": HWBackend.AMD,
 }
@@ -45,28 +51,27 @@ class RegistryVisitor(ast.NodeVisitor):
             return None
 
         hw = REGISTER_MAPPING[func_call.func.id]
-        est_time = None
-        ci_stage = None
+        est_time, suite = None, None
         for kw in func_call.keywords:
-            if kw.arg == "estimation_time":
+            if kw.arg == "est_time":
                 if isinstance(kw.value, ast.Constant):
                     est_time = kw.value.value
-            elif kw.arg == "ci_stage":
+            elif kw.arg == "suite":
                 if isinstance(kw.value, ast.Constant):
-                    ci_stage = kw.value.value
+                    suite = kw.value.value
 
         for i, arg in enumerate(func_call.args):
             if isinstance(arg, ast.Constant):
                 if i == 0:
                     est_time = arg.value
                 elif i == 1:
-                    ci_stage = arg.value
+                    suite = arg.value
         assert (
             est_time is not None
         ), "esimation_time is required and should be a constant"
-        assert ci_stage is not None, "ci_stage is required and should be a constant"
+        assert suite is not None, "suite is required and should be a constant"
         return CIRegistry(
-            backend=hw, filename=self.filename, estimation_time=est_time, stage=ci_stage
+            backend=hw, filename=self.filename, est_time=est_time, suite=suite
         )
 
     def visit_Module(self, node):

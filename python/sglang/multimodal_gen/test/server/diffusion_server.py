@@ -105,7 +105,7 @@ class ServerManager:
 
     def start(self) -> ServerContext:
         """Start the diffusion server and wait for readiness."""
-        log_dir, perf_log_path = prepare_perf_log(Path(__file__))
+        log_dir, perf_log_path = prepare_perf_log()
 
         safe_model_name = self.model.replace("/", "_")
         stdout_path = (

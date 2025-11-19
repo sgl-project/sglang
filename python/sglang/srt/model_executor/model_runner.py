@@ -32,6 +32,7 @@ import torch.distributed as dist
 from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
+    JetVLMConfig,
     KimiLinearConfig,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -41,6 +42,7 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
+    ModelImpl,
     get_nsa_index_head_dim,
     is_deepseek_nsa,
 )
@@ -112,6 +114,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.hook_manager import register_hooks
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -315,6 +318,8 @@ class ModelRunner:
 
         if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
             slow_rank_detector.execute()
+        # Init mindspore running environment when model impl is "mindspore"
+        self.init_mindspore_runner()
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -361,6 +366,20 @@ class ModelRunner:
                 self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
         else:
             self.piecewise_cuda_graph_runner = None
+
+    def init_mindspore_runner(self):
+        # Init the mindspore runner
+        # for now, there is only some communication initialization work
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE and _is_npu:
+            from sglang.srt.model_executor.mindspore_runner import init_ms_distributed
+
+            init_ms_distributed(
+                world_size=self.tp_size * self.pp_size,
+                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                local_rank=self.gpu_id,
+                server_args=self.server_args,
+                port=self.dist_port,
+            )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -496,6 +515,9 @@ class ModelRunner:
             self.graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
+
+        if server_args.hooks:
+            register_hooks(self.model, server_args.hooks)
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -1412,7 +1434,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig):
             return config
         return None
 
@@ -2011,6 +2033,9 @@ class ModelRunner:
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
+            return
+
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
             return
 
         if self.device != "cpu" and self.server_args.disable_cuda_graph:
