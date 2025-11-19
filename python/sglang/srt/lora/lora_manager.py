@@ -40,6 +40,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.lora_moe import FusedMoEWithLoRA
 
 if is_npu():
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
@@ -300,25 +302,83 @@ class LoRAManager:
             batch_info=self.cuda_graph_batch_info if use_cuda_graph else None,
         )
 
+        # Populate per-token LoRA indices from segment information
+        batch_info = self.lora_backend.batch_info
+        num_tokens = forward_batch.batch_size
+        if batch_info.permutation is None:
+            # No reordering (e.g., triton backend): segments are in original order
+            token_lora_indices = torch.empty(num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device)
+            seg_indptr = batch_info.seg_indptr  # [num_segments + 1]
+            for seg_idx in range(batch_info.num_segments):
+                start_token = seg_indptr[seg_idx]
+                end_token = seg_indptr[seg_idx + 1]
+                lora_adapter = batch_info.weight_indices[seg_idx]
+                token_lora_indices[start_token:end_token] = lora_adapter
+        else:
+            # Tokens are reordered (chunked backend): need to convert back to original order
+            token_lora_indices_reordered = torch.empty(num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device)
+            seg_indptr = batch_info.seg_indptr  # [num_segments + 1]
+            for seg_idx in range(batch_info.num_segments):
+                start_token = seg_indptr[seg_idx]
+                end_token = seg_indptr[seg_idx + 1]
+                lora_adapter = batch_info.weight_indices[seg_idx]
+                token_lora_indices_reordered[start_token:end_token] = lora_adapter
+
+            # Convert back to original token order using inverse permutation
+            inverse_permutation = torch.empty_like(batch_info.permutation)
+            inverse_permutation[batch_info.permutation] = torch.arange(num_tokens, dtype=batch_info.permutation.dtype, device=batch_info.permutation.device)
+            token_lora_indices = token_lora_indices_reordered[inverse_permutation]
+
+        forward_batch.token_lora_indices = token_lora_indices
+
+        # Store forward_batch reference in backend for MoE layer access
+        self.lora_backend.forward_batch = forward_batch
+
     def update_lora_info(self):
         """
         Update all LoRA modules to associate them with the latest memory buffer.
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
+                # Hack for FusedMoE layer
+                if isinstance(module, FusedMoEWithLoRA) and all(x in self.target_modules for x in ['gate_up_proj', 'down_proj']):
+                    module.set_lora_info(
+                        self.memory_pool.get_tensor(
+                            target_module='gate_up_proj',
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                            context='moe',
+                        ),
+                        self.memory_pool.get_tensor(
+                            target_module='down_proj',
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                            context='moe',
+                        ),
+                    )
+                    continue
+                
                 target_module = get_target_module_name(
                     module_name, self.memory_pool.target_modules
                 )
+
+                # Determine context based on module name
+                context = None
+                if isinstance(module, FusedMoEWithLoRA):
+                    context = "moe"
+
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
                         target_module=target_module,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_A,
+                        context=context,
                     ),
                     self.memory_pool.get_tensor(
                         target_module=target_module,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_B,
+                        context=context,
                     ),
                 )
 
@@ -470,6 +530,13 @@ class LoRAManager:
             # Check if module should be wrapped with LoRA
             if module_name.split(".")[-1] in self.target_modules:
                 layer_id = get_layer_id(module_name)
+                self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                    module_name, module
+                )
+                continue
+        
+            # Temporarily workaround for FusedMoE layer
+            if isinstance(module, FusedMoE) and all(x in self.target_modules for x in ['gate_up_proj', 'down_proj']):
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )

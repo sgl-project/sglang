@@ -109,8 +109,17 @@ class LoRAMemoryPool:
 
     def is_moe_module(self, module_name: str) -> bool:
         """Check if module is part of MoE experts."""
-        moe_patterns = ["block_sparse_moe.experts", "experts.", "mlp.experts"]
-        return any(pattern in module_name for pattern in moe_patterns)
+        return "moe" in module_name
+
+    def _get_standard_shape(self, module_name: str, base_model: torch.nn.Module, max_lora_dim: int, layer_idx: int) -> Tuple[int]:
+        """Get 3D shape for standard (non-MoE) modules."""
+        input_dim, _ = get_hidden_dim(
+            module_name, self.base_hf_config, base_model, layer_idx
+        )
+        c = get_stacked_multiply(module_name)
+        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+            input_dim = divide(input_dim, self.tp_size)
+        return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
     def get_lora_A_shape(
         self,
@@ -133,7 +142,7 @@ class LoRAMemoryPool:
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
 
-        # Check if MoE module and return appropriate shape
+        # Check if MoE module and return appropriate shape (the assumption is that down_proj and gate_up_proj are only used in MoE modules)
         if self.is_moe_module(module_name):
             num_experts = getattr(
                 self.base_hf_config,
@@ -183,20 +192,52 @@ class LoRAMemoryPool:
             target_modules: Set[str],
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
         ):
+            # Check if model has both shared experts and MoE experts
+            has_shared_experts = hasattr(base_model.config, 'shared_expert_intermediate_size') and \
+                               base_model.config.shared_expert_intermediate_size > 0
+            has_moe = getattr(base_model.config, "num_experts", 1) > 1
+
             for module_name in target_modules:
-                buffer[module_name] = [
-                    torch.empty(
-                        get_lora_shape_fn(
-                            module_name,
-                            base_model,
-                            self.max_lora_rank,
-                            idx,
-                        ),
-                        dtype=self.dtype,
-                        device=device,
-                    )
-                    for idx in range(self.num_layer)
-                ]
+                # Special handling for ambiguous target modules that can be in different contexts
+                ambiguous_modules = {"gate_up_proj", "down_proj"}
+                if module_name in ambiguous_modules and has_shared_experts and has_moe:
+                    # Allocate separate buffers for shared and MoE contexts
+                    # Shared expert version (3D)
+                    shared_key = module_name
+                    buffer[shared_key] = [
+                        torch.empty(
+                            get_lora_shape_fn(module_name, base_model, self.max_lora_rank, idx),
+                            dtype=self.dtype,
+                            device=device,
+                        )
+                        for idx in range(self.num_layer)
+                    ]
+
+                    # MoE expert version (4D)
+                    moe_key = f"{module_name}_moe"
+                    buffer[moe_key] = [
+                        torch.empty(
+                            get_lora_shape_fn(moe_key, base_model, self.max_lora_rank, idx),
+                            dtype=self.dtype,
+                            device=device,
+                        )
+                        for idx in range(self.num_layer)
+                    ]
+                else:
+                    # Standard allocation for unambiguous modules
+                    buffer[module_name] = [
+                        torch.empty(
+                            get_lora_shape_fn(
+                                module_name,
+                                base_model,
+                                self.max_lora_rank,
+                                idx,
+                            ),
+                            dtype=self.dtype,
+                            device=device,
+                        )
+                        for idx in range(self.num_layer)
+                    ]
 
         # Shape functions automatically handle both 3D (standard) and 4D (MoE)
         init_buffer(
@@ -408,18 +449,31 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, weights)
 
     def get_tensor(
-        self, target_module: str, layer_id: int, lora_type: LoRAType
+        self, target_module: str, layer_id: int, lora_type: LoRAType, context: str = None
     ) -> torch.Tensor:
         """
         Get LoRA tensor buffer (automatically handles both 3D and 4D tensors).
+
+        Args:
+            target_module: Target module name (e.g., 'gate_up_proj')
+            layer_id: Layer index
+            lora_type: LoRAType.LORA_A or LoRAType.LORA_B
+            context: Optional context hint ('moe' or None for auto-detect)
 
         Returns:
             - 3D tensor [num_loras, rank, hidden] for standard modules
             - 4D tensor [num_loras, num_experts, rank, hidden] for MoE modules
         """
-        if lora_type == LoRAType.LORA_A:
-            return self.A_buffer[target_module][layer_id]
-        return self.B_buffer[target_module][layer_id]
+        buffer_dict = self.A_buffer if lora_type == LoRAType.LORA_A else self.B_buffer
+
+        # Handle context-specific buffer selection for ambiguous modules
+        ambiguous_modules = {"gate_up_proj", "down_proj"}
+        if target_module in ambiguous_modules:
+            if context == "moe" and f"{target_module}_moe" in buffer_dict:
+                return buffer_dict[f"{target_module}_moe"][layer_id]
+                
+        # Fall back to original key for non-ambiguous modules
+        return buffer_dict[target_module][layer_id]
 
     def get_buffer_id(self, lora_uid: str):
         return self.uid_to_buffer_id[lora_uid]

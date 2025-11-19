@@ -12,30 +12,30 @@
 # limitations under the License.
 # ==============================================================================
 
-"""MoE-specific LoRA dispatch utilities."""
+"""MoE dispatch utilities."""
 
 import torch
 
 
-def per_lora_moe_dispatch(
+def moe_dispatch(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-    weight_indices: torch.Tensor,
+    lora_indices: torch.Tensor,
     num_experts: int,
     num_loras: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Dispatch tokens to experts with per-LoRA routing.
+    Dispatch tokens to experts for MoE computation.
 
     Args:
         topk_ids: [num_tokens, top_k] - Expert IDs selected by router
         topk_weights: [num_tokens, top_k] - Router weights
-        weight_indices: [num_tokens] - LoRA adapter ID for each token
+        lora_indices: [num_tokens] - LoRA adapter ID for each token
         num_experts: Total number of experts
         num_loras: Total number of LoRA adapters
 
     Returns:
-        sorted_token_ids: Token indices sorted by (lora_id, expert_id)
+        sorted_token_ids: Token indices sorted by expert_id
         sorted_expert_ids: Corresponding expert IDs
         sorted_weights: Corresponding router weights
     """
@@ -46,12 +46,11 @@ def per_lora_moe_dispatch(
     flat_topk_ids = topk_ids.flatten()
     flat_topk_weights = topk_weights.flatten()
     flat_token_ids = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
-    flat_lora_ids = weight_indices.repeat_interleave(top_k)
 
-    # Create composite key for sorting: lora_id * num_experts + expert_id
-    composite_key = flat_lora_ids * num_experts + flat_topk_ids
+    # Sort by expert_id only (each expert uses same LoRA adapter logic)
+    composite_key = flat_topk_ids
 
-    # Sort by composite key to group by (lora_id, expert_id)
+    # Sort by expert_id to group tokens by expert
     sorted_indices = torch.argsort(composite_key)
 
     sorted_token_ids = flat_token_ids[sorted_indices]

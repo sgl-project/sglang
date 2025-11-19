@@ -22,146 +22,190 @@ import triton.language as tl
 @triton.jit
 def _per_expert_lora_kernel(
     # Input/Output pointers
-    hidden_states_ptr,
-    lora_a_weights_ptr,
-    lora_b_weights_ptr,
-    output_ptr,
-    # Dispatch info
-    token_ids_ptr,
-    expert_ids_ptr,
-    lora_ids_ptr,
+    hidden_states_ptr,        # [num_total_tokens, hidden_dim]
+    lora_a_weights_ptr,       # [num_loras, num_experts, max_rank, hidden_dim]
+    lora_b_weights_ptr,       # [num_loras, num_experts, intermediate_dim, max_rank]
+    output_ptr,               # [num_total_tokens, intermediate_dim]
+
+    # Dispatch info (length = num_dispatched)
+    token_ids_ptr,            # [num_dispatched] -> index into hidden/output
+    expert_ids_ptr,           # [num_dispatched]
+    lora_ids_ptr,             # [num_dispatched]
+
     # Dimensions
     hidden_dim: tl.constexpr,
     intermediate_dim: tl.constexpr,
     max_rank: tl.constexpr,
     num_experts: tl.constexpr,
-    num_tokens: tl.constexpr,
-    # Strides for 4D LoRA weights [num_loras, num_experts, *, *]
+    num_dispatched,
+
+    # Strides for 4D LoRA A weights [num_loras, num_experts, max_rank, hidden_dim]
     lora_a_stride_lora: tl.constexpr,
     lora_a_stride_expert: tl.constexpr,
     lora_a_stride_rank: tl.constexpr,
     lora_a_stride_hidden: tl.constexpr,
+
+    # Strides for 4D LoRA B weights [num_loras, num_experts, intermediate_dim, max_rank]
     lora_b_stride_lora: tl.constexpr,
     lora_b_stride_expert: tl.constexpr,
     lora_b_stride_intermediate: tl.constexpr,
     lora_b_stride_rank: tl.constexpr,
-    # LoRA ranks per adapter
+
+    # LoRA ranks per adapter [num_loras]
     lora_ranks_ptr,
-    # Scaling factors per adapter
+    # Scaling factors per adapter [num_loras]
     lora_scalings_ptr,
-    # Block sizes
-    BLOCK_HIDDEN: tl.constexpr,
-    BLOCK_INTERMEDIATE: tl.constexpr,
-    BLOCK_RANK: tl.constexpr,
+
+    # Block size (used for hidden and output tiling; rank is not tiled)
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Compute per-expert LoRA delta: delta = B @ A @ hidden_states.
+    Compute per-expert LoRA delta:
 
-    Grid: (spatial_tiles, intermediate_slices, num_loras)
-    - spatial_tiles: Number of token tiles
-    - intermediate_slices: Number of output dimension tiles
-    - num_loras: Process each LoRA adapter in parallel
+        delta[token, out_slice, lora] = B[out_slice, :] @ (A @ hidden_states[token])
+
+    3D Grid: (spatial, slices, loras)
+      - spatial = program_id(0): dispatched token index
+      - slices  = program_id(1): tile index along intermediate_dim
+      - loras   = program_id(2): LoRA adapter index
     """
-    # Grid IDs
-    token_tile_id = tl.program_id(0)
-    output_tile_id = tl.program_id(1)
-    lora_id = tl.program_id(2)
 
-    # Get rank and scaling for this LoRA adapter
-    rank = tl.load(lora_ranks_ptr + lora_id)
-    scaling = tl.load(lora_scalings_ptr + lora_id)
+    # 3D grid indices
+    spatial_id = tl.program_id(0)   # dispatched token index
+    slice_id = tl.program_id(1)     # output slice index
+    lora_id_grid = tl.program_id(2) # LoRA adapter index
 
-    # Early exit if rank is 0
-    if rank == 0:
+    # Bounds check on dispatched tokens
+    if spatial_id >= num_dispatched:
         return
 
-    # Token range for this tile
-    token_start = token_tile_id * BLOCK_HIDDEN
-    token_end = tl.minimum(token_start + BLOCK_HIDDEN, num_tokens)
+    # Load dispatch info for this dispatched index
+    actual_token_id = tl.load(token_ids_ptr + spatial_id)
+    expert_id = tl.load(expert_ids_ptr + spatial_id)
+    token_lora_id = tl.load(lora_ids_ptr + spatial_id)
 
-    # Output dimension range
-    out_start = output_tile_id * BLOCK_INTERMEDIATE
-    out_end = tl.minimum(out_start + BLOCK_INTERMEDIATE, intermediate_dim)
+    # Skip if this token does not use this LoRA adapter
+    if token_lora_id != lora_id_grid:
+        return
 
-    # Process each token in this tile
-    for token_idx in range(token_start, token_end):
-        if token_idx >= num_tokens:
-            break
+    # Load LoRA rank and scaling (scalar tensors) for this LoRA adapter
+    rank = tl.load(lora_ranks_ptr + lora_id_grid)
+    scaling = tl.load(lora_scalings_ptr + lora_id_grid)
+    has_rank = rank > 0
+    if not has_rank:
+        return
 
-        # Load dispatch info for this token
-        actual_token_id = tl.load(token_ids_ptr + token_idx)
-        expert_id = tl.load(expert_ids_ptr + token_idx)
-        token_lora_id = tl.load(lora_ids_ptr + token_idx)
+    # ----------------------------
+    # Base pointers
+    # ----------------------------
+    # hidden_states[actual_token_id, :]
+    hidden_ptr = hidden_states_ptr + actual_token_id * hidden_dim
 
-        # Skip if this token doesn't belong to current LoRA
-        if token_lora_id != lora_id:
-            continue
+    # A[lora_id_grid, expert_id, :, :]
+    lora_a_base = (
+        lora_a_weights_ptr
+        + lora_id_grid * lora_a_stride_lora
+        + expert_id * lora_a_stride_expert
+    )
 
-        # Load hidden states for this token: [hidden_dim]
-        hidden_ptr = hidden_states_ptr + actual_token_id * hidden_dim
-        hidden_offs = tl.arange(0, BLOCK_HIDDEN)
-        hidden_mask = hidden_offs < hidden_dim
-        hidden = tl.load(hidden_ptr + hidden_offs, mask=hidden_mask, other=0.0)
+    # B[lora_id_grid, expert_id, :, :]
+    lora_b_base = (
+        lora_b_weights_ptr
+        + lora_id_grid * lora_b_stride_lora
+        + expert_id * lora_b_stride_expert
+    )
 
-        # Compute A @ hidden: [rank] = [rank, hidden_dim] @ [hidden_dim]
-        intermediate_a = tl.zeros([BLOCK_RANK], dtype=tl.float32)
+    # ----------------------------
+    # Stage 1: intermediate = A @ hidden
+    # ----------------------------
 
-        for k_tile in range(0, tl.cdiv(hidden_dim, BLOCK_HIDDEN)):
-            k_start = k_tile * BLOCK_HIDDEN
-            k_offs = tl.arange(0, BLOCK_HIDDEN) + k_start
-            k_mask = k_offs < hidden_dim
+    # We assume max_rank is small enough to keep as a single 1D vector
+    r_offs = tl.arange(0, max_rank)                    # [max_rank]
+    rank_mask = r_offs < rank                          # [max_rank]
 
-            # Load from hidden states
-            h_vals = tl.load(hidden_ptr + k_offs, mask=k_mask, other=0.0)
+    # Accumulator for intermediate: [max_rank]
+    intermediate = tl.zeros((max_rank,), dtype=tl.float32)
 
-            # Load LoRA A weights: [rank, hidden_dim]
-            for r in range(BLOCK_RANK):
-                if r >= rank:
-                    break
-                lora_a_offset = (
-                    lora_id * lora_a_stride_lora
-                    + expert_id * lora_a_stride_expert
-                    + r * lora_a_stride_rank
-                    + k_start * lora_a_stride_hidden
-                )
-                a_vals = tl.load(
-                    lora_a_weights_ptr + lora_a_offset + k_offs,
-                    mask=k_mask,
-                    other=0.0,
-                )
-                intermediate_a[r] += tl.sum(a_vals * h_vals)
+    # Tile over hidden_dim in chunks of BLOCK_SIZE
+    NUM_HIDDEN_TILES = (hidden_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
+    for hidden_tile_idx in range(NUM_HIDDEN_TILES):
+        hidden_start = hidden_tile_idx * BLOCK_SIZE
+        hidden_offs = hidden_start + tl.arange(0, BLOCK_SIZE)    # [BLOCK_SIZE]
+        hidden_mask = hidden_offs < hidden_dim                   # [BLOCK_SIZE]
 
-        # Compute B @ intermediate_a: [intermediate_dim] = [intermediate_dim, rank] @ [rank]
-        out_offs = tl.arange(0, BLOCK_INTERMEDIATE) + out_start
-        out_mask = out_offs < intermediate_dim
+        # Load hidden values for this tile: [BLOCK_SIZE]
+        h_vals = tl.load(
+            hidden_ptr + hidden_offs,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
 
-        output_vals = tl.zeros([BLOCK_INTERMEDIATE], dtype=tl.float32)
+        # Build [max_rank, BLOCK_SIZE] tile of A:
+        #   rows: r_offs
+        #   cols: hidden_offs
+        # offset = base + r * stride_rank + h * stride_hidden
+        a_ptrs = (
+            lora_a_base
+            + r_offs[:, None] * lora_a_stride_rank
+            + hidden_offs[None, :] * lora_a_stride_hidden
+        )
+        a_vals = tl.load(
+            a_ptrs,
+            mask=rank_mask[:, None] & hidden_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
 
-        for r in range(BLOCK_RANK):
-            if r >= rank:
-                break
+        # Dot over hidden axis: [max_rank]
+        # intermediate[r] += sum_h A[r, h] * h_vals[h]
+        intermediate += tl.sum(a_vals * h_vals[None, :], axis=1)
 
-            # Load LoRA B weights: [intermediate_dim, rank]
-            lora_b_offset = (
-                lora_id * lora_b_stride_lora
-                + expert_id * lora_b_stride_expert
-                + out_start * lora_b_stride_intermediate
-                + r * lora_b_stride_rank
-            )
-            b_vals = tl.load(
-                lora_b_weights_ptr
-                + lora_b_offset
-                + out_offs * lora_b_stride_intermediate,
-                mask=out_mask,
-                other=0.0,
-            )
-            output_vals += b_vals * intermediate_a[r]
+    # ----------------------------
+    # Stage 2: y_slice = B[out_slice, :] @ intermediate
+    # One output slice per program along intermediate_dim.
+    # ----------------------------
+    out_start = slice_id * BLOCK_SIZE
+    out_offs = out_start + tl.arange(0, BLOCK_SIZE)     # [BLOCK_SIZE]
+    out_mask = out_offs < intermediate_dim              # [BLOCK_SIZE]
 
-        # Scale and accumulate to output
-        output_vals *= scaling
-        output_offset = actual_token_id * intermediate_dim + out_start
-        tl.atomic_add(output_ptr + output_offset + out_offs, output_vals, mask=out_mask)
+    # If this slice is entirely out of bounds, we can early-exit
+    # (not strictly necessary but cheap)
+    # NOTE: Triton doesn't have a direct "if not any(mask)" primitive,
+    # but the mask will naturally guard loads/stores below, so this is safe to omit.
+    # We'll just rely on masks.
 
+    # Build [max_rank, BLOCK_SIZE] tile of B:
+    #   rows: r_offs (rank dimension)
+    #   cols: out_offs (output dimension)
+    # offset = base + out * stride_intermediate + r * stride_rank
+    b_ptrs = (
+        lora_b_base
+        + out_offs[None, :] * lora_b_stride_intermediate
+        + r_offs[:, None] * lora_b_stride_rank
+    )
+    b_vals = tl.load(
+        b_ptrs,
+        mask=rank_mask[:, None] & out_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    # Contribution:
+    #   out_vals[j] = sum_r B[j, r] * intermediate[r]
+    out_vals = tl.sum(b_vals * intermediate[:, None], axis=0)    # [BLOCK_SIZE]
+
+    # Apply scaling
+    out_vals *= scaling
+
+    # ----------------------------
+    # Accumulate into global output
+    # ----------------------------
+    out_row_base = actual_token_id * intermediate_dim
+    out_ptrs = output_ptr + out_row_base + out_offs
+
+    tl.atomic_add(
+        out_ptrs,
+        out_vals,
+        mask=out_mask & has_rank,
+    )
 
 def per_expert_lora_forward(
     hidden_states: torch.Tensor,
@@ -176,7 +220,8 @@ def per_expert_lora_forward(
     base_output: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Forward pass for per-expert LoRA computation.
+    Forward pass for per-expert LoRA computation using a 3D Triton grid:
+        grid = (spatial, slices, loras)
 
     Args:
         hidden_states: [num_tokens, hidden_dim]
@@ -193,61 +238,82 @@ def per_expert_lora_forward(
     Returns:
         output: [num_tokens, intermediate_dim] - Base output + LoRA delta (in-place)
     """
+    # Shapes
     num_tokens, hidden_dim = hidden_states.shape
     num_loras, _, intermediate_dim, max_rank = lora_b_weights.shape
     num_dispatched = token_ids.shape[0]
 
+    # Make sure everything is on the same device and contiguous
+    device = hidden_states.device
+    hidden_states = hidden_states.contiguous()
+    lora_a_weights = lora_a_weights.contiguous()
+    lora_b_weights = lora_b_weights.contiguous()
+    token_ids = token_ids.contiguous()
+    expert_ids = expert_ids.contiguous()
+    lora_ids = lora_ids.contiguous()
+    lora_ranks = lora_ranks.contiguous()
+    lora_scalings = lora_scalings.contiguous()
+
     # Initialize or reuse output tensor for in-place addition
     if base_output is None:
+        # Use float32 for accumulation; you can cast back if needed
         output = torch.zeros(
             num_tokens,
-            intermediate_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            hidden_dim,
+            dtype=torch.float32,
+            device=device,
         )
     else:
         output = base_output
+        assert output.shape == (num_tokens, hidden_dim) # TODO (jonahcb): check if this is correct
+        assert output.device == device
 
-    # Block sizes (tuned for typical dimensions)
-    BLOCK_HIDDEN = 128
-    BLOCK_INTERMEDIATE = 128
-    BLOCK_RANK = 64
+    # Tile size for hidden and output dimensions
+    BLOCK_SIZE = 64  # tune as needed
 
-    # Grid dimensions: (spatial_tiles, intermediate_slices, num_loras)
-    grid = (
-        triton.cdiv(num_dispatched, BLOCK_HIDDEN),
-        triton.cdiv(intermediate_dim, BLOCK_INTERMEDIATE),
-        num_loras,
-    )
+    # Number of output slices along intermediate_dim
+    num_slices = (intermediate_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    # 3D grid: (spatial, slices, loras)
+    grid = (num_dispatched, num_slices, num_loras)
 
     _per_expert_lora_kernel[grid](
-        hidden_states,
-        lora_a_weights,
-        lora_b_weights,
-        output,
-        token_ids,
-        expert_ids,
-        lora_ids,
-        hidden_dim,
-        intermediate_dim,
-        max_rank,
-        num_experts,
-        num_dispatched,
+        # Pointers
+        hidden_states,          # hidden_states_ptr
+        lora_a_weights,         # lora_a_weights_ptr
+        lora_b_weights,         # lora_b_weights_ptr
+        output,                 # output_ptr
+
+        # Dispatch info
+        token_ids,              # token_ids_ptr
+        expert_ids,             # expert_ids_ptr
+        lora_ids,               # lora_ids_ptr
+
+        # Dimensions
+        hidden_dim,             # hidden_dim
+        intermediate_dim,       # intermediate_dim
+        max_rank,               # max_rank
+        num_experts,            # num_experts
+        num_dispatched,         # num_dispatched (runtime scalar)
+
         # LoRA A strides: [num_loras, num_experts, max_rank, hidden_dim]
         lora_a_weights.stride(0),
         lora_a_weights.stride(1),
         lora_a_weights.stride(2),
         lora_a_weights.stride(3),
+
         # LoRA B strides: [num_loras, num_experts, intermediate_dim, max_rank]
         lora_b_weights.stride(0),
         lora_b_weights.stride(1),
         lora_b_weights.stride(2),
         lora_b_weights.stride(3),
-        lora_ranks,
-        lora_scalings,
-        BLOCK_HIDDEN,
-        BLOCK_INTERMEDIATE,
-        BLOCK_RANK,
+
+        # Rank & scaling
+        lora_ranks,             # lora_ranks_ptr
+        lora_scalings,          # lora_scalings_ptr
+
+        # Block size (constexpr)
+        BLOCK_SIZE=BLOCK_SIZE,
     )
 
     return output

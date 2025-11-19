@@ -81,9 +81,9 @@ class FusedMoEWithLoRA(nn.Module):
         """
         Compute LoRA delta using per-expert LoRA weights and add to base_output in-place.
 
-        Dispatch tokens to experts with LoRA-aware routing and compute per-expert deltas.
+        Dispatch tokens to experts and compute per-expert deltas.
         """
-        from sglang.srt.lora.moe_dispatch import per_lora_moe_dispatch
+        from sglang.srt.lora.moe_dispatch import moe_dispatch
         from sglang.srt.lora.triton_ops.per_expert_lora_moe import (
             per_expert_lora_forward,
         )
@@ -94,24 +94,28 @@ class FusedMoEWithLoRA(nn.Module):
 
         # Get LoRA batch info from backend
         batch_info = self.lora_backend.batch_info
-        weight_indices = batch_info.weight_indices  # [num_tokens]
         lora_ranks = batch_info.lora_ranks  # [num_loras]
         scalings = batch_info.scalings  # [num_loras]
+
+        # Use precomputed per-token LoRA indices from forward batch
+        lora_indices = self.lora_backend.forward_batch.token_lora_indices
 
         num_experts = self.base_moe.num_experts
         num_loras = self.lora_a_weights.shape[0]
 
-        # Dispatch tokens to (lora, expert) pairs
-        token_ids, expert_ids, _ = per_lora_moe_dispatch(
+        # Dispatch tokens to experts
+        token_ids, expert_ids, _ = moe_dispatch(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            weight_indices=weight_indices,
+            lora_indices=lora_indices,
             num_experts=num_experts,
             num_loras=num_loras,
         )
 
         # Get LoRA IDs for dispatched tokens
-        lora_ids = weight_indices[token_ids]
+        lora_ids = lora_indices[token_ids]
+
+
 
         # Compute per-expert LoRA forward (adds to base_output in-place)
         per_expert_lora_forward(
