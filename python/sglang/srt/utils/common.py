@@ -1972,34 +1972,79 @@ def set_gpu_proc_affinity(
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
-
-    # total physical cores
-    total_pcores = psutil.cpu_count(logical=False)
-    # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = envs.SGLANG_CPU_AFFINITY_NUM_PHYSICAL_CORE_PER_RANK.get() or (
-        total_pcores // tp_size_per_node
-    )
-
-    # able to handle multiple DP per node
-    start_cpu_id = (
-        gpu_id * num_cores_bind
-    ) % total_pcores + envs.SGLANG_CPU_AFFINITY_SKIP_PREFIX_NUM.get()
-    end_cpu_id = start_cpu_id + num_cores_bind
-
-    if psutil.cpu_count() != psutil.cpu_count(logical=False):
-        # HT on
-        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
+    cpu_affinity_rule = envs.SGLANG_CPU_AFFINITY_RULE.value
+    if cpu_affinity_rule:
+        cpus_per_rank = parse_cpu_affinity_rule(cpu_affinity_rule)
+        bind_cpu_ids = cpus_per_rank[gpu_id]
     else:
-        # HT off
-        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        nnodes_per_tp_group = max(nnodes // pp_size, 1)
+        tp_size_per_node = tp_size // nnodes_per_tp_group
+
+        # total physical cores
+        total_pcores = psutil.cpu_count(logical=False)
+        # physical cores per TP (N.B. more Cores than GPUs on node)
+        num_cores_bind = envs.SGLANG_CPU_AFFINITY_NUM_PHYSICAL_CORE_PER_RANK.get() or (
+            total_pcores // tp_size_per_node
+        )
+
+        # able to handle multiple DP per node
+        start_cpu_id = (
+            gpu_id * num_cores_bind
+        ) % total_pcores + envs.SGLANG_CPU_AFFINITY_SKIP_PREFIX_NUM.get()
+        end_cpu_id = start_cpu_id + num_cores_bind
+
+        if psutil.cpu_count() != psutil.cpu_count(logical=False):
+            # HT on
+            lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+            upper_cpu_ids = [
+                id + total_pcores for id in range(start_cpu_id, end_cpu_id)
+            ]
+            bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
+        else:
+            # HT off
+            bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
 
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+
+
+def parse_cpu_affinity_rule(rule_str: str) -> list[list[int]]:
+    """
+    解析 CPU 亲和性规则字符串
+
+    输入: "3-9,99-105;10-16,106-112;17-23,113-119"
+    输出: [[3,4,5,6,7,8,9,99,100,101,102,103,104,105],
+           [10,11,12,13,14,15,16,106,107,108,109,110,111,112],
+           [17,18,19,20,21,22,23,113,114,115,116,117,118,119]]
+    """
+    if not rule_str or rule_str == "":
+        return []
+
+    # 按分号分割每个 rank 的配置
+    rank_configs = rule_str.split(";")
+
+    cpus_per_rank = []
+    for rank_config in rank_configs:
+        rank_config = rank_config.strip()
+        if not rank_config:
+            continue
+
+        cpus = []
+        # 按逗号分割每个范围或单个数字
+        for part in rank_config.split(","):
+            part = part.strip()
+            if "-" in part:
+                # 范围格式: "3-9"
+                start, end = map(int, part.split("-"))
+                cpus.extend(range(start, end + 1))
+            else:
+                # 单个数字
+                cpus.append(int(part))
+
+        cpus_per_rank.append(cpus)
+
+    return cpus_per_rank
 
 
 @lru_cache(maxsize=2)
