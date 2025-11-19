@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
@@ -430,7 +431,7 @@ class HiRadixCache(RadixCache):
         # todo: more loading policies
 
         start_time = time.perf_counter()
-        last_hit_node = node
+        last_hit_node = node  # last_host_node
         nodes_to_load = []
         while node.evicted:
             assert (
@@ -484,26 +485,29 @@ class HiRadixCache(RadixCache):
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
+        req: Req,
         mem_quota: Optional[int] = None,
     ):
-        _ = host_hit_length  # unused, but kept for compatibility
+        if req.host_hit_length <= 0:
+            return None
+
+        _ = req.host_hit_length  # unused, but kept for compatibility
+
+        last_node = req.last_host_node
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values, last_node
+                req.last_node = last_node
+                return loading_values
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
-            last_node,
-        )
+        req.last_node = last_node
+        return None
 
     def ready_to_load_host_cache(self) -> int:
         """

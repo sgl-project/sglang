@@ -1,3 +1,4 @@
+import array
 import hashlib
 import logging
 import os
@@ -7,10 +8,23 @@ from typing import Any, List, Optional
 
 import torch
 
+from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
+
+def get_hash_str_v1(token_ids: List[int], prior_hash: str = None) -> str:
+    hasher = hashlib.sha256()
+
+    if prior_hash:
+        hasher.update(bytes.fromhex(prior_hash))
+
+    arr = array.array('L', token_ids)
+    batch_bytes = arr.tobytes()
+    hasher.update(batch_bytes)
+
+    return hasher.hexdigest()
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     hasher = hashlib.sha256()
@@ -57,6 +71,9 @@ class HiCacheStorage(ABC):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
 
+    def register_mem_pool_device(self, mem_pool_device: KVCache):
+        self.mem_pool_device = mem_pool_device
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -101,7 +118,7 @@ class HiCacheStorage(ABC):
         keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | None] | int:
+    ) -> List[torch.Tensor | int | None] | int:
         """
         Retrieve values for multiple keys.
         Returns a list of tensors or None for each key.
@@ -130,7 +147,7 @@ class HiCacheStorage(ABC):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> bool:
+    ) -> bool | List[int]:
         """
         Store multiple key-value pairs.
         Returns True if all operations were successful, False otherwise.
@@ -148,7 +165,7 @@ class HiCacheStorage(ABC):
     # TODO: Use a finer-grained return type (e.g., List[bool])
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> int:
+    ) -> int | List[int]:
         """
         Check if the keys exist in the storage.
         return the number of consecutive existing keys from the start.

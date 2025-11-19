@@ -247,7 +247,6 @@ class RadixCache(BasePrefixCache):
         self.root_node.key = RadixKey(token_ids=[], extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
-        self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()

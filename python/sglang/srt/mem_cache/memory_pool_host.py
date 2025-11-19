@@ -33,7 +33,7 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-SUPPORT_PIN_MEMORY = not _is_npu
+NEED_HOST_REGISTER = not _is_npu
 
 
 def synchronized(func):
@@ -60,7 +60,9 @@ class HostKVCache(abc.ABC):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
-        self.pin_memory = pin_memory and SUPPORT_PIN_MEMORY
+        self.pin_memory = pin_memory
+        self.host_register = self.pin_memory and NEED_HOST_REGISTER
+
         self.device = device
 
         self.dtype = device_pool.store_dtype
@@ -253,14 +255,21 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        buffer = torch.empty(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        if self.pin_memory:
+        if self.host_register:
+            buffer = torch.empty(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+            )
             torch.cuda.cudart().cudaHostRegister(
                 buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+            )
+        else:
+            buffer = torch.empty(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
             )
         return buffer
 
@@ -642,11 +651,13 @@ class MLATokenToKVPoolHost(HostKVCache):
                 (*base_dims, self.kv_lora_rank),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=self.pin_memory,
             )
             self.v_buffer = torch.empty(
                 (*base_dims, self.qk_rope_head_dim),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=self.pin_memory,
             )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
@@ -657,14 +668,22 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_lora_rank + self.qk_rope_head_dim
         ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        buffer = torch.empty(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        if self.pin_memory:
+
+        if self.host_register:
+            buffer = torch.empty(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+            )
             torch.cuda.cudart().cudaHostRegister(
                 buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+            )
+        else:
+            buffer = torch.empty(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
             )
         return buffer
 

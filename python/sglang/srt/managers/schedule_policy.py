@@ -565,7 +565,11 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        enable_hierarchical_cache: bool = False,
     ):
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
@@ -596,14 +600,13 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if req.host_hit_length > 0:
-                new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length
-                )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                prefix_len = len(req.prefix_indices)
-                req.last_matched_prefix_len = prefix_len
+            if enable_hierarchical_cache:
+                new_indices = self.tree_cache.init_load_back(req)
+                if new_indices is not None:
+                    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                    req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                    prefix_len = len(req.prefix_indices)
+                    req.last_matched_prefix_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
