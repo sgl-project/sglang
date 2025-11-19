@@ -1268,6 +1268,18 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+        elif model_arch in [
+            "NemotronHForCausalLM",
+            "FalconH1ForCausalLM",
+            "JetNemotronForCausalLM",
+            "JetVLMForConditionalGeneration",
+        ]:
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
+                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
