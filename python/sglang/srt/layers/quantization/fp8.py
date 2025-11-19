@@ -341,9 +341,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        
+
         if self.block_quant:
-            logger.info(f"[FP8] Block-wise quantization: shape={layer.weight.shape}, dtype={layer.weight.dtype}")
+            logger.info(
+                f"[FP8] Block-wise quantization: shape={layer.weight.shape}, dtype={layer.weight.dtype}"
+            )
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
                 logger.info("[FP8] ROCm: Normalizing to e4m3fnuz")
@@ -373,20 +375,24 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                
+
                 if self.cutlass_fp8_supported or self.use_marlin:
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
-                    logger.info(f"[FP8] Per-channel quantization: {layer.weight.dtype} -> FP8 (cutlass={self.cutlass_fp8_supported}, marlin={self.use_marlin})")
-                    
+                    logger.info(
+                        f"[FP8] Per-channel quantization: {layer.weight.dtype} -> FP8 (cutlass={self.cutlass_fp8_supported}, marlin={self.use_marlin})"
+                    )
+
                     qweight, weight_scale = per_token_group_quant_fp8(
                         layer.weight, layer.weight.shape[-1]
                     )
                     weight_scale = weight_scale.t().contiguous()
                 else:
                     # per-tensor quantization
-                    logger.info(f"[FP8] Per-tensor quantization: {layer.weight.dtype} -> FP8")
-                    
+                    logger.info(
+                        f"[FP8] Per-tensor quantization: {layer.weight.dtype} -> FP8"
+                    )
+
                     qweight, weight_scale = input_to_float8(layer.weight)
 
                 # Update the layer with the new values.

@@ -227,7 +227,9 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     quant_profile_path: Optional[str] = None  # For quantized_rl load format
-    quantized_rl_model: Optional[str] = None  # Pre-quantized model for quantized_rl initial load
+    quantized_rl_model: Optional[str] = (
+        None  # Pre-quantized model for quantized_rl initial load
+    )
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False

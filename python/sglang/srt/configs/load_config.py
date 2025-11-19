@@ -80,9 +80,11 @@ class LoadConfig:
 
     # ModelOpt configuration object
     modelopt_config: Optional[ModelOptConfig] = None
-    
+
     # QuantizedRL-specific options (for FlashRL-style quantization)
-    quant_profile_path: Optional[str] = None  # Path to quantization profile (e.g., /root/profile.7b.pt)
+    quant_profile_path: Optional[str] = (
+        None  # Path to quantization profile (e.g., /root/profile.7b.pt)
+    )
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}
