@@ -2984,9 +2984,9 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_suffix_max_cached_requests,
             help="The maximum number of requests to cache in the global suffix tree. "
-            "If exceeded, will trigger eviction in FIFO order. If set to 0, the global "
-            "suffix tree is disabled and past responses are not cached (prompt trees "
-            "are still used).",
+            "If exceeded, will trigger eviction in FIFO order. Set to -1 for unlimited "
+            "cache size, or 0 to disable the global suffix tree (past responses are not "
+            "cached, but prompt trees are still used).",
         )
         parser.add_argument(
             "--speculative-suffix-max-spec-factor",

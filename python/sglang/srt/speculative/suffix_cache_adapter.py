@@ -8,7 +8,7 @@ This allows NGRAMWorker to use suffix decoding without modification.
 import logging
 import os
 from collections import deque
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -264,7 +264,7 @@ class SuffixCacheAdapter:
         logger.info("[SUFFIX ADAPTER] Cache reset")
 
     def _reorder_tree_bfs(
-        self, token_ids: List[int], parents: List[int]
+        self, token_ids: List[int], parents: List[Optional[int]]
     ) -> Tuple[List[int], List[int]]:
         """
         Reorder nodes so parents always precede their descendants.
@@ -329,13 +329,10 @@ class SuffixCacheAdapter:
         """
         Insert the latest verified token as index 0 so the layout matches NGRAM.
         """
-        if context_token is None:
-            context_token = 0
-
         rooted_ids = [context_token]
         rooted_parents = [-1]
         for parent_idx in parents:
-            if parent_idx is None or parent_idx < 0:
+            if parent_idx < 0:
                 rooted_parents.append(0)
             else:
                 rooted_parents.append(parent_idx + 1)
