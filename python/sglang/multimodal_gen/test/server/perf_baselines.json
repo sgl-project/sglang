@@ -98,7 +98,7 @@
         "flux_image_t2i": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
-                "TextEncodingStage": 73.91,
+                "TextEncodingStage": 87.36,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.98,
                 "LatentPreparationStage": 4.95,
