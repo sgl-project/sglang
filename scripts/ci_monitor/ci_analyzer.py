@@ -30,7 +30,6 @@ class SGLangCIAnalyzer:
 
         # Nightly workflow files to monitor
         self.nightly_workflows = [
-            "nightly-test.yml",
             "nightly-test-nvidia.yml",
             "nightly-test-amd.yml",
             "nightly-test-intel.yml",
@@ -130,16 +129,7 @@ class SGLangCIAnalyzer:
                 "per-commit-8-gpu-h20",
             ],
             "nightly": [
-                # Old job names (nightly-test.yml)
-                "nightly-test-perf-text-models",
-                "nightly-test-eval-text-models",
-                "nightly-test-1-gpu",
-                "nightly-test-4-gpu",
-                "nightly-test-8-gpu-h200",
-                "nightly-test-8-gpu-h20",
-                "nightly-test-4-gpu-b200",
-                "nightly-test-8-gpu-b200",
-                # New NVIDIA job names (nightly-test-nvidia.yml)
+                # NVIDIA job names (nightly-test-nvidia.yml)
                 "nightly-test-general-1-gpu-runner",
                 "nightly-test-general-4-gpu-h100",
                 "nightly-test-general-8-gpu-h200",
@@ -237,18 +227,7 @@ class SGLangCIAnalyzer:
                     "unit-test-backend-4-gpu-b200",
                     "unit-test-backend-4-gpu-gb200",
                     "quantization-test",
-                    # Old nightly job names (nightly-test.yml)
-                    "nightly-test-eval-text-models",
-                    "nightly-test-perf-text-models",
-                    "nightly-test-eval-vlms",
-                    "nightly-test-perf-vlms",
-                    "nightly-test-1-gpu",
-                    "nightly-test-4-gpu",
-                    "nightly-test-8-gpu-h200",
-                    "nightly-test-8-gpu-h20",
-                    "nightly-test-4-gpu-b200",
-                    "nightly-test-8-gpu-b200",
-                    # New NVIDIA job names (nightly-test-nvidia.yml)
+                    # NVIDIA job names (nightly-test-nvidia.yml)
                     "nightly-test-general-1-gpu-runner",
                     "nightly-test-general-4-gpu-h100",
                     "nightly-test-general-8-gpu-h200",
@@ -743,7 +722,7 @@ class SGLangCIAnalyzer:
 
         # Get nightly job names from the existing job categories
         nightly_jobs = [
-            # New NVIDIA job names (nightly-test-nvidia.yml)
+            # NVIDIA job names (nightly-test-nvidia.yml)
             "nightly-test-general-1-gpu-runner",
             "nightly-test-general-4-gpu-h100",
             "nightly-test-general-8-gpu-h200",
@@ -758,17 +737,6 @@ class SGLangCIAnalyzer:
             "nightly-test",
             # Intel job names (nightly-test-intel.yml)
             "placeholder",
-            # Old job names (kept for backwards compatibility)
-            "nightly-test-eval-text-models",
-            "nightly-test-perf-text-models",
-            "nightly-test-eval-vlms",
-            "nightly-test-perf-vlms",
-            "nightly-test-1-gpu",
-            "nightly-test-4-gpu",
-            "nightly-test-8-gpu-h200",
-            "nightly-test-8-gpu-h20",
-            "nightly-test-4-gpu-b200",
-            "nightly-test-8-gpu-b200",
         ]
 
         stats = {
