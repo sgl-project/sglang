@@ -1080,7 +1080,7 @@ class SGLangFailuresAnalyzer:
                 print("## ALERTS: Runners with Issues")
                 print("=" * 100)
                 print(
-                    "\nNothing to display (no runners with consecutive failure streak >= 2)"
+                    "\nNothing to display (no runners with consecutive failure streak > 2)"
                 )
 
         # Section 1: Currently Broken Jobs (streak >= 2)
@@ -1483,7 +1483,7 @@ class SGLangFailuresAnalyzer:
                     summary_lines.append("## ALERTS: Runners with Issues")
                     summary_lines.append("")
                     summary_lines.append(
-                        "Nothing to display (no runners with consecutive failure streak >= 2)"
+                        "Nothing to display (no runners with consecutive failure streak > 2)"
                     )
                     summary_lines.append("")
                     summary_lines.append("")
