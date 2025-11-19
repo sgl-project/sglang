@@ -17,11 +17,12 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 
 # TODO: better handle operator import for registration
 import sglang.srt.compilation.fusion.triton_ops.fused_swiglu  # noqa: F401
-from sglang.srt.compilation.fusion.fusion_pass import FusionPass
+from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
 
 
-class FusedActivationPass(FusionPass):
+class FusedActivationPass(SGLangPatternMatcherInductorPass):
     def register_swiglu_replacement_pattern(self) -> None:
+
         def pattern(x, w, out):
             mm = torch.ops.aten.mm.default(x, w)
             silu_and_mul = auto_functionalized_v2(
@@ -44,6 +45,7 @@ class FusedActivationPass(FusionPass):
         self.register_replacement_pattern(pattern, replacement, example_inputs)
 
     def register_swiglu_fp8_replacement_pattern(self) -> None:
+
         def pattern(x, w, x_scale, w_scale, o_scale, out, output_q):
             mm = torch.ops.aten._scaled_mm.default(
                 x, w, x_scale, w_scale, None, None, out.dtype

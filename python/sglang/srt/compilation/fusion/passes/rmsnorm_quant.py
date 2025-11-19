@@ -1,12 +1,10 @@
 import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 
-from sglang.srt.compilation.fusion.fusion_pass import FusionPass
+from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
 
 
-class RMSNormQuantPass(FusionPass):
-    # TODO: Probably need to get rid of the attention graph breaks in dynamo
-    # TODO: for this pattern to appear in the graph
+class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
     def register_rmsnorm_quant_replacement_pattern(self):
         def pattern(x, rms_result, weight, scale, eps, output):
             rmsnorm = auto_functionalized_v2(
@@ -19,11 +17,9 @@ class RMSNormQuantPass(FusionPass):
                 _all_bases=[rms_result],
             )
 
-            view = torch.ops.aten.reshape.default(rmsnorm[1], [-1, rmsnorm[1].shape[1]])
-
             sgl_per_tensor_quant_fp8 = auto_functionalized_v2(
                 torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default,
-                input=view,
+                input=rmsnorm[1],
                 output_s=scale,
                 is_static=True,
                 _output_q_base_index=0,
@@ -33,7 +29,7 @@ class RMSNormQuantPass(FusionPass):
 
         def replacement(x, rms_result, weight, scale, eps, output):
             rms_norm_static_fp8_quant = auto_functionalized_v2(
-                torch.ops._C.rms_norm_static_fp8_quant.default,
+                torch.ops.sgl_kernel.rms_norm_static_fp8_quant.default,
                 input=x,
                 weight=weight,
                 scale=scale,
@@ -51,7 +47,7 @@ class RMSNormQuantPass(FusionPass):
             torch.empty(16, 16).to(dtype=torch.float8_e4m3fn).cuda(),
         ]
 
-        for eps in self.fusion_config.rms_norm_eps:
+        for eps in self.pass_config.rms_norm_eps:
             self.register_replacement_pattern(
                 pattern, replacement, example_inputs, scalar_workaround={"eps": eps}
             )
@@ -85,7 +81,7 @@ class RMSNormQuantPass(FusionPass):
 
         def replacement(x, residual, weight, scale, result, eps):
             fused_add_rms_norm_static_fp8_quant = auto_functionalized_v2(
-                torch.ops._C.fused_add_rms_norm_static_fp8_quant.default,
+                torch.ops.sgl_kernel.fused_add_rms_norm_static_fp8_quant.default,
                 input=x,
                 weight=weight,
                 scale=scale,
@@ -108,11 +104,11 @@ class RMSNormQuantPass(FusionPass):
             torch.empty(16, 16).to(dtype=torch.float8_e4m3fn).cuda(),
         ]
 
-        for eps in self.fusion_config.rms_norm_eps:
+        for eps in self.pass_config.rms_norm_eps:
             self.register_replacement_pattern(
                 pattern, replacement, example_inputs, scalar_workaround={"eps": eps}
             )
 
     def build_pass(self):
-        # self.register_rmsnorm_quant_replacement_pattern()
+        self.register_rmsnorm_quant_replacement_pattern()
         self.register_fused_add_rmsnorm_quant_replacement_pattern()

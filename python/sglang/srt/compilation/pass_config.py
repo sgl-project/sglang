@@ -12,48 +12,43 @@
 # limitations under the License.
 # ==============================================================================
 
+import hashlib
+import json
 import logging
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-from sglang.srt.compilation.fusion.fusion_utils import hash_dict
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
-
-try:
-    from vllm import _custom_ops  # noqa: F401
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class FusionConfig:
+class PassConfig:
     device: Optional[str]
     model_dtype: Optional[str]
 
-    enable_rmsnorm_quant_pass: bool
-    enable_fused_activation_pass: bool
+    enable_fusion: bool
+    disable_rmsnorm_quant_pass: bool
+    disable_fused_activation_pass: bool
 
     rms_norm_eps: list[float]
 
     enable_torch_compile_graph_trace_logs: bool
 
     def uuid(self):
-        return hash_dict(asdict(self))
+        encoded = json.dumps(asdict(self), sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def from_server_args_and_model_config(
         server_args: ServerArgs, model_config: ModelConfig
     ):
-        enable_rmsnorm_quant_pass = False
+        disable_rmsnorm_quant_pass = True
         rms_norm_eps = []
-        if server_args.enable_rmsnorm_quant_pass and VLLM_AVAILABLE:
-            enable_rmsnorm_quant_pass = True
+        if not server_args.disable_rmsnorm_quant_pass:
+            disable_rmsnorm_quant_pass = False
             if model_config.hf_config.rms_norm_eps is not None:
                 rms_norm_eps.append(model_config.hf_config.rms_norm_eps)
             else:
@@ -63,14 +58,13 @@ class FusionConfig:
                 )
                 rms_norm_eps.append(1e-05)
                 rms_norm_eps.append(1e-06)
-        elif server_args.enable_rmsnorm_quant_pass:
-            logger.warning("RMSNormQuant pass requires vllm to be installed.")
 
-        return FusionConfig(
+        return PassConfig(
             device=server_args.device if server_args.device else None,
             model_dtype=server_args.dtype if server_args.dtype else None,
-            enable_rmsnorm_quant_pass=enable_rmsnorm_quant_pass,
-            enable_fused_activation_pass=server_args.enable_fused_activation_pass,
+            enable_fusion=server_args.enable_torch_compile_fusion,
+            disable_rmsnorm_quant_pass=disable_rmsnorm_quant_pass,
+            disable_fused_activation_pass=server_args.disable_fused_activation_pass,
             enable_torch_compile_graph_trace_logs=server_args.enable_torch_compile_graph_trace_logs,
             rms_norm_eps=rms_norm_eps,
         )
