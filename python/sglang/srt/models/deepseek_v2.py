@@ -3568,14 +3568,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             weight_block_size=getattr(self.quant_config, "weight_block_size", None)
         ):
             self._moe_weight_requant_ue8m0(is_nextn)
-
-        # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
-        ):
-            self._transform_scale_ue8m0(is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._transform_scale_nextn_moe_ue8m0()
 
@@ -3608,25 +3600,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         (experts.w2_weight, experts.w2_weight_scale_inv),
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
-
-    # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
-    def _transform_scale_ue8m0(self, is_nextn=False):
-        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
-
-        for layer_id in range(num_hidden_layers):
-            if is_nextn:
-                layer = self.model.decoder
-            else:
-                layer = self.model.layers[layer_id]
-
-            module_list = []
-            if self.config.q_lora_rank is not None:
-                module_list.append(layer.self_attn.q_b_proj)
-
-            for module in module_list:
-                transform_scale_ue8m0_inplace(
-                    module.weight_scale_inv, mn=module.weight.shape[-2]
-                )
 
     # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
     def _transform_scale_nextn_moe_ue8m0(self):
