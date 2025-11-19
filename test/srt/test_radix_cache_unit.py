@@ -669,7 +669,7 @@ class TestRadixCache(unittest.TestCase):
 
         # Insert a sequence
         cache.insert(RadixKey([1, 2, 3, 4, 5, 6, 7, 8]), None)
-        
+
         # Trigger event emission to compute sequence_hash lazily
         cache.take_events()
 

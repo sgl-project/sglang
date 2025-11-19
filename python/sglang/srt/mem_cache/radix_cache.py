@@ -614,7 +614,7 @@ class RadixCache(BasePrefixCache):
                 split_pages = split_len
             else:
                 split_pages = split_len // self.page_size
-            
+
             new_node.sequence_hash = child.sequence_hash[:split_pages]
             child.sequence_hash = child.sequence_hash[split_pages:]
         # If sequence_hash wasn't set, leave as None - will be computed lazily during event emission
@@ -709,11 +709,14 @@ class RadixCache(BasePrefixCache):
 
     def _compute_node_sequence_hashes(self, node: TreeNode) -> List[int]:
         sequence_hashes = []
-        
+
         # Get parent's last sequence hash if parent exists
         parent_seq_hash = None
         if node.parent is not None and node.parent != self.root_node:
-            if node.parent.sequence_hash is not None and len(node.parent.sequence_hash) > 0:
+            if (
+                node.parent.sequence_hash is not None
+                and len(node.parent.sequence_hash) > 0
+            ):
                 parent_seq_hash = node.parent.sequence_hash[-1]
             else:
                 # Parent exists but sequence_hash not computed yet - log warning
@@ -722,25 +725,25 @@ class RadixCache(BasePrefixCache):
                     f"Computing sequence hash from scratch. This may indicate events were not emitted "
                     f"in order or parent node was not processed yet."
                 )
-        
+
         # Iterate through node's pages
         for start in range(0, len(node.key), self.page_size):
             page_tokens = node.key.token_ids[start : start + self.page_size]
             if not page_tokens:
                 continue
-            
+
             # Compute content hash for this page
             content_hash = hash(tuple(page_tokens))
-            
+
             # Compute sequence hash
             if parent_seq_hash is None:
                 seq_hash = content_hash
             else:
                 seq_hash = hash((parent_seq_hash, content_hash))
-            
+
             sequence_hashes.append(seq_hash)
             parent_seq_hash = seq_hash
-        
+
         return sequence_hashes
 
     def _record_store_event(self, node: TreeNode):
@@ -750,11 +753,14 @@ class RadixCache(BasePrefixCache):
             # Typically parent's last sequence hash is already computed and used as base
             if node.sequence_hash is None:
                 node.sequence_hash = self._compute_node_sequence_hashes(node)
-            
+
             # Get parent's last sequence hash for first page
             parent_block_hash = None
             if node.parent is not None and node.parent != self.root_node:
-                if node.parent.sequence_hash is not None and len(node.parent.sequence_hash) > 0:
+                if (
+                    node.parent.sequence_hash is not None
+                    and len(node.parent.sequence_hash) > 0
+                ):
                     parent_block_hash = node.parent.sequence_hash[-1]
 
             page_index = 0
@@ -764,7 +770,7 @@ class RadixCache(BasePrefixCache):
                     continue
 
                 block_hash = node.sequence_hash[page_index]
-                
+
                 self.kv_event_queue.append(
                     BlockStored(
                         block_hashes=[block_hash],
@@ -784,17 +790,17 @@ class RadixCache(BasePrefixCache):
             # Compute sequence_hash lazily if not already set (must match what was stored)
             if node.sequence_hash is None:
                 node.sequence_hash = self._compute_node_sequence_hashes(node)
-            
+
             page_index = 0
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key.token_ids[start : start + self.page_size]
                 if not page_tokens:
                     continue
-                
+
                 block_hash = node.sequence_hash[page_index]
-                
+
                 self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
-                
+
                 page_index += 1
 
     def _record_all_cleared_event(self):
