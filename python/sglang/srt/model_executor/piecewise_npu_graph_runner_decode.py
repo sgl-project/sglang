@@ -37,6 +37,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.compilation.piecewise_npu_graph_compiler import (
     PiecewiseNpuGraphCompiler,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_batch_sizes_to_capture
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -47,7 +48,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     get_available_gpu_memory,
-    get_device_memory_capacity,
     rank0_log,
 )
 
@@ -90,58 +90,6 @@ class CompiledGraph:
         self.callable = callable
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner):
-    server_args = model_runner.server_args
-    capture_bs = server_args.cuda_graph_bs
-
-    if capture_bs is None:
-        if server_args.speculative_algorithm is None:
-            if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
-            else:
-                capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
-        else:
-            # Since speculative decoding requires more npu graph memory, we
-            # capture less.
-            capture_bs = (
-                list(range(1, 9))
-                + list(range(10, 33, 2))
-                + list(range(40, 64, 8))
-                + list(range(80, 161, 16))
-            )
-
-        gpu_mem = get_device_memory_capacity()
-        if gpu_mem is not None and gpu_mem > 96 * 1024:
-            capture_bs += list(range(160, 257, 8))
-        if gpu_mem is not None and gpu_mem > 180 * 1000:
-            capture_bs += list(range(256, 513, 16))
-
-    if max(capture_bs) > model_runner.req_to_token_pool.size:
-        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
-        # is very small. We add more values here to make sure we capture the maximum bs.
-        capture_bs += [model_runner.req_to_token_pool.size]
-
-    if server_args.enable_two_batch_overlap:
-        capture_bs = [bs for bs in capture_bs if bs >= 2]
-
-    if server_args.cuda_graph_max_bs:
-        capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
-        if max(capture_bs) < server_args.cuda_graph_max_bs:
-            capture_bs += list(
-                range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
-            )
-    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
-    capture_bs = list(sorted(set(capture_bs)))
-    assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
-    compile_bs = (
-        [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
-        if server_args.enable_torch_compile
-        else []
-    )
-
-    return capture_bs, compile_bs
-
-
 class PiecewiseNPUGraphRunnerDecode:
     """A PiecewiseNPUGraphRunnerDecode runs the forward pass of a model with npu graph and torch.compile."""
 
@@ -179,7 +127,7 @@ class PiecewiseNPUGraphRunnerDecode:
         self.pp_size = model_runner.server_args.pp_size
 
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
         rank0_log(f"Capture npu graph bs {self.capture_bs}")
         self.capture_forward_mode: int = ForwardMode.DECODE
         self.capture_hidden_mode: int = CaptureHiddenMode.NULL
