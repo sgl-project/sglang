@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import pickle
 import signal
 import sys
 import threading
@@ -1055,10 +1056,55 @@ class Scheduler(
 
                 while True:
                     try:
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
+                        parts = self.recv_from_tokenizer.recv_multipart(
+                            flags=zmq.NOBLOCK, copy=False
+                        )
+
+                        if not parts:
+                            break
+
+                        # Check message type
+                        msg_type = bytes(parts[0])
+
+                        if msg_type == b"NORM":
+                            # Normal message
+                            recv_req = pickle.loads(parts[1])
+                            recv_reqs.append(recv_req)
+
+                        elif msg_type == b"FEAT":
+                            # Message with optimized feature tensors
+                            recv_req = pickle.loads(parts[1])
+                            feature_infos = pickle.loads(parts[2])
+
+                            # Reconstruct tensors
+                            for i, feature_info in enumerate(feature_infos):
+                                buffer_idx = 3 + i
+                                buffer = (
+                                    parts[buffer_idx].buffer
+                                    if hasattr(parts[buffer_idx], "buffer")
+                                    else parts[buffer_idx]
+                                )
+
+                                dtype = feature_info["dtype"]
+                                shape = feature_info["shape"]
+                                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(
+                                    shape
+                                )
+
+                                idx = feature_info["idx"]
+                                if (
+                                    hasattr(recv_req, "mm_inputs")
+                                    and recv_req.mm_inputs
+                                ):
+                                    mm_items = recv_req.mm_inputs.get("mm_items", [])
+                                    if idx < len(mm_items):
+                                        mm_items[idx].feature = tensor
+                            recv_reqs.append(recv_req)
+                        else:
+                            logger.warning(f"Unknown message type: {msg_type}")
+
+                    except zmq.ZMQError as e:
                         break
-                    recv_reqs.append(recv_req)
 
                 while True:
                     try:
