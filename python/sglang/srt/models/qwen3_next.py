@@ -465,7 +465,10 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.linear_attn = Qwen3GatedDeltaNet(
-            config, layer_id, quant_config, alt_stream,
+            config,
+            layer_id,
+            quant_config,
+            alt_stream,
             prefix=add_prefix("linear_attn", prefix),
         )
 
