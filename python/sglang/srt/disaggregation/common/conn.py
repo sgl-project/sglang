@@ -48,11 +48,9 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
-        is_draft_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend
-        self.is_draft_mla_backend = is_draft_mla_backend
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
@@ -153,33 +151,30 @@ class CommonKVManager(BaseKVManager):
         return socket
 
     def get_mha_kv_ptrs_with_pp(
-        self,
-        src_kv_ptrs: List[int],
-        dst_kv_ptrs: List[int],
-        start_layer: int,
-        end_layer: int,
+        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
         # pp is not supported on the decode side yet
-        num_kv_layers = end_layer - start_layer
-        src_k_ptrs = src_kv_ptrs[start_layer:end_layer]
-        src_v_ptrs = src_kv_ptrs[end_layer : end_layer + num_kv_layers]
+        start_layer = self.kv_args.prefill_start_layer
+        num_kv_layers = len(src_kv_ptrs) // 2
+        end_layer = start_layer + num_kv_layers
+        dst_num_total_layers = len(dst_kv_ptrs) // 2
+        src_k_ptrs = src_kv_ptrs[:num_kv_layers]
+        src_v_ptrs = src_kv_ptrs[num_kv_layers:]
         dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
         dst_v_ptrs = dst_kv_ptrs[
-            num_kv_layers + start_layer : num_kv_layers + end_layer
+            dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
         ]
-        layers_current_pp_stage = num_kv_layers
+        layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
-        self,
-        src_kv_ptrs: List[int],
-        dst_kv_ptrs: List[int],
-        start_layer: int,
-        end_layer: int,
+        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], int]:
         # pp is not supported on the decode side yet
+        start_layer = self.kv_args.prefill_start_layer
+        end_layer = start_layer + len(src_kv_ptrs)
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
-        layers_current_pp_stage = end_layer - start_layer
+        layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
 
