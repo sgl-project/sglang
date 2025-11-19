@@ -71,7 +71,7 @@ def init_process(
     checking_parameters,
     tie_word_embeddings,
     barrier,
-    non_blocking=False,
+    force=False,
 ):
     torch.cuda.set_device(rank)
 
@@ -100,7 +100,7 @@ def init_process(
             backend,
             tp_size,
             barrier,
-            non_blocking=non_blocking,
+            force=force,
         )
 
 
@@ -215,7 +215,7 @@ def init_process_sgl(
     backend,
     tp_size,
     barrier,
-    non_blocking=False,
+    force=False,
 ):
     torch.cuda.set_device(rank)
     torch.cuda.synchronize()
@@ -290,7 +290,8 @@ def init_process_sgl(
             },
         )
 
-    if non_blocking:
+    if force:
+
         def run_decode(max_new_tokens=32):
             response = requests.post(
                 url + "/generate",
@@ -309,7 +310,6 @@ def init_process_sgl(
             futures = [executor.submit(run_decode, 3000) for _ in range(32)]
             time.sleep(2)
 
-
     # The last parameter is lm_head.weight, which is tied
     # with embed_tokens.weight. Actually, we only need
     # to update embed_tokens.weight once.
@@ -325,11 +325,6 @@ def init_process_sgl(
     dtypes = [torch.bfloat16 if backend == "Engine" else "bfloat16"] * len(names)
     shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
 
-    if non_blocking:
-        requests.post(
-            url + "/pause_generation",
-            json={"abort_all": False, "retract_all": True},
-        )
     torch.cuda.synchronize()
     barrier.wait()
     time_begin_update = time.perf_counter()
@@ -348,16 +343,11 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
-                "non_blocking": non_blocking,
+                "force": force,
             },
         )
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
-    if non_blocking:
-        requests.post(
-            url + "/continue_generation",
-            json={},
-        )
 
     # Measure the latency of broadcast/weights update.
     update_time = time_end_update - time_begin_update
@@ -422,7 +412,7 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
-    non_blocking=False,
+    force=False,
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -448,7 +438,7 @@ def test_update_weights_from_distributed(
             checking_parameters,
             tie_word_embeddings,
             barrier,
-            non_blocking,
+            force,
         ),
         nprocs=1 + dp_size,
         join=False,
@@ -669,7 +659,8 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 checking_parameters,
             )
 
-class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
+
+class TestUpdateWeightsFromDistributedForce(CustomTestCase):
 
     def test_update_weights_from_distributed(self):
 
@@ -736,8 +727,9 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
                 model_state_dict_shapes[model_name],
                 truncate_size,
                 checking_parameters,
-                non_blocking=True,
+                force=True,
             )
+
 
 if __name__ == "__main__":
     unittest.main()

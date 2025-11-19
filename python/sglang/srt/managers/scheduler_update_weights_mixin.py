@@ -12,7 +12,6 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.managers.io_struct import (
-    ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
@@ -44,6 +43,9 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        self.pause_generation(
+            recv_req=PauseGenerationReqInput(abort_all=False, retract_all=True)
+        )
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
             flush_cache_success = self.flush_cache()
@@ -67,25 +69,43 @@ class SchedulerUpdateWeightsMixin:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        self.pause_generation(
+            recv_req=PauseGenerationReqInput(
+                abort_all=False, retract_all=recv_req.flush_cache
+            )
+        )
+        if recv_req.flush_cache:
+            self.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+            )
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
-        if success:
-            if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
-                assert flush_cache_success, "Cache flush failed after updating weights"
-        else:
+        if not success:
             logger.error(message)
+        if recv_req.flush_cache:
+            self.resume_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+            )
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        self.pause_generation(
+            recv_req=PauseGenerationReqInput(
+                abort_all=False, retract_all=recv_req.flush_cache
+            )
+        )
+        if recv_req.flush_cache:
+            self.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+            )
         success, message = self.tp_worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
-        if success:
-            if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
-                assert flush_cache_success, "Cache flush failed after updating weights"
-        else:
+        if not success:
             logger.error(message)
+        if recv_req.flush_cache:
+            self.resume_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+            )
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 

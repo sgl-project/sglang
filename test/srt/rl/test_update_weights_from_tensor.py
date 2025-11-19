@@ -177,7 +177,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         engine.shutdown()
 
 
-class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
+class TestServerUpdateWeightsFromTensorForce(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -213,36 +213,20 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         print(json.dumps(response.json()))
         return model_path
 
-    def pause_generation(self):
-        response = requests.post(
-            self.base_url + "/pause_generation",
-            json={"abort_all": False, "retract_all": True},
-        )
-        ret = response.json()
-        return ret
-    
-    def continue_generation(self):
-        response = requests.post(
-            self.base_url + "/continue_generation",
-            json={},
-        )
-        ret = response.json()
-        return ret
-
-    def run_update_weights(self, named_tensors, non_blocking=False):
+    def run_update_weights(self, named_tensors, force=False):
         response = requests.post(
             self.base_url + "/update_weights_from_tensor",
             json={
                 "serialized_named_tensors": [
                     MultiprocessingSerializer.serialize(named_tensors, output_str=True)
                 ],
-                "non_blocking": non_blocking,
+                "force": force,
             },
         )
         ret = response.json()
         return ret
 
-    def test_update_weights_non_blocking(self):
+    def test_update_weights_force(self):
         num_requests = 32
         with ThreadPoolExecutor(num_requests) as executor:
             futures = [
@@ -256,10 +240,8 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
             new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
             named_tensors = [(x, new_tensor) for x in param_names]
 
-            ret = self.pause_generation()
-            ret = self.run_update_weights(named_tensors, non_blocking=True)
+            ret = self.run_update_weights(named_tensors, force=True)
             self.assertTrue(ret["success"])
-            ret = self.continue_generation()
 
             for future in as_completed(futures):
                 self.assertNotEqual(

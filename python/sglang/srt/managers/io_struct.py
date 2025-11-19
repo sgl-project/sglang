@@ -1040,8 +1040,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
     # Whether to wait for all ongoing inference requests to complete before updating
-    # parameters, or interrupt them and update parameters directly.
-    non_blocking: bool = False
+    # weights, or update weights between two consecutive forward passes during decoding.
+    force: bool = False
 
 
 @dataclass
@@ -1066,8 +1066,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
     # Whether to wait for all ongoing inference requests to complete before updating
-    # parameters, or interrupt them and update parameters directly.
-    non_blocking: bool = False
+    # weights, or update weights between two consecutive forward passes during decoding.
+    force: bool = False
 
 
 @dataclass
@@ -1094,8 +1094,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
     # Whether to wait for all ongoing inference requests to complete before updating
-    # parameters, or interrupt them and update parameters directly.
-    non_blocking: bool = False
+    # weights, or update weights between two consecutive forward passes during decoding.
+    force: bool = False
 
 
 @dataclass

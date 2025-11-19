@@ -54,14 +54,12 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
-    ContinueGenerationReqInput,
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
     GetLoadReqInput,
     HealthCheckOutput,
     OpenSessionReqOutput,
-    PauseGenerationReqInput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -1143,18 +1141,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self.metrics_collector.labels
             )
 
-    async def pause_generation(self, obj: PauseGenerationReqInput):
+    async def pause_generation(self):
         async with self.is_pause_cond:
             self.is_pause = True
-            if not obj.abort_all:
-                await self.send_to_scheduler.send_pyobj(obj)
-            else:
-                self.abort_request(abort_all=True)
+            self.abort_request(abort_all=True)
 
-    async def continue_generation(self, obj: ContinueGenerationReqInput):
+    async def continue_generation(self):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1169,7 +1163,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if obj.non_blocking:
+        if obj.force:
             return await self._wait_for_model_update_from_disk(obj)
 
         if obj.abort_all_requests:

@@ -451,7 +451,6 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
-        self._engine_paused = False
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -585,8 +584,6 @@ class Scheduler(
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
-                (PauseGenerationReqInput, self.pause_generation),
-                (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
 
@@ -971,9 +968,6 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
-            if self._engine_paused:
-                continue
-
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -994,9 +988,6 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-
-            if self._engine_paused:
-                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -2600,21 +2591,17 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        self._engine_paused = True
-
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
             self.last_batch = None
-            self.cur_batch = None #TODO: to confirm
+            self.cur_batch = None  # TODO: to confirm
 
         if recv_req.retract_all:
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_decode(
-                    self.server_args, retract_all=True
-                )
+                retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 
@@ -2622,7 +2609,7 @@ class Scheduler(
             self.chunked_req = None
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
-        self._engine_paused = False
+        raise NotImplementedError()
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
