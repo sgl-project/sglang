@@ -1469,7 +1469,7 @@ fn inject_mcp_metadata(
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|cached_tool| McpToolInfo {
-            name: cached_tool.tool.name.to_string(),
+            name: cached_tool.tool_name.clone(),
             description: cached_tool.tool.description.as_ref().map(|d| d.to_string()),
             input_schema: Value::Object((*cached_tool.tool.input_schema).clone()),
             annotations: Some(json!({
