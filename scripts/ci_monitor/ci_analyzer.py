@@ -948,6 +948,107 @@ class SGLangCIAnalyzer:
                 json.dump(stats, f, indent=2, default=str)
             print(f"\nDetailed stats saved to: {output_file}")
 
+    def generate_nightly_github_summary(self, stats: Dict):
+        """Generate GitHub Actions summary for nightly test analysis"""
+        try:
+            github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if not github_step_summary:
+                print("Not running in GitHub Actions, skipping nightly summary generation")
+                return
+
+            print("Generating GitHub Actions summary for Nightly Analysis...")
+
+            summary_lines = []
+            summary_lines.append("# Nightly Test Monitor Report")
+            summary_lines.append("")
+            summary_lines.append(f"**Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            summary_lines.append("")
+
+            # Overall statistics
+            total = stats["total_runs"]
+            success = stats["successful_runs"]
+            failed = stats["failed_runs"]
+            cancelled = stats["cancelled_runs"]
+
+            summary_lines.append("## Overall Statistics")
+            summary_lines.append("")
+            summary_lines.append("| Metric | Count | Percentage |")
+            summary_lines.append("|--------|-------|------------|")
+            summary_lines.append(f"| Total Runs | {total} | 100% |")
+            summary_lines.append(f"| Successful | {success} | {success/max(1,total)*100:.1f}% |")
+            summary_lines.append(f"| Failed | {failed} | {failed/max(1,total)*100:.1f}% |")
+            summary_lines.append(f"| Cancelled | {cancelled} | {cancelled/max(1,total)*100:.1f}% |")
+            summary_lines.append("")
+
+            # Daily trends
+            summary_lines.append("## Daily Trends")
+            summary_lines.append("")
+            summary_lines.append("| Date | Total Runs | Success | Failed | Success Rate |")
+            summary_lines.append("|------|------------|---------|--------|--------------|")
+
+            daily_stats = sorted(stats["daily_stats"].items(), reverse=True)[:7]
+            for date, day_stats in daily_stats:
+                success_rate = (day_stats["success"] / max(1, day_stats["total"])) * 100
+                summary_lines.append(
+                    f"| {date} | {day_stats['total']} | {day_stats['success']} | "
+                    f"{day_stats['failure']} | {success_rate:.1f}% |"
+                )
+            summary_lines.append("")
+
+            # Job statistics with performance metrics
+            if stats["job_stats"]:
+                summary_lines.append("## Job Statistics")
+                summary_lines.append("")
+
+                job_stats_sorted = sorted(
+                    stats["job_stats"].items(), key=lambda x: x[1]["failure"], reverse=True
+                )
+
+                for job_name, job_stat in job_stats_sorted:
+                    total_job = job_stat["total"]
+                    success_job = job_stat["success"]
+                    failure_job = job_stat["failure"]
+                    success_rate_job = (success_job / max(1, total_job)) * 100
+                    avg_duration = job_stat["avg_duration_minutes"]
+
+                    summary_lines.append(f"### {job_name}")
+                    summary_lines.append("")
+                    summary_lines.append(
+                        f"**Stats:** {total_job} runs | {success_job} success ({success_rate_job:.1f}%) | "
+                        f"{failure_job} failed | Avg duration: {avg_duration:.1f}m"
+                    )
+                    summary_lines.append("")
+
+                    # Performance metrics
+                    if job_stat.get("performance_metrics"):
+                        summary_lines.append("**Performance Metrics:**")
+                        summary_lines.append("")
+                        summary_lines.append("| Metric | Avg Value | Samples |")
+                        summary_lines.append("|--------|-----------|---------|")
+
+                        for metric_name, metric_data in job_stat["performance_metrics"].items():
+                            if metric_data:
+                                values = [m["value"] for m in metric_data]
+                                avg_value = sum(values) / len(values)
+                                summary_lines.append(f"| {metric_name} | {avg_value:.2f} | {len(values)} |")
+                        summary_lines.append("")
+
+                    # Recent failures
+                    if job_stat["recent_failures"]:
+                        summary_lines.append("**Recent Failures:**")
+                        for failure in job_stat["recent_failures"][:3]:
+                            summary_lines.append(f"- [Run #{failure['run_number']}]({failure['run_url']})")
+                        summary_lines.append("")
+
+            with open(github_step_summary, "a", encoding="utf-8") as f:
+                f.write("\n".join(summary_lines))
+                f.write("\n\n---\n\n")
+
+            print("GitHub Actions nightly summary generated successfully")
+
+        except Exception as e:
+            print(f"Failed to generate nightly GitHub Actions summary: {e}")
+
     def detect_nightly_regressions(self, stats: Dict) -> List[Dict]:
         """Detect regressions in nightly tests"""
         regressions = []
@@ -1048,6 +1149,7 @@ def main():
 
             stats = analyzer.analyze_nightly_with_metrics(runs)
             analyzer.generate_nightly_report(stats, args.output)
+            analyzer.generate_nightly_github_summary(stats)
             regressions = analyzer.detect_nightly_regressions(stats)
 
             # Exit with error code if regressions detected
