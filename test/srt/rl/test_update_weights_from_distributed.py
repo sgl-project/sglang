@@ -291,6 +291,7 @@ def init_process_sgl(
         )
 
     if force:
+
         def run_decode(max_new_tokens=32):
             response = requests.post(
                 url + "/generate",
@@ -308,7 +309,6 @@ def init_process_sgl(
         with ThreadPoolExecutor(32) as executor:
             futures = [executor.submit(run_decode, 3000) for _ in range(32)]
             time.sleep(2)
-
 
     # The last parameter is lm_head.weight, which is tied
     # with embed_tokens.weight. Actually, we only need
@@ -669,6 +669,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 checking_parameters,
             )
 
+
 class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
 
     def test_update_weights_from_distributed(self):
@@ -738,6 +739,7 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
                 checking_parameters,
                 force=True,
             )
+
 
 if __name__ == "__main__":
     unittest.main()

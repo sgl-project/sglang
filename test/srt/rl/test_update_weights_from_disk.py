@@ -277,7 +277,7 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         )
         ret = response.json()
         return ret
-    
+
     def pause_generation(self):
         response = requests.post(
             self.base_url + "/pause_generation",
@@ -285,7 +285,7 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         )
         ret = response.json()
         return ret
-    
+
     def continue_generation(self):
         response = requests.post(
             self.base_url + "/continue_generation",

@@ -220,7 +220,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         )
         ret = response.json()
         return ret
-    
+
     def continue_generation(self):
         response = requests.post(
             self.base_url + "/continue_generation",
