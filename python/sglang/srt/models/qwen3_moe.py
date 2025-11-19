@@ -430,8 +430,8 @@ class Qwen3MoeAttention(nn.Module):
             assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
             self.rotary_emb(
                 qkv,
-                self.k_norm.weight,
                 self.q_norm.weight,
+                self.k_norm.weight,
                 positions,
                 self.num_heads,
                 self.num_kv_heads,
