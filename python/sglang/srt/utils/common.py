@@ -915,6 +915,13 @@ def get_image_bytes(image_file: Union[str, bytes]):
 
 
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.value:
+        return get_video_opencv_handler(video_file)
+    else:
+        return get_video_decord_handler(video_file, use_gpu)
+
+
+def get_video_decord_handler(video_file: Union[str, bytes], use_gpu: bool = True):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
     from decord import VideoReader, cpu, gpu
 
@@ -968,6 +975,79 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     finally:
         if tmp_file and os.path.exists(tmp_file.name):
             os.unlink(tmp_file.name)
+
+
+def get_video_opencv_handler(video_file: Union[str, bytes]):
+    import cv2
+
+    tmp_file = None
+    vc = None
+    try:
+        if isinstance(video_file, bytes):
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tmp_file.write(video_file)
+            tmp_file.close()
+            vc = cv2.VideoCapture(tmp_file.name)
+        elif isinstance(video_file, str):
+            if video_file.startswith(("http://", "https://")):
+                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+                response = requests.get(video_file, stream=True, timeout=timeout)
+                response.raise_for_status()
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                for chunk in response.iter_content(chunk_size=8192):
+                    tmp_file.write(chunk)
+                tmp_file.close()
+                vc = cv2.VideoCapture(tmp_file.name)
+            elif video_file.startswith("data:"):
+                _, encoded = video_file.split(",", 1)
+                video_bytes = pybase64.b64decode(encoded, validate=True)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp_file.write(video_bytes)
+                tmp_file.close()
+                vc = cv2.VideoCapture(tmp_file.name)
+            # `urlparse` supports file:// paths, and so does VideoReader
+            elif os.path.isfile(urlparse(video_file).path):
+                vc = cv2.VideoCapture(tmp_file.name)
+            else:
+                video_bytes = pybase64.b64decode(video_file, validate=True)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp_file.write(video_bytes)
+                tmp_file.close()
+                vc = cv2.VideoCapture(tmp_file.name)
+        else:
+            raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+        return vc
+
+    finally:
+        if tmp_file and os.path.exists(tmp_file.name):
+            os.unlink(tmp_file.name)
+
+
+def read_video_frames_opencv(vc, frame_idx: List[int]):
+    import cv2
+
+    try:
+        width = int(vc.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(vc.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(vc.get(cv2.CAP_PROP_FRAME_COUNT))
+        n_frames = len(frame_idx)
+
+        video_np = np.empty((n_frames, height, width, 3), dtype=np.uint8)
+        mx_idx = min(total_frames, max(frame_idx) + 1)
+        i = 0
+        for idx in range(mx_idx):
+            ok = vc.grab()
+            if not ok:
+                break
+            if idx in frame_idx:
+                ret, frame = vc.retrieve()
+                if ret:
+                    video_np[i] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    i += 1
+        return video_np
+    finally:
+        vc.release()
 
 
 def encode_video(video_path, frame_count_limit=None):
