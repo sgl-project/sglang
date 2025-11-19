@@ -45,6 +45,11 @@ from sglang.srt.mem_cache.evict_policy import (
     LRUStrategy,
     MRUStrategy,
 )
+from sglang.srt.mem_cache.hicache_storage import (
+    compute_node_hash_values,
+    hash_str_to_int64,
+    split_node_hash_value,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -96,8 +101,6 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
-        # store sequence hashes for each page (position-aware hashes)
-        self.sequence_hash: Optional[List[int]] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -253,7 +256,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.value = []
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
-        self.root_node.sequence_hash = []
+        self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
@@ -607,17 +610,10 @@ class RadixCache(BasePrefixCache):
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
-        # Split sequence_hash if it was already computed, otherwise leave as None
-        # (will be computed lazily when events are emitted)
-        if child.sequence_hash is not None:
-            if self.page_size == 1:
-                split_pages = split_len
-            else:
-                split_pages = split_len // self.page_size
-
-            new_node.sequence_hash = child.sequence_hash[:split_pages]
-            child.sequence_hash = child.sequence_hash[split_pages:]
-        # If sequence_hash wasn't set, leave as None - will be computed lazily during event emission
+        # Split hash_value if it was already computed, otherwise leave as None
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         return new_node
 
@@ -652,7 +648,7 @@ class RadixCache(BasePrefixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
-            # Sequence hash will be computed lazily during event emission
+            # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
         return total_prefix_length
 
@@ -707,61 +703,21 @@ class RadixCache(BasePrefixCache):
 
         return ret_list
 
-    def _compute_node_sequence_hashes(self, node: TreeNode) -> List[int]:
-        sequence_hashes = []
-
-        # Get parent's last sequence hash if parent exists
-        parent_seq_hash = None
-        if node.parent is not None and node.parent != self.root_node:
-            if (
-                node.parent.sequence_hash is not None
-                and len(node.parent.sequence_hash) > 0
-            ):
-                parent_seq_hash = node.parent.sequence_hash[-1]
-            else:
-                # Parent exists but sequence_hash not computed yet - log warning
-                logger.warning(
-                    f"Parent node sequence_hash not available for node with key={node.key.token_ids[:10]}. "
-                    f"Computing sequence hash from scratch. This may indicate events were not emitted "
-                    f"in order or parent node was not processed yet."
-                )
-
-        # Iterate through node's pages
-        for start in range(0, len(node.key), self.page_size):
-            page_tokens = node.key.token_ids[start : start + self.page_size]
-            if not page_tokens:
-                continue
-
-            # Compute content hash for this page
-            content_hash = hash(tuple(page_tokens))
-
-            # Compute sequence hash
-            if parent_seq_hash is None:
-                seq_hash = content_hash
-            else:
-                seq_hash = hash((parent_seq_hash, content_hash))
-
-            sequence_hashes.append(seq_hash)
-            parent_seq_hash = seq_hash
-
-        return sequence_hashes
-
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
-            # Compute sequence_hash lazily if not already set
-            # Typically parent's last sequence hash is already computed and used as base
-            if node.sequence_hash is None:
-                node.sequence_hash = self._compute_node_sequence_hashes(node)
+            # Compute hash_value lazily if not already set
+            if node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
 
-            # Get parent's last sequence hash for first page
+            # Get parent's last hash value for first page
             parent_block_hash = None
             if node.parent is not None and node.parent != self.root_node:
                 if (
-                    node.parent.sequence_hash is not None
-                    and len(node.parent.sequence_hash) > 0
+                    node.parent.hash_value is not None
+                    and len(node.parent.hash_value) > 0
                 ):
-                    parent_block_hash = node.parent.sequence_hash[-1]
+                    parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
 
             page_index = 0
             for start in range(0, len(node.key), self.page_size):
@@ -769,7 +725,7 @@ class RadixCache(BasePrefixCache):
                 if not page_tokens:
                     continue
 
-                block_hash = node.sequence_hash[page_index]
+                block_hash = hash_str_to_int64(node.hash_value[page_index])
 
                 self.kv_event_queue.append(
                     BlockStored(
@@ -787,9 +743,9 @@ class RadixCache(BasePrefixCache):
     def _record_remove_event(self, node: TreeNode):
         # One BlockRemoved per chunk.
         if self.enable_kv_cache_events:
-            # Compute sequence_hash lazily if not already set (must match what was stored)
-            if node.sequence_hash is None:
-                node.sequence_hash = self._compute_node_sequence_hashes(node)
+            # Compute hash_value lazily if not already set (must match what was stored)
+            if node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
 
             page_index = 0
             for start in range(0, len(node.key), self.page_size):
@@ -797,7 +753,7 @@ class RadixCache(BasePrefixCache):
                 if not page_tokens:
                     continue
 
-                block_hash = node.sequence_hash[page_index]
+                block_hash = hash_str_to_int64(node.hash_value[page_index])
 
                 self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
 
