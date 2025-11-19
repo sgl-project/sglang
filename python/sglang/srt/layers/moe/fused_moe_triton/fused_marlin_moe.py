@@ -37,7 +37,6 @@ def fused_marlin_moe(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: float = None,
-    alt_stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -62,7 +61,6 @@ def fused_marlin_moe(
     - w1_zeros (Optional[torch.Tensor]): Optional zero points to be used for w1.
     - w2_zeros (Optional[torch.Tensor]): Optional zero points to be used for w2.
     - num_bits (bool): The number of bits in expert weights quantization.
-    - alt_stream (Optional[torch.cuda.Stream]): Alternative CUDA stream for parallel execution.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -173,20 +171,10 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if alt_stream is not None and expert_map is not None:
-        current_stream = torch.cuda.current_stream()
-        alt_stream.wait_stream(current_stream)
+    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
-        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
-
-        with torch.cuda.stream(alt_stream):
-            intermediate_cache3.zero_()
-
-        current_stream.wait_stream(alt_stream)
-    else:
-        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
-        if expert_map is not None:
-            intermediate_cache3.zero_()
+    if expert_map is not None:
+        intermediate_cache3.zero_()
 
     intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
         intermediate_cache2,

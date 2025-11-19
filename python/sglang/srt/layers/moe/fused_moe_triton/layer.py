@@ -147,7 +147,6 @@ class FusedMoE(torch.nn.Module):
         use_weight_loader_fused: bool = False,
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
-        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -158,7 +157,6 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
-        self.alt_stream = alt_stream
 
         enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
 
