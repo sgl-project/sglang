@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import msgpack
 import numpy as np
 import numpy.typing as npt
+from mori.cpp import TransferStatus
 from mori.io import (
     BackendType,
     EngineDesc,
@@ -72,7 +73,7 @@ class TransferInfo:
     is_dummy: bool
 
     @classmethod
-    def from_zmq(cls, payload: List[bytes]) -> "TransferInfo":
+    def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
         room = int(payload[0].decode("ascii"))
         endpoint = payload[1].decode("ascii")
         dst_port = int(payload[2].decode("ascii"))
@@ -125,7 +126,7 @@ class KVArgsRegisterInfo:
         return self.engine_desc.key
 
     @classmethod
-    def from_zmq(cls, payload: List[bytes]) -> "KVArgsRegisterInfo":
+    def from_zmq(cls, payload: List[bytes]) -> KVArgsRegisterInfo:
         endpoint = payload[1].decode("ascii")
         dst_port = int(payload[2].decode("ascii"))
         engine_desc = EngineDesc.unpack(payload[3])
@@ -273,46 +274,52 @@ class MoriKVManager(CommonKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
+    def _handle_register_message(self, payload: List[bytes]) -> None:
+        try:
+            register_info = KVArgsRegisterInfo.from_zmq(payload)
+            self._add_remote_peer(register_info)
+        except Exception:
+            logger.exception("Failed to register remote peer")
+
+    def _handle_transfer_message(self, payload: List[bytes]) -> None:
+        try:
+            transfer_info = TransferInfo.from_zmq(payload)
+            infos = self.transfer_infos.setdefault(transfer_info.room, {})
+            infos[transfer_info.engine_key] = transfer_info
+
+            if len(infos) >= transfer_info.required_dst_info_num:
+                logger.debug(
+                    "Bootstrap room %s got enough transfer info (%s)",
+                    transfer_info.room,
+                    len(infos),
+                )
+                self.update_status(transfer_info.room, KVPoll.WaitingForInput)
+        except Exception:
+            logger.exception("Failed to parse transfer info message")
+
+    def _validate_message(self, msg: List[bytes]) -> Optional[List[bytes]]:
+        if not msg or msg[0] != MORI_GUARD:
+            logger.warning("Received malformed bootstrap message")
+            return None
+        payload = msg[1:]
+        if not payload:
+            return None
+        return payload
+
     def _start_bootstrap_thread(self) -> None:
         def bootstrap_worker():
             while True:
                 try:
-                    waiting_req_bytes = self.server_socket.recv_multipart()
-                    if not waiting_req_bytes:
-                        continue
-                    if waiting_req_bytes[0] != MORI_GUARD:
-                        logger.warning(
-                            "Received malformed bootstrap message (guard=%s)",
-                            waiting_req_bytes[0],
-                        )
-                        continue
-                    payload = waiting_req_bytes[1:]
-                    if not payload:
+                    msg = self.server_socket.recv_multipart()
+                    payload = self._validate_message(msg)
+                    if payload is None:
                         continue
                     room = payload[0].decode("ascii")
+
                     if room == "None":
-                        try:
-                            register_info = KVArgsRegisterInfo.from_zmq(payload)
-                            self._add_remote_peer(register_info)
-                        except Exception:
-                            logger.exception("Failed to register remote peer")
-                        continue
-
-                    try:
-                        transfer_info = TransferInfo.from_zmq(payload)
-                    except Exception:
-                        logger.exception("Failed to parse transfer info message")
-                        continue
-
-                    infos = self.transfer_infos.setdefault(transfer_info.room, {})
-                    infos[transfer_info.engine_key] = transfer_info
-                    if len(infos) >= transfer_info.required_dst_info_num:
-                        logger.debug(
-                            "Bootstrap room %s got enough transfer info (%s)",
-                            transfer_info.room,
-                            len(infos),
-                        )
-                        self.update_status(transfer_info.room, KVPoll.WaitingForInput)
+                        self._handle_register_message(payload)
+                    else:
+                        self._handle_transfer_message(payload)
                 except Exception:
                     logger.exception("Bootstrap worker failed")
 
@@ -474,17 +481,21 @@ class MoriKVManager(CommonKVManager):
         kv_item_len: int,
         src_groups: List[List[int]],
         dst_groups: List[List[int]],
-    ) -> List["mori_cpp.TransferStatus"]:
+    ) -> List[TransferStatus]:
         if not src_groups:
             return []
-        
+
         local_mems = [src_desc] * len(src_groups)
         remote_mems = [dst_desc] * len(src_groups)
-        local_offsets_list = [[int(src_group[0]) * kv_item_len] for src_group in src_groups]
-        remote_offsets_list = [[int(dst_group[0]) * kv_item_len] for dst_group in dst_groups]
+        local_offsets_list = [
+            [int(src_group[0]) * kv_item_len] for src_group in src_groups
+        ]
+        remote_offsets_list = [
+            [int(dst_group[0]) * kv_item_len] for dst_group in dst_groups
+        ]
         sizes_list = [[len(src_group) * kv_item_len] for src_group in src_groups]
         transfer_uids = [self.engine.allocate_transfer_uid() for _ in src_groups]
-        
+
         statuses = self.engine.batch_write(
             local_mems,
             local_offsets_list,
@@ -500,7 +511,7 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
-    ) -> List["mori_cpp.TransferStatus"]:
+    ) -> List[TransferStatus]:
         src_groups, dst_groups = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
@@ -540,7 +551,6 @@ class MoriKVManager(CommonKVManager):
                         dst_groups,
                     )
                 )
-            for layer_id in range(layers_current_pp_stage):
                 statuses.extend(
                     self._issue_layer_transfers(
                         src_v_descs[layer_id],
@@ -550,6 +560,7 @@ class MoriKVManager(CommonKVManager):
                         dst_groups,
                     )
                 )
+
         return statuses
 
     def send_aux(
@@ -557,17 +568,23 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         prefill_aux_index: int,
         dst_aux_index: int,
-    ) -> List["mori_cpp.TransferStatus"]:
+    ) -> List[TransferStatus]:
         if not self.aux_mem_descs:
             return []
-        
+
         local_mems = self.aux_mem_descs
         remote_mems = peer_info.dst_aux_mem_descs
-        local_offsets_list = [[prefill_aux_index * length] for length in self.kv_args.aux_item_lens]
-        remote_offsets_list = [[dst_aux_index * length] for length in self.kv_args.aux_item_lens]
+        local_offsets_list = [
+            [prefill_aux_index * length] for length in self.kv_args.aux_item_lens
+        ]
+        remote_offsets_list = [
+            [dst_aux_index * length] for length in self.kv_args.aux_item_lens
+        ]
         sizes_list = [[length] for length in self.kv_args.aux_item_lens]
-        transfer_uids = [self.engine.allocate_transfer_uid() for _ in self.aux_mem_descs]
-        
+        transfer_uids = [
+            self.engine.allocate_transfer_uid() for _ in self.aux_mem_descs
+        ]
+
         statuses = self.engine.batch_write(
             local_mems,
             local_offsets_list,
@@ -586,7 +603,7 @@ class MoriKVManager(CommonKVManager):
         is_last: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[npt.NDArray[np.int32]] = None,
-    ) -> Tuple[List["mori_cpp.TransferStatus"], Optional[List[TransferInfo]]]:
+    ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]]]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         transfer_infos = self.transfer_infos.get(bootstrap_room)
         if not transfer_infos:
@@ -639,7 +656,7 @@ class MoriKVSender(CommonKVSender):
         pp_rank: int,
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
-        self.transfer_statuses: List["mori_cpp.TransferStatus"] = []
+        self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
         self.sent_last_chunk = False
         self.conclude_state: Optional[KVPoll] = None
