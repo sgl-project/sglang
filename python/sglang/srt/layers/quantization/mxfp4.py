@@ -39,11 +39,10 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     direct_register_custom_op,
-    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
-    is_hip,
     is_gfx95_supported,
+    is_hip,
     is_sm100_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
@@ -845,7 +844,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         else:
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
-        
+
         if hasattr(layer.w13_weight, "is_shuffled"):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
