@@ -18,6 +18,7 @@ class EncoderArchConfig(ArchConfig):
     _supported_attention_backends: set[AttentionBackendEnum] = field(
         default_factory=lambda: {
             AttentionBackendEnum.FA,
+            AttentionBackendEnum.AITER,
             AttentionBackendEnum.TORCH_SDPA,
         }
     )

@@ -35,9 +35,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    FlashAttentionBackend,
-)
+
+try:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+        FlashAttentionBackend,
+    )
+except ImportError:
+    FlashAttentionBackend = None
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
@@ -1136,7 +1140,11 @@ class DenoisingStage(PipelineStage):
             The attention metadata, or None if not applicable.
         """
         attn_metadata = None
-        self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        self.attn_metadata_builder = None
+        try:
+            self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        except NotImplementedError:
+            self.attn_metadata_builder_cls = None
         if self.attn_metadata_builder_cls:
             self.attn_metadata_builder = self.attn_metadata_builder_cls()
         if (st_attn_available and self.attn_backend == SlidingTileAttentionBackend) or (
