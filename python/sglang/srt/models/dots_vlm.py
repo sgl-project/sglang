@@ -55,9 +55,8 @@ class DotsVLMForCausalLM(nn.Module):
                 config.language_config, quant_config
             )
 
-        if not config.language_only:
-            # Initialize vision tower (matching transformers naming for weight compatibility)
-            self.vision_tower = DotsVisionTransformer(config.vision_config)
+        # Initialize vision tower (matching transformers naming for weight compatibility)
+        self.vision_tower = DotsVisionTransformer(config.vision_config)
 
     def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
         """pad attn qkv weights for dummy heads"""

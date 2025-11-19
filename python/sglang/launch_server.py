@@ -15,7 +15,7 @@ def run_server(server_args):
 
         asyncio.run(serve_grpc(server_args))
     elif server_args.mm_only:
-        from sglang.srt.entrypoints.encode_server import launch_server
+        from python.sglang.srt.disaggregation.encode_server import launch_server
 
         launch_server(server_args)
     else:

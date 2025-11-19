@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from typing import Optional
 
@@ -12,6 +11,7 @@ from fastapi.responses import ORJSONResponse
 from transformers import AutoImageProcessor
 from transformers.image_utils import load_images
 
+from python.sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
@@ -23,11 +23,6 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.model_loader import get_model
-from sglang.srt.multimodal.processors.dots_vlm import DotsVLMImageProcessor
-from sglang.srt.multimodal.processors.qwen_vl import (
-    QwenVLImageProcessor,
-    resize_image_async,
-)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -147,34 +142,8 @@ class ImageEncoder:
 
         self.embedding_to_send = dict()
 
-        # dots-specific:
-        if self.processor_cls == DotsVLMImageProcessor:
-            vision_config = self.model_config.hf_config.vision_config
-            patch_size = vision_config.patch_size
-            merge_size = vision_config.spatial_merge_size
-
-            self.IMAGE_FACTOR = patch_size * merge_size
-            self.MIN_PIXELS = self.image_processor.min_pixels
-            self.MAX_PIXELS = self.image_processor.max_pixels
-
     async def mm_encode(self, mm_items) -> torch.Tensor:
         images = load_images(mm_items)
-
-        # resize images
-        if self.processor_cls and self.processor_cls in [
-            QwenVLImageProcessor,
-            DotsVLMImageProcessor,
-        ]:
-            if self.processor_cls == QwenVLImageProcessor:
-                resize_tasks = [resize_image_async(image) for image in images]
-            elif self.processor_cls == DotsVLMImageProcessor:
-                resize_tasks = [
-                    resize_image_async(
-                        image, self.MIN_PIXELS, self.MAX_PIXELS, self.IMAGE_FACTOR
-                    )
-                    for image in images
-                ]
-            images = await asyncio.gather(*resize_tasks)
 
         images_input = self.image_processor(images=images)
         mm_item = MultimodalDataItem.from_dict(
