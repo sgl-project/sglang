@@ -573,10 +573,9 @@ class DeepseekForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # Track if this is an expert weight to enable early skipping
+                is_expert_weight = False
                 if _is_npu:
-                    # Track if this is an expert weight to enable early skipping
-                    is_expert_weight = False
-
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
@@ -584,6 +583,9 @@ class DeepseekForCausalLM(nn.Module):
                         # Mark as expert weight regardless of whether we can process it
                         is_expert_weight = True
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            # Expert weight not on this rank, will be skipped below
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(
@@ -594,37 +596,22 @@ class DeepseekForCausalLM(nn.Module):
                             expert_id=expert_id,
                         )
                         break
-                    else:
-                        if is_expert_weight:
-                            # This is an expert weight but not mapped to this rank, skip all remaining processing
-                            continue
-                        # Skip loading extra bias for GPTQ models.
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        # Skip experts that are not assigned to this worker.
-                        if (
-                            "mlp.experts." in name or "mlp.shared_experts." in name
-                        ) and name not in params_dict:
-                            continue
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Skip experts that are not assigned to this worker.
-                    if (
-                        "mlp.experts." in name or "mlp.shared_experts." in name
-                    ) and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                if is_expert_weight:
+                    # This is an expert weight but not mapped to this rank, skip all remaining processing
+                    continue
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip experts that are not assigned to this worker.
+                if (
+                    "mlp.experts." in name or "mlp.shared_experts." in name
+                ) and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
         if _is_npu:
             # Lazy initialization of expert weights cache to avoid slowing down load_weights
             if not hasattr(self, "routed_experts_weights_of_layer"):
