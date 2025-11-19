@@ -275,6 +275,7 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_suffix()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -462,6 +463,7 @@ class CudaGraphRunner:
                 == forward_batch.input_ids.numel()
             )
             if self.model_runner.spec_algorithm.is_ngram()
+            or self.model_runner.spec_algorithm.is_suffix()
             else True
         )
 
@@ -945,6 +947,20 @@ class CudaGraphRunner:
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
             spec_info = NgramVerifyInput(
+                draft_token=None,
+                tree_mask=self.custom_mask,
+                positions=None,
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                draft_token_num=self.num_tokens_per_bs,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+        elif self.model_runner.spec_algorithm.is_suffix():
+            from sglang.srt.speculative.suffix_info import SuffixVerifyInput
+
+            spec_info = SuffixVerifyInput(
                 draft_token=None,
                 tree_mask=self.custom_mask,
                 positions=None,
