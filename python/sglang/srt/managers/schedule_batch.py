@@ -1707,7 +1707,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if other.spec_info:
                 self.spec_info.merge_batch(other.spec_info)
             else:
-                # 状态不一致，完全清除spec状态
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
                 other.out_cache_loc = None
                 self.spec_info = None
