@@ -94,7 +94,7 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
-        TestFile("test_piecewise_cuda_graph.py", 450),
+        TestFile("test_piecewise_cuda_graph.py", 600),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -124,7 +124,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 100),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 170),
-        # TestFile("test_vision_openai_server_a.py", 900),
+        TestFile("test_vision_openai_server_a.py", 900),
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_modelopt_export.py", 30),
@@ -176,6 +176,7 @@ suites = {
         # TODO: Add it back after the bug is fixed
         # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
+    "per-commit-8-gpu-b200": [],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
@@ -215,8 +216,11 @@ suites = {
         TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
         TestFile("test_fp4_moe.py", 300),
     ],
-    "nightly-8-gpu-b200": [],
+    "nightly-8-gpu-b200": [
+        TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
+    ],
     "nightly-4-gpu": [
+        TestFile("nightly/test_encoder_dp.py", 500),
         TestFile("test_qwen3_next_deterministic.py", 200),
     ],
     "nightly-8-gpu": [],
@@ -362,7 +366,7 @@ suites = {
         TestFile("test_verl_engine_4_gpu.py"),
         TestFile("test_verl_engine_server.py"),
         TestFile("test_vertex_endpoint.py"),
-        TestFile("test_vision_openai_server_a.py"),  # TODO: Fix timeout
+        # TestFile("test_vision_openai_server_a.py"),  # TODO: Fix timeout
         TestFile("test_vision_openai_server_b.py"),
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_vlm_accuracy.py"),
@@ -381,7 +385,7 @@ suite_amd = {
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
-        TestFile("lora/test_lora.py", 150),
+        TestFile("lora/test_lora.py", 665),
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("lora/test_lora_eviction.py", 240),
@@ -531,6 +535,9 @@ suite_ascend = {
     "per-commit-16-ascend-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
         TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+    ],
+    "__not_in_ascend_ci__": [
+        TestFile("ascend/test_mindspore_models.py"),
     ],
 }
 

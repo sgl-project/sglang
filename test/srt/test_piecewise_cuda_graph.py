@@ -209,5 +209,44 @@ class TestPiecewiseCudaGraphAWQ(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], 0.65)
 
 
+class TestPiecewiseCudaGraphFP8(CustomTestCase):
+    """Test piecewise CUDA graph with FP8 quantized model"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "nvidia/Llama-3.1-8B-Instruct-FP8"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-piecewise-cuda-graph",
+                "--quantization",
+                "modelopt_fp8",
+                "--kv-cache-dtype",
+                "bfloat16",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mgsm_accuracy(self):
+        """Test MGSM accuracy with FP8 model"""
+        num_examples = 1319
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=num_examples,
+            num_threads=min(num_examples, 1024),
+        )
+        metrics = run_eval(args)
+        self.assertGreaterEqual(metrics["score"], 0.85)
+        print(f"MGSM Accuracy: {metrics['score']:.3f}")
+
+
 if __name__ == "__main__":
     unittest.main()

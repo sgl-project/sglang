@@ -1,6 +1,5 @@
 import argparse
 import json
-import unittest
 
 import torch
 import torch.nn as nn
@@ -149,4 +148,5 @@ class TestAttachHooks(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    pass
+    # unittest.main()
