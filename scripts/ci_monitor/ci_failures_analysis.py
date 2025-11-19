@@ -202,6 +202,9 @@ class SGLangFailuresAnalyzer:
             runner_had_success: Dict[str, bool] = defaultdict(bool)
             runner_instance_had_failure: Dict[str, bool] = defaultdict(bool)
             runner_instance_had_success: Dict[str, bool] = defaultdict(bool)
+            # Track first failed job for each runner in this run (for linking)
+            runner_first_failed_job: Dict[str, Dict] = {}
+            runner_instance_first_failed_job: Dict[str, Dict] = {}
 
             for job in jobs:
                 job_name = job.get("name", "")
@@ -277,6 +280,14 @@ class SGLangFailuresAnalyzer:
                     runner_job_failures[runner_key][job_name] += 1
                     runner_had_failure[runner_key] = True
 
+                    # Track first failed job for this runner in this run (for linking)
+                    if runner_key not in runner_first_failed_job:
+                        runner_first_failed_job[runner_key] = {
+                            "job_id": job.get("id"),
+                            "job_url": job.get("html_url", run_info["url"]),
+                            "job_name": job_name,
+                        }
+
                     # Extract error signature for runner
                     error_signature = self._extract_error_signature(job)
                     if error_signature:
@@ -288,6 +299,14 @@ class SGLangFailuresAnalyzer:
                             job_name
                         ] += 1
                         runner_instance_had_failure[runner_instance_key] = True
+
+                        # Track first failed job for this runner instance in this run
+                        if runner_instance_key not in runner_instance_first_failed_job:
+                            runner_instance_first_failed_job[runner_instance_key] = {
+                                "job_id": job.get("id"),
+                                "job_url": job.get("html_url", run_info["url"]),
+                                "job_name": job_name,
+                            }
 
                         # Extract error signature for runner instance
                         if error_signature:
@@ -310,16 +329,24 @@ class SGLangFailuresAnalyzer:
 
                     # Track if this is the first failure in a new streak
                     if runner_current_streak[runner_key] == 1:
-                        runner_first_failure_in_streak[runner_key] = {
+                        failure_info = {
                             **run_info,
                             "runner_key": runner_key,
                         }
+                        # Include job URL if we have it
+                        if runner_key in runner_first_failed_job:
+                            failure_info.update(runner_first_failed_job[runner_key])
+                        runner_first_failure_in_streak[runner_key] = failure_info
 
                     # Always update last failure to the most recent one
-                    runner_last_failure_in_streak[runner_key] = {
+                    failure_info = {
                         **run_info,
                         "runner_key": runner_key,
                     }
+                    # Include job URL if we have it
+                    if runner_key in runner_first_failed_job:
+                        failure_info.update(runner_first_failed_job[runner_key])
+                    runner_last_failure_in_streak[runner_key] = failure_info
 
                     # Update max streak
                     if (
@@ -352,16 +379,30 @@ class SGLangFailuresAnalyzer:
                     runner_instance_current_streak[runner_instance_key] += 1
 
                     if runner_instance_current_streak[runner_instance_key] == 1:
-                        runner_instance_first_failure[runner_instance_key] = {
+                        failure_info = {
                             **run_info,
                             "runner_instance": runner_instance_key,
                         }
+                        # Include job URL if we have it
+                        if runner_instance_key in runner_instance_first_failed_job:
+                            failure_info.update(
+                                runner_instance_first_failed_job[runner_instance_key]
+                            )
+                        runner_instance_first_failure[runner_instance_key] = (
+                            failure_info
+                        )
 
                     # Always update last failure to the most recent one
-                    runner_instance_last_failure[runner_instance_key] = {
+                    failure_info = {
                         **run_info,
                         "runner_instance": runner_instance_key,
                     }
+                    # Include job URL if we have it
+                    if runner_instance_key in runner_instance_first_failed_job:
+                        failure_info.update(
+                            runner_instance_first_failed_job[runner_instance_key]
+                        )
+                    runner_instance_last_failure[runner_instance_key] = failure_info
 
                     if (
                         runner_instance_current_streak[runner_instance_key]
@@ -1411,13 +1452,13 @@ class SGLangFailuresAnalyzer:
 
                         first_failure = alert.get("first_failure")
                         if first_failure:
-                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure['url']})"
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
                         else:
                             first_failure_str = "N/A"
 
                         last_failure = alert.get("last_failure")
                         if last_failure:
-                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure['url']})"
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
                         else:
                             last_failure_str = "N/A"
 
@@ -1583,13 +1624,13 @@ class SGLangFailuresAnalyzer:
                         # Get first and last failure info
                         first_failure = runner_data.get("first_failure")
                         if first_failure:
-                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure['url']})"
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
                         else:
                             first_failure_str = "N/A"
 
                         last_failure = runner_data.get("last_failure")
                         if last_failure:
-                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure['url']})"
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
                         else:
                             last_failure_str = "N/A"
 
