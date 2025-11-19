@@ -194,6 +194,13 @@ def wait_for_stage_metrics(
     while time.time() < deadline:
         records = read_perf_records(log_path)
         for rec in records[prev_len:]:
+            # Check if the request is completed
+            if (
+                rec.get("tag") == "total_inference_time"
+                and rec.get("request_id") == request_id
+            ):
+                return metrics, len(records)
+
             if (
                 rec.get("tag") == "pipeline_stage_metric"
                 and rec.get("request_id") == request_id
