@@ -805,7 +805,7 @@ def biased_grouped_topk_gpu(
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
             gating_output.to(dtype=torch.float32),
-            correction_bias,
+            correction_bias.to(dtype=torch.float32),
             topk_weights,
             topk_ids,
             num_expert_group,
