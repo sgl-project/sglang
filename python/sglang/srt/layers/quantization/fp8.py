@@ -10,22 +10,12 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
-
-from sglang.srt.layers.quantization.marlin_utils_fp8 import (
-    apply_fp8_marlin_linear,
-    prepare_fp8_layer_for_marlin,
-)
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -56,6 +46,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
