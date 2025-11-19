@@ -614,6 +614,12 @@ def _sanity_check_suites(suites):
         f"{missing_text}"
     )
 
+    nonexistent_files = sorted(list(suite_files - disk_files))
+    nonexistent_text = "\n".join(f'TestFile("{x}"),' for x in nonexistent_files)
+    assert (
+        len(nonexistent_files) == 0
+    ), f"Some test files in test suite do not exist on disk:\n{nonexistent_text}"
+
 
 def main():
     arg_parser = argparse.ArgumentParser()
