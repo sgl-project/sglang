@@ -19,7 +19,6 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     PerformanceValidator,
     ServerContext,
     ServerManager,
-    VideoPerformanceValidator,
     WarmupRunner,
     download_image_from_url,
 )
