@@ -383,6 +383,37 @@ class LoRAMemoryPool:
             if self.tp_size > 1:
                 cur_layer_modules = lora_modules[layer_id]
                 for module_name, module in cur_layer_modules.items():
+                    # TODO (Jonahcb): check if the code can be refactored to avoid the special handling for FusedMoEWithLoRA
+                    # Handle FusedMoEWithLoRA specially - it contains multiple target modules
+                    from sglang.srt.layers.moe.lora_moe import FusedMoEWithLoRA
+                    if isinstance(module, FusedMoEWithLoRA):
+                        # FusedMoEWithLoRA contains both gate_up_proj and down_proj
+                        moe_target_modules = ['gate_up_proj_moe', 'down_proj_moe']
+                        for target_module in moe_target_modules:
+
+                            if temp_A_buffer[target_module] is None:
+                                # Skip weight slicing if the weight is not present in the adapter
+                                continue
+
+                        # Handle MoE modules (they contain dicts of per-expert tensors)
+                            # Slice each expert's weights individually
+                            for expert_id in temp_A_buffer[target_module].keys():
+                                temp_A_buffer[target_module][expert_id] = (
+                                    module.slice_lora_a_weights(
+                                        temp_A_buffer[target_module][expert_id],
+                                        self.tp_rank,
+                                    )
+                                )
+                                temp_B_buffer[target_module][expert_id] = (
+                                    module.slice_lora_b_weights(
+                                        temp_B_buffer[target_module][expert_id],
+                                        self.tp_rank,
+                                    )
+                                )
+
+                        continue
+
+                    # Handle regular modules
                     target_module = get_target_module_name(
                         module_name, self.target_modules
                     )
