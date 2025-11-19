@@ -11,7 +11,7 @@ from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 USE_FULL_MASK = True
 
 
-class NGRAMWorker:
+class NGRAMWorker(TpModelWorker):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -35,9 +35,9 @@ class NGRAMWorker:
         target_worker: TpModelWorker,
     ):
         self.target_worker = target_worker
-        self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
+        self.hicache_layer_transfer_counter = None  # NGRAMWorker doesn't use hicache
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.branch_length: int = server_args.speculative_ngram_branch_length
         self.max_match_window_size: int = (
@@ -58,6 +58,10 @@ class NGRAMWorker:
             branch_length=server_args.speculative_ngram_branch_length,
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
+
+    @property
+    def model_runner(self):
+        return self.target_worker.model_runner
 
     def clear_cache_pool(self):
         self.ngram_cache.reset()
@@ -292,13 +296,15 @@ class NGRAMWorker:
         self.ngram_cache.batch_put(batch_tokens)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        assert isinstance(batch, ScheduleBatch), f"{type(batch)=}"
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
 
         if model_worker_batch.forward_mode.is_target_verify():
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
             batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True
+                forward_batch, is_verify=True
             )
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
@@ -314,9 +320,8 @@ class NGRAMWorker:
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch
-            )
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            batch_result = self.target_worker.forward_batch_generation(forward_batch)
             logits_output, next_token_ids, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

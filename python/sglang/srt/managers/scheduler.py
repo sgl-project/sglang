@@ -1933,9 +1933,13 @@ class Scheduler(
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
             self.model_worker.set_hicache_consumer(batch.hicache_consumer_index)
-            forward_batch = ForwardBatch.init_new(
-                batch_or_worker_batch, self.model_worker.model_runner
-            )
+
+            # Only create ForwardBatch when needed (overlap or no spec)
+            # For spec without overlap, the conversion is handled internally
+            if self.enable_overlap or self.spec_algorithm.is_none():
+                forward_batch = ForwardBatch.init_new(
+                    batch_or_worker_batch, self.model_worker.model_runner
+                )
 
             if self.enable_overlap:
                 # FIXME: remove this assert
@@ -1990,7 +1994,13 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
-                batch_result = self.model_worker.forward_batch_generation(forward_batch)
+                # For spec without overlap, pass ScheduleBatch; otherwise pass ForwardBatch
+                if self.spec_algorithm.is_none():
+                    batch_result = self.model_worker.forward_batch_generation(
+                        forward_batch
+                    )
+                else:
+                    batch_result = self.model_worker.forward_batch_generation(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
