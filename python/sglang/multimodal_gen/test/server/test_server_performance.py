@@ -151,13 +151,10 @@ class TestDiffusionPerformance:
 
         stage_metrics = {}
         if perf_record:
-            scenario = BASELINE_CONFIG.scenarios.get(case.id)
-            num_stages = len(scenario.stages_ms) if scenario else 0
 
             stage_metrics, _ = wait_for_stage_metrics(
                 perf_record.get("request_id", ""),
                 prev_len,
-                num_stages,
                 log_path,
                 timeout=log_wait_timeout,
             )
