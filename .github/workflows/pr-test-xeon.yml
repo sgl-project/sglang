@@ -21,7 +21,6 @@ on:
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xeon.yml"
       - "docker/xeon.Dockerfile"
-    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:

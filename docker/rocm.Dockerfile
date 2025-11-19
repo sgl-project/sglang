@@ -210,7 +210,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 
 # Build and install sgl-router
 RUN python3 -m pip install --no-cache-dir setuptools-rust \
-    && cd /sgl-workspace/sglang/sgl-router \
+    && cd /sgl-workspace/sglang/sgl-router/bindings/python \
     && cargo build --release \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache

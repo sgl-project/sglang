@@ -1,14 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
-#include <cutlass/array.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
 #include <torch/all.h>
 
 #include <cfloat>
-
-using bfloat16_t = cutlass::bfloat16_t;
-using float16_t = cutlass::half_t;
 
 // Kimi K2 specific constants
 static constexpr int WARP_SIZE = 32;
@@ -21,21 +15,13 @@ static constexpr int SMALL_TOKEN_THRESHOLD = 512;
 static constexpr int WARPS_PER_TOKEN_SMALL = 12;  // Use 12 warps per token for small batches
 static constexpr int THREADS_PER_BLOCK_SMALL = WARPS_PER_TOKEN_SMALL * WARP_SIZE;  // 384 threads
 
-template <typename T>
-__device__ inline bool cmp_gt(const T& a, const T& b) {
-  return static_cast<float>(a) > static_cast<float>(b);
-}
+// Vectorization constants (used by large token kernel)
+static constexpr int VEC_SIZE = 4;  // Use float4 for vectorized loads
 
-template <typename T>
-__device__ inline bool cmp_eq(const T& a, const T& b) {
-  return static_cast<float>(a) == static_cast<float>(b);
-}
-
-// Small token optimized kernel: Multiple warps collaborate on a single token
-template <typename T>
+// Small token optimized kernel: Each warp independently finds top-k, then merge, using warp-level topk
 __global__ void kimi_k2_moe_fused_gate_kernel_small_token(
-    T* input,
-    T* bias,
+    float* input,
+    float* bias,
     float* output_ptr,
     int32_t* indices_ptr,
     int64_t num_rows,
@@ -43,7 +29,6 @@ __global__ void kimi_k2_moe_fused_gate_kernel_small_token(
     bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
-  // Each block handles one token with WARPS_PER_TOKEN_SMALL warps collaborating
   int64_t row_idx = blockIdx.x;
   if (row_idx >= num_rows) return;
 
@@ -51,119 +36,123 @@ __global__ void kimi_k2_moe_fused_gate_kernel_small_token(
   int warp_id = tid / WARP_SIZE;
   int lane_id = tid % WARP_SIZE;
 
-  // Shared memory for all warps to collaborate
+  // Shared memory: biased scores and original scores
   __shared__ float shared_scores[NUM_EXPERTS];
   __shared__ float shared_original_scores[NUM_EXPERTS];
+  // For storing selected top-k indices and values
+  __shared__ int selected_experts[8];  // Up to topk=6, I use 8 for alignment
+  __shared__ float selected_vals[8];
+  // For warp-level reduction
+  __shared__ float warp_maxs[WARPS_PER_TOKEN_SMALL];
+  __shared__ int warp_experts[WARPS_PER_TOKEN_SMALL];
 
-  // Each thread loads one expert (384 threads for 384 experts)
+  // Load data: all 384 threads load one expert each
   if (tid < NUM_EXPERTS) {
-    T input_val = input[row_idx * NUM_EXPERTS + tid];
-    T bias_val = bias[tid];
-    float sigmoid_val = 1.0f / (1.0f + expf(-static_cast<float>(input_val)));
-    float biased_val = sigmoid_val + static_cast<float>(bias_val);
+    float input_val = input[row_idx * NUM_EXPERTS + tid];
+    float bias_val = bias[tid];
+    float sigmoid_val = 1.0f / (1.0f + expf(-input_val));
+    float biased_val = sigmoid_val + bias_val;
     shared_scores[tid] = biased_val;
     shared_original_scores[tid] = sigmoid_val;
   }
 
   __syncthreads();
 
-  // Parallel TopK: Each warp processes a portion of experts
-  // Use multiple warps to find top-k elements in parallel
-  int experts_per_warp = (NUM_EXPERTS + WARPS_PER_TOKEN_SMALL - 1) / WARPS_PER_TOKEN_SMALL;
-  int warp_start = warp_id * experts_per_warp;
-  int warp_end = min(warp_start + experts_per_warp, NUM_EXPERTS);
-
+  // Find top-k using iterative selection, each iteration finds the next maximum
   for (int k = 0; k < topk; k++) {
-    float max_val = -FLT_MAX;
-    int max_expert = -1;
+    // Each thread holds one expert's value
+    float my_val = (tid < NUM_EXPERTS) ? shared_scores[tid] : -FLT_MAX;
+    int my_expert = tid;
 
-    // Each warp finds the max in its portion
-    for (int expert = warp_start + lane_id; expert < warp_end; expert += WARP_SIZE) {
-      float val = shared_scores[expert];
-      if (val > max_val) {
-        max_val = val;
-        max_expert = expert;
+    // Use warp-level reduction first
+    float warp_max_val = my_val;
+    int warp_max_expert = my_expert;
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+      float other_val = __shfl_down_sync(0xFFFFFFFF, warp_max_val, offset);
+      int other_expert = __shfl_down_sync(0xFFFFFFFF, warp_max_expert, offset);
+      if (other_val > warp_max_val) {
+        warp_max_val = other_val;
+        warp_max_expert = other_expert;
       }
     }
 
-    // Warp-level reduction to find warp's maximum
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-      float other_val = __shfl_down_sync(0xFFFFFFFF, max_val, offset);
-      int other_expert = __shfl_down_sync(0xFFFFFFFF, max_expert, offset);
-
-      if (other_val > max_val || (other_val == max_val && other_expert < max_expert)) {
-        max_val = other_val;
-        max_expert = other_expert;
-      }
-    }
-
-    // Store warp results in shared memory
-    __shared__ float warp_max_vals[WARPS_PER_TOKEN_SMALL];
-    __shared__ int warp_max_experts[WARPS_PER_TOKEN_SMALL];
-
+    // Warp leaders write to shared memory
     if (lane_id == 0) {
-      warp_max_vals[warp_id] = max_val;
-      warp_max_experts[warp_id] = max_expert;
+      warp_maxs[warp_id] = warp_max_val;
+      warp_experts[warp_id] = warp_max_expert;
     }
 
     __syncthreads();
 
-    // First warp reduces across all warp results
+    // Final reduction among warps (done by first warp)
     if (warp_id == 0) {
-      float final_max_val = -FLT_MAX;
-      int final_max_expert = -1;
+      float final_max = (lane_id < WARPS_PER_TOKEN_SMALL) ? warp_maxs[lane_id] : -FLT_MAX;
+      int final_expert = (lane_id < WARPS_PER_TOKEN_SMALL) ? warp_experts[lane_id] : -1;
 
-      if (lane_id < WARPS_PER_TOKEN_SMALL) {
-        final_max_val = warp_max_vals[lane_id];
-        final_max_expert = warp_max_experts[lane_id];
-      }
-
-      // Warp reduction
-      for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        float other_val = __shfl_down_sync(0xFFFFFFFF, final_max_val, offset);
-        int other_expert = __shfl_down_sync(0xFFFFFFFF, final_max_expert, offset);
-
-        if (other_val > final_max_val || (other_val == final_max_val && other_expert < final_max_expert)) {
-          final_max_val = other_val;
-          final_max_expert = other_expert;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xFFFFFFFF, final_max, offset);
+        int other_expert = __shfl_down_sync(0xFFFFFFFF, final_expert, offset);
+        if (other_val > final_max) {
+          final_max = other_val;
+          final_expert = other_expert;
         }
       }
 
-      // Lane 0 writes result and marks the expert as used
-      if (lane_id == 0 && final_max_expert != -1) {
-        int64_t output_idx = row_idx * topk + k;
-        output_ptr[output_idx] = shared_original_scores[final_max_expert];
-        indices_ptr[output_idx] = final_max_expert;
-        shared_scores[final_max_expert] = -FLT_MAX;
+      if (lane_id == 0) {
+        selected_experts[k] = final_expert;
+        selected_vals[k] = final_max;
       }
+    }
+
+    __syncthreads();
+
+    // Mark the selected expert as used for next iteration
+    // All threads can read from selected_experts[k]
+    int selected = selected_experts[k];
+    if (tid == selected) {
+      shared_scores[tid] = -FLT_MAX;
     }
 
     __syncthreads();
   }
 
-  // Renormalization (only first warp)
-  if (renormalize && warp_id == 0 && lane_id == 0) {
-    float sum = 0.0f;
+  // Write output (done by thread 0)
+  if (tid == 0) {
     for (int k = 0; k < topk; k++) {
-      sum += output_ptr[row_idx * topk + k];
+      int expert_id = selected_experts[k];
+      if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
+        output_ptr[row_idx * topk + k] = shared_original_scores[expert_id];
+        indices_ptr[row_idx * topk + k] = expert_id;
+      }
     }
 
-    if (sum > 0.0f) {
+    // Renormalization
+    if (renormalize) {
+      float sum = 0.0f;
       for (int k = 0; k < topk; k++) {
-        int64_t idx = row_idx * topk + k;
-        output_ptr[idx] /= sum;
-        if (apply_routed_scaling_factor_on_output) {
-          output_ptr[idx] *= static_cast<float>(routed_scaling_factor);
+        sum += output_ptr[row_idx * topk + k];
+      }
+
+      if (sum > 0.0f) {
+        for (int k = 0; k < topk; k++) {
+          int64_t idx = row_idx * topk + k;
+          output_ptr[idx] /= sum;
+          if (apply_routed_scaling_factor_on_output) {
+            output_ptr[idx] *= static_cast<float>(routed_scaling_factor);
+          }
         }
       }
     }
   }
 }
 
-template <typename T>
+// Large token kernel: Original implementation with vectorized loads
 __global__ void kimi_k2_moe_fused_gate_kernel(
-    T* input,
-    T* bias,
+    float* input,
+    float* bias,
     float* output_ptr,
     int32_t* indices_ptr,
     int64_t num_rows,
@@ -183,13 +172,28 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
   float* warp_scores = shared_scores + warp_id * NUM_EXPERTS;
   float* warp_original_scores = shared_original_scores + warp_id * NUM_EXPERTS;
 
-  for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
-    T input_val = input[row_idx * NUM_EXPERTS + expert];
-    T bias_val = bias[expert];
-    float sigmoid_val = 1.0f / (1.0f + expf(-static_cast<float>(input_val)));
-    float biased_val = sigmoid_val + static_cast<float>(bias_val);
-    warp_scores[expert] = biased_val;
-    warp_original_scores[expert] = sigmoid_val;
+  // Vectorized loading: each lane loads multiple float4 chunks
+  // VPT = 12, so we load 12/4 = 3 float4 per lane
+  const int VEC_PER_LANE = VPT / VEC_SIZE;  // 3
+  float4* input_vec = reinterpret_cast<float4*>(input + row_idx * NUM_EXPERTS);
+  float4* bias_vec = reinterpret_cast<float4*>(bias);
+
+#pragma unroll
+  for (int i = 0; i < VEC_PER_LANE; i++) {
+    int vec_idx = lane_id * VEC_PER_LANE + i;
+    float4 input_val = input_vec[vec_idx];
+    float4 bias_val = bias_vec[vec_idx];
+
+#pragma unroll
+    for (int j = 0; j < VEC_SIZE; j++) {
+      int expert = vec_idx * VEC_SIZE + j;
+      float inp = ((float*)&input_val)[j];
+      float b = ((float*)&bias_val)[j];
+      float sigmoid_val = 1.0f / (1.0f + expf(-inp));
+      float biased_val = sigmoid_val + b;
+      warp_scores[expert] = biased_val;
+      warp_original_scores[expert] = sigmoid_val;
+    }
   }
 
   __syncthreads();
@@ -265,6 +269,10 @@ std::vector<at::Tensor> kimi_k2_moe_fused_gate(
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  // Only support float32
+  TORCH_CHECK(input.scalar_type() == at::kFloat, "kimi_k2_moe_fused_gate only supports float32 input");
+  TORCH_CHECK(bias.scalar_type() == at::kFloat, "kimi_k2_moe_fused_gate only supports float32 bias");
+
   bool use_small_token_kernel = num_rows <= SMALL_TOKEN_THRESHOLD;
 
   if (use_small_token_kernel) {
@@ -272,82 +280,31 @@ std::vector<at::Tensor> kimi_k2_moe_fused_gate(
     int64_t num_blocks = num_rows;
     dim3 block_dim(THREADS_PER_BLOCK_SMALL);
 
-    if (input.scalar_type() == at::kBFloat16) {
-      kimi_k2_moe_fused_gate_kernel_small_token<bfloat16_t><<<num_blocks, block_dim, 0, stream>>>(
-          reinterpret_cast<bfloat16_t*>(input.data_ptr()),
-          reinterpret_cast<bfloat16_t*>(bias.data_ptr()),
-          output.data_ptr<float>(),
-          indices.data_ptr<int32_t>(),
-          num_rows,
-          topk,
-          renormalize,
-          routed_scaling_factor,
-          apply_routed_scaling_factor_on_output);
-    } else if (input.scalar_type() == at::kHalf) {
-      kimi_k2_moe_fused_gate_kernel_small_token<float16_t><<<num_blocks, block_dim, 0, stream>>>(
-          reinterpret_cast<float16_t*>(input.data_ptr()),
-          reinterpret_cast<float16_t*>(bias.data_ptr()),
-          output.data_ptr<float>(),
-          indices.data_ptr<int32_t>(),
-          num_rows,
-          topk,
-          renormalize,
-          routed_scaling_factor,
-          apply_routed_scaling_factor_on_output);
-    } else if (input.scalar_type() == at::kFloat) {
-      kimi_k2_moe_fused_gate_kernel_small_token<float><<<num_blocks, block_dim, 0, stream>>>(
-          input.data_ptr<float>(),
-          bias.data_ptr<float>(),
-          output.data_ptr<float>(),
-          indices.data_ptr<int32_t>(),
-          num_rows,
-          topk,
-          renormalize,
-          routed_scaling_factor,
-          apply_routed_scaling_factor_on_output);
-    } else {
-      TORCH_CHECK(false, "Unsupported data type for kimi_k2_moe_fused_gate");
-    }
+    kimi_k2_moe_fused_gate_kernel_small_token<<<num_blocks, block_dim, 0, stream>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        indices.data_ptr<int32_t>(),
+        num_rows,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output);
   } else {
+    // Large token kernel: Original implementation
     int64_t num_blocks = (num_rows + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
     dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
-    if (input.scalar_type() == at::kBFloat16) {
-      kimi_k2_moe_fused_gate_kernel<bfloat16_t><<<num_blocks, block_dim, 0, stream>>>(
-          reinterpret_cast<bfloat16_t*>(input.data_ptr()),
-          reinterpret_cast<bfloat16_t*>(bias.data_ptr()),
-          output.data_ptr<float>(),
-          indices.data_ptr<int32_t>(),
-          num_rows,
-          topk,
-          renormalize,
-          routed_scaling_factor,
-          apply_routed_scaling_factor_on_output);
-    } else if (input.scalar_type() == at::kHalf) {
-      kimi_k2_moe_fused_gate_kernel<float16_t><<<num_blocks, block_dim, 0, stream>>>(
-          reinterpret_cast<float16_t*>(input.data_ptr()),
-          reinterpret_cast<float16_t*>(bias.data_ptr()),
-          output.data_ptr<float>(),
-          indices.data_ptr<int32_t>(),
-          num_rows,
-          topk,
-          renormalize,
-          routed_scaling_factor,
-          apply_routed_scaling_factor_on_output);
-    } else if (input.scalar_type() == at::kFloat) {
-      kimi_k2_moe_fused_gate_kernel<float><<<num_blocks, block_dim, 0, stream>>>(
-          input.data_ptr<float>(),
-          bias.data_ptr<float>(),
-          output.data_ptr<float>(),
-          indices.data_ptr<int32_t>(),
-          num_rows,
-          topk,
-          renormalize,
-          routed_scaling_factor,
-          apply_routed_scaling_factor_on_output);
-    } else {
-      TORCH_CHECK(false, "Unsupported data type for kimi_k2_moe_fused_gate");
-    }
+    kimi_k2_moe_fused_gate_kernel<<<num_blocks, block_dim, 0, stream>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        indices.data_ptr<int32_t>(),
+        num_rows,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output);
   }
 
   return {output, indices};

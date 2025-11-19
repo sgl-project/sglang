@@ -39,6 +39,7 @@ except ImportError:
 RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "1-gpu-runner": [
         "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+        "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
         "deepseek-ai/DeepSeek-OCR",
         "google/gemma-3-4b-it",
         "intfloat/e5-mistral-7b-instruct",
@@ -56,7 +57,9 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
         "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8",
         "openai/gpt-oss-20b",
+        "lmsys/gpt-oss-20b-bf16",
         "OpenGVLab/InternVL2_5-2B",
+        "Qwen/Qwen1.5-MoE-A2.7B",
         "Qwen/Qwen2.5-7B-Instruct",
         "Qwen/Qwen3-8B",
         "Qwen/Qwen3-Coder-30B-A3B-Instruct",
