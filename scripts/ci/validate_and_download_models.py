@@ -56,6 +56,7 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
         "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8",
         "openai/gpt-oss-20b",
+        "lmsys/gpt-oss-20b-bf16",
         "OpenGVLab/InternVL2_5-2B",
         "Qwen/Qwen1.5-MoE-A2.7B",
         "Qwen/Qwen2.5-7B-Instruct",
