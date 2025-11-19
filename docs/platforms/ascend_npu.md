@@ -103,7 +103,7 @@ For installation of SGLang Kernels NPU check the [installation guide](https://gi
 #### DeepEP-compatible Library
 We are also providing a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
 
-### CustomOps
+#### CustomOps
 _TODO: to be removed once merged into sgl-kernel-npu
 ```shell
 wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
