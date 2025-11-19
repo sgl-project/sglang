@@ -5,6 +5,7 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import ray
@@ -132,9 +133,13 @@ def benchmark_config(
     )
     topk_output = select_experts(hidden_states, input_gating, topk_config)
 
+    @lru_cache
+    def _load_topk_ids(topk_ids_dir, i: int):
+        return torch.load(f"{topk_ids_dir}/topk_ids_layer{i%58+3}_idx{i//58}.pt")
+
     def prepare(i: int):
         input_gating = gating_output[i]
-        topk_ids = torch.load(f"{topk_ids_dir}/topk_ids_layer{i%58+3}_idx{i//58}.pt")
+        topk_ids = _load_topk_ids(topk_ids_dir, i)
         new_topk_output = select_experts(hidden_states, input_gating, topk_config)
         topk_output.topk_weights.copy_(new_topk_output.topk_weights)
         tokens, _topk = topk_output.topk_ids.shape
