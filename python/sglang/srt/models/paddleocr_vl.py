@@ -16,15 +16,14 @@
 
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple, Union
-from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 import numpy as np
 
 import torch
 import torch.nn as nn
 from einops import rearrange
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -39,11 +38,8 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM
+from sglang.srt.utils import add_prefix
 from transformers.activations import GELUActivation
-from transformers.modeling_outputs import (
-    BaseModelOutput,
-    BaseModelOutputWithPooling,
-)
 from transformers.utils import torch_int
 
 class Projector(nn.Module):
@@ -260,100 +256,6 @@ class SiglipVisionEmbeddings(nn.Module):
                 f" {pixel_values.dim()}. Expected 4 or 5."
             )
 
-def apply_rotary_pos_emb_flashatt(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-
-    q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin)
-    return q_embed, k_embed
-
-class SiglipAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You
-    Need' paper."""
-
-    def __init__(
-        self,
-        config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.config = config
-
-        hidden_size = config.hidden_size
-        self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = config.num_attention_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = config.hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scale = self.head_dim**-0.5
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.out_proj = RowParallelLinear(
-            input_size=hidden_size,
-            output_size=hidden_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.out_proj",
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: Optional[List[torch.Tensor]] = None,
-        rope_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        batch_size, seq_length, embed_dim = hidden_states.shape
-
-        qkv_states, _ = self.qkv_proj(hidden_states)
-        queries, keys, values = qkv_states.chunk(3, dim=-1)
-
-        queries = queries.view(seq_length, self.num_heads, self.head_dim)
-        keys = keys.view(seq_length, self.num_heads, self.head_dim)
-        values = values.view(seq_length, self.num_heads, self.head_dim)
-
-        if rope_emb is not None:
-            cos, sin = rope_emb
-            queries, keys = apply_rotary_pos_emb_flashatt(
-                queries.unsqueeze(0), keys.unsqueeze(0), cos, sin
-            )
-            queries = queries.squeeze(0)
-            keys = keys.squeeze(0)
-
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-
-        attn_output = flash_attn_varlen_func(
-            queries,
-            keys,
-            values,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-        ).reshape(seq_length, -1)
-
-        output, _ = self.out_proj(attn_output)
-        return output
 
 class SigLIPRotaryEmbedding(nn.Module):
 
@@ -379,6 +281,7 @@ class SigLIPRotaryEmbedding(nn.Module):
         freqs = torch.outer(seq, self.inv_freq)
         return freqs
 
+
 class SiglipMLP(nn.Module):
 
     def __init__(
@@ -401,13 +304,13 @@ class SiglipMLP(nn.Module):
             config.hidden_size,
             config.intermediate_size,
             quant_config=quant_config if quantizable else None,
-            prefix=f"{prefix}.fc1",
+            prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             quant_config=quant_config if quantizable else None,
-            prefix=f"{prefix}.fc2",
+            prefix=add_prefix("fc2", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -415,6 +318,7 @@ class SiglipMLP(nn.Module):
         hidden_states = self.activation_fn(hidden_states)
         hidden_states, _ = self.fc2(hidden_states)
         return hidden_states
+
 
 class SiglipEncoderLayer(nn.Module):
 
@@ -427,16 +331,23 @@ class SiglipEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.self_attn = SiglipAttention(
-            config,
+
+        self.self_attn = VisionAttention(
+            embed_dim=self.embed_dim,
+            num_heads=config.num_attention_heads,
+            projection_size=self.embed_dim,
+            use_qkv_parallel=True,
+            qkv_bias=True,
+            flatten_batch=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
+
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = SiglipMLP(
             config,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix)
         )
 
     def forward(
@@ -449,10 +360,11 @@ class SiglipEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
+
         hidden_states = self.self_attn(
-            hidden_states=hidden_states,
+            hidden_states,
             cu_seqlens=cu_seqlens,
-            rope_emb=rope_emb,
+            position_embeddings=rope_emb,
         )
 
         hidden_states = residual + hidden_states
@@ -483,7 +395,7 @@ class SiglipEncoder(nn.Module):
                 SiglipEncoderLayer(
                     config,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{layer_idx}",
+                    prefix=add_prefix(f"layers.{layer_idx}", prefix),
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -514,7 +426,7 @@ class SiglipEncoder(nn.Module):
         ] = None,
         height_position_ids: Optional[torch.Tensor] = None,
         width_position_ids: Optional[torch.Tensor] = None,
-    ) -> BaseModelOutput:
+    ) -> torch.Tensor:
         device = inputs_embeds.device
         hidden_states = inputs_embeds
         flatten_image_grid_thw = self.flatten_list(image_grid_thw)
@@ -568,7 +480,7 @@ class SiglipVisionTransformer(nn.Module):
         self.encoder = SiglipEncoder(
             config,
             quant_config=quant_config,
-            prefix=f"{prefix}.encoder",
+            prefix=add_prefix("encoder", prefix),
         )
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
@@ -588,7 +500,7 @@ class SiglipVisionTransformer(nn.Module):
                 ]
             ]
         ] = None,
-    ) -> BaseModelOutputWithPooling:
+    ) -> list[torch.Tensor]:
 
         hidden_states = self.embeddings(
             pixel_values,
@@ -636,7 +548,7 @@ class SiglipVisionModel(nn.Module):
         self.vision_model = SiglipVisionTransformer(
             config,
             quant_config=quant_config,
-            prefix=f"{prefix}.vision_model",
+            prefix=add_prefix("vision_model", prefix),
         )
         self.quant_config = quant_config
 
@@ -665,7 +577,7 @@ class SiglipVisionModel(nn.Module):
             ]
         ] = None,
         cu_seqlens: Optional[List[torch.Tensor]] = None,
-    ) -> BaseModelOutputWithPooling:
+    ) -> list[torch.Tensor]:
 
         return self.vision_model(
             pixel_values=pixel_values,
@@ -681,8 +593,8 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
         super().__init__(config=config, prefix=prefix)
         config = self.config
 
-        self.mlp_AR = Projector(config, config.vision_config, prefix=f"{prefix}.mlp_AR")
-        self.visual = SiglipVisionModel(config=config.vision_config, prefix=f"{prefix}.visual")
+        self.mlp_AR = Projector(config, config.vision_config, prefix=add_prefix("mlp_AR", prefix))
+        self.visual = SiglipVisionModel(config=config.vision_config, prefix=add_prefix("visual", prefix))
         if not hasattr(self.model, "get_input_embeddings"):
             import types
 
@@ -801,6 +713,9 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if "vision_model" in name and "out_proj" in name:
+                    # adapt to VisionAttention
+                    name = name.replace(".self_attn.out_proj", ".self_attn.proj")
                 if name in params_dict.keys():
                     param = params_dict[name]
                     weight_loader = getattr(
