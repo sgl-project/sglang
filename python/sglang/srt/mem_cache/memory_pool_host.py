@@ -33,7 +33,7 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-SUPPORT_PIN_MEMORY = not _is_npu
+NEED_ALLOC_PIN_MEMORY = _is_npu
 
 
 def synchronized(func):
@@ -60,7 +60,7 @@ class HostKVCache(abc.ABC):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
-        self.pin_memory = pin_memory and SUPPORT_PIN_MEMORY
+        self.pin_memory = pin_memory and not NEED_ALLOC_PIN_MEMORY
         self.device = device
 
         self.dtype = device_pool.store_dtype
@@ -257,6 +257,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             dims,
             dtype=self.dtype,
             device=self.device,
+            pin_memory=NEED_ALLOC_PIN_MEMORY,
         )
         if self.pin_memory:
             torch.cuda.cudart().cudaHostRegister(
@@ -642,11 +643,13 @@ class MLATokenToKVPoolHost(HostKVCache):
                 (*base_dims, self.kv_lora_rank),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=NEED_ALLOC_PIN_MEMORY,
             )
             self.v_buffer = torch.empty(
                 (*base_dims, self.qk_rope_head_dim),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=NEED_ALLOC_PIN_MEMORY,
             )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
