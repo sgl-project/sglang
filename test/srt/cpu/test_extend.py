@@ -214,8 +214,12 @@ class TestExtendAttention(CustomTestCase):
 
         from sglang.srt.layers.quantization.fp8_utils import input_to_float8
 
-        k_buffer_fp8, k_scale = input_to_float8(k_buffer)
-        v_buffer_fp8, v_scale = input_to_float8(v_buffer)
+        k_scale = torch.empty((total_token_num, 1, 1), dtype=torch.float32)
+        v_scale = torch.empty((total_token_num, 1, 1), dtype=torch.float32)
+        k_buffer_fp8, k_scale0 = input_to_float8(k_buffer)
+        v_buffer_fp8, v_scale0 = input_to_float8(v_buffer)
+        k_scale.copy_(k_scale0)
+        v_scale.copy_(v_scale0)
         k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
         v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
 

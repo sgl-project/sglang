@@ -150,7 +150,7 @@ void pack_vnni(
     index_t index = get_index(ind, n);
     for (int k = 0; k < K / 2; ++k) {
       for (int d = 0; d < 2; ++d) {
-        dst[k * ld_dst * 2 + n * 2 + d] = src[index * ld_src + k * 2 + d] * src_scale[0];
+        dst[k * ld_dst * 2 + n * 2 + d] = src[index * ld_src + k * 2 + d] * src_scale[index];
       }
     }
   }
@@ -241,14 +241,14 @@ void pack_vnni2(
     index_t index0 = get_index(ind, k + 0);
     index_t index1 = get_index(ind, k + 1);
     for (int n = 0; n < N; ++n) {
-      dst[(k >> 1) * ld_dst * 2 + n * 2 + 0] = src[index0 * ld_src + n] * src_scale[0];
-      dst[(k >> 1) * ld_dst * 2 + n * 2 + 1] = src[index1 * ld_src + n] * src_scale[0];
+      dst[(k >> 1) * ld_dst * 2 + n * 2 + 0] = src[index0 * ld_src + n] * src_scale[index0];
+      dst[(k >> 1) * ld_dst * 2 + n * 2 + 1] = src[index1 * ld_src + n] * src_scale[index1];
     }
   }
   if (K % 2 != 0) {
     index_t index = get_index(ind, K - 1);
     for (int n = 0; n < N; ++n) {
-      dst[(K >> 1) * ld_dst * 2 + n * 2 + 0] = src[index * ld_src + n] * src_scale[0];
+      dst[(K >> 1) * ld_dst * 2 + n * 2 + 0] = src[index * ld_src + n] * src_scale[index];
       dst[(K >> 1) * ld_dst * 2 + n * 2 + 1] = 0;
     }
     k += 2;

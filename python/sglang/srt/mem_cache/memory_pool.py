@@ -49,7 +49,14 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_float4_e2m1fn_x2, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_float4_e2m1fn_x2,
+    is_npu,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -61,6 +68,8 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
 if _is_npu:
     import torch_npu
 
@@ -1334,6 +1343,15 @@ class MLATokenToKVPool(KVCache):
         if not use_nsa:
             # NSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
+        if _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+            self.kv_scale_buffer = [
+                torch.zeros(
+                    (size + page_size, 1, 1),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -1355,6 +1373,12 @@ class MLATokenToKVPool(KVCache):
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+            return (
+                self.kv_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.kv_scale_buffer[layer_id - self.start_layer],
+            )
 
         if self.store_dtype != self.dtype:
             if is_float4_e2m1fn_x2(self.dtype):
@@ -1379,6 +1403,13 @@ class MLATokenToKVPool(KVCache):
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+            return (
+                self.kv_buffer[layer_id - self.start_layer][
+                    ..., : self.kv_lora_rank
+                ].view(self.dtype),
+                self.kv_scale_buffer[layer_id - self.start_layer],
+            )
 
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer][
@@ -1407,6 +1438,11 @@ class MLATokenToKVPool(KVCache):
                 cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
                     cache_k
                 )
+            elif _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+                from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+                cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
+                cache_k = cache_k_fp8
             else:
                 cache_k = cache_k.to(self.dtype)
 
@@ -1417,6 +1453,13 @@ class MLATokenToKVPool(KVCache):
                 )
                 self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
                     cache_k_fp4_sf.view(self.store_dtype)
+                )
+            elif _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                    self.store_dtype
+                )
+                self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
+                    cache_k_scale.view(torch.float32)
                 )
             else:
                 self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(

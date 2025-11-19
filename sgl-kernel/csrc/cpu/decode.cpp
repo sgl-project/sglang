@@ -126,6 +126,68 @@ void pack_vnni(
 #endif
 }
 
+template <typename scalar_t, typename index_t>
+void pack_vnni(
+    scalar_t* __restrict__ dst0,
+    scalar_t* __restrict__ dst1,
+    const at::Float8_e4m3fn* __restrict__ src,
+    const float* __restrict__ src_scale,
+    const index_t* __restrict__ ind,
+    int N,
+    int K,
+    int Kv,
+    int ld_src,
+    int ld_dst0,
+    int ld_dst1) {
+  // #if defined(CPU_CAPABILITY_AVX512)
+  //   const int NB = div_up(N, 16);
+  //   const int KB = K / 32;    // no remainder
+  //   const int KBv = Kv / 32;  // no remainder
+
+  //   for (int nb = 0; nb < NB; ++nb) {
+  //     for (int kb = 0; kb < KB; ++kb) {
+  //       // handle 16x512bits each block
+  //       int nb_size = std::min(N - nb * 16, 16);
+  //       pack_vnni_Nx32<scalar_t, index_t>(
+  //           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
+  //           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
+  //           /*     src */ src + kb * 32,
+  //           /*     ind */ ind + nb * 16,
+  //           /*       N */ nb_size,
+  //           /*  ld_src */ ld_src,
+  //           /* ld_dst0 */ ld_dst0,
+  //           /* ld_dst1 */ ld_dst1,
+  //           /*   cvt_v */ kb < KBv);
+  //     }
+  //   }
+  // #else
+  for (int n = 0; n < N; ++n) {
+    index_t index = ind[n];
+    for (int k = 0; k < K / 2; ++k) {
+      for (int d = 0; d < 2; ++d) {
+        dst0[k * ld_dst0 * 2 + n * 2 + d] = static_cast<scalar_t>(src[index * ld_src + k * 2 + d] * src_scale[index]);
+      }
+    }
+  }
+  // from [N/2, 2, K] to [N/2, K, 2]
+  for (int n = 0; n < (N >> 1) * 2; n += 2) {
+    index_t index0 = ind[n + 0];
+    index_t index1 = ind[n + 1];
+    for (int k = 0; k < Kv; ++k) {
+      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = static_cast<scalar_t>(src[index0 * ld_src + k] * src_scale[index0]);
+      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = static_cast<scalar_t>(src[index1 * ld_src + k] * src_scale[index1]);
+    }
+  }
+  if (N % 2 != 0) {
+    index_t index = ind[N - 1];
+    for (int k = 0; k < Kv; ++k) {
+      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = static_cast<scalar_t>(src[index * ld_src + k] * src_scale[index]);
+      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
+    }
+  }
+  // #endif
+}
+
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
@@ -978,6 +1040,92 @@ void decode_set_kv_buffer(
 }
 
 template <typename scalar_t>
+void decode_set_kv_buffer(
+    at::Float8_e4m3fn* __restrict__ k_buffer,
+    at::Float8_e4m3fn* __restrict__ v_buffer,
+    float* __restrict__ k_scale,
+    float* __restrict__ v_scale,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const int64_t* __restrict__ loc,
+    int64_t batches,
+    int64_t num_heads_kv,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t k_strideN,
+    int64_t k_strideH,
+    int64_t v_strideN,
+    int64_t v_strideH,
+    int64_t nk_strideN,
+    int64_t nk_strideH,
+    int64_t nv_strideN,
+    int64_t nv_strideH,
+    bool is_mla) {
+  constexpr float FP8_MAX = 448.0f;
+  constexpr float eps = 1e-12;
+  for (int64_t bi = 0; bi < batches; bi++) {
+    int64_t loc_val = loc[bi];
+    float min_val = FP8_MAX;
+    float max_val = -FP8_MAX;
+    for (int64_t hi = 0; hi < num_heads_kv; hi++) {
+      for (int64_t di = 0; di < head_size; di++) {
+        const scalar_t* key_ptr = key + bi * nk_strideN + hi * nk_strideH;
+        if (key_ptr[di] < min_val) {
+          min_val = key_ptr[di];
+        } else if (key_ptr[di] > max_val) {
+          max_val = key_ptr[di];
+        }
+      }
+    }
+    float scale = std::max(std::abs(min_val), std::abs(max_val));
+    scale = std::max(scale / FP8_MAX, eps);
+    k_scale[loc_val] = scale;
+    if (!is_mla) {
+      min_val = FP8_MAX;
+      max_val = -FP8_MAX;
+      for (int64_t hi = 0; hi < num_heads_kv; hi++) {
+        for (int64_t di = 0; di < head_size_v; di++) {
+          const scalar_t* value_ptr = value + bi * nv_strideN + hi * nv_strideH;
+          if (value_ptr[di] < min_val) {
+            min_val = value_ptr[di];
+          } else if (value_ptr[di] > max_val) {
+            max_val = value_ptr[di];
+          }
+        }
+      }
+      scale = std::max(std::abs(min_val), std::abs(max_val));
+      scale = std::max(scale / FP8_MAX, eps);
+      v_scale[loc_val] = scale;
+    }
+  }
+  at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, head_kv_id{0};
+    data_index_init(begin, bs, batches, head_kv_id, num_heads_kv);
+
+    for (int64_t i = begin; i < end; i++) {
+      int64_t loc_val = loc[bs];
+      at::Float8_e4m3fn* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
+      const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
+      // copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
+      for (int64_t di = 0; di < head_size; di++) {
+        k_buffer_ptr[di] = static_cast<at::Float8_e4m3fn>(new_key_ptr[di] / k_scale[loc_val]);
+      }
+      if (!is_mla) {
+        at::Float8_e4m3fn* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
+        const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
+        // copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
+        for (int64_t di = 0; di < head_size_v; di++) {
+          v_buffer_ptr[di] = static_cast<at::Float8_e4m3fn>(new_value_ptr[di] / v_scale[loc_val]);
+        }
+      }
+
+      // move to the next index
+      data_index_step(bs, batches, head_kv_id, num_heads_kv);
+    }
+  });
+}
+
+template <typename scalar_t>
 void decode_accumulate_kv_splits(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
@@ -1363,6 +1511,200 @@ void decode_attention_mla_kernel_impl(
 }  // MLA
 
 template <typename scalar_t, typename index_t, int64_t BLOCK_N>
+void decode_attention_mla_kernel_impl(
+    scalar_t* __restrict__ output,
+    float* __restrict__ attn_logits,
+    const scalar_t* __restrict__ query,
+    const at::Float8_e4m3fn* __restrict__ k_buffer,
+    const at::Float8_e4m3fn* __restrict__ v_buffer,
+    const float* __restrict__ k_buf_scale,
+    const float* __restrict__ v_buf_scale,
+    const index_t* __restrict__ req_to_token,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ seq_lens,
+    scalar_t* __restrict__ buffer,
+    int64_t batches,
+    int64_t num_heads,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t num_kv_splits,
+    int64_t q_strideM,
+    int64_t q_strideH,
+    int64_t k_strideN,
+    int64_t k_strideH,
+    int64_t v_strideN,
+    int64_t v_strideH,
+    float scaling,
+    float logit_cap,
+    int64_t max_num_reqs,
+    int64_t max_context_len,
+    int64_t max_total_num_tokens,
+    int64_t buffer_size_per_thread) {
+  using Vec = at::vec::Vectorized<float>;
+
+  // block length for heads
+  const int64_t BLOCK_H = batches == 1 ? 6 : (batches > 16 ? 22 : 11);
+
+  // strides
+  const int64_t l_stride0 = num_heads * num_kv_splits * (head_size_v + 1);
+  const int64_t l_stride1 = num_kv_splits * (head_size_v + 1);
+  const int64_t l_stride2 = head_size_v + 1;
+
+  TORCH_CHECK(logit_cap == 0.f, "decode MLA: expect no logit_cap.");
+
+  // partition the heads into blocks for parallel
+  const int64_t num_blocks = div_up(num_heads, BLOCK_H);
+
+  // parallel on [batches, num_blocks, num_kv_splits]
+  at::parallel_for(0, batches * num_blocks * num_kv_splits, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, block_id{0}, kv_id{0};
+    data_index_init(begin, bs, batches, block_id, num_blocks, kv_id, num_kv_splits);
+
+    int tid = at::get_thread_num();
+    scalar_t* __restrict__ Btmp0 = buffer + tid * buffer_size_per_thread;
+    scalar_t* __restrict__ Btmp1 = Btmp0 + BLOCK_N * head_size;
+
+    // init Btmp1 just once for each thread to prevent NaN
+    // Btmp0 is not needed as it computes full K every single time
+    fill_stub(Btmp1, 0.f, BLOCK_N * head_size_v);
+
+    alignas(64) float s_i[BLOCK_H * BLOCK_N];
+    float* __restrict__ s_delta = s_i;
+    alignas(64) scalar_t s_delta2[BLOCK_H * BLOCK_N];
+
+    alignas(64) float s_prime[BLOCK_H];
+    alignas(64) float m_prime[BLOCK_H];
+    alignas(64) float m_delta[BLOCK_H];
+
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t h_start = block_id * BLOCK_H;
+      const int64_t h_end = std::min(block_id * BLOCK_H + BLOCK_H, num_heads);
+      const int64_t h_size = h_end - h_start;
+
+      // get query
+      const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + h_start * q_strideH;
+
+      int64_t seq_len_kv = seq_lens[bs];
+      int64_t req_pool_id = req_pool_indices[bs];
+      TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
+      TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
+
+      const int64_t SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
+      const int64_t kv_start = kv_id * SPLIT_SIZE;
+      const int64_t kv_end = std::min(kv_start + SPLIT_SIZE, seq_len_kv);
+
+      fill_stub(s_prime, 0.f, BLOCK_H);
+      fill_stub(m_prime, -std::numeric_limits<float>::infinity(), BLOCK_H);
+
+      // get v_prime, and init to zero
+      float* __restrict__ v_prime = attn_logits + bs * l_stride0 + h_start * l_stride1 + kv_id * l_stride2;
+      for (int64_t h = 0; h < h_size; ++h) {
+        fill_stub(v_prime + h * l_stride1, 0.f, head_size_v);
+      }
+
+      // loop over K and V sequence with BLOCK_N
+      for (int64_t n = kv_start; n < kv_end; n += BLOCK_N) {
+        int64_t n_size = std::min(BLOCK_N, kv_end - n);
+        const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
+        // get key and pack
+        pack_vnni<scalar_t, index_t>(
+            /*    dst0 */ Btmp0,
+            /*    dst1 */ Btmp1,
+            /*     src */ k_buffer + /* head_kv_id */ 0 * k_strideH,
+            /* src_scale */ k_buf_scale,
+            /*     ind */ req_to_token + req_pool_id * max_context_len + n,
+            /*       N */ n_size,
+            /*       K */ head_size,
+            /*      Kv */ head_size_v,
+            /*  ld_src */ k_strideN,
+            /* ld_dst0 */ BLOCK_N,
+            /* ld_dst1 */ head_size_v);
+
+        // calculate s_i <- Q @ K
+        at::native::cpublas::brgemm(
+            /* M     */ h_size,
+            /* N     */ n_size,
+            /* K     */ head_size,
+            /* lda   */ q_strideH,
+            /* ldb   */ BLOCK_N,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ q_ptr,
+            /* B     */ Btmp0,
+            /* C     */ s_i);
+
+        const Vec scale_vec = Vec(scaling);
+        for (int64_t h = 0; h < h_size; ++h) {
+          // s_i <- s_i * scale
+          at::vec::map<float>(
+              [scale_vec](Vec x) { return x * scale_vec; }, s_i + h * BLOCK_N, s_i + h * BLOCK_N, n_size);
+
+          // m_i: max value per row
+          float m_i = at::vec::reduce_all<float>(
+              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + h * BLOCK_N, n_size);
+          m_i = std::max(m_i, m_prime[h]);
+
+          // m_delta <- exp(m' - m_i)
+          m_delta[h] = std::exp(m_prime[h] - m_i);
+
+          // s_delta <- exp(s_i - m_i)
+          at::vec::map<float>(
+              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + h * BLOCK_N, s_i + h * BLOCK_N, n_size);
+
+          // s' <- s' * m_delta + sum(s_delta)
+          s_prime[h] *= m_delta[h];
+          s_prime[h] += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
+
+          m_prime[h] = m_i;
+
+          // v' <- v' * m_delta
+          float scale_m = m_delta[h];
+          at::vec::map<float>(
+              [scale_m](Vec x) { return x * Vec(scale_m); },
+              v_prime + h * l_stride1,
+              v_prime + h * l_stride1,
+              head_size_v);
+
+          // pad s_delta with 0 first and then convert to scalar_t
+          fill_stub(s_delta + h * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
+          copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
+        }
+
+        // calculate V' <- s_delta @ V + V'
+        at::native::cpublas::brgemm(
+            /* M     */ h_size,
+            /* N     */ head_size_v,
+            /* K     */ padded_n_size,  // n_size
+            /* lda   */ BLOCK_N,
+            /* ldb   */ head_size_v,
+            /* ldc   */ l_stride1,
+            /* add_C */ true,
+            /* A     */ s_delta2,
+            /* B     */ Btmp1,
+            /* C     */ v_prime);
+      }  // loop with KV blocks
+
+      // only update v' when kv_split_size > 0
+      if (kv_end > kv_start) {
+        for (int64_t h = 0; h < h_size; ++h) {
+          float s = 1 / s_prime[h];
+          at::vec::map<float>(
+              [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
+          (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
+        }
+      }
+
+      // move to the next index
+      data_index_step(bs, batches, block_id, num_blocks, kv_id, num_kv_splits);
+    }
+    at::native::cpublas::brgemm_release();
+  });
+
+  decode_accumulate_kv_splits(
+      output, attn_logits, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2);
+}  // MLA
+
+template <typename scalar_t, typename index_t, int64_t BLOCK_N>
 void decode_attention_grouped_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
@@ -1545,6 +1887,8 @@ void decode_attention_cpu(
     at::Tensor& query,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    std::optional<at::Tensor> k_buf_scale,
+    std::optional<at::Tensor> v_buf_scale,
     at::Tensor& output,
     at::Tensor& key,
     at::Tensor& value,
@@ -1629,115 +1973,178 @@ void decode_attention_cpu(
   // buffer for packing k_cache and v_cache
   int num_threads = at::get_num_threads();
   int64_t size_per_thread = is_mla ? BLOCK_N * head_size + BLOCK_N * head_size_v : 0;
-  auto buffer = at::empty({num_threads, size_per_thread}, k_buffer.options());
-
+  auto buffer = at::empty({num_threads, size_per_thread}, key.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
       // update the kv buffer
-      decode_set_kv_buffer(
-          (scalar_t*)k_buffer_data,
-          (scalar_t*)v_buffer_data,
-          key.data_ptr<scalar_t>(),
-          value.data_ptr<scalar_t>(),
-          loc.data_ptr<int64_t>(),
-          num_seqs,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          nk_strideN,
-          nk_strideH,
-          nv_strideN,
-          nv_strideH,
-          is_mla);
-
-      if (num_heads == num_heads_kv) {
-        // MHA
-        decode_attention_kernel_impl<scalar_t, index_t, BLOCK_N>(
-            output.data_ptr<scalar_t>(),
-            attn_logits.data_ptr<float>(),
-            query.data_ptr<scalar_t>(),
-            (const scalar_t*)k_buffer_data,
-            (const scalar_t*)v_buffer_data,
-            req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<int64_t>(),
-            seq_lens.data_ptr<int64_t>(),
+      auto kv_dtype = k_buffer.scalar_type();
+      if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
+        TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
+        TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "Float8 kv_buffer requires scale tensors");
+        at::Tensor k_scale = k_buf_scale.value();
+        at::Tensor v_scale = v_buf_scale.value();
+        TORCH_CHECK(k_scale.scalar_type() == at::kFloat, "k_buf_scale should be float32");
+        TORCH_CHECK(v_scale.scalar_type() == at::kFloat, "v_buf_scale should be float32");
+        if (is_mla) {
+          TORCH_CHECK(k_scale.data_ptr() == v_scale.data_ptr(), "k_scale and v_scale should be the same one in mla");
+        }
+        decode_set_kv_buffer(
+            (at::Float8_e4m3fn*)k_buffer_data,
+            (at::Float8_e4m3fn*)v_buffer_data,
+            k_scale.data_ptr<float>(),
+            v_scale.data_ptr<float>(),
+            key.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            loc.data_ptr<int64_t>(),
             num_seqs,
-            num_heads,
-            head_size,
-            head_size_v,
-            num_kv_splits,
-            q_strideM,
-            q_strideH,
-            k_strideN,
-            k_strideH,
-            v_strideN,
-            v_strideH,
-            sm_scale,
-            logit_cap,
-            max_num_reqs,
-            max_context_len,
-            max_total_num_tokens);
-      } else if (is_mla) {
-        // MLA
-        decode_attention_mla_kernel_impl<scalar_t, index_t, BLOCK_N>(
-            output.data_ptr<scalar_t>(),
-            attn_logits.data_ptr<float>(),
-            query.data_ptr<scalar_t>(),
-            (const scalar_t*)k_buffer_data,
-            (const scalar_t*)v_buffer_data,
-            req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<int64_t>(),
-            seq_lens.data_ptr<int64_t>(),
-            buffer.data_ptr<scalar_t>(),
-            num_seqs,
-            num_heads,
-            head_size,
-            head_size_v,
-            num_kv_splits,
-            q_strideM,
-            q_strideH,
-            k_strideN,
-            k_strideH,
-            v_strideN,
-            v_strideH,
-            sm_scale,
-            logit_cap,
-            max_num_reqs,
-            max_context_len,
-            max_total_num_tokens,
-            size_per_thread);
-      } else {
-        // GQA/MQA
-        decode_attention_grouped_kernel_impl<scalar_t, index_t, BLOCK_N>(
-            output.data_ptr<scalar_t>(),
-            attn_logits.data_ptr<float>(),
-            query.data_ptr<scalar_t>(),
-            (const scalar_t*)k_buffer_data,
-            (const scalar_t*)v_buffer_data,
-            req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<int64_t>(),
-            seq_lens.data_ptr<int64_t>(),
-            num_seqs,
-            num_heads,
             num_heads_kv,
             head_size,
             head_size_v,
-            num_kv_splits,
-            q_strideM,
-            q_strideH,
             k_strideN,
             k_strideH,
             v_strideN,
             v_strideH,
-            sm_scale,
-            logit_cap,
-            max_num_reqs,
-            max_context_len,
-            max_total_num_tokens);
+            nk_strideN,
+            nk_strideH,
+            nv_strideN,
+            nv_strideH,
+            is_mla);
+        if (is_mla) {
+          decode_attention_mla_kernel_impl<scalar_t, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const at::Float8_e4m3fn*)k_buffer_data,
+              (const at::Float8_e4m3fn*)v_buffer_data,
+              k_scale.data_ptr<float>(),
+              v_scale.data_ptr<float>(),
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              buffer.data_ptr<scalar_t>(),
+              num_seqs,
+              num_heads,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens,
+              size_per_thread);
+        }
+      } else {
+        decode_set_kv_buffer(
+            (scalar_t*)k_buffer_data,
+            (scalar_t*)v_buffer_data,
+            key.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            loc.data_ptr<int64_t>(),
+            num_seqs,
+            num_heads_kv,
+            head_size,
+            head_size_v,
+            k_strideN,
+            k_strideH,
+            v_strideN,
+            v_strideH,
+            nk_strideN,
+            nk_strideH,
+            nv_strideN,
+            nv_strideH,
+            is_mla);
+        if (num_heads == num_heads_kv) {
+          // MHA
+          decode_attention_kernel_impl<scalar_t, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const scalar_t*)k_buffer_data,
+              (const scalar_t*)v_buffer_data,
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              num_seqs,
+              num_heads,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens);
+        } else if (is_mla) {
+          // MLA
+          decode_attention_mla_kernel_impl<scalar_t, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const scalar_t*)k_buffer_data,
+              (const scalar_t*)v_buffer_data,
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              buffer.data_ptr<scalar_t>(),
+              num_seqs,
+              num_heads,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens,
+              size_per_thread);
+        } else {
+          // GQA/MQA
+          decode_attention_grouped_kernel_impl<scalar_t, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const scalar_t*)k_buffer_data,
+              (const scalar_t*)v_buffer_data,
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              num_seqs,
+              num_heads,
+              num_heads_kv,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens);
+        }
       }
     });
   });
