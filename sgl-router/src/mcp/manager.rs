@@ -170,9 +170,6 @@ impl McpManager {
     /// - Dynamic tools from request MCP servers
     ///
     /// The returned inventory exists only for the request lifetime.
-    ///
-    /// # Arguments
-    /// * `dynamic_servers` - List of (server_label, server_url) pairs from request
     pub async fn build_request_inventory(
         &self,
         dynamic_servers: &[(String, String)],
@@ -225,12 +222,6 @@ impl McpManager {
     ///
     /// This is the primary API for working with MCP tools in a request.
     /// It encapsulates the tool inventory and provides a clean interface.
-    ///
-    /// # Arguments
-    /// * `request_tools` - Tools from the request (may include dynamic MCP servers)
-    ///
-    /// # Returns
-    /// A context object that provides access to all available tools for this request
     pub async fn create_request_context(
         self: &Arc<Self>,
         request_tools: &[ResponseTool],
@@ -290,12 +281,6 @@ impl McpManager {
     ///
     /// This is the preferred method for calling tools with composite keys.
     /// Use this when you have a per-request inventory that includes both static and dynamic tools.
-    ///
-    /// # Arguments
-    /// * `inventory` - ToolInventory to look up the tool (can be static or per-request)
-    /// * `server_label` - Server label identifying which server owns the tool
-    /// * `tool_name` - Name of the tool to call
-    /// * `args` - Tool arguments (JSON string or Map)
     pub async fn call_tool_from_inventory(
         &self,
         inventory: &ToolInventory,

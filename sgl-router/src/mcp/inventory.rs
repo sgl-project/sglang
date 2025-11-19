@@ -48,13 +48,6 @@ pub const TOOL_NAME_SEPARATOR: &str = "__";
 ///
 /// This creates a globally unique tool identifier by combining the server label
 /// and tool name with a double underscore separator.
-///
-/// # Examples
-/// ```
-/// use sglang_router_rs::mcp::inventory::format_tool_name;
-/// let formatted = format_tool_name("my-server", "get_weather");
-/// assert_eq!(formatted, "my-server__get_weather");
-/// ```
 pub fn format_tool_name(server_label: &str, tool_name: &str) -> String {
     format!("{}{}{}", server_label, TOOL_NAME_SEPARATOR, tool_name)
 }
@@ -85,12 +78,6 @@ impl ToolInventory {
     }
 
     /// Get a cached tool by its formatted name
-    ///
-    /// # Arguments
-    /// * `formatted_name` - The formatted name in format "server_label__tool_name"
-    ///
-    /// # Returns
-    /// A cloned `CachedTool` if found
     pub fn get_tool(&self, formatted_name: &str) -> Option<CachedTool> {
         self.tools
             .get(formatted_name)
@@ -105,12 +92,6 @@ impl ToolInventory {
     /// Insert a tool into the inventory
     ///
     /// Automatically creates the CachedTool and uses formatted name as key.
-    ///
-    /// # Arguments
-    /// * `server_label` - Server label (identifier for the MCP server)
-    /// * `tool_name` - Tool name (as provided by the MCP server)
-    /// * `tool` - Tool definition with schema
-    /// * `server_url` - Server URL (where the tool is hosted)
     pub fn insert_tool(
         &self,
         server_label: String,
@@ -136,9 +117,6 @@ impl ToolInventory {
     /// Clear all tools for a specific server
     ///
     /// Used when LRU evicts a client or when cleaning up after a request.
-    ///
-    /// # Arguments
-    /// * `server_prefix` - The server label prefix (e.g., "server1" will clear "server1__*")
     pub fn clear_server_tools(&self, server_prefix: &str) {
         let prefix_with_sep = format!("{}__", server_prefix);
         self.tools
