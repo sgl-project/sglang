@@ -3576,7 +3576,10 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Requant the weights and scales of MoE layers
         # TODO: move this to Fp8MoEMethod.process_weights_after_loading
-        self._moe_weight_requant_ue8m0(is_nextn)
+        if should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=getattr(self.quant_config, "weight_block_size", None)
+        ):
+            self._moe_weight_requant_ue8m0(is_nextn)
 
         # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
         if (
