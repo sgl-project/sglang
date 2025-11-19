@@ -176,6 +176,8 @@ class BenchArgs:
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
+    profile_activities: Tuple[str] = ("CPU", "GPU")
+    profile_start_step: Optional[int] = None
     profile_steps: int = 3
     profile_by_stage: bool = False
     profile_filename_prefix: str = None
@@ -224,6 +226,20 @@ class BenchArgs:
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
+        parser.add_argument(
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=("CPU", "GPU"),
+            choices=["CPU", "GPU", "XPU"],
+            help="Profiler activities: CPU, GPU, XPU. use torch profiler.",
+        )
+        parser.add_argument(
+            "--profile-start-step",
+            type=int,
+            default=BenchArgs.profile_start_step,
+            help="Start profiling after this many forward steps. Useful for warmup.",
+        )
         parser.add_argument(
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
@@ -311,6 +327,8 @@ def run_one_case(
     tokenizer: PreTrainedTokenizer | AutoProcessor,
     dataset_name="",
     profile: bool = False,
+    profile_activities: Tuple[str] = ("CPU", "GPU"),
+    profile_start_step: Optional[int] = None,
     profile_steps: int = 3,
     profile_by_stage: bool = False,
     profile_filename_prefix: str = None,
@@ -360,10 +378,11 @@ def run_one_case(
         profile_link: str = run_profile(
             url,
             profile_steps,
-            ["CPU", "GPU"],
+            profile_activities,
             output_dir,
             profile_name,
             profile_by_stage,
+            start_step=profile_start_step,
         )
 
     tic = time.perf_counter()
@@ -706,6 +725,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 tokenizer=tokenizer,
                                 dataset_name=bench_args.dataset_name,
                                 profile=bench_args.profile,
+                                profile_activities=bench_args.profile_activities,
+                                profile_start_step=bench_args.profile_start_step,
                                 profile_steps=bench_args.profile_steps,
                                 profile_by_stage=bench_args.profile_by_stage,
                                 dataset_path=bench_args.dataset_path,

@@ -26,6 +26,7 @@ def _run_profile(
     profile_name: Optional[str] = None,
     profile_by_stage: bool = False,
     merge_profiles: bool = False,
+    start_step: Optional[int] = None,
 ) -> str:
     if output_dir is None:
         output_dir = PROFILER_DIR
@@ -63,6 +64,8 @@ def _run_profile(
         "profile_by_stage": profile_by_stage,
         "merge_profiles": merge_profiles,
     }
+    if start_step is not None:
+        json_data["start_step"] = str(start_step)
 
     response = requests.post(url=url + "/start_profile", json=json_data)
     response.raise_for_status()
@@ -79,6 +82,7 @@ def run_profile(
     profile_name: Optional[str] = None,
     profile_by_stage: bool = False,
     merge_profiles: bool = False,
+    start_step: Optional[int] = None,
 ):
     # step based profile will self terminate on num_steps constraints
     link = _run_profile(
@@ -89,6 +93,7 @@ def run_profile(
         profile_name,
         profile_by_stage,
         merge_profiles,
+        start_step,
     )
     return link
 
