@@ -185,7 +185,6 @@ def wait_for_perf_record(
 def wait_for_stage_metrics(
     request_id: str,
     prev_len: int,
-    expected_count: int,
     log_path: Path,
     timeout: float = 300.0,
 ) -> tuple[dict[str, float], int]:
@@ -209,17 +208,12 @@ def wait_for_stage_metrics(
                 duration = rec.get("duration_ms")
                 if stage is not None and duration is not None:
                     metrics[str(stage)] = float(duration)
-        if len(metrics) >= expected_count:
-            return metrics, len(records)
         time.sleep(0.5)
 
     if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
         records = read_perf_records(log_path)
         return {}, len(records)
-    raise AssertionError(
-        f"Timeout waiting for stage metrics for request {request_id} "
-        f"(collected={len(metrics)} expected={expected_count})"
-    )
+    raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
 
 
 def sample_step_indices(
