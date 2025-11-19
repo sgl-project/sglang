@@ -727,6 +727,14 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 # stop_profile doesn't need any parameters
                 body = {}
             print(f"async_request_profile {api_url=} {body=}")
+            # Add optional profiling parameters if provided
+            if (
+                hasattr(args, "profile_start_step")
+                and args.profile_start_step is not None
+            ):
+                body["start_step"] = str(args.profile_start_step)
+            if hasattr(args, "profile_steps") and args.profile_steps is not None:
+                body["num_steps"] = str(args.profile_steps)
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
@@ -2514,8 +2522,10 @@ async def benchmark(
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
-    # Stop profiler
-    if profile:
+    # Stop profiler (only if profile_steps was not provided, as it auto-stops)
+    if profile and not (
+        hasattr(args, "profile_steps") and args.profile_steps is not None
+    ):
         if pd_separated:
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
@@ -3217,6 +3227,19 @@ if __name__ == "__main__":
         nargs="+",
         default=["CPU", "GPU"],
         choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
+        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER.",
+    )
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=None,
+        help="Start profiling after this many forward steps. Useful for warmup.",
+    )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=None,
+        help="Number of steps to profile. If specified, profiling stops automatically after this many steps.",
     )
     parser.add_argument("--profile-num-steps", type=int, default=None)
     parser.add_argument("--profile-by-stage", action="store_true", default=False)
