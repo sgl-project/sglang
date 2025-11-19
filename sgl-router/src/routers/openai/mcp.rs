@@ -22,7 +22,7 @@ use crate::{
     protocols::responses::{
         generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
     },
-    routers::header_utils::apply_request_headers,
+    routers::{common::strip_server_label, header_utils::apply_request_headers},
 };
 
 // ============================================================================
@@ -856,9 +856,9 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label
     let tools = mcp.list_tools();
     let tools_json: Vec<Value> = tools
         .iter()
-        .map(|(qualified_name, _server_name, t)| {
+        .map(|(_qualified_name, _server_name, t)| {
             json!({
-                "name": qualified_name,
+                "name": t.name,
                 "description": t.description,
                 "input_schema": Value::Object((*t.input_schema).clone()),
                 "annotations": {
@@ -892,7 +892,7 @@ pub(super) fn build_mcp_call_item(
         "approval_request_id": Value::Null,
         "arguments": arguments,
         "error": error,
-        "name": tool_name,
+        "name": strip_server_label(tool_name),
         "output": output,
         "server_label": server_label
     })

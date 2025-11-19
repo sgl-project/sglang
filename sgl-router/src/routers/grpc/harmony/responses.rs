@@ -54,15 +54,18 @@ use crate::{
             ResponsesUsage, StringOrContentParts,
         },
     },
-    routers::grpc::{
-        common::responses::{
-            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
-            streaming::{OutputItemType, ResponseStreamEventEmitter},
+    routers::{
+        common::strip_server_label,
+        grpc::{
+            common::responses::{
+                build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+                streaming::{OutputItemType, ResponseStreamEventEmitter},
+            },
+            context::SharedComponents,
+            error,
+            harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
+            pipeline::RequestPipeline,
         },
-        context::SharedComponents,
-        error,
-        harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
-        pipeline::RequestPipeline,
     },
 };
 
@@ -1446,8 +1449,8 @@ fn inject_mcp_metadata(
     let tools = mcp_manager.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|(qualified_name, _server_name, t)| McpToolInfo {
-            name: qualified_name.clone(),
+        .map(|(_qualified_name, _server_name, t)| McpToolInfo {
+            name: t.name.to_string(),
             description: t.description.as_ref().map(|d| d.to_string()),
             input_schema: Value::Object((*t.input_schema).clone()),
             annotations: Some(json!({
@@ -1477,7 +1480,7 @@ fn inject_mcp_metadata(
             approval_request_id: None,
             arguments: record.arguments.clone(),
             error: record.error.clone(),
-            name: record.tool_name.clone(),
+            name: strip_server_label(&record.tool_name).to_string(),
             output: record.output.clone(),
             server_label: tracking.server_label.clone(),
         })

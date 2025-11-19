@@ -34,9 +34,12 @@ use crate::{
             ResponsesResponse,
         },
     },
-    routers::grpc::{
-        common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
-        error,
+    routers::{
+        common::strip_server_label,
+        grpc::{
+            common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+            error,
+        },
     },
 };
 
@@ -164,8 +167,8 @@ fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> Respo
     let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|(qualified_name, _server_name, t)| McpToolInfo {
-            name: qualified_name.clone(),
+        .map(|(_qualified_name, _server_name, t)| McpToolInfo {
+            name: t.name.to_string(),
             description: t.description.as_ref().map(|d| d.to_string()),
             input_schema: Value::Object((*t.input_schema).clone()),
             annotations: Some(json!({
@@ -196,7 +199,7 @@ fn build_mcp_call_item(
         approval_request_id: None,
         arguments: arguments.to_string(),
         error: error.map(|e| e.to_string()),
-        name: tool_name.to_string(),
+        name: strip_server_label(tool_name).to_string(),
         output: output.to_string(),
         server_label: server_label.to_string(),
     }
