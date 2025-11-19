@@ -1,22 +1,10 @@
-name: PR Test (Ascend NPU)
+name: PR Test (NPU)
 
 on:
   push:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "!python/sglang/multimodal_gen/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - ".github/workflows/pr-test-npu.yml"
   pull_request:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "!python/sglang/multimodal_gen/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - ".github/workflows/pr-test-npu.yml"
   workflow_dispatch:
 
 concurrency:
@@ -24,8 +12,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  per-commit-1-ascend-npu:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+  # ================================================= #
+
+  # ==================== Check Changes ==================== #
+  check-changes:
+    needs: [pr-gate]
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
+              - "scripts/ci/npu_ci_install_dependency.sh"
+              - "test/srt/ascend/**"
+              - ".github/workflows/pr-test-npu.yml"
+  # ======================================================= #
+
+  per-commit-1-npu-a2:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-1
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
@@ -60,10 +79,11 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-ascend-npu
+          python3 run_suite.py --suite per-commit-1-npu-a2
 
-  per-commit-2-ascend-npu:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  per-commit-2-npu-a2:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-2
     strategy:
       fail-fast: true
@@ -102,10 +122,11 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-ascend-npu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
+          python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
-  per-commit-4-ascend-npu:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  per-commit-4-npu-a2:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-4
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
@@ -140,10 +161,11 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600
+          python3 run_suite.py --suite per-commit-4-npu-a2 --timeout-per-file 3600
 
-  per-commit-16-ascend-a3:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  per-commit-16-npu-a3:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
     strategy:
       fail-fast: true
@@ -182,4 +204,4 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
