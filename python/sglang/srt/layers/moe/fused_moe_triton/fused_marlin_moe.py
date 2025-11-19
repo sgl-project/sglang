@@ -60,7 +60,7 @@ def fused_marlin_moe(
     - topk_ids (torch.Tensor): Indices of topk-k elements.
     - w1_zeros (Optional[torch.Tensor]): Optional zero points to be used for w1.
     - w2_zeros (Optional[torch.Tensor]): Optional zero points to be used for w2.
-    - num_bits (bool): The number of bits in expert weights quantization.
+    - num_bits (int): The number of bits in expert weights quantization.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
