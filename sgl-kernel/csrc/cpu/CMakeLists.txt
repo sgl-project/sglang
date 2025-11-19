@@ -54,6 +54,14 @@ if(DEFINED ENV{CONDA_PREFIX})
         message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
                             "Please install it using: conda install libnuma numactl\n")
     endif()
+else()
+    find_library(NUMA_LIB numa HINTS "${PLAT_LIB_DIR}")
+    if(NUMA_LIB)
+        message(STATUS "Found libnuma: ${NUMA_LIB}")
+    else()
+	    message(FATAL_ERROR "libnuma not found in platform environment at ${PLAT_LIB_DIR}\n"
+                            "Please install libnuma and numactl\n")
+    endif()
 endif()
 
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
