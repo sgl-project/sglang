@@ -2059,6 +2059,7 @@ class ServerArgs:
             "implementation is available.\n"
             '* "sglang" will use the SGLang model implementation.\n'
             '* "transformers" will use the Transformers model '
+            '* "mindspore" will use the MindSpore model '
             "implementation.\n",
         )
 
@@ -3956,6 +3957,9 @@ class ServerArgs:
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
+
+        if self.model_impl == "mindspore":
+            assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
