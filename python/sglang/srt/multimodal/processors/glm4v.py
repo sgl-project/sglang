@@ -26,8 +26,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         # Token IDs
         self.IM_TOKEN_ID = hf_config.image_token_id
         self.VIDEO_TOKEN_ID = hf_config.video_token_id
-        self.IM_START_TOKEN_ID = hf_config.image_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.image_end_token_id
+        self.IMAGE_START_TOKEN_ID = hf_config.image_start_token_id
+        self.IMAGE_END_TOKEN_ID = hf_config.image_end_token_id
         self.VIDEO_START_TOKEN_ID = hf_config.video_start_token_id
         self.VIDEO_END_TOKEN_ID = hf_config.video_end_token_id
 
