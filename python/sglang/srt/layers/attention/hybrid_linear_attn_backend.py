@@ -641,10 +641,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            conv_states_to_use = conv_states.clone()
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
-            conv_states_to_use = conv_states
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
@@ -656,7 +654,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
-                conv_states_to_use,
+                conv_states,
                 conv_weights,
                 bias,
                 activation,
@@ -675,7 +673,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states_to_use,
+                conv_states=conv_states,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
