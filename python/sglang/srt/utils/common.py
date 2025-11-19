@@ -1434,6 +1434,15 @@ def is_triton_3():
     return triton.__version__.startswith("3.")
 
 
+def is_triton_34() -> bool:
+    """
+    Returns True when running on a CUDA backend with Triton 3.4.x.
+    Currently, this is used to gate CSGMV Triton cache, as
+    we currently use a private API for the cache.
+    """
+    return triton.__version__.startswith("3.4.")
+
+
 def maybe_torch_compile(*args, **kwargs):
     """
     torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
@@ -3618,6 +3627,19 @@ def cached_triton_kernel(key_fn=None):
     """
 
     def decorator(fn):
+        # Auto-enable the custom kernel cache for CUDA + Triton 3.4, where it is
+        # known to be compatible.
+        # TODO(brayden): expand this for other versions as well.
+        if (
+            is_triton_34()
+            and is_cuda()
+            and not envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get()
+        ):
+            logger.debug(
+                "Detected CUDA + Triton 3.4.x; using custom triton kernel cache."
+            )
+            return CachedKernel(fn, key_fn)
+
         if envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
             logger.debug(
                 f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = True. Using custom triton kernel cache."
