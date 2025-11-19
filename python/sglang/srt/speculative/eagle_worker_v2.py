@@ -37,6 +37,7 @@ from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
     generate_token_bitmask,
+    generate_token_bitmask_v2,
     load_token_map,
 )
 from sglang.srt.utils.common import (
@@ -594,6 +595,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        # from .forkedpdb import ForkedPdb
+        # ForkedPdb().set_trace()
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -626,7 +629,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
-            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output) # 比较奇怪的是为什么draft extend after decode的和之前用的是一样的grammar词表mask
             return batch_output
 
     def verify(
@@ -675,7 +678,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         # Prepare grammar data on CPU if needed
-        if batch.has_grammar:
+        # from .forkedpdb import ForkedPdb
+        # ForkedPdb().set_trace()
+        if batch.sampling_info.grammars:
             retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
             retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
             draft_tokens_cpu = verify_input.draft_token.view(
@@ -693,10 +698,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Generate vocab mask for constrained decoding
         vocab_mask = None
-        if batch.has_grammar:
+        if batch.sampling_info.grammars:
             # Generate the logit mask for structured output.
-            vocab_mask = generate_token_bitmask(
-                batch.reqs,
+            vocab_mask = generate_token_bitmask_v2(
+                batch,
                 verify_input,
                 retrieve_next_token_cpu,
                 retrieve_next_sibling_cpu,

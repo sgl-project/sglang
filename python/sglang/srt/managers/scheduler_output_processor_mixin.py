@@ -156,16 +156,16 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                        try:
-                            req.grammar.accept_token(next_token_id)
-                        except ValueError as e:
-                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                            # This can happen if the grammar is not set correctly or the token is invalid.
-                            logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                            )
-                            self.abort_request(AbortReq(rid=req.rid))
+                    #     # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    #     try:
+                    #         req.grammar.accept_token(next_token_id)
+                    #     except ValueError as e:
+                    #         # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    #         # This can happen if the grammar is not set correctly or the token is invalid.
+                    #         logger.error(
+                    #             f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    #         )
+                    #         self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
                     trace_slice(
@@ -280,6 +280,37 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+
+    def _peek_spec_token_ids(
+            self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+        ) -> List[List[int]]:
+            """
+            [新增] 只计算 Eagle 的 Token IDs，没有任何副作用（不修改 req 状态）。
+            用于在 Fast-Path 中提前获取 Token 更新 Grammar。
+            """
+            # 确保数据已在 CPU
+            if not isinstance(result.next_token_ids, list):
+                # 注意：这里的转换只会影响当前引用，不会破坏原始 result 对象给后续流程的使用
+                # 但为了性能，如果已经是 Tensor，这里转了之后最好回写或者让后续流程复用
+                # 简单起见，这里假设输入可能是 Tensor 或 List
+                next_token_ids = result.next_token_ids.tolist() if hasattr(result.next_token_ids, 'tolist') else result.next_token_ids
+                accept_lens = result.accept_lens.tolist() if hasattr(result.accept_lens, 'tolist') else result.accept_lens
+            else:
+                next_token_ids = result.next_token_ids
+                accept_lens = result.accept_lens
+
+            predict_tokens = []
+            stride = self.draft_worker.speculative_num_draft_tokens
+            for i, req in enumerate(batch.reqs):
+                # 纯计算切片，不修改 req.spec_verify_ct
+                predict_tokens.append(
+                    next_token_ids[i * stride : i * stride + accept_lens[i]]
+                )
+            return predict_tokens
+
+
+
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -367,16 +398,16 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    req.grammar.accept_token(next_token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
-                    self.abort_request(AbortReq(rid=req.rid))
+            #     # FIXME: this try-except block is for handling unexpected xgrammar issue.
+            #     try:
+            #         req.grammar.accept_token(next_token_id)
+            #     except ValueError as e:
+            #         # Grammar accept_token can raise ValueError if the token is not in the grammar.
+            #         # This can happen if the grammar is not set correctly or the token is invalid.
+            #         logger.error(
+            #             f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+            #         )
+            #         self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)

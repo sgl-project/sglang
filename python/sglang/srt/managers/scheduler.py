@@ -988,6 +988,64 @@ class Scheduler(
 
             self.last_batch = batch
 
+
+
+    def _update_grammar_fast_path(self, batch, batch_result):
+        """
+        [New Feature] Fast update Grammar state after run batch.
+
+        Note: This will force the synchronization of GPU data to CPU.
+        """
+
+        if batch.forward_mode.is_decode():
+            if batch_result.next_token_ids is not None and hasattr(batch_result.next_token_ids, 'to'):
+                batch_result.next_token_ids = batch_result.next_token_ids.to("cpu", non_blocking=True)
+            if batch_result.accept_lens is not None and hasattr(batch_result.accept_lens, 'to'):
+                batch_result.accept_lens = batch_result.accept_lens.to("cpu", non_blocking=True)
+            if batch_result.allocate_lens is not None and hasattr(batch_result.allocate_lens, 'to'):
+                batch_result.allocate_lens = batch_result.allocate_lens.to("cpu", non_blocking=True)
+            
+            # force sync because we are going to read data
+            if hasattr(batch_result.next_token_ids, 'cpu'): 
+                torch.cuda.synchronize() 
+
+            if batch.spec_algorithm.is_none():
+                if hasattr(batch_result.next_token_ids, 'flatten'):
+                    next_token_ids = batch_result.next_token_ids.flatten().tolist()
+                else:
+                    next_token_ids = batch_result.next_token_ids
+            elif batch.is_v2_eagle:
+                next_token_ids = self._peek_spec_token_ids(batch_result, batch)
+                
+        elif batch.forward_mode.is_extend():
+            if hasattr(batch_result.next_token_ids, 'flatten'):
+                batch_result.next_token_ids = batch_result.next_token_ids.to("cpu", non_blocking=True)
+                torch.cuda.synchronize() # 同步
+                next_token_ids = batch_result.next_token_ids.flatten().tolist()
+            else:
+                next_token_ids = batch_result.next_token_ids
+        else:
+            return
+        # print(f"next_token_ids: {next_token_ids}")
+        # 3. update Grammar
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if req.grammar is None:
+                continue
+
+            # 类型清洗
+            token_val = next_token_id
+            try:
+                if isinstance(token_val, list):
+                    for t in token_val:
+                        req.grammar.accept_token(int(t))
+                else:
+                    if hasattr(token_val, 'item'):
+                        token_val = token_val.item()
+                    req.grammar.accept_token(int(token_val))
+            except ValueError as e:
+                logger.error(f"Fast-path grammar update failed for req {req.rid}: {e}")
+
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1004,8 +1062,9 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-
-            batch = self.get_next_batch_to_run()
+            # from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
+            batch = self.get_next_batch_to_run() # 获取一会儿需要计算的batch
             self.cur_batch = batch
 
             disable_overlap_for_batch = (
@@ -1022,6 +1081,10 @@ class Scheduler(
             batch_result = None
             if batch:
                 batch_result = self.run_batch(batch)
+                if batch.has_grammar:
+                    self._update_grammar_fast_path(batch, batch_result)
+                # from .forkedpdb import ForkedPdb
+                # ForkedPdb().set_trace()
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
@@ -2132,6 +2195,8 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
+            # from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():

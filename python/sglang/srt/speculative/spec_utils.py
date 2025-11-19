@@ -20,7 +20,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
-
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -649,6 +649,56 @@ def generate_token_bitmask(
 
     verify_input.grammar = grammar
     return allocate_token_bitmask
+
+def generate_token_bitmask_v2(
+    batch: ModelWorkerBatch,
+    verify_input: EagleVerifyInput,
+    retrieve_next_token_cpu: torch.Tensor,
+    retrieve_next_sibling_cpu: torch.Tensor,
+    draft_tokens_cpu: torch.Tensor,
+    vocab_size: int,
+):
+    """
+    Generate the logit mask for structured output.
+    Draft model's token can be either valid or invalid with respect to the grammar.
+    We need to perform DFS to
+    1. figure out which tokens are accepted by the grammar.
+    2. if so, what is the corresponding logit mask.
+    """
+
+    num_draft_tokens = draft_tokens_cpu.shape[-1]
+
+    allocate_token_bitmask = None
+    grammar = None
+    for i in range(retrieve_next_token_cpu.shape[0]):
+        if batch.sampling_info.grammars[i] is not None:
+            if allocate_token_bitmask is None:
+                allocate_token_bitmask = batch.sampling_info.grammars[i].allocate_vocab_mask(
+                    vocab_size=vocab_size,
+                    batch_size=draft_tokens_cpu.numel(),
+                    device="cpu",
+                )
+            grammar = batch.sampling_info.grammars[i]
+            s = time.perf_counter()
+            traverse_tree(
+                retrieve_next_token_cpu[i],
+                retrieve_next_sibling_cpu[i],
+                draft_tokens_cpu[i],
+                batch.sampling_info.grammars[i],
+                allocate_token_bitmask[
+                    i * num_draft_tokens : (i + 1) * num_draft_tokens
+                ],
+            )
+            tree_traverse_time = time.perf_counter() - s
+            if tree_traverse_time > TREE_TRAVERSE_TIME_THRESHOLD:
+                logger.warning(
+                    f"Bit mask generation took {tree_traverse_time} seconds with "
+                    f"grammar: {batch.sampling_info.grammars[i]}"
+                )
+
+    verify_input.grammar = grammar
+    return allocate_token_bitmask
+
 
 
 def load_token_map(token_map_path: str) -> List[int]:
