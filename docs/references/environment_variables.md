@@ -29,12 +29,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_SKIP_P2P_CHECK` | Skip P2P (peer-to-peer) access check | `false` |
 | `SGL_CHUNKED_PREFIX_CACHE_THRESHOLD` | Sets the threshold for enabling chunked prefix caching | `8192` |
 | `SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION` | Enable RoPE fusion in Fused Multi-Layer Attention | `1` |
-<<<<<<< HEAD
 | `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP` | Disable overlap schedule for consecutive prefill batches | `false` |
 | `SGLANG_DISABLE_FA4_WARMUP` | Disable Flash Attention 4 warmup passes (set to `1`, `true`, `yes`, or `on` to disable) | `false` |
-=======
-| `SGLANG_DUAL_STREAM_TOKEN_THRESHOLD` | Enable parallel execution of shared and routed experts using separate CUDA streams for small batches (<= threshold tokens) | `1024` |
->>>>>>> a235cf584 (Add env var SGLANG_DUAL_STREAM_TOKEN_THRESHOLD)
 
 ## DeepGEMM Configuration (Advanced Optimization)
 
