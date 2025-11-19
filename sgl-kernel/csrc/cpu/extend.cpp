@@ -47,6 +47,45 @@ inline void pack_vnni_Nx32(
   }
 }
 
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_Nx32(
+    scalar_t* __restrict__ dst,
+    const at::Float8_e4m3fn* __restrict__ src,
+    const float* __restrict__ src_scale,
+    const index_t* __restrict__ ind,
+    int N,
+    int ld_src,
+    int ld_dst) {
+  __m512i vinputs[16];
+
+  int n = 0;
+  for (; n < N; ++n) {
+    index_t index = get_index(ind, n);
+    __m512 scale = _mm512_set1_ps(src_scale[index]);
+    __m512i s8 = _mm512_loadu_si512(src + index * ld_src);
+    __m256i s8_0 = _mm512_extracti32x8_epi32(s8, 0);
+    __m512bh bf16_0 = CVT_FP8_TO_BF16(s8_0);
+    __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
+    __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
+    f_lo = _mm512_mul_ps(f_lo, scale);
+    f_hi = _mm512_mul_ps(f_hi, scale);
+    bf16_0 = _mm512_cvtne2ps_pbh(f_hi, f_lo);
+    vinputs[n] = (__m512i)bf16_0;
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; n < 16; ++n) {
+    vinputs[n] = _mm512_set1_epi32(0);
+  }
+
+  // pack key
+  transpose_16x16_32bit(vinputs);
+
+  const __mmask16 vmask = (1 << N) - 1;
+  for (int k = 0; k < 16; ++k) {
+    _mm512_mask_storeu_epi32(dst + k * ld_dst * 2, vmask, vinputs[k]);
+  }
+}
+
 // value: from [K, 32] to [K/2, 32, 2]
 template <typename scalar_t, typename index_t>
 inline void pack_vnni_Kx32(
@@ -74,6 +113,44 @@ inline void pack_vnni_Kx32(
   _mm512_storeu_si512(dst + 0 * ld_dst * 2, d0);
   _mm512_storeu_si512(dst + 0 * ld_dst * 2 + 32, d1);
 }
+
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_Kx32(
+    scalar_t* __restrict__ dst,
+    const at::Float8_e4m3fn* __restrict__ src,
+    const float* __restrict__ src_scale,
+    const index_t* __restrict__ ind,
+    int K,
+    int ld_src,
+    int ld_dst) {
+  __m512i vinputs[2];
+
+  int k = 0;
+  for (; k < K; ++k) {
+    index_t index = get_index(ind, k);
+    __m512 scale = _mm512_set1_ps(src_scale[index]);
+    __m512i s8 = _mm512_loadu_si512(src + index * ld_src);
+    __m256i s8_0 = _mm512_extracti32x8_epi32(s8, 0);
+    __m512bh bf16_0 = CVT_FP8_TO_BF16(s8_0);
+    __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
+    __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
+    f_lo = _mm512_mul_ps(f_lo, scale);
+    f_hi = _mm512_mul_ps(f_hi, scale);
+    bf16_0 = _mm512_cvtne2ps_pbh(f_hi, f_lo);
+    vinputs[k] = (__m512i)bf16_0;
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; k < 2; ++k) {
+    vinputs[k] = _mm512_set1_epi32(0);
+  }
+
+  // pack value
+  __m512i d0, d1;
+  std::tie(d0, d1) = transpose_2x32_16bit(vinputs[0], vinputs[1]);
+  _mm512_storeu_si512(dst + 0 * ld_dst * 2, d0);
+  _mm512_storeu_si512(dst + 0 * ld_dst * 2 + 32, d1);
+}
+
 #endif
 
 // convert to vnni format
@@ -128,25 +205,26 @@ void pack_vnni(
     int K,
     int ld_src,
     int ld_dst) {
-  // #if defined(CPU_CAPABILITY_AVX512)
-  //   const int NB = div_up(N, 16);
-  //   const int KB = K / 32;  // no remainder
-  //   const bool is_indexed = ind != nullptr;
+#if defined(CPU_CAPABILITY_AVX512)
+  const int NB = div_up(N, 16);
+  const int KB = K / 32;  // no remainder
+  const bool is_indexed = ind != nullptr;
 
-  //   for (int nb = 0; nb < NB; ++nb) {
-  //     for (int kb = 0; kb < KB; ++kb) {
-  //       // handle 16x512bits each block
-  //       int nb_size = std::min(N - nb * 16, 16);
-  //       pack_vnni_Nx32<scalar_t, index_t>(
-  //           /*    dst */ dst + ((kb * 32) >> 1) * ld_dst * 2 + nb * 16 * 2,
-  //           /*    src */ src + kb * 32 + (is_indexed ? 0 : nb * 16 * ld_src),
-  //           /*    ind */ is_indexed ? ind + nb * 16 : nullptr,
-  //           /*      N */ nb_size,
-  //           /* ld_src */ ld_src,
-  //           /* ld_dst */ ld_dst);
-  //     }
-  //   }
-  // #else
+  for (int nb = 0; nb < NB; ++nb) {
+    for (int kb = 0; kb < KB; ++kb) {
+      // handle 16x512bits each block
+      int nb_size = std::min(N - nb * 16, 16);
+      pack_vnni_Nx32<scalar_t, index_t>(
+          /*    dst */ dst + ((kb * 32) >> 1) * ld_dst * 2 + nb * 16 * 2,
+          /*    src */ src + kb * 32 + (is_indexed ? 0 : nb * 16 * ld_src),
+          /* src_scale*/ src_scale,
+          /*    ind */ is_indexed ? ind + nb * 16 : nullptr,
+          /*      N */ nb_size,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+  }
+#else
   for (int n = 0; n < N; ++n) {
     index_t index = get_index(ind, n);
     for (int k = 0; k < K / 2; ++k) {
@@ -155,7 +233,7 @@ void pack_vnni(
       }
     }
   }
-  // #endif
+#endif
 }
 
 // convert to vnni format
@@ -219,25 +297,26 @@ void pack_vnni2(
     int N,
     int ld_src,
     int ld_dst) {
-  // #if defined(CPU_CAPABILITY_AVX512)
-  //   const int KB = div_up(K, 2);
-  //   const int NB = N / 32;  // no remainder
-  //   const bool is_indexed = ind != nullptr;
+#if defined(CPU_CAPABILITY_AVX512)
+  const int KB = div_up(K, 2);
+  const int NB = N / 32;  // no remainder
+  const bool is_indexed = ind != nullptr;
 
-  //   for (int kb = 0; kb < KB; ++kb) {
-  //     for (int nb = 0; nb < NB; ++nb) {
-  //       // handle 2x512bits each block
-  //       int kb_size = std::min(K - kb * 2, 2);
-  //       pack_vnni_Kx32<scalar_t, index_t>(
-  //           /*    dst */ dst + ((kb * 2) >> 1) * ld_dst * 2 + nb * 32 * 2,
-  //           /*    src */ src + (is_indexed ? 0 : kb * 2 * ld_src) + nb * 32,
-  //           /*    ind */ is_indexed ? ind + kb * 2 : nullptr,
-  //           /*      K */ kb_size,
-  //           /* ld_src */ ld_src,
-  //           /* ld_dst */ ld_dst);
-  //     }
-  //   }
-  // #else
+  for (int kb = 0; kb < KB; ++kb) {
+    for (int nb = 0; nb < NB; ++nb) {
+      // handle 2x512bits each block
+      int kb_size = std::min(K - kb * 2, 2);
+      pack_vnni_Kx32<scalar_t, index_t>(
+          /*    dst */ dst + ((kb * 2) >> 1) * ld_dst * 2 + nb * 32 * 2,
+          /*    src */ src + (is_indexed ? 0 : kb * 2 * ld_src) + nb * 32,
+          /* src_scale*/ src_scale,
+          /*    ind */ is_indexed ? ind + kb * 2 : nullptr,
+          /*      K */ kb_size,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+  }
+#else
   int k = 0;
   for (; k < (K >> 1) * 2; k += 2) {
     index_t index0 = get_index(ind, k + 0);
@@ -255,7 +334,7 @@ void pack_vnni2(
     }
     k += 2;
   }
-  // #endif
+#endif
 }
 
 template <typename scalar_t>
