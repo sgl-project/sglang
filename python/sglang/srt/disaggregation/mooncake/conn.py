@@ -159,8 +159,11 @@ class MooncakeKVManager(CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_draft_mla_backend: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        super().__init__(
+            args, disaggregation_mode, server_args, is_mla_backend, is_draft_mla_backend
+        )
         self.init_engine()
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -284,9 +287,20 @@ class MooncakeKVManager(CommonKVManager):
         layers_params = None
 
         # pp is not supported on the decode side yet
-        if self.is_mla_backend:
+        if self.is_mla_backend and (
+            self.kv_args.draft_layer_num == 0
+            or self.kv_args.draft_layer_num != 0
+            and self.is_draft_mla_backend
+        ):
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mla_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    self.kv_args.prefill_start_layer,
+                    self.kv_args.prefill_start_layer
+                    + self.kv_args.layer_num
+                    + self.kv_args.draft_layer_num,
+                )
             )
             kv_item_len = item_lens[0]
             layers_params = [
@@ -297,9 +311,16 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
-        else:
+        elif not self.is_mla_backend and not self.is_draft_mla_backend:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mha_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    self.kv_args.prefill_start_layer,
+                    self.kv_args.prefill_start_layer
+                    + self.kv_args.layer_num
+                    + self.kv_args.draft_layer_num,
+                )
             )
             kv_item_len = item_lens[0]
             layers_params = [
@@ -317,6 +338,69 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
+        elif (
+            self.is_mla_backend
+            and self.kv_args.draft_layer_num != 0
+            and not self.is_draft_mla_backend
+        ):
+            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    self.kv_args.prefill_start_layer,
+                    self.kv_args.prefill_start_layer + self.kv_args.layer_num,
+                )
+            )
+            kv_item_len = item_lens[0]
+            layers_params = [
+                (
+                    src_kv_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+
+            # draft kvcache
+            (
+                src_k_ptrs,
+                src_v_ptrs,
+                dst_k_ptrs,
+                dst_v_ptrs,
+                layers_draft_current_pp_stage,
+            ) = self.get_mha_kv_ptrs_with_pp(
+                src_data_ptrs,
+                dst_data_ptrs,
+                self.kv_args.prefill_start_layer
+                + self.kv_args.layer_num
+                + self.kv_args.draft_prefill_start_layer,
+                self.kv_args.prefill_start_layer
+                + self.kv_args.layer_num
+                + self.kv_args.draft_layer_num,
+            )
+            kv_item_len = item_lens[self.kv_args.layer_num]
+            layers_params += [
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_draft_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_draft_current_pp_stage)
+            ]
+        else:
+            # not self.is_mla_backend and not self.is_draft_mla_backend
+            # should we support this?
+            raise RuntimeError(
+                f"PD Disaggregation does NOT support target MHA draft MLA models yet."
+            )
+
         assert layers_params is not None
 
         def set_transfer_blocks(

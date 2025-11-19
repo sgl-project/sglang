@@ -31,10 +31,13 @@ class KVArgs:
     decode_tp_size: int
     kv_head_num: int
     page_size: int
+    layer_num: int
+    draft_layer_num: int
     # for pp prefill
     prefill_pp_size: int
     pp_rank: int
     prefill_start_layer: int
+    draft_prefill_start_layer: int
     # for system dp
     system_dp_rank: int
 
@@ -57,6 +60,7 @@ class BaseKVManager(ABC):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_draft_mla_backend: Optional[bool] = False,
     ): ...
 
 

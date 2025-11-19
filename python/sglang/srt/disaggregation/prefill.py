@@ -93,6 +93,10 @@ class PrefillBootstrapQueue:
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
+        if draft_token_to_kv_pool:
+            self.is_draft_mla_backend = is_mla_backend(self.draft_token_to_kv_pool)
+        else:
+            self.is_draft_mla_backend = False
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -122,7 +126,9 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
-
+        kv_args.layer_num = (
+            len(kv_data_ptrs) if self.is_mla_backend else len(kv_data_ptrs) // 2
+        )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -132,12 +138,23 @@ class PrefillBootstrapQueue:
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            kv_args.draft_layer_num = (
+                len(draft_kv_data_ptrs)
+                if self.is_draft_mla_backend
+                else len(draft_kv_data_ptrs) // 2
+            )
+            kv_args.draft_prefill_start_layer = self.draft_token_to_kv_pool.start_layer
+        else:
+            kv_args.draft_layer_num = 0
+            kv_args.draft_prefill_start_layer = 0
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        if not self.is_draft_mla_backend:
+            kv_args.draft_kv_head_num = self.draft_token_to_kv_pool.head_num
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -176,6 +193,7 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.is_draft_mla_backend,
         )
         return kv_manager
 
