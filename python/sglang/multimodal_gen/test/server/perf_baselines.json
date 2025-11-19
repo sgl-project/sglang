@@ -38,7 +38,7 @@
                 "TextEncodingStage": 834.2,
                 "ConditioningStage": 0.1,
                 "TimestepPreparationStage": 10.6,
-                "LatentPreparationStage": 9.0,
+                "LatentPreparationStage": 11.8,
                 "DenoisingStage": 21202.6,
                 "DecodingStage": 476.12
             },
@@ -99,7 +99,7 @@
             "stages_ms": {
                 "InputValidationStage": 0.08,
                 "TextEncodingStage": 87.36,
-                "ConditioningStage": 0.01,
+                "ConditioningStage": 0.024,
                 "TimestepPreparationStage": 2.31,
                 "LatentPreparationStage": 4.95,
                 "DenoisingStage": 8161.97,
@@ -222,7 +222,7 @@
                 "ConditioningStage": 2.0,
                 "TimestepPreparationStage": 2.0,
                 "LatentPreparationStage": 10.0,
-                "ImageVAEEncodingStage": 1800.0,
+                "ImageVAEEncodingStage": 2031.0,
                 "DenoisingStage": 278000.0,
                 "DecodingStage": 2700.0
             },
@@ -300,7 +300,7 @@
             "stages_ms": {
                 "InputValidationStage": 47.04,
                 "TextEncodingStage": 2321.27,
-                "ImageEncodingStage": 2314.32,
+                "ImageEncodingStage": 3244.34,
                 "ConditioningStage": 0.0105,
                 "TimestepPreparationStage": 1.98,
                 "LatentPreparationStage": 5.24,
