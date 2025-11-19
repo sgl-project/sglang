@@ -379,12 +379,7 @@ class TestDiffusionPerformance:
             return
 
         try:
-            if isinstance(validator, VideoPerformanceValidator):
-                summary = validator.validate(
-                    perf_record, stage_metrics, case.num_frames
-                )
-            else:
-                summary = validator.validate(perf_record, stage_metrics)
+            validator.validate(perf_record, stage_metrics, case.num_frames)
         except AssertionError:
             self._dump_baseline_scenario(case, summary)
             raise
