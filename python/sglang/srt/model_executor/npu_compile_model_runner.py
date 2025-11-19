@@ -31,19 +31,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cuda_graph_runner import (
-    CudaGraphRunner
-)
+from sglang.srt.model_executor.cuda_graph_runner import get_batch_sizes_to_capture
 from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
     ForwardBatch,
     PPProxyTensors,
-    CaptureHiddenMode,
 )
 
 
-class NPUCompileModelRunner(CudaGraphRunner):
+class NPUCompileModelRunner:
     def __init__(self, model_runner: ModelRunner):
-        super().__init__(model_runner)
+        self.model_runner = model_runner
+        _, self.compile_bs = get_batch_sizes_to_capture(model_runner)
 
     def capture(self) -> None:
         # Reverse the order to enable better memory sharing across cuda graphs.
