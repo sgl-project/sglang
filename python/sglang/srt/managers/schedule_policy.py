@@ -107,7 +107,7 @@ class SchedulePolicy:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
-                    waiting_queue, self.schedule_low_priority_values_first
+                    waiting_queue, self.priority_sign
                 )
             return False
 
@@ -134,7 +134,7 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_longest_output(
                     waiting_queue,
                     self.enable_priority_scheduling,
-                    self.schedule_low_priority_values_first,
+                    self.priority_sign,
                 )
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
@@ -254,12 +254,12 @@ class SchedulePolicy:
         self,
         waiting_queue: List[Req],
         enable_priority_scheduling: bool,
-        schedule_low_priority_values_first: bool,
+        priority_sign: int,
     ) -> None:
         """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
         if enable_priority_scheduling:
             waiting_queue.sort(
-                key=lambda x: (x.priority * self.priority_sign, -x.sampling_params.max_new_tokens)
+                key=lambda x: (x.priority * priority_sign, -x.sampling_params.max_new_tokens)
             )
         else:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
@@ -271,11 +271,11 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_priority_and_fcfs(
-        self, waiting_queue: List[Req], schedule_low_priority_values_first: bool
+        self, waiting_queue: List[Req], priority_sign: int
     ) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
         waiting_queue.sort(
-            key=lambda x: (x.priority * self.priority_sign, x.time_stats.wait_queue_entry_time)
+            key=lambda x: (x.priority * priority_sign, x.time_stats.wait_queue_entry_time)
         )
 
     @staticmethod
@@ -367,7 +367,7 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
-    def _cal_available_and_evictable_tokens(self):
+    def _calc_available_and_evictable_tokens(self):
         if self.is_hybrid:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
@@ -389,11 +389,11 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        return self._cal_available_and_evictable_tokens() - self.rem_total_token_offset
+        return self._calc_available_and_evictable_tokens() - self.rem_total_token_offset
 
     @property
     def cur_rem_tokens(self):
-        return self._cal_available_and_evictable_tokens() - self.cur_rem_token_offset
+        return self._calc_available_and_evictable_tokens() - self.cur_rem_token_offset
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
