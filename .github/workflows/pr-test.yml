@@ -317,8 +317,8 @@ jobs:
 
 
   multimodal-gen-test:
-    needs: [check-changes, stage-a-test-1]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: (always() && !failure() && !cancelled()) && needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
