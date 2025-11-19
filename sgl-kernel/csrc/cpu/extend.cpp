@@ -82,6 +82,7 @@ template <typename scalar_t, typename index_t>
 void pack_vnni(
     scalar_t* __restrict__ dst,
     const scalar_t* __restrict__ src,
+    const float* __restrict__ src_scale,
     const index_t* __restrict__ ind,
     int N,
     int K,
@@ -163,6 +164,7 @@ template <typename scalar_t, typename index_t>
 void pack_vnni2(
     scalar_t* __restrict__ dst,
     const scalar_t* __restrict__ src,
+    const float* __restrict__ src_scale,
     const index_t* __restrict__ ind,
     int K,
     int N,
@@ -310,352 +312,14 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   }
 }
 
-template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
+template <typename scalar_t, typename kvcache_t, typename index_t, int BLOCK_M, int BLOCK_N>
 void extend_attention_kernel_impl(
     scalar_t* __restrict__ o_extend,
     const scalar_t* __restrict__ q_extend,
     const scalar_t* __restrict__ k_extend,
     const scalar_t* __restrict__ v_extend,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
-    const index_t* __restrict__ req_to_token,
-    const int64_t* __restrict__ req_pool_indices,
-    const int64_t* __restrict__ seq_lens,
-    const index_t* __restrict__ extend_seq_lens,
-    const index_t* __restrict__ extend_start_loc,
-    const void* __restrict__ buffer,
-    int batches,
-    int num_heads,
-    int num_heads_kv,
-    int head_size,
-    int head_size_v,
-    int q_strideM,
-    int q_strideH,
-    int ke_strideN,
-    int ke_strideH,
-    int ve_strideN,
-    int ve_strideH,
-    int k_strideN,
-    int k_strideH,
-    int v_strideN,
-    int v_strideH,
-    float scaling,
-    float logit_cap,
-    int max_num_reqs,
-    int max_context_len,
-    int max_total_num_tokens,
-    int max_len_extend,
-    int buffer_size_per_thread,
-    bool is_prefix_skipped) {
-  using Vec = at::vec::Vectorized<float>;
-
-  // strides
-  const int o_strideM = num_heads * head_size_v;
-  const int o_strideH = head_size_v;
-
-  // we use same buffer for packed key and value
-  const int ldb_tmp = std::max(head_size, head_size_v);
-
-  const bool has_logit_cap = logit_cap > 0;
-  float rlogit_cap = has_logit_cap ? 1 / logit_cap : 0.f;
-
-  const int num_groups = num_heads / num_heads_kv;
-  TORCH_CHECK(num_groups * num_heads_kv == num_heads);
-
-  // number of blocks along M
-  int MB = div_up(max_len_extend, BLOCK_M);
-
-  // parallel on [batches, num_heads, BM]
-  at::parallel_for(0, batches * num_heads * MB, 0, [&](int begin, int end) {
-    int bs{0}, head_id{0}, mb{0};
-    data_index_init(begin, bs, batches, head_id, num_heads, mb, MB);
-
-    int tid = at::get_thread_num();
-    // s_i and s_delta: [BLOCK_M, BLOCK_N]
-    float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
-    float* __restrict__ s_delta = s_i;
-
-    // v_prime: [BLOCK_M, head_size_v]
-    float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
-
-    // s_delta2: [BLOCK_M, BLOCK_N]; copy of s_delta in scalar_t
-    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(v_prime + BLOCK_N * head_size_v);
-
-    // Btmp: [BLOCK_N, max(head_size, head_size_v)]
-    scalar_t* __restrict__ Btmp = s_delta2 + BLOCK_M * BLOCK_N;
-
-    // init Btmp just once for each thread to prevent NaN
-    fill_stub(Btmp, 0.f, BLOCK_N * ldb_tmp);
-
-    alignas(64) float s_prime[BLOCK_M];
-    alignas(64) float m_prime[BLOCK_M];
-
-    for (int i = begin; i < end; ++i) {
-      // seq_len = prefix + extend
-      int head_kv_id = head_id / num_groups;
-      int seq_len = seq_lens[bs];
-      int seq_len_extend = extend_seq_lens[bs];
-      int seq_len_prefix = seq_len - seq_len_extend;
-      int seq_extend_start_loc = extend_start_loc[bs];
-
-      int req_pool_id = req_pool_indices[bs];
-      TORCH_CHECK(seq_len_prefix >= 0, "prefix len < 0!");
-      TORCH_CHECK(seq_len <= max_context_len, "seq_len out of scope!");
-      TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
-
-      if (is_prefix_skipped) {
-        TORCH_CHECK(seq_len_prefix == 0, "extend attention: expect seq_len_prefix to be 0, got ", seq_len_prefix);
-      }
-
-      // offset and size in MB
-      int m = mb * BLOCK_N;
-      int m_size = std::min(BLOCK_M, seq_len_extend - m);
-
-      if (m_size <= 0) {
-        data_index_step(bs, batches, head_id, num_heads, mb, MB);
-        continue;
-      }
-
-      // get query
-      const scalar_t* __restrict__ q_ptr = q_extend + (seq_extend_start_loc + m) * q_strideM + head_id * q_strideH;
-
-      // init v', s' and m'
-      fill_stub(v_prime, 0.f, m_size * head_size_v);
-      fill_stub(s_prime, 0.f, m_size);
-      fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
-
-      // stage 1: compute scores with prefix
-      for (int n = 0; n < seq_len_prefix; n += BLOCK_N) {
-        int n_size = std::min(BLOCK_N, seq_len_prefix - n);
-
-        // `n_size` is K in 2nd gemm, pad to TILE_K;
-        const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
-
-        // get key and pack
-        pack_vnni<scalar_t, index_t>(
-            /*    dst */ Btmp,
-            /*    src */ k_buffer + head_kv_id * k_strideH,
-            /*    ind */ req_to_token + req_pool_id * max_context_len + n,
-            /*     N  */ n_size,
-            /*     K  */ head_size,
-            /* ld_src */ k_strideN,
-            /* ld_dst */ BLOCK_N);
-
-        // calculate s_i <- Q @ K
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ n_size,
-            /* K     */ head_size,
-            /* lda   */ q_strideM,
-            /* ldb   */ BLOCK_N,
-            /* ldc   */ BLOCK_N,
-            /* add_C */ false,
-            /* A     */ q_ptr,
-            /* B     */ Btmp,
-            /* C     */ s_i);
-
-        const Vec scale_vec = Vec(scaling);
-        for (int row = 0; row < m_size; ++row) {
-          // s_i <- s_i * scale
-          at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // TODO: `tanh` from torch uses sleef u10, going to be slow
-          if (has_logit_cap) {
-            at::vec::map<float>(
-                [logit_cap, rlogit_cap](Vec x) { return Vec(logit_cap) * (x * Vec(rlogit_cap)).tanh(); },
-                s_i + row * BLOCK_N,
-                s_i + row * BLOCK_N,
-                n_size);
-          }
-
-          // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-          m_i = std::max(m_i, m_prime[row]);
-
-          // m_delta <- exp(m' - m_i)
-          float m_delta = std::exp(m_prime[row] - m_i);
-
-          // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // s' <- s' * m_delta + sum(s_delta)
-          s_prime[row] *= m_delta;
-          s_prime[row] +=
-              at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
-
-          m_prime[row] = m_i;
-
-          // v' <- v' * m_delta
-          at::vec::map<float>(
-              [m_delta](Vec x) { return x * Vec(m_delta); },
-              v_prime + row * head_size_v,
-              v_prime + row * head_size_v,
-              head_size_v);
-
-          // pad s_delta with 0 first and then convert to scalar_t
-          fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
-        }
-
-        // get value and pack
-        pack_vnni2<scalar_t, index_t>(
-            /*    dst */ Btmp,
-            /*    src */ v_buffer + head_kv_id * v_strideH,
-            /*    ind */ req_to_token + req_pool_id * max_context_len + n,
-            /*     K  */ n_size,
-            /*     N  */ head_size_v,
-            /* ld_src */ v_strideN,
-            /* ld_dst */ head_size_v);
-
-        // calculate V' <- s_delta @ V + V'
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ head_size_v,
-            /* K     */ padded_n_size,  // n_size
-            /* lda   */ BLOCK_N,
-            /* ldb   */ head_size_v,
-            /* ldc   */ head_size_v,
-            /* add_C */ true,
-            /* A     */ s_delta2,
-            /* B     */ Btmp,
-            /* C     */ v_prime);
-      }  // loop with seq_len_prefix
-
-      // stage 2: compute the triangle part
-      int num_keys = std::min(seq_len_extend, m + BLOCK_M);
-      for (int n = 0; n < num_keys; n += BLOCK_N) {
-        int n_size = std::min(BLOCK_N, num_keys - n);
-
-        // `n_size` is K in 2nd gemm, pad to TILE_K;
-        const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
-
-        // get key and pack
-        pack_vnni<scalar_t, index_t>(
-            /*    dst */ Btmp,
-            /*    src */ k_extend + (seq_extend_start_loc + n) * ke_strideN + head_kv_id * ke_strideH,
-            /*    ind */ nullptr,
-            /*     N  */ n_size,
-            /*     K  */ head_size,
-            /* ld_src */ ke_strideN,
-            /* ld_dst */ BLOCK_N);
-
-        // calculate s_i <- Q @ K
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ n_size,
-            /* K     */ head_size,
-            /* lda   */ q_strideM,
-            /* ldb   */ BLOCK_N,
-            /* ldc   */ BLOCK_N,
-            /* add_C */ false,
-            /* A     */ q_ptr,
-            /* B     */ Btmp,
-            /* C     */ s_i);
-
-        // apply causal mask
-        if (num_keys - n <= BLOCK_N) {
-          for (int row = 0; row < m_size; ++row) {
-            int last_col = m + row - n;
-            // fill [last_col + 1, n_size) to -inf
-            float* row_ptr = s_i + row * BLOCK_N;
-            fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
-          }
-        }
-
-        const Vec scale_vec = Vec(scaling);
-        for (int row = 0; row < m_size; ++row) {
-          // s_i <- s_i * scale
-          at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // TODO: `tanh` from torch uses sleef u10, going to be slow
-          if (has_logit_cap) {
-            at::vec::map<float>(
-                [logit_cap, rlogit_cap](Vec x) { return Vec(logit_cap) * (x * Vec(rlogit_cap)).tanh(); },
-                s_i + row * BLOCK_N,
-                s_i + row * BLOCK_N,
-                n_size);
-          }
-
-          // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-          m_i = std::max(m_i, m_prime[row]);
-
-          // m_delta <- exp(m' - m_i)
-          float m_delta = std::exp(m_prime[row] - m_i);
-
-          // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // s' <- s' * m_delta + sum(s_delta)
-          s_prime[row] *= m_delta;
-          s_prime[row] +=
-              at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
-
-          m_prime[row] = m_i;
-
-          // v' <- v' * m_delta
-          at::vec::map<float>(
-              [m_delta](Vec x) { return x * Vec(m_delta); },
-              v_prime + row * head_size_v,
-              v_prime + row * head_size_v,
-              head_size_v);
-
-          // pad s_delta with 0 first and then convert to scalar_t
-          fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
-        }
-
-        // get value and pack
-        pack_vnni2<scalar_t, index_t>(
-            /*    dst */ Btmp,
-            /*    src */ v_extend + (seq_extend_start_loc + n) * ve_strideN + head_kv_id * ve_strideH,
-            /*    ind */ nullptr,
-            /*     K  */ n_size,
-            /*     N  */ head_size_v,
-            /* ld_src */ ve_strideN,
-            /* ld_dst */ head_size_v);
-
-        // calculate V' <- s_delta @ V + V'
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ head_size_v,
-            /* K     */ padded_n_size,  // n_size
-            /* lda   */ BLOCK_N,
-            /* ldb   */ head_size_v,
-            /* ldc   */ head_size_v,
-            /* add_C */ true,
-            /* A     */ s_delta2,
-            /* B     */ Btmp,
-            /* C     */ v_prime);
-      }  // loop with seq_len_extend
-
-      scalar_t* __restrict__ out_ptr = o_extend + (seq_extend_start_loc + m) * o_strideM + head_id * o_strideH;
-      for (int row = 0; row < m_size; ++row) {
-        float s = 1 / s_prime[row];
-        copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
-      }
-
-      // move to the next index
-      data_index_step(bs, batches, head_id, num_heads, mb, MB);
-    }
-    at::native::cpublas::brgemm_release();
-  });
-}
-
-template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
-void extend_attention_kernel_impl(
-    scalar_t* __restrict__ o_extend,
-    const scalar_t* __restrict__ q_extend,
-    const scalar_t* __restrict__ k_extend,
-    const scalar_t* __restrict__ v_extend,
-    const at::Float8_e4m3fn* __restrict__ k_buffer,
-    const at::Float8_e4m3fn* __restrict__ v_buffer,
+    const kvcache_t* __restrict__ k_buffer,
+    const kvcache_t* __restrict__ v_buffer,
     const float* __restrict__ k_buf_scale,
     const float* __restrict__ v_buf_scale,
     const index_t* __restrict__ req_to_token,
@@ -773,12 +437,12 @@ void extend_attention_kernel_impl(
 
         // get key and pack
         pack_vnni<scalar_t, index_t>(
-            /*    dst  */ Btmp,
-            /*    src  */ k_buffer + head_kv_id * k_strideH,
-            /*src_scale*/ k_buf_scale,
-            /*    ind  */ req_to_token + req_pool_id * max_context_len + n,
-            /*     N   */ n_size,
-            /*     K   */ head_size,
+            /*    dst */ Btmp,
+            /*    src */ k_buffer + head_kv_id * k_strideH,
+            /* src_scale*/ k_buf_scale,
+            /*    ind */ req_to_token + req_pool_id * max_context_len + n,
+            /*     N  */ n_size,
+            /*     K  */ head_size,
             /* ld_src */ k_strideN,
             /* ld_dst */ BLOCK_N);
 
@@ -845,7 +509,7 @@ void extend_attention_kernel_impl(
         pack_vnni2<scalar_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ v_buffer + head_kv_id * v_strideH,
-            /*src_scale*/ v_buf_scale,
+            /* src_scale*/ v_buf_scale,
             /*    ind */ req_to_token + req_pool_id * max_context_len + n,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
@@ -878,6 +542,7 @@ void extend_attention_kernel_impl(
         pack_vnni<scalar_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ k_extend + (seq_extend_start_loc + n) * ke_strideN + head_kv_id * ke_strideH,
+            /* src_scale*/ nullptr,
             /*    ind */ nullptr,
             /*     N  */ n_size,
             /*     K  */ head_size,
@@ -957,6 +622,7 @@ void extend_attention_kernel_impl(
         pack_vnni2<scalar_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ v_extend + (seq_extend_start_loc + n) * ve_strideN + head_kv_id * ve_strideH,
+            /* src_scale*/ nullptr,
             /*    ind */ nullptr,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
@@ -991,6 +657,46 @@ void extend_attention_kernel_impl(
 }
 
 }  // anonymous namespace
+
+#define CALL_EXTEND_ATTENTION_KERNEL_IMPL(scalar_t, kvcache_t, index_t, BLOCK_M, BLOCK_N) \
+  extend_attention_kernel_impl<scalar_t, kvcache_t, index_t, BLOCK_M, BLOCK_N>(           \
+      o_extend.data_ptr<scalar_t>(),                                                      \
+      q_extend.data_ptr<scalar_t>(),                                                      \
+      k_extend.data_ptr<scalar_t>(),                                                      \
+      v_extend.data_ptr<scalar_t>(),                                                      \
+      k_buffer.data_ptr<kvcache_t>(),                                                     \
+      v_buffer.data_ptr<kvcache_t>(),                                                     \
+      k_buf_scale_ptr,                                                                    \
+      v_buf_scale_ptr,                                                                    \
+      req_to_token.data_ptr<index_t>(),                                                   \
+      req_pool_indices.data_ptr<int64_t>(),                                               \
+      seq_lens.data_ptr<int64_t>(),                                                       \
+      extend_seq_lens.data_ptr<index_t>(),                                                \
+      extend_start_loc.data_ptr<index_t>(),                                               \
+      buffer.data_ptr(),                                                                  \
+      num_seqs,                                                                           \
+      num_heads,                                                                          \
+      num_heads_kv,                                                                       \
+      head_size,                                                                          \
+      head_size_v,                                                                        \
+      q_strideM,                                                                          \
+      q_strideH,                                                                          \
+      ke_strideN,                                                                         \
+      ke_strideH,                                                                         \
+      ve_strideN,                                                                         \
+      ve_strideH,                                                                         \
+      k_strideN,                                                                          \
+      k_strideH,                                                                          \
+      v_strideN,                                                                          \
+      v_strideH,                                                                          \
+      sm_scale,                                                                           \
+      logit_cap,                                                                          \
+      max_num_reqs,                                                                       \
+      max_context_len,                                                                    \
+      max_total_num_tokens,                                                               \
+      max_len_extend,                                                                     \
+      size_per_thread,                                                                    \
+      is_prefix_skipped);
 
 // q_extend, k_extend, v_extend, o_extend: contiguous tensors
 // k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
@@ -1116,6 +822,8 @@ void extend_attention_cpu(
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
       auto kv_dtype = k_buffer.scalar_type();
+      float* __restrict__ k_buf_scale_ptr = nullptr;
+      float* __restrict__ v_buf_scale_ptr = nullptr;
       if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
         TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
         TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "float8 scale tensors are required");
@@ -1123,82 +831,11 @@ void extend_attention_cpu(
         at::Tensor v_buf_scale_tensor = v_buf_scale.value();
         TORCH_CHECK(k_buf_scale_tensor.scalar_type() == at::kFloat, "k_buf_scale should be float32");
         TORCH_CHECK(v_buf_scale_tensor.scalar_type() == at::kFloat, "v_buf_scale should be float32");
-
-        extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(
-            o_extend.data_ptr<scalar_t>(),
-            q_extend.data_ptr<scalar_t>(),
-            k_extend.data_ptr<scalar_t>(),
-            v_extend.data_ptr<scalar_t>(),
-            k_buffer.data_ptr<at::Float8_e4m3fn>(),
-            v_buffer.data_ptr<at::Float8_e4m3fn>(),
-            k_buf_scale_tensor.data_ptr<float>(),
-            v_buf_scale_tensor.data_ptr<float>(),
-            req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<int64_t>(),
-            seq_lens.data_ptr<int64_t>(),
-            extend_seq_lens.data_ptr<index_t>(),
-            extend_start_loc.data_ptr<index_t>(),
-            buffer.data_ptr(),
-            num_seqs,
-            num_heads,
-            num_heads_kv,
-            head_size,
-            head_size_v,
-            q_strideM,
-            q_strideH,
-            ke_strideN,
-            ke_strideH,
-            ve_strideN,
-            ve_strideH,
-            k_strideN,
-            k_strideH,
-            v_strideN,
-            v_strideH,
-            sm_scale,
-            logit_cap,
-            max_num_reqs,
-            max_context_len,
-            max_total_num_tokens,
-            max_len_extend,
-            size_per_thread,
-            is_prefix_skipped);
+        k_buf_scale_ptr = k_buf_scale_tensor.data_ptr<float>();
+        v_buf_scale_ptr = v_buf_scale_tensor.data_ptr<float>();
+        CALL_EXTEND_ATTENTION_KERNEL_IMPL(scalar_t, at::Float8_e4m3fn, index_t, BLOCK_M, BLOCK_N)
       } else {
-        extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(
-            o_extend.data_ptr<scalar_t>(),
-            q_extend.data_ptr<scalar_t>(),
-            k_extend.data_ptr<scalar_t>(),
-            v_extend.data_ptr<scalar_t>(),
-            k_buffer.data_ptr<scalar_t>(),
-            v_buffer.data_ptr<scalar_t>(),
-            req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<int64_t>(),
-            seq_lens.data_ptr<int64_t>(),
-            extend_seq_lens.data_ptr<index_t>(),
-            extend_start_loc.data_ptr<index_t>(),
-            buffer.data_ptr(),
-            num_seqs,
-            num_heads,
-            num_heads_kv,
-            head_size,
-            head_size_v,
-            q_strideM,
-            q_strideH,
-            ke_strideN,
-            ke_strideH,
-            ve_strideN,
-            ve_strideH,
-            k_strideN,
-            k_strideH,
-            v_strideN,
-            v_strideH,
-            sm_scale,
-            logit_cap,
-            max_num_reqs,
-            max_context_len,
-            max_total_num_tokens,
-            max_len_extend,
-            size_per_thread,
-            is_prefix_skipped);
+        CALL_EXTEND_ATTENTION_KERNEL_IMPL(scalar_t, scalar_t, index_t, BLOCK_M, BLOCK_N)
       }
     });
   });
