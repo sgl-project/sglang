@@ -192,7 +192,7 @@ class MambaPool:
                 )
                 for conv_shape in conv_state_shape
             ]
-  
+
             if _is_cpu and _cpu_has_amx_support:
                 conv_state = conv_state.as_strided_(
                     conv_state.size(),
