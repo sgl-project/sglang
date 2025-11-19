@@ -270,7 +270,13 @@ class SchedulerOutputProcessorMixin:
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
         for i, req in enumerate(batch.reqs):
+            req.kv_committed_len += accept_lens[i]
+            req.kv_allocate_offset = (
+                accept_lens[i] - EagleDraftInput.ALLOC_LEN_PER_DECODE
+            )
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )

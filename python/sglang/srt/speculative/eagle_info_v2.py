@@ -89,49 +89,53 @@ class EagleDraftInputV2Mixin:
         batch.maybe_wait_verify_done()
 
         page_size = batch.token_to_kv_pool_allocator.page_size
+        cur_kv_allocated_len = []
+        nxt_kv_allocated_len = []
+        num_needed_tokens = 0
+        for r in batch.reqs:
+            x = self.ALLOC_LEN_PER_DECODE + r.kv_allocate_offset
+            cur_kv_allocated_len.append(r.kv_allocated_len)
+            nxt_kv_allocated_len.append(r.kv_allocated_len + x)
+            num_needed_tokens += x
+            r.kv_allocated_len += x
+
+        alloc_prev_lens_cpu = torch.tensor(
+            cur_kv_allocated_len, dtype=torch.int32, device="cpu"
+        )
+        alloc_next_lens_cpu = torch.tensor(
+            nxt_kv_allocated_len, dtype=torch.int32, device="cpu"
+        )
 
         if page_size == 1:
-            new_allocate_lens = batch.seq_lens + self.ALLOC_LEN_PER_DECODE
-            num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
-                self.allocate_lens,
+                cur_kv_allocated_len,
             )
-            new_allocate_lens = batch.seq_lens + self.ALLOC_LEN_PER_DECODE
-            new_allocate_lens_cpu = new_allocate_lens.cpu()
-            allocate_lens_cpu = self.allocate_lens.cpu()
-            extend_num_tokens = sum(new_allocate_lens_cpu - allocate_lens_cpu).item()
             out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
-                self.allocate_lens,
-                allocate_lens_cpu,
-                new_allocate_lens,
-                new_allocate_lens_cpu,
+                alloc_prev_lens_cpu.to(device=batch.device),
+                alloc_prev_lens_cpu,
+                alloc_next_lens_cpu.to(device=batch.device),
+                alloc_next_lens_cpu,
                 last_loc,
-                extend_num_tokens,
+                num_needed_tokens,
             )
 
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            self.allocate_lens,
-            new_allocate_lens,
+            alloc_prev_lens_cpu.to(device=batch.device),
+            alloc_next_lens_cpu.to(device=batch.device),
             out_cache_loc,
             bs,
         )
 
-        self.allocate_lens = new_allocate_lens
-
         # FIXME(lsyin): make this sync optional
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
-
-        for i, req in enumerate(batch.reqs):
-            req.kv_committed_len = batch.seq_lens_cpu[i].item()
-            req.kv_allocated_len = req.kv_committed_len + self.ALLOC_LEN_PER_DECODE
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,
