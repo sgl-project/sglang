@@ -18,6 +18,10 @@ if ENABLE_JIT_DEEPGEMM:
 _ENABLE_MM_DEEPGEMM = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
 )
+# If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
+_ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0"
+)
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
 )
@@ -241,7 +245,15 @@ def _matmul_persistent_deepgemm(
     dtype = a.dtype
     out = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    deep_gemm.bf16_gemm_nn(a, b, out)
+    try:
+        deep_gemm.bf16_gemm_nn(a, b, out)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"DeepGEMM failed for matrix shapes M={M}, N={N}, K={K}. "
+            f"This typically occurs when dimensions are too small for DeepGEMM's TMA descriptors. "
+            f"Consider increasing MIN_DEEPGEMM_DIM in matmul_persistent() or disabling DeepGEMM "
+            f"for small matrices. Original error: {e}"
+        ) from e
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -253,6 +265,11 @@ def _matmul_persistent_deepgemm(
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
+    K, N = b.shape
+
+    # DeepGEMM has minimum dimension requirements for TMA descriptors
+    MIN_DEEPGEMM_DIM = 16
+
     if (
         _ENABLE_MM_DEEPGEMM
         and ENABLE_JIT_DEEPGEMM
@@ -260,6 +277,7 @@ def matmul_persistent(
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
+        and N >= MIN_DEEPGEMM_DIM
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
@@ -277,6 +295,9 @@ def matmul_persistent(
             return out_deepgemm
 
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+
+    if _ENABLE_MM_FALLBACK_VARIANT:
+        return torch.einsum("ik,kj->ij", a, b)
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 

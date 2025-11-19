@@ -553,7 +553,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer_id = kwargs["layer_id"]
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = layer_cache.conv
+        conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -636,12 +636,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = self.forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = mamba_cache_params.conv
+        conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
+            intermediate_conv_window_cache = (
+                mamba_cache_params.intermediate_conv_window[0]
+            )
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
@@ -981,10 +983,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv
+        conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
+        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
         # SSM state updates (chunked to reduce peak memory)
         valid_mask = accepted_indices >= 0
