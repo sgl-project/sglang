@@ -2022,13 +2022,13 @@ class ServerArgs:
             "--diffusion-algorithm",
             type=str,
             default=ServerArgs.diffusion_algorithm,
-            help="The diffusion algorithm."
+            help="The diffusion algorithm.",
         )
         parser.add_argument(
             "--diffusion-block-size",
             type=int,
             default=ServerArgs.diffusion_block_size,
-            help="The number of tokens processed in each iteration of the block diffusion model."
+            help="The number of tokens processed in each iteration of the block diffusion model.",
         )
 
         # HTTP server

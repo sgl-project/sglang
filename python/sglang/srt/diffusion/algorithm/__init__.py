@@ -11,8 +11,7 @@ def import_algorithms():
     mapping = {}
     package_name = "sglang.srt.diffusion.algorithm"
     package = importlib.import_module(package_name)
-    for _, name, ispkg in pkgutil.iter_modules(package.__path__,
-                                               package_name + "."):
+    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if ispkg:
             continue
         try:
@@ -34,7 +33,7 @@ def get_algorithm(config: DiffusionConfig):
         name = config.algorithm
         return algo_name_to_cls[name](config)
     except:
-        raise RuntimeError(f"Unkown diffusion algorithm: {name}")
+        raise RuntimeError(f"Unknown diffusion algorithm: {name}")
 
 
 algo_name_to_cls = import_algorithms()

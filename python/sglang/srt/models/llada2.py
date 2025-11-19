@@ -579,12 +579,8 @@ class LLaDA2MoeBlock(nn.Module):
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
-        self.is_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id
-        )
-        is_previous_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id - 1
-        )
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
+        is_previous_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id - 1)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -626,9 +622,7 @@ class LLaDA2MoeBlock(nn.Module):
             allow_reduce_scatter=True,
         )
 
-    def _is_layer_sparse(
-        self, config: PretrainedConfig, layer_id: int
-    ) -> bool:
+    def _is_layer_sparse(self, config: PretrainedConfig, layer_id: int) -> bool:
         return (
             config.num_experts is not None and layer_id >= config.first_k_dense_replace
         )

@@ -102,6 +102,7 @@ class LogitsProcessorOutput:
     ## Part 4: Diffusion-only.
     full_logits: Optional[torch.Tensor] = None
 
+
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
@@ -499,9 +500,11 @@ class LogitsProcessor(nn.Module):
                 input_logprob_indices, device=pruned_states.device, dtype=torch.int64
             )
 
-        full_logits = self._get_logits(
-            hidden_states, lm_head,
-            logits_metadata) if self.return_full_logits else None
+        full_logits = (
+            self._get_logits(hidden_states, lm_head, logits_metadata)
+            if self.return_full_logits
+            else None
+        )
 
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():

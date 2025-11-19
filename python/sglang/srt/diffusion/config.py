@@ -1,6 +1,7 @@
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
+
 class DiffusionConfig:
     def __init__(
         self,
@@ -28,7 +29,9 @@ class DiffusionConfig:
         if config.hf_config.architectures[0] == "LLaDA2MoeModelLM":
             mask_id = 156895
         else:
-            raise RuntimeError(f"Unkown diffusion model: {config.hf_config.architectures[0]}")
+            raise RuntimeError(
+                f"Unknown diffusion model: {config.hf_config.architectures[0]}"
+            )
 
         return DiffusionConfig(
             algorithm=server_args.diffusion_algorithm,

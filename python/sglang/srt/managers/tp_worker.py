@@ -236,8 +236,7 @@ class TpModelWorker(BaseTpWorker):
         )
 
         if server_args.diffusion_algorithm is not None:
-            self.diffusion_algorithm = DiffusionAlgorithm.from_server_args(
-                server_args)
+            self.diffusion_algorithm = DiffusionAlgorithm.from_server_args(server_args)
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
@@ -377,8 +376,9 @@ class TpModelWorker(BaseTpWorker):
 
         if self.pp_group.is_last_rank:
             if self.is_diffusion():
-                logits_output, next_token_ids, can_run_cuda_graph = self.diffusion_algorithm.run(
-                    self.model_runner, forward_batch)
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    self.diffusion_algorithm.run(self.model_runner, forward_batch)
+                )
                 return GenerationBatchResult(
                     logits_output=logits_output,
                     next_token_ids=next_token_ids,

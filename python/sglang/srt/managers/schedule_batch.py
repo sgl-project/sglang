@@ -762,13 +762,18 @@ class Req:
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_diffusion():
             if not self.fill_ids:
-                self.diffusion_ids = self.origin_input_ids + [
-                    self.diffusion_config.mask_id,
-                ] * self.diffusion_config.block_size
+                self.diffusion_ids = (
+                    self.origin_input_ids
+                    + [
+                        self.diffusion_config.mask_id,
+                    ]
+                    * self.diffusion_config.block_size
+                )
             else:
                 self.diffusion_block_offset += self.diffusion_config.block_size
-                self.diffusion_ids += [self.diffusion_config.mask_id
-                                       ] * self.diffusion_config.block_size
+                self.diffusion_ids += [
+                    self.diffusion_config.mask_id
+                ] * self.diffusion_config.block_size
             self.fill_ids = self.diffusion_ids
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
