@@ -89,8 +89,6 @@ class TransferInfo:
             dst_aux_index = -1
 
         dst_state_indices: List[int] = []
-        if len(payload) > 6 and payload[6]:
-            dst_state_indices = list(np.frombuffer(payload[6], dtype=np.int32))
 
         required_dst_info_num = (
             int(payload[7].decode("ascii")) if len(payload) > 7 else 1
@@ -477,21 +475,24 @@ class MoriKVManager(CommonKVManager):
         src_groups: List[List[int]],
         dst_groups: List[List[int]],
     ) -> List["mori_cpp.TransferStatus"]:
-        statuses = []
-        for src_group, dst_group in zip(src_groups, dst_groups):
-            local_offset = int(src_group[0]) * kv_item_len
-            remote_offset = int(dst_group[0]) * kv_item_len
-            size = len(src_group) * kv_item_len
-            transfer_uid = self.engine.allocate_transfer_uid()
-            status = self.engine.write(
-                src_desc,
-                local_offset,
-                dst_desc,
-                remote_offset,
-                size,
-                transfer_uid,
-            )
-            statuses.append(status)
+        if not src_groups:
+            return []
+        
+        local_mems = [src_desc] * len(src_groups)
+        remote_mems = [dst_desc] * len(src_groups)
+        local_offsets_list = [[int(src_group[0]) * kv_item_len] for src_group in src_groups]
+        remote_offsets_list = [[int(dst_group[0]) * kv_item_len] for dst_group in dst_groups]
+        sizes_list = [[len(src_group) * kv_item_len] for src_group in src_groups]
+        transfer_uids = [self.engine.allocate_transfer_uid() for _ in src_groups]
+        
+        statuses = self.engine.batch_write(
+            local_mems,
+            local_offsets_list,
+            remote_mems,
+            remote_offsets_list,
+            sizes_list,
+            transfer_uids,
+        )
         return statuses
 
     def send_kvcache(
@@ -557,65 +558,24 @@ class MoriKVManager(CommonKVManager):
         prefill_aux_index: int,
         dst_aux_index: int,
     ) -> List["mori_cpp.TransferStatus"]:
-        statuses = []
-        for src_desc, dst_desc, length in zip(
-            self.aux_mem_descs,
-            peer_info.dst_aux_mem_descs,
-            self.kv_args.aux_item_lens,
-        ):
-            local_offset = prefill_aux_index * length
-            remote_offset = dst_aux_index * length
-            transfer_uid = self.engine.allocate_transfer_uid()
-            status = self.engine.write(
-                src_desc,
-                local_offset,
-                dst_desc,
-                remote_offset,
-                length,
-                transfer_uid,
-            )
-            statuses.append(status)
-        return statuses
-
-    def send_state(
-        self,
-        peer_info: KVArgsRegisterInfo,
-        prefill_state_indices: Optional[npt.NDArray[np.int32]],
-        dst_state_indices: Optional[List[int]],
-    ) -> List["mori_cpp.TransferStatus"]:
-        if (
-            prefill_state_indices is None
-            or dst_state_indices is None
-            or not len(dst_state_indices)
-            or not self.state_mem_descs
-            or not peer_info.dst_state_mem_descs
-        ):
+        if not self.aux_mem_descs:
             return []
-
-        src_indices = np.asarray(prefill_state_indices, dtype=np.int32).flatten()
-        dst_indices = np.asarray(dst_state_indices, dtype=np.int32).flatten()
-        if src_indices.size != dst_indices.size:
-            raise ValueError("State indices from prefill and decode must match in size")
-
-        statuses: List["mori_cpp.TransferStatus"] = []
-        for src_desc, dst_desc, length in zip(
-            self.state_mem_descs,
-            peer_info.dst_state_mem_descs,
-            self.kv_args.state_item_lens,
-        ):
-            for src_idx, dst_idx in zip(src_indices, dst_indices):
-                local_offset = int(src_idx) * length
-                remote_offset = int(dst_idx) * length
-                transfer_uid = self.engine.allocate_transfer_uid()
-                status = self.engine.write(
-                    src_desc,
-                    local_offset,
-                    dst_desc,
-                    remote_offset,
-                    length,
-                    transfer_uid,
-                )
-                statuses.append(status)
+        
+        local_mems = self.aux_mem_descs
+        remote_mems = peer_info.dst_aux_mem_descs
+        local_offsets_list = [[prefill_aux_index * length] for length in self.kv_args.aux_item_lens]
+        remote_offsets_list = [[dst_aux_index * length] for length in self.kv_args.aux_item_lens]
+        sizes_list = [[length] for length in self.kv_args.aux_item_lens]
+        transfer_uids = [self.engine.allocate_transfer_uid() for _ in self.aux_mem_descs]
+        
+        statuses = self.engine.batch_write(
+            local_mems,
+            local_offsets_list,
+            remote_mems,
+            remote_offsets_list,
+            sizes_list,
+            transfer_uids,
+        )
         return statuses
 
     def add_transfer_request(
@@ -653,17 +613,6 @@ class MoriKVManager(CommonKVManager):
                         peer_info, kv_indices, dst_indices_chunk
                     )
                     result_statuses.extend(statuses)
-                    if (
-                        is_last
-                        and state_indices is not None
-                        and info.dst_state_indices
-                        and self.pp_group.is_last_rank
-                    ):
-                        result_statuses.extend(
-                            self.send_state(
-                                peer_info, state_indices, info.dst_state_indices
-                            )
-                        )
                 if (
                     is_last
                     and aux_index is not None
@@ -705,18 +654,13 @@ class MoriKVSender(CommonKVSender):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
-        state_array = (
-            np.asarray(state_indices, dtype=np.int32)
-            if state_indices is not None
-            else None
-        )
+
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
             index_slice,
             is_last,
             aux_index=self.aux_index if is_last else None,
-            state_indices=state_array,
         )
         self.transfer_statuses.extend(statuses)
         if infos is not None:
@@ -884,11 +828,7 @@ class MoriKVReceiver(CommonKVReceiver):
             np.asarray(kv_indices, dtype=np.int32).tobytes() if kv_indices.size else b""
         )
         aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
-        state_bytes = (
-            np.asarray(state_indices, dtype=np.int32).tobytes()
-            if state_indices is not None
-            else b""
-        )
+        state_bytes = b""
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -903,7 +843,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         self.kv_mgr.engine_desc.key.encode("ascii"),
                         kv_indices_bytes if not is_dummy else b"",
                         aux_bytes if not is_dummy else b"",
-                        state_bytes if (state_bytes and not is_dummy) else b"",
+                        state_bytes,
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )
