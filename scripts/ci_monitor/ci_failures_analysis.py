@@ -1331,11 +1331,11 @@ class SGLangFailuresAnalyzer:
                         else:
                             last_failure_str = "N/A"
 
-                        # Format top errors - don't truncate
+                        # Format top errors as bullet list
                         top_errors = alert.get("top_error_signatures", [])
                         if top_errors:
-                            error_str = ", ".join(
-                                [f"{err[0]} ({err[1]})" for err in top_errors]
+                            error_str = "<br>".join(
+                                [f"• {err[0]} ({err[1]})" for err in top_errors]
                             )
                         else:
                             error_str = "N/A"
@@ -1384,13 +1384,15 @@ class SGLangFailuresAnalyzer:
                         if len(runner_name) > 28:
                             runner_name = runner_name[:25] + "..."
 
-                        # Get all failed jobs - don't truncate
+                        # Get all failed jobs as bullet list
                         jobs_failed = alert.get("jobs_failed", {})
                         top_jobs = sorted(
                             jobs_failed.items(), key=lambda x: x[1], reverse=True
                         )
                         jobs_str = (
-                            ", ".join([f"{job} ({count})" for job, count in top_jobs])
+                            "<br>".join(
+                                [f"• {job} ({count})" for job, count in top_jobs]
+                            )
                             if top_jobs
                             else "N/A"
                         )
@@ -1413,11 +1415,11 @@ class SGLangFailuresAnalyzer:
                         else:
                             last_failure_str = "N/A"
 
-                        # Format top errors - don't truncate
+                        # Format top errors as bullet list
                         top_errors = alert.get("top_error_signatures", [])
                         if top_errors:
-                            error_str = ", ".join(
-                                [f"{err[0]} ({err[1]})" for err in top_errors]
+                            error_str = "<br>".join(
+                                [f"• {err[0]} ({err[1]})" for err in top_errors]
                             )
                         else:
                             error_str = "N/A"
