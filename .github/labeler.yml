@@ -26,7 +26,7 @@ dependencies:
       - '**/requirements*.txt'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
-      - '**/pyproject.toml'
+      - '**/pyproject*.toml'
       - '**/setup.py'
       - '**/poetry.lock'
       - '**/package.json'
@@ -36,31 +36,27 @@ dependencies:
 Multi-modal:
   - changed-files:
     - any-glob-to-any-file:
-      - '**/vision/**/*'
-      - '**/multimodal/**/*'
-      - '**/vlm/**/*'
+      - '**/*multimodal*'
+      - '**/*vision*'
+      - '**/*vlm*'
 
 # LoRA
 lora:
   - changed-files:
     - any-glob-to-any-file:
-      - '**/lora/**/*'
       - '**/*lora*'
 
 # Quantization
 quant:
   - changed-files:
     - any-glob-to-any-file:
-      - '**/quant/**/*'
       - '**/*quant*'
-      - '**/awq/**/*'
-      - '**/gptq/**/*'
+      - '**/*quantization*'
 
 # Speculative decoding
 speculative-decoding:
   - changed-files:
     - any-glob-to-any-file:
-      - '**/speculative/**/*'
       - '**/*speculative*'
 
 # AMD specific
@@ -69,6 +65,13 @@ amd:
     - any-glob-to-any-file:
       - '**/*amd*'
       - '**/*rocm*'
+
+# NPU specific
+npu:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*npu*'
+      - '**/*ascend*'
 
 # DeepSeek specific
 deepseek:
@@ -80,5 +83,4 @@ deepseek:
 hicache:
   - changed-files:
     - any-glob-to-any-file:
-      - '**/hicache/**/*'
       - '**/*hicache*'
