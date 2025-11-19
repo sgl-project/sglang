@@ -78,7 +78,7 @@ LOAD_FORMAT_CHOICES = [
     "gguf",
     "bitsandbytes",
     "layered",
-    "quantized_rl",
+    "flash_rl",
     "remote",
     "remote_instance",
 ]
@@ -234,9 +234,9 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
-    quant_profile_path: Optional[str] = None  # For quantized_rl load format
-    quantized_rl_model: Optional[str] = (
-        None  # Pre-quantized model for quantized_rl initial load
+    quant_profile_path: Optional[str] = None  # For flash_rl load format
+    flash_rl_model: Optional[str] = (
+        None  # Pre-quantized model for flash_rl initial load
     )
     trust_remote_code: bool = False
     context_length: Optional[int] = None
@@ -2028,7 +2028,7 @@ class ServerArgs:
             "--quant-profile-path",
             type=str,
             default=ServerArgs.quant_profile_path,
-            help="Path to the FlashRL quantization profile. Required when using --load-format quantized_rl.",
+            help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
         )
         parser.add_argument(
             "--trust-remote-code",

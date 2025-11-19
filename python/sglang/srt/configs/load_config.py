@@ -23,7 +23,7 @@ class LoadFormat(str, enum.Enum):
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
-    QUANTIZED_RL = "quantized_rl"  # For RL training with quantized models
+    FLASH_RL = "flash_rl"  # For RL training with quantized models
     JAX = "jax"
     REMOTE = "remote"
     REMOTE_INSTANCE = "remote_instance"
@@ -47,7 +47,7 @@ class LoadConfig:
         "dummy" will initialize the weights with random values, which is
             mainly for profiling.
         "bitsandbytes" will load nf4 type weights.
-        "quantized_rl" will load weights with support for RL training
+        "flash_rl" will load weights with support for RL training
             with quantized models, enabling efficient weight reloading.
     ignore_patterns: The list of patterns to ignore when loading the model.
         Default to "original/**/*" to avoid repeated loading of llama's

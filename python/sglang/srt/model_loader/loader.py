@@ -707,7 +707,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
       4. Use torch.as_strided to preserve memory locations across reloads
 
     Usage:
-      --model-path Qwen/Qwen2.5-7B --quantization fp8 --load-format quantized_rl
+      --model-path Qwen/Qwen2.5-7B --quantization fp8 --load-format flash_rl
 
     Key features:
       - Profile-free FP8 quantization (no calibration needed)
@@ -824,7 +824,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
-        model.quantized_rl_initial_load_complete = True
+        model.flash_rl_initial_load_complete = True
         self._initial_load_complete = True
         logger.info("[QuantizedRL] Initial load complete")
 
@@ -834,7 +834,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         return (
             hasattr(model, "original_weights_rebuild_keys")
             and hasattr(model, "recorded_loader")
-            and getattr(model, "quantized_rl_initial_load_complete", False)
+            and getattr(model, "flash_rl_initial_load_complete", False)
         )
 
     @staticmethod
@@ -2542,9 +2542,9 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
 
-    # Check for QUANTIZED_RL format early
+    # Check for FLASH_RL format early
     # FP8 approach: BF16/FP16 model with native FP8 quantization
-    if load_config.load_format == LoadFormat.QUANTIZED_RL:
+    if load_config.load_format == LoadFormat.FLASH_RL:
         logger.info(
             "Using QuantizedRLModelLoader for RL training with native FP8 quantization."
         )
