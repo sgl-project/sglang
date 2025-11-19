@@ -317,9 +317,7 @@ class PerformanceValidator:
         )
 
     def validate(
-        self,
-        perf_record: dict,
-        stage_metrics: dict,
+        self, perf_record: dict, stage_metrics: dict, **kwargs
     ) -> PerformanceSummary:
         """Validate all performance metrics and return summary."""
         summary = self.collect_metrics(perf_record, stage_metrics)
