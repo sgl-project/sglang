@@ -79,7 +79,7 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-ascend-npu
+          python3 run_suite.py --suite per-commit-1-npu-a2
 
   per-commit-2-npu-a2:
     needs: [check-changes]
@@ -122,7 +122,7 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-ascend-npu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
+          python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   per-commit-4-npu-a2:
     needs: [check-changes]
@@ -161,7 +161,7 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600
+          python3 run_suite.py --suite per-commit-4-npu-a2 --timeout-per-file 3600
 
   per-commit-16-npu-a3:
     needs: [check-changes]
@@ -204,4 +204,4 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
