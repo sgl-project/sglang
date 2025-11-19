@@ -953,7 +953,9 @@ class SGLangCIAnalyzer:
         try:
             github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if not github_step_summary:
-                print("Not running in GitHub Actions, skipping nightly summary generation")
+                print(
+                    "Not running in GitHub Actions, skipping nightly summary generation"
+                )
                 return
 
             print("Generating GitHub Actions summary for Nightly Analysis...")
@@ -961,7 +963,9 @@ class SGLangCIAnalyzer:
             summary_lines = []
             summary_lines.append("# Nightly Test Monitor Report")
             summary_lines.append("")
-            summary_lines.append(f"**Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            summary_lines.append(
+                f"**Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
             summary_lines.append("")
 
             # Overall statistics
