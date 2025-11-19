@@ -26,7 +26,10 @@ import tqdm
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
-from sglang.srt.compilation.piecewise_context_manager import set_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    enable_piecewise_cuda_graph,
+    set_forward_context,
+)
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -54,22 +57,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-_in_piecewise_cuda_graph = False
-
-
-def is_in_piecewise_cuda_graph():
-    return _in_piecewise_cuda_graph
-
-
-@contextmanager
-def enable_piecewise_cuda_graph():
-    global _in_piecewise_cuda_graph
-    _in_piecewise_cuda_graph = True
-
-    yield
-
-    _in_piecewise_cuda_graph = False
 
 
 @contextmanager

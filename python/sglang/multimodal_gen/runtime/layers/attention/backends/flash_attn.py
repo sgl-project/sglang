@@ -28,6 +28,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+fa_ver = 3
+
+
+def set_fa_ver(ver: int):
+    global fa_ver
+    fa_ver = ver
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -128,5 +135,6 @@ class FlashAttentionImpl(AttentionImpl):
             softmax_scale=self.softmax_scale,
             causal=self.causal,
             return_softmax_lse=return_softmax_lse,
+            ver=fa_ver,
         )
         return output
