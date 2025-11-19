@@ -9,7 +9,6 @@ adjusted to match the structure and interface of `cuda.py`.
 
 import torch
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -127,7 +126,9 @@ class RocmPlatform(Platform):
 
         logger.info("Using AITER backend.")
 
-        return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+        )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

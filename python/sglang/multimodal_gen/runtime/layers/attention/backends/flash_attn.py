@@ -7,16 +7,8 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.utils.common import is_cuda
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
-
-from sglang.multimodal_gen.runtime.utils.common import (
-        get_bool_env_var,
-        is_cpu,
-        is_cuda,
-        is_hip,
-        is_npu,
-        is_xpu,
-        )
 
 _is_cuda = is_cuda()
 
