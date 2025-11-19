@@ -908,13 +908,13 @@ class SGLangFailuresAnalyzer:
             filtered_job_alerts = [a for a in job_alerts if a["current_streak"] >= 2]
 
             if filtered_job_alerts:
-                print("\n" + "=" * 200)
+                print("\n" + "=" * 150)
                 print("## ALERTS: Critical Consecutive Job Failures")
-                print("=" * 200)
+                print("=" * 150)
                 print(
-                    f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First Failure':<16} {'Last Failure':<16} {'Top Errors':<60} {'First Link':<50}"
+                    f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First Failure':<16} {'Last Failure':<16} {'Top Errors':<60}"
                 )
-                print("-" * 200)
+                print("-" * 150)
 
                 for alert in sorted(
                     filtered_job_alerts, key=lambda x: x["current_streak"], reverse=True
@@ -930,29 +930,23 @@ class SGLangFailuresAnalyzer:
                         if first_failure
                         else "N/A"
                     )
-                    first_failure_link = first_failure["url"] if first_failure else ""
 
                     last_failure = alert.get("last_failure")
                     last_failure_str = (
                         f"Run #{last_failure['run_number']}" if last_failure else "N/A"
                     )
 
-                    # Format top errors
+                    # Format top errors - don't truncate
                     top_errors = alert.get("top_error_signatures", [])
                     if top_errors:
-                        error_str = ", ".join(
-                            [f"{err[0]} ({err[1]})" for err in top_errors[:2]]
-                        )
-                        error_display = (
-                            error_str
-                            if len(error_str) <= 58
-                            else error_str[:55] + "..."
+                        error_display = ", ".join(
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
                         )
                     else:
                         error_display = "N/A"
 
                     print(
-                        f"{display_name:<40} {alert['current_streak']:<8} {alert['max_streak']:<6} {first_failure_str:<16} {last_failure_str:<16} {error_display:<60} {first_failure_link:<50}"
+                        f"{display_name:<40} {alert['current_streak']:<8} {alert['max_streak']:<6} {first_failure_str:<16} {last_failure_str:<16} {error_display:<60}"
                     )
             else:
                 print("\n" + "=" * 100)
@@ -973,14 +967,14 @@ class SGLangFailuresAnalyzer:
             ]
 
             if instance_alerts:
-                print("\n" + "=" * 220)
+                print("\n" + "=" * 170)
                 print("## ALERTS: Runners with Issues")
-                print("=" * 220)
+                print("=" * 170)
                 print("\n### Runner Consecutive Failures")
                 print(
-                    f"\n{'Runner':<30} {'Str':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'First':<13} {'Last':<13} {'Top Errors':<45} {'Jobs Failed':<40} {'Link':<50}"
+                    f"\n{'Runner':<30} {'Str':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'First':<13} {'Last':<13} {'Top Errors':<45} {'Jobs Failed':<40}"
                 )
-                print("-" * 220)
+                print("-" * 170)
 
                 for alert in sorted(
                     instance_alerts,
@@ -995,18 +989,15 @@ class SGLangFailuresAnalyzer:
                         else runner_name[:25] + "..."
                     )
 
-                    # Get top 3 failed jobs
+                    # Get all failed jobs - don't truncate
                     jobs_failed = alert.get("jobs_failed", {})
                     top_jobs = sorted(
                         jobs_failed.items(), key=lambda x: x[1], reverse=True
-                    )[:3]
-                    jobs_str = (
+                    )
+                    jobs_display = (
                         ", ".join([f"{job} ({count})" for job, count in top_jobs])
                         if top_jobs
                         else "N/A"
-                    )
-                    jobs_display = (
-                        jobs_str if len(jobs_str) <= 38 else jobs_str[:35] + "..."
                     )
 
                     # Format queue time
@@ -1019,29 +1010,23 @@ class SGLangFailuresAnalyzer:
                         if first_failure
                         else "N/A"
                     )
-                    first_failure_link = first_failure["url"] if first_failure else ""
 
                     last_failure = alert.get("last_failure")
                     last_failure_str = (
                         f"Run #{last_failure['run_number']}" if last_failure else "N/A"
                     )
 
-                    # Format top errors
+                    # Format top errors - don't truncate
                     top_errors = alert.get("top_error_signatures", [])
                     if top_errors:
-                        error_str = ", ".join(
-                            [f"{err[0]} ({err[1]})" for err in top_errors[:2]]
-                        )
-                        error_display = (
-                            error_str
-                            if len(error_str) <= 43
-                            else error_str[:40] + "..."
+                        error_display = ", ".join(
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
                         )
                     else:
                         error_display = "N/A"
 
                     print(
-                        f"{display_name:<30} {alert['current_streak']:<5} {alert['max_streak']:<5} {alert['failure_rate']:>5.1f}% {avg_queue_str:<7} {first_failure_str:<13} {last_failure_str:<13} {error_display:<45} {jobs_display:<40} {first_failure_link:<50}"
+                        f"{display_name:<30} {alert['current_streak']:<5} {alert['max_streak']:<5} {alert['failure_rate']:>5.1f}% {avg_queue_str:<7} {first_failure_str:<13} {last_failure_str:<13} {error_display:<45} {jobs_display:<40}"
                     )
             else:
                 print("\n" + "=" * 100)
@@ -1057,13 +1042,13 @@ class SGLangFailuresAnalyzer:
         ]
 
         if broken_jobs:
-            print("\n" + "=" * 200)
+            print("\n" + "=" * 150)
             print("## Section 1: Top 15 Consecutively Failing Jobs")
-            print("=" * 200)
+            print("=" * 150)
             print(
-                f"\n{'Rank':<6} {'Job Name':<40} {'Streak':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Top Errors':<50} {'First Link':<50}"
+                f"\n{'Rank':<6} {'Job Name':<40} {'Streak':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Top Errors':<50}"
             )
-            print("-" * 200)
+            print("-" * 150)
             for i, (job_name, data) in enumerate(broken_jobs[:20], 1):
                 display_name = (
                     job_name if len(job_name) <= 38 else job_name[:35] + "..."
@@ -1074,27 +1059,23 @@ class SGLangFailuresAnalyzer:
                 first_failure_str = (
                     f"Run #{first_failure['run_number']}" if first_failure else "N/A"
                 )
-                first_failure_link = first_failure["url"] if first_failure else ""
 
                 last_failure = data.get("last_failure_in_streak")
                 last_failure_str = (
                     f"Run #{last_failure['run_number']}" if last_failure else "N/A"
                 )
 
-                # Format top errors
+                # Format top errors - don't truncate
                 top_errors = data.get("top_error_signatures", [])
                 if top_errors:
-                    error_str = ", ".join(
-                        [f"{err[0]} ({err[1]})" for err in top_errors[:2]]
-                    )
-                    error_display = (
-                        error_str if len(error_str) <= 48 else error_str[:45] + "..."
+                    error_display = ", ".join(
+                        [f"{err[0]} ({err[1]})" for err in top_errors]
                     )
                 else:
                     error_display = "N/A"
 
                 print(
-                    f"{i:<6} {display_name:<40} {data['current_streak']:<8} {data['max_streak']:<6} {first_failure_str:<13} {last_failure_str:<13} {error_display:<50} {first_failure_link:<50}"
+                    f"{i:<6} {display_name:<40} {data['current_streak']:<8} {data['max_streak']:<6} {first_failure_str:<13} {last_failure_str:<13} {error_display:<50}"
                 )
 
         # Section 2: Runner Health Analysis - Use machine names from runner instances (streak >= 2)
@@ -1136,13 +1117,13 @@ class SGLangFailuresAnalyzer:
             ]
 
             if runners_with_issues:
-                print("\n" + "=" * 220)
+                print("\n" + "=" * 170)
                 print("## Section 2: Top 15 Workers by Consecutive Failures")
-                print("=" * 220)
+                print("=" * 170)
                 print(
-                    f"\n{'Rank':<6} {'Machine Name':<30} {'Str':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'First':<13} {'Last':<13} {'Top Errors':<45} {'Total':<7} {'Unique':<8} {'Link':<50}"
+                    f"\n{'Rank':<6} {'Machine Name':<30} {'Str':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'First':<13} {'Last':<13} {'Top Errors':<45} {'Total Jobs':<11} {'Unique Jobs':<12}"
                 )
-                print("-" * 220)
+                print("-" * 170)
 
                 for i, runner_data in enumerate(runners_with_issues[:15], 1):
                     # Truncate machine name if too long for display
@@ -1170,29 +1151,23 @@ class SGLangFailuresAnalyzer:
                         if first_failure
                         else "N/A"
                     )
-                    first_failure_link = first_failure["url"] if first_failure else ""
 
                     last_failure = runner_data.get("last_failure")
                     last_failure_str = (
                         f"Run #{last_failure['run_number']}" if last_failure else "N/A"
                     )
 
-                    # Format top errors
+                    # Format top errors - don't truncate
                     top_errors = runner_data.get("top_error_signatures", [])
                     if top_errors:
-                        error_str = ", ".join(
-                            [f"{err[0]} ({err[1]})" for err in top_errors[:2]]
-                        )
-                        error_display = (
-                            error_str
-                            if len(error_str) <= 43
-                            else error_str[:40] + "..."
+                        error_display = ", ".join(
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
                         )
                     else:
                         error_display = "N/A"
 
                     print(
-                        f"{i:<6} {display_name:<30} {streak_str:<5} {max_str:<5} {runner_data['failure_rate']:>5.1f}% {avg_queue_str:<7} {first_failure_str:<13} {last_failure_str:<13} {error_display:<45} {runner_data['total_jobs']:<7} {runner_data['unique_jobs']:<8} {first_failure_link:<50}"
+                        f"{i:<6} {display_name:<30} {streak_str:<5} {max_str:<5} {runner_data['failure_rate']:>5.1f}% {avg_queue_str:<7} {first_failure_str:<13} {last_failure_str:<13} {error_display:<45} {runner_data['total_jobs']:<11} {runner_data['unique_jobs']:<12}"
                     )
 
         # Build report data (always needed for GitHub summary)
@@ -1329,10 +1304,10 @@ class SGLangFailuresAnalyzer:
                     summary_lines.append("## ALERTS: Critical Consecutive Job Failures")
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Job Name | Streak | Max | First Failure | Last Failure | Top Errors | First Link | Last Link |"
+                        "| Job Name | Streak | Max | First Failure | Last Failure | Top Errors |"
                     )
                     summary_lines.append(
-                        "|----------|--------|-----|---------------|--------------|------------|------------|-----------|"
+                        "|----------|--------|-----|---------------|--------------|------------|"
                     )
 
                     for alert in sorted(
@@ -1345,37 +1320,29 @@ class SGLangFailuresAnalyzer:
                             job_name = job_name[:32] + "..."
 
                         first_failure = alert.get("first_failure")
-                        first_failure_str = (
-                            f"Run #{first_failure['run_number']}"
-                            if first_failure
-                            else "N/A"
-                        )
-                        first_failure_link = (
-                            first_failure["url"] if first_failure else ""
-                        )
+                        if first_failure:
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure['url']})"
+                        else:
+                            first_failure_str = "N/A"
 
                         last_failure = alert.get("last_failure")
-                        last_failure_str = (
-                            f"Run #{last_failure['run_number']}"
-                            if last_failure
-                            else "N/A"
-                        )
-                        last_failure_link = last_failure["url"] if last_failure else ""
+                        if last_failure:
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure['url']})"
+                        else:
+                            last_failure_str = "N/A"
 
-                        # Format top errors
+                        # Format top errors - don't truncate
                         top_errors = alert.get("top_error_signatures", [])
                         if top_errors:
                             error_str = ", ".join(
-                                [f"{err[0]} ({err[1]})" for err in top_errors[:2]]
+                                [f"{err[0]} ({err[1]})" for err in top_errors]
                             )
-                            if len(error_str) > 40:
-                                error_str = error_str[:37] + "..."
                         else:
                             error_str = "N/A"
 
                         summary_lines.append(
                             f"| `{job_name}` | {alert['current_streak']} | {alert['max_streak']} | "
-                            f"{first_failure_str} | {last_failure_str} | {error_str} | [View]({first_failure_link}) | [View]({last_failure_link}) |"
+                            f"{first_failure_str} | {last_failure_str} | {error_str} |"
                         )
 
                     summary_lines.append("")
@@ -1401,10 +1368,10 @@ class SGLangFailuresAnalyzer:
                     summary_lines.append("## ALERTS: Workers with Issues")
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Runner | Streak | Max | Fail Rate | Avg Queue | First Failure | Last Failure | Top Errors | Jobs Failed | First Link | Last Link |"
+                        "| Runner | Streak | Max | Fail Rate | Avg Queue | First Failure | Last Failure | Top Errors | Jobs Failed |"
                     )
                     summary_lines.append(
-                        "|--------|--------|-----|-----------|-----------|---------------|--------------|------------|-------------|------------|-----------|"
+                        "|--------|--------|-----|-----------|-----------|---------------|--------------|------------|-------------|"
                     )
 
                     for alert in sorted(
@@ -1417,18 +1384,16 @@ class SGLangFailuresAnalyzer:
                         if len(runner_name) > 28:
                             runner_name = runner_name[:25] + "..."
 
-                        # Get top 3 failed jobs
+                        # Get all failed jobs - don't truncate
                         jobs_failed = alert.get("jobs_failed", {})
                         top_jobs = sorted(
                             jobs_failed.items(), key=lambda x: x[1], reverse=True
-                        )[:3]
+                        )
                         jobs_str = (
                             ", ".join([f"{job} ({count})" for job, count in top_jobs])
                             if top_jobs
                             else "N/A"
                         )
-                        if len(jobs_str) > 35:
-                            jobs_str = jobs_str[:32] + "..."
 
                         # Format queue time
                         avg_queue = alert.get("avg_queue_time_seconds", 0)
@@ -1437,38 +1402,30 @@ class SGLangFailuresAnalyzer:
                         )
 
                         first_failure = alert.get("first_failure")
-                        first_failure_str = (
-                            f"Run #{first_failure['run_number']}"
-                            if first_failure
-                            else "N/A"
-                        )
-                        first_failure_link = (
-                            first_failure["url"] if first_failure else ""
-                        )
+                        if first_failure:
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure['url']})"
+                        else:
+                            first_failure_str = "N/A"
 
                         last_failure = alert.get("last_failure")
-                        last_failure_str = (
-                            f"Run #{last_failure['run_number']}"
-                            if last_failure
-                            else "N/A"
-                        )
-                        last_failure_link = last_failure["url"] if last_failure else ""
+                        if last_failure:
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure['url']})"
+                        else:
+                            last_failure_str = "N/A"
 
-                        # Format top errors
+                        # Format top errors - don't truncate
                         top_errors = alert.get("top_error_signatures", [])
                         if top_errors:
                             error_str = ", ".join(
-                                [f"{err[0]} ({err[1]})" for err in top_errors[:2]]
+                                [f"{err[0]} ({err[1]})" for err in top_errors]
                             )
-                            if len(error_str) > 35:
-                                error_str = error_str[:32] + "..."
                         else:
                             error_str = "N/A"
 
                         summary_lines.append(
                             f"| `{runner_name}` | {alert['current_streak']} | {alert['max_streak']} | "
                             f"{alert['failure_rate']:.1f}% | {avg_queue_str} | {first_failure_str} | {last_failure_str} | "
-                            f"{error_str} | {jobs_str} | [View]({first_failure_link}) | [View]({last_failure_link}) |"
+                            f"{error_str} | {jobs_str} |"
                         )
 
                     summary_lines.append("")
@@ -1500,10 +1457,10 @@ class SGLangFailuresAnalyzer:
                 summary_lines.append("## Section 1: Top 15 Consecutively Failing Jobs")
                 summary_lines.append("")
                 summary_lines.append(
-                    "| Rank | Job Name | Streak | Max | First Failure | Last Failure | Top Errors | First Link | Last Link |"
+                    "| Rank | Job Name | Streak | Max | First Failure | Last Failure | Top Errors |"
                 )
                 summary_lines.append(
-                    "|------|----------|--------|-----|---------------|--------------|------------|------------|-----------|"
+                    "|------|----------|--------|-----|---------------|--------------|------------|"
                 )
                 for i, (job_name, data) in enumerate(broken_jobs[:20], 1):
                     display_name = (
@@ -1512,33 +1469,29 @@ class SGLangFailuresAnalyzer:
 
                     # Get first and last failure info
                     first_failure = data.get("first_failure_in_streak")
-                    first_failure_str = (
-                        f"Run #{first_failure['run_number']}"
-                        if first_failure
-                        else "N/A"
-                    )
-                    first_failure_link = first_failure["url"] if first_failure else ""
+                    if first_failure:
+                        first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure['url']})"
+                    else:
+                        first_failure_str = "N/A"
 
                     last_failure = data.get("last_failure_in_streak")
-                    last_failure_str = (
-                        f"Run #{last_failure['run_number']}" if last_failure else "N/A"
-                    )
-                    last_failure_link = last_failure["url"] if last_failure else ""
+                    if last_failure:
+                        last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure['url']})"
+                    else:
+                        last_failure_str = "N/A"
 
-                    # Format top errors
+                    # Format top errors - don't truncate
                     top_errors = data.get("top_error_signatures", [])
                     if top_errors:
                         error_str = ", ".join(
-                            [f"{err[0]} ({err[1]})" for err in top_errors[:2]]
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
                         )
-                        if len(error_str) > 35:
-                            error_str = error_str[:32] + "..."
                     else:
                         error_str = "N/A"
 
                     summary_lines.append(
                         f"| {i} | `{display_name}` | {data['current_streak']} | {data['max_streak']} | "
-                        f"{first_failure_str} | {last_failure_str} | {error_str} | [View]({first_failure_link}) | [View]({last_failure_link}) |"
+                        f"{first_failure_str} | {last_failure_str} | {error_str} |"
                     )
 
                 summary_lines.append("")
@@ -1595,10 +1548,10 @@ class SGLangFailuresAnalyzer:
                     )
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Rank | Machine Name | Streak | Max | Fail Rate | Avg Queue | First Failure | Last Failure | Top Errors | Total | Unique | First Link | Last Link |"
+                        "| Rank | Machine Name | Streak | Max | Fail Rate | Avg Queue | First Failure | Last Failure | Top Errors | Total Jobs | Unique Jobs |"
                     )
                     summary_lines.append(
-                        "|------|--------------|--------|-----|-----------|-----------|---------------|--------------|------------|-------|--------|------------|-----------|"
+                        "|------|--------------|--------|-----|-----------|-----------|---------------|--------------|------------|------------|-------------|"
                     )
 
                     for i, runner_data in enumerate(runners_with_issues[:15], 1):
@@ -1621,38 +1574,30 @@ class SGLangFailuresAnalyzer:
 
                         # Get first and last failure info
                         first_failure = runner_data.get("first_failure")
-                        first_failure_str = (
-                            f"Run #{first_failure['run_number']}"
-                            if first_failure
-                            else "N/A"
-                        )
-                        first_failure_link = (
-                            first_failure["url"] if first_failure else ""
-                        )
+                        if first_failure:
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure['url']})"
+                        else:
+                            first_failure_str = "N/A"
 
                         last_failure = runner_data.get("last_failure")
-                        last_failure_str = (
-                            f"Run #{last_failure['run_number']}"
-                            if last_failure
-                            else "N/A"
-                        )
-                        last_failure_link = last_failure["url"] if last_failure else ""
+                        if last_failure:
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure['url']})"
+                        else:
+                            last_failure_str = "N/A"
 
-                        # Format top errors
+                        # Format top errors - don't truncate
                         top_errors = runner_data.get("top_error_signatures", [])
                         if top_errors:
                             error_str = ", ".join(
-                                [f"{err[0]} ({err[1]})" for err in top_errors[:2]]
+                                [f"{err[0]} ({err[1]})" for err in top_errors]
                             )
-                            if len(error_str) > 30:
-                                error_str = error_str[:27] + "..."
                         else:
                             error_str = "N/A"
 
                         summary_lines.append(
                             f"| {i} | `{display_name}` | {streak_str} | {max_str} | {runner_data['failure_rate']:.1f}% | "
                             f"{avg_queue_str} | {first_failure_str} | {last_failure_str} | {error_str} | "
-                            f"{runner_data['total_jobs']} | {runner_data['unique_jobs']} | [View]({first_failure_link}) | [View]({last_failure_link}) |"
+                            f"{runner_data['total_jobs']} | {runner_data['unique_jobs']} |"
                         )
 
                     summary_lines.append("")
