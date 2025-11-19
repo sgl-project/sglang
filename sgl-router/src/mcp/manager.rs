@@ -3,7 +3,7 @@
 //! Manages both static MCP servers (from config) and dynamic MCP servers (from requests).
 //! Static clients are never evicted; dynamic clients use LRU eviction via connection pool.
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
@@ -153,28 +153,27 @@ impl McpManager {
     }
 
     /// List all available tools from all servers
-    pub fn list_tools(&self) -> Vec<Tool> {
-        self.inventory
-            .list_tools()
-            .into_iter()
-            .map(|(_tool_name, _server_name, tool_info)| tool_info)
-            .collect()
+    ///
+    /// Returns Vec of (qualified_tool_name, server_label, Tool) where qualified_tool_name is server_label__tool_name
+    pub fn list_tools(&self) -> Vec<(String, String, Tool)> {
+        self.inventory.list_tools()
     }
 
     /// Call a tool by name with automatic type coercion
     ///
+    /// Accepts qualified tool name (server_label__tool_name) or legacy tool name.
     /// Accepts either JSON string or parsed Map as arguments.
     /// Automatically converts string numbers to actual numbers based on tool schema.
     pub async fn call_tool(
         &self,
-        tool_name: &str,
+        qualified_tool_name: &str,
         args: impl Into<ToolArgs>,
     ) -> McpResult<CallToolResult> {
-        // Get tool info for schema and server
-        let (server_name, tool_info) = self
+        // Get tool info for schema and server using qualified name
+        let (server_label, tool_info) = self
             .inventory
-            .get_tool(tool_name)
-            .ok_or_else(|| McpError::ToolNotFound(tool_name.to_string()))?;
+            .get_tool(qualified_tool_name)
+            .ok_or_else(|| McpError::ToolNotFound(qualified_tool_name.to_string()))?;
 
         // Convert args with type coercion based on schema
         let tool_schema = Some(serde_json::Value::Object((*tool_info.input_schema).clone()));
@@ -185,13 +184,14 @@ impl McpManager {
 
         // Get client for that server
         let client = self
-            .get_client(&server_name)
+            .get_client(&server_label)
             .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
+            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
 
-        // Call the tool
+        // Call the tool using the original tool name from the Tool struct
+        // (not the qualified name, since the MCP server expects the original name)
         let request = CallToolRequestParam {
-            name: Cow::Owned(tool_name.to_string()),
+            name: tool_info.name.clone(),
             arguments: args_map,
         };
 
@@ -205,7 +205,7 @@ impl McpManager {
     pub fn get_tool(&self, tool_name: &str) -> Option<Tool> {
         self.inventory
             .get_tool(tool_name)
-            .map(|(_server_name, tool_info)| tool_info)
+            .map(|(_server_label, tool_info)| tool_info)
     }
 
     /// Get a prompt by name
@@ -215,16 +215,16 @@ impl McpManager {
         args: Option<Map<String, serde_json::Value>>,
     ) -> McpResult<GetPromptResult> {
         // Get server that owns this prompt
-        let (server_name, _prompt_info) = self
+        let (server_label, _prompt_info) = self
             .inventory
             .get_prompt(prompt_name)
             .ok_or_else(|| McpError::PromptNotFound(prompt_name.to_string()))?;
 
         // Get client for that server
         let client = self
-            .get_client(&server_name)
+            .get_client(&server_label)
             .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
+            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
 
         // Get the prompt
         let request = GetPromptRequestParam {
@@ -250,16 +250,16 @@ impl McpManager {
     /// Read a resource by URI
     pub async fn read_resource(&self, uri: &str) -> McpResult<ReadResourceResult> {
         // Get server that owns this resource
-        let (server_name, _resource_info) = self
+        let (server_label, _resource_info) = self
             .inventory
             .get_resource(uri)
             .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
 
         // Get client for that server
         let client = self
-            .get_client(&server_name)
+            .get_client(&server_label)
             .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
+            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
 
         // Read the resource
         let request = ReadResourceRequestParam {
@@ -351,17 +351,17 @@ impl McpManager {
 
     /// Subscribe to resource changes
     pub async fn subscribe_resource(&self, uri: &str) -> McpResult<()> {
-        let (server_name, _resource_info) = self
+        let (server_label, _resource_info) = self
             .inventory
             .get_resource(uri)
             .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
 
         let client = self
-            .get_client(&server_name)
+            .get_client(&server_label)
             .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
+            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
 
-        debug!("Subscribing to '{}' on '{}'", uri, server_name);
+        debug!("Subscribing to '{}' on '{}'", uri, server_label);
 
         client
             .peer()
@@ -374,17 +374,17 @@ impl McpManager {
 
     /// Unsubscribe from resource changes
     pub async fn unsubscribe_resource(&self, uri: &str) -> McpResult<()> {
-        let (server_name, _resource_info) = self
+        let (server_label, _resource_info) = self
             .inventory
             .get_resource(uri)
             .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
 
         let client = self
-            .get_client(&server_name)
+            .get_client(&server_label)
             .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
+            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
 
-        debug!("Unsubscribing from '{}' on '{}'", uri, server_name);
+        debug!("Unsubscribing from '{}' on '{}'", uri, server_label);
 
         client
             .peer()

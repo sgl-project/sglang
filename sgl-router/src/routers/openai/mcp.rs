@@ -294,11 +294,11 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         // Build function tools for all discovered MCP tools
         let mut tools_json = Vec::new();
         let tools = active_mcp.list_tools();
-        for t in tools {
+        for (qualified_name, _server_name, t) in tools {
             let parameters = Value::Object((*t.input_schema).clone());
             let tool = serde_json::json!({
                 "type": event_types::ITEM_TYPE_FUNCTION,
-                "name": t.name,
+                "name": qualified_name,
                 "description": t.description,
                 "parameters": parameters
             });
@@ -856,9 +856,9 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label
     let tools = mcp.list_tools();
     let tools_json: Vec<Value> = tools
         .iter()
-        .map(|t| {
+        .map(|(qualified_name, _server_name, t)| {
             json!({
-                "name": t.name,
+                "name": qualified_name,
                 "description": t.description,
                 "input_schema": Value::Object((*t.input_schema).clone()),
                 "annotations": {

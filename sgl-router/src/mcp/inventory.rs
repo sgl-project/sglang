@@ -9,21 +9,21 @@ use crate::mcp::config::{Prompt, RawResource, Tool};
 /// Cached tool with metadata
 #[derive(Clone)]
 pub struct CachedTool {
-    pub server_name: String,
+    pub server_label: String,
     pub tool: Tool,
 }
 
 /// Cached prompt with metadata
 #[derive(Clone)]
 pub struct CachedPrompt {
-    pub server_name: String,
+    pub server_label: String,
     pub prompt: Prompt,
 }
 
 /// Cached resource with metadata
 #[derive(Clone)]
 pub struct CachedResource {
-    pub server_name: String,
+    pub server_label: String,
     pub resource: RawResource,
 }
 
@@ -32,7 +32,7 @@ pub struct CachedResource {
 /// Provides thread-safe caching of MCP tools, prompts, and resources.
 /// Entries are refreshed periodically by background tasks.
 pub struct ToolInventory {
-    /// Map of tool_name -> cached tool
+    /// Map of server_label__tool_name -> cached tool
     tools: DashMap<String, CachedTool>,
 
     /// Map of prompt_name -> cached prompt
@@ -65,32 +65,39 @@ impl ToolInventory {
     // ============================================================================
 
     /// Get a tool if it exists
-    pub fn get_tool(&self, tool_name: &str) -> Option<(String, Tool)> {
+    ///
+    /// Accepts either full key (server_label__tool_name) or constructs it from separate parts
+    pub fn get_tool(&self, qualified_tool_name: &str) -> Option<(String, Tool)> {
         self.tools
-            .get(tool_name)
-            .map(|entry| (entry.server_name.clone(), entry.tool.clone()))
+            .get(qualified_tool_name)
+            .map(|entry| (entry.server_label.clone(), entry.tool.clone()))
     }
 
     /// Check if tool exists
-    pub fn has_tool(&self, tool_name: &str) -> bool {
-        self.tools.contains_key(tool_name)
+    pub fn has_tool(&self, qualified_tool_name: &str) -> bool {
+        self.tools.contains_key(qualified_tool_name)
     }
 
     /// Insert or update a tool
-    pub fn insert_tool(&self, tool_name: String, server_name: String, tool: Tool) {
+    ///
+    /// Constructs key as server_label__tool_name
+    pub fn insert_tool(&self, tool_name: String, server_label: String, tool: Tool) {
+        let qualified_name = format!("{}__{}", server_label, tool_name);
         self.tools
-            .insert(tool_name, CachedTool { server_name, tool });
+            .insert(qualified_name, CachedTool { server_label, tool });
     }
 
     /// Get all tools
+    ///
+    /// Returns Vec of (qualified_tool_name, server_label, Tool) where qualified_tool_name is server_label__tool_name
     pub fn list_tools(&self) -> Vec<(String, String, Tool)> {
         self.tools
             .iter()
             .map(|entry| {
-                let (name, cached) = entry.pair();
+                let (qualified_name, cached) = entry.pair();
                 (
-                    name.clone(),
-                    cached.server_name.clone(),
+                    qualified_name.clone(),
+                    cached.server_label.clone(),
                     cached.tool.clone(),
                 )
             })
@@ -105,7 +112,7 @@ impl ToolInventory {
     pub fn get_prompt(&self, prompt_name: &str) -> Option<(String, Prompt)> {
         self.prompts
             .get(prompt_name)
-            .map(|entry| (entry.server_name.clone(), entry.prompt.clone()))
+            .map(|entry| (entry.server_label.clone(), entry.prompt.clone()))
     }
 
     /// Check if prompt exists
@@ -114,11 +121,11 @@ impl ToolInventory {
     }
 
     /// Insert or update a prompt
-    pub fn insert_prompt(&self, prompt_name: String, server_name: String, prompt: Prompt) {
+    pub fn insert_prompt(&self, prompt_name: String, server_label: String, prompt: Prompt) {
         self.prompts.insert(
             prompt_name,
             CachedPrompt {
-                server_name,
+                server_label,
                 prompt,
             },
         );
@@ -132,7 +139,7 @@ impl ToolInventory {
                 let (name, cached) = entry.pair();
                 (
                     name.clone(),
-                    cached.server_name.clone(),
+                    cached.server_label.clone(),
                     cached.prompt.clone(),
                 )
             })
@@ -147,7 +154,7 @@ impl ToolInventory {
     pub fn get_resource(&self, resource_uri: &str) -> Option<(String, RawResource)> {
         self.resources
             .get(resource_uri)
-            .map(|entry| (entry.server_name.clone(), entry.resource.clone()))
+            .map(|entry| (entry.server_label.clone(), entry.resource.clone()))
     }
 
     /// Check if resource exists
@@ -159,13 +166,13 @@ impl ToolInventory {
     pub fn insert_resource(
         &self,
         resource_uri: String,
-        server_name: String,
+        server_label: String,
         resource: RawResource,
     ) {
         self.resources.insert(
             resource_uri,
             CachedResource {
-                server_name,
+                server_label,
                 resource,
             },
         );
@@ -179,7 +186,7 @@ impl ToolInventory {
                 let (uri, cached) = entry.pair();
                 (
                     uri.clone(),
-                    cached.server_name.clone(),
+                    cached.server_label.clone(),
                     cached.resource.clone(),
                 )
             })
@@ -191,13 +198,13 @@ impl ToolInventory {
     // ============================================================================
 
     /// Clear all cached items for a specific server (called when LRU evicts client)
-    pub fn clear_server_tools(&self, server_name: &str) {
+    pub fn clear_server_tools(&self, server_label: &str) {
         self.tools
-            .retain(|_, cached| cached.server_name != server_name);
+            .retain(|_, cached| cached.server_label != server_label);
         self.prompts
-            .retain(|_, cached| cached.server_name != server_name);
+            .retain(|_, cached| cached.server_label != server_label);
         self.resources
-            .retain(|_, cached| cached.server_name != server_name);
+            .retain(|_, cached| cached.server_label != server_label);
     }
 
     /// Get count of cached items
@@ -275,7 +282,7 @@ mod tests {
 
         inventory.insert_tool("test_tool".to_string(), "server1".to_string(), tool.clone());
 
-        let result = inventory.get_tool("test_tool");
+        let result = inventory.get_tool("server1__test_tool");
         assert!(result.is_some());
 
         let (server_name, retrieved_tool) = result.unwrap();
@@ -288,11 +295,11 @@ mod tests {
         let inventory = ToolInventory::new();
         let tool = create_test_tool("check_tool");
 
-        assert!(!inventory.has_tool("check_tool"));
+        assert!(!inventory.has_tool("server1__check_tool"));
 
         inventory.insert_tool("check_tool".to_string(), "server1".to_string(), tool);
 
-        assert!(inventory.has_tool("check_tool"));
+        assert!(inventory.has_tool("server1__check_tool"));
     }
 
     #[test]
@@ -317,6 +324,12 @@ mod tests {
 
         let tools = inventory.list_tools();
         assert_eq!(tools.len(), 3);
+
+        // Check that qualified names are returned
+        let qualified_names: Vec<_> = tools.iter().map(|(name, _, _)| name.as_str()).collect();
+        assert!(qualified_names.contains(&"server1__tool1"));
+        assert!(qualified_names.contains(&"server1__tool2"));
+        assert!(qualified_names.contains(&"server2__tool3"));
     }
 
     #[test]
@@ -340,7 +353,7 @@ mod tests {
 
         let tools = inventory.list_tools();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].0, "tool2");
+        assert_eq!(tools[0].0, "server2__tool2");
     }
 
     #[test]

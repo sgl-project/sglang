@@ -164,8 +164,8 @@ fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> Respo
     let tools = mcp.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|t| McpToolInfo {
-            name: t.name.to_string(),
+        .map(|(qualified_name, _server_name, t)| McpToolInfo {
+            name: qualified_name.clone(),
             description: t.description.as_ref().map(|d| d.to_string()),
             input_schema: Value::Object((*t.input_schema).clone()),
             annotations: Some(json!({
@@ -288,7 +288,7 @@ pub(super) async fn execute_tool_loop(
 
             // Separate MCP and function tool calls
             let mcp_tool_names: std::collections::HashSet<&str> =
-                mcp_tools.iter().map(|t| t.name.as_ref()).collect();
+                mcp_tools.iter().map(|(name, _, _)| name.as_str()).collect();
             let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                 .into_iter()
                 .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
@@ -646,9 +646,9 @@ async fn execute_tool_loop_streaming_internal(
             // Build tools list for item structure
             let tool_items: Vec<_> = mcp_tools
                 .iter()
-                .map(|t| {
+                .map(|(qualified_name, _server_name, t)| {
                     json!({
-                        "name": t.name,
+                        "name": qualified_name,
                         "description": t.description,
                         "input_schema": Value::Object((*t.input_schema).clone())
                     })
@@ -728,7 +728,7 @@ async fn execute_tool_loop_streaming_internal(
 
             // Separate MCP and function tool calls
             let mcp_tool_names: std::collections::HashSet<&str> =
-                mcp_tools.iter().map(|t| t.name.as_ref()).collect();
+                mcp_tools.iter().map(|(name, _, _)| name.as_str()).collect();
             let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                 .into_iter()
                 .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
@@ -1051,13 +1051,17 @@ async fn execute_tool_loop_streaming_internal(
 }
 
 /// Convert MCP tools to Chat API tool format
-fn convert_mcp_tools_to_chat_tools(mcp_tools: &[mcp::Tool]) -> Vec<Tool> {
+///
+/// Tools from MCP manager's list_tools() have qualified names (server_label__tool_name).
+/// These qualified names are used as function names so the model can distinguish tools
+/// from different servers.
+fn convert_mcp_tools_to_chat_tools(mcp_tools: &[(String, String, mcp::Tool)]) -> Vec<Tool> {
     mcp_tools
         .iter()
-        .map(|tool_info| Tool {
+        .map(|(qualified_name, _server_name, tool_info)| Tool {
             tool_type: "function".to_string(),
             function: Function {
-                name: tool_info.name.to_string(),
+                name: qualified_name.clone(),
                 description: tool_info.description.as_ref().map(|d| d.to_string()),
                 parameters: Value::Object((*tool_info.input_schema).clone()),
                 strict: None,

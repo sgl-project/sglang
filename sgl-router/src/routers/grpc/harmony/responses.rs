@@ -692,9 +692,9 @@ async fn execute_mcp_tool_loop_streaming(
     // Build tools list for item structure
     let tool_items: Vec<_> = mcp_tools
         .iter()
-        .map(|t| {
+        .map(|(qualified_name, _server_name, t)| {
             json!({
-                "name": t.name,
+                "name": qualified_name,
                 "description": t.description,
                 "input_schema": Value::Object((*t.input_schema).clone())
             })
@@ -1401,13 +1401,16 @@ pub(crate) struct ToolResult {
 ///
 /// Converts MCP Tool entries (from rmcp SDK) to ResponseTool format so the model
 /// knows about available MCP tools when making tool calls.
-pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
+/// Tools from MCP manager's list_tools() have qualified names (server_label__tool_name).
+pub fn convert_mcp_tools_to_response_tools(
+    mcp_tools: &[(String, String, mcp::Tool)],
+) -> Vec<ResponseTool> {
     mcp_tools
         .iter()
-        .map(|tool_info| ResponseTool {
+        .map(|(qualified_name, _server_name, tool_info)| ResponseTool {
             r#type: ResponseToolType::Mcp,
             function: Some(Function {
-                name: tool_info.name.to_string(),
+                name: qualified_name.clone(),
                 description: tool_info.description.as_ref().map(|d| d.to_string()),
                 parameters: Value::Object((*tool_info.input_schema).clone()),
                 strict: None,
@@ -1443,8 +1446,8 @@ fn inject_mcp_metadata(
     let tools = mcp_manager.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|t| McpToolInfo {
-            name: t.name.to_string(),
+        .map(|(qualified_name, _server_name, t)| McpToolInfo {
+            name: qualified_name.clone(),
             description: t.description.as_ref().map(|d| d.to_string()),
             input_schema: Value::Object((*t.input_schema).clone()),
             annotations: Some(json!({
