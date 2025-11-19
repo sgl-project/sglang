@@ -25,8 +25,8 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
                     "--trust-remote-code",
                     "--tp",
                     "8",
-                    "--dp",
-                    "8",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
                 ],
             },
             {
@@ -34,8 +34,6 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
-                    "8",
-                    "--dp",
                     "8",
                     "--speculative-algorithm",
                     "EAGLE",
@@ -47,6 +45,8 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
                     "4",
                     "--mem-frac",
                     "0.7",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
                 ],
             },
         ]

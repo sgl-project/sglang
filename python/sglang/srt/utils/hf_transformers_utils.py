@@ -46,6 +46,7 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     JetNemotronConfig,
+    JetVLMConfig,
     KimiLinearConfig,
     KimiVLConfig,
     LongcatFlashConfig,
@@ -80,6 +81,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     NemotronHConfig,
     DeepseekVLV2Config,
     JetNemotronConfig,
+    JetVLMConfig,
     BailingMoeLinearConfig,
 ]
 
