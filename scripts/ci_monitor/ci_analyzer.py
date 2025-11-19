@@ -975,16 +975,26 @@ class SGLangCIAnalyzer:
             summary_lines.append("| Metric | Count | Percentage |")
             summary_lines.append("|--------|-------|------------|")
             summary_lines.append(f"| Total Runs | {total} | 100% |")
-            summary_lines.append(f"| Successful | {success} | {success/max(1,total)*100:.1f}% |")
-            summary_lines.append(f"| Failed | {failed} | {failed/max(1,total)*100:.1f}% |")
-            summary_lines.append(f"| Cancelled | {cancelled} | {cancelled/max(1,total)*100:.1f}% |")
+            summary_lines.append(
+                f"| Successful | {success} | {success/max(1,total)*100:.1f}% |"
+            )
+            summary_lines.append(
+                f"| Failed | {failed} | {failed/max(1,total)*100:.1f}% |"
+            )
+            summary_lines.append(
+                f"| Cancelled | {cancelled} | {cancelled/max(1,total)*100:.1f}% |"
+            )
             summary_lines.append("")
 
             # Daily trends
             summary_lines.append("## Daily Trends")
             summary_lines.append("")
-            summary_lines.append("| Date | Total Runs | Success | Failed | Success Rate |")
-            summary_lines.append("|------|------------|---------|--------|--------------|")
+            summary_lines.append(
+                "| Date | Total Runs | Success | Failed | Success Rate |"
+            )
+            summary_lines.append(
+                "|------|------------|---------|--------|--------------|"
+            )
 
             daily_stats = sorted(stats["daily_stats"].items(), reverse=True)[:7]
             for date, day_stats in daily_stats:
@@ -1001,7 +1011,9 @@ class SGLangCIAnalyzer:
                 summary_lines.append("")
 
                 job_stats_sorted = sorted(
-                    stats["job_stats"].items(), key=lambda x: x[1]["failure"], reverse=True
+                    stats["job_stats"].items(),
+                    key=lambda x: x[1]["failure"],
+                    reverse=True,
                 )
 
                 for job_name, job_stat in job_stats_sorted:
@@ -1026,18 +1038,24 @@ class SGLangCIAnalyzer:
                         summary_lines.append("| Metric | Avg Value | Samples |")
                         summary_lines.append("|--------|-----------|---------|")
 
-                        for metric_name, metric_data in job_stat["performance_metrics"].items():
+                        for metric_name, metric_data in job_stat[
+                            "performance_metrics"
+                        ].items():
                             if metric_data:
                                 values = [m["value"] for m in metric_data]
                                 avg_value = sum(values) / len(values)
-                                summary_lines.append(f"| {metric_name} | {avg_value:.2f} | {len(values)} |")
+                                summary_lines.append(
+                                    f"| {metric_name} | {avg_value:.2f} | {len(values)} |"
+                                )
                         summary_lines.append("")
 
                     # Recent failures
                     if job_stat["recent_failures"]:
                         summary_lines.append("**Recent Failures:**")
                         for failure in job_stat["recent_failures"][:3]:
-                            summary_lines.append(f"- [Run #{failure['run_number']}]({failure['run_url']})")
+                            summary_lines.append(
+                                f"- [Run #{failure['run_number']}]({failure['run_url']})"
+                            )
                         summary_lines.append("")
 
             with open(github_step_summary, "a", encoding="utf-8") as f:
