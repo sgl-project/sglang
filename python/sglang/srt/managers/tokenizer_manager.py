@@ -39,8 +39,8 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from python.sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -75,7 +75,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.schedule_batch import Modality, RequestStage
+from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -318,19 +318,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # E Disaggregation
         if self.model_config.is_multimodal and self.server_args.language_only:
-            self.embedding_port = get_free_port()
-            self.recv_from_encoder = get_zmq_socket(
-                context, zmq.PULL, f"tcp://*:{self.embedding_port}", True
+            self.mm_receiver = MMReceiver(
+                server_args.mm_transfer_backend,
+                server_args.disaggregation_ib_device,
+                self.model_config.dtype,
             )
-            self.received_data = dict()
-            self.embeddings_lock = asyncio.Lock()
-            if self.server_args.mm_transfer_backend == "mooncake":
-                self.embeddings_engine = MooncakeTransferEngine(
-                    hostname=get_local_ip_auto(),
-                    gpu_id=None,
-                    ib_device=server_args.disaggregation_ib_device,
-                )
-                self.embeddings_buffer = dict()
 
         # Request states
         self._chosen_loop = None
@@ -576,18 +568,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         return "batch_strings"
 
-    async def allocate_embedding_buffer(self, req_id, embedding_length, embedding_dim):
-        embeddings = torch.zeros(
-            (embedding_length, embedding_dim),
-            dtype=self.model_config.dtype,
-        )
-        self.embeddings_engine.register(
-            embeddings.data_ptr(),
-            embeddings.nbytes,
-        )
-        self.embeddings_buffer[req_id] = embeddings
-        return embeddings.data_ptr()
-
     def _prepare_tokenizer_input(
         self, texts: Union[str, List[str]], input_format: str
     ) -> Union[List[str], List[List[str]]]:
@@ -744,40 +724,21 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
 
-            if not self.server_args.language_only:
+            mm_inputs = None
+            if self.server_args.language_only:
+                mm_inputs: Dict = await self.mm_receiver.recv_mm_data(
+                    obj.bootstrap_room,
+                    self.mm_processor,
+                    input_text or input_ids,
+                )
+
+            if mm_inputs is None:
                 mm_inputs: Dict = await self.mm_data_processor.process(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,
                     input_text_or_ids=(input_text or input_ids),
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
-                )
-            else:
-                # E Disaggregation
-                recv_embedding = None
-                img_grid_thw = None
-                # Use async lock to avoid race condition
-                async with self.embeddings_lock:
-                    while (
-                        obj.bootstrap_room not in self.received_data
-                        or not self.received_data[obj.bootstrap_room].ready
-                    ):
-                        await self.handle_embedding()
-
-                    recv_embedding_data = self.received_data[obj.bootstrap_room]
-                    if self.server_args.mm_transfer_backend == "mooncake":
-                        recv_embedding = self.embeddings_buffer[obj.bootstrap_room]
-                        self.embeddings_engine.deregister(recv_embedding.data_ptr())
-                    elif self.server_args.mm_transfer_backend == "zmq":
-                        recv_embedding = recv_embedding_data.get_embedding()
-                    img_grid_thw = recv_embedding_data.get_img_grid()
-                    del self.received_data[obj.bootstrap_room]
-                    if self.server_args.mm_transfer_backend == "mooncake":
-                        del self.embeddings_buffer[obj.bootstrap_room]
-
-                prompt = input_text or input_ids
-                mm_inputs = self.mm_processor.get_mm_data(
-                    prompt, recv_embedding, img_grid_thw
                 )
 
             if mm_inputs and "input_ids" in mm_inputs:
@@ -1604,13 +1565,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
-
-    async def handle_embedding(self):
-        recv_obj = await self.recv_from_encoder.recv_pyobj()
-        if recv_obj.req_id not in self.received_data:
-            self.received_data[recv_obj.req_id] = recv_obj
-        else:
-            self.received_data[recv_obj.req_id].add(recv_obj)
 
     def _add_metric_if_present(
         self,

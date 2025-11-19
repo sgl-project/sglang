@@ -475,7 +475,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         self.pp_group = get_pp_group()
         self.config = config
-<<<<<<< HEAD
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
         if self.pp_group.is_last_rank:
@@ -491,18 +490,15 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         else:
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
-=======
->>>>>>> e9fbeb706 (Format)
 
-        if not self.config.language_only:
-            self.visual = Qwen2_5_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-                quant_config=quant_config,
-                prefix=add_prefix("visual", prefix),
-            )
+        self.visual = Qwen2_5_VisionTransformer(
+            config.vision_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+            quant_config=quant_config,
+            prefix=add_prefix("visual", prefix),
+        )
 
         if not self.config.mm_only:
             self.model = Qwen2Model(
@@ -666,6 +662,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
+                    and hasattr(self, "model")
                     and hasattr(self.model, "start_layer")
                     and (
                         layer_id < self.model.start_layer
