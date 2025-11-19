@@ -1978,10 +1978,14 @@ def set_gpu_proc_affinity(
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
     # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = total_pcores // tp_size_per_node
+    num_cores_bind = envs.SGLANG_CPU_AFFINITY_NUM_PHYSICAL_CORE_PER_RANK.get() or (
+        total_pcores // tp_size_per_node
+    )
 
     # able to handle multiple DP per node
-    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
+    start_cpu_id = (
+        gpu_id * num_cores_bind
+    ) % total_pcores + envs.SGLANG_CPU_AFFINITY_SKIP_PREFIX_NUM.get()
     end_cpu_id = start_cpu_id + num_cores_bind
 
     if psutil.cpu_count() != psutil.cpu_count(logical=False):
