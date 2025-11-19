@@ -446,6 +446,7 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
+        self.dp_ranks_for_slowdown = None
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -1990,9 +1991,10 @@ class Scheduler(
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
-        if self.forward_sleep_time is not None:
-            logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
-            time.sleep(self.forward_sleep_time)
+        if self.dp_ranks_for_slowdown is not None and self.dp_rank in self.dp_ranks_for_slowdown:
+            if self.forward_sleep_time is not None:
+                logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
+                time.sleep(self.forward_sleep_time)
 
         # Capture prefill start time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
@@ -2544,9 +2546,17 @@ class Scheduler(
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
+        drs = recv_req.dp_ranks
         if t is not None and t <= 0:
             t = None
         self.forward_sleep_time = t
+        if drs is not None:
+            if isinstance(drs, int):
+                drs = [drs]
+            drs = [rank for rank in drs if rank >= 0]
+            if not drs:
+                drs = None
+        self.dp_ranks_for_slowdown = drs
         return SlowDownReqOutput()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
