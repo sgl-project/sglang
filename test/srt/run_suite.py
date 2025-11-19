@@ -78,8 +78,6 @@ suites = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_mamba_unittest.py", 4),
-        TestFile("test_metrics.py", 32),
-        TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 180),
         TestFile("test_mla_deepseek_v3.py", 500),
         TestFile("test_mla_flashinfer.py", 302),
@@ -426,8 +424,6 @@ suite_amd = {
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
-        TestFile("test_metrics.py", 32),
-        TestFile("test_metrics_utils.py", 1),
         # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),

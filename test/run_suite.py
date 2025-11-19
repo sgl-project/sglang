@@ -14,7 +14,7 @@ HW_MAPPING = {
 LABEL_MAPPING = {
     HWBackend.CPU: ["default"],
     HWBackend.AMD: ["stage-a-test-1"],
-    HWBackend.CUDA: ["stage-a-test-1"],
+    HWBackend.CUDA: ["stage-a-test-1", "stage-b-test-small-1-gpu"],
 }
 
 
