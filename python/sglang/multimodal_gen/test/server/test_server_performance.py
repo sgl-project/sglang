@@ -372,8 +372,9 @@ class TestDiffusionPerformance:
             step_fractions=BASELINE_CONFIG.step_fractions,
         )
 
+        summary = validator.collect_metrics(perf_record, stage_metrics)
+
         if is_baseline_generation_mode:
-            summary = validator.collect_metrics(perf_record, stage_metrics)
             self._dump_baseline_scenario(case, summary)
             return
 
