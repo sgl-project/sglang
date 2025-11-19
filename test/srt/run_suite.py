@@ -230,6 +230,7 @@ suites = {
     "nightly-8-gpu-h20": [],
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
+        TestFile("ascend/test_mindspore_models.py"),
         TestFile("cpu/test_comm.py"),
         TestFile("debug_utils/test_log_parser.py", 5),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py"),
@@ -481,9 +482,6 @@ suite_ascend = {
         TestFile("ascend/test_ascend_deepep.py", 400),
         TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
-    "__not_in_ascend_ci__": [
-        TestFile("ascend/test_mindspore_models.py"),
-    ],
 }
 
 suites.update(suite_amd)
@@ -563,6 +561,24 @@ def _sanity_check_suites(suites):
     assert (
         len(nonexistent_files) == 0
     ), f"Some test files in test suite do not exist on disk:\n{nonexistent_text}"
+
+    not_in_ci_files = set(
+        [test_file.name for test_file in suites.get("__not_in_ci__", [])]
+    )
+    in_ci_files = set(
+        [
+            test_file.name
+            for suite_name, suite in suites.items()
+            if suite_name != "__not_in_ci__"
+            for test_file in suite
+        ]
+    )
+    intersection = not_in_ci_files & in_ci_files
+    intersection_text = "\n".join(f'TestFile("{x}"),' for x in intersection)
+    assert len(intersection) == 0, (
+        f"Some test files are in both `not_in_ci` section and other suites:\n"
+        f"{intersection_text}"
+    )
 
 
 def main():
