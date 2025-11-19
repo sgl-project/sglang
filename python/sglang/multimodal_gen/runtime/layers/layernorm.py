@@ -195,6 +195,8 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not x.is_cuda:
+            x = x.cuda()
         shape = x.shape
         x = x.view(-1, self.hidden_size)
         return self.forward_triton(x).view(shape)
