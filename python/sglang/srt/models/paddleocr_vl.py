@@ -26,7 +26,6 @@ from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
