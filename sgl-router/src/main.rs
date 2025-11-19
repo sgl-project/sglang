@@ -126,7 +126,7 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
     decode_policy: Option<String>,
 
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 1800)]
     worker_startup_timeout_secs: u64,
 
     #[arg(long, default_value_t = 30)]
