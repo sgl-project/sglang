@@ -51,15 +51,15 @@ jobs:
 
           cd _build/html
 
-          git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1
+          git clone https://"$GITHUB_TOKEN"@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1
           find ../sgl-project.github.io/ -mindepth 1 -not -path "../sgl-project.github.io/.git*" -not -name CNAME -not -name ".jekyll" -not -name ".nojekyll" -delete
-          cp -r * ../sgl-project.github.io
+          cp -r ./* ../sgl-project.github.io
           cp ../../README.md ../sgl-project.github.io/README.md
           cd ../sgl-project.github.io
           git config user.name "sglang-bot"
           git config user.email "sglangbot@gmail.com"
           git add .
           git commit -m "Update $(date +'%Y-%m-%d %H:%M:%S')"
-          git push https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git main
+          git push https://"$GITHUB_TOKEN"@github.com/sgl-project/sgl-project.github.io.git main
           cd ..
           rm -rf sgl-project.github.io

@@ -38,7 +38,7 @@ jobs:
       - name: Nightly Test
         run: |
           bash scripts/ci/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY"
 
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')

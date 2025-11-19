@@ -53,7 +53,7 @@ jobs:
       - name: Require run-ci label (optional)
         if:  github.event_name == 'pull_request' && inputs.require-run-ci == true
         run: |
-          labels='${{ steps.pr.outputs.labels }}'
+          _labels='${{ steps.pr.outputs.labels }}'
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
             echo "Missing required label 'run-ci'."
             exit 1

@@ -241,13 +241,13 @@ jobs:
             mkdir -p "$INSTANT_CLIENT_DIR"
             cd "$INSTANT_CLIENT_DIR"
             wget https://download.oracle.com/otn_software/linux/instantclient/2390000/$INSTANT_CLIENT_ZIP
-            unzip $INSTANT_CLIENT_ZIP
-            rm $INSTANT_CLIENT_ZIP
+            unzip "$INSTANT_CLIENT_ZIP"
+            rm "$INSTANT_CLIENT_ZIP"
           else
             echo "Oracle Instant Client already exists, skipping download"
           fi
 
-          echo "LD_LIBRARY_PATH=/home/ubuntu/instant-client/instantclient_23_9:\$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/home/ubuntu/instant-client/instantclient_23_9:\$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 
       - name: Start Oracle Database
         run: |
@@ -255,9 +255,11 @@ jobs:
           echo "Starting Oracle DB..."
 
           # Export Oracle connection environment variables
-          echo "ATP_USER=system" >> $GITHUB_ENV
-          echo "ATP_PASSWORD=oracle" >> $GITHUB_ENV
-          echo "ATP_DSN=localhost:1521/XEPDB1" >> $GITHUB_ENV
+          {
+            echo "ATP_USER=system"
+            echo "ATP_PASSWORD=oracle"
+            echo "ATP_DSN=localhost:1521/XEPDB1"
+          } >> "$GITHUB_ENV"
 
       - name: Start Brave MCP Server
         run: |
@@ -343,12 +345,14 @@ jobs:
         find . -name "benchmark_*" -type d || true
         echo "=========================================="
 
-        echo "## Router E2E Genai-Bench Results Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "Results captured from E2E tests for two scenarios: regular router (2 workers, dp=2) and PD router (2 prefill + 2 decode)." >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "| Scenario | Status | TTFT (s) | E2E Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |" >> $GITHUB_STEP_SUMMARY
-        echo "|----------|--------|----------|-----------------|--------------------------|---------------------------|" >> $GITHUB_STEP_SUMMARY
+        {
+          echo "## Router E2E Genai-Bench Results Summary"
+          echo ""
+          echo "Results captured from E2E tests for two scenarios: regular router (2 workers, dp=2) and PD router (2 prefill + 2 decode)."
+          echo ""
+          echo "| Scenario | Status | TTFT (s) | E2E Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |"
+          echo "|----------|--------|----------|-----------------|--------------------------|---------------------------|"
+        } >> "$GITHUB_STEP_SUMMARY"
 
         scenarios=$'Regular (dp=2, round_robin)|benchmark_round_robin_regular\nPD (2 prefill + 2 decode, round_robin)|benchmark_round_robin_pd'
 
@@ -371,16 +375,18 @@ jobs:
               input_display=$(printf "%.0f" "$input_throughput_mean" 2>/dev/null || echo "$input_throughput_mean")
               output_display=$(printf "%.0f" "$output_throughput_mean" 2>/dev/null || echo "$output_throughput_mean")
 
-              echo "| ${label} | ✅ Success | $ttft_display | $e2e_display | $input_display | $output_display |" >> $GITHUB_STEP_SUMMARY
+              echo "| ${label} | ✅ Success | $ttft_display | $e2e_display | $input_display | $output_display |" >> "$GITHUB_STEP_SUMMARY"
 
               # Optional GPU utilization table if monitor output exists
               gpu_json="$result_folder/gpu_utilization.json"
               if [ -f "$gpu_json" ]; then
                 overall_mean=$(jq -r '.overall.mean // 0' "$gpu_json")
-                printf "\n#### GPU Utilization — %s\n\n" "$label" >> $GITHUB_STEP_SUMMARY
-                printf "Overall mean: %.2f%%\n\n" "$overall_mean" >> $GITHUB_STEP_SUMMARY
-                echo "| GPU | Mean (%) | p5 | p10 | p25 | p50 | p75 | p90 | p95 |" >> $GITHUB_STEP_SUMMARY
-                echo "|-----|----------|----|-----|-----|-----|-----|-----|-----|" >> $GITHUB_STEP_SUMMARY
+                {
+                  printf "\n#### GPU Utilization — %s\n\n" "$label"
+                  printf "Overall mean: %.2f%%\n\n" "$overall_mean"
+                  echo "| GPU | Mean (%) | p5 | p10 | p25 | p50 | p75 | p90 | p95 |"
+                  echo "|-----|----------|----|-----|-----|-----|-----|-----|-----|"
+                } >> "$GITHUB_STEP_SUMMARY"
                 jq -r '
                   .per_gpu
                   | to_entries[]
@@ -396,9 +402,9 @@ jobs:
                     ]
                   | @tsv' "$gpu_json" \
                   | while IFS=$'\t' read -r gpu m p5 p10 p25 p50 p75 p90 p95; do
-                      printf "| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |\n" "$gpu" "$m" "$p5" "$p10" "$p25" "$p50" "$p75" "$p90" "$p95" >> $GITHUB_STEP_SUMMARY
+                      printf "| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |\n" "$gpu" "$m" "$p5" "$p10" "$p25" "$p50" "$p75" "$p90" "$p95" >> "$GITHUB_STEP_SUMMARY"
                     done
-                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "" >> "$GITHUB_STEP_SUMMARY"
               fi
             fi
           fi

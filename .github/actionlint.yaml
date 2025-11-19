@@ -1,0 +1,30 @@
+self-hosted-runner:
+  # Custom self-hosted runner labels used in this repository
+  labels:
+    - 1-gpu-runner
+    - 2-gpu-runner
+    - 4-gpu-a10
+    - 4-gpu-b200
+    - 4-gpu-gb200
+    - 4-gpu-h100
+    - 8-gpu-b200
+    - 8-gpu-h20
+    - 8-gpu-h200
+    - 8-gpu-h200-oracle
+    - amd-docker-scale
+    - arm-docker-build-node
+    - arm-kernel-build-node
+    - intel-bmg
+    - linux-aarch64-a3-16
+    - linux-arm64-npu-1
+    - linux-arm64-npu-2
+    - linux-arm64-npu-4
+    - linux-mi300-gpu-1
+    - linux-mi300-gpu-2
+    - linux-mi300-gpu-8
+    - linux-mi325-gpu-2-nightly
+    - ubuntu-22.04-arm
+    - x64-cu13-kernel-tests
+    - x64-docker-build-node
+    - x64-kernel-build-node
+    - xeon-gnr

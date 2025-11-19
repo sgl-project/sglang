@@ -75,7 +75,7 @@ jobs:
           sed -i.bak "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" bindings/python/pyproject.toml
 
           # Verify the change
-          cat bindings/python/pyproject.toml | grep "^version"
+          grep "^version" < bindings/python/pyproject.toml
         shell: bash
 
       - name: Install twine and tomli
@@ -161,7 +161,7 @@ jobs:
           sed -i "s/version = \"${CURRENT_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" bindings/python/pyproject.toml
 
           # Verify the change
-          cat bindings/python/pyproject.toml | grep "^version"
+          grep "^version" < bindings/python/pyproject.toml
 
       - name: Build SDist
         uses: PyO3/maturin-action@v1
