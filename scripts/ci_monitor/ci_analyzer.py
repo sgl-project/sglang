@@ -593,9 +593,7 @@ class SGLangCIAnalyzer:
             if stats.get("performance_metrics"):
                 summary_lines.append("## Nightly Test Performance Metrics")
                 summary_lines.append("")
-                summary_lines.append(
-                    "| Job | Metric | Latest Value | Count | Trend |"
-                )
+                summary_lines.append("| Job | Metric | Latest Value | Count | Trend |")
                 summary_lines.append("|-----|--------|--------------|-------|-------|")
 
                 for job_name in sorted(stats["performance_metrics"].keys()):
@@ -627,9 +625,7 @@ class SGLangCIAnalyzer:
                                         if change_pct > 10:
                                             trend_indicator = f"📈 +{change_pct:.1f}%"
                                         elif change_pct < -10:
-                                            trend_indicator = (
-                                                f"⚠️ 📉 {change_pct:.1f}%"
-                                            )
+                                            trend_indicator = f"⚠️ 📉 {change_pct:.1f}%"
                                         else:
                                             trend_indicator = f"➡️ {change_pct:+.1f}%"
                                     elif (
@@ -639,9 +635,7 @@ class SGLangCIAnalyzer:
                                         if change_pct < -10:
                                             trend_indicator = f"📈 {change_pct:.1f}%"
                                         elif change_pct > 10:
-                                            trend_indicator = (
-                                                f"⚠️ 📉 +{change_pct:.1f}%"
-                                            )
+                                            trend_indicator = f"⚠️ 📉 +{change_pct:.1f}%"
                                         else:
                                             trend_indicator = f"➡️ {change_pct:+.1f}%"
                                     else:
