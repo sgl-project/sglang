@@ -344,7 +344,7 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
   accuracy-test-1-gpu-amd:
-    needs: [check-changes]
+    needs: [check-changes, stage-a-test-1-amd]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
