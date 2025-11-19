@@ -57,6 +57,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
+    set_mnnvl_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -609,6 +610,7 @@ class ModelRunner:
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+        set_mnnvl_mem_all_reduce(self.server_args.enable_flashinfer_mnnvl_allreduce)
 
         if not self.is_draft_worker:
             if self.device == "cpu":

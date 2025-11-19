@@ -281,6 +281,7 @@ def initialize_dp_attention(
         use_pymscclpp=False,
         use_custom_allreduce=False,
         use_torch_symm_mem_all_reduce=False,
+        use_mnnvl_all_reduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,

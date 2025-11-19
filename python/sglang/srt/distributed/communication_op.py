@@ -15,8 +15,8 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     from sglang.srt.layers.flashinfer_allreduce import (
         run_flashinfer_mnnvl_allreduce,
     )
-    if use_flashinfer_mnnvl_allreduce:
-        return run_flashinfer_mnnvl_allreduce(input_)
+    # if use_flashinfer_mnnvl_allreduce:
+    #     return run_flashinfer_mnnvl_allreduce(input_)
 
     return get_tp_group().all_reduce(input_)
 
