@@ -275,7 +275,7 @@ Currently all built-in custom logit processors are defined in module `sglang.srt
 
 Launch a server with `--enable-custom-logit-processor` flag on.
 
-```
+```bash
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --reasoning-parser deepseek-r1 --enable-custom-logit-processor
 ```
 
