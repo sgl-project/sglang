@@ -536,6 +536,9 @@ suite_ascend = {
         TestFile("ascend/test_ascend_deepep.py", 400),
         TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
+    "__not_in_ascend_ci__": [
+        TestFile("ascend/test_mindspore_models.py"),
+    ],
 }
 
 suites.update(suite_amd)
