@@ -180,6 +180,7 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         startup_grace_seconds=30.0,
     ),
     # === Text to Video (T2V) ===
+    # TODO: FastWan2.1, FastWan2.2
     DiffusionTestCase(
         id="fastwan2_1_t2v",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
