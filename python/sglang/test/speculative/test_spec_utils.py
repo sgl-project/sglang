@@ -65,7 +65,7 @@ class TestSpecUtils(unittest.TestCase):
         out_cache_loc = torch.arange(11, 11 + extend_lens_num, device=device)
         last_page_lens = torch.tensor([3], dtype=torch.int32, device=device)
         last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-        duplicate_cache_len = last_page_lens.sum() * (topk - 1)
+        duplicate_cache_len = last_page_lens.sum().item() * (topk - 1)
         target_cache_loc = torch.zeros(
             duplicate_cache_len, dtype=torch.int32, device=device
         )
@@ -82,6 +82,7 @@ class TestSpecUtils(unittest.TestCase):
             source_cache_loc,
             target_cache_loc,
             last_page_lens_cumsum,
+            duplicate_cache_len,
             req_to_token.shape[1],
             topk,
             speculative_num_steps,
@@ -141,7 +142,7 @@ class TestSpecUtils(unittest.TestCase):
         req_to_token[2, :5] = torch.tensor([4, 5, 6, 7, 8], device=device)
         last_page_lens = torch.tensor([0, 3, 1], dtype=torch.int32, device=device)
         last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-        duplicate_cache_len = last_page_lens.sum() * (topk - 1)
+        duplicate_cache_len = last_page_lens.sum().item() * (topk - 1)
         out_cache_loc = torch.arange(
             12, 12 + torch.sum(extend_lens), dtype=torch.int32, device=device
         )
@@ -161,6 +162,7 @@ class TestSpecUtils(unittest.TestCase):
             source_cache_loc,
             target_cache_loc,
             last_page_lens_cumsum,
+            duplicate_cache_len,
             req_to_token.shape[1],
             topk,
             speculative_num_steps,
@@ -264,6 +266,7 @@ class TestSpecUtils(unittest.TestCase):
             source_cache_loc,
             target_cache_loc,
             last_page_lens_cumsum,
+            duplicate_cache_len,
             req_to_token.shape[1],
             topk,
             speculative_num_steps,
@@ -303,7 +306,7 @@ class TestSpecUtils(unittest.TestCase):
         out_cache_loc = torch.arange(
             2000, 2000 + extend_lens_num, dtype=torch.int32, device=device
         )
-        duplicate_cache_len = int(last_page_len * (topk - 1))
+        duplicate_cache_len = last_page_lens.sum().item() * (topk - 1)
         target_cache_loc = torch.zeros(
             duplicate_cache_len, dtype=torch.int32, device=device
         )
@@ -320,6 +323,7 @@ class TestSpecUtils(unittest.TestCase):
             source_cache_loc,
             target_cache_loc,
             last_page_lens_cumsum,
+            duplicate_cache_len,
             req_to_token.shape[1],
             topk,
             speculative_num_steps,

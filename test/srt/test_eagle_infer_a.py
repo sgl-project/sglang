@@ -198,18 +198,20 @@ class TestEAGLERadixCache(CustomTestCase):
         "trust_remote_code": True,
         "attention_backend": "fa3",
         "skip_server_warmup": True,
-        "disable_cuda_graph": True,
-        "base_gpu_id": 3,
+        "cuda_graph_max_bs": 5,
     }
 
     def test_correctness(self):
         os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         configs = [
-            # # Basic config
+            # Basic config
             self.BASE_CONFIG,
             # Chunked prefill & Page Size > 1
-            {**self.BASE_CONFIG, "page_size": 4},
             {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
+            {**self.BASE_CONFIG, "page_size": 4},
+            {**self.BASE_CONFIG, "page_size": 128},
+            # Disable CUDA Graph
+            {**self.BASE_CONFIG, "disable_cuda_graph": True, "base_gpu_id": 5, "page_size": 4},
         ]
 
         for i, config in enumerate(configs):

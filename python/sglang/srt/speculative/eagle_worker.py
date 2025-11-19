@@ -442,6 +442,7 @@ class EAGLEWorker(TpModelWorker):
                     backup_state=True,
                 )
             )
+
         if self.page_size > 1 and self.topk > 1:
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
             duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (self.topk - 1)
@@ -466,6 +467,7 @@ class EAGLEWorker(TpModelWorker):
             source_cache_loc,
             target_cache_loc,
             last_page_lens_cumsum,
+            duplicate_cache_len,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
