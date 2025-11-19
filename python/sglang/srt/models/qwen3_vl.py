@@ -335,9 +335,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         patch_pos_embeds_permute = []
         m_size = self.spatial_merge_size
 
-        embeds = torch.arange(
-            self.num_grid, device=self.pos_embed.weight.device
-        )
+        embeds = torch.arange(self.num_grid, device=self.pos_embed.weight.device)
         embeds = (
             self.pos_embed(embeds)
             .permute(1, 0)
