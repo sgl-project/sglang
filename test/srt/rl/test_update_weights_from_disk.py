@@ -231,7 +231,7 @@ class TestServerUpdateWeightsFromDiskAbortAllRequests(CustomTestCase):
         self.assertNotEqual(updated_model_path, origin_model_path)
 
 
-class TestServerUpdateWeightsFromDiskForce(CustomTestCase):
+class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -267,18 +267,34 @@ class TestServerUpdateWeightsFromDiskForce(CustomTestCase):
         print(json.dumps(response.json()))
         return model_path
 
-    def run_update_weights(self, model_path, force=False):
+    def run_update_weights(self, model_path, non_blocking=False):
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
             json={
                 "model_path": model_path,
-                "force": force,
+                "non_blocking": non_blocking,
             },
         )
         ret = response.json()
         return ret
+    
+    def pause_generation(self):
+        response = requests.post(
+            self.base_url + "/pause_generation",
+            json={"abort_all": False, "retract_all": True},
+        )
+        ret = response.json()
+        return ret
+    
+    def continue_generation(self):
+        response = requests.post(
+            self.base_url + "/continue_generation",
+            json={},
+        )
+        ret = response.json()
+        return ret
 
-    def test_update_weights_force(self):
+    def test_update_weights_non_blocking(self):
         origin_model_path = self.get_model_info()
         print(f"[Server Mode] origin_model_path: {origin_model_path}")
 
@@ -292,8 +308,10 @@ class TestServerUpdateWeightsFromDiskForce(CustomTestCase):
             time.sleep(2)
 
             new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
-            ret = self.run_update_weights(new_model_path, force=True)
+            ret = self.pause_generation()
+            ret = self.run_update_weights(new_model_path, non_blocking=True)
             self.assertTrue(ret["success"])
+            ret = self.continue_generation()
 
             for future in as_completed(futures):
                 self.assertNotEqual(

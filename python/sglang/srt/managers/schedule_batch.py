@@ -1455,17 +1455,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
-    def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = self.reqs
-        for idx in range(len(self.reqs)):
-            self.release_req(idx, len(self.reqs) - idx, server_args)
-
-        self.filter_batch(retracted_reqs)
-        return retracted_reqs
-
     def retract_decode(
-        self,
-        server_args: ServerArgs,
+        self, server_args: ServerArgs, retract_all=False
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1486,10 +1477,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         retracted_reqs = []
         first_iter = True
-        while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
+        while (
+            first_iter
+            or retract_all
+            or (not self.check_decode_mem(selected_indices=sorted_indices))
         ):
-            if len(sorted_indices) == 1:
+            if not retract_all and len(sorted_indices) == 1:
                 # Corner case: only one request left
                 if self.is_hybrid:
                     full_available_size = (
@@ -1507,6 +1500,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
                 break
 
+            if len(sorted_indices) == 0:
+                break
+
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
@@ -1521,6 +1517,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         self.filter_batch(keep_indices=sorted_indices)
+
+        if retract_all:
+            # retract_all does not take effect on new_token_ratio
+            return retracted_reqs
 
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
