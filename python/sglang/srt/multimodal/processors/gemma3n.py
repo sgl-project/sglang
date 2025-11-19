@@ -31,7 +31,6 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
 
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id
-        self.IM_TOKEN_ID = hf_config.image_token_id
 
         self.AUDIO_START_TOKEN_ID = hf_config.boa_token_id
         self.AUDIO_END_TOKEN_ID = hf_config.eoa_token_id
