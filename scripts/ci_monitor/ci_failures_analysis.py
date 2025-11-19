@@ -592,12 +592,127 @@ class SGLangFailuresAnalyzer:
         if not failed_steps:
             return "Unknown Error"
 
-        # Use the name of the first failed step as a simple signature
-        # In the future, this could be enhanced to fetch logs and extract actual error messages
+        # Try to fetch and parse logs for the first failed step
         first_failed_step = failed_steps[0]
+        step_number = first_failed_step.get("number")
+
+        # Attempt to get detailed error from logs
+        if step_number is not None:
+            try:
+                job_id = job.get("id")
+                # Fetch logs for this specific step
+                log_url = (
+                    f"{self.base_url}/repos/{self.repo}/actions/jobs/{job_id}/logs"
+                )
+                response = self.session.get(log_url, timeout=10)
+
+                if response.status_code == 200:
+                    log_text = response.text
+
+                    # Check for specific error patterns in logs (case-insensitive)
+                    log_lower = log_text.lower()
+
+                    # CUDA/GPU Memory errors (most common for GPU clusters)
+                    if (
+                        "cuda out of memory" in log_lower
+                        or "cudaerror: out of memory" in log_lower
+                    ):
+                        return "CUDA OOM"
+                    elif "out of memory" in log_lower and (
+                        "gpu" in log_lower or "device" in log_lower
+                    ):
+                        return "GPU OOM"
+                    elif "out of memory" in log_lower and "cuda" not in log_lower:
+                        return "Out of Memory"
+
+                    # CUDA/GPU device errors
+                    if (
+                        "cuda error: device-side assert" in log_lower
+                        or "device-side assert" in log_lower
+                    ):
+                        return "CUDA Device Assert"
+                    elif (
+                        "cuda error: an illegal memory access" in log_lower
+                        or "illegal memory access" in log_lower
+                    ):
+                        return "CUDA Illegal Memory Access"
+                    elif "cuda error" in log_lower or "cudaerror" in log_lower:
+                        return "CUDA Error"
+                    elif "gpu" in log_lower and (
+                        "hang" in log_lower or "hung" in log_lower
+                    ):
+                        return "GPU Hang"
+                    elif (
+                        "no cuda-capable device" in log_lower
+                        or "cuda device count" in log_lower
+                        and "0" in log_lower
+                    ):
+                        return "No GPU Available"
+
+                    # ROCm/AMD GPU errors
+                    if (
+                        "hipoutofmemoryerror" in log_lower
+                        or "hip out of memory" in log_lower
+                    ):
+                        return "ROCm OOM"
+                    elif "hiperror" in log_lower or "rocm error" in log_lower:
+                        return "ROCm/HIP Error"
+
+                    # NCCL/collective communication errors (multi-GPU)
+                    if "nccl error" in log_lower or "ncclerror" in log_lower:
+                        return "NCCL Error"
+                    elif "timeout after" in log_lower and "nccl" in log_lower:
+                        return "NCCL Timeout"
+
+                    # Process/system errors
+                    if "killed" in log_lower and (
+                        "oom" in log_lower or "out of memory" in log_lower
+                    ):
+                        return "Process Killed (OOM)"
+                    elif "killed" in log_lower or "sigkill" in log_lower:
+                        return "Process Killed"
+                    elif "segmentation fault" in log_lower or "sigsegv" in log_lower:
+                        return "Segmentation Fault"
+
+                    # Timeout errors
+                    if "timeout" in log_lower or "timed out" in log_lower:
+                        return "Timeout"
+
+                    # Connection/network errors
+                    if (
+                        "connection refused" in log_lower
+                        or "connection reset" in log_lower
+                    ):
+                        return "Connection Error"
+                    elif "ssh" in log_lower and (
+                        "failed" in log_lower or "error" in log_lower
+                    ):
+                        return "SSH Error"
+
+                    # Import/module errors
+                    if "modulenotfounderror" in log_lower or "importerror" in log_lower:
+                        return "Import Error"
+
+                    # Assertion errors
+                    if "assertionerror" in log_lower:
+                        return "Assertion Error"
+
+                    # Pytest-specific errors
+                    if (
+                        "pytest" in log_lower
+                        and "error" in log_lower
+                        and "collection" in log_lower
+                    ):
+                        return "Pytest Collection Error"
+
+            except Exception:
+                # If log fetching fails, fall back to step name analysis
+                pass
+
+        # Fallback to step name analysis if we couldn't get logs or didn't find specific errors
         step_name = first_failed_step.get("name", "Unknown Step")
 
-        # Simplify common patterns
+        # Simplify common patterns based on step name
         if "timeout" in step_name.lower():
             return "Timeout"
         elif "setup" in step_name.lower() or "install" in step_name.lower():
