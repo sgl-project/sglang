@@ -10,6 +10,7 @@ use crate::mcp::config::Tool;
 #[derive(Clone)]
 pub struct CachedTool {
     pub server_label: String,
+    pub server_url: String,
     pub tool: Tool,
 }
 
@@ -45,10 +46,15 @@ impl ToolInventory {
     /// Get a tool if it exists
     ///
     /// Accepts qualified tool name in the format `server_label__tool_name`
-    pub fn get_tool(&self, qualified_tool_name: &str) -> Option<(String, Tool)> {
-        self.tools
-            .get(qualified_tool_name)
-            .map(|entry| (entry.server_label.clone(), entry.tool.clone()))
+    /// Returns (server_label, server_url, tool)
+    pub fn get_tool(&self, qualified_tool_name: &str) -> Option<(String, String, Tool)> {
+        self.tools.get(qualified_tool_name).map(|entry| {
+            (
+                entry.server_label.clone(),
+                entry.server_url.clone(),
+                entry.tool.clone(),
+            )
+        })
     }
 
     /// Check if tool exists
@@ -59,10 +65,22 @@ impl ToolInventory {
     /// Insert or update a tool
     ///
     /// Constructs key as server_label__tool_name
-    pub fn insert_tool(&self, tool_name: String, server_label: String, tool: Tool) {
+    pub fn insert_tool(
+        &self,
+        tool_name: String,
+        server_label: String,
+        server_url: String,
+        tool: Tool,
+    ) {
         let qualified_name = format!("{}__{}", server_label, tool_name);
-        self.tools
-            .insert(qualified_name, CachedTool { server_label, tool });
+        self.tools.insert(
+            qualified_name,
+            CachedTool {
+                server_label,
+                server_url,
+                tool,
+            },
+        );
     }
 
     /// Get all tools
@@ -86,7 +104,9 @@ impl ToolInventory {
     // Server Management Methods
     // ============================================================================
 
-    /// Clear all cached tools for a specific server (called when LRU evicts client)
+    /// Clear all cached tools for a specific server
+    ///
+    /// Matches on server_label
     pub fn clear_server_tools(&self, server_label: &str) {
         self.tools
             .retain(|_, cached| cached.server_label != server_label);
@@ -139,13 +159,19 @@ mod tests {
         let inventory = ToolInventory::new();
         let tool = create_test_tool("test_tool");
 
-        inventory.insert_tool("test_tool".to_string(), "server1".to_string(), tool.clone());
+        inventory.insert_tool(
+            "test_tool".to_string(),
+            "server1".to_string(),
+            "url1".to_string(),
+            tool.clone(),
+        );
 
         let result = inventory.get_tool("server1__test_tool");
         assert!(result.is_some());
 
-        let (server_name, retrieved_tool) = result.unwrap();
+        let (server_name, server_url, retrieved_tool) = result.unwrap();
         assert_eq!(server_name, "server1");
+        assert_eq!(server_url, "url1");
         assert_eq!(retrieved_tool.name, "test_tool");
     }
 
@@ -156,7 +182,12 @@ mod tests {
 
         assert!(!inventory.has_tool("server1__check_tool"));
 
-        inventory.insert_tool("check_tool".to_string(), "server1".to_string(), tool);
+        inventory.insert_tool(
+            "check_tool".to_string(),
+            "server1".to_string(),
+            "url1".to_string(),
+            tool,
+        );
 
         assert!(inventory.has_tool("server1__check_tool"));
     }
@@ -168,16 +199,19 @@ mod tests {
         inventory.insert_tool(
             "tool1".to_string(),
             "server1".to_string(),
+            "url1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_tool(
             "tool2".to_string(),
             "server1".to_string(),
+            "url1".to_string(),
             create_test_tool("tool2"),
         );
         inventory.insert_tool(
             "tool3".to_string(),
             "server2".to_string(),
+            "url2".to_string(),
             create_test_tool("tool3"),
         );
 
@@ -198,11 +232,13 @@ mod tests {
         inventory.insert_tool(
             "tool1".to_string(),
             "server1".to_string(),
+            "url1".to_string(),
             create_test_tool("tool1"),
         );
         inventory.insert_tool(
             "tool2".to_string(),
             "server2".to_string(),
+            "url2".to_string(),
             create_test_tool("tool2"),
         );
 
@@ -227,7 +263,12 @@ mod tests {
             let inv = Arc::clone(&inventory);
             let handle = tokio::spawn(async move {
                 let tool = create_test_tool(&format!("tool_{}", i));
-                inv.insert_tool(format!("tool_{}", i), format!("server_{}", i % 3), tool);
+                inv.insert_tool(
+                    format!("tool_{}", i),
+                    format!("server_{}", i % 3),
+                    format!("url_{}", i % 3),
+                    tool,
+                );
             });
             handles.push(handle);
         }
@@ -248,6 +289,7 @@ mod tests {
         inventory.insert_tool(
             "tool1".to_string(),
             "server1".to_string(),
+            "url1".to_string(),
             create_test_tool("tool1"),
         );
 
