@@ -264,11 +264,11 @@ class ServerArgs:
     output_type: str = "pil"
 
     # CPU offload parameters
-    dit_cpu_offload: bool = True
+    dit_cpu_offload: bool = False
     use_fsdp_inference: bool = False
-    text_encoder_cpu_offload: bool = True
-    image_encoder_cpu_offload: bool = True
-    vae_cpu_offload: bool = True
+    text_encoder_cpu_offload: bool = False
+    image_encoder_cpu_offload: bool = False
+    vae_cpu_offload: bool = False
     pin_cpu_memory: bool = True
 
     # STA (Sliding Tile Attention) parameters
