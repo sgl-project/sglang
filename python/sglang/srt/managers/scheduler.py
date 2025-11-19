@@ -341,7 +341,9 @@ class Scheduler(
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.name in {"EAGLE", "EAGLE3"}:
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-            self.drafter_config = ModelConfig(self.server_args.speculative_draft_model_path)
+            self.drafter_config = ModelConfig(
+                self.server_args.speculative_draft_model_path
+            )
         self.draft_worker = self.spec_algorithm.create_draft_worker(
             **draft_worker_kwargs
         )
