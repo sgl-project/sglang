@@ -176,12 +176,12 @@ def fused_marlin_moe(
     if alt_stream is not None and expert_map is not None:
         current_stream = torch.cuda.current_stream()
         alt_stream.wait_stream(current_stream)
-        
+
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
-        
+
         with torch.cuda.stream(alt_stream):
             intermediate_cache3.zero_()
-        
+
         current_stream.wait_stream(alt_stream)
     else:
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
@@ -243,4 +243,3 @@ def fused_marlin_moe_fake(
     routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
-

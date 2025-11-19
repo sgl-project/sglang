@@ -57,8 +57,6 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import gptq_gemm, gptq_marlin_repack, gptq_shuffle
 
-    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
-
 
 logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
@@ -1061,13 +1059,13 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-
-        # Delay the import to avoid circular dependency
 
         assert (
             self.moe_runner_config.activation == "silu"
