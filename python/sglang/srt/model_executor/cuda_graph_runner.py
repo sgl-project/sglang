@@ -140,24 +140,21 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
 def _torch_compile_wrapper(forward):
     return torch.compile(
         torch.no_grad()(forward),
-        mode=os.environ.get(
-            "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-        ),
+        mode=os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"),
         dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
     )
 
 
 def torch_compile(model: torch.nn.Module, server_args, model_config):
     set_torch_compile_config(server_args, model_config)
-    _to_torch(model, reverse=False, num_tokens=1)
     model.forward = _torch_compile_wrapper(model.forward)
-    _to_torch(model, reverse=True, num_tokens=1)
 
 
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
+    enable_fusion: bool,
     num_tokens: int,
     tp_group: GroupCoordinator,
 ):
@@ -166,7 +163,8 @@ def patch_model(
 
     try:
         if enable_compile:
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
+            if not enable_fusion:
+                _to_torch(model, reverse=False, num_tokens=num_tokens)
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
@@ -177,7 +175,8 @@ def patch_model(
             yield model.forward
     finally:
         if enable_compile:
-            _to_torch(model, reverse=True, num_tokens=num_tokens)
+            if not enable_fusion:
+                _to_torch(model, reverse=True, num_tokens=num_tokens)
             tp_group.ca_comm = backup_ca_comm
 
 
@@ -190,11 +189,16 @@ def set_torch_compile_config(server_args, model_config):
     torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
 
     if server_args.enable_torch_compile_fusion:
-        from sglang.srt.compilation.fusion.fusion_manager import FusionManager
+        from sglang.srt.compilation.pass_config import PassConfig
+        from sglang.srt.compilation.pass_manager import PostGradPassManager
 
-        fusion_manager = FusionManager(server_args, model_config)
+        pass_config = PassConfig.from_server_args_and_model_config(
+            server_args, model_config
+        )
+        pass_manager = PostGradPassManager(pass_config)
+        pass_manager.configure()
 
-        torch._inductor.config.post_grad_custom_post_pass = fusion_manager
+        torch._inductor.config.post_grad_custom_post_pass = pass_manager
 
     # FIXME: tmp workaround
     torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -258,6 +262,9 @@ class CudaGraphRunner:
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile_fusion = (
+            model_runner.server_args.enable_torch_compile_fusion
+        )
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -497,6 +504,7 @@ class CudaGraphRunner:
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
+                    self.enable_torch_compile_fusion,
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:

@@ -18,11 +18,7 @@ from types import SimpleNamespace
 import torch
 from torch._inductor.utils import run_and_get_code
 
-from sglang.srt.compilation.fusion.fusion_context import (
-    fusion_context,
-    get_fusion_context,
-)
-from sglang.srt.compilation.fusion.fusion_pass import FusionPass
+from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
 
 # FusionConfig.enable_torch_compile_graph_trace_logs requires
 # log level debug to print the pre and post graph changes
@@ -63,7 +59,7 @@ def topk_softmax_fake(
     pass
 
 
-class ExampleFusionPass(FusionPass):
+class ExampleFusionPass(SGLangPatternMatcherInductorPass):
     def build_pass(self):
         """graph trace of Example Model obtained using TORCH_LOGS="post_grad_graphs"
         def forward(self, arg0_1: "f32[1, 4][4, 1]cuda:0"):
@@ -142,12 +138,9 @@ class ExampleFusionPass(FusionPass):
 
 
 def mock_fusion_manager(graph: torch.fx.graph):
-    with fusion_context():
-        ExampleFusionPass(
-            fusion_config=SimpleNamespace(enable_torch_compile_graph_trace_logs=True)
-        )(graph)
-
-        get_fusion_context().log_stats()
+    ExampleFusionPass(
+        fusion_config=SimpleNamespace(enable_torch_compile_graph_trace_logs=True)
+    )(graph)
 
 
 def test_fusion_example_pass(num_experts, num_tokens, topk):

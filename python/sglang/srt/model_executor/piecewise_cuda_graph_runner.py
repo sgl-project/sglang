@@ -26,6 +26,7 @@ import tqdm
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
+from sglang.srt.compilation.pass_config import PassConfig
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     set_forward_context,
@@ -173,6 +174,10 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
+        self.pass_config = PassConfig.from_server_args_and_model_config(
+            self.model_runner.server_args,
+            self.model_runner.model_config,
+        )
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
 
         # Batch sizes to capture
@@ -228,6 +233,7 @@ class PiecewiseCudaGraphRunner:
                     fullgraph=True,
                     dynamic_arg_dims=None,
                     compile_config=self.compile_config,
+                    pass_config=self.pass_config,
                     graph_pool=get_global_graph_memory_pool(),
                 )
 

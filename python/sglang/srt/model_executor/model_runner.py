@@ -127,7 +127,7 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     set_torch_compile_config,
-    torch_compile
+    torch_compile,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
