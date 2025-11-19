@@ -344,7 +344,6 @@ jobs:
 
   unit-test-backend-1-gpu:
     needs: [stage-a-test-1]
-    if: ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
