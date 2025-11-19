@@ -1526,6 +1526,9 @@ class DeepseekOCRForCausalLM(nn.Module):
                         # Mark as expert weight regardless of whether we can process it
                         is_expert_weight = True
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            # Expert weight not on this rank, will be skipped below
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(
