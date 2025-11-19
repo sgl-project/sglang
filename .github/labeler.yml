@@ -66,6 +66,13 @@ amd:
       - '**/*amd*'
       - '**/*rocm*'
 
+# NPU specific
+npu:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*npu*'
+      - '**/*ascend*'
+
 # DeepSeek specific
 deepseek:
   - changed-files:
