@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 import torch
 
@@ -25,11 +25,13 @@ from sglang.srt.layers.attention.nsa.utils import (
     NSA_ENABLE_MTP_PRECOMPUTE_METADATA,
     NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
     NSA_FUSE_TOPK,
+    can_nsa_prefill_cp_mode1,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
+    nsa_cp_mode1_split_data,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -125,6 +127,10 @@ class NSAMetadata:
     # shape: (seq_lens_sum,)
     topk_indices_offset: Optional[torch.Tensor] = None
 
+    indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    indexer_seq_lens_cpu: Optional[torch.Tensor] = None
+    token_to_batch_idx: Optional[torch.Tensor] = None
+
 
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
@@ -171,6 +177,15 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_cu_seqlens_k(self) -> torch.Tensor:
         return self.attn_metadata.cu_seqlens_k
+
+    def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.attn_metadata.indexer_k_start_end
+
+    def get_indexer_seq_len_cpu(self) -> torch.Tensor:
+        return self.attn_metadata.indexer_seq_lens_cpu
+
+    def get_token_to_batch_idx(self) -> torch.Tensor:
+        return self.attn_metadata.token_to_batch_idx
 
     def topk_transform(
         self,
@@ -525,10 +540,35 @@ class NativeSparseAttnBackend(
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
+        (
+            bs_idx,
+            seqlens_expanded,
+            indexer_seq_lens_cpu,
+            page_table,
+            page_table_1_flattened,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            topk_indices_offset,
+        ) = self._cp_mode1_split(
+            forward_batch,
+            seqlens_expanded,
+            forward_batch.seq_lens_cpu,
+            page_table,
+            page_table_1_flattened,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            topk_indices_offset,
+        )
+        indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
+            forward_batch, bs_idx
+        )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
             nsa_index_topk=self.nsa_index_topk,
+        )
+        nsa_cache_seqlens_int32 = self._pad_nsa_cache_seqlens(
+            forward_batch, nsa_cache_seqlens_int32
         )
         nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
@@ -586,9 +626,179 @@ class NativeSparseAttnBackend(
             real_page_table=self._transform_table_1_to_real(page_table),
             nsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
+            indexer_k_start_end=indexer_k_start_end,
+            indexer_seq_lens_cpu=indexer_seq_lens_cpu,
+            token_to_batch_idx=token_to_batch_idx,
+        )
+        self.forward_metadata = metadata
+
+    def _cp_mode1_split(
+        self,
+        forward_batch: ForwardBatch,
+        seqlens_expanded: torch.Tensor,
+        indexer_seq_lens_cpu,
+        page_table,
+        page_table_1_flattened,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        topk_indices_offset,
+    ):
+        if not can_nsa_prefill_cp_mode1(forward_batch):
+            return (
+                None,
+                seqlens_expanded,
+                indexer_seq_lens_cpu,
+                page_table,
+                page_table_1_flattened,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                topk_indices_offset,
+            )
+        rank_size = get_attention_tp_size()
+        rank_id = get_attention_tp_rank()
+        seqlens_expanded = nsa_cp_mode1_split_data(seqlens_expanded)
+
+        extend_seqs = forward_batch.extend_seq_lens_cpu
+        extra_seq = 0
+        q_seqs = []
+        for bs, cur_len in enumerate(extend_seqs):
+            cur_len += extra_seq
+            cur_seq = cur_len // rank_size + int(cur_len % rank_size > rank_id)
+            q_seqs.append(cur_seq)
+            extra_seq = cur_len - cur_seq * rank_size
+        bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
+        q_seqs = [q_len for q_len in q_seqs if q_len > 0]
+        cu_seqlens_q = torch.tensor(
+            q_seqs, device=cu_seqlens_q.device, dtype=cu_seqlens_q.dtype
+        )
+        cu_seqlens_q = compute_cu_seqlens(cu_seqlens_q)
+
+        indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx]
+        page_table = page_table[bs_idx]
+        if page_table_1_flattened is not None:
+            seq_lens_cpu = forward_batch.seq_lens_cpu[bs_idx]
+            page_table_1_flattened = torch.cat(
+                [
+                    page_table[i, :kv_len]
+                    for i, kv_len in enumerate(
+                        seq_lens_cpu.tolist(),
+                    )
+                ]
+            )
+        if forward_batch.forward_mode.is_target_verify():
+            draft_token_num = self.speculative_num_draft_tokens
+        else:
+            draft_token_num = 0
+        cache_seqlens_int32 = (forward_batch.seq_lens[bs_idx] + draft_token_num).to(
+            torch.int32
+        )
+        cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+        if topk_indices_offset is not None:
+            topk_indices_offset = torch.repeat_interleave(
+                cu_seqlens_k[:-1],
+                q_seqs,
+            )
+
+        return (
+            bs_idx,
+            seqlens_expanded,
+            indexer_seq_lens_cpu,
+            page_table,
+            page_table_1_flattened,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            topk_indices_offset,
         )
 
-        self.forward_metadata = metadata
+    def _pad_nsa_cache_seqlens(self, forward_batch: ForwardBatch, nsa_cache_seqlens):
+        attn_tp_size = get_attention_tp_size()
+        if attn_tp_size == 1 and not can_nsa_prefill_cp_mode1(forward_batch):
+            return nsa_cache_seqlens
+        tokens = sum(forward_batch.extend_seq_lens_cpu)
+        pad_len = (tokens - 1) // attn_tp_size + 1 - nsa_cache_seqlens.shape[0]
+        if pad_len > 0:
+            nsa_cache_seqlens = torch.cat(
+                [
+                    nsa_cache_seqlens,
+                    nsa_cache_seqlens.new_zeros(pad_len, *nsa_cache_seqlens.shape[1:]),
+                ]
+            )
+        return nsa_cache_seqlens
+
+    def _cal_indexer_k_start_end(
+        self,
+        forward_batch: ForwardBatch,
+        bs_idx: Optional[List[int]] = None,
+    ):
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            return None, None
+        if forward_batch.batch_size == 0 or (bs_idx is not None and len(bs_idx) == 0):
+            empty_t = torch.empty(0, dtype=torch.int32, device=self.device)
+            return (empty_t, empty_t), empty_t
+
+        # Suppose there are two requests, with extend_seq_len = [3, 2]
+        # and seq_lens = [10, 4]
+        # The logits matrix looks like this, with * representing the valid logits
+        # and - representing the invalid logits:
+        #
+        #  ********--|----
+        #  *********-|----
+        #  **********|----
+        #  ----------|***-
+        #  ----------|****
+        #
+        # ks = [0, 0, 0, 10, 10]
+        # ke = [8, 9, 10, 13, 14]
+        ks_list = []
+        ke_list = []
+        token_to_batch_idx = []
+
+        q_offset = 0
+        k_offset = 0
+
+        assert (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+        for i in range(forward_batch.batch_size):
+            seq_len = forward_batch.seq_lens_cpu[i].item()
+            assert isinstance(seq_len, int)
+            extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
+            ks = torch.full(
+                (extend_seq_len,), k_offset, dtype=torch.int32, device=self.device
+            )
+            kv_len = seq_len
+            if forward_batch.forward_mode.is_target_verify():
+                kv_len += self.speculative_num_draft_tokens
+            seq_lens_expanded = torch.arange(
+                kv_len - extend_seq_len + 1,
+                kv_len + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            ke = ks + seq_lens_expanded
+            ks_list.append(ks)
+            ke_list.append(ke)
+
+            bi = bs_idx.index(i) if (bs_idx is not None and i in bs_idx) else i
+            tb = torch.full(
+                (extend_seq_len,), bi, dtype=torch.int32, device=self.device
+            )
+            token_to_batch_idx.append(tb)
+
+            if bs_idx is None or i in bs_idx:  # skip batch not included in bs_idx
+                q_offset += extend_seq_len
+                k_offset += seq_len
+
+        ks = torch.cat(ks_list, dim=0)
+        ke = torch.cat(ke_list, dim=0)
+        token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
+        if bs_idx is not None:
+            assert can_nsa_prefill_cp_mode1(forward_batch)
+            ks = nsa_cp_mode1_split_data(ks)
+            ke = nsa_cp_mode1_split_data(ke)
+            token_to_batch_idx = nsa_cp_mode1_split_data(token_to_batch_idx)
+        return (ks, ke), token_to_batch_idx
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.

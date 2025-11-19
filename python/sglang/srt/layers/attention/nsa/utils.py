@@ -1,14 +1,23 @@
 # temp NSA debugging environ
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import List
+from typing import TYPE_CHECKING, List, Union
 
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 
 NSA_DUAL_STREAM = get_bool_env_var("SGLANG_NSA_DUAL_STREAM", "true")
 NSA_FUSE_TOPK = get_bool_env_var("SGLANG_NSA_FUSE_TOPK", "true")
@@ -41,6 +50,39 @@ def is_nsa_enable_prefill_cp():
     return get_global_server_args().enable_nsa_prefill_context_parallel
 
 
+def is_nsa_prefill_cp_mode0():
+    return (
+        is_nsa_enable_prefill_cp() and get_global_server_args().nsa_prefill_cp_mode == 0
+    )
+
+
+def is_nsa_prefill_cp_mode1():
+    return (
+        is_nsa_enable_prefill_cp() and get_global_server_args().nsa_prefill_cp_mode == 1
+    )
+
+
+def can_nsa_prefill_cp_mode1(forward_batch: "ForwardBatch"):
+    cp_size = get_attention_tp_size()
+    seq_len = sum(forward_batch.extend_seq_lens_cpu)
+    return (
+        is_nsa_prefill_cp_mode1()
+        and seq_len > 0
+        and cp_size > 1
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    )
+
+
+def nsa_cp_mode1_split_data(input_: Union[torch.Tensor, List]):
+    cp_size = get_attention_tp_size()
+    cp_rank = get_attention_tp_rank()
+    if isinstance(input_, (tuple, list)) or len(input_) % cp_size != 0:
+        indices = range(cp_rank, len(input_), cp_size)
+        return input_[indices]
+    # for torch device tensor
+    return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
+
+
 @dataclass
 class NSAContextParallelMetadata:
 
@@ -61,7 +103,17 @@ class NSAContextParallelMetadata:
     total_seq_lens: torch.Tensor = None
 
 
-def can_cp_split(cur_cp_seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+    if is_nsa_prefill_cp_mode1():
+        cur_cp_seq_len = seq_len // cp_size
+        assert (
+            seq_len % cp_size == 0
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is 1"
+    else:
+        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
+        # the seq data needs to be divided and recombined at twice the size of cp_size.
+        cur_cp_seq_len = seq_len // (cp_size * 2)
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
@@ -75,6 +127,13 @@ def can_cp_split(cur_cp_seq_len: int, cp_size: int, use_nsa: bool, forward_batch
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
+    if is_nsa_prefill_cp_mode1():
+        cp_size = get_attention_tp_size()
+        assert (
+            input_.shape[0] % cp_size == 0
+        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        return nsa_cp_mode1_split_data(input_)
+
     input_list = list(
         torch.split(input_, forward_batch.nsa_cp_metadata.split_list, dim=0)
     )
@@ -85,6 +144,14 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
+    if is_nsa_prefill_cp_mode1():
+        cp_size = get_attention_tp_size()
+        assert positions.shape[0] % cp_size == 0, (
+            f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
+            f"cp size {cp_size}"
+        )
+        return nsa_cp_mode1_split_data(positions)
+
     position_id_list = list(
         torch.split(positions, forward_batch.nsa_cp_metadata.split_list, dim=-1)
     )
@@ -95,7 +162,9 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
-def enable_prefill_cp(forward_batch, nsa_enable_prefill_cp):
+def enable_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
+    if nsa_enable_prefill_cp is None:
+        nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
     if (
         forward_batch.nsa_cp_metadata is not None
         and nsa_enable_prefill_cp
@@ -162,6 +231,22 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
     """
+    if is_nsa_prefill_cp_mode1():
+        output_tensor = input_tensor.new_empty(
+            (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+        )
+        attn_tp_all_gather_into_tensor(
+            output_tensor,
+            input_tensor,
+        )
+        out_shape = output_tensor.shape
+        output_tensor = (
+            output_tensor.view(cp_size, -1, *out_shape[1:])
+            .transpose(0, 1)
+            .reshape(out_shape)
+        )
+        return output_tensor
+
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
@@ -274,6 +359,7 @@ def prepare_input_dp_with_cp_dsa(
     - To mitigate uneven load, the input hissenstate needs to be sliced by cp_size*2 and rearranged.
     """
     # just support batch = 1
+    kv_len = torch.tensor(kv_len)
     bs_per_cp_group = 1
     kv_len_origin = kv_len
     # get zigzag index
