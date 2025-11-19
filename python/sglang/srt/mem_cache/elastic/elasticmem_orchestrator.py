@@ -121,13 +121,17 @@ class ElasticMempoolOrchestrator:
                 or (allocator.token_usage() < unmap_candidate.token_usage())
             ):
                 unmap_candidate = allocator
-        logger.info("ElasticMempoolOrchestrator try_resize")
 
         if (
             map_candidate is not None
             and unmap_candidate is not None
             and map_candidate != unmap_candidate
         ):
+            logger.info(
+                "ElasticMempoolOrchestrator try_resize "
+                f"{map_candidate.token_usage()=}, "
+                f"{unmap_candidate.token_usage()=}"
+            )
             self.do_resize(map_candidate, unmap_candidate)
 
     def do_resize(

@@ -92,7 +92,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
         self.k_buffer = [etensor.etensor for etensor in self.ek_buffer]
         self.v_buffer = [etensor.etensor for etensor in self.ev_buffer]
         self.state_memsize = self.ek_buffer[0].state_memsize
-        logger.debug(f"{self.esize=}, {self.k_buffer[0].shape=}")
+        logger.debug(f"{self.esize=}, {self.k_buffer[0].shape=}, {self.state_memsize=}")
 
     @override
     def disable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:

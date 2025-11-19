@@ -89,8 +89,8 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
 
     @override
     def can_unmap(self) -> bool:
-        if self.token_usage() < 0.9:
-            return True
+        if self.token_usage() > 0.9:
+            return False
 
         self.merge_and_sort_free()
         cu_page_token = (cu_page_size // self._kvcache.state_memsize + 1) * 2
@@ -120,6 +120,9 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
                     False
                 ), f"{self.size=}, {mid=}, {len(self.free_pages)=}, {self.free_pages[mid:]}"
 
+        logger.debug(
+            f"{tail_consecutive_size=}, {(low, mid, high)=}, {self.free_pages[mid]=}, {self.free_pages[-1]=}"
+        )
         need_size = tail_consecutive_size // 2
         if need_size <= 0:
             return 0

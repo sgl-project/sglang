@@ -1645,6 +1645,9 @@ class Scheduler(
             else:
                 ret = None
 
+        if use_elasticmem and ret:
+            self.emem_orch.try_resize()
+
         # Handle DP attention
         if need_dp_attn_preparation:
             ret = self.prepare_mlp_sync_batch(ret)
@@ -1819,9 +1822,6 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
-
-        if use_elasticmem and flag_no_token:
-            self.emem_orch.try_resize()
 
         # Mixed-style chunked prefill
         if (
