@@ -3609,7 +3609,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
-
     # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
     def _transform_scale_ue8m0(self, is_nextn=False):
         num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers

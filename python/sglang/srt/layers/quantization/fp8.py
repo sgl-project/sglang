@@ -369,7 +369,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 return
             else:
                 # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
-                from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+                from sglang.srt.model_loader.utils import (
+                    should_deepgemm_weight_requant_ue8m0,
+                )
+
                 if should_deepgemm_weight_requant_ue8m0(
                     weight_block_size=getattr(
                         self.quant_config, "weight_block_size", None
