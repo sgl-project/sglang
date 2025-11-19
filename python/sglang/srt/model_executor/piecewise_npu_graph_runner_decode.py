@@ -46,10 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    rank0_log,
-)
+from sglang.srt.utils import get_available_gpu_memory, rank0_log
 
 torch._dynamo.config.skip_nnmodule_hook_guards = True
 torch._dynamo.config.automatic_dynamic_shapes = False
