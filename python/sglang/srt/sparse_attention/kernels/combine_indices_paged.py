@@ -169,6 +169,79 @@ def combine_indices_paged_kernel(
             tl.store(new_seq_lens_ptr + batch_idx, seq_len)
 
 
+@triton.jit
+def combine_indices_paged_sync_kernel(
+    retrived_cache_indices_page_ptr,
+    cur_req_pool_indices_ptr,
+    req_to_token_ptr,
+    seq_lens_ptr,
+    diff_ptr,
+    new_seq_lens_ptr,
+    page_table_ptr,
+    num_kv_heads : tl.constexpr,
+    cache_len : tl.constexpr,
+    num_sink_pages : tl.constexpr,
+    num_local_pages : tl.constexpr,
+    max_seq_len : tl.constexpr,
+    max_pages : tl.constexpr,
+    page_size : tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    batch_idx = pid // num_kv_heads
+    kv_head_idx = pid % num_kv_heads
+    
+    # bs, num_kv_heads, num_pages
+    # copy sink
+    cur_req_idx = tl.load(cur_req_pool_indices_ptr + batch_idx)
+    if cur_req_idx < 0:
+        return
+    req_to_token_ptr = req_to_token_ptr + cur_req_idx * max_seq_len
+    retrived_cache_indices_page_ptr = retrived_cache_indices_page_ptr + batch_idx * cache_len * num_kv_heads + kv_head_idx * cache_len
+    page_table_ptr = page_table_ptr + cur_req_idx * num_kv_heads * max_pages + kv_head_idx * max_pages
+    
+    seq_len = tl.load(seq_lens_ptr + batch_idx).to(tl.int32)
+    num_pages = (seq_len + page_size - 1) // page_size
+    if num_pages < cache_len + num_sink_pages + num_local_pages:
+        for i in range(0, num_pages, BLOCK_SIZE):
+            block_offsets = tl.arange(0, BLOCK_SIZE) + i
+            block_mask = block_offsets < num_pages
+            cache_vals = tl.load(
+                retrived_cache_indices_page_ptr + block_offsets,
+                mask=block_mask,
+                other=0
+            )
+            tl.store(page_table_ptr + block_offsets, cache_vals, mask=block_mask)
+            tl.store(new_seq_lens_ptr + batch_idx, seq_len)
+    else:
+        for i in range(num_sink_pages):
+            token_offset = i * page_size 
+            sink_indices = tl.load(req_to_token_ptr + token_offset, mask=token_offset < seq_len) // page_size
+            tl.store(page_table_ptr + i, sink_indices)
+            
+            
+        for i in range(0, cache_len, BLOCK_SIZE):
+            block_offsets = tl.arange(0, BLOCK_SIZE) + i
+            block_mask = block_offsets < cache_len
+            cache_vals = tl.load(
+                retrived_cache_indices_page_ptr + block_offsets,
+                mask=block_mask,
+                other=0
+            )
+            tl.store(page_table_ptr + block_offsets + num_sink_pages, cache_vals, mask=block_mask)
+
+
+        for i in range(num_local_pages):
+            token_offset = (num_pages - num_local_pages + i)*page_size
+            local_indices = tl.load(req_to_token_ptr + token_offset) // page_size
+            tl.store(page_table_ptr + num_sink_pages + cache_len + i, local_indices)
+        
+        if kv_head_idx == 0:
+            diff_val = tl.load(diff_ptr + batch_idx)
+            tl.store(new_seq_lens_ptr + batch_idx, page_size * (cache_len + num_sink_pages + num_local_pages) - diff_val)
+
+
 def combine_indices(
     retrived_cache_indices: torch.Tensor,  # [pre_bs, cache_len] or [max_bs, num_kv_heads, top_k]
     cur_req_pool_indices: torch.Tensor,  # [cur_bs]
@@ -182,6 +255,7 @@ def combine_indices(
     num_local_pages: int,
     page_size: int,
     budget_size: int,
+    async_retrive: bool,
 ) -> torch.Tensor:
     cur_bs = cur_req_pool_indices.shape[0]
     max_bs_pre = pre_req_pool_indices.shape[0]
@@ -191,29 +265,48 @@ def combine_indices(
     
     grid = (cur_bs * num_kv_heads,)
     
-    BLOCK_SIZE = 256
-    
-    combine_indices_paged_kernel[grid](
-        retrived_cache_indices,
-        cur_req_pool_indices,
-        pre_req_pool_indices,
-        req_to_token,
-        seq_lens,
-        diff,
-        new_seq_lens,
-        page_table,
-        cur_bs,
-        max_bs_pre,
-        max_bs,
-        num_kv_heads,
-        cache_len,
-        num_sink_pages,
-        num_local_pages,
-        max_seq_len,
-        max_pages,
-        page_size,
-        budget_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    BLOCK_SIZE = 32
+
+    if async_retrive:
+        combine_indices_paged_kernel[grid](
+            retrived_cache_indices,
+            cur_req_pool_indices,
+            pre_req_pool_indices,
+            req_to_token,
+            seq_lens,
+            diff,
+            new_seq_lens,
+            page_table,
+            cur_bs,
+            max_bs_pre,
+            max_bs,
+            num_kv_heads,
+            cache_len,
+            num_sink_pages,
+            num_local_pages,
+            max_seq_len,
+            max_pages,
+            page_size,
+            budget_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+    else:
+        combine_indices_paged_sync_kernel[grid](
+            retrived_cache_indices,
+            cur_req_pool_indices,
+            req_to_token,
+            seq_lens,
+            diff,
+            new_seq_lens,
+            page_table,
+            num_kv_heads,
+            cache_len,
+            num_sink_pages,
+            num_local_pages,
+            req_to_token.stride(0),
+            page_table.stride(1),
+            page_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
     return new_seq_lens[:cur_bs]
 

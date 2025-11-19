@@ -232,6 +232,7 @@ class NaiveDecodeSparseRetriver:
             num_local_pages=num_local_pages,
             page_size=self.cache_manager.config.page_size,
             budget_size=self.budget_per_seq,
+            async_retrive=self.cache_manager.config.async_retrive,
         )
 
     def retrive_decode(
