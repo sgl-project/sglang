@@ -311,9 +311,9 @@ class PerformanceValidator:
         upper_bound = expected * (1 + tolerance)
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
-            f"  - Actual:   {actual:.2f}ms\n"
-            f"  - Expected: {expected:.2f}ms\n"
-            f"  - Limit:    {upper_bound:.2f}ms (tolerance: {tolerance:.1%})"
+            f"  - Actual:   {actual:.4f}ms\n"
+            f"  - Expected: {expected:.4f}ms\n"
+            f"  - Limit:    {upper_bound:.4f}ms (tolerance: {tolerance:.1%})"
         )
 
     def validate(

@@ -211,7 +211,7 @@
             "total_frames": 49,
             "avg_frame_time_ms": 1951.36
         },
-        "wan2_2_i2v-a14b": {
+        "wan2_2_i2v_a14b": {
             "notes": "Wan-AI/Wan2.2-I2V-A14B",
             "expected_e2e_ms": 282500.0,
             "expected_avg_denoise_ms": 7000.0,
@@ -301,7 +301,7 @@
                 "InputValidationStage": 47.04,
                 "TextEncodingStage": 2321.27,
                 "ImageEncodingStage": 2314.32,
-                "ConditioningStage": 0.01,
+                "ConditioningStage": 0.0105,
                 "TimestepPreparationStage": 1.98,
                 "LatentPreparationStage": 5.24,
                 "ImageVAEEncodingStage": 1887.64,

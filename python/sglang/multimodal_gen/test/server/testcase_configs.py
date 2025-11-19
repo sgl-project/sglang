@@ -194,7 +194,7 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     ),
     # === Image to Video (I2V) ===
     DiffusionTestCase(
-        id="wan2_2_i2v",
+        id="wan2_2_i2v_a14b",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
         modality="video",
         prompt="generate",  # passing in something since failing if no prompt is passed
