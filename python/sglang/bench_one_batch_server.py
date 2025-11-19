@@ -402,6 +402,7 @@ def run_one_case(
 
     # The TTFT of the last request in the batch
     ttft = 0.0
+    last_time = tic
     for chunk in response.iter_lines(decode_unicode=False):
         chunk = chunk.decode("utf-8")
         if chunk and chunk.startswith("data:"):
@@ -416,7 +417,8 @@ def run_one_case(
                 or data["meta_info"]["finish_reason"]["type"] == "length"
             )
             if data["meta_info"]["completion_tokens"] == 1:
-                ttft = time.perf_counter() - tic
+                ttft += time.perf_counter() - last_time
+            last_time = time.perf_counter()
 
     latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / ttft
