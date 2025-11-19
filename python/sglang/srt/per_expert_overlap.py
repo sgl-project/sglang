@@ -7,6 +7,8 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import is_peo_enable
 from sglang.srt.layers.moe.ep_moe.layer import PeoDeepEPMoE
 
+GEMM_STREAM = torch.cuda.Stream()
+COMM_STREAM = torch.cuda.Stream()
 
 def forward_overlap_1(
     experts: PeoDeepEPMoE,
@@ -15,7 +17,6 @@ def forward_overlap_1(
     current_stream: torch.cuda.Stream,
 ):
     global combine_state, dispatch_output
-    gemm_stream = torch.cuda.Stream()
     states = list()
     gemm_done_events = list()
     moe_hidden_states = list()
@@ -42,15 +43,15 @@ def forward_overlap_1(
             forward_batch=states[round_id][0],
             inner_state=states[round_id][1],
         )
-        gemm_stream.wait_stream(current_stream)
-        with torch.cuda.stream(gemm_stream):
+        GEMM_STREAM.wait_stream(current_stream)
+        with torch.cuda.stream(GEMM_STREAM):
             num_experts_per_round = experts.num_experts // experts.num_ranks // experts.num_rounds
             start_idx = num_experts_per_round * round_id
             end_idx = start_idx + num_experts_per_round
             moe_hidden_state = experts.run_moe_core(dispatch_output, start_idx, end_idx)
             moe_hidden_states.append(moe_hidden_state)
             gemm_done_event = torch.cuda.Event()
-            gemm_stream.record_event(gemm_done_event)
+            GEMM_STREAM.record_event(gemm_done_event)
             gemm_done_events.append(gemm_done_event)
 
     # combine send
@@ -76,7 +77,7 @@ def forward_overlap_1(
     combined_x = experts.dispatcher.combine_b_peo(
         forward_batch=combine_state[0], inner_state=combine_state[1])
 
-    current_stream.wait_stream(gemm_stream)
+    current_stream.wait_stream(GEMM_STREAM)
     return combined_x
 
 
@@ -85,11 +86,9 @@ def forward_overlap_2_3(
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
     current_stream: torch.cuda.Stream,
-    comm_stream: torch.cuda.Stream,
 ):
     states = list()
     gemm_done_events = list()
-    gemm_stream = torch.cuda.Stream()
 
     global dispatch_output, combine_state
     hook_use_default_stream = experts.overlap_type == 2
@@ -117,23 +116,23 @@ def forward_overlap_2_3(
                 inner_state=state[1],
             )
         else:
-            comm_stream.wait_stream(current_stream)
-            with torch.cuda.stream(comm_stream):
+            COMM_STREAM.wait_stream(current_stream)
+            with torch.cuda.stream(COMM_STREAM):
                 dispatch_output = experts.dispatcher.dispatch_b_peo(
                     forward_batch=state[0],
                     inner_state=state[1],
                 )
-            gemm_stream.wait_stream(comm_stream)
+            GEMM_STREAM.wait_stream(COMM_STREAM)
 
         # GEMM
-        gemm_stream.wait_stream(current_stream)
+        GEMM_STREAM.wait_stream(current_stream)
         num_experts_per_round = experts.num_experts // experts.num_ranks // experts.num_rounds
         start_idx = num_experts_per_round * round_id
         end_idx = start_idx + num_experts_per_round
-        with torch.cuda.stream(gemm_stream):
+        with torch.cuda.stream(GEMM_STREAM):
             experts.run_moe_core(dispatch_output, start_idx, end_idx)
             gemm_done_event = torch.cuda.Event()
-            gemm_stream.record_event(gemm_done_event)
+            GEMM_STREAM.record_event(gemm_done_event)
             gemm_done_events.append(gemm_done_event)
 
     # combine send
@@ -152,18 +151,18 @@ def forward_overlap_2_3(
         )
         current_stream.wait_event(gemm_done_events[round_id])
         if not hook_use_default_stream:
-            current_stream.wait_stream(comm_stream)
+            current_stream.wait_stream(COMM_STREAM)
 
     # combine recv
     if hook_use_default_stream:
         combined_x, event, hook = experts.dispatcher.combine_b_peo(inner_state=combine_state)
     else:
-        comm_stream.wait_stream(current_stream)
-        with torch.cuda.stream(comm_stream):
+        COMM_STREAM.wait_stream(current_stream)
+        with torch.cuda.stream(COMM_STREAM):
             combined_x, event, hook = experts.dispatcher.combine_b_peo(inner_state=combine_state)
-        current_stream.wait_stream(comm_stream)
+        current_stream.wait_stream(COMM_STREAM)
 
-    current_stream.wait_stream(gemm_stream)
+    current_stream.wait_stream(GEMM_STREAM)
     return combined_x
 
 def forward_overlap_4(
@@ -171,12 +170,11 @@ def forward_overlap_4(
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
     current_stream: torch.cuda.Stream,
-    comm_stream: torch.cuda.Stream,
 ):
     gemm_done_events = list()
     # dispatch
-    comm_stream.wait_stream(current_stream)
-    with torch.cuda.stream(comm_stream):
+    COMM_STREAM.wait_stream(current_stream)
+    with torch.cuda.stream(COMM_STREAM):
         dispatch_output = experts.dispatch(hidden_states, topk_output)
 
         # current_stream.wait_stream(comm_stream)
@@ -187,7 +185,7 @@ def forward_overlap_4(
             experts.run_moe_core(dispatch_output, start_idx, end_idx)
 
             gemm_done_event = torch.cuda.Event()
-            comm_stream.record_event(gemm_done_event)
+            COMM_STREAM.record_event(gemm_done_event)
             gemm_done_events.append(gemm_done_event)
 
     # combine send
@@ -209,7 +207,7 @@ def forward_overlap_4(
         # combine recv
         combined_x, event, hook = experts.dispatcher.combine_b_peo(inner_state=combine_state)
 
-    current_stream.wait_stream(comm_stream)
+    current_stream.wait_stream(COMM_STREAM)
     return combined_x
 
 
@@ -229,22 +227,18 @@ def execute_peo(
                 current_stream,
             )
         elif experts.overlap_method == 2 or experts.overlap_method == 3:
-            comm_stream = torch.cuda.Stream()
             return forward_overlap_2_3(
                 experts,
                 hidden_states,
                 topk_output,
                 current_stream,
-                comm_stream,
             )
         elif experts.overlap_method == 4:
-            comm_stream = torch.cuda.Stream()
             return forward_overlap_4(
                 experts,
                 hidden_states,
                 topk_output,
                 current_stream,
-                comm_stream,
             )
         else:
             raise ValueError(f"Invalid overlap_method: {experts.overlap_method}")
