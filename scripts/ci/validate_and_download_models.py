@@ -39,6 +39,7 @@ except ImportError:
 RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "1-gpu-runner": [
         "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+        "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
         "deepseek-ai/DeepSeek-OCR",
         "google/gemma-3-4b-it",
         "intfloat/e5-mistral-7b-instruct",
