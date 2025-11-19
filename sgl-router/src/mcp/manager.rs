@@ -154,9 +154,9 @@ impl McpManager {
         self.inventory.list_tools()
     }
 
-    /// Call a tool by name with automatic type coercion
+    /// Call a tool by qualified name with automatic type coercion
     ///
-    /// Accepts qualified tool name (server_label__tool_name) or legacy tool name.
+    /// Accepts qualified tool name in the format `server_label__tool_name`.
     /// Accepts either JSON string or parsed Map as arguments.
     /// Automatically converts string numbers to actual numbers based on tool schema.
     pub async fn call_tool(

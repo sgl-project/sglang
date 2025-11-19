@@ -44,7 +44,7 @@ impl ToolInventory {
 
     /// Get a tool if it exists
     ///
-    /// Accepts either full key (server_label__tool_name) or constructs it from separate parts
+    /// Accepts qualified tool name in the format `server_label__tool_name`
     pub fn get_tool(&self, qualified_tool_name: &str) -> Option<(String, Tool)> {
         self.tools
             .get(qualified_tool_name)
