@@ -457,7 +457,7 @@ class ServerArgs:
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
-    dllm_block_size: Optional[int] = None
+    dllm_algorithm_config: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -3296,10 +3296,10 @@ class ServerArgs:
             help="The diffusion LLM algorithm.",
         )
         parser.add_argument(
-            "--dllm-block-size",
-            type=int,
-            default=ServerArgs.dllm_block_size,
-            help="The number of tokens processed in each iteration of the block diffusion LLM.",
+            "--dllm-algorithm-config",
+            type=str,
+            default=ServerArgs.dllm_algorithm_config,
+            help="The config of diffusion LLM algorithm, including block size, threshold, etc.",
         )
 
         # Double Sparsity
