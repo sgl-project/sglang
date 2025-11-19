@@ -48,7 +48,6 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -80,6 +79,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
+from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -369,12 +369,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 return
             else:
-                if (
-                    deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                    and hasattr(self.quant_config, "weight_block_size")
-                    and self.quant_config.weight_block_size is not None
-                    and self.w8a8_block_fp8_linear
+                # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
+                if should_deepgemm_weight_requant_ue8m0(
+                    weight_block_size=getattr(
+                        self.quant_config, "weight_block_size", None
+                    )
+                ) and (
+                    self.w8a8_block_fp8_linear
                     is deepgemm_w8a8_block_fp8_linear_with_fallback
                 ):
                     requant_weight_ue8m0_inplace(
