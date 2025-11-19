@@ -95,7 +95,6 @@
                 "49": 410.42
             }
         },
-
         "flux_image_t2i": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
