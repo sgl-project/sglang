@@ -247,6 +247,7 @@ def assign_draft_cache_locs(
                 mask=combined_mask,
             )
 
+
 @triton.jit
 def generate_draft_decode_kv_indices(
     req_pool_indices,

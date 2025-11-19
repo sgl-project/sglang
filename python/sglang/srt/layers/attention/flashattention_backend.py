@@ -645,8 +645,8 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             if (
-                self.topk > 1 
-                and forward_batch.forward_mode.is_decode_or_idle() 
+                self.topk > 1
+                and forward_batch.forward_mode.is_decode_or_idle()
                 and forward_batch.spec_info is not None
             ):
                 # Modifies cache_seqlens_int32 and page_table(B, speculative_num_steps).
@@ -655,25 +655,21 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cache_seqlens_int32 -= last_page_lens  # Both (B, )
 
                 # Second attention handles last_page_len + decode part.
-                expanded_last_page_lens = last_page_lens.repeat_interleave(
-                    self.topk
-                )
+                expanded_last_page_lens = last_page_lens.repeat_interleave(self.topk)
                 self.forward_metadata_spec_decode_expand.cache_seqlens_int32 += (
                     expanded_last_page_lens
                 )
                 decode_length = self.speculative_step_id + 1
-                expand_page_table = cache_loc[
-                    :, : decode_length
-                ].clone()
+                expand_page_table = cache_loc[:, :decode_length].clone()
                 strided_indices_expand = torch.arange(
                     0,
                     decode_length,
                     self.page_size,
                     device=self.device,
                 )
-                last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(
-                    -1
-                ).expand(-1, expand_page_table.shape[1])
+                last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(-1).expand(
+                    -1, expand_page_table.shape[1]
+                )
                 expand_page_table -= last_page_lens_broadcast
                 expand_page_table = (
                     expand_page_table[:, strided_indices_expand] // self.page_size
@@ -835,7 +831,7 @@ class FlashAttentionBackend(AttentionBackend):
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    # Here metadata_expand.page_table is not devided with page_size.
+                    # Here metadata_expand.page_table is not divided with page_size.
                     # This is because we loose the fine control of  what token to attend,
                     # but has to attend to some block completely.
                     k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
@@ -1847,9 +1843,14 @@ class FlashAttentionBackend(AttentionBackend):
                     ) // self.page_size
                     strided_indices = self.decode_cuda_graph_metadata["strided_indices"]
                     strided_indices = strided_indices[:max_seq_pages]
-                    page_table = self.req_to_token[req_pool_indices, strided_indices] // self.page_size
+                    page_table = (
+                        self.req_to_token[
+                            req_pool_indices[:, None],  # shape [bs, 1]
+                            strided_indices[None, :],  # shape [1, max_seq_pages]
+                        ]
+                        // self.page_size
+                    )
                     metadata.page_table[:, :max_seq_pages].copy_(page_table)
-
                     # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                     metadata_expand = self.draft_decode_metadata_topk_expand[bs]
                     decode_length = self.speculative_step_id + 1
@@ -1857,10 +1858,14 @@ class FlashAttentionBackend(AttentionBackend):
                     cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
                     if self.page_size > 1:
                         # Second attention handles last_page_len + decode part.
-                        strided_indices_expand = self.draft_decode_metadata_topk_expand.get("strided_indices_expand")
+                        strided_indices_expand = (
+                            self.draft_decode_metadata_topk_expand.get(
+                                "strided_indices_expand"
+                            )
+                        )
                         update_draft_decode_set_expand_metadata_with_page_size(
-                            metadata_expand.cache_seqlens_int32, # Modifies
-                            metadata_expand.page_table, # Modifies
+                            metadata_expand.cache_seqlens_int32,  # Modifies
+                            metadata_expand.page_table,  # Modifies
                             cache_loc,
                             last_page_lens,
                             strided_indices_expand,
@@ -1870,7 +1875,9 @@ class FlashAttentionBackend(AttentionBackend):
                             self.page_size,
                         )
                     else:
-                        metadata_expand.page_table[: cache_loc.shape[0]].copy_(cache_loc[:, :decode_length])                        
+                        metadata_expand.page_table[: cache_loc.shape[0]].copy_(
+                            cache_loc[:, :decode_length]
+                        )
                 # TODO: Handle local attention metadata for draft decode when llama4 eagle is supported
             else:
                 # Normal Decode
@@ -2487,8 +2494,8 @@ def normal_decode_set_metadata(
 
 
 def update_draft_decode_set_expand_metadata_with_page_size(
-    cache_seqlens_int32: torch.Tensor, # Modifies
-    page_table: torch.Tensor, # Modifies
+    cache_seqlens_int32: torch.Tensor,  # Modifies
+    page_table: torch.Tensor,  # Modifies
     cache_loc: torch.Tensor,
     last_page_lens: torch.Tensor,
     strided_indices_expand: torch.Tensor,
@@ -2500,12 +2507,12 @@ def update_draft_decode_set_expand_metadata_with_page_size(
     expanded_last_page_lens = last_page_lens.repeat_interleave(topk)
     cache_seqlens_int32.copy_(decode_length + expanded_last_page_lens)
     expand_page_table = cache_loc[:, :decode_length].clone()
-    last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(
-        -1
-    ).expand(-1, expand_page_table.shape[1])
+    last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(-1).expand(
+        -1, expand_page_table.shape[1]
+    )
     expand_page_table -= last_page_lens_broadcast
     expand_page_table = (
         expand_page_table[:, strided_indices_expand[:decode_length]] // page_size
     )
     max_seq_pages_expand = (decode_length + page_size - 1) // page_size
-    page_table[:, ].copy_(expand_page_table[:, :max_seq_pages_expand])
+    page_table[:,].copy_(expand_page_table[:, :max_seq_pages_expand])

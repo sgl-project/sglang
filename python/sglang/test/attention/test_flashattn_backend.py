@@ -411,10 +411,9 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
 
             expected_cache_seqlens = torch.tensor([4, 4], dtype=torch.int32)
 
-            self.assertTrue(
-                torch.equal(cache_seqlens_int32, expected_cache_seqlens)
-            )
+            self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
             self.assertTrue(torch.equal(page_table, expected_page_table))
 
+
 if __name__ == "__main__":
-    unittest.main(defaultTest="TestUpdateDraftDecodeSetExpandMetadata.test_update_draft_decode_set_expand_metadata_with_page_size")
+    unittest.main()

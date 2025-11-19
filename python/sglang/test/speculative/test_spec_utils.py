@@ -1,4 +1,3 @@
-import os
 import unittest
 
 import numpy as np
@@ -9,6 +8,7 @@ from sglang.srt.speculative.spec_utils import assign_draft_cache_locs
 from sglang.srt.utils import next_power_of_2
 
 BYTES_PER_TILE = 128
+
 
 class TestSpecUtils(unittest.TestCase):
 
@@ -287,7 +287,9 @@ class TestSpecUtils(unittest.TestCase):
         seq_lens_num = 12
         pool_len = 256
         req_pool_indices = torch.arange(num_seqs, dtype=torch.int32, device=device)
-        req_to_token = torch.zeros((num_seqs, pool_len), dtype=torch.int32, device=device)
+        req_to_token = torch.zeros(
+            (num_seqs, pool_len), dtype=torch.int32, device=device
+        )
         req_to_token[0, :seq_lens_num] = torch.arange(
             seq_lens_num, dtype=torch.int32, device=device
         )

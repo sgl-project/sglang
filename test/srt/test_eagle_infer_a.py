@@ -1,10 +1,10 @@
+import os
 import unittest
 
 import requests
 import torch
-import os
-import sglang as sgl
 
+import sglang as sgl
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
@@ -23,6 +23,11 @@ from sglang.test.test_utils import (
 torch_dtype = torch.float16
 prefill_tolerance = 5e-2
 decode_tolerance: float = 5e-2
+
+# TODO: Remove before commit
+# Change the path below when OFFLINE_MODE is True.
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693"
+DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714"
 
 
 class TestEAGLEEngine(CustomTestCase):
@@ -209,9 +214,15 @@ class TestEAGLERadixCache(CustomTestCase):
             # Chunked prefill & Page Size > 1
             {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
             {**self.BASE_CONFIG, "page_size": 4},
-            {**self.BASE_CONFIG, "page_size": 128},
+            # Preferred by some kernels
+            {**self.BASE_CONFIG, "page_size": 64},
             # Disable CUDA Graph
-            {**self.BASE_CONFIG, "disable_cuda_graph": True, "base_gpu_id": 5, "page_size": 4},
+            {
+                **self.BASE_CONFIG,
+                "disable_cuda_graph": True,
+                "base_gpu_id": 5,
+                "page_size": 4,
+            },
         ]
 
         for i, config in enumerate(configs):
@@ -253,7 +264,7 @@ class TestEAGLERadixCache(CustomTestCase):
         print(f"{acc_length=:.4f}, {speed=}")
 
         self.assertGreater(acc_length, 2.5)
-    
+
     def _test_batch_generation(self, engine):
         prompts = [
             "Hello, my name is",
@@ -430,4 +441,4 @@ class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
 
 
 if __name__ == "__main__":
-    unittest.main(defaultTest="TestEAGLERadixCache.test_correctness")
+    unittest.main()
