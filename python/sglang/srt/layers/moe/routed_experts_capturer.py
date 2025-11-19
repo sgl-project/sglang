@@ -152,9 +152,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     ):
         batch = device_loc.shape[0]
 
-        self.host_cache.buffer[cpu_loc] = self.device_cache.buffer[:batch].to(
-            device="cpu", non_blocking=True
-        )
+        self.host_cache.buffer[cpu_loc] = self.device_cache.buffer[:batch].cpu()
 
     def get_routed_experts(
         self,
