@@ -17,6 +17,9 @@ from PIL import Image
 from sglang.multimodal_gen.configs.sample.base import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.performance_logger import (
+    get_diffusion_perf_log_dir,
+)
 
 logger = init_logger(__name__)
 
@@ -107,12 +110,15 @@ def check_image_size(ut, image, width, height):
     ut.assertEqual(image.size, (width, height))
 
 
-def get_perf_log_dir(start_file: Path) -> Path:
-    """Mirror runtime/utils/performance_logger.py behaviour for locating logs."""
-    this_file = start_file.resolve()
-    root_logs = this_file.parents[3] / "logs"
-    fallback = this_file.parents[2] / "logs"
-    return root_logs if root_logs.exists() or not fallback.exists() else fallback
+def get_perf_log_dir() -> Path:
+    """Gets the performance log directory from the centralized sglang utility."""
+    log_dir_str = get_diffusion_perf_log_dir()
+    if not log_dir_str:
+        raise RuntimeError(
+            "Performance logging is disabled (SGLANG_PERF_LOG_DIR is empty), "
+            "but a test tried to access the log directory."
+        )
+    return Path(log_dir_str)
 
 
 def _ensure_log_path(log_dir: Path) -> Path:
@@ -129,9 +135,9 @@ def clear_perf_log(log_dir: Path) -> Path:
     return log_path
 
 
-def prepare_perf_log(start_file: Path) -> tuple[Path, Path]:
+def prepare_perf_log() -> tuple[Path, Path]:
     """Convenience helper to resolve and clear the perf log in one call."""
-    log_dir = get_perf_log_dir(start_file)
+    log_dir = get_perf_log_dir()
     log_path = clear_perf_log(log_dir)
     return log_dir, log_path
 
