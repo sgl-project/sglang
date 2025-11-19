@@ -64,43 +64,6 @@ jobs:
             scripts/ci_monitor/performance_tables_*
           retention-days: 30
 
-  nightly-monitor:
-    needs: ci-monitor
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Run Nightly Test Monitor
-        id: monitor
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          PYTHONUNBUFFERED: 1
-          PYTHONIOENCODING: utf-8
-        run: |
-          cd scripts/ci_monitor
-          python ci_analyzer.py --token $GITHUB_TOKEN --mode nightly --days 7 --output nightly_monitor_$(date +%Y%m%d_%H%M%S).json
-        continue-on-error: true
-
-      - name: Upload Nightly Monitor Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: nightly-monitor-results-${{ github.run_number }}
-          path: |
-            scripts/ci_monitor/nightly_monitor_*.json
-          retention-days: 90
-
   ci-monitor-balance:
     needs: ci-monitor
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

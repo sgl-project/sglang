@@ -179,6 +179,9 @@ class SGLangCIAnalyzer:
                 list
             ),  # Store recent failure links for each job
             "job_last_success": {},  # Store last successful run for each job
+            "performance_metrics": defaultdict(
+                lambda: defaultdict(list)
+            ),  # Track performance metrics for nightly jobs
         }
 
         total_runs = len(runs)
@@ -268,6 +271,30 @@ class SGLangCIAnalyzer:
                             "created_at": created_at,
                             "pr_info": pr_info,
                         }
+
+                        # Parse performance metrics from successful nightly jobs
+                        if job_name in job_categories["nightly"] and (
+                            "perf" in job_name.lower()
+                            or "accuracy" in job_name.lower()
+                            or "eval" in job_name.lower()
+                        ):
+                            job_id = job.get("id")
+                            logs = self.get_job_logs(job_id)
+                            if logs:
+                                metrics = self.parse_metrics_from_logs(logs, job_name)
+                                for metric_name, values in metrics.items():
+                                    if values:
+                                        for value in values:
+                                            stats["performance_metrics"][job_name][
+                                                metric_name
+                                            ].append(
+                                                {
+                                                    "value": value,
+                                                    "timestamp": created_at,
+                                                    "run_id": run_id,
+                                                    "run_url": run_url,
+                                                }
+                                            )
 
                     elif job_conclusion == "failure":
                         stats["job_failures"][job_name] += 1
@@ -560,6 +587,70 @@ class SGLangCIAnalyzer:
                     stats["failure_patterns"].items(), key=lambda x: x[1], reverse=True
                 ):
                     summary_lines.append(f"| {pattern} | {count} |")
+                summary_lines.append("")
+
+            # Performance metrics section for nightly jobs
+            if stats.get("performance_metrics"):
+                summary_lines.append("## Nightly Test Performance Metrics")
+                summary_lines.append("")
+                summary_lines.append(
+                    "| Job | Metric | Latest Value | Count | Trend |"
+                )
+                summary_lines.append("|-----|--------|--------------|-------|-------|")
+
+                for job_name in sorted(stats["performance_metrics"].keys()):
+                    job_metrics = stats["performance_metrics"][job_name]
+                    for metric_name in sorted(job_metrics.keys()):
+                        metric_data = job_metrics[metric_name]
+                        if metric_data:
+                            # Calculate average of recent values
+                            values = [m["value"] for m in metric_data]
+                            avg_value = sum(values) / len(values)
+                            count = len(values)
+
+                            # Simple trend: compare first half vs second half
+                            trend_indicator = "➡️"
+                            if len(values) >= 4:
+                                first_half = values[: len(values) // 2]
+                                second_half = values[len(values) // 2 :]
+                                first_avg = sum(first_half) / len(first_half)
+                                second_avg = sum(second_half) / len(second_half)
+
+                                if first_avg > 0:
+                                    change_pct = (
+                                        (second_avg - first_avg) / first_avg
+                                    ) * 100
+
+                                    # For throughput metrics, up is good
+                                    # For latency/ttft metrics, down is good
+                                    if "throughput" in metric_name.lower():
+                                        if change_pct > 10:
+                                            trend_indicator = f"📈 +{change_pct:.1f}%"
+                                        elif change_pct < -10:
+                                            trend_indicator = (
+                                                f"⚠️ 📉 {change_pct:.1f}%"
+                                            )
+                                        else:
+                                            trend_indicator = f"➡️ {change_pct:+.1f}%"
+                                    elif (
+                                        "latency" in metric_name.lower()
+                                        or "ttft" in metric_name.lower()
+                                    ):
+                                        if change_pct < -10:
+                                            trend_indicator = f"📈 {change_pct:.1f}%"
+                                        elif change_pct > 10:
+                                            trend_indicator = (
+                                                f"⚠️ 📉 +{change_pct:.1f}%"
+                                            )
+                                        else:
+                                            trend_indicator = f"➡️ {change_pct:+.1f}%"
+                                    else:
+                                        trend_indicator = f"➡️ {change_pct:+.1f}%"
+
+                            summary_lines.append(
+                                f"| {job_name} | {metric_name} | {avg_value:.2f} | {count} | {trend_indicator} |"
+                            )
+
                 summary_lines.append("")
 
             with open(github_step_summary, "w", encoding="utf-8") as f:
