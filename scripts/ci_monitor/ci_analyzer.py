@@ -1051,8 +1051,8 @@ def main():
     parser.add_argument(
         "--days",
         type=int,
-        default=7,
-        help="Number of days to analyze (for nightly mode, default: 7)",
+        default=2,
+        help="Number of days to analyze (for nightly mode, default: 2)",
     )
     parser.add_argument(
         "--output",
