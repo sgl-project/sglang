@@ -94,7 +94,7 @@ class TestPiecewiseCudaGraphLlama31FP4(CustomTestCase):
 
 
 class TestPiecewiseCudaGraphQwen3MoE(CustomTestCase):
-    """Test piecewise CUDA graph with Qwen3-Coder-30B-A3B-Instruct MoE model"""
+    """Test piecewise CUDA graph with Qwen3-Coder-30B-A3B-Instruct MoE model with TP & EP"""
 
     @classmethod
     def setUpClass(cls):
@@ -108,6 +108,10 @@ class TestPiecewiseCudaGraphQwen3MoE(CustomTestCase):
                 "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-compiler",
                 "eager",
+                "--ep",
+                "2",
+                "--tp",
+                "2",
             ],
         )
 
