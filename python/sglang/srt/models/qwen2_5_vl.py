@@ -477,6 +477,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
+        if not self.config.mm_only:
+            self.model = Qwen2Model(
+                config,
+                quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
@@ -499,13 +506,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
         )
-
-        if not self.config.mm_only:
-            self.model = Qwen2Model(
-                config,
-                quant_config,
-                prefix=add_prefix("model", prefix),
-            )
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
