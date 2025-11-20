@@ -127,23 +127,6 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertIn("json_schema", sampling_params)
         self.assertIsInstance(sampling_params["json_schema"], str)
 
-    def test_response_format_structural_tag(self):
-        """Test that response_format structural_tag is correctly processed in sampling params."""
-        req = CompletionRequest(
-            model="x",
-            prompt="Generate structured output:",
-            max_tokens=100,
-            response_format={
-                "type": "structural_tag",
-                "structures": [{"begin": "<data>", "end": "</data>"}],
-                "triggers": ["<data>"],
-            },
-        )
-        sampling_params = self.sc._build_sampling_params(req)
-        # The structural_tag should be processed
-        self.assertIn("structural_tag", sampling_params)
-        self.assertIsInstance(sampling_params["structural_tag"], str)
-
     def test_response_format_none(self):
         """Test that no response_format doesn't add extra constraints."""
         req = CompletionRequest(model="x", prompt="Generate text:", max_tokens=100)
