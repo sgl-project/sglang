@@ -229,7 +229,7 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         seconds=1,
     ),
     DiffusionTestCase(
-        id="wan2_2_i2v_14b_720P",
+        id="wan2_1_i2v_14b_720P",
         model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
         modality="video",
         prompt="Animate this image",

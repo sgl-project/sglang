@@ -231,7 +231,7 @@ Consider updating perf_baselines.json with the snippets below:
                 if time.time() > deadline:
                     break
 
-                time.sleep(5)
+                time.sleep(1)
 
             if not job_completed:
                 if is_baseline_generation_mode:
