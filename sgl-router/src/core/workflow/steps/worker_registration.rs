@@ -44,6 +44,7 @@ struct ServerInfo {
     #[serde(alias = "model")]
     model_id: Option<String>,
     model_path: Option<String>,
+    served_model_name: Option<String>,
     dp_size: Option<usize>,
     version: Option<String>,
     max_batch_size: Option<usize>,
@@ -105,6 +106,8 @@ async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, String>
 
     let model_id = info
         .model_id
+        .filter(|s| !s.is_empty())
+        .or(info.served_model_name.filter(|s| !s.is_empty()))
         .or_else(|| {
             info.model_path
                 .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
@@ -348,11 +351,15 @@ impl StepExecutor for DiscoverMetadataStep {
                 match get_server_info(&config.url, config.api_key.as_deref()).await {
                     Ok(server_info) => {
                         let mut labels = HashMap::new();
-                        if let Some(model_path) = server_info.model_path {
-                            if !model_path.is_empty() {
-                                labels.insert("model_path".to_string(), model_path);
-                            }
+                        if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
+                            labels.insert("model_path".to_string(), model_path);
                         }
+                        if let Some(served_model_name) =
+                            server_info.served_model_name.filter(|s| !s.is_empty())
+                        {
+                            labels.insert("served_model_name".to_string(), served_model_name);
+                        }
+
                         Ok((labels, None))
                     }
                     Err(e) => Err(e),
@@ -891,10 +898,11 @@ impl StepExecutor for ActivateWorkerStep {
 pub fn create_worker_registration_workflow(
     router_config: &crate::config::RouterConfig,
 ) -> WorkflowDefinition {
-    // Use health check timeout from config with 30 second buffer as workflow-level upper bound
-    let detect_timeout = Duration::from_secs(router_config.health_check.timeout_secs + 30);
+    // Use startup timeout from config for worker registration
+    // This is separate from health_check.timeout_secs which is for individual HTTP requests
+    let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
 
-    // Calculate max_attempts to match the detect_timeout
+    // Calculate max_attempts to match the startup_timeout
     // With Linear backoff (increment 1s, max 5s):
     // - Attempts 1-5: 0s, 1s, 2s, 3s, 4s = 10s total
     // - Attempts 6+: 5s each

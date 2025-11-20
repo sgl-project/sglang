@@ -8,28 +8,20 @@ else
 fi
 """
 
-import itertools
 import os
 import random
 import socket
 import unittest
-from contextlib import contextmanager, nullcontext
-from typing import Any, List, Optional, Union
+from typing import Any
 
 import ray
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup, ReduceOp
 
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.communication_op import (  # noqa
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-    CustomAllreduce,
-)
-from sglang.srt.distributed.device_communicators.pymscclpp import PyMscclppCommunicator
-from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_group,
     graph_capture,
@@ -37,7 +29,6 @@ from sglang.srt.distributed.parallel_state import (
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
 )
-from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.test.test_utils import CustomTestCase
 
 

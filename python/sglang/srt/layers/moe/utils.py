@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from enum import Enum
+from enum import Enum, IntEnum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
@@ -248,3 +248,22 @@ def speculative_moe_backend_context():
         yield
     finally:
         MOE_RUNNER_BACKEND = original_backend
+
+
+# The type of method in top-K routing, for use in torch custom op
+# Please keep this in sync with the counterpart defined in https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/trtllm/fused_moe/runner.h
+class RoutingMethodType(IntEnum):
+    # Default: Softmax -> TopK
+    Default = (0,)
+    # Renormalize: TopK -> Softmax
+    Renormalize = (1,)
+    # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
+    DeepSeekV3 = (2,)
+    # Llama4: Top1 -> Sigmoid
+    Llama4 = (3,)
+    # Qwen3: Softmax -> TopK -> Renormalize
+    RenormalizeNaive = (4,)
+    # TopK only (no softmax)
+    TopK = (5,)
+    # Unspecified
+    Unspecified = 6

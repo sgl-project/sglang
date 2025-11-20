@@ -39,10 +39,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -127,7 +124,6 @@ class Qwen2VisionBlock(nn.Module):
         mlp_ratio: float,
         act_layer: Type[nn.Module] = QuickGELU,
         norm_layer: Type[nn.Module] = None,
-        attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -137,23 +133,12 @@ class Qwen2VisionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        if attn_implementation == "sdpa":
-            qkv_backend = "sdpa"
-            softmax_in_single_precision = False
-        elif attn_implementation == "flash_attention_2":
-            qkv_backend = "triton_attn"
-            softmax_in_single_precision = False
-        elif attn_implementation == "eager":
-            qkv_backend = "sdpa"
-            softmax_in_single_precision = True
 
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -333,7 +318,6 @@ class Qwen2VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                 )
@@ -522,6 +506,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds=None,
         get_embedding: bool = False,
     ):
         """Run forward pass for Qwen2-VL.
@@ -548,11 +533,22 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
-        hidden_states = general_mm_embed_routine(
+
+        input_embeds = forward_batch.input_embeds
+        # It may seem strange to assign input_embeds again even after passing it as an argument.
+        # This is for compatibility considerations.
+        # In the 'extend' scenario, this forward function is called from two places:
+        # 1. model_runner calls forward directly,
+        # 2. piece_wise_cuda_graph_runner calls forward and replay.
+
+        # Currently,
+        # In 'extend', input_embeds is passed in.
+        # In 'decode', input_ids is passed in.
+
+        hidden_states = self.model(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
+            input_embeds=input_embeds,
             positions=positions,
         )
 

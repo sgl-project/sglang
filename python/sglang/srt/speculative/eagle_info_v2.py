@@ -142,26 +142,29 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
-        bs = len(batch.seq_lens)
+        if not batch.forward_mode.is_idle():
+            bs = len(batch.seq_lens)
 
-        # Assign cache locations
-        batch.out_cache_loc = torch.empty(
-            (bs * topk * num_steps,),
-            dtype=torch.int64,
-            device=batch.input_ids.device,
-        )
-        # FIXME(lsyin): align with the default code path
-        assign_draft_cache_locs_page_size_1[(bs,)](
-            batch.req_pool_indices,
-            req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
-            topk,
-            num_steps,
-        )
+            # Assign cache locations
+            batch.out_cache_loc = torch.empty(
+                (bs * topk * num_steps,),
+                dtype=torch.int64,
+                device=batch.input_ids.device,
+            )
+            # FIXME(lsyin): align with the default code path
+            assign_draft_cache_locs_page_size_1[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                topk,
+                num_steps,
+            )
 
         # Get a forward batch
+        self.num_tokens_per_batch = topk
+        self.num_tokens_for_logprob_per_batch = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
@@ -174,6 +177,7 @@ class EagleDraftInputV2Mixin:
         predict: torch.Tensor,
         num_draft_tokens: int,
         draft_model_runner: Any,
+        cuda_graph_runner: Any,
     ):
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
@@ -187,9 +191,15 @@ class EagleDraftInputV2Mixin:
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.DRAFT_EXTEND_V2
+        )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        if not batch.forward_mode.is_idle() and not can_cuda_graph:
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
 
@@ -201,22 +211,27 @@ class EagleVerifyInputV2Mixin:
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
     ):
-        # Assign cache locations
-        bs = len(batch.req_pool_indices)
-        batch.input_ids = self.draft_token
-        device = batch.input_ids.device
-        batch.out_cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + self.draft_token_num,
-            batch_size=bs,
-            draft_token_num=self.draft_token_num,
-            device=device,
-        )
+        if not batch.forward_mode.is_idle():
+            # Assign cache locations
+            bs = len(batch.req_pool_indices)
+            batch.input_ids = self.draft_token
+            device = batch.input_ids.device
+            batch.out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + self.draft_token_num,
+                batch_size=bs,
+                draft_token_num=self.draft_token_num,
+                device=device,
+            )
 
         # Get a forward batch
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
@@ -228,9 +243,10 @@ class EagleVerifyInputV2Mixin:
         if can_run_cuda_graph:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
         else:
-            target_worker.model_runner.attn_backend.init_forward_metadata(
-                verify_forward_batch
-            )
+            if not batch.forward_mode.is_idle():
+                target_worker.model_runner.attn_backend.init_forward_metadata(
+                    verify_forward_batch
+                )
 
         return verify_forward_batch, can_run_cuda_graph
 
@@ -243,6 +259,16 @@ class EagleVerifyInputV2Mixin:
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
         """
+        if batch.forward_mode.is_idle():
+            predict = torch.empty(0, dtype=torch.long, device=batch.input_ids.device)
+            accept_length = torch.empty(
+                0, dtype=torch.int32, device=batch.input_ids.device
+            )
+            accept_index = torch.empty(
+                0, dtype=torch.int32, device=batch.input_ids.device
+            )
+            return predict, accept_length, accept_index
+
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits

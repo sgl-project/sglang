@@ -21,8 +21,8 @@ import torch
 import torchvision
 from einops import rearrange
 
-from sglang.multimodal_gen.runtime.pipelines import Req
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 # Suppress verbose logging from imageio, which is triggered when saving images.
 logging.getLogger("imageio").setLevel(logging.WARNING)
@@ -259,7 +259,7 @@ class DiffGenerator:
         # TODO: simplify
         data_type = (
             DataType.IMAGE
-            if self.server_args.pipeline_config.task_type.is_image_task()
+            if self.server_args.pipeline_config.task_type.is_image_gen()
             or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )

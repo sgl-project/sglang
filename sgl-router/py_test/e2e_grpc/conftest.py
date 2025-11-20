@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest  # noqa: F401
 
-# Ensure router py_src is importable
+# Ensure router bindings/python is importable
 _ROUTER_ROOT = Path(__file__).resolve().parents[2]
-_ROUTER_SRC = _ROUTER_ROOT / "py_src"
+_ROUTER_SRC = _ROUTER_ROOT / "bindings" / "python"
 if str(_ROUTER_SRC) not in sys.path:
     sys.path.insert(0, str(_ROUTER_SRC))
 

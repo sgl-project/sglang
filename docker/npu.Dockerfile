@@ -45,7 +45,6 @@ RUN apt-get update -y && apt upgrade -y && apt-get install -y \
     libssl-dev \
     pkg-config \
     ca-certificates \
-    protobuf-compiler \
     && rm -rf /var/cache/apt/* \
     && rm -rf /var/lib/apt/lists/* \
     && update-ca-certificates \
@@ -54,17 +53,10 @@ RUN apt-get update -y && apt upgrade -y && apt-get install -y \
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
-ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install dependencies
 # TODO: install from pypi released memfabric
 RUN pip install $MEMFABRIC_URL --no-cache-dir
-
-RUN pip install setuptools-rust wheel build --no-cache-dir
-
-# install rustup from rustup.rs
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version && protoc --version
 
 # Install vLLM
 RUN git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG && \
@@ -79,12 +71,14 @@ RUN pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --inde
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
     (cd sglang/python && rm -rf pyproject.toml && mv pyproject_other.toml pyproject.toml && pip install -v .[srt_npu] --no-cache-dir) && \
-    (cd sglang/sgl-router && python -m build && pip install --force-reinstall dist/*.whl) && \
     rm -rf sglang
+
+# Install SGLang Model Gateway
+RUN pip install sglang-router --no-cache-dir
 
 # Install Deep-ep
 # pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
-RUN pip install wheel==0.45.1 && git clone  --branch $SGLANG_KERNEL_NPU_TAG https://github.com/sgl-project/sgl-kernel-npu.git \
+RUN pip install wheel==0.45.1 && git clone --branch $SGLANG_KERNEL_NPU_TAG https://github.com/sgl-project/sgl-kernel-npu.git \
     && export LD_LIBRARY_PATH=${ASCEND_CANN_PATH}/latest/runtime/lib64/stub:$LD_LIBRARY_PATH && \
     source ${ASCEND_CANN_PATH}/set_env.sh && \
     cd sgl-kernel-npu && \

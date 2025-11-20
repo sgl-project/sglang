@@ -48,8 +48,8 @@ PRECISION_TO_TYPE = {
     "bf16": torch.bfloat16,
 }
 
-STR_BACKEND_ENV_VAR: str = "SGL_DIFFUSION_ATTENTION_BACKEND"
-STR_ATTN_CONFIG_ENV_VAR: str = "SGL_DIFFUSION_ATTENTION_CONFIG"
+STR_BACKEND_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_BACKEND"
+STR_ATTN_CONFIG_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_CONFIG"
 
 
 def find_nccl_library() -> str:
@@ -59,12 +59,12 @@ def find_nccl_library() -> str:
     After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
     found by `ctypes` automatically.
     """
-    so_file = envs.SGL_DIFFUSION_NCCL_SO_PATH
+    so_file = envs.SGLANG_DIFFUSION_NCCL_SO_PATH
 
     # manually load the nccl library
     if so_file:
         logger.info(
-            "Found nccl from environment variable SGL_DIFFUSION_NCCL_SO_PATH=%s",
+            "Found nccl from environment variable SGLANG_DIFFUSION_NCCL_SO_PATH=%s",
             so_file,
         )
     else:
@@ -801,3 +801,13 @@ def save_decoded_latents_as_video(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     imageio.mimsave(output_path, frames, fps=fps, format="mp4")
+
+
+def calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height, None
