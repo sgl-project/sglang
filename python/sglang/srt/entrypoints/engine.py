@@ -141,7 +141,7 @@ class Engine(EngineBase):
         )
 
         # Enable tracing
-        if server_args.enable_trace:
+        if server_args.trace_level > 0:
             process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
             thread_label = "Tokenizer"
             if server_args.disaggregation_mode == "prefill":
