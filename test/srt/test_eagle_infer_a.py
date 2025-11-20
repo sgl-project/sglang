@@ -24,11 +24,6 @@ torch_dtype = torch.float16
 prefill_tolerance = 5e-2
 decode_tolerance: float = 5e-2
 
-# TODO: Remove before commit
-# Change the path below when OFFLINE_MODE is True.
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693"
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714"
-
 
 class TestEAGLEEngine(CustomTestCase):
     BASE_CONFIG = {
@@ -220,7 +215,6 @@ class TestEAGLERadixCache(CustomTestCase):
             {
                 **self.BASE_CONFIG,
                 "disable_cuda_graph": True,
-                "base_gpu_id": 5,
                 "page_size": 4,
             },
         ]
