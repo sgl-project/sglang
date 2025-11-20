@@ -89,7 +89,7 @@ If you don’t have permission, please ask maintainers to trigger CI for you.
 
 We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
 
-Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default rate limit window is 120 minutes, and each workflow can override it via the `cool-down-minutes` input parameter:
+Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default cooldown period is 120 minutes, and each workflow can override it via the `cool-down-minutes` input parameter:
 
 ```yaml
 cool-down-minutes:
