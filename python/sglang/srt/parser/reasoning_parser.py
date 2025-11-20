@@ -136,29 +136,76 @@ class Indices:
 
 def string_overlap(a: str, b: str) -> Tuple[Optional[Indices], Optional[Indices]]:
     """
-    Find the longest overlap where the end of string a matches the start
-    of string b.
+    Find the longest overlap where the end of one string matches
+    the start of the other, or the shorter string is contained
+    in the longer one.
     """
+
+    def _build_prefix(pattern: str) -> list[int]:
+        """Prefix-function (π) for KMP: longest proper prefix == suffix for each prefix."""
+        pi = [0] * len(pattern)
+        for i in range(1, len(pattern)):
+            j = pi[i - 1]
+            while j > 0 and pattern[i] != pattern[j]:
+                j = pi[j - 1]
+            if pattern[i] == pattern[j]:
+                j += 1
+            pi[i] = j
+        return pi
+
+    def _overlap_suffix_prefix(text: str, pattern: str) -> int:
+        """
+        Length of the longest suffix of `text` that equals a prefix of `pattern`.
+        Computed in O(len(text) + len(pattern)) via KMP.
+        """
+        if not text or not pattern:
+            return 0
+
+        pi = _build_prefix(pattern)
+        j = 0  # current matched prefix length in `pattern`
+
+        for ch in text:
+            # standard KMP transition
+            while j > 0 and (j == len(pattern) or ch != pattern[j]):
+                j = pi[j - 1]
+            if ch == pattern[j]:
+                j += 1
+
+        # j is the length of the longest prefix of pattern that is a suffix of text
+        return j
 
     # Ensure `a` is the shorter string for simpler handling.
     a, b, swapped = (a, b, False) if len(a) < len(b) else (b, a, True)
 
-    if a in b:
+    # Substring case: same as `if a in b` + `b.index(a)`
+    idx = b.find(a)
+    if idx != -1:
         ind_a = Indices(0, len(a))
-        ind_b = Indices(b.index(a), b.index(a) + len(a))
+        ind_b = Indices(idx, idx + len(a))
         return (ind_b, ind_a) if swapped else (ind_a, ind_b)
 
-    for i in range(len(a) - 1, 0, -1):
-        if a[-i:] == b[:i]:
-            ind_a = Indices(len(a) - i, len(a))
-            ind_b = Indices(0, i)
-            return (ind_b, ind_a) if swapped else (ind_a, ind_b)
+    # 1) suffix(a) == prefix(b), prefer this direction just like your first loop
+    l1 = _overlap_suffix_prefix(a, b)
+    # original code only considers overlaps of length 1..len(a)-1, not len(a)
+    if l1 >= len(a):
+        l1 = len(a) - 1
 
-    for i in range(len(a) - 1, 0, -1):
-        if b[-i:] == a[:i]:
-            ind_a = Indices(0, i)
-            ind_b = Indices(len(b) - i, len(b))
-            return (ind_b, ind_a) if swapped else (ind_a, ind_b)
+    if l1 > 0:
+        i = l1
+        ind_a = Indices(len(a) - i, len(a))
+        ind_b = Indices(0, i)
+        return (ind_b, ind_a) if swapped else (ind_a, ind_b)
+
+    # 2) suffix(b) == prefix(a), only if first direction failed
+    l2 = _overlap_suffix_prefix(b, a)
+    if l2 >= len(a):
+        l2 = len(a) - 1
+
+    if l2 > 0:
+        i = l2
+        ind_a = Indices(0, i)
+        ind_b = Indices(len(b) - i, len(b))
+        return (ind_b, ind_a) if swapped else (ind_a, ind_b)
 
     return None, None
 
