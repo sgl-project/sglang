@@ -58,7 +58,9 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     return parser
 
 
-def maybe_dump_performance(args: argparse.Namespace, server_args, sampling_params, results):
+def maybe_dump_performance(
+    args: argparse.Namespace, server_args, sampling_params, results
+):
     """dump performance if necessary"""
     if not (args.perf_dump_path and results):
         return
