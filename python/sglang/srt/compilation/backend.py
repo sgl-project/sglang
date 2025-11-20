@@ -300,24 +300,19 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                     runtime_shape=None,
                 )
             )
-            if target not in self.module.__dict__:
-                self.module.__dict__[target] = CUDAPiecewiseBackend(
-                    submod,
-                    self.compile_config,
-                    self.inductor_config,
-                    self.graph_pool,
-                    index,
-                    len(self.compile_submod_names),
-                    sym_shape_indices,
-                    compiled_graph_for_dynamic_shape,
-                    self.sglang_backend,
-                )
-                # print(f"[DEBUG] Created CUDAPiecewiseBackend for submodule {target}, index {index}, backend_id={id(self.module.__dict__[target])}")
+            self.module.__dict__[target] = CUDAPiecewiseBackend(
+                submod,
+                self.compile_config,
+                self.inductor_config,
+                self.graph_pool,
+                index,
+                len(self.compile_submod_names),
+                sym_shape_indices,
+                compiled_graph_for_dynamic_shape,
+                self.sglang_backend,
+            )
 
-                compilation_counter.num_piecewise_capturable_graphs_seen += 1
-            else:
-                # print(f"[DEBUG] Reusing existing CUDAPiecewiseBackend for submodule {target}, index {index}, backend_id={id(self.module.__dict__[target])}")
-                pass
+            compilation_counter.num_piecewise_capturable_graphs_seen += 1
 
         return output
 
@@ -399,10 +394,6 @@ class SGLangBackend:
             local_cache_dir, disable_cache=False, prefix=""
         )
         compilation_counter.num_graphs_seen += 1
-
-        # assert not self._called, "SGLangBackend can only be called once"
-        if (self._called):
-            return self.split_gm
         
         # Print call stack trace
         # import traceback
@@ -410,6 +401,10 @@ class SGLangBackend:
         # print("[DEBUG] Call stack:")
         # for line in traceback.format_stack()[:-1]:  # Exclude current frame
         #     print(line.rstrip())
+
+        # assert not self._called, "SGLangBackend can only be called once"
+        if (self._called):
+            return self.split_gm
 
         self.graph = graph
         self.configure_post_pass()
