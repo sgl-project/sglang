@@ -361,32 +361,32 @@ def fused_moe_router_shim(
         256 if num_experts < 256 else 64
     )  # if experts are large, need to use smaller k block or shared memory OOM
 
-    # if (
-    #     (bs >= 512 or num_experts > 8)
-    #     and hidden_dim % BLOCK_SIZE_K == 0
-    #     # we keep using single kernel to avoid non-deterministic behavior
-    #     and not enable_deterministic_inference
-    # ):
-    #     # if large batch size or large expert, use kernel that uses tensorcore in matmul
-    #     return fused_moe_router_tensorcore(
-    #         x=hidden_states,
-    #         router_weight=gating_output,
-    #         topk=topk,
-    #         moe_softcapping=moe_softcapping,
-    #         BLOCK_SIZE_M=BLOCK_SIZE_M,
-    #         BLOCK_SIZE_N=BLOCK_SIZE_N,
-    #         BLOCK_SIZE_K=BLOCK_SIZE_K,
-    #         correction_bias=correction_bias,
-    #     )
-    # else:
-    # if smaller, use kernel that does not use tensorcore in matmul
-    return fused_moe_router_cudacore(
-        x=hidden_states,
-        router_weight=gating_output,
-        topk=topk,
-        moe_softcapping=moe_softcapping,
-        correction_bias=correction_bias,
-    )
+    if (
+        (bs >= 512 or num_experts > 8)
+        and hidden_dim % BLOCK_SIZE_K == 0
+        # we keep using single kernel to avoid non-deterministic behavior
+        and not enable_deterministic_inference
+    ):
+        # if large batch size or large expert, use kernel that uses tensorcore in matmul
+        return fused_moe_router_tensorcore(
+            x=hidden_states,
+            router_weight=gating_output,
+            topk=topk,
+            moe_softcapping=moe_softcapping,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            correction_bias=correction_bias,
+        )
+    else:
+        # if smaller, use kernel that does not use tensorcore in matmul
+        return fused_moe_router_cudacore(
+            x=hidden_states,
+            router_weight=gating_output,
+            topk=topk,
+            moe_softcapping=moe_softcapping,
+            correction_bias=correction_bias,
+        )
 
 
 class FusedMoeRouter:
