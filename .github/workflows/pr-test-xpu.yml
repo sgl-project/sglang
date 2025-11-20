@@ -20,6 +20,7 @@ jobs:
   # ==================== Check Changes ==================== #
   check-changes:
     needs: [pr-gate]
+    runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
     steps:
