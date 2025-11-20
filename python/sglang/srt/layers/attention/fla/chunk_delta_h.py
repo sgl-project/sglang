@@ -46,9 +46,9 @@ def _chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_G: tl.constexpr,
 ):
     for i_i in range(intermediate_len):
-        intermediate_position = tl.load(
-            intermediate_positions + (boi + i_i)
-        ).to(tl.int32)
+        intermediate_position = tl.load(intermediate_positions + (boi + i_i)).to(
+            tl.int32
+        )
 
         if intermediate_position > i_t * BT and intermediate_position <= (i_t + 1) * BT:
             offset = intermediate_position - i_t * BT
@@ -162,6 +162,7 @@ def _chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     b_h4_i.to(p_intermediate.dtype.element_ty),
                     boundary_check=(0, 1),
                 )
+
 
 @triton.heuristics(
     {

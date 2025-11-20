@@ -1620,8 +1620,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
-            for req in self.reqs:
-                req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
+            for i, req in enumerate(self.reqs):
+                if self.mamba_copy_mask[i]:
+                    req.mamba_pool_copy_next_idx = 1 - req.mamba_pool_copy_next_idx
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:

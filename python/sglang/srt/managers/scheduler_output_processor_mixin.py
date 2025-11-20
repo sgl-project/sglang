@@ -100,7 +100,6 @@ class SchedulerOutputProcessorMixin:
                 if req.is_retracted:
                     continue
 
-
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
