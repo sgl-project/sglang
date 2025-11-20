@@ -199,6 +199,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        if get_dcp_world_size() > 1:
+            free_index = free_index[free_index >= 0]
+            if free_index.numel() == 0:
+                return
+
         if self.is_not_in_free_group:
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
@@ -698,6 +703,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        if get_dcp_world_size() > 1:
+            free_index = free_index[free_index >= 0]
+            if free_index.numel() == 0:
+                return
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
