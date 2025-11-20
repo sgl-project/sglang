@@ -4,10 +4,11 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
+from torch import nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 if is_cuda():
@@ -20,7 +21,7 @@ if is_cuda():
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
     NSA_DUAL_STREAM,
-    cp_all_gather_rerange_output,
+    cp_all_gather_rearrange_output,
     is_nsa_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -89,6 +90,29 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
     return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+class V32LayerNorm(nn.Module):
+    """
+    Layer Normalization.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    @torch.compile
+    def _forward_compiled(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(
+            x.float(), (self.dim,), self.weight, self.bias, self.eps
+        ).type_as(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        torch._dynamo.mark_dynamic(x, 0)
+        return self._forward_compiled(x)
 
 
 class Indexer(CustomOp):
@@ -161,7 +185,7 @@ class Indexer(CustomOp):
                 bias=False,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
+        self.k_norm = V32LayerNorm(self.head_dim)
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -180,93 +204,6 @@ class Indexer(CustomOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
-
-    def _get_q_k_bf16(
-        self,
-        q_lora: torch.Tensor,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        enable_dual_stream: bool,
-        forward_batch: ForwardBatch,
-    ):
-        weights = None
-        if enable_dual_stream:
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-
-            with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-                self.half_device_sm_count
-            ):
-                query, _ = self.wq_b(q_lora)
-                query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-                q_rope, _ = torch.split(
-                    query,
-                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                    dim=-1,
-                )
-            with torch.cuda.stream(self.alt_stream):
-                # TODO we should also put DeepGEMM half SM here?
-                if self.fuse_wk_and_weights_proj:
-                    key, weights = self.fused_wk_and_weights_proj(x)[0].split(
-                        [self.head_dim, self.n_heads], dim=-1
-                    )
-                else:
-                    key, _ = self.wk(x)
-                key = self.k_norm(key)
-
-                k_rope, _ = torch.split(
-                    key,
-                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                    dim=-1,
-                )
-
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            query, _ = self.wq_b(q_lora)
-            query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-
-            q_rope, _ = torch.split(
-                query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-            )
-
-            if self.fuse_wk_and_weights_proj:
-                key, weights = self.fused_wk_and_weights_proj(x)[0].split(
-                    [self.head_dim, self.n_heads], dim=-1
-                )
-            else:
-                key, _ = self.wk(x)
-            key = self.k_norm(key)
-            k_rope, _ = torch.split(
-                key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-            )
-
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
-
-        query[..., : self.rope_head_dim] = q_rope
-        key[..., : self.rope_head_dim] = k_rope
-
-        # allgather+rerrange
-        if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
-            key = cp_all_gather_rerange_output(
-                key.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-
-        if enable_dual_stream:
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            query = rotate_activation(query)
-
-            with torch.cuda.stream(self.alt_stream):
-                key = rotate_activation(key)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            query = rotate_activation(query)
-            key = rotate_activation(key)
-
-        return query, key, weights
 
     def _get_k_bf16(
         self,
@@ -292,6 +229,32 @@ class Indexer(CustomOp):
 
         return key
 
+    def _get_seqlens_32(
+        self, forward_batch: ForwardBatch, metadata: BaseIndexerMetadata
+    ) -> torch.Tensor:
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            return metadata.get_seqlens_expanded()
+        else:
+            return metadata.get_seqlens_int32()
+
+    def _compute_schedule_metadata(
+        self, forward_batch: ForwardBatch, metadata: BaseIndexerMetadata
+    ) -> torch.Tensor:
+        page_size = forward_batch.token_to_kv_pool.page_size
+        # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
+        assert page_size == 64, "only support page size 64"
+        blocksize = page_size
+        seqlens_32 = self._get_seqlens_32(forward_batch, metadata)
+
+        # NOTE(dark): 132 is SM count on H200/B200, not magic number
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            seqlens_32, blocksize, self.sm_count
+        )
+        return schedule_metadata
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -299,6 +262,7 @@ class Indexer(CustomOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        schedule_metadata: torch.Tensor,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
@@ -315,18 +279,7 @@ class Indexer(CustomOp):
             layer_id=layer_id
         )
 
-        blocksize = page_size
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
-        ):
-            seqlens_32 = metadata.get_seqlens_expanded()
-        else:
-            seqlens_32 = metadata.get_seqlens_int32()
-        # NOTE(dark): 132 is SM count on H200/B200, not magic number
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-            seqlens_32, blocksize, self.sm_count
-        )
+        seqlens_32 = self._get_seqlens_32(forward_batch, metadata)
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -414,11 +367,18 @@ class Indexer(CustomOp):
             q_offset += extend_seq_len
             k_offset += seq_len
 
-        k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
-        k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
-        kv_fp8 = (k_fp8, k_scale)
-        ks = torch.cat(ks_list, dim=0)
-        ke = torch.cat(ke_list, dim=0)
+        if forward_batch.batch_size == 1:
+            k_fp8 = k_fp8_list[0].view(torch.float8_e4m3fn)
+            k_scale = k_scale_list[0].view(torch.float32).squeeze(-1)
+            kv_fp8 = (k_fp8, k_scale)
+            ks = ks_list[0]
+            ke = ke_list[0]
+        else:
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+            k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+            kv_fp8 = (k_fp8, k_scale)
+            ks = torch.cat(ks_list, dim=0)
+            ke = torch.cat(ke_list, dim=0)
 
         # Suppose there are two requests, with extend_seq_len = [3, 2]
         # and seq_lens = [10, 4]
@@ -487,7 +447,7 @@ class Indexer(CustomOp):
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        dummy_logits = torch.zeros(
+        dummy_logits = torch.empty(
             seq_lens_expanded.shape[0],
             self.index_topk,
             dtype=torch.float32,
@@ -779,38 +739,139 @@ class Indexer(CustomOp):
                 return_indices,
             )
 
-        query, key, weights = self._get_q_k_bf16(
-            q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
-        )
+        def _set_index_k_buffer(k_fp8, k_scale):
+            # k_fp8: (seq_len, head_dim) fp8_e4m3fn
+            # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
+            # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
+            # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
+            if not forward_batch.out_cache_loc.is_contiguous():
+                forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=forward_batch.out_cache_loc,
+                index_k=k_fp8,
+                index_k_scale=k_scale,
+            )
 
+        def _get_weights(weights, q_scale):
+            if not self.fuse_wk_and_weights_proj:
+                weights, _ = self.weights_proj(x)
+            weights = self._get_logits_head_gate(weights, q_scale)
+            return weights
+
+        use_topk_paged = is_cuda() and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        )
+        weights = None
+        schedule_metadata = None
         if enable_dual_stream:
+            assert (
+                self.nsa_enable_prefill_cp is False
+            ), "nsa_enable_prefill_cp cannot be True when dual stream is on"
+
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                self.half_device_sm_count
+            ):
+                query, _ = self.wq_b(q_lora)
+                query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+
+                # separate q_rope and k_rope ops so do need to sync the two
+                # streams before the self.rotary_emb kernel, creating gpu bubbles
+                q_rope, _ = torch.split(
+                    query,
+                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                    dim=-1,
+                )
+                k_rope_dummy = torch.empty(
+                    (q_rope.shape[0], 1, self.rope_head_dim),
+                    dtype=q_rope.dtype,
+                    device=q_rope.device,
+                )
+                q_rope, _ = self.rotary_emb(positions, q_rope, k_rope_dummy)
+                query[..., : self.rope_head_dim] = q_rope
+                query = rotate_activation(query)
+
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                weights = _get_weights(weights, q_scale)
+                if use_topk_paged:
+                    schedule_metadata = self._compute_schedule_metadata(
+                        forward_batch, metadata
+                    )
             with torch.cuda.stream(self.alt_stream):
+                # TODO we should also put DeepGEMM half SM here?
+                if self.fuse_wk_and_weights_proj:
+                    key, weights = self.fused_wk_and_weights_proj(x)[0].split(
+                        [self.head_dim, self.n_heads], dim=-1
+                    )
+                else:
+                    key, _ = self.wk(x)
+                key = self.k_norm(key)
+
+                k_rope, _ = torch.split(
+                    key,
+                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                    dim=-1,
+                )
+                q_rope_dummy = torch.empty(
+                    (k_rope.shape[0], 1, self.rope_head_dim),
+                    dtype=k_rope.dtype,
+                    device=k_rope.device,
+                )
+                _, k_rope = self.rotary_emb(positions, q_rope_dummy, k_rope)
+                key[..., : self.rope_head_dim] = k_rope
+                key = rotate_activation(key)
+
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                _set_index_k_buffer(k_fp8, k_scale)
             current_stream.wait_stream(self.alt_stream)
         else:
+            query, _ = self.wq_b(q_lora)
+            query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+
+            q_rope, _ = torch.split(
+                query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+            )
+
+            if self.fuse_wk_and_weights_proj:
+                key, weights = self.fused_wk_and_weights_proj(x)[0].split(
+                    [self.head_dim, self.n_heads], dim=-1
+                )
+            else:
+                key, _ = self.wk(x)
+            key = self.k_norm(key)
+            k_rope, _ = torch.split(
+                key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+            )
+
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+            query[..., : self.rope_head_dim] = q_rope
+            key[..., : self.rope_head_dim] = k_rope
+
+            # allgather+rerrange
+            if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
+                key = cp_all_gather_rearrange_output(
+                    key.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+
+            query = rotate_activation(query)
+            key = rotate_activation(key)
+
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-
-        # k_fp8: (seq_len, head_dim) fp8_e4m3fn
-        # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
-        # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
-        # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
-        if not forward_batch.out_cache_loc.is_contiguous():
-            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
-
-        if not self.fuse_wk_and_weights_proj:
-            weights, _ = self.weights_proj(x)
-        weights = self._get_logits_head_gate(weights, q_scale)
+            _set_index_k_buffer(k_fp8, k_scale)
+            weights = _get_weights(weights, q_scale)
+            if use_topk_paged:
+                schedule_metadata = self._compute_schedule_metadata(
+                    forward_batch, metadata
+                )
 
         if is_cuda():
             assert forward_batch.seq_lens_cpu is not None
@@ -830,7 +891,7 @@ class Indexer(CustomOp):
                 or forward_batch.forward_mode.is_draft_extend()
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                    forward_batch, layer_id, q_fp8, weights, metadata, schedule_metadata
                 )
             else:
                 if (

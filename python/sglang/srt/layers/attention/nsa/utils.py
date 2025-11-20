@@ -138,7 +138,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     return outputs
 
 
-def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
+def cp_all_gather_rearrange_output(input_tensor, cp_size, forward_batch, stream):
     """
     |   +-----------before allgather------------+|
     |   | dp_atten_tp0: block0, block7 |
