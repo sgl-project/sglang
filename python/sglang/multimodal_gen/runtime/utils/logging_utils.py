@@ -17,10 +17,10 @@ from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
 
-SGL_DIFFUSION_CONFIGURE_LOGGING = envs.SGL_DIFFUSION_CONFIGURE_LOGGING
-SGL_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGL_DIFFUSION_LOGGING_CONFIG_PATH
-SGL_DIFFUSION_LOGGING_LEVEL = envs.SGL_DIFFUSION_LOGGING_LEVEL
-SGL_DIFFUSION_LOGGING_PREFIX = envs.SGL_DIFFUSION_LOGGING_PREFIX
+SGLANG_DIFFUSION_CONFIGURE_LOGGING = envs.SGLANG_DIFFUSION_CONFIGURE_LOGGING
+SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
+SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
+SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -28,7 +28,7 @@ YELLOW = "\033[93m"
 RESET = "\033[0;0m"
 
 _FORMAT = (
-    f"{SGL_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
+    f"{SGLANG_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
     "[%(filename)s: %(lineno)d] %(message)s"
 )
 
@@ -47,7 +47,7 @@ DEFAULT_LOGGING_CONFIG = {
         "sgl_diffusion": {
             "class": "logging.StreamHandler",
             "formatter": "sgl_diffusion",
-            "level": SGL_DIFFUSION_LOGGING_LEVEL,
+            "level": SGLANG_DIFFUSION_LOGGING_LEVEL,
             "stream": "ext://sys.stdout",
         },
     },
@@ -340,7 +340,7 @@ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     will have the trace enabled. Other threads will not be affected.
     """
     logger.warning(
-        "SGL_DIFFUSION_TRACE_FUNCTION is enabled. It will record every"
+        "SGLANG_DIFFUSION_TRACE_FUNCTION is enabled. It will record every"
         " function executed by Python. This will slow down the code. It "
         "is suggested to be used for debugging hang or crashes only."
     )
