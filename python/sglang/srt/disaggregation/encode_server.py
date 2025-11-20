@@ -259,5 +259,5 @@ async def handle_send_request(request: dict):
 
 
 @app.get("/health_check")
-async def handle_send_request():
+async def handle_health_check_request():
     return ORJSONResponse(content={"is_alive": True})
