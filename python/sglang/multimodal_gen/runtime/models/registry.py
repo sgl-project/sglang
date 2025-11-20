@@ -102,7 +102,7 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
     return discovered_models
 
 
-_SGL_DIFFUSION_MODELS = _discover_and_register_models()
+_SGLANG_DIFFUSION_MODELS = _discover_and_register_models()
 
 _SUBPROCESS_COMMAND = [
     sys.executable,
@@ -361,6 +361,6 @@ ModelRegistry = _ModelRegistry(
             component_name,
             mod_relname,
             cls_name,
-        ) in _SGL_DIFFUSION_MODELS.items()
+        ) in _SGLANG_DIFFUSION_MODELS.items()
     }
 )

@@ -39,6 +39,7 @@ except ImportError:
 RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
     "1-gpu-runner": [
         "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+        "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
         "deepseek-ai/DeepSeek-OCR",
         "google/gemma-3-4b-it",
         "intfloat/e5-mistral-7b-instruct",
@@ -56,6 +57,7 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
         "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8",
         "openai/gpt-oss-20b",
+        "lmsys/gpt-oss-20b-bf16",
         "OpenGVLab/InternVL2_5-2B",
         "Qwen/Qwen1.5-MoE-A2.7B",
         "Qwen/Qwen2.5-7B-Instruct",
@@ -64,11 +66,16 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "Qwen/Qwen3-Embedding-8B",
         "Qwen/QwQ-32B-AWQ",
         "Qwen/Qwen3-30B-A3B",
+        "Skywork/Skywork-Reward-Llama-3.1-8B-v0.2",
+        # diffusion
         "Qwen/Qwen-Image",
         "Qwen/Qwen-Image-Edit",
-        "Skywork/Skywork-Reward-Llama-3.1-8B-v0.2",
-        "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "black-forest-labs/FLUX.1-dev",
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
         "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
     ],
     "2-gpu-runner": [
         "mistralai/Mixtral-8x7B-Instruct-v0.1",

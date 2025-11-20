@@ -16,6 +16,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial, wraps
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
@@ -25,6 +26,7 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
@@ -123,10 +125,26 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+
+
+def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Image:
+    for i in range(max_retries):
+        try:
+            response = requests.get(image_url, timeout=30)
+            response.raise_for_status()
+            image = Image.open(BytesIO(response.content))
+            image.load()
+            return image
+        except Exception as e:
+            if i == max_retries - 1:
+                raise RuntimeError(
+                    f"Failed to download image after {max_retries} retries: {image_url}"
+                ) from e
+            time.sleep(2**i)
 
 
 def is_in_ci():

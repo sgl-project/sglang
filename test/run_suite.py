@@ -8,11 +8,13 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
+    "amd": HWBackend.AMD,
 }
 
 LABEL_MAPPING = {
-    HWBackend.CUDA: ["stage-a-test-1"],
     HWBackend.CPU: ["default"],
+    HWBackend.AMD: ["stage-a-test-1"],
+    HWBackend.CUDA: ["stage-a-test-1"],
 }
 
 
@@ -45,7 +47,7 @@ def main():
     parser.add_argument(
         "--hw",
         type=str,
-        choices=["cpu", "cuda"],
+        choices=["cpu", "cuda", "amd"],
         required=True,
         help="Hardware backend to run tests on.",
     )
