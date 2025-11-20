@@ -7,7 +7,6 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.jit_kernel.hicache import transfer_hicache_one_layer
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import is_npu, is_xpu
 
@@ -15,12 +14,14 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 if not (_is_npu or _is_xpu):
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
+        transfer_kv_per_layer,
         transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
@@ -281,14 +282,14 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_hicache_one_layer(
-                    k_cache_dst=device_pool.k_buffer[layer_id],
-                    v_cache_dst=device_pool.v_buffer[layer_id],
-                    k_cache_src=self.k_buffer[layer_id],
-                    v_cache_src=self.v_buffer[layer_id],
-                    indices_dst=device_indices,
-                    indices_src=host_indices,
-                    element_dim=self.head_num * self.head_dim,
+                transfer_kv_per_layer(
+                    src_k=self.k_buffer[layer_id],
+                    dst_k=device_pool.k_buffer[layer_id],
+                    src_v=self.v_buffer[layer_id],
+                    dst_v=device_pool.v_buffer[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    item_size=self.token_stride_size,
                 )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_pf_lf(
@@ -368,17 +369,16 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                element_dim = self.head_num * self.head_dim
-                for layer_id in range(self.layer_num):
-                    transfer_hicache_one_layer(
-                        k_cache_dst=self.k_buffer[layer_id],
-                        v_cache_dst=self.v_buffer[layer_id],
-                        k_cache_src=device_pool.k_buffer[layer_id],
-                        v_cache_src=device_pool.v_buffer[layer_id],
-                        indices_dst=host_indices,
-                        indices_src=device_indices,
-                        element_dim=element_dim,
-                    )
+                transfer_kv_all_layer(
+                    src_k_layers=device_pool.k_data_ptrs,
+                    dst_k_layers=self.k_data_ptrs,
+                    src_v_layers=device_pool.v_data_ptrs,
+                    dst_v_layers=self.v_data_ptrs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    num_layers=self.layer_num,
+                )
             elif self.layout == "page_first":
                 transfer_kv_all_layer_lf_pf(
                     src_k_layers=device_pool.k_data_ptrs,
