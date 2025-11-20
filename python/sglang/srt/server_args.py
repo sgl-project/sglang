@@ -1173,8 +1173,14 @@ class ServerArgs:
                         f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
                     )
                 else:
-                    self.dp_size = self.tp_size
-
+                    # Allow true TP for NSA: if dp_size is not set, default to 1 (pure TP)
+                    if self.dp_size is None:
+                        self.dp_size = 1
+                        logger.warning(
+                            f"NSA with pure TP mode: dp_size=1, tp_size={self.tp_size}, "
+                            f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
+                        )
+                
                 self.page_size = 64
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
 
