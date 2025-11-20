@@ -1712,7 +1712,7 @@ class Scheduler(
                 dtype=torch.int64,
                 device="cpu",
             )
-            current_running_stream = torch.Tensor(
+            current_running_stream = torch.tensor(
                 [
                     self.running_batch.batch_size(),
                 ],
