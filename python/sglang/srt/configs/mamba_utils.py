@@ -181,3 +181,53 @@ class KimiLinearStateShape:
 @dataclass(kw_only=True, frozen=True)
 class KimiLinearCacheParams(BaseLinearStateParams):
     shape: KimiLinearStateShape
+
+
+@dataclass(kw_only=True, frozen=True)
+class JetNemotronStateShape:
+    conv: list[tuple[int, int]]
+    temporal: tuple[int, int, int]
+
+    intermediate_size: int
+    conv_dim: int
+    ssm_state_size: int
+    num_heads: int
+    head_dim: int
+    state_size: int
+    conv_kernel: int
+
+    @staticmethod
+    def create(
+        *,
+        tp_world_size: int,
+        intermediate_size: int,
+        n_groups: int,
+        num_heads: int,
+        head_dim: int,
+        state_size: int,
+        conv_kernel: int,
+    ) -> "JetNemotronStateShape":
+        if n_groups % tp_world_size != 0:
+            extra_groups = extra_groups_for_head_shards(n_groups, tp_world_size)
+            n_groups += extra_groups
+        conv_dim = intermediate_size
+
+        conv_state_shape = divide(conv_dim, tp_world_size), conv_kernel
+
+        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+        return JetNemotronStateShape(
+            conv=[conv_state_shape],
+            temporal=temporal_state_shape,
+            intermediate_size=intermediate_size,
+            conv_dim=conv_dim,
+            ssm_state_size=state_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+        )
+
+
+@dataclass(kw_only=True, frozen=True)
+class JetNemotronCacheParams(BaseLinearStateParams):
+    shape: JetNemotronStateShape
