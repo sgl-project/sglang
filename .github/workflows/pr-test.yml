@@ -720,38 +720,38 @@ jobs:
       - name: Benchmark single latency
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
 
       - name: Benchmark online latency
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
       - name: Benchmark offline throughput
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
 
       - name: Benchmark offline throughput (Non-streaming, small batch size)
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
       - name: Benchmark online latency (EAGLE)
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
       - name: Benchmark online latency (LoRA)
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
@@ -781,31 +781,31 @@ jobs:
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
       - name: Benchmark offline throughput (w/ Triton)
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
       - name: Benchmark offline throughput (w/ FP8)
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
       - name: Benchmark VLM offline throughput
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
 
       - name: Benchmark VLM online latency
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-1-gpu-part-3:
@@ -834,25 +834,25 @@ jobs:
       - name: Benchmark Scores online latency and throughput
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_latency_throughput
 
       - name: Benchmark Scores online latency and throughput (batch size scaling)
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_batch_scaling
 
       - name: Benchmark Embeddings online latency and throughput
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_latency_throughput
 
       - name: Benchmark Embeddings online latency and throughput (batch size scaling)
         timeout-minutes: 10
         run: |
-          cd test/srt
+          cd test/manual
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
       - name: Cleanup logs directory
