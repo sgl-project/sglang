@@ -72,7 +72,7 @@ from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
 
-from python.sglang.srt.managers.io_struct import ModelWorkerTaskOutput, ModelWorkerTask
+from sglang.srt.managers.io_struct import ModelWorkerTaskOutput, ModelWorkerTask
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
