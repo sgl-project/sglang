@@ -164,7 +164,7 @@ class InputValidationStage(PipelineStage):
         if isinstance(server_args.pipeline_config, WanI2V480PConfig):
             # TODO: could we merge with above?
             # resize image only, Wan2.1 I2V
-            max_area = 720 * 1280
+            max_area = server_args.pipeline_config.max_area
             aspect_ratio = image.height / image.width
             mod_value = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial

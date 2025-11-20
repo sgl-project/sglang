@@ -55,7 +55,7 @@ def prepare_sampling_params(
         logger.debug(f"Setting num_frames to 1 because this is a image-gen model")
         sampling_params.num_frames = 1
         sampling_params.data_type = DataType.IMAGE
-    else:
+    elif sampling_params.adjust_frames:
         # Adjust number of frames based on number of GPUs for video task
         use_temporal_scaling_frames = (
             pipeline_config.vae_config.use_temporal_scaling_frames
@@ -107,6 +107,9 @@ def prepare_sampling_params(
         sampling_params.num_frames = server_args.pipeline_config.adjust_num_frames(
             sampling_params.num_frames
         )
+    else:
+        logger.info(
+            "Not adjusting number of frames because adjust_frames is False")
 
     sampling_params.set_output_file_ext()
     sampling_params.log(server_args=server_args)
