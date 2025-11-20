@@ -234,9 +234,6 @@ class CudaPlatformBase(Platform):
 
                 set_fa_ver(4)
             target_backend = AttentionBackendEnum.FA
-            logger.debug(
-                f"Using FlashAttention (FA3 for hopper, FA4 for blackwell) as default backend"
-            )
 
         if not cls.has_device_capability(80):
             logger.info(

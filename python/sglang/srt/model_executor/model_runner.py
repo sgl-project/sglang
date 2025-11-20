@@ -32,6 +32,7 @@ import torch.distributed as dist
 from sglang.srt.configs import (
     FalconH1Config,
     JetNemotronConfig,
+    JetVLMConfig,
     KimiLinearConfig,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -41,6 +42,7 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
+    ModelImpl,
     get_nsa_index_head_dim,
     is_deepseek_nsa,
 )
@@ -90,6 +92,10 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.mm_utils import (
+    external_mm_preprocess_routine,
+    should_use_external_mm_preprocess,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -112,6 +118,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.hook_manager import register_hooks
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -295,6 +302,7 @@ class ModelRunner:
 
         # Model-specific adjustment
         self.model_specific_adjustment()
+        self.check_quantized_moe_compatibility()
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -315,6 +323,8 @@ class ModelRunner:
 
         if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
             slow_rank_detector.execute()
+        # Init mindspore running environment when model impl is "mindspore"
+        self.init_mindspore_runner()
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -361,6 +371,20 @@ class ModelRunner:
                 self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
         else:
             self.piecewise_cuda_graph_runner = None
+
+    def init_mindspore_runner(self):
+        # Init the mindspore runner
+        # for now, there is only some communication initialization work
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE and _is_npu:
+            from sglang.srt.model_executor.mindspore_runner import init_ms_distributed
+
+            init_ms_distributed(
+                world_size=self.tp_size * self.pp_size,
+                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                local_rank=self.gpu_id,
+                server_args=self.server_args,
+                port=self.dist_port,
+            )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -497,6 +521,9 @@ class ModelRunner:
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
+        if server_args.hooks:
+            register_hooks(self.model, server_args.hooks)
+
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
@@ -548,34 +575,34 @@ class ModelRunner:
         if not server_args.disable_chunked_prefix_cache:
             log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
-        if self.model_config.hf_config.model_type == "qwen3_vl_moe":
-            if (
-                quantization_config := getattr(
-                    self.model_config.hf_config, "quantization_config", None
+    def check_quantized_moe_compatibility(self):
+        if (
+            quantization_config := getattr(
+                self.model_config.hf_config, "quantization_config", None
+            )
+        ) is not None and "weight_block_size" in quantization_config:
+            weight_block_size_n = quantization_config["weight_block_size"][0]
+
+            if self.tp_size % self.moe_ep_size != 0:
+                raise ValueError(
+                    f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
                 )
-            ) is not None and "weight_block_size" in quantization_config:
-                weight_block_size_n = quantization_config["weight_block_size"][0]
+            moe_tp_size = self.tp_size // self.moe_ep_size
 
-                if self.tp_size % self.moe_ep_size != 0:
-                    raise ValueError(
-                        f"tp_size {self.tp_size} must be divisible by moe_ep_size {self.moe_ep_size}"
-                    )
-                moe_tp_size = self.tp_size // self.moe_ep_size
-
-                moe_intermediate_size = (
-                    self.model_config.hf_text_config.moe_intermediate_size
+            moe_intermediate_size = (
+                self.model_config.hf_text_config.moe_intermediate_size
+            )
+            if moe_intermediate_size % moe_tp_size != 0:
+                raise ValueError(
+                    f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
                 )
-                if moe_intermediate_size % moe_tp_size != 0:
-                    raise ValueError(
-                        f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
-                    )
 
-                if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
-                    raise ValueError(
-                        f"For qwen3-vl-fp8 models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
-                        f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size}). "
-                        f"You can fix this by setting arguments `--tp-size` and `--ep-size` correctly."
-                    )
+            if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
+                raise ValueError(
+                    f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
+                    f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
+                    f"You can fix this by setting arguments `--tp` and `--ep` correctly."
+                )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -1412,7 +1439,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig):
             return config
         return None
 
@@ -2013,6 +2040,9 @@ class ModelRunner:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+            return
+
         if self.device != "cpu" and self.server_args.disable_cuda_graph:
             return
 
@@ -2113,6 +2143,13 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+
+        if self.is_multimodal and should_use_external_mm_preprocess(self.model):
+            forward_batch = external_mm_preprocess_routine(
+                forward_batch=forward_batch,
+                multimodal_model=self.model,
+            )
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors

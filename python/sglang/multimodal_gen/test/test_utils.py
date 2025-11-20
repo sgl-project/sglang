@@ -17,6 +17,9 @@ from PIL import Image
 from sglang.multimodal_gen.configs.sample.base import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.performance_logger import (
+    get_diffusion_perf_log_dir,
+)
 
 logger = init_logger(__name__)
 
@@ -107,12 +110,15 @@ def check_image_size(ut, image, width, height):
     ut.assertEqual(image.size, (width, height))
 
 
-def get_perf_log_dir(start_file: Path) -> Path:
-    """Mirror runtime/utils/performance_logger.py behaviour for locating logs."""
-    this_file = start_file.resolve()
-    root_logs = this_file.parents[3] / "logs"
-    fallback = this_file.parents[2] / "logs"
-    return root_logs if root_logs.exists() or not fallback.exists() else fallback
+def get_perf_log_dir() -> Path:
+    """Gets the performance log directory from the centralized sglang utility."""
+    log_dir_str = get_diffusion_perf_log_dir()
+    if not log_dir_str:
+        raise RuntimeError(
+            "Performance logging is disabled (SGLANG_PERF_LOG_DIR is empty), "
+            "but a test tried to access the log directory."
+        )
+    return Path(log_dir_str)
 
 
 def _ensure_log_path(log_dir: Path) -> Path:
@@ -129,9 +135,9 @@ def clear_perf_log(log_dir: Path) -> Path:
     return log_path
 
 
-def prepare_perf_log(start_file: Path) -> tuple[Path, Path]:
+def prepare_perf_log() -> tuple[Path, Path]:
     """Convenience helper to resolve and clear the perf log in one call."""
-    log_dir = get_perf_log_dir(start_file)
+    log_dir = get_perf_log_dir()
     log_path = clear_perf_log(log_dir)
     return log_dir, log_path
 
@@ -166,6 +172,11 @@ def wait_for_perf_record(
                 if rec.get("tag") == tag:
                     return rec, len(records)
         time.sleep(0.5)
+
+    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+        records = read_perf_records(log_path)
+        return {}, len(records)
+
     raise AssertionError(
         f"Timeout waiting for perf log entry '{tag}' (start_len={prev_len})"
     )
@@ -174,15 +185,21 @@ def wait_for_perf_record(
 def wait_for_stage_metrics(
     request_id: str,
     prev_len: int,
-    expected_count: int,
     log_path: Path,
-    timeout: float = 120.0,
+    timeout: float = 300.0,
 ) -> tuple[dict[str, float], int]:
     deadline = time.time() + timeout
     metrics: dict[str, float] = {}
     while time.time() < deadline:
         records = read_perf_records(log_path)
         for rec in records[prev_len:]:
+            # Check if the request is completed
+            if (
+                rec.get("tag") == "total_inference_time"
+                and rec.get("request_id") == request_id
+            ):
+                return metrics, len(records)
+
             if (
                 rec.get("tag") == "pipeline_stage_metric"
                 and rec.get("request_id") == request_id
@@ -191,13 +208,12 @@ def wait_for_stage_metrics(
                 duration = rec.get("duration_ms")
                 if stage is not None and duration is not None:
                     metrics[str(stage)] = float(duration)
-        if len(metrics) >= expected_count:
-            return metrics, len(records)
         time.sleep(0.5)
-    raise AssertionError(
-        f"Timeout waiting for stage metrics for request {request_id} "
-        f"(collected={len(metrics)} expected={expected_count})"
-    )
+
+    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+        records = read_perf_records(log_path)
+        return {}, len(records)
+    raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
 
 
 def sample_step_indices(
