@@ -1227,12 +1227,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
         async with self.is_pause_cond:
             if self.is_pause:
                 return await self._wait_for_model_update_from_disk(obj)
-
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
 
         if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
