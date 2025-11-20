@@ -10,6 +10,10 @@ import torch
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.hicache_storage import (
+    compute_node_hash_values,
+    split_node_hash_value,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -840,9 +844,9 @@ class HiRadixCache(RadixCache):
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
 
-        if child.hash_value:
-            new_node.hash_value = child.hash_value[: split_len // self.page_size]
-            child.hash_value = child.hash_value[split_len // self.page_size :]
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
@@ -901,20 +905,9 @@ class HiRadixCache(RadixCache):
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
 
+            # Compute hash_value if storage is enabled
             if self.enable_storage:
-                last_hash = node.get_last_hash_value()
-                assert (node == self.root_node) or (
-                    last_hash is not None
-                ), "Parent node must have a hash value with storage enabled"
-                new_node.hash_value = []
-                for idx in range(0, len(key), self.page_size):
-                    new_node.hash_value.append(
-                        self.cache_controller.get_hash_str(
-                            key.token_ids[idx : idx + self.page_size],
-                            prior_hash=last_hash,
-                        )
-                    )
-                    last_hash = new_node.hash_value[-1]
+                new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)

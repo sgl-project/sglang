@@ -3,11 +3,14 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.radix_cache import TreeNode
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,79 @@ def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
             hasher.update(t.to_bytes(4, byteorder="little", signed=False))
 
     return hasher.hexdigest()
+
+
+def hash_str_to_int64(hash_str: str) -> int:
+    """Convert SHA256 hex string to signed 64-bit integer for events.
+
+    Takes first 16 hex characters (64 bits) and converts to signed int64 range.
+    """
+    # Take first 16 hex chars to get 64-bit value
+    uint64_val = int(hash_str[:16], 16)
+    # Convert to signed int64 range [-2^63, 2^63-1]
+    if uint64_val >= 2**63:
+        return uint64_val - 2**64
+    return uint64_val
+
+
+def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
+    """Compute SHA256-based hash values for position-aware identification.
+
+    Args:
+        node: The TreeNode to compute hash values for
+        page_size: The page size for chunking tokens
+
+    Returns:
+        List of SHA256 hex strings, one per page
+    """
+    hash_values = []
+
+    # Get parent's last hash value if parent exists
+    parent_hash = None
+    if node.parent is not None and node.parent.hash_value is not None:
+        # Check if parent is root by checking if it has empty key
+        if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
+            parent_hash = node.parent.hash_value[-1]
+
+    # Iterate through node's pages
+    for start in range(0, len(node.key), page_size):
+        page_tokens = node.key.token_ids[start : start + page_size]
+        if not page_tokens:
+            continue
+
+        # Use SHA256-based chaining via get_hash_str
+        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
+        hash_values.append(hash_val)
+        parent_hash = hash_val
+
+    return hash_values
+
+
+def split_node_hash_value(
+    child_hash_value: Optional[List[str]], split_len: int, page_size: int
+) -> tuple[Optional[List[str]], Optional[List[str]]]:
+    """Split hash_value between parent and child nodes during node splitting.
+
+    Args:
+        child_hash_value: The hash_value list from the child node being split
+        split_len: The length at which to split (in tokens)
+        page_size: The page size for calculating number of pages
+
+    Returns:
+        Tuple of (new_node_hash_value, updated_child_hash_value)
+    """
+    if child_hash_value is None:
+        return None, None
+
+    if page_size == 1:
+        split_pages = split_len
+    else:
+        split_pages = split_len // page_size
+
+    new_node_hash = child_hash_value[:split_pages]
+    child_hash = child_hash_value[split_pages:]
+
+    return new_node_hash, child_hash
 
 
 @dataclass

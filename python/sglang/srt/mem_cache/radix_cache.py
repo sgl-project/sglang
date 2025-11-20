@@ -20,12 +20,15 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
+import logging
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -41,6 +44,11 @@ from sglang.srt.mem_cache.evict_policy import (
     LFUStrategy,
     LRUStrategy,
     MRUStrategy,
+)
+from sglang.srt.mem_cache.hicache_storage import (
+    compute_node_hash_values,
+    hash_str_to_int64,
+    split_node_hash_value,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -248,6 +256,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.value = []
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
+        self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
@@ -590,7 +599,6 @@ class RadixCache(BasePrefixCache):
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
-        self._record_remove_event(child)
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -602,8 +610,10 @@ class RadixCache(BasePrefixCache):
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
-        self._record_store_event(new_node)
-        self._record_store_event(child)
+        # Split hash_value if it was already computed, otherwise leave as None
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         return new_node
 
@@ -638,6 +648,7 @@ class RadixCache(BasePrefixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
         return total_prefix_length
 
@@ -695,22 +706,26 @@ class RadixCache(BasePrefixCache):
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
-            # First chunk links to the last page of the parent node (if any).
-            if node.parent is None or node != self.root_node:
-                parent_block_hash = None
-            else:
-                last_page_start = (
-                    (len(node.parent.key) - 1) // self.page_size
-                ) * self.page_size
-                parent_parent_tokens = node.parent.key.token_ids[last_page_start:]
-                parent_block_hash = hash(tuple(parent_parent_tokens))
+            # Compute hash_value lazily if not already set
+            if node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
 
+            # Get parent's last hash value for first page
+            parent_block_hash = None
+            if node.parent is not None and node.parent != self.root_node:
+                if (
+                    node.parent.hash_value is not None
+                    and len(node.parent.hash_value) > 0
+                ):
+                    parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+
+            page_index = 0
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key.token_ids[start : start + self.page_size]
                 if not page_tokens:
                     continue
 
-                block_hash = hash(tuple(page_tokens))
+                block_hash = hash_str_to_int64(node.hash_value[page_index])
 
                 self.kv_event_queue.append(
                     BlockStored(
@@ -722,18 +737,27 @@ class RadixCache(BasePrefixCache):
                     )
                 )
 
-                # Chain next chunk to this one.
                 parent_block_hash = block_hash
+                page_index += 1
 
     def _record_remove_event(self, node: TreeNode):
         # One BlockRemoved per chunk.
         if self.enable_kv_cache_events:
+            # Compute hash_value lazily if not already set (must match what was stored)
+            if node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
+
+            page_index = 0
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key.token_ids[start : start + self.page_size]
                 if not page_tokens:
                     continue
-                block_hash = hash(tuple(page_tokens))
+
+                block_hash = hash_str_to_int64(node.hash_value[page_index])
+
                 self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+
+                page_index += 1
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
