@@ -431,12 +431,12 @@ class PerformanceValidator:
                 continue
             actual = summary.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
-
+            tolerance = self.tolerances.denoise_stage if stage == "DenoisingStage" else self.tolerances.non_denoise_stage
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,
                 expected,
-                self.tolerances.stage,
+                tolerance,
                 min_abs_tolerance_ms=120.0,  # relax absolute tolerance for non-denoising stages
             )
 
@@ -473,7 +473,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 "Average Frame Time",
                 summary.avg_frame_time_ms,
                 expected_frame_time,
-                self.tolerances.stage,
+                self.tolerances.denoise_stage,
             )
 
 

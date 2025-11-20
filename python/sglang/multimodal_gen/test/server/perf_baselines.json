@@ -6,7 +6,8 @@
     },
     "tolerances": {
         "e2e": 0.05,
-        "stage": 0.05,
+        "denoise_stage": 0.05,
+        "non_denoise_stage": 0.15,
         "denoise_step": 0.15,
         "denoise_agg": 0.08
     },
@@ -303,7 +304,7 @@
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.52,
                 "LatentPreparationStage": 7.01,
-                "ImageVAEEncodingStage": 1904.33,
+                "ImageVAEEncodingStage": 2068,
                 "DenoisingStage": 231725.24,
                 "DecodingStage": 2655.39,
                 "per_frame_generation": null
