@@ -401,7 +401,6 @@ class DenoisingStage(PipelineStage):
             reserved_frames_mask_sp = (
                 reserved_frames_masks[0] if reserved_frames_masks is not None else None
             )  # Extract tensor
-        
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
