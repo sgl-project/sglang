@@ -112,7 +112,7 @@ class ComposedPipelineBase(ABC):
             except Exception:
                 pass
             mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune"
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
             )
             transformer = self.modules.get("transformer")
             if transformer is not None and hasattr(transformer, "forward"):
