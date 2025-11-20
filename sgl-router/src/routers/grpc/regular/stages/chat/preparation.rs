@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 
 use crate::{
     protocols::chat::ChatCompletionRequest,
@@ -43,18 +44,22 @@ impl ChatPreparationStage {
         let body_ref = utils::filter_chat_request_by_tool_choice(request);
 
         // Step 2: Process messages and apply chat template
-        let processed_messages =
-            match utils::process_chat_messages(&body_ref, &*ctx.components.tokenizer) {
-                Ok(msgs) => msgs,
-                Err(e) => {
-                    return Err(error::bad_request(e));
-                }
-            };
+        let processed_messages = match utils::process_chat_messages(
+            &body_ref,
+            &*ctx.components.tokenizer,
+        ) {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                return Err(error::bad_request(e));
+            }
+        };
 
         // Step 3: Tokenize the processed text
         let encoding = match ctx.components.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
+                error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
                 return Err(error::internal_error(format!("Tokenization failed: {}", e)));
             }
         };
@@ -64,7 +69,10 @@ impl ChatPreparationStage {
         // Step 4: Build tool constraints if needed
         let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
             utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
-                .map_err(|e| error::bad_request(format!("Invalid tool configuration: {}", e)))?
+                .map_err(|e| {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
+                    error::bad_request(format!("Invalid tool configuration: {}", e))
+                })?
         } else {
             None
         };

@@ -7,7 +7,6 @@ import requests
 import torch
 from PIL import Image
 from transformers import (
-    AutoModel,
     AutoProcessor,
     Gemma3ForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,
@@ -17,7 +16,7 @@ from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
 
-TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
 
 
 class VLMInputTestBase:

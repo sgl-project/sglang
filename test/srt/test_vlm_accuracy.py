@@ -14,7 +14,7 @@ from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.managers.mm_utils import embed_mm_inputs, init_embedding_cache
+from sglang.srt.managers.mm_utils import embed_mm_inputs, init_mm_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -30,7 +30,7 @@ from sglang.srt.server_args import ServerArgs
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.model_path = ""
         cls.chat_template = ""
@@ -182,7 +182,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
             .eval()
             .to(cls.device)
         )
-        init_embedding_cache()
+        init_mm_embedding_cache()
 
     async def test_vlm_embedding_output(self):
         """
@@ -288,7 +288,7 @@ class TestMiniCPMV4Logits(VisionLLMLogitsBase):
             .eval()
             .to(cls.device)
         )
-        init_embedding_cache()
+        init_mm_embedding_cache()
 
     async def test_vlm_embedding_output(self):
         """

@@ -1,5 +1,5 @@
 Hierarchical KV Caching (HiCache)
-======================
+=================================
 
 .. toctree::
    :maxdepth: 1

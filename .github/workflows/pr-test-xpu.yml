@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
+      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
@@ -13,11 +14,11 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
+      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xpu.yml"
-    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:

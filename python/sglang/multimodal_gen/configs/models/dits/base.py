@@ -20,7 +20,7 @@ class DiTArchConfig(ArchConfig):
         default_factory=lambda: {
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
-            AttentionBackendEnum.FA3,
+            AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
