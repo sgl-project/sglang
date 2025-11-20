@@ -262,7 +262,9 @@ class NativeSparseAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.nsa_prefill_impl: _NSA_IMPL_T = model_runner.server_args.nsa_prefill_backend
+        self.nsa_prefill_impl: _NSA_IMPL_T = (
+            model_runner.server_args.nsa_prefill_backend
+        )
         self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
@@ -1365,7 +1367,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         """
         Decide all strategies for this batch.
         """
-        from sglang.srt.utils import is_blackwell, get_device_sm
+        from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
         if forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
@@ -1381,7 +1383,8 @@ class NativeSparseAttnBackend(AttentionBackend):
                 and max_kv_len <= self.nsa_index_topk  # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
-                and sum_seq_lens <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
+                and sum_seq_lens
+                <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
