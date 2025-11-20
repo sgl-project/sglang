@@ -10,6 +10,8 @@ in a functional manner, reducing the need for explicit parameter passing.
 """
 
 import pprint
+import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -17,19 +19,14 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.base import DataType
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.performance_logger import PerformanceLogger
-
-if TYPE_CHECKING:
-    from torchcodec.decoders import VideoDecoder
-
-import time
-from collections import OrderedDict
-
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from torchcodec.decoders import VideoDecoder
 
 
 class PipelineLoggingInfo:
@@ -191,7 +188,6 @@ class Req:
 
     # VSA parameters
     VSA_sparsity: float = 0.0
-    perf_logger: PerformanceLogger | None = None
 
     # stage logging
     logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)
@@ -202,6 +198,8 @@ class Req:
 
     # debugging
     debug: bool = False
+    # dummy for now
+    perf_dump_path: str | None = None
 
     # results
     output: torch.Tensor | None = None
@@ -229,9 +227,6 @@ class Req:
             self.negative_prompt_embeds = []
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
-
-        if self.perf_logger is None:
-            self.perf_logger = PerformanceLogger(self.request_id)
 
     def set_width_and_height(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
