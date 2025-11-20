@@ -1983,7 +1983,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
             else:
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
-                    # YC TO DO
                     attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
                         WQ=self.w_vc.transpose(-1, -2),
