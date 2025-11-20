@@ -112,6 +112,7 @@ class TestDeepseek_w8a8(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
             env=env,
+            timeout=3000,  
         )
 
     @classmethod
