@@ -78,6 +78,18 @@ class TrainingWeightSender:
         ptr = tensor.data_ptr()
         length = tensor.numel() * tensor.element_size()
 
+        # Check if this memory region is already registered
+        if name in self.weight_buffers:
+            existing_ptr = self.weight_buffers[name]['ptr']
+            if existing_ptr == ptr:
+                # Same memory region, just update the tensor reference
+                self.weight_buffers[name]['tensor'] = tensor
+                logger.debug(f"[TrainingWeightSender] Updated tensor reference for '{name}': ptr={ptr:#x}")
+                return
+            else:
+                # Different memory region, need to register new one
+                logger.info(f"[TrainingWeightSender] Re-registering '{name}' with new ptr: {existing_ptr:#x} -> {ptr:#x}")
+
         # Register with Mooncake engine
         self.engine.register(ptr, length)
 
@@ -112,10 +124,34 @@ class TrainingWeightSender:
         while self.running:
             try:
                 if self.router_socket.poll(timeout=100):  # 100ms timeout
-                    # Receive: [identity, empty_frame, json_data]
-                    identity = self.router_socket.recv()
-                    empty = self.router_socket.recv()
-                    message = self.router_socket.recv_json()
+                    # ROUTER receives frames from DEALER
+                    frames = self.router_socket.recv_multipart()
+
+                    logger.debug(f"[TrainingWeightSender] Received {len(frames)} frames, "
+                                f"frame lengths: {[len(f) for f in frames]}")
+
+                    if len(frames) < 2:
+                        logger.warning(f"[TrainingWeightSender] Received malformed message with {len(frames)} frames")
+                        continue
+
+                    # ROUTER adds identity as first frame
+                    # Format is typically: [identity, delimiter (empty), actual_message]
+                    identity = frames[0]
+
+                    # Try to find the JSON payload
+                    message = None
+                    for i in range(1, len(frames)):
+                        try:
+                            if len(frames[i]) > 0:  # Skip empty frames
+                                message = zmq.utils.jsonapi.loads(frames[i])
+                                logger.debug(f"[TrainingWeightSender] Found JSON in frame {i}")
+                                break
+                        except Exception:
+                            continue
+
+                    if message is None:
+                        logger.error(f"[TrainingWeightSender] Could not decode JSON from any frame")
+                        continue
 
                     msg_type = message.get("type", "")
 
@@ -139,23 +175,32 @@ class TrainingWeightSender:
         Message format:
         {
             "type": "sync_status",
-            "session_id": "ip:port",
+            "p2p_session_id": "training_ip:training_port",  # Training's ZMQ address
             "status": "ready",
             "ip": rollout_ip,
+            "transfer_session_id": rollout_mooncake_session_id,  # Rollout's Mooncake RPC address
             "ptr": rollout_ptr,
             "length": buffer_length,
             "task_id": task_id
         }
         """
-        session_id = message.get("session_id", "")
+        # Log the raw message for debugging
+        logger.debug(f"[TrainingWeightSender] Raw message: {message}")
+
+        p2p_session_id = message.get("p2p_session_id", "")
         rollout_ip = message.get("ip", "")
+        rollout_transfer_session_id = message.get("transfer_session_id", "")
         rollout_ptr = message.get("ptr", 0)
         rollout_length = message.get("length", 0)
         task_id = message.get("task_id", "")
 
         logger.info(
-            f"[TrainingWeightSender] Received sync_status from {session_id}, "
-            f"task_id={task_id}, rollout_ptr={rollout_ptr:#x}"
+            f"[TrainingWeightSender] Received sync_status: "
+            f"p2p_session_id={p2p_session_id}, "
+            f"task_id={task_id}, "
+            f"rollout_transfer_session_id={rollout_transfer_session_id}, "
+            f"rollout_ip={rollout_ip}, "
+            f"rollout_ptr={rollout_ptr:#x}"
         )
 
         try:
@@ -175,19 +220,26 @@ class TrainingWeightSender:
                     f"Length mismatch: src={src_length}, dst={rollout_length}"
                 )
 
+            # Validate that we have rollout_transfer_session_id
+            if not rollout_transfer_session_id:
+                raise RuntimeError(
+                    "Missing rollout_transfer_session_id in sync_status message. "
+                    "This is required for establishing RDMA connection."
+                )
+
             logger.info(
                 f"[TrainingWeightSender] Performing RDMA write: "
-                f"src_ptr={src_ptr:#x} -> dst_ptr={rollout_ptr:#x}, length={src_length}"
+                f"src_ptr={src_ptr:#x} -> dst_ptr={rollout_ptr:#x}, "
+                f"length={src_length}, "
+                f"target_session={rollout_transfer_session_id}"
             )
 
             # Perform RDMA write using Mooncake transfer engine
-            # Get session_id from rollout (format: "ip:port")
-            rollout_session_id = self.engine.get_session_id()  # This should be replaced with actual session management
-
+            # Use rollout's Mooncake transfer_session_id for RDMA connection
             status = self.engine.transfer_sync(
-                session_id=session_id,
-                src_ptr=src_ptr,
-                dst_ptr=rollout_ptr,
+                session_id=rollout_transfer_session_id,
+                buffer=src_ptr,
+                peer_buffer_address=rollout_ptr,
                 length=src_length,
             )
 
@@ -199,15 +251,13 @@ class TrainingWeightSender:
             )
 
             # Send success confirmation back to rollout worker
-            self.router_socket.send_multipart([
-                identity,
-                b"",
-                zmq.utils.jsonapi.dumps({
-                    "type": "transfer_complete",
-                    "status": "success",
-                    "task_id": task_id,
-                })
-            ])
+            # ROUTER to DEALER: [identity, empty_delimiter, payload]
+            response_data = zmq.utils.jsonapi.dumps({
+                "type": "transfer_complete",
+                "status": "success",
+                "task_id": task_id,
+            })
+            self.router_socket.send_multipart([identity, b"", response_data])
 
             logger.info(f"[TrainingWeightSender] Sent success confirmation for task {task_id}")
 
@@ -215,16 +265,13 @@ class TrainingWeightSender:
             logger.error(f"[TrainingWeightSender] Error handling sync_status: {e}", exc_info=True)
 
             # Send failure confirmation
-            self.router_socket.send_multipart([
-                identity,
-                b"",
-                zmq.utils.jsonapi.dumps({
-                    "type": "transfer_complete",
-                    "status": "failed",
-                    "error": str(e),
-                    "task_id": task_id,
-                })
-            ])
+            response_data = zmq.utils.jsonapi.dumps({
+                "type": "transfer_complete",
+                "status": "failed",
+                "error": str(e),
+                "task_id": task_id,
+            })
+            self.router_socket.send_multipart([identity, b"", response_data])
 
 
 def training_process(
@@ -624,8 +671,10 @@ class TestP2PTransferEngineBasic(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    # Use DEBUG level to see more detailed logs
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - [%(process)d] - %(name)s - %(levelname)s - %(message)s",
+        level=logging.DEBUG,
+        format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     unittest.main()

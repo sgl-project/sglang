@@ -27,19 +27,8 @@ class TransferHandle:
         self.socket_lock = socket_lock
 
     def wait(self):
-        """Wait for the transfer to complete and release the socket"""
+        """Wait for the transfer to complete"""
         self._event.wait()
-
-        # Clean up the socket after completion
-        with self.socket_lock:
-            if self.task_id in self.socket_cache:
-                socket_info = self.socket_cache.pop(self.task_id)
-                try:
-                    socket_info['socket'].close()
-                    socket_info['context'].term()
-                    logger.debug(f"Released socket for task {self.task_id}")
-                except Exception as e:
-                    logger.warning(f"Error releasing socket for task {self.task_id}: {e}")
 
         if not self.success:
             raise RuntimeError("P2P weight transfer failed")
@@ -57,20 +46,18 @@ class TransferTask:
     def __init__(
         self,
         task_id: str,
-        session_id: str,
+        training_p2p_session_id: str,
+        rollout_transfer_session_id: str,
         ptr: int,
         length: int,
-        remote_ip: str,
-        remote_port: int,
         socket_cache: Dict,
         socket_lock: threading.Lock,
     ):
         self.task_id = task_id
-        self.session_id = session_id
+        self.training_p2p_session_id = training_p2p_session_id  # ZMQ communication endpoint (training ip:port)
+        self.rollout_transfer_session_id = rollout_transfer_session_id  # Local Mooncake session_id for RDMA
         self.ptr = ptr
         self.length = length
-        self.remote_ip = remote_ip
-        self.remote_port = remote_port
         self.handle = TransferHandle(task_id, socket_cache, socket_lock)
 
 class P2PTransferEngine:
@@ -145,15 +132,29 @@ class P2PTransferEngine:
         The task will be picked up by an idle worker thread which will:
         1. Register the memory region
         2. Send sync_status to training side with ip:port and registered ptr
+
+        Args:
+            session_id: Remote training process address (ip:port) for ZMQ communication
+            ptr: Local memory pointer to register
+            length: Buffer length
         """
         task_id = self._generate_task_id()
         try:
             remote_ip, remote_port = session_id.split(":")[0], int(session_id.split(":")[1])
         except Exception as e:
             raise ValueError(f"Invalid session_id format: {session_id}") from e
+
+        # Get local Mooncake transfer session_id
+        local_transfer_session_id = self.engine.get_session_id()
+
         task = TransferTask(
-            task_id, session_id, ptr, length, remote_ip, remote_port,
-            self.socket_cache, self.socket_lock
+            task_id=task_id,
+            training_p2p_session_id=session_id,
+            rollout_transfer_session_id=local_transfer_session_id,
+            ptr=ptr,
+            length=length,
+            socket_cache=self.socket_cache,
+            socket_lock=self.socket_lock
         )
 
         # Shard task to queue based on session_id
@@ -184,7 +185,7 @@ class P2PTransferEngine:
                     task.handle._mark_done(True)
                 except Exception as e:
                     logger.error(
-                        f"Transfer task failed for session {task.session_id}: {e}"
+                        f"Transfer task failed for session {task.training_p2p_session_id} : {e}"
                     )
                     task.handle._mark_done(False)
 
@@ -199,49 +200,63 @@ class P2PTransferEngine:
         2. Send sync_status to training side with connection info and ptr
         3. Wait for success confirmation from training side
         """
-        session_id = task.session_id
+        training_p2p_session_id = task.training_p2p_session_id
+        rollout_transfer_session_id = task.rollout_transfer_session_id
         ptr = task.ptr
         length = task.length
 
         # Register memory region if not already registered
         with self.registration_lock:
-            if ptr not in self.registered_ptrs[session_id]:
+            if ptr not in self.registered_ptrs[training_p2p_session_id]:
                 logger.debug(
-                    f"Registering memory region for session {session_id}: "
+                    f"Registering memory region for session {training_p2p_session_id}: "
                     f"ptr={ptr:#x}, length={length}"
                 )
                 self.engine.register(ptr, length)
-                self.registered_ptrs[session_id].add(ptr)
+                self.registered_ptrs[training_p2p_session_id].add(ptr)
             else:
                 logger.debug(
-                    f"Memory region already registered for session {session_id}: ptr={ptr:#x}"
+                    f"Memory region already registered for session {training_p2p_session_id}: ptr={ptr:#x}"
                 )
 
         # Send sync_status to training side and wait for confirmation
-        self._send_sync_status_and_wait(task.task_id, task.remote_ip, task.remote_port, session_id, ptr, length)
+        self._send_sync_status_and_wait(
+            task_id=task.task_id,
+            training_p2p_session_id=training_p2p_session_id,
+            rollout_transfer_session_id=rollout_transfer_session_id,
+            ptr=ptr,
+            length=length
+        )
 
     def _send_sync_status_and_wait(
-        self, task_id: str, remote_ip: str, remote_port: int, session_id: str, ptr: int, length: int
+        self,
+        task_id: str,
+        training_p2p_session_id: str,
+        rollout_transfer_session_id: str,
+        ptr: int,
+        length: int
     ):
         """
         Send sync_status message to training side and wait for confirmation.
 
         Workflow:
-        1. Send sync_status with ip:port and registered ptr to training side
+        1. Send sync_status with local Mooncake session_id and registered ptr to training side
         2. Wait for training side to send back success/failure confirmation
-        3. Socket is cached and will be released when handle.wait() is called
+        3. Socket is cleaned up after successful transfer
 
         Args:
             task_id: Unique task identifier
             remote_ip: Training process IP
-            remote_port: Training process port
-            session_id: Session identifier
+            remote_port: Training process ZMQ port
+            remote_p2p_session_id: Training process address for P2P communication (ip:port)
+            local_transfer_session_id: Local Mooncake transfer engine session_id
             ptr: Registered memory pointer
             length: Buffer length
         """
         # Create a temporary socket and cache it for this task
         context = zmq.Context()
         socket = context.socket(zmq.DEALER)
+        remote_ip, remote_port = training_p2p_session_id.split(":")[0], int(training_p2p_session_id.split(":")[1])
         socket.connect(format_tcp_address(remote_ip, remote_port))
 
         # Cache the socket for later cleanup
@@ -255,20 +270,22 @@ class P2PTransferEngine:
 
         try:
             # Send sync_status to training side
+            # Include our Mooncake session_id so training can connect to us for RDMA
             socket.send_json(
                 {
                     "type": "sync_status",
-                    "session_id": session_id,
+                    "p2p_session_id": training_p2p_session_id,
                     "status": "ready",
                     "ip": self.engine.hostname,
+                    "transfer_session_id": rollout_transfer_session_id,
                     "ptr": ptr,
                     "length": length,
                     "task_id": task_id,
                 }
             )
             logger.info(
-                f"Sent sync_status to {remote_ip}:{remote_port} for session {session_id}, "
-                f"task_id={task_id}, ptr={ptr:#x}"
+                f"Sent sync_status to {remote_ip}:{remote_port} for session {training_p2p_session_id}, "
+                f"task_id={task_id}, rollout_transfer_session_id={rollout_transfer_session_id}, ptr={ptr:#x}"
             )
 
             # Wait for confirmation from training side
@@ -276,7 +293,32 @@ class P2PTransferEngine:
             socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30 seconds timeout
 
             logger.debug(f"Waiting for confirmation from {remote_ip}:{remote_port} for task {task_id}")
-            response = socket.recv_json()
+
+            # DEALER receives from ROUTER: the message may have multiple frames
+            # ROUTER sends: [identity, empty_delimiter, payload]
+            # DEALER receives: [empty_delimiter, payload] (identity is automatically stripped)
+            try:
+                frames = socket.recv_multipart()
+                logger.debug(f"Received {len(frames)} frames: {[len(f) for f in frames]}")
+
+                # Find the JSON payload (skip empty frames)
+                response = None
+                for i, frame in enumerate(frames):
+                    if len(frame) > 0:
+                        try:
+                            response = zmq.utils.jsonapi.loads(frame)
+                            logger.debug(f"Parsed JSON from frame {i}: {response}")
+                            break
+                        except Exception:
+                            logger.debug(f"Frame {i} is not JSON: {repr(frame[:100])}")
+                            continue
+
+                if response is None:
+                    raise RuntimeError(f"No valid JSON found in {len(frames)} frames")
+
+            except Exception as json_error:
+                logger.error(f"Failed to receive/parse response: {json_error}")
+                raise json_error
 
             # Check response status
             response_type = response.get("type", "")
@@ -285,8 +327,15 @@ class P2PTransferEngine:
             if response_type == "transfer_complete" and response_status == "success":
                 logger.info(
                     f"Received success confirmation from {remote_ip}:{remote_port} "
-                    f"for task {task_id}, session {session_id}"
+                    f"for task {task_id}, transfer session {rollout_transfer_session_id}"
                 )
+                # Clean up the socket after successful transfer
+                with self.socket_lock:
+                    if task_id in self.socket_cache:
+                        self.socket_cache.pop(task_id)
+                socket.close()
+                context.term()
+                logger.debug(f"Released socket for task {task_id}")
             else:
                 error_msg = response.get("error", "Unknown error")
                 logger.error(
