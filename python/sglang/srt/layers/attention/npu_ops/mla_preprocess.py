@@ -6,6 +6,7 @@ from sglang.srt.utils import get_bool_env_var, is_npu
 _is_npu = is_npu()
 _ENABLE_MLA_PREPROCESS_FLAG = get_bool_env_var("SGLANG_NPU_USE_MLAPO")
 _NPU_FORMAT_NZ = 29
+_use_fia_nz = get_bool_env_var("SGLANG_USE_FIA_NZ")
 
 
 def is_mla_preprocess_enabled() -> bool:
@@ -287,7 +288,19 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
         )  # (B*S,N,1,D)
 
-        cache_mode = "PA_BNSD"
+        cache_mode = ("PA_NZ" if _use_fia_nz else "PA_BNSD",)
+        # self.kvCache = self.kvCache.view(
+        #     -1,
+        #     forward_batch.attn_backend.page_size,
+        #     1,
+        #     forward_batch.attn_backend.kv_lora_rank,
+        # )
+        # self.kvCacheRope = self.kvCacheRope.view(
+        #     -1,
+        #     forward_batch.attn_backend.page_size,
+        #     1,
+        #     forward_batch.attn_backend.qk_rope_head_dim,
+        # )
         self.kvCache = self.kvCache.view(
             -1,
             forward_batch.attn_backend.page_size,
@@ -334,7 +347,15 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             dtype=input_dtype,
             device=hidden_states.device,
         )
-
+        if _use_fia_nz:
+            kv_shape, kv_rope_shape = k_cache.shape, v_cache.shape
+            num_blocks, block_size, num_heads, _ = kv_shape
+            k_cache = k_cache.view(
+                num_blocks, num_heads * self.kv_lora_rank // 16, block_size, 16
+            )
+            v_cache = v_cache.view(
+                num_blocks, num_heads * self.qk_rope_head_dim // 16, block_size, 16
+            )
         # TODO: dummy inputs to be removed
         # https://github.com/sgl-project/sgl-kernel-npu/issues/78
         torch.ops.npu.mla_preprocess(
@@ -360,13 +381,17 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             quant_scale1=self.q_b_proj.input_scale,
             quant_offset1=self.q_b_proj_input_offset,
             bias1=self.q_b_proj_quant_bias,
-            cache_mode="krope_ctkv",
+            cache_mode="nzcache" if _use_fia_nz else "krope_ctkv",
             quant_mode="per_tensor_quant_asymm",
             q_out0=q_nope_out,
             kv_cache_out0=k_cache,
             q_out1=q_rope_out,
             kv_cache_out1=v_cache,
         )
+        if _use_fia_nz:
+            k_cache = k_cache.view(kv_shape)
+            v_cache = v_cache.view(kv_rope_shape)
+
         return (
             q_rope_out,
             v_cache,

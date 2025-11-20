@@ -23,6 +23,22 @@ if TYPE_CHECKING:
 
 import numpy as np
 
+_use_fia_nz = get_bool_env_var("SGLANG_USE_FIA_NZ") and is_mla_preprocess_enabled()
+
+
+def _reshape_kv_for_fia_nz(
+    tensor: torch.Tensor, num_heads: int, head_dim: int, page_size: int
+) -> torch.Tensor:
+    """Reshapes a tensor for FIA NZ format."""
+    return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
+
+
+def _reshape_kv_for_fia_bsnd(
+    tensor: torch.Tensor, num_heads: int, head_dim: int, page_size: int
+) -> torch.Tensor:
+    """Reshapes a tensor for FIA BSND format."""
+    return tensor.view(-1, page_size, num_heads * head_dim)
+
 
 @dataclass
 class ForwardMetadata:
@@ -513,12 +529,20 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_rope_cache = k_rope.view(
-            -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
-        )
-        c_kv_cache = c_kv.view(
-            -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
-        )
+        if _use_fia_nz:
+            k_rope_cache = _reshape_kv_for_fia_nz(
+                k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+            )
+            c_kv_cache = _reshape_kv_for_fia_nz(
+                c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
+            )
+        else:
+            k_rope_cache = k_rope.view(
+                -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
+            )
+            c_kv_cache = c_kv.view(
+                -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
+            )
 
         q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
         q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
@@ -674,15 +698,23 @@ class AscendAttnBackend(AttentionBackend):
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            k_rope_cache = k_rope.view(
-                -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
-            )
-            c_kv_cache = c_kv.view(
-                -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
-            )
+            if _use_fia_nz:
+                k_rope_cache = _reshape_kv_for_fia_nz(
+                    k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+                )
+                c_kv_cache = _reshape_kv_for_fia_nz(
+                    c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
+                )
+            else:
+                k_rope_cache = _reshape_kv_for_fia_bsnd(
+                    k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+                )
+                c_kv_cache = _reshape_kv_for_fia_bsnd(
+                    c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
+                )
 
-            q_nope = q.view(-1, layer.tp_q_head_num, 1, self.kv_lora_rank).contiguous()
-            q_rope = q_rope.view(-1, layer.tp_q_head_num, 1, self.qk_rope_head_dim)
+            q_nope = q.view(-1, 1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
+            q_rope = q_rope.view(-1, 1, layer.tp_q_head_num, self.qk_rope_head_dim)
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
             else:
@@ -700,7 +732,7 @@ class AscendAttnBackend(AttentionBackend):
                 num_key_value_heads=layer.tp_k_head_num,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
-                input_layout="BNSD",
+                input_layout="BSND",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
                 antiquant_mode=0,
@@ -720,7 +752,7 @@ class AscendAttnBackend(AttentionBackend):
                 num_key_value_heads=layer.tp_k_head_num,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
-                input_layout="BNSD",
+                input_layout="BSND",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
                 antiquant_mode=0,
@@ -835,12 +867,20 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
-                kv_c = kv_c.view(
-                    -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
-                )
-                k_pe = k_pe.view(
-                    -1, self.page_size, layer.tp_k_head_num * self.qk_rope_head_dim
-                )
+                if _use_fia_nz:
+                    kv_c = _reshape_kv_for_fia_nz(
+                        kv_c, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
+                    )
+                    k_pe = _reshape_kv_for_fia_nz(
+                        k_pe, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+                    )
+                else:
+                    kv_c = _reshape_kv_for_fia_bsnd(
+                        kv_c, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
+                    )
+                    k_pe = _reshape_kv_for_fia_bsnd(
+                        k_pe, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+                    )
                 q = q.view(
                     forward_batch.batch_size, -1, layer.tp_q_head_num, self.kv_lora_rank
                 )

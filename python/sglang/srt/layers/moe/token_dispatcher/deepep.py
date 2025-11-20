@@ -674,6 +674,37 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
 
+    def fused_moe(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        gmm1_permuted_weight: torch.Tensor,
+        gmm1_permuted_weight_scale: torch.Tensor,
+        gmm2_weight: torch.Tensor,
+        gmm2_weight_scale: torch.Tensor,
+        use_fp8: bool = False,
+    ):
+        buffer = self._get_buffer()
+        topk_idx = topk_idx.to(torch.int64)
+
+        (
+            hidden_states,
+            _,
+        ) = buffer.fused_deep_moe(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            gmm1_permuted_weight,
+            gmm1_permuted_weight_scale,
+            gmm2_weight,
+            gmm2_weight_scale,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+            quant_mode=use_fp8,
+        )
+        return hidden_states
+
     def _get_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
         return DeepEPBuffer.get_deepep_buffer(
@@ -809,3 +840,27 @@ class DeepEPDispatcher(BaseDispatcher):
             self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
+
+    def fused_moe(self, *args, **kwargs) -> Tuple:
+        return self._fused_moe_impl(*args, **kwargs)
+
+    def _fused_moe_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        gmm1_permuted_weight: torch.Tensor,
+        gmm1_permuted_weight_scale: torch.Tensor,
+        gmm2_weight: torch.Tensor,
+        gmm2_weight_scale: torch.Tensor,
+    ):
+        hidden_states = self._get_impl().fused_moe(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            gmm1_permuted_weight=gmm1_permuted_weight,
+            gmm1_permuted_weight_scale=gmm1_permuted_weight_scale,
+            gmm2_weight=gmm2_weight,
+            gmm2_weight_scale=gmm2_weight_scale,
+        )
+        return hidden_states

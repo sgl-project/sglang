@@ -794,6 +794,13 @@ def get_dataset(args, tokenizer, model_id=None):
             fixed_output_len=args.random_output_len,
             random_sample=True,
         )
+    elif args.dataset_name == "gsm8k":
+        input_requests = sample_gsm8k_requests(
+            dataset_path=args.dataset_path,
+            num_prompts=args.num_prompts,
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+        )
     elif args.dataset_name == "mooncake":
         # For mooncake, we don't generate the prompts here.
         # We just load the raw trace data. The async generator will handle the rest.
@@ -1196,6 +1203,31 @@ def sample_sharegpt_requests(
     print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
     return filtered_dataset
+
+
+def sample_gsm8k_requests(
+    dataset_path: str,
+    num_prompts: int,
+    input_len: int,
+    output_len: int,
+) -> List[DatasetRow]:
+    dataset = []
+    with open(dataset_path) as f:
+        for line in f:
+            data = json.loads(line.strip())
+            dataset.append(data)
+
+    random.shuffle(dataset)
+    sampled_dataset = []
+    for i in range(min(len(dataset), num_prompts)):
+        sampled_dataset.append(
+            DatasetRow(
+                prompt=dataset[i]["question"],
+                prompt_len=input_len,
+                output_len=output_len,
+            )
+        )
+    return sampled_dataset
 
 
 def sample_random_requests(
@@ -2450,6 +2482,7 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "gsm8k",
         ],
         help="Name of the dataset to benchmark on.",
     )
