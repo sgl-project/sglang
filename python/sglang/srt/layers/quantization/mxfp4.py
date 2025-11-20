@@ -35,7 +35,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.utils import (
+    is_layer_skipped,
+    get_torch_compile_disable_decorator
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cuda,
@@ -88,6 +91,7 @@ if _is_hip:
             err
         )
 
+conditional_decorator = get_torch_compile_disable_decorator(_is_hip)
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
@@ -582,6 +586,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         self.runner = MoeRunner(backend, moe_runner_config)
 
+    @conditional_decorator
     def apply(
         self,
         layer: torch.nn.Module,
