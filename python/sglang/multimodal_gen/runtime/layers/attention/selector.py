@@ -110,7 +110,7 @@ def _cached_get_attn_backend(
     # Check whether a particular choice of backend was
     # previously forced.
     #
-    # THIS SELECTION OVERRIDES THE SGL_DIFFUSION_ATTENTION_BACKEND
+    # THIS SELECTION OVERRIDES THE SGLANG_DIFFUSION_ATTENTION_BACKEND
     # ENVIRONMENT VARIABLE.
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
