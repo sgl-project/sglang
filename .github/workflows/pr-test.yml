@@ -244,8 +244,6 @@ jobs:
 
           echo "All benchmark tests completed!"
 
-  # =============================================== multimodal_gen ====================================================
-
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
   # cuda13-kernel-smoke-test:
