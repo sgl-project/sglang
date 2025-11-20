@@ -2004,10 +2004,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             else:
-                # if self.o_proj.weight.dtype == torch.float8_e4m3fn and False:
-                #     attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                #     attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-                # else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
