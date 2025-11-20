@@ -287,7 +287,6 @@ class Scheduler(
 
         # Init model config
         self.model_config = ModelConfig.from_server_args(server_args)
-        self.drafter_config = None
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
@@ -341,12 +340,6 @@ class Scheduler(
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.is_eagle():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-            self.drafter_config = ModelConfig.from_server_args(
-                self.server_args,
-                model_path=self.server_args.speculative_draft_model_path,
-                model_revision=self.server_args.speculative_draft_model_revision,
-                is_draft_model=True,
-            )
         self.draft_worker = self.spec_algorithm.create_draft_worker(
             **draft_worker_kwargs
         )
@@ -872,15 +865,16 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
-                    self.drafter_config.hf_text_config.hidden_size
-                    if self.drafter_config
+                    self.draft_worker.model_config.hidden_size
+                    if self.spec_algorithm.is_eagle()
                     else 0
                 ),
                 hidden_states_dtype=(
-                    self.drafter_config.dtype if self.drafter_config else torch.float32
+                    self.draft_worker.model_config.dtype
+                    if self.spec_algorithm.is_eagle()
+                    else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                require_hidden_states=self.spec_algorithm.is_eagle(),
             )
 
             # The decode requests polling kv cache
@@ -924,15 +918,16 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
-                    self.drafter_config.hf_text_config.hidden_size
-                    if self.drafter_config
+                    self.draft_worker.model_config.hidden_size
+                    if self.spec_algorithm.is_eagle()
                     else 0
                 ),
                 hidden_states_dtype=(
-                    self.drafter_config.dtype if self.drafter_config else torch.float32
+                    self.draft_worker.model_config.dtype
+                    if self.spec_algorithm.is_eagle()
+                    else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                require_hidden_states=self.spec_algorithm.is_eagle(),
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

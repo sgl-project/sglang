@@ -88,7 +88,6 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
-        require_hidden_states: bool = False,
     ):
         self.custom_mem_pool = custom_mem_pool
         device = "cpu"
@@ -123,29 +122,16 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
-            self.require_hidden_states = require_hidden_states
-            if self.require_hidden_states:
-                # For PD + spec decode
-                self.output_topk_p = torch.zeros(
-                    (size, 16), dtype=torch.float32, device=device
-                )
-                self.output_topk_index = torch.zeros(
-                    (size, 16), dtype=torch.int64, device=device
-                )
-                self.output_hidden_states = torch.zeros(
-                    (size, hidden_size), dtype=hidden_states_dtype, device=device
-                )
-            else:
-                # Other methods don't need hidden states
-                self.output_topk_p = torch.empty(
-                    (size, 0), dtype=torch.float32, device=device
-                )
-                self.output_topk_index = torch.empty(
-                    (size, 0), dtype=torch.int64, device=device
-                )
-                self.output_hidden_states = torch.empty(
-                    (size, 0), dtype=hidden_states_dtype, device=device
-                )
+            # For PD + spec decode
+            self.output_topk_p = torch.zeros(
+                (size, 16), dtype=torch.float32, device=device
+            )
+            self.output_topk_index = torch.zeros(
+                (size, 16), dtype=torch.int64, device=device
+            )
+            self.output_hidden_states = torch.zeros(
+                (size, hidden_size), dtype=hidden_states_dtype, device=device
+            )
 
     def get_buf_infos(self):
         ptrs = [
@@ -223,7 +209,7 @@ class MetadataBuffers:
                     req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
                 )
         # For PD + spec decode
-        if req.hidden_states_tensor is not None and self.require_hidden_states:
+        if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
             topk = req.output_topk_p.size(0)
 
