@@ -51,6 +51,8 @@ try:
 except Exception as e:
     print(f"import vllm failed: {e}")
 
+from pydantic import BaseModel
+
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 
 logger = logging.getLogger(__name__)
@@ -109,6 +111,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             self.transform_config = TransformConfig.model_validate(transform_config)
         else:
             self.transform_config = None
+        self._is_wfp8afp8_moe = False
+        self._is_wint4afp8_moe = False
 
     def get_linear_method(self) -> "CompressedTensorsLinearMethod":
         return CompressedTensorsLinearMethod(self)
@@ -376,9 +380,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
         return is_symmetric_activation and is_per_tensor_activation
 
-    def _is_int4_afp8(
-        self, weight_quant: BaseModel, input_quant: BaseModel
-    ) -> bool:
+    def _is_int4_afp8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         # Confirm weights and activations quantized.
         if weight_quant is None or input_quant is None:
             return False

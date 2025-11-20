@@ -5,24 +5,24 @@ from __future__ import annotations
 import enum
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-<<<<<<< HEAD
-=======
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
->>>>>>> d9d83e985 (support wInt4aFp8 moe for llm-compressor)
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import find_matched_target
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.utils.utils import (
     replace_parameter,
 )
 <<<<<<< HEAD
+<<<<<<< HEAD
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
 =======
 
@@ -42,6 +43,8 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 
+=======
+>>>>>>> 6dec3690d (support deepep for wfp8afp8 wint4afp8)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -60,6 +63,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLDispatchOutput,
+        DeepEPNormalDispatchOutput,
     )
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
@@ -131,10 +138,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             return CompressedTensorsWNA16AMXEPMoEMethod(quant_config, layer_number)
 
         if quant_config.target_scheme_map:
-            
+
             # Use 'Linear' as the default target for fused MoE layers in llm-compressor
-            if 'Linear' in quant_config.target_scheme_map.keys(): 
-                prefix = 'Linear'
+            if "Linear" in quant_config.target_scheme_map.keys():
+                prefix = "Linear"
 
             matched_target = find_matched_target(
                 layer_name=prefix,
@@ -153,8 +160,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
+            quant_config._is_wfp8afp8_moe = True
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
         elif quant_config._is_int4_afp8(weight_quant, input_quant):
+            quant_config._is_wint4afp8_moe = True
             return CompressedTensorsWInt4AFp8MoEMethod(scheme_dict)
         else:
             raise RuntimeError(
@@ -525,8 +534,28 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+
+        if moe_runner_backend.is_auto():
+            if (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and get_moe_a2a_backend().is_deepep()
+            ):
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            else:
+                moe_runner_backend = MoeRunnerBackend.TRITON
+        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO(cwan): refactor other backends
+            pass
 
     def apply(
         self,
@@ -537,8 +566,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
         moe_runner_config = self.moe_runner_config
 
 <<<<<<< HEAD
@@ -548,7 +575,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         if self.use_cutlass_fused_experts_fp8:
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
-            topk_weights, topk_ids, _ = topk_output
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
             output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
@@ -578,6 +605,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and moe_runner_config.apply_router_weight_on_input
         ):
+<<<<<<< HEAD
 >>>>>>> d9d83e985 (support wInt4aFp8 moe for llm-compressor)
             topk_weights, topk_ids, _ = topk_output
             if moe_runner_config.apply_router_weight_on_input:
@@ -604,13 +632,63 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     else ActivationType.Gelu
                 ),
                 quant_type=QuantType.per_Token,
+=======
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            output = rocm_fused_experts_tkw1(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=moe_runner_config.activation,
+                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
+>>>>>>> 6dec3690d (support deepep for wfp8afp8 wint4afp8)
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
             return StandardCombineInput(hidden_states=output)
-        else:
+        elif self.runner.runner_backend.is_deep_gemm():
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
+            if self.block_quant:
+                block_shape = self.weight_block_size
+                w13_scale = layer.w13_weight_scale
+                w2_scale = layer.w2_weight_scale
+            else:
+                # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
+                scale_block_size = 128
+                block_shape = [scale_block_size, scale_block_size]
+                w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+                w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+                w13_scale = (
+                    layer.w13_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w13_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w13_scale_k, dim=2)
+                )
+                w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+                w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+                w2_scale = (
+                    layer.w2_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w2_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w2_scale_k, dim=2)
+                )
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=True,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                block_shape=block_shape,
+            )
+        elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -623,7 +701,12 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.weight_block_size if self.block_quant else None,
             )
-            return self.runner.run(dispatch_output, quant_info)
+
+        else:
+            raise NotImplementedError(
+                "Unsupported runner backend: %s" % self.runner.runner_backend
+            )
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
@@ -1273,16 +1356,16 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
         self.moe_runner_config = moe_runner_config
         self.AMX_method.create_moe_runner(layer, moe_runner_config)
 
+
 class CompressedTensorsWInt4AFp8MoEMethod(CompressedTensorsMoEMethod):
     def __init__(self, scheme_dict: Dict[str, Any]):
         self.input_quant = scheme_dict.get("input_activations")
         self.weight_quant = scheme_dict.get("weights")
         self.static_input_scales = not self.input_quant.dynamic
 
-
     def create_weights(
         self,
-        layer: Module,
+        layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
@@ -1368,7 +1451,6 @@ class CompressedTensorsWInt4AFp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
-
         # Pre-populate the strides
         device = layer.w13_weight_packed.device
 
@@ -1412,15 +1494,18 @@ class CompressedTensorsWInt4AFp8MoEMethod(CompressedTensorsMoEMethod):
         )
         return
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        from sglang.srt.layers.quantization.w4afp8 import interleave_scales 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.quantization.w4afp8 import interleave_scales
+
         dtype = torch.bfloat16
         device = layer.w2_weight_packed.device
 
         # Interleave w13_weight_scale (gate_up_proj)
         w13_weight_scale = layer.w13_weight_scale.to(dtype)
         w13_weight_scale = interleave_scales(w13_weight_scale)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(
+            w13_weight_scale, requires_grad=False
+        )
 
         # Interleave w2_weight_scale (down_proj)
         w2_weight_scale = layer.w2_weight_scale.to(dtype)
@@ -1446,6 +1531,21 @@ class CompressedTensorsWInt4AFp8MoEMethod(CompressedTensorsMoEMethod):
             logger.error(
                 "Static input scales for WInt4AFp8MoEMethod are not yet supported for llm-compressor."
             )
+
+        # Use scale = 1.0 (cast to bfloat16), is faster
+        new_w13_input_scale = torch.tensor(
+            [1],
+            dtype=dtype,
+            device=device,
+        )
+        layer.w13_input_scale = torch.nn.Parameter(
+            new_w13_input_scale, requires_grad=False
+        )
+        new_w2_input_scale = torch.tensor([1], dtype=dtype, device=device)
+        layer.w2_input_scale = torch.nn.Parameter(
+            new_w2_input_scale, requires_grad=False
+        )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -1453,7 +1553,7 @@ class CompressedTensorsWInt4AFp8MoEMethod(CompressedTensorsMoEMethod):
 
     def apply(
         self,
-        layer: Module,
+        layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 

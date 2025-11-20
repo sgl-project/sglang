@@ -123,7 +123,12 @@ def cutlass_w4a8_moe(
 
     # TODO: Fuse quantization with pre-reorder
     if a1_scale is None:
-        a1_scale = torch.max(torch.abs(a)).to(torch.float32).div_(torch.finfo(torch.float8_e4m3fn).max).view(1) 
+        a1_scale = (
+            torch.max(torch.abs(a))
+            .to(torch.float32)
+            .div_(torch.finfo(torch.float8_e4m3fn).max)
+            .view(1)
+        )
     pre_reorder_triton_kernel_for_cutlass_moe[(m,)](
         a,
         gateup_input,
@@ -535,9 +540,14 @@ def cutlass_w4a8_moe_deepep_ll(
         (num_experts, m, n), device=a.device, dtype=torch.float8_e4m3fn
     )
 
-     # TODO: Fuse quantization with silu_and_mul_masked_post_per_tensor_quant_fwd
+    # TODO: Fuse quantization with silu_and_mul_masked_post_per_tensor_quant_fwd
     if a2_scale is None:
-        a2_scale = torch.max(torch.abs(c1)).to(torch.float32).div_(torch.finfo(torch.float8_e4m3fn).max).view(1) 
+        a2_scale = (
+            torch.max(torch.abs(c1))
+            .to(torch.float32)
+            .div_(torch.finfo(torch.float8_e4m3fn).max)
+            .view(1)
+        )
 
     silu_and_mul_masked_post_per_tensor_quant_fwd(
         c1, intermediate_q, masked_m, a2_scale
