@@ -180,6 +180,9 @@ class MoriKVManager(CommonKVManager):
             self._start_decode_thread()
 
     def _init_engine(self) -> IOEngine:
+        if self.kv_args.ib_device:
+            os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
+
         engine_key = (
             f"mori-{self.disaggregation_mode.value}-"
             f"dp{self.system_dp_rank}-tp{self.attn_tp_rank}-"
