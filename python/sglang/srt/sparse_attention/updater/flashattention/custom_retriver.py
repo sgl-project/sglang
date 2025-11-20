@@ -11,8 +11,6 @@ from sglang.srt.sparse_attention.cache_manager.cache_manager import (
     RetriveQuery,
 )
 
-# from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_average import compute_average_score as compute_score
-# from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_average import proxy_k_tensor_decode, proxy_k_tensor_extend
 from sglang.srt.sparse_attention.kernels.combine_indices_paged import combine_indices
 from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_quest import (
     compute_quest_score as compute_score,
@@ -29,8 +27,7 @@ if TYPE_CHECKING:
         FlashAttentionMetadata,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class DenseRetriver:

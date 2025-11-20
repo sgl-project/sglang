@@ -83,13 +83,6 @@ class RetriveQuery:
             dtype=config.q_dtype,
         )
 
-        # for average
-        # self.proxy_k_tensor = torch.zeros(
-        #     size=(config.keys[0].shape[0]//config.page_size, 1, config.head_num, config.head_dim),
-        #     device=config.device,
-        #     dtype=config.q_dtype
-        # )
-
         self.count_steps = torch.zeros(
             config.max_bs,
             device=config.device,
