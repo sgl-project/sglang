@@ -78,12 +78,12 @@ class TestAscendW4A4(CustomTestCase):
                 )
                 metrics = run_eval(args)
                 print(metrics)
-                
+
                 self.assertGreaterEqual(
                     metrics["accuracy"], TEST_MODEL_MATRIX[model]["accuracy"]
                 )
                 self.assertGreaterEqual(
-                    metrics["output_throughput"], 
+                    metrics["output_throughput"],
                     TEST_MODEL_MATRIX[model]["output_throughput"]
                 )
 
@@ -105,14 +105,14 @@ class TestAscendW4A4(CustomTestCase):
         for model in self.models:
             with self.subTest(model=model):
                 max_tokens = 256
-                
+
                 tic = time.perf_counter()
                 res = self.run_decode(max_tokens)
                 tok = time.perf_counter()
                 print(res["text"])
                 throughput = max_tokens / (tok - tic)
                 print(f"Throughput: {throughput} tokens/s")
-                
+
                 if is_in_ci():
                     self.assertGreaterEqual(
                         throughput, TEST_MODEL_MATRIX[model]["output_throughput"]
