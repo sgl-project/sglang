@@ -125,8 +125,7 @@ class SamplingParams:
 
     # Profiling
     profile: bool = False
-    num_profiled_timesteps: int = 2
-
+    num_profiled_timesteps: int = 8
     # Debugging
     debug: bool = False
 

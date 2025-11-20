@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -583,23 +584,19 @@ class DenoisingStage(PipelineStage):
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-        prof = torch.profiler.profile(
+        self.profiler = torch.profiler.profile(
             activities=activities,
             schedule=torch.profiler.schedule(
                 skip_first=0,
                 wait=0,
-                warmup=5,
+                warmup=1,
                 active=batch.num_profiled_timesteps,
                 repeat=5,
-            ),
-            on_trace_ready=lambda _: torch.profiler.tensorboard_trace_handler(
-                f"./logs"
             ),
             record_shapes=True,
             with_stack=True,
         )
-        prof.start()
-        self.profiler = prof
+        self.profiler.start()
 
     def step_profile(self):
         if self.profiler:
@@ -618,11 +615,13 @@ class DenoisingStage(PipelineStage):
                 log_dir = f"./logs"
                 os.makedirs(log_dir, exist_ok=True)
 
+                rank = get_world_rank()
                 trace_path = os.path.abspath(
-                    os.path.join(log_dir, f"{request_id}.trace.json.gz")
+                    os.path.join(log_dir, f"{request_id}-rank{rank}.trace.json.gz")
                 )
                 logger.info(f"Saving profiler traces to: {trace_path}")
                 self.profiler.export_chrome_trace(trace_path)
+                torch.distributed.barrier()
         except Exception as e:
             logger.error(f"{e}")
 
