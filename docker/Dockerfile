@@ -15,6 +15,7 @@ ARG SGL_VERSION=0.5.5.post3
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
+ARG INSTALL_DEV_TOOLS=1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -218,54 +219,63 @@ RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]
     MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
 fi
 
-# Python tools
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
-    datamodel_code_generator \
-    mooncake-transfer-engine==0.3.7.post2 \
-    pre-commit \
-    pytest \
-    black \
-    isort \
-    icdiff \
-    uv \
-    wheel \
-    scikit-build-core \
-    nixl \
-    py-spy
+# Python tools (optional)
+RUN --mount=type=cache,target=/root/.cache/pip if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    python3 -m pip install \
+        datamodel_code_generator \
+        mooncake-transfer-engine==0.3.7.post2 \
+        pre-commit \
+        pytest \
+        black \
+        isort \
+        icdiff \
+        uv \
+        wheel \
+        scikit-build-core \
+        nixl \
+        py-spy; \
+    fi
 
-# Install development tools and utilities
-RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
-    gdb \
-    ninja-build \
-    vim \
-    tmux \
-    htop \
-    wget \
-    curl \
-    locales \
-    lsof \
-    git \
-    git-lfs \
-    zsh \
-    tree \
-    silversearcher-ag \
-    cloc \
-    unzip \
-    pkg-config \
-    libssl-dev \
-    bear \
-    ccache \
-    less \
-    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+# Install development tools and utilities (optional)
+RUN --mount=type=cache,target=/var/cache/apt if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    apt-get update && apt-get install -y \
+        gdb \
+        ninja-build \
+        vim \
+        tmux \
+        htop \
+        wget \
+        curl \
+        locales \
+        lsof \
+        git \
+        git-lfs \
+        zsh \
+        tree \
+        silversearcher-ag \
+        cloc \
+        unzip \
+        pkg-config \
+        libssl-dev \
+        bear \
+        ccache \
+        less \
+        rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean; \
+    fi
 
-RUN --mount=type=cache,target=/var/cache/apt apt update -y \
-    && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
-    && apt update -y \
-    && apt install nsight-systems-cli -y
+RUN --mount=type=cache,target=/var/cache/apt if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    apt update -y && \
+    apt install -y --no-install-recommends gnupg curl ca-certificates && \
+    ARCH="$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi)" && \
+    KEYRING_PATH=/usr/share/keyrings/nvidia-devtools.gpg && \
+    mkdir -p "$(dirname ${KEYRING_PATH})" && \
+    curl -fsSL http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub | gpg --dearmor -o ${KEYRING_PATH} && \
+    echo "deb [signed-by=${KEYRING_PATH}] http://developer.download.nvidia.com/devtools/repos/ubuntu2004/${ARCH} /" > /etc/apt/sources.list.d/nvidia-devtools.list && \
+    apt update -y && \
+    apt install -y nsight-systems-cli; \
+    fi
 
 # Set up locale
 RUN locale-gen en_US.UTF-8
@@ -273,43 +283,38 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-# Install minimal Python packages
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --break-system-packages \
-    pytest \
-    black \
-    isort \
-    icdiff \
-    scikit-build-core \
-    uv \
-    pre-commit \
-    pandas \
-    matplotlib \
-    tabulate
+# Install diff-so-fancy (optional)
+RUN if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    curl -LSso /usr/local/bin/diff-so-fancy https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy && \
+    chmod +x /usr/local/bin/diff-so-fancy; \
+    fi
 
-# Install diff-so-fancy
-RUN curl -LSso /usr/local/bin/diff-so-fancy https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
-    && chmod +x /usr/local/bin/diff-so-fancy
+# Install clang-format (optional)
+RUN if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    curl -LSso /usr/local/bin/clang-format https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 && \
+    chmod +x /usr/local/bin/clang-format; \
+    fi
 
-# Install clang-format
-RUN curl -LSso /usr/local/bin/clang-format https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
-    && chmod +x /usr/local/bin/clang-format
-
-# Install clangd
-RUN curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip \
-    && unzip clangd.zip \
-    && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
-    && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
-    && rm -rf clangd_18.1.3 clangd.zip
+# Install clangd (optional)
+RUN if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    curl -L https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip -o clangd.zip && \
+    unzip clangd.zip && \
+    cp -r clangd_18.1.3/bin/* /usr/local/bin/ && \
+    cp -r clangd_18.1.3/lib/* /usr/local/lib/ && \
+    rm -rf clangd_18.1.3 clangd.zip; \
+    fi
 
 # Install CMake
-RUN CMAKE_VERSION=3.31.1 \
-    && ARCH=$(uname -m) \
-    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && wget -q "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
-    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
-    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
-    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
-    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
+RUN if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    CMAKE_VERSION=3.31.1 && \
+    ARCH=$(uname -m) && \
+    CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" && \
+    wget -q "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" && \
+    tar -xzf "${CMAKE_INSTALLER}.tar.gz" && \
+    cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ && \
+    cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ && \
+    rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"; \
+    fi
 
 # Build and install sgl-router (Rust toolchain removed after build to save space)
 RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
@@ -323,29 +328,30 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
 
-# Add yank script
-COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
+# Developer convenience files
+COPY docker/configs /tmp/dev-configs
+RUN if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+        install -m 755 /tmp/dev-configs/yank /usr/local/bin/yank && \
+        cp /tmp/dev-configs/.vimrc /root/.vimrc && \
+        cp /tmp/dev-configs/.tmux.conf /root/.tmux.conf && \
+        cat /tmp/dev-configs/.gitconfig >> /root/.gitconfig && \
+        cp /tmp/dev-configs/.zshrc /root/.zshrc; \
+    fi && rm -rf /tmp/dev-configs
 
-# Install oh-my-zsh and plugins
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+# Install oh-my-zsh and plugins (optional)
+RUN if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \
+    git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions && \
+    git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting; \
+    fi
 
-# Configure Vim and tmux
-COPY docker/configs/.vimrc /root/.vimrc
-COPY docker/configs/.tmux.conf /root/.tmux.conf
-
-# Configure Git
-COPY docker/configs/.gitconfig /tmp/.gitconfig
-RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
-
-# Configure zsh
-COPY docker/configs/.zshrc /root/.zshrc
-
-RUN set -euxo ; \
+# Install just (optional)
+RUN if [ "${INSTALL_DEV_TOOLS}" = "1" ]; then \
+    set -euxo pipefail; \
     curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
     sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /usr/local/bin
+    bash -s -- --tag 1.42.4 --to /usr/local/bin; \
+    fi
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
