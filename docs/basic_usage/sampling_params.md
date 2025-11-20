@@ -250,9 +250,9 @@ text = "<image>\nDescribe this image."
 processor_output = processor(images=[image], text=text, return_tensors="pt")
 
 # Pass processor output directly to SGLang
-# Note: For HTTP requests, tensors must be converted to lists. 
+# Note: For HTTP requests, tensors must be converted to lists.
 # For Python Engine API, you can pass tensors directly.
-processor_output_dict = {k: v.tolist() if hasattr(v, "tolist") else v 
+processor_output_dict = {k: v.tolist() if hasattr(v, "tolist") else v
                         for k, v in processor_output.items()}
 
 response = requests.post(
@@ -310,7 +310,7 @@ response = requests.post(
 )
 ```
 
-**Use case**: 
+**Use case**:
 - High-throughput serving with repeated image queries
 - Caching visual embeddings for frequently used images
 - Reducing latency when the same image is used across multiple requests

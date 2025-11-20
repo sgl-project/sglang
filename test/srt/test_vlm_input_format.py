@@ -266,6 +266,7 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
 #             pixel_values=processor_output["pixel_values"],
 #         )
 
+
 class TestLlavaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "llava-hf/llava-1.5-7b-hf"
     chat_template = "vicuna_v1"
@@ -284,8 +285,10 @@ class TestLlavaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
         cls.config = model.config
 
         def visual_func(processor_output):
-            pixel_values = processor_output["pixel_values"].to(cls.device, dtype=torch.float16)
-            
+            pixel_values = processor_output["pixel_values"].to(
+                cls.device, dtype=torch.float16
+            )
+
             vision_outputs = cls.vision_tower(pixel_values, output_hidden_states=True)
             image_features = vision_outputs.hidden_states[-2]
 
@@ -293,7 +296,7 @@ class TestLlavaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
                 image_features = image_features[:, 1:]
             elif cls.config.vision_feature_select_strategy == "full":
                 image_features = image_features
-            
+
             image_features = cls.multi_modal_projector(image_features)
             return image_features
 
