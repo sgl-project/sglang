@@ -298,7 +298,7 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         origin_model_path = self.get_model_info()
         print(f"[Server Mode] origin_model_path: {origin_model_path}")
 
-        modes = ['in_place', 'retract']
+        modes = ["in_place", "retract"]
         for mode in modes:
             num_requests = 32
             with ThreadPoolExecutor(num_requests) as executor:
@@ -309,9 +309,13 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
                 # ensure the decode has been started
                 time.sleep(2)
 
-                new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
+                new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace(
+                    "-Instruct", ""
+                )
                 ret = self.pause_generation(mode)
-                ret = self.run_update_weights(new_model_path, flush_cache=mode=='retract')
+                ret = self.run_update_weights(
+                    new_model_path, flush_cache=mode == "retract"
+                )
                 self.assertTrue(ret["success"])
                 ret = self.continue_generation()
 

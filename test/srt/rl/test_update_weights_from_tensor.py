@@ -243,7 +243,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         return ret
 
     def test_update_weights(self):
-        modes = ['in_place', 'retract']
+        modes = ["in_place", "retract"]
         for mode in modes:
             num_requests = 32
             with ThreadPoolExecutor(num_requests) as executor:
@@ -254,12 +254,16 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
                 # ensure the decode has been started
                 time.sleep(2)
 
-                param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
+                param_names = [
+                    f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)
+                ]
                 new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
                 named_tensors = [(x, new_tensor) for x in param_names]
 
                 ret = self.pause_generation(mode)
-                ret = self.run_update_weights(named_tensors, flush_cache=mode=='retract')
+                ret = self.run_update_weights(
+                    named_tensors, flush_cache=mode == "retract"
+                )
                 self.assertTrue(ret["success"])
                 ret = self.continue_generation()
 

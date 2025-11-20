@@ -401,7 +401,9 @@ class TokenizerCommunicatorMixin:
 
         async with self.is_pause_cond:
             if self.is_pause:
-                result = (await self.update_weights_from_distributed_communicator(obj))[0]
+                result = (await self.update_weights_from_distributed_communicator(obj))[
+                    0
+                ]
                 return result.success, result.message
 
         if obj.abort_all_requests:

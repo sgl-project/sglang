@@ -21,7 +21,7 @@ import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Literal
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -1022,15 +1022,16 @@ class PauseGenerationReqInput(BaseReq):
             only non-inference requests will be handled, and all currently running
             requests will be retracted back to the waiting_queue.
     """
+
     mode: Literal["abort", "retract", "in_place"] = "abort"
 
     def __post_init__(self):
         allowed = ["abort", "retract", "in_place"]
         if self.mode not in allowed:
             raise ValueError(
-                f"Invalid mode: {self.mode!r}. "
-                f"Expected one of {allowed}."
+                f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}."
             )
+
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):

@@ -71,7 +71,7 @@ def init_process(
     checking_parameters,
     tie_word_embeddings,
     barrier,
-    mode='abort',
+    mode="abort",
 ):
     torch.cuda.set_device(rank)
 
@@ -290,7 +290,7 @@ def init_process_sgl(
             },
         )
 
-    if mode in ['inplace', 'retract']:
+    if mode in ["inplace", "retract"]:
 
         def run_decode(max_new_tokens=32):
             response = requests.post(
@@ -325,7 +325,7 @@ def init_process_sgl(
     dtypes = [torch.bfloat16 if backend == "Engine" else "bfloat16"] * len(names)
     shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
 
-    if mode in ['in_place', 'retract']:
+    if mode in ["in_place", "retract"]:
         requests.post(
             url + "/pause_generation",
             json={"mode": mode},
@@ -348,12 +348,12 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
-                "flush_cache": mode in ['retract', 'abort']
+                "flush_cache": mode in ["retract", "abort"],
             },
         )
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
-    if mode in ['in_place', 'retract']:
+    if mode in ["in_place", "retract"]:
         requests.post(
             url + "/continue_generation",
             json={},
@@ -422,7 +422,7 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
-    mode='abort',
+    mode="abort",
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -729,7 +729,7 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
         ]
 
         for tp_size, dp_size, model_name, backend in test_suits:
-            modes = ['in_place', 'retract']
+            modes = ["in_place", "retract"]
             for mode in modes:
                 test_update_weights_from_distributed(
                     tp_size,
