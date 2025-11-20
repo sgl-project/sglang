@@ -34,7 +34,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     post_process_sample,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

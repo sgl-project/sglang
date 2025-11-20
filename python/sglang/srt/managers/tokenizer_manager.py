@@ -41,6 +41,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
@@ -210,6 +211,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
+            if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:
+                import_processors(
+                    envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
+                )
             try:
                 _processor = get_processor(
                     server_args.tokenizer_path,
@@ -1190,7 +1195,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def pause_generation(self):
         async with self.is_pause_cond:
             self.is_pause = True
-            self.abort_request(abort_all=True)
+            # we are using the model_update_lock to check if there is still on-going requests.
+            while True:
+                # TODO: maybe make it async instead of fire-and-forget
+                self.abort_request(abort_all=True)
+                is_locked = await self.model_update_lock.is_locked()
+                if not is_locked:
+                    break
+                await asyncio.sleep(1.0)
 
     async def continue_generation(self):
         async with self.is_pause_cond:
@@ -1216,7 +1228,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
-                return await self._wait_for_model_update_from_disk(obj)
+                success, message, num_paused_requests = (
+                    await self._wait_for_model_update_from_disk(obj)
+                )
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message, num_paused_requests
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
@@ -1771,6 +1791,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
+                meta_info["spec_accept_token_num"] = accepted_tokens
+                meta_info["spec_draft_token_num"] = total_draft_tokens
+                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
     def _calculate_timing_metrics(
         self,
