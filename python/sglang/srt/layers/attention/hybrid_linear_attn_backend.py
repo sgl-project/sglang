@@ -5,6 +5,7 @@ from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
@@ -30,7 +31,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.models.qwen3_next import fused_gdn_gating
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
@@ -66,11 +66,18 @@ class MambaAttnBackendBase(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         self.query_start_loc_list = []
+        self.retrieve_next_token_list = []
+        self.retrieve_next_sibling_list = []
+        self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
+
+        retrieve_next_token = None
+        retrieve_next_sibling = None
+        retrieve_parent_token = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -85,6 +92,11 @@ class MambaAttnBackendBase(AttentionBackend):
                     dtype=torch.int32,
                     device=forward_batch.input_ids.device,
                 )
+
+                if forward_batch.spec_info.topk > 1:
+                    retrieve_next_token = forward_batch.spec_info.retrive_next_token
+                    retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
+                    retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -102,6 +114,9 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -118,7 +133,7 @@ class MambaAttnBackendBase(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         self.forward_metadata = self._capture_metadata(
-            bs, req_pool_indices, forward_mode
+            bs, req_pool_indices, forward_mode, spec_info
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -140,7 +155,7 @@ class MambaAttnBackendBase(AttentionBackend):
         assert (
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
-        verify_step = max_num_tokens / max_bs
+        draft_token_num = max_num_tokens // max_bs
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -150,19 +165,38 @@ class MambaAttnBackendBase(AttentionBackend):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
+            self.retrieve_next_token_list.append(
+                torch.zeros(
+                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                )
+            )
+            self.retrieve_next_sibling_list.append(
+                torch.zeros(
+                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                )
+            )
+            self.retrieve_parent_token_list.append(
+                torch.zeros(
+                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                )
+            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
         self.cached_cuda_graph_verify_query_start_loc = torch.arange(
             0,
-            max_bs * verify_step + 1,
-            step=verify_step,
+            max_bs * draft_token_num + 1,
+            step=draft_token_num,
             dtype=torch.int32,
             device=self.device,
         )
 
     def _capture_metadata(
-        self, bs: int, req_pool_indices: torch.Tensor, forward_mode: ForwardMode
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
@@ -176,10 +210,24 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
-        return ForwardMetadata(
-            query_start_loc=self.query_start_loc_list[bs - 1],
-            mamba_cache_indices=self.state_indices_list[bs - 1],
-        )
+
+        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
+        if forward_mode.is_target_verify() and spec_info.topk > 1:
+            # They are None during cuda graph capture so skip the copy_...
+            # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
+            # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
+            return ForwardMetadata(
+                query_start_loc=self.query_start_loc_list[bs - 1],
+                mamba_cache_indices=self.state_indices_list[bs - 1],
+                retrieve_next_token=self.retrieve_next_token_list[bs - 1],
+                retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
+                retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+            )
+        else:
+            return ForwardMetadata(
+                query_start_loc=self.query_start_loc_list[bs - 1],
+                mamba_cache_indices=self.state_indices_list[bs - 1],
+            )
 
     def _replay_metadata(
         self,
@@ -224,10 +272,28 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
-        return ForwardMetadata(
-            query_start_loc=self.query_start_loc_list[bs - 1],
-            mamba_cache_indices=self.state_indices_list[bs - 1],
-        )
+        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
+        if forward_mode.is_target_verify() and spec_info.topk > 1:
+            bs_without_pad = spec_info.retrive_next_token.shape[0]
+            # print(spec_info.retrive_next_token, spec_info.retrive_next_sibling)
+            self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
+                spec_info.retrive_next_token
+            )
+            self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
+                spec_info.retrive_next_sibling
+            )
+            return ForwardMetadata(
+                query_start_loc=self.query_start_loc_list[bs - 1],
+                mamba_cache_indices=self.state_indices_list[bs - 1],
+                retrieve_next_token=self.retrieve_next_token_list[bs - 1],
+                retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
+                retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+            )
+        else:
+            return ForwardMetadata(
+                query_start_loc=self.query_start_loc_list[bs - 1],
+                mamba_cache_indices=self.state_indices_list[bs - 1],
+            )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1  # Mamba attn does not use seq lens to index kv cache
@@ -479,7 +545,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer_id = kwargs["layer_id"]
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = layer_cache.conv
+        conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -557,51 +623,53 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        retrieve_next_token = self.forward_metadata.retrieve_next_token
+        retrieve_next_sibling = self.forward_metadata.retrieve_next_sibling
+        retrieve_parent_token = self.forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = mamba_cache_params.conv
+        conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
+            intermediate_conv_window_cache = (
+                mamba_cache_params.intermediate_conv_window[0]
+            )
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            conv_states_to_use = conv_states.clone()
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
-            conv_states_to_use = conv_states
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = (
-                mixed_qkv.view(batch_size, draft_token_num, -1)
-                .transpose(1, 2)
-                .contiguous()
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
-                conv_states_to_use,
+                conv_states,
                 conv_weights,
                 bias,
                 activation,
                 conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=intermediate_conv_window_cache,
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
-            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states_to_use,
+                conv_states=conv_states,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -625,11 +693,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, actual_seq_len, num_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
-        beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
-
-        g = g.unsqueeze(0)
-        beta = beta.unsqueeze(0)
+        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
 
         if is_target_verify:
             core_attn_out = fused_recurrent_gated_delta_rule_update(
@@ -645,6 +709,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 disable_state_update=True,
                 intermediate_states_buffer=intermediate_state_cache,
                 cache_steps=forward_batch.spec_info.draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
             )
         else:
             recurrent_state = ssm_states[cache_indices]
@@ -694,7 +759,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode)
+        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
         self.forward_metadata = Mamba2Metadata.prepare_decode(
             metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
         )
@@ -891,8 +956,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
-    def update_mamba_state_after_mtp_verify(self, accepted_length, model):
-        request_number = accepted_length.shape[0]
+    def update_mamba_state_after_mtp_verify(self, accepted_indices, model):
+        request_number = accepted_indices.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -904,18 +969,17 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv
+        conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
+        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
         # SSM state updates (chunked to reduce peak memory)
-        valid_mask = accepted_length > 0
+        valid_mask = accepted_indices >= 0
 
         # Compute common indices once to avoid duplication
-        last_steps_all = (accepted_length - 1).to(torch.int64)
         valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        last_steps = last_steps_all[valid_mask].to(torch.int64)  # [N]
+        last_steps = accepted_indices[valid_mask].to(torch.int64)  # [N]
 
         # scatter into ssm_states at the chosen cache lines
         ssm_states[:, valid_state_indices, :] = intermediate_state_cache[

@@ -152,7 +152,6 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     bool enable_pdl,
-    int64_t cuda_stream,
     const std::optional<at::Tensor>& v,
     const std::optional<at::Tensor>& k_buffer,
     const std::optional<at::Tensor>& v_buffer,
@@ -167,25 +166,30 @@ void downcast_fp8(
     at::Tensor& v_scale,
     at::Tensor& loc,
     int64_t mult,
-    int64_t offset,
-    int64_t cuda_stream);
+    int64_t offset);
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
-void fast_topk_interface(const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths);
+void fast_topk_interface(
+    const at::Tensor& score,
+    at::Tensor& indices,
+    const at::Tensor& lengths,
+    std::optional<at::Tensor> row_starts_opt = std::nullopt);
 void fast_topk_transform_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
-    const at::Tensor& cu_seqlens_q);
+    const at::Tensor& cu_seqlens_q,
+    std::optional<at::Tensor> row_starts_opt = std::nullopt);
 void fast_topk_transform_ragged_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
     at::Tensor& topk_indices_ragged,
-    const at::Tensor& topk_indices_offset);
+    const at::Tensor& topk_indices_offset,
+    std::optional<at::Tensor> row_starts_opt = std::nullopt);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
@@ -253,8 +257,7 @@ void bmm_fp8(
     at::Tensor A_scale,
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
+    int64_t cublas_handle);
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
@@ -314,6 +317,13 @@ void topk_softmax(
     double moe_softcapping,
     const c10::optional<torch::Tensor>& correction_bias);
 
+void topk_sigmoid(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
+    const c10::optional<torch::Tensor>& correction_bias);
+
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
@@ -325,6 +335,14 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
+
+std::vector<at::Tensor> kimi_k2_moe_fused_gate(
+    at::Tensor& input,
+    at::Tensor& bias,
+    int64_t topk,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output);
 
@@ -471,8 +489,7 @@ void tree_speculative_sampling_target_only(
     at::Tensor draft_probs,
     double threshold_single = 1,
     double threshold_acc = 1,
-    bool deterministic = true,
-    int64_t cuda_stream = 0);
+    bool deterministic = true);
 
 void verify_tree_greedy(
     at::Tensor predicts,          // mutable
@@ -482,8 +499,7 @@ void verify_tree_greedy(
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
-    at::Tensor target_predict,
-    int64_t cuda_stream = 0);
+    at::Tensor target_predict);
 
 void reconstruct_indices_from_tree_mask(
     at::Tensor tree_mask,
@@ -665,6 +681,7 @@ void transfer_kv_all_layer_direct_lf_pf(
 /*
  * From csrc/memory
  */
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
 
 /*
@@ -933,3 +950,21 @@ void FMHACutlassSM100FwdRun(
 
 std::vector<at::Tensor>
 sparse_prefill_fwd(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices, double sm_scale, int64_t d_v);
+
+std::vector<at::Tensor> fwd_kvcache_mla_fp8(
+    at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size
+    const at::Tensor& kcache,  // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or
+                               // num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
+    const int64_t head_size_v,
+    const at::Tensor& seqlens_k,    // batch_size
+    const at::Tensor& block_table,  // batch_size x max_num_blocks_per_seq
+    const double softmax_scale,
+    bool is_causal,
+    const at::Tensor& tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
+    const at::Tensor& num_splits,                // batch_size + 1
+    const std::optional<at::Tensor>& descale_q,  // None or batch_size
+    const std::optional<at::Tensor>& descale_k   // None or batch_size
+);
+
+std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
+    at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);

@@ -18,6 +18,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from packaging.version import Version
 
 from sglang.srt.batch_invariant_ops import (
@@ -46,11 +47,19 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_flashinfer_layernorm_available = False
 
 if _is_cuda or _is_xpu:
-    # if _is_flashinfer_available:
-    #     from flashinfer.norm import fused_add_rmsnorm
-    # else:
+    if _is_flashinfer_available:
+        try:
+            from flashinfer.norm import layernorm
+
+            _flashinfer_layernorm_available = True
+        except (ImportError, AttributeError):
+            _flashinfer_layernorm_available = False
+    else:
+        _flashinfer_layernorm_available = False
+
     from sgl_kernel import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
@@ -287,6 +296,85 @@ class RMSNorm(CustomOp):
                     return fused_result
 
         return self.forward(x, residual)
+
+
+class LayerNorm(CustomOp):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+        self.elementwise_affine = elementwise_affine
+        self.use_bias = bias
+        self.dtype = dtype
+
+        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=self.dtype))
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=self.dtype))
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            _flashinfer_layernorm_available
+            and x.dtype == torch.bfloat16
+            and self.dtype == torch.float32
+        ):
+            return layernorm(x, self.weight, self.bias, self.variance_epsilon)
+        else:
+            return self.forward_native(x)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = self.weight if self.elementwise_affine else None
+        bias = self.bias if self.use_bias else None
+        orig_dtype = x.dtype
+        x = x.to(self.dtype)
+        return F.layer_norm(
+            x,
+            (self.hidden_size,),
+            weight=self.weight,
+            bias=bias,
+            eps=self.variance_epsilon,
+        ).to(orig_dtype)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x = x.to(self.dtype)
+
+        mean = x.mean(dim=-1, keepdim=True)
+        variance = (x - mean).pow(2).mean(dim=-1, keepdim=True)
+        x = (x - mean) * torch.rsqrt(variance + self.variance_epsilon)
+
+        if self.elementwise_affine:
+            x = x * self.weight.to(self.dtype)
+            if self.use_bias:
+                x = x + self.bias.to(self.dtype)
+
+        return x.to(orig_dtype)
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x)
 
 
 class GemmaRMSNorm(CustomOp):

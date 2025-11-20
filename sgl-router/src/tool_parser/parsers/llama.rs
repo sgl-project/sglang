@@ -181,7 +181,7 @@ impl ToolParser for LlamaParser {
 
         // Check if current_text has tool_call
         let has_tool_start = self.has_tool_markers(current_text)
-            || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
+            || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
@@ -205,7 +205,7 @@ impl ToolParser for LlamaParser {
         // Determine start index for JSON parsing
         let start_idx = if let Some(pos) = current_text.find(self.bot_token) {
             pos + self.bot_token.len()
-        } else if self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator) {
+        } else if self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator) {
             self.tool_call_separator.len()
         } else {
             0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -84,10 +85,14 @@ class OpenAIServingBase(ABC):
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
-        """Handle the specific request type with common pattern"""
+        """Handle the specific request type with common pattern
+        If you want to override this method, you should be careful to record the validation time.
+        """
         try:
             # Validate request
+            validation_start = time.perf_counter()
             error_msg = self._validate_request(request)
+            validation_time = time.perf_counter() - validation_start
             if error_msg:
                 return self.create_error_response(error_msg)
 
@@ -95,6 +100,8 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+            if hasattr(adapted_request, "validation_time"):
+                adapted_request.validation_time = validation_time
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
@@ -157,6 +164,7 @@ class OpenAIServingBase(ABC):
         self,
         request: OpenAIServingRequest,
         raw_request: Request = None,
+        validation_time: float = None,
     ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass
