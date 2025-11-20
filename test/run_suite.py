@@ -19,10 +19,10 @@ LABEL_MAPPING = {
         "stage-a-test-2",
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
+        # "stage-b-test-large-2-gpu",  # TODO: Uncomment when multi-GPU tests are migrated
         "stage-c-test-large-1-gpu",
-        "stage-c-test-large-2-gpu",
-        "stage-c-test-large-4-gpu",
+        # "stage-c-test-large-2-gpu",  # TODO: Uncomment when multi-GPU tests are migrated
+        # "stage-c-test-large-4-gpu",  # TODO: Uncomment when multi-GPU tests are migrated
     ],
 }
 
