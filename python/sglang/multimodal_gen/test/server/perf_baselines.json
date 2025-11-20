@@ -232,7 +232,7 @@
         "wan2_1_t2v_1.3b": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
-                "TextEncodingStage": 2140.81,
+                "TextEncodingStage": 2352.7,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.97,
                 "LatentPreparationStage": 6.85,
