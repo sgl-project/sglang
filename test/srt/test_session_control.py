@@ -594,8 +594,8 @@ class TestSessionControlVision(CustomTestCase):
             "<|im_start|>user\nDescribe this image in a very short sentence.<|im_end|>\nassistant:",
         ]
         image_chunks = [
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
             "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png",
         ]
 
