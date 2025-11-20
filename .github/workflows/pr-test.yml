@@ -256,8 +256,6 @@ jobs:
 
           echo "All benchmark tests completed!"
 
-  # =============================================== multimodal_gen ====================================================
-
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
   # cuda13-kernel-smoke-test:
@@ -321,11 +319,6 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-a-test-1
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   stage-a-test-2:
     needs: [check-changes, stage-a-test-1, sgl-kernel-build-wheels]
