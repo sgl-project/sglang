@@ -8,7 +8,6 @@ Run with:
 import threading
 import time
 import unittest
-from typing import Optional
 
 import requests
 

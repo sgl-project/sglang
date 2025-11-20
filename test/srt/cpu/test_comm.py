@@ -5,11 +5,9 @@ import traceback
 import unittest
 from multiprocessing import Process
 
-import sgl_kernel
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from utils import precision
 
 from sglang.test.test_utils import CustomTestCase, find_available_port
 

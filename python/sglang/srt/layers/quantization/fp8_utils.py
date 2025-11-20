@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -50,6 +51,14 @@ if _use_aiter:
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+
+    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
+    def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
+        M = mat_a.shape[-2]
+        N = mat_b.shape[-1]
+        return mat_a.new_empty((M, N), dtype=out_dtype)
+
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
@@ -127,17 +136,17 @@ def cutlass_block_fp8_supported() -> bool:
 
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
-ENABLE_FLASHINFER_GEMM = (
-    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
+ENABLE_FLASHINFER_FP8_GEMM = (
+    envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
     and is_blackwell_supported()
     and is_flashinfer_available()
 )
-if ENABLE_FLASHINFER_GEMM:
+if ENABLE_FLASHINFER_FP8_GEMM:
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
-    if ENABLE_FLASHINFER_GEMM:
+    if ENABLE_FLASHINFER_FP8_GEMM:
         return flashinfer_gemm_w8a8_block_fp8_linear
     elif CUTLASS_BLOCK_FP8_SUPPORTED:
         return cutlass_w8a8_block_fp8_linear_with_fallback
@@ -430,7 +439,7 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
 
-    new_weight, new_weight_scale_inv = _requant_weight_ue8m0(
+    new_weight, new_weight_scale_inv = requant_weight_ue8m0(
         weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
     )
 
@@ -438,7 +447,7 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     weight_scale_inv.data = new_weight_scale_inv
 
 
-def _requant_weight_ue8m0(
+def requant_weight_ue8m0(
     weight: torch.Tensor,
     weight_scale_inv: torch.Tensor,
     weight_block_size: List[int],
@@ -459,7 +468,7 @@ def _requant_weight_ue8m0(
         weight_block_size=weight_block_size,
     )
 
-    out_s = _transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
+    out_s = transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
 
     return out_w, out_s
 
@@ -491,16 +500,55 @@ def quant_weight_ue8m0(
 
 
 def transform_scale_ue8m0_inplace(param, mn):
-    param.data = _transform_scale_ue8m0(param.data, mn=mn)
+    param.data = transform_scale_ue8m0(param.data, mn=mn)
 
 
 # NOTE copy and modified from DeepGEMM
-def _transform_scale_ue8m0(sf, mn):
+def transform_scale_ue8m0(sf, mn):
     import deep_gemm.utils.layout
 
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
     sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
     return sf
+
+
+def inverse_transform_scale_ue8m0(sf_packed, mn):
+    sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed)
+    # Can call consistency check every time since this is only called on startup
+    sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn)
+    assert torch.all(
+        sf_packed == sf_packed_recreated
+    ), f"{sf_packed=} {sf_packed_recreated}"
+    return sf_fp32
+
+
+# Inverse impl can refer to DeepGEMM's torch impl in get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
+def _inverse_transform_scale_ue8m0_impl(sf_packed):
+    """
+    NOTE: We assume k is aligned
+    :param sf_packed: (scale_mn, scale_k/4) int32
+    :return: (scale_mn, scale_k), float32
+    """
+    block_size = 128
+    assert len(sf_packed.shape) == 2
+    assert sf_packed.dtype == torch.int32
+
+    mn_repeat_128, k_div_4 = sf_packed.shape
+    mn = mn_repeat_128 // block_size
+    k = k_div_4 * 4
+
+    # packed u8 -> fp32
+    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat_128, k)
+    sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
+
+    # remove repeat
+    sf_reshaped = sf_fp32.view(mn, block_size, k)
+    sf_unrepeated = sf_reshaped[:, 0:1, :]
+    assert torch.all(sf_unrepeated == sf_reshaped)
+    sf_unrepeated = sf_unrepeated.squeeze(1).contiguous()
+
+    assert sf_unrepeated.shape == (mn, k)
+    return sf_unrepeated
 
 
 # COPIED FROM DeepGEMM
