@@ -31,7 +31,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -39,7 +38,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
