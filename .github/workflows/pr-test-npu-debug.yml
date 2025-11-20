@@ -249,9 +249,9 @@ jobs:
           # copy download through proxy
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
-      - name: Print Log Information
-        run: |
-          bash scripts/ci/log_print.sh
+      # - name: Print Log Information
+      #   run: |
+      #     bash scripts/ci/log_print.sh
 
       - name: Run test
         timeout-minutes: 180
