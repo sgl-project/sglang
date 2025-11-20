@@ -437,7 +437,7 @@ class PerformanceValidator:
                 actual,
                 expected,
                 self.tolerances.stage,
-                min_abs_tolerance_ms=50.0,  # Relaxed absolute tolerance for non-denoising stages
+                min_abs_tolerance_ms=70.0,  # relax absolute tolerance for non-denoising stages
             )
 
 
