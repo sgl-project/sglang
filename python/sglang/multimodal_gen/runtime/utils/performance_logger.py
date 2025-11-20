@@ -6,17 +6,38 @@ import os
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from dateutil.tz import UTC
 
-LOG_DIR = os.environ.get("SGLANG_PERF_LOG_DIR")
-if LOG_DIR:
-    LOG_DIR = os.path.abspath(LOG_DIR)
-elif LOG_DIR is None:  # Not set
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
-    LOG_DIR = os.path.join(project_root, "logs")
-# if LOG_DIR is "", it will remain "", disabling file logging.
+import sglang
+
+
+def get_diffusion_perf_log_dir() -> str:
+    """
+    Determines the directory for performance logs, centralizing the logic.
+
+    Resolution order:
+    1. SGLANG_PERF_LOG_DIR environment variable, if set and not empty.
+    2. Default to ~/.cache/sglang/logs if the environment variable is not set.
+    3. Returns an empty string if SGLANG_PERF_LOG_DIR is set to an empty string,
+       which effectively disables file logging.
+    """
+    log_dir = os.environ.get("SGLANG_PERF_LOG_DIR")
+    if log_dir:
+        return os.path.abspath(log_dir)
+    if log_dir is None:
+        # Not set, use default
+        sglang_path = Path(sglang.__file__).resolve()
+        # .gitignore
+        target_path = (sglang_path.parent / "../../.cache/logs").resolve()
+        return str(target_path)
+    # Is set, but is an empty string
+    return ""
+
+
+LOG_DIR = get_diffusion_perf_log_dir()
 
 # Configure a specific logger for performance metrics
 perf_logger = logging.getLogger("performance")
