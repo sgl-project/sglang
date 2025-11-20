@@ -365,6 +365,7 @@ class PerformanceValidator:
             median_denoise_ms=median_denoise,
             stage_metrics=stage_metrics,
             sampled_steps=sampled_steps,
+            all_denoise_steps=per_step,
         )
 
     def _validate_e2e(self, summary: PerformanceSummary) -> None:

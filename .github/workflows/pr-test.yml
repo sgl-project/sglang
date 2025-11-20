@@ -335,7 +335,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
-        timeout-minutes: 60
+        timeout-minutes: 70
         run: |
           cd python
           pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py

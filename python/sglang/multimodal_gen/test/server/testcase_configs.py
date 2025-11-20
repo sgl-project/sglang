@@ -54,6 +54,7 @@ class BaselineConfig:
     step_fractions: Sequence[float]
     warmup_defaults: dict[str, int]
     tolerances: ToleranceConfig
+    improvement_threshold: float
 
     @classmethod
     def load(cls, path: Path) -> BaselineConfig:
@@ -88,6 +89,9 @@ class BaselineConfig:
             step_fractions=tuple(data["sampling"]["step_fractions"]),
             warmup_defaults=data["sampling"].get("warmup_requests", {}),
             tolerances=tolerances,
+            improvement_threshold=data.get("improvement_reporting", {}).get(
+                "threshold", 0.2
+            ),
         )
 
 
@@ -134,6 +138,7 @@ class PerformanceSummary:
     median_denoise_ms: float
     stage_metrics: dict[str, float]
     sampled_steps: dict[int, float]
+    all_denoise_steps: dict[int, float]
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
