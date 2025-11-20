@@ -13,13 +13,11 @@
 # ==============================================================================
 
 import multiprocessing as mp
-import random
 import unittest
 
 import torch
-from utils import CI_MULTI_LORA_MODELS, DEFAULT_PROMPTS, run_lora_test_one_by_one
+from utils import CI_MULTI_LORA_MODELS, run_lora_test_one_by_one
 
-from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
 PROMPTS = [

@@ -10,17 +10,22 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.16.post5
+ARG SGL_KERNEL_VERSION=0.3.17.post2
+ARG SGL_VERSION=0.5.5.post3
+ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG NVSHMEM_VERSION=3.4.5
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
+ARG INSTALL_FLASHINFER_JIT_CACHE=0
+ARG FLASHINFER_VERSION=0.5.2
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
+    FLASHINFER_VERSION=${FLASHINFER_VERSION}
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
@@ -38,7 +43,10 @@ RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y &
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
  && update-alternatives --set python3 /usr/bin/python3.12 \
  && wget https://bootstrap.pypa.io/get-pip.py \
- && python3 get-pip.py
+ && python3 get-pip.py \
+ # Fix for `apt-add-repository`
+ && cd /usr/lib/python3/dist-packages/ \
+ && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
 # Set timezone and install all packages
 RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -94,8 +102,10 @@ ARG BRANCH_TYPE
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
-    else \
+    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    else \
+        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
 RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
@@ -121,6 +131,9 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
    ; \
    fi \
  && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
+      python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+   fi \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
@@ -201,7 +214,7 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade 
 RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
     wget -q https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/${TRITON_LANG_COMMIT}.zip && \
     unzip -q ${TRITON_LANG_COMMIT}.zip && rm ${TRITON_LANG_COMMIT}.zip && mv triton-${TRITON_LANG_COMMIT} triton && \
-    pip install --break-system-packages -r python/requirements.txt && \
+    cd triton && pip install --break-system-packages -r python/requirements.txt && \
     MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
 fi
 
@@ -303,10 +316,11 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && export PATH="/root/.cargo/bin:${PATH}" \
     && rustc --version && cargo --version \
     && python3 -m pip install maturin \
-    && cd /sgl-workspace/sglang/sgl-router \
+    && cd /sgl-workspace/sglang/sgl-router/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
-    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo
+    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
+    && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
 
 # Add yank script

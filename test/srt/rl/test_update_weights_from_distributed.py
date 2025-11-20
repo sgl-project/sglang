@@ -23,7 +23,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
@@ -195,6 +194,9 @@ def init_process_hf(
     broadcast_time = time_end_broadcast - time_begin_broadcast
     print(f"[hf] {rank=} {broadcast_time=:.3f}s")
     param_queue.put(("broadcast_time", broadcast_time))
+
+    # Destroy process group and release related resource
+    torch.distributed.destroy_process_group(group)
 
     # Delete the huggingface models to free up memory.
     del hf_instruct_model

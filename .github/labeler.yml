@@ -1,0 +1,86 @@
+# Configuration for the GitHub Labeler action
+# Automatically adds labels to PRs based on the files changed
+
+# Router specific (Rust code in sgl-router)
+model-gateway:
+  - changed-files:
+    - any-glob-to-any-file: 'sgl-router/**/*'
+
+# Kernel specific
+sgl-kernel:
+  - changed-files:
+    - any-glob-to-any-file: 'sgl-kernel/**/*'
+
+# Documentation
+documentation:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*.md'
+      - 'docs/**/*'
+      - 'README*'
+
+# Dependencies
+dependencies:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/requirements*.txt'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/pyproject*.toml'
+      - '**/setup.py'
+      - '**/poetry.lock'
+      - '**/package.json'
+      - '**/package-lock.json'
+
+# Multi-modal
+Multi-modal:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*multimodal*'
+      - '**/*vision*'
+      - '**/*vlm*'
+
+# LoRA
+lora:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*lora*'
+
+# Quantization
+quant:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*quant*'
+      - '**/*quantization*'
+
+# Speculative decoding
+speculative-decoding:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*speculative*'
+
+# AMD specific
+amd:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*amd*'
+      - '**/*rocm*'
+
+# NPU specific
+npu:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*npu*'
+      - '**/*ascend*'
+
+# DeepSeek specific
+deepseek:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*deepseek*'
+
+# HiCache
+hicache:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*hicache*'

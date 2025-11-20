@@ -6,7 +6,6 @@ both dict and string types for tool['function']['arguments'] without double-esca
 addressing issue #11700.
 """
 
-import json
 import os
 import unittest
 

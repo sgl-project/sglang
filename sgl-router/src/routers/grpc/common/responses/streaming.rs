@@ -11,7 +11,14 @@ use uuid::Uuid;
 
 use crate::{
     mcp,
-    protocols::{chat::ChatCompletionStreamResponse, responses::ResponsesRequest},
+    protocols::{
+        chat::ChatCompletionStreamResponse,
+        common::{Usage, UsageInfo},
+        responses::{
+            ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        },
+    },
+    routers::grpc::harmony::responses::ToolResult,
 };
 
 pub enum OutputItemType {
@@ -69,6 +76,7 @@ pub struct ResponseStreamEventEmitter {
     has_emitted_content_part_added: bool,
     // MCP call tracking
     mcp_call_accumulated_args: HashMap<String, String>,
+    pub(crate) mcp_server_label: Option<String>, // Server label for MCP tools
     // Output item tracking
     output_items: Vec<OutputItemState>,
     next_output_index: usize,
@@ -93,6 +101,7 @@ impl ResponseStreamEventEmitter {
             has_emitted_output_item_added: false,
             has_emitted_content_part_added: false,
             mcp_call_accumulated_args: HashMap::new(),
+            mcp_server_label: None,
             output_items: Vec::new(),
             next_output_index: 0,
             current_message_output_index: None,
@@ -104,6 +113,41 @@ impl ResponseStreamEventEmitter {
     /// Set the original request for including all fields in response.completed
     pub fn set_original_request(&mut self, request: ResponsesRequest) {
         self.original_request = Some(request);
+    }
+
+    /// Set the MCP server label for MCP tool calls
+    pub fn set_mcp_server_label(&mut self, server_label: String) {
+        self.mcp_server_label = Some(server_label);
+    }
+
+    /// Update mcp_call output items with tool execution results
+    ///
+    /// After MCP tools are executed, this updates the stored output items
+    /// to include the output field from the tool results.
+    pub(crate) fn update_mcp_call_outputs(&mut self, tool_results: &[ToolResult]) {
+        for tool_result in tool_results {
+            // Find the output item with matching call_id
+            for item_state in self.output_items.iter_mut() {
+                if let Some(ref mut item_data) = item_state.item_data {
+                    // Check if this is an mcp_call item with matching call_id
+                    if item_data.get("type").and_then(|t| t.as_str()) == Some("mcp_call")
+                        && item_data.get("call_id").and_then(|c| c.as_str())
+                            == Some(&tool_result.call_id)
+                    {
+                        // Add output field
+                        let output_str = serde_json::to_string(&tool_result.output)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        item_data["output"] = json!(output_str);
+
+                        // Update status based on success
+                        if tool_result.is_error {
+                            item_data["status"] = json!("failed");
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn next_sequence(&mut self) -> u64 {
@@ -540,6 +584,47 @@ impl ResponseStreamEventEmitter {
         {
             item.item_data = Some(item_data);
         }
+    }
+
+    /// Finalize and return the complete ResponsesResponse
+    ///
+    /// This constructs the final ResponsesResponse from all accumulated output items
+    /// for persistence. Should be called after streaming is complete.
+    pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
+        // Build output array from tracked items
+        let output: Vec<ResponseOutputItem> = self
+            .output_items
+            .iter()
+            .filter_map(|item| {
+                item.item_data
+                    .as_ref()
+                    .and_then(|data| serde_json::from_value(data.clone()).ok())
+            })
+            .collect();
+
+        // Convert Usage to ResponsesUsage
+        let responses_usage = usage.map(|u| {
+            let usage_info = UsageInfo {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+                reasoning_tokens: u
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens),
+                prompt_tokens_details: None,
+            };
+            ResponsesUsage::Classic(usage_info)
+        });
+
+        // Build response using builder
+        ResponsesResponse::builder(&self.response_id, &self.model)
+            .created_at(self.created_at as i64)
+            .status(ResponseStatus::Completed)
+            .output(output)
+            .maybe_copy_from_request(self.original_request.as_ref())
+            .maybe_usage(responses_usage)
+            .build()
     }
 
     /// Emit reasoning item wrapper events (added + done)
