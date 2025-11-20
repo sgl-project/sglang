@@ -603,6 +603,7 @@ the "scenarios" section of perf_baselines.json:
 
 """
         print(output)
+        logger.error(output)
 
     def test_diffusion_perf(
         self,
