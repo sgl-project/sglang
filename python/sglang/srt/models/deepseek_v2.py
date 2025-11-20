@@ -2319,11 +2319,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        # Access forward_metadata as a dataclass, not a tuple
-        forward_metadata = forward_batch.attn_backend.forward_metadata
-        attn_logits = forward_metadata.attn_logits
-        kv_indptr = forward_metadata.kv_indptr
-        kv_indices = forward_metadata.kv_indices
+        attn_logits, _, kv_indptr, kv_indices, _, _, _ = (
+            forward_batch.attn_backend.forward_metadata
+        )
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         num_kv_split = forward_batch.attn_backend.num_kv_splits
         sm_scale = self.attn_mqa.scaling
