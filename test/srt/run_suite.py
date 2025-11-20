@@ -233,7 +233,9 @@ suites = {
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
+        TestFile("test_gpt_oss_common.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
+        TestFile("test_vision_openai_server_common.py"),
     ],
 }
 
