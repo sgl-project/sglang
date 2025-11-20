@@ -78,17 +78,17 @@ def send_one_prompt(args):
         args.prompt = (
             "Human: Describe this image in a very short sentence.\n\nAssistant:"
         )
-        image_data = "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+        image_data = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
     elif args.many_images:
         args.prompt = (
             "Human: I have one reference image and many images."
             "Describe their relationship in a very short sentence.\n\nAssistant:"
         )
         image_data = [
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
         ]
     else:
         image_data = None
