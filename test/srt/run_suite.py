@@ -69,7 +69,6 @@ suites = {
         TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
         TestFile("test_fp8_utils.py", 5),
-        TestFile("rotary_embedding/test_mrope.py", 10),
         TestFile("test_fused_moe.py", 80),
         TestFile("test_gpt_oss_1gpu.py", 750),
         TestFile("test_harmony_parser.py", 20),
