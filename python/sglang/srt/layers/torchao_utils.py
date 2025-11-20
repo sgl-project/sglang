@@ -40,7 +40,10 @@ def proj_filter_conv3d(
     module: torch.nn.Module,
     fqn: str,
 ):
-    return "proj" in fqn and not isinstance(module, torch.nn.Conv3d)
+    if isinstance(module, torch.nn.Conv3d):
+        logger.warning(f"Quantize: skipping {fqn} because it's a Conv3d")
+        return False
+    return "proj" in fqn
 
 
 def apply_torchao_config_to_model(
