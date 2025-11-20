@@ -2200,37 +2200,37 @@ class Scheduler(
             self.process_batch_result_decode(batch, result)
             if self.enable_trace:
                 trace_slice_batch("decode loop", batch.reqs)
-            if (
-                self.token_to_kv_pool_allocator is not None
-                and self.tree_cache is not None
-            ):
-                # Log KV pool status after each decode batch.
-                _, _, available_size, evictable_size = self._get_token_info()
-                logger.info(
-                    "KV pool after decode batch: max_total_num_tokens=%d, "
-                    "available_size=%d, evictable_size=%d",
-                    self.max_total_num_tokens,
-                    available_size,
-                    evictable_size,
-                )
+            # if (
+            #     self.token_to_kv_pool_allocator is not None
+            #     and self.tree_cache is not None
+            # ):
+            #     # Log KV pool status after each decode batch.
+            #     _, _, available_size, evictable_size = self._get_token_info()
+            #     logger.info(
+            #         "KV pool after decode batch: max_total_num_tokens=%d, "
+            #         "available_size=%d, evictable_size=%d",
+            #         self.max_total_num_tokens,
+            #         available_size,
+            #         evictable_size,
+            #     )
 
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
             if self.enable_trace:
                 trace_slice_batch("prefill", batch.reqs)
-            if (
-                self.token_to_kv_pool_allocator is not None
-                and self.tree_cache is not None
-            ):
-                # Log KV pool status after each prefill batch.
-                _, _, available_size, evictable_size = self._get_token_info()
-                logger.info(
-                    "KV pool after prefill batch: max_total_num_tokens=%d, "
-                    "available_size=%d, evictable_size=%d",
-                    self.max_total_num_tokens,
-                    available_size,
-                    evictable_size,
-                )
+            # if (
+            #     self.token_to_kv_pool_allocator is not None
+            #     and self.tree_cache is not None
+            # ):
+            #     # Log KV pool status after each prefill batch.
+            #     _, _, available_size, evictable_size = self._get_token_info()
+            #     logger.info(
+            #         "KV pool after prefill batch: max_total_num_tokens=%d, "
+            #         "available_size=%d, evictable_size=%d",
+            #         self.max_total_num_tokens,
+            #         available_size,
+            #         evictable_size,
+            #     )
 
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
