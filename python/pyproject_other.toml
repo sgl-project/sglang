@@ -67,6 +67,19 @@ runtime_common = [
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
 ]
 
+checkpoint-engine = ["checkpoint-engine==0.1.2"]
+diffusion = [
+    "diffusers==0.35.2",
+    #"yunchang==0.6.3.post1", # for now need to install yunchang from sources
+    "opencv-python==4.10.0.84",
+    "imageio==2.36.0",
+    "imageio-ffmpeg==0.5.1",
+    "PyYAML==6.0.1",
+    "moviepy>=2.0.0",
+    "cloudpickle",
+    "remote-pdb",
+]
+
 tracing = [
   "opentelemetry-sdk",
   "opentelemetry-api",

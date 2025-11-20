@@ -43,6 +43,7 @@ class PlatformEnum(enum.Enum):
     TPU = enum.auto()
     CPU = enum.auto()
     MPS = enum.auto()
+    NPU = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -91,6 +92,9 @@ class Platform:
 
     def is_cuda(self) -> bool:
         return self._enum == PlatformEnum.CUDA
+
+    def is_npu(self) -> bool:
+        return self._enum == PlatformEnum.NPU
 
     def is_rocm(self) -> bool:
         return self._enum == PlatformEnum.ROCM

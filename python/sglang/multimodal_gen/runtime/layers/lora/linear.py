@@ -32,9 +32,12 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from sglang.multimodal_gen.runtime.utils.common import is_cuda
 from sglang.multimodal_gen.utils import get_mixed_precision_state
 
-torch._dynamo.config.recompile_limit = 16
+_is_cuda = is_cuda()
+if _is_cuda:
+    torch._dynamo.config.recompile_limit = 16
 
 
 class BaseLayerWithLoRA(nn.Module):

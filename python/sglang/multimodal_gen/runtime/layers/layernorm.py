@@ -30,7 +30,21 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
+if is_cuda():
+    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+
+if is_npu():
+    # TODO: remove this when triton ascend bug is fixed
+    def fuse_scale_shift_native(
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        block_l: int = 128,
+        block_c: int = 128,
+    ):
+        return x * (1 + scale) + shift
+
+    fuse_scale_shift_kernel = fuse_scale_shift_native
 
 
 # Copied and adapted from sglang
