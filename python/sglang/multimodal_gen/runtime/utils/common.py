@@ -301,6 +301,7 @@ def is_cpu() -> bool:
 
 # cuda
 
+
 def set_cuda_arch():
     capability = torch.cuda.get_device_capability()
     arch = f"{capability[0]}.{capability[1]}"
@@ -320,6 +321,7 @@ def is_flashinfer_available():
 # env var managements
 
 _warned_bool_env_var_keys = set()
+
 
 def get_bool_env_var(env_var_name: str, default: str | bool = "false") -> bool:
     raw_value = os.getenv(env_var_name, None)
@@ -343,4 +345,3 @@ def get_bool_env_var(env_var_name: str, default: str | bool = "false") -> bool:
         default_bool,
     )
     return default_bool
-
