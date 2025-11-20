@@ -109,6 +109,8 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
             max_concurrency=batch_size,
             disable_tqdm=False,
             lora_names=None,
+            lora_request_distribution=None,
+            lora_zipf_alpha=None,
             extra_request_body={},
             profile=None,
             lora_request_distribution=None,
