@@ -12,10 +12,10 @@ from fastapi.responses import ORJSONResponse
 from transformers import AutoImageProcessor
 from transformers.image_utils import load_images
 
-from python.sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
@@ -132,7 +132,8 @@ class ImageEncoder:
             if k == "pixel_values":
                 continue
             mm_item.set(k, _convert(v))
-        mm_embedding = self.model.get_image_feature([mm_item])
+        with torch.inference_mode():
+            mm_embedding = self.model.get_image_feature([mm_item])
         if len(mm_embedding.shape) != 2:
             mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
         return _get_image_grid_dim(images_input), mm_embedding
@@ -169,7 +170,6 @@ class ImageEncoder:
             self.send_to_prefill_sockets[embedding_port] = socket
         socket.send_pyobj(mm_data)
 
-    @torch.inference_mode()
     async def encode(self, mm_items, req_id, num_parts, part_idx):
         image_grid_dim, mm_embedding = await self.mm_encode(mm_items)
         mm_data = EmbeddingData(
