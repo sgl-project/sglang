@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -312,6 +313,8 @@ class SchedulerOutputProcessorMixin:
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
+        sparse_coordinator = get_sparse_coordinator()
+
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
@@ -341,6 +344,8 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
+                if sparse_coordinator is not None:
+                    sparse_coordinator.request_end(req)
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding

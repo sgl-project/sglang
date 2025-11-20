@@ -35,6 +35,7 @@ from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
+from sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
@@ -1879,6 +1880,13 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        # Notify sparse coordinator about new requests
+        if self.server_args.enable_sparse_attn:
+            sparse_coordinator = get_sparse_coordinator()
+            if sparse_coordinator is not None:
+                for req in new_batch.reqs:
+                    sparse_coordinator.request_begin(req)
 
         # Mixed-style chunked prefill
         if (

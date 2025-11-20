@@ -486,6 +486,7 @@ class ModelRunner:
         )
         if self.device == "cuda":
             self.init_cublas()
+            self.init_sparse_coordinator()
             self.init_attention_backend()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
@@ -1893,6 +1894,32 @@ class ModelRunner:
         b = torch.ones((16, 16), dtype=dtype, device=device)
         c = a @ b
         return c
+
+    def init_sparse_coordinator(self):
+        """Initialize sparse attention coordinator if enabled."""
+        self.sparse_coordinator = None
+        
+        # Check if sparse attention is enabled
+        if not self.server_args.enable_sparse_attn:
+            return
+        
+        try:
+            from sglang.srt.sparsity2 import (
+                create_sparse_coordinator
+            )
+            
+            self.sparse_coordinator = create_sparse_coordinator(
+                device=self.device,
+                page_size=self.server_args.page_size,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
+            
+        except Exception as e:
+            logger.error(f"[ModelRunner] Failed to initialize sparse coordinator: {e}")
+            self.sparse_coordinator = None
 
     def init_attention_backend(self):
         """Init attention kernel backend."""

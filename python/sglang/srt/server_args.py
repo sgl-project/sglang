@@ -438,6 +438,9 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
+    # Sparse Attn
+    enable_sparse_attn: bool = False
+
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
     kt_method: Optional[str] = None
@@ -3027,6 +3030,13 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+
+        # Sparse Attn
+        parser.add_argument(
+            "--enable-sparse-attn",
+            action="store_true",
+            help="Enable sparse attention",
         )
 
         # Ktransformer server args
