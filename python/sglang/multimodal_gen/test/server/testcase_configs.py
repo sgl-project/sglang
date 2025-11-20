@@ -187,7 +187,7 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     # TODO: FastWan2.1, FastWan2.2
     DiffusionTestCase(
-        id="fastwan2_1_t2v",
+        id="wan2_1_t2v_1.3b",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         modality="video",
         prompt="A curious raccoon",
