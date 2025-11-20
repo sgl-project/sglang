@@ -1039,6 +1039,34 @@ void decode_set_kv_buffer(
   });
 }
 
+template<typename scalar_t>
+float find_max_abs(
+  const scalar_t* __restrict__ data,
+  int64_t size,
+  float max_val) {
+    using Vec = at::vec::Vectorized<scalar_t>;
+  auto vec_size = Vec::size();
+  int64_t i = 0;
+  for (; i <= size - vec_size; i += vec_size) {
+    Vec vec_data = Vec::loadu(data + i);
+    Vec vec_abs = vec_data.abs();
+    scalar_t vec_max = at::vec::vec_reduce_all<scalar_t>(
+      [](Vec& x, Vec& y) {return at::vec::maximum(x, y);},
+      vec_abs
+    );
+    if (vec_max > max_val) {
+      max_val = vec_max;
+    }
+  }
+  for (; i < size; i++) {
+    scalar_t abs_val = std::abs(data[i]);
+    if (abs_val > max_val) {
+      max_val = abs_val;
+    }
+  }
+  return max_val;
+}
+
 template <typename scalar_t>
 void decode_set_kv_buffer(
     at::Float8_e4m3fn* __restrict__ k_buffer,
@@ -1065,37 +1093,19 @@ void decode_set_kv_buffer(
   constexpr float eps = 1e-12;
   for (int64_t bi = 0; bi < batches; bi++) {
     int64_t loc_val = loc[bi];
-    float min_val = FP8_MAX;
-    float max_val = -FP8_MAX;
+    float max_abs = 0;
     for (int64_t hi = 0; hi < num_heads_kv; hi++) {
-      for (int64_t di = 0; di < head_size; di++) {
         const scalar_t* key_ptr = key + bi * nk_strideN + hi * nk_strideH;
-        if (key_ptr[di] < min_val) {
-          min_val = key_ptr[di];
-        } else if (key_ptr[di] > max_val) {
-          max_val = key_ptr[di];
-        }
-      }
+        max_abs = find_max_abs<scalar_t>(key_ptr, head_size, max_abs);
     }
-    float scale = std::max(std::abs(min_val), std::abs(max_val));
-    scale = std::max(scale / FP8_MAX, eps);
-    k_scale[loc_val] = scale;
+    k_scale[loc_val] = std::max(max_abs / FP8_MAX, eps);
     if (!is_mla) {
-      min_val = FP8_MAX;
-      max_val = -FP8_MAX;
+      max_abs = 0;
       for (int64_t hi = 0; hi < num_heads_kv; hi++) {
-        for (int64_t di = 0; di < head_size_v; di++) {
           const scalar_t* value_ptr = value + bi * nv_strideN + hi * nv_strideH;
-          if (value_ptr[di] < min_val) {
-            min_val = value_ptr[di];
-          } else if (value_ptr[di] > max_val) {
-            max_val = value_ptr[di];
-          }
-        }
+          max_abs = find_max_abs<scalar_t>(value_ptr, head_size_v, max_abs);
       }
-      scale = std::max(std::abs(min_val), std::abs(max_val));
-      scale = std::max(scale / FP8_MAX, eps);
-      v_scale[loc_val] = scale;
+      v_scale[loc_val] = std::max(max_abs / FP8_MAX, eps);
     }
   }
   at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
