@@ -171,7 +171,7 @@ class RotaryEmbedding(CustomOp):
         return cache
 
     def get_cos_sin_with_position(self, positions):
-        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
         last_dim = cos_sin.size()[-1]
         cos, sin = (
             cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
