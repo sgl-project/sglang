@@ -187,6 +187,9 @@ def init_process_hf(
     print(f"[hf] {rank=} {broadcast_time=:.3f}s")
     param_queue.put(("broadcast_time", broadcast_time))
 
+    # Destroy process group and release related resource
+    torch.distributed.destroy_process_group(group)
+
     # Delete the huggingface models to free up memory.
     del hf_instruct_model
     del hf_base_model
