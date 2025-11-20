@@ -2,9 +2,9 @@
 
 ## Overview
 
-This document tracks the migration of all 122 tests from `per-commit-1-gpu` suite in `test/srt/run_suite.py` to the new `test/per_commit/` structure with registration decorators.
+This document tracks the migration of all 120 tests from `per-commit-1-gpu` suite in `test/srt/run_suite.py` to the new `test/per_commit/` structure with registration decorators.
 
-**Total Tests**: 122 tests
+**Total Tests**: 120 unique tests (122 entries with 2 duplicates noted below)
 **Total Estimated Runtime**: ~19,009 seconds (~5.3 hours)
 
 ## Migration Strategy
