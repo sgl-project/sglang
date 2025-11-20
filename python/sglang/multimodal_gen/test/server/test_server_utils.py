@@ -431,7 +431,11 @@ class PerformanceValidator:
                 continue
             actual = summary.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
-            tolerance = self.tolerances.denoise_stage if stage == "DenoisingStage" else self.tolerances.non_denoise_stage
+            tolerance = (
+                self.tolerances.denoise_stage
+                if stage == "DenoisingStage"
+                else self.tolerances.non_denoise_stage
+            )
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,

@@ -66,8 +66,15 @@ class BaselineConfig:
         tol_data = data["tolerances"]
         tolerances = ToleranceConfig(
             e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", tol_data["e2e"])),
-            denoise_stage=float(os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["denoise_stage"])),
-            non_denoise_stage=float(os.getenv("SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE", tol_data["non_denoise_stage"])),
+            denoise_stage=float(
+                os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["denoise_stage"])
+            ),
+            non_denoise_stage=float(
+                os.getenv(
+                    "SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE",
+                    tol_data["non_denoise_stage"],
+                )
+            ),
             denoise_step=float(
                 os.getenv("SGLANG_DENOISE_STEP_TOLERANCE", tol_data["denoise_step"])
             ),
