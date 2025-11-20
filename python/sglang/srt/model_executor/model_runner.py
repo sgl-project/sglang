@@ -216,7 +216,7 @@ _is_xpu_xmx_available = xpu_has_xmx_support()
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 
 # Detect stragger ranks in model loading
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(os.getenv("UNBALANCED_MODEL_LOADING_TIMEOUT_S", 300))
 
 # the ratio of mamba cache pool size to max_running_requests, it will be safe when it is larger than 2 (yizhang2077)
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
