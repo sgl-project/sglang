@@ -472,6 +472,14 @@ suite_ascend = {
         TestFile("ascend/test_ascend_deepep.py", 400),
         TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
+    # "per-commit-1-ascend-npu-debug": [],
+    # "per-commit-2-ascend-npu-debug": [],
+    # "per-commit-4-ascend-npu-debug": [],
+    # "per-commit-8-ascend-npu-debug": [],
+    "per-commit-16-ascend-npu-debug": [
+        TestFile("ascend_k8s/test_ascend_deepseek_v3_w4a8.py", 400),
+    ],
+    
 }
 
 suites.update(suite_amd)
