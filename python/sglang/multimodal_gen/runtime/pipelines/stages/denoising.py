@@ -1284,9 +1284,9 @@ class DenoisingStage(PipelineStage):
         elif STA_mode == STA_Mode.STA_INFERENCE:
             import sglang.multimodal_gen.envs as envs
 
-            config_file = envs.SGL_DIFFUSION_ATTENTION_CONFIG
+            config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
             if config_file is None:
-                raise ValueError("SGL_DIFFUSION_ATTENTION_CONFIG is not set")
+                raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")
             STA_param = configure_sta(
                 mode=STA_Mode.STA_INFERENCE,
                 layer_num=layer_num,
