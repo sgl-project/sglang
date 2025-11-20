@@ -276,14 +276,14 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--expert-parallel-size`<br>`--ep-size`<br>`--ep` | The expert parallelism size. | `1` | Type: int |
-| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | `none` | `none`, `deepep` |
-| `--moe-runner-backend` | Choose the runner backend for MoE. | `auto` | `auto`, `deep_gemm`, `triton`, `triton_kernel`, `flashinfer_trtllm`, `flashinfer_cutlass`, `flashinfer_mxfp4`, `flashinfer_cutedsl` |
+| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. DeepEP and Mooncake automatically set `ep_size=tp_size`. | `none` | `none`, `deepep`, `mooncake` |
+| `--moe-runner-backend` | Choose the runner backend for MoE. | `auto` | `auto`, `deep_gemm`, `triton`, `triton_kernel`, `flashinfer_trtllm`, `flashinfer_cutlass`, `flashinfer_mxfp4`, `flashinfer_cutedsl`, `cutlass` |
 | `--flashinfer-mxfp4-moe-precision` | Choose the computation precision of flashinfer mxfp4 moe | `default` | `default`, `bf16` |
 | `--enable-flashinfer-allreduce-fusion` | Enable FlashInfer allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | `auto` | `normal`, `low_latency`, `auto` |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | `0` | Type: int |
-| `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | `None` | Type: str |
-| `--init-expert-location` | Initial location of EP experts. | `trivial` | Type: str |
+| `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | `None` | `static`, `dynamic`, `fake` |
+| `--init-expert-location` | Initial location of EP experts. Pass `trivial`, a JSON string/file, or a `.pt` snapshot exported by EPLB. | `trivial` | `trivial`, `<path or JSON>` |
 | `--enable-eplb` | Enable EPLB algorithm | `False` | bool flag (set to enable) |
 | `--eplb-algorithm` | Chosen EPLB algorithm | `auto` | Type: str |
 | `--eplb-rebalance-num-iterations` | Number of iterations to automatically trigger a EPLB re-balance. | `1000` | Type: int |
@@ -294,6 +294,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-expert-distribution-metrics` | Enable logging metrics for expert balancedness | `False` | bool flag (set to enable) |
 | `--deepep-config` | Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path. | `None` | Type: str |
 | `--moe-dense-tp-size` | TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports. | `None` | Type: int |
+| `--elastic-ep-backend` | Collective backend used to mute unhealthy EP ranks. | `none` | `none`, `mooncake` |
+| `--mooncake-ib-device` | Comma-separated list of InfiniBand devices for the Mooncake backend. | `None` | Type: str |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |
