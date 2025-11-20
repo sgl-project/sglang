@@ -327,7 +327,6 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
-
         self.rem_total_token_offset = mixed_with_decode_tokens
         self.cur_rem_token_offset = mixed_with_decode_tokens
 
@@ -639,9 +638,10 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
+        priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
         sorted_running_reqs = sorted(
             self.running_batch.reqs,
-            key=lambda x: (x.priority * (- self.priority_sign), -x.time_stats.wait_queue_entry_time),
+            key=lambda x: (x.priority * (- priority_sign), -x.time_stats.wait_queue_entry_time),
         )
         preemptible_reqs = []
         min_tokens_to_remove = (
@@ -653,7 +653,7 @@ class PrefillAdder:
             if running_req in self.preempt_list:
                 continue
             # Priority difference needs to meet the threshold to be preemptible.
-            priority_diff = (req.priority - running_req.priority) * (- self.priority_sign)
+            priority_diff = (req.priority - running_req.priority) * (-priority_sign)
 
             if priority_diff > self.priority_scheduling_preemption_threshold:
                 preemptible_reqs.append(running_req)

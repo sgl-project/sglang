@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
@@ -8,6 +9,7 @@ from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     SchedulePolicy,
 )
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -16,8 +18,10 @@ from sglang.test.test_utils import CustomTestCase
 class TestPrefillAdder(CustomTestCase):
     def setUp(self):
         self.mock_tree_cache = self.create_tree_cache()
-        self.mock_token_allocator = self.create_token_allocator()
-        self.mock_server_args = self.create_server_args(schedule_low_priority_values_first=False)   
+        self.mock_token_allocator = self.create_token_allocator()        
+        patcher = patch("sglang.srt.managers.schedule_policy.is_nsa_enable_prefill_cp", return_value=False)
+        self.mock_is_nsa = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def create_tree_cache(
         self,
@@ -61,14 +65,14 @@ class TestPrefillAdder(CustomTestCase):
         return server_args
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
-            req = MagicMock(spec=Req)
-            req.rid = str(rid)
-            req.priority = priority
-            req.extend_input_len = 0 
-            req.output_ids = [0] * output_len
-            req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
-            req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
-            return req
+        req = MagicMock(spec=Req)
+        req.rid = str(rid)
+        req.priority = priority
+        req.extend_input_len = 0 
+        req.output_ids = [0] * output_len
+        req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+        req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        return req
 
     def create_adder(self, running_batch):
         return PrefillAdder(
@@ -84,31 +88,89 @@ class TestPrefillAdder(CustomTestCase):
         )
     
     def test_preempt_success_high_value_priority(self):
-            params = [
-                ("run1", 0, 50),
-                ("run2", 1, 75),
-                ("run3", 2, 100),
-            ]
-            running_reqs = [
-                self.create_mock_req(rid, priority, max_new_tokens)
-                for rid, priority, max_new_tokens in params
-            ]
-            running_batch = self.create_running_batch(running_reqs)
-            adder = self.create_adder(running_batch)
-            
-            self.assertEqual(adder.rem_total_token_offset, 225)
+        params = [
+            ("run1", 0, 50),
+            ("run2", 1, 75),
+            ("run3", 2, 100),
+        ]
+        running_reqs = [
+            self.create_mock_req(rid, priority, max_new_tokens)
+            for rid, priority, max_new_tokens in params
+        ]
+        mock_server_args = self.create_server_args(schedule_low_priority_values_first=False)
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+        
+        self.assertEqual(adder.rem_total_token_offset, 225)
 
-            self.mock_token_allocator.full_available_size.return_value = 250
-            self.mock_token_allocator.available_size.return_value = 250
+        self.mock_token_allocator.full_available_size.return_value = 225 #full occupation of GRam
+        self.mock_token_allocator.available_size.return_value = 225
 
-            new_req = self.create_mock_req("new1", priority=0, max_new_tokens=76)
-            
-            success = adder.preempt_to_schedule(new_req, self.mock_server_args)
+        new_req = self.create_mock_req("new1", priority=1, max_new_tokens=49)
+        
+        success = adder.preempt_to_schedule(new_req, mock_server_args)
 
-            self.assertTrue(success)
-            self.assertIn(running_reqs[2], adder.preempt_list)
-            self.assertEqual(adder.rem_total_token_offset, 125) # 50 + 75 + 100 - 100 = 125
-            running_batch.release_req.assert_called_once()
+        self.assertTrue(success)
+        self.assertIn(running_reqs[0], adder.preempt_list)
+        self.assertEqual(adder.rem_total_token_offset, 175) # 50 + 75 + 100 - 50 = 175
+        running_batch.release_req.assert_called_once()
+
+    def test_preempt_success_low_value_priority(self):
+        params = [
+            ("run1", 0, 50),
+            ("run2", 1, 75),
+            ("run3", 2, 100),
+        ]
+        running_reqs = [
+            self.create_mock_req(rid, priority, max_new_tokens)
+            for rid, priority, max_new_tokens in params
+        ]
+        mock_server_args = self.create_server_args(schedule_low_priority_values_first=True)
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+        
+        self.assertEqual(adder.rem_total_token_offset, 225)
+
+        self.mock_token_allocator.full_available_size.return_value = 225 #full occupation of GRam
+        self.mock_token_allocator.available_size.return_value = 225
+
+        new_req = self.create_mock_req("new1", priority=1, max_new_tokens=49)
+        
+        success = adder.preempt_to_schedule(new_req, mock_server_args)
+
+        self.assertTrue(success)
+        self.assertIn(running_reqs[2], adder.preempt_list)
+        self.assertEqual(adder.rem_total_token_offset, 125) # 50 + 75 + 100 - 100 = 125
+        running_batch.release_req.assert_called_once()
+
+    def test_preempt_fail_low_priority_value_first(self):
+        params = [
+            ("run1", 0, 50),
+            ("run2", 1, 75),
+            ("run3", 2, 100),
+        ]
+        running_reqs = [
+            self.create_mock_req(rid, priority, max_new_tokens)
+            for rid, priority, max_new_tokens in params
+        ]
+        mock_server_args = self.create_server_args(schedule_low_priority_values_first=True)
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+        
+        self.assertEqual(adder.rem_total_token_offset, 225)
+
+        self.mock_token_allocator.full_available_size.return_value = 225 #full occupation of GRam
+        self.mock_token_allocator.available_size.return_value = 225
+
+        new_req_fail_by_priority_check = self.create_mock_req("new1", priority=2, max_new_tokens=49)
+        
+        success_by_priority_check = adder.preempt_to_schedule(new_req_fail_by_priority_check, mock_server_args)
+        self.assertFalse(success_by_priority_check)
+
+        new_req_fail_by_priority_check = self.create_mock_req("new2", priority=1, max_new_tokens=110)
+        success_by_capacity_check = adder.preempt_to_schedule(new_req_fail_by_priority_check, mock_server_args)
+        self.assertFalse(success_by_capacity_check)
+
 
 if __name__ == "__main__":
     unittest.main()
