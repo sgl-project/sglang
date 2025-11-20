@@ -3620,7 +3620,7 @@ def cached_triton_kernel(key_fn=None):
     def decorator(fn):
         # Auto-enable the custom kernel cache for CUDA, where it is
         # known to be compatible.
-        if is_cuda() and not envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
+        if is_cuda() and not envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.is_set():
             logger.debug("Detected platform CUDA, using custom triton kernel cache.")
             return CachedKernel(fn, key_fn)
 
