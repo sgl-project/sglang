@@ -48,7 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, LazyValue
 
 _is_npu = is_npu()
 
@@ -573,9 +573,10 @@ class DeepseekForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Track if this is an expert weight to enable early skipping
-                is_expert_weight = False
+                is_expert_weight_loaded = False
                 if _is_npu:
+                    # Track if this is an expert weight to enable early skipping
+                    is_expert_weight = False
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
@@ -595,29 +596,34 @@ class DeepseekForCausalLM(nn.Module):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
+                        is_expert_weight_loaded = True
                         break
-                if is_expert_weight:
-                    # This is an expert weight but not mapped to this rank, skip all remaining processing
-                    continue
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip experts that are not assigned to this worker.
-                if (
-                    "mlp.experts." in name or "mlp.shared_experts." in name
-                ) and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                    else:
+                        if is_expert_weight:
+                            # This is an expert weight but not mapped to this rank, skip all remaining processing
+                            continue
+                if not is_expert_weight_loaded:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip experts that are not assigned to this worker.
+                    if (
+                        "mlp.experts." in name or "mlp.shared_experts." in name
+                    ) and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
         if _is_npu:
             # Lazy initialization of expert weights cache to avoid slowing down load_weights
             if not hasattr(self, "routed_experts_weights_of_layer"):
-                self.routed_experts_weights_of_layer = {
-                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                    for layer_id in range(self.start_layer, self.end_layer)
-                    if isinstance(self.model.layers[layer_id].mlp, DeepseekMoE)
-                }
+                self.routed_experts_weights_of_layer = LazyValue(
+                    lambda: {
+                        layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                        for layer_id in range(self.start_layer, self.end_layer)
+                        if isinstance(self.model.layers[layer_id].mlp, DeepseekMoE)
+                    }
+                )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
