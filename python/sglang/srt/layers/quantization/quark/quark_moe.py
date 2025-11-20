@@ -12,7 +12,11 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
+from sglang.srt.layers.quantization.utils import (
+    all_close_1d,
+    per_tensor_dequantize,
+    get_torch_compile_disable_decorator,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
@@ -49,6 +53,7 @@ OCP_MX_BLOCK_SIZE = 32
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuarkConfig
 
+conditional_decorator = get_torch_compile_disable_decorator(_is_hip)
 
 class QuarkMoEMethod(FusedMoEMethodBase):
 
@@ -202,6 +207,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
     ):
         self.moe_runner_config = moe_runner_config
 
+    @conditional_decorator
     def apply(
         self,
         layer: torch.nn.Module,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union, Callable
 
 import numpy
 import torch
@@ -732,3 +732,8 @@ def prepare_static_weights_for_trtllm_fp4_moe(
         gemm2_weights_fp4_shuffled,
         gemm2_scales_fp4_shuffled,
     )
+def get_torch_compile_disable_decorator(is_disable) -> Callable:
+    if is_disable:
+        return torch._dynamo.disable
+    else:
+        return lambda func: func
