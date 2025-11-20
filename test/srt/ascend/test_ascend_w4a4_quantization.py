@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-    8000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
+    7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
 )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
