@@ -55,6 +55,18 @@ jobs:
               - "python/*.toml"
               - ".github/workflows/pr-test.yml"
 
+      - name: Show filter results in summary (table)
+        run: |
+          {
+            echo "## Change Detection"
+            echo ""
+            echo "| Component       | Changed |"
+            echo "|----------------|---------|"
+            echo "| main_package   | ${{ steps.filter.outputs.main_package }} |"
+            echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel }} |"
+            echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
   # =============================================== sgl-kernel ====================================================
 
   sgl-kernel-build-wheels:
@@ -854,11 +866,6 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu]
