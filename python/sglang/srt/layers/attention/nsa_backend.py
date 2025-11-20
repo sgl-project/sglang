@@ -286,9 +286,11 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         self.speculative_step_id = speculative_step_id
 
+        self.device_capability = torch.cuda.get_device_capability()
+        self.device_sm_major = self.device_capability[0]
+
         # Allocate global workspace buffer for TRTLLm ragged attention kernel (SM100/B200)
-        device_sm_major = torch.cuda.get_device_capability()[0]
-        if device_sm_major >= 10:
+        if self.device_sm_major >= 10:
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -1172,10 +1174,8 @@ class NativeSparseAttnBackend(AttentionBackend):
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
 
-        # Determine required padding based on GPU architecture
-        device_capability = torch.cuda.get_device_capability()
-        is_blackwell = device_capability[0] >= 10
-        required_padding = 128 if is_blackwell else 64
+        # Determine required padding based on GPU architecture (use cached value)
+        required_padding = 128 if self.device_sm_major >= 10 else 64
 
         need_padding = num_heads % required_padding != 0
 
@@ -1186,7 +1186,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
 
             # Pad q to required size
-            q_padded = q_all.new_empty((num_tokens, required_padding, head_dim))
+            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
             q_padded[:, :num_heads, :] = q_all
             q_input = q_padded
         else:
@@ -1281,8 +1281,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
 
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
-        device_sm_major = torch.cuda.get_device_capability()[0]
-        if device_sm_major >= 10:
+        if self.device_sm_major >= 10:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
