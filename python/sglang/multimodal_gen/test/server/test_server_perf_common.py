@@ -542,6 +542,7 @@ Consider updating perf_baselines.json with the snippets below:
 
 """
         logger.error(output)
+        logger.error(output)
 
     def test_diffusion_perf(
         self,
