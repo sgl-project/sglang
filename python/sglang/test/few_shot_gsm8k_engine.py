@@ -89,7 +89,11 @@ def run_eval(args):
     # Run requests
     tic = time.perf_counter()
 
-    loop = asyncio.get_event_loop()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     outputs = loop.run_until_complete(
         concurrent_generate(engine, prompts, sampling_param)

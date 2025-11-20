@@ -69,7 +69,7 @@ dependencies = [
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop==0.21.0",
+  "uvloop",
   "xgrammar==0.1.25",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
