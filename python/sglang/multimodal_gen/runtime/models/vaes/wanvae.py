@@ -543,7 +543,6 @@ class WanAttentionBlock(nn.Module):
         q, k, v = qkv.chunk(3, dim=-1)
 
         # apply attention
-        # x = F.scaled_dot_product_attention(q, k, v)
         x, _ = self.attn(q, k, v)
 
         x = (
