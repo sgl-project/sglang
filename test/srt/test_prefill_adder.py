@@ -87,7 +87,7 @@ class TestPrefillAdder(CustomTestCase):
             priority_scheduling_preemption_threshold=0,
         )
     
-    def test_preempt_success_high_value_priority(self):
+    def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),
             ("run2", 1, 75),
@@ -115,7 +115,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_total_token_offset, 175) # 50 + 75 + 100 - 50 = 175
         running_batch.release_req.assert_called_once()
 
-    def test_preempt_success_low_value_priority(self):
+    def test_preempt_success_low_priority_values_first(self):
         params = [
             ("run1", 0, 50),
             ("run2", 1, 75),
@@ -143,7 +143,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_total_token_offset, 125) # 50 + 75 + 100 - 100 = 125
         running_batch.release_req.assert_called_once()
 
-    def test_preempt_fail_low_priority_value_first(self):
+    def test_preempt_fail_low_priority_values_first(self):
         params = [
             ("run1", 0, 50),
             ("run2", 1, 75),
@@ -171,6 +171,62 @@ class TestPrefillAdder(CustomTestCase):
         success_by_capacity_check = adder.preempt_to_schedule(new_req_fail_by_priority_check, mock_server_args)
         self.assertFalse(success_by_capacity_check)
 
+    def test_preempt_fail_high_priority_values_first(self):
+        params = [
+            ("run1", 0, 50),
+            ("run2", 1, 75),
+            ("run3", 2, 100),
+        ]
+        running_reqs = [
+            self.create_mock_req(rid, priority, max_new_tokens)
+            for rid, priority, max_new_tokens in params
+        ]
+        mock_server_args = self.create_server_args(schedule_low_priority_values_first=False)
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+        
+        self.assertEqual(adder.rem_total_token_offset, 225)
+
+        self.mock_token_allocator.full_available_size.return_value = 225 #full occupation of GRam
+        self.mock_token_allocator.available_size.return_value = 225
+
+        new_req_fail_by_priority_check = self.create_mock_req("new1", priority=0, max_new_tokens=49)
+        
+        success_by_priority_check = adder.preempt_to_schedule(new_req_fail_by_priority_check, mock_server_args)
+        self.assertFalse(success_by_priority_check)
+
+        new_req_fail_by_priority_check = self.create_mock_req("new2", priority=-1, max_new_tokens=110)
+        success_by_capacity_check = adder.preempt_to_schedule(new_req_fail_by_priority_check, mock_server_args)
+        self.assertFalse(success_by_capacity_check)
+
+    def test_over_preempt_success_low_priority_values_first(self):
+        params = [
+            ("run1", 0, 50),
+            ("run2", 1, 75),
+            ("run3", 2, 100),
+            ("run4", 2, 125),
+            ("run4", 2, 125),
+        ]
+        running_reqs = [
+            self.create_mock_req(rid, priority, max_new_tokens)
+            for rid, priority, max_new_tokens in params
+        ]
+        mock_server_args = self.create_server_args(schedule_low_priority_values_first=True)
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+        
+        self.assertEqual(adder.rem_total_token_offset, 475)
+
+        self.mock_token_allocator.full_available_size.return_value = 475 #full occupation of GRam
+        self.mock_token_allocator.available_size.return_value = 475
+
+        new_req = self.create_mock_req("new1", priority=1, max_new_tokens=75)
+        
+        success = adder.preempt_to_schedule(new_req, mock_server_args)
+        self.assertFalse(success)
+        self.assertIn(running_reqs[0], adder.preempt_list)
+        self.assertEqual(adder.rem_total_token_offset, 175) # 50 + 75 + 100 + 125 + 125 - 125 = 350
+        running_batch.release_req.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()
