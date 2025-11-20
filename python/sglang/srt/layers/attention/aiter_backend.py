@@ -29,6 +29,7 @@ try:
         flash_attn_varlen_func,
         mha_batch_prefill_func,
         paged_attention_ragged,
+        ragged_layout_trans,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
@@ -764,15 +765,21 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            k, v = ragged_layout_trans(
+                self.forward_metadata.kv_indptr[0:bs0],
+                self.forward_metadata.kv_indices,
                 k_cache,
-                v_cache,
+                v_cache
+            )
+
+            o = flash_attn_varlen_func(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k,
+                v,
                 self.qo_indptr[:bs0],
                 self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
+                self.forward_metadata.max_q_len, #max_len_extend,
+                self.forward_metadata.max_kv_len, #max_len_in_batch,
                 causal=True,
                 logits_soft_cap=self.logits_soft_cap,
                 alibi_slopes=None,
