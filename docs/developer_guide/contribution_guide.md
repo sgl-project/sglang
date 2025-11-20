@@ -93,7 +93,7 @@ Each CI workflow has a default limit defined in its workflow configuration file.
 
 ```yaml
 cool-down-minutes:
-  description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
+  description: "Default cooldown period in minutes; 0 disables rate limiting"
   type: number
   default: 120
 ```
