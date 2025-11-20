@@ -17,7 +17,7 @@ import atexit
 import logging
 import signal
 from abc import ABC, abstractmethod
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
 
@@ -26,6 +26,7 @@ from sglang.srt.utils import get_bool_env_var, get_int_env_var
 logger = logging.getLogger(__name__)
 
 use_elasticmem = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "false")
+# page size of device memory, default 2MB
 cu_page_size = get_int_env_var("SGLANG_CU_PAGE_SIZE", 2 << 20)
 
 if use_elasticmem:
@@ -38,15 +39,32 @@ class ElasticMempool(ABC):
         pass
 
     @abstractmethod
-    def disable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+    def reduce(self, new_size: int) -> Tuple[int, int]:
+        """Reduce the memory pool to a new size.
+
+        Args:
+            new_size: Target size for the memory pool.
+
+        Returns:
+            A tuple containing (released_cu_pages, mempool_size_after_reduce).
+        """
         pass
 
     @abstractmethod
-    def enable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+    def expand(self, new_size: int) -> Tuple[int, int]:
+        """Expand the memory pool to a new size.
+
+        Args:
+            new_size: Target size for the memory pool.
+
+        Returns:
+            A tuple containing (allocated_cu_pages, mempool_size_after_expand).
+        """
         pass
 
     @abstractmethod
     def cu_page_to_token(self, cu_page_num: int) -> int:
+        # The approximate number of tokens that can be expanded by mapping cu_page_num cu_pages.
         pass
 
 
@@ -66,15 +84,37 @@ class ElasticAllocator(ABC):
         pass
 
     @abstractmethod
-    def disable(self) -> int:
+    def reduce(self) -> int:
+        """Reduce the allocated memory.
+
+        Returns:
+            Number of cu_page unmapped.
+        """
         pass
 
     @abstractmethod
-    def enable(self, need_size: int) -> int:
+    def expand(self, expand_size: int) -> int:
+        """Expand the allocated memory.
+
+        Args:
+            need_size: Required additional size.
+
+        Returns:
+            Number of cu_page mapped.
+        """
         pass
 
     @abstractmethod
     def cu_page_to_token(self, cu_page_num: int) -> int:
+        # The approximate number of tokens that can be expanded by mapping cu_page_num cu_pages.
+        pass
+
+    @abstractmethod
+    def register_evict_func(self, func_evictable_size, func_evict) -> None:
+        pass
+
+    @abstractmethod
+    def token_usage(self) -> float:
         pass
 
     @abstractmethod
@@ -87,10 +127,16 @@ class ElasticAllocator(ABC):
 
     @abstractmethod
     def update_size(self) -> None:
+        """Update the internal size tracking."""
         pass
 
 
 class ElasticMempoolOrchestrator:
+    """Orchestrator for managing elastic memory pools.
+    Coordinates between different allocators to dynamically resize memory pools
+    based on demand.
+    """
+
     def __init__(self):
         assert use_elasticmem
         atexit.register(vmm_ops.shutdown_emem)
@@ -140,13 +186,14 @@ class ElasticMempoolOrchestrator:
         logger.info("ElasticMempoolOrchestrator do_resize")
         unmap_page = 0
         unmap_allocator.evict(unmap_allocator.evictable_size())
-        unmap_page = unmap_allocator.disable()
+        unmap_page = unmap_allocator.reduce()
         logger.info(f"{unmap_allocator._kvcache.pool_name} unmap {unmap_page} cu_page")
 
+        # The approximate number of tokens that can be expanded by mapping cu_page_num cu_pages.
         map_token = map_allocator.cu_page_to_token(unmap_page)
         map_page = 0
         if map_token > 0:
-            map_page = map_allocator.enable(map_token)
+            map_page = map_allocator.expand(map_token)
         logger.info(f"{map_allocator._kvcache.pool_name} map {map_page} cu_page")
 
         for _allocator in self.allocators:

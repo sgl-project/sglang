@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple, override
+from typing import Optional, Tuple, override
 
 import torch
 
@@ -50,18 +50,19 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
     def _create_buffers(self):
         self.create_elastic_buffers()
 
+    def _size_to_esize(self, size: int):
+        return size + self.page_size
+
+    def _esize_to_size(self, esize: int):
+        return esize - self.page_size
+
     @override
     def create_elastic_buffers(self):
         current_device_id = f"cuda:{torch.cuda.current_device()}"
 
         free_memory, total_memory = torch.cuda.mem_get_info()
 
-        assert self.size % self.page_size == 0
-        self.esize = (
-            ((self.size + self.page_size) + self.page_size - 1)
-            // self.page_size
-            * self.page_size
-        )
+        self.esize = self._size_to_esize(self.size)
         page_size = self.page_size
         state_shape = (self.head_num, self.head_dim)
         dtype = self.store_dtype
@@ -94,33 +95,37 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
         self.state_memsize = self.ek_buffer[0].state_memsize
         logger.debug(f"{self.esize=}, {self.k_buffer[0].shape=}, {self.state_memsize=}")
 
+    # TODO: exception handler, consistency in mempool size for each kv layer
     @override
-    def disable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+    def reduce(self, new_size: int) -> Tuple[int, int]:
+        new_esize = self._size_to_esize(new_size)
         total_unmap_num = 0
         for ek, ev in zip(self.ek_buffer, self.ev_buffer):
-            unmap_num, pass_indices, proc_indices = ek.disable(indices)
+            unmap_num, self.esize = ek.reduce(new_esize)
             total_unmap_num += unmap_num
-            unmap_num, pass_indices, proc_indices = ev.disable(indices)
+            unmap_num, self.esize = ev.reduce(new_esize)
             total_unmap_num += unmap_num
-        self.size -= len(proc_indices)
-        return total_unmap_num, pass_indices, proc_indices
+        self.size = self._esize_to_size(self.esize)
+        return total_unmap_num, self.size
 
     @override
-    def enable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+    def expand(self, new_size: int) -> Tuple[int, int]:
+        new_esize = self._size_to_esize(new_size)
         total_map_num = 0
         for ek, ev in zip(self.ek_buffer, self.ev_buffer):
-            map_num, pass_indices, proc_indices = ek.enable(indices)
+            map_num, self.esize = ek.expand(new_esize)
             total_map_num += map_num
-            map_num, pass_indices, proc_indices = ev.enable(indices)
+            map_num, self.esize = ev.expand(new_esize)
             total_map_num += map_num
-        self.size += len(proc_indices)
-        return total_map_num, pass_indices, proc_indices
+        self.size = self._esize_to_size(self.esize)
+        return total_map_num, self.size
 
     @override
     def cu_page_to_token(self, cu_page_num: int) -> int:
-        cu_mem = cu_page_num * cu_page_size
-        cu_mem_per_kv_layer = cu_mem // 2 // self.layer_num
+        cu_page_num_per_kv_layer = cu_page_num // (2 * self.layer_num)
+        cu_mem_per_kv_layer = cu_page_num_per_kv_layer * cu_page_size
         token_num = cu_mem_per_kv_layer // self.state_memsize
+        token_num = token_num // self.page_size * self.page_size
         return token_num
 
 
@@ -155,11 +160,11 @@ class ElasticSWAKVPool(SWAKVPool):
         )
 
     @override
-    def disable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+    def reduce(self, new_size: int) -> Tuple[int, int]:
         raise NotImplementedError()
 
     @override
-    def enable(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+    def expand(self, new_size: int) -> Tuple[int, int]:
         raise NotImplementedError()
 
     @override
