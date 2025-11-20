@@ -415,7 +415,8 @@ Consider updating perf_baselines.json with the snippets below:
 
         try:
             validator.validate(perf_record, stage_metrics, case.num_frames)
-        except AssertionError:
+        except AssertionError as e:
+            logger.error(f"Performance validation failed for {case.id}:\n{e}")
             self._dump_baseline_scenario(case, summary)
             raise
 
