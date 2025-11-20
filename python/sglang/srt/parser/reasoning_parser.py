@@ -1,4 +1,8 @@
+from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, Optional, Tuple, Type
+
+import regex as re
 
 from sglang.srt.parser.harmony_parser import HarmonyParser
 
@@ -114,6 +118,198 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
+
+
+class Olmo3ReasoningState(Enum):
+    REASONING = 1
+    CONTENT = 2
+
+
+@dataclass(frozen=True)
+class Indices:
+    start: int
+    end: int
+
+    def __len__(self):
+        return self.end - self.start
+
+
+def string_overlap(a: str, b: str) -> Tuple[Optional[Indices], Optional[Indices]]:
+    """
+    Find the longest overlap where the end of string a matches the start
+    of string b.
+    """
+
+    # Ensure `a` is the shorter string for simpler handling.
+    a, b, swapped = (a, b, False) if len(a) < len(b) else (b, a, True)
+
+    if a in b:
+        ind_a = Indices(0, len(a))
+        ind_b = Indices(b.index(a), b.index(a) + len(a))
+        return (ind_b, ind_a) if swapped else (ind_a, ind_b)
+
+    for i in range(len(a) - 1, 0, -1):
+        if a[-i:] == b[:i]:
+            ind_a = Indices(len(a) - i, len(a))
+            ind_b = Indices(0, i)
+            return (ind_b, ind_a) if swapped else (ind_a, ind_b)
+
+    for i in range(len(a) - 1, 0, -1):
+        if b[-i:] == a[:i]:
+            ind_a = Indices(0, i)
+            ind_b = Indices(len(b) - i, len(b))
+            return (ind_b, ind_a) if swapped else (ind_a, ind_b)
+
+    return None, None
+
+
+@dataclass
+class Olmo3ReasoningBuffer:
+    think_start: str = "<think>"
+    think_end: str = "</think>"
+    buffer: str = ""
+    state: Olmo3ReasoningState = Olmo3ReasoningState.REASONING
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def process_buffer(self) -> Optional[Tuple[str, str]]:
+        start_idx = self.buffer.find(self.think_start)
+        if start_idx >= 0:
+            self.state = Olmo3ReasoningState.REASONING
+            pretext, self.buffer = (
+                self.buffer[:start_idx],
+                self.buffer[start_idx + len(self.think_start) :],
+            )
+            if start_idx > 0:
+                return "", pretext
+
+        end_idx = self.buffer.rfind(self.think_end)
+        if end_idx >= 0:
+            self.state = Olmo3ReasoningState.CONTENT
+            pretext, self.buffer = (
+                self.buffer[:end_idx],
+                self.buffer[end_idx + len(self.think_end) :],
+            )
+            if end_idx > 0:
+                return pretext, ""
+
+        if self.state == Olmo3ReasoningState.REASONING:
+            text_buffer, self.buffer = self.buffer, ""
+            if text_buffer:
+                return text_buffer, ""
+
+        if self.state == Olmo3ReasoningState.CONTENT:
+            text_buffer, self.buffer = self.buffer, ""
+            if text_buffer:
+                return "", text_buffer
+
+        return None
+
+    def add_text(self, delta_text: str) -> Optional[Tuple[str, str]]:
+        self.buffer += delta_text
+
+        _, overlap_start = string_overlap(delta_text, self.think_start)
+        _, overlap_end = string_overlap(delta_text, self.think_end)
+
+        partial_start = overlap_start is not None and len(overlap_start) < len(
+            self.think_start
+        )
+        partial_end = overlap_end is not None and len(overlap_end) < len(self.think_end)
+
+        if partial_start and self.think_start in self.buffer and not partial_end:
+            return self.process_buffer()
+        if partial_end and self.think_end in self.buffer:
+            return self.process_buffer()
+        if partial_start or partial_end:
+            return None
+        return self.process_buffer()
+
+
+class Olmo3Detector(BaseReasoningFormatDetector):
+    """
+    Parser for Olmo 3 models where `<think>` and `</think>` are plain strings
+    in the vocabulary. Adapted from vLLM's Olmo3 reasoning parser.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+    ):
+        super().__init__(
+            think_start_token="<think>",
+            think_end_token="</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+
+        reasoning_expr = (
+            rf"^(?:{self.think_start_token})?(?P<reasoning>.*?)"
+            + rf"{self.think_end_token}(?P<content>.*)$"
+        )
+        self.reasoning_regex = re.compile(reasoning_expr, re.DOTALL)
+
+        initial_state = (
+            Olmo3ReasoningState.REASONING
+            if force_reasoning
+            else Olmo3ReasoningState.CONTENT
+        )
+        self.buffer = Olmo3ReasoningBuffer(
+            think_start=self.think_start_token,
+            think_end=self.think_end_token,
+            state=initial_state,
+        )
+        self._pending_reasoning = ""
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        match = self.reasoning_regex.match(text)
+        if match:
+            reasoning = match.group("reasoning") or ""
+            content = match.group("content") or ""
+            return StreamingParseResult(
+                normal_text=content,
+                reasoning_text=reasoning,
+            )
+        # Fallback to the generic detector which handles force_reasoning mode
+        # and truncated reasoning blocks that never emit </think>.
+        return super().detect_and_parse(text)
+
+    def _handle_streaming_controls(self, reasoning_text: str) -> str:
+        if self.stream_reasoning:
+            return reasoning_text
+
+        if not reasoning_text:
+            return ""
+
+        if self.buffer.state == Olmo3ReasoningState.REASONING:
+            self._pending_reasoning += reasoning_text
+            return ""
+
+        reasoning = self._pending_reasoning + reasoning_text
+        self._pending_reasoning = ""
+        return reasoning
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        result = self.buffer.add_text(new_text)
+        if result is None and self.buffer.think_end in self.buffer.buffer:
+            result = self.buffer.process_buffer()
+
+        if result is None:
+            return StreamingParseResult()
+
+        reasoning_text, normal_text = result
+        if reasoning_text:
+            reasoning_text = self._handle_streaming_controls(reasoning_text)
+
+        if normal_text and not self.stream_reasoning and self._pending_reasoning:
+            reasoning_text = self._pending_reasoning
+            self._pending_reasoning = ""
+
+        return StreamingParseResult(
+            normal_text=normal_text,
+            reasoning_text=reasoning_text,
+        )
 
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
@@ -292,6 +488,7 @@ class ReasoningParser:
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": DeepSeekR1Detector,
+        "olmo3": Olmo3Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
