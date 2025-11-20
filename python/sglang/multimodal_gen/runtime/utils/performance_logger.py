@@ -1,20 +1,21 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import argparse
 import json
 import logging
 import os
 import subprocess
 import sys
 import time
+import traceback
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from dateutil.tz import UTC
 
 import sglang
+import sglang.multimodal_gen.envs as envs
 
 
 def get_diffusion_perf_log_dir() -> str:
@@ -256,131 +257,93 @@ class PerformanceLogger:
         perf_logger.info(json.dumps(log_entry))
 
 
-# -------------------------------------------------------------------------
-#  Benchmark Comparison Utilities
-# -------------------------------------------------------------------------
-
-
-def _load_benchmark_file(file_path: str) -> Dict[str, Any]:
-    """Loads a benchmark JSON file."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _calculate_diff(base: float, new: float) -> tuple[float, float]:
-    """Returns (diff, diff_percent)."""
-    diff = new - base
-    if base == 0:
-        percent = 0.0
-    else:
-        percent = (diff / base) * 100
-    return diff, percent
-
-
-def compare_benchmarks(
-    baseline_path: str, new_path: str, output_format: str = "markdown"
-):
+class StageProfiler:
     """
-    Compares two benchmark JSON files and prints a report.
+    A unified context manager for profiling and logging pipeline stage execution.
+    Handles timing, updating logging_info, and writing to perf_logger.
     """
-    try:
-        base_data = _load_benchmark_file(baseline_path)
-        new_data = _load_benchmark_file(new_path)
-    except Exception as e:
-        print(f"Error loading benchmark files: {e}")
-        return
 
-    # --- High-level Summary ---
-    base_e2e = base_data.get("total_duration_ms", 0)
-    new_e2e = new_data.get("total_duration_ms", 0)
+    def __init__(
+        self,
+        stage_name: str,
+        batch: Any = None,
+        logger: logging.Logger = None,
+        simple_log: bool = False,
+    ):
+        self.stage_name = stage_name
+        self.batch = batch
+        # If simple_log is True, we log start/end unconditionally (like Timer)
+        self.simple_log = simple_log
+        self.logger = logger or logging.getLogger(__name__)
 
-    diff_ms, diff_pct = _calculate_diff(base_e2e, new_e2e)
+        # Check if metric recording is enabled
+        self.metrics_enabled = envs.SGLANG_DIFFUSION_STAGE_LOGGING
 
-    # Status icon: Improved (Green), Regression (Red), Neutral (Gray)
-    # Assuming lower latency is better
-    if diff_pct < -2.0:
-        status = "✅ (Faster)"
-    elif diff_pct > 2.0:
-        status = "❌ (Slower)"
-    else:
-        status = "➖ (Similar)"
+    def __enter__(self):
+        if self.simple_log:
+            self.logger.info(f"[{self.stage_name}] started...")
 
-    # Determine significant stage changes
-    # We assume 'steps' is a list of dicts: [{'name': ..., 'duration_ms': ...}, ...]
-    # We flatten them by name. If multiple steps have same name, we sum them?
-    # Or usually steps are unique phases like "TE", "UNet", "VAE".
-    # Let's aggregate by name just in case.
+        if self.metrics_enabled or self.simple_log:
+            self.start_time = time.perf_counter()
 
-    def aggregate_steps(steps: List[Dict]) -> Dict[str, float]:
-        agg = {}
-        for s in steps:
-            name = s.get("name", "unknown")
-            dur = s.get("duration_ms", 0)
-            agg[name] = agg.get(name, 0) + dur
-        return agg
+        return self
 
-    base_steps = aggregate_steps(base_data.get("steps", []))
-    new_steps = aggregate_steps(new_data.get("steps", []))
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # If not tracking time, just return (propagate exception if any)
+        if not (self.metrics_enabled or self.simple_log):
+            return False
 
-    # Identify significant changes (e.g. > 1% diff contribution or > 5% absolute change)
-    stage_rows = []
-    all_stage_names = set(base_steps.keys()) | set(new_steps.keys())
+        execution_time = time.perf_counter() - self.start_time
 
-    for stage in sorted(all_stage_names):
-        b_val = base_steps.get(stage, 0)
-        n_val = new_steps.get(stage, 0)
-        s_diff, s_pct = _calculate_diff(b_val, n_val)
+        # Handle Exceptions
+        if exc_type:
+            self.logger.error(
+                "[%s] Error during execution after %.4f ms: %s",
+                self.stage_name,
+                execution_time * 1000,
+                exc_val,
+            )
+            if self.metrics_enabled:
+                self.logger.error(
+                    "[%s] Traceback: %s",
+                    self.stage_name,
+                    "".join(traceback.format_tb(exc_tb)),
+                )
+            return False  # Propagate exception
 
-        # Filter noise: show if diff is > 0.5ms
-        if abs(s_diff) > 0.5:
-            stage_rows.append((stage, b_val, n_val, s_diff, s_pct))
+        # Success Case
+        if self.simple_log:
+            self.logger.info(
+                f"[{self.stage_name}] finished in {execution_time:.4f} seconds"
+            )
 
-    # Sort by absolute diff magnitude (descending)
-    stage_rows.sort(key=lambda x: abs(x[3]), reverse=True)
+        if self.metrics_enabled:
+            self._record_metrics(execution_time)
 
-    if output_format == "markdown":
-        print("### Performance Comparison Report\n")
+        return False
 
-        # Summary Table
-        print("#### 1. High-level Summary")
-        print("| Metric | Baseline | New | Diff | Status |")
-        print("| :--- | :--- | :--- | :--- | :--- |")
-        print(
-            f"| **E2E Latency** | {base_e2e:.2f} ms | {new_e2e:.2f} ms | **{diff_ms:+.2f} ms ({diff_pct:+.1f}%)** | {status} |"
-        )
-        print(
-            f"| **Throughput** | {1000/base_e2e if base_e2e else 0:.2f} req/s | {1000/new_e2e if new_e2e else 0:.2f} req/s | - | - |"
-        )
-        print("\n")
+    def _record_metrics(self, execution_time: float):
+        if self.batch is None:
+            return
 
-        # Detailed Breakdown
-        print("#### 2. Stage Breakdown (Top Changes)")
-        if not stage_rows:
-            print("*No significant stage differences found.*")
-        else:
-            print("| Stage Name | Baseline (ms) | New (ms) | Diff (ms) | Diff (%) |")
-            print("| :--- | :--- | :--- | :--- | :--- |")
-            for name, b, n, d, p in stage_rows:
-                # Highlight large regressions
-                name_str = f"**{name}**" if p > 5.0 else name
-                print(f"| {name_str} | {b:.2f} | {n:.2f} | {d:+.2f} | {p:+.1f}% |")
-        print("\n")
+        logging_info = getattr(self.batch, "logging_info", None)
+        if logging_info is not None:
+            try:
+                logging_info.add_stage_execution_time(self.stage_name, execution_time)
+            except Exception:
+                self.logger.warning(
+                    "[%s] Failed to record stage timing on batch.logging_info",
+                    self.stage_name,
+                    exc_info=True,
+                )
 
-        # Metadata
-        print("<details>")
-        print("<summary>Metadata</summary>\n")
-        print(f"- Baseline Commit: `{base_data.get('commit_hash', 'N/A')}`")
-        print(f"- New Commit: `{new_data.get('commit_hash', 'N/A')}`")
-        print(f"- Timestamp: {datetime.now().isoformat()}")
-        print("</details>")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Compare two sglang performance JSON files."
-    )
-    parser.add_argument("baseline", help="Path to the baseline JSON file")
-    parser.add_argument("new", help="Path to the new JSON file")
-    args = parser.parse_args()
-
-    compare_benchmarks(args.baseline, args.new)
+        perf_logger = getattr(self.batch, "perf_logger", None)
+        if perf_logger is not None:
+            try:
+                perf_logger.log_stage_metric(self.stage_name, execution_time * 1000)
+            except Exception:
+                self.logger.warning(
+                    "[%s] Failed to log stage metric to performance logger",
+                    self.stage_name,
+                    exc_info=True,
+                )

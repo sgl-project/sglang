@@ -4,7 +4,7 @@
 """
 Base class for all pipeline executors.
 """
-import time
+
 from abc import ABC, abstractmethod
 from typing import List
 
@@ -12,31 +12,23 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.performance_logger import StageProfiler
 
 logger = init_logger(__name__)
 
 
-class Timer:
+class Timer(StageProfiler):
     """
-    A very simple timer that doesn't for cuda-stream to be synced
+    A wrapper around StageProfiler to maintain backward compatibility.
+    It forces simple logging behavior (log start/end) regardless of env vars.
     """
 
     def __init__(self, name="Stage"):
-        self.name = name
-        self.start = None
-        self.end = None
-        self.elapsed = None
-
-    def __enter__(self):
-        self.start = time.perf_counter()
-        logger.info(f"[{self.name}] started...")
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.end = time.perf_counter()
-        self.elapsed = self.end - self.start
-        logger.info(f"[{self.name}] finished in {self.elapsed:.4f} seconds")
-        return False
+        # Enable simple_log to mimic old Timer behavior (logging start/end info)
+        # Pass the module-level logger or specific logger
+        super().__init__(stage_name=name, logger=logger, simple_log=True)
+        # Old Timer exposed these attributes, though StageProfiler doesn't publicize them as much
+        # We can add properties if needed, but usually users just use the context manager.
 
 
 class PipelineExecutor(ABC):
