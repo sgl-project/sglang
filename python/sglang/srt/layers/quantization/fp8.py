@@ -20,7 +20,9 @@ try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
         prepare_fp8_layer_for_marlin,
+        prepare_moe_fp8_layer_for_marlin,
     )
+    from vllm.scalar_type import scalar_types
 
     MARLIN_FP8_AVAILABLE = True
 except ImportError:
@@ -31,7 +33,9 @@ except ImportError:
             "marlin FP8 requires some operators from vllm. Please install vllm."
         )
 
-    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
+    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = (
+        prepare_moe_fp8_layer_for_marlin
+    ) = scalar_types = dummy_func
 
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
@@ -533,6 +537,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        self.use_marlin = False
+        if _is_cuda and MARLIN_FP8_AVAILABLE:
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            auto_enable = can_auto_enable_marlin_fp8()
+            self.use_marlin = force_marlin or auto_enable
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -551,10 +560,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        layer.intermediate_size_per_partition = intermediate_size_per_partition
+        layer.hidden_size = hidden_size
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
+            assert self.quant_config.weight_block_size is not None
+            layer.weight_block_size = self.quant_config.weight_block_size
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
@@ -770,10 +787,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
-            return
-
         # If checkpoint is fp16 or bfloat16, quantize in place.
-        if not self.quant_config.is_checkpoint_fp8_serialized:
+        elif not self.quant_config.is_checkpoint_fp8_serialized:
             # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
@@ -800,7 +815,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
-            return
 
         # If checkpoint is fp8, we need to handle that the
         # MoE kernels require single activation scale and single weight
@@ -883,7 +897,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
-            return
+
+        if self.use_marlin:
+            prepare_moe_fp8_layer_for_marlin(layer, False)
+            # Activations not quantized for marlin.
+            del layer.w13_input_scale
+            del layer.w2_input_scale
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added
@@ -1034,6 +1053,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
+
+        if self.use_marlin:
+            assert (
+                moe_runner_config.activation == "silu"
+            ), "Only SiLU activation is supported."
+
+            topk_weights, topk_ids, router_logits = dispatch_output.topk_output
+
+            return torch.ops.vllm.fused_marlin_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                None,
+                None,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                quant_type_id=scalar_types.float8_e4m3fn.id,
+                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+                global_num_experts=layer.num_experts,
+            )
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
