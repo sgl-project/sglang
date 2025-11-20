@@ -21,7 +21,10 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.performance_logger import PerformanceLogger
+from sglang.multimodal_gen.runtime.utils.performance_logger import (
+    PerformanceLogger,
+    RequestTimings,
+)
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
@@ -63,6 +66,7 @@ def generate_cmd(args: argparse.Namespace):
 
     # Auto-enable stage logging if dump path is provided
     if args.perf_dump_path:
+        os.environ["SGLANG_DIFFUSION_STAGE_LOGGING"] = "True"
         envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
 
     server_args = ServerArgs.from_cli_args(args)
@@ -77,7 +81,7 @@ def generate_cmd(args: argparse.Namespace):
         prompt=sampling_params.prompt, sampling_params=sampling_params
     )
     total_duration = time.monotonic() - start_time
-
+    print(f"{results=}")
     # Handle performance dumping
     if args.perf_dump_path and results:
         # Assuming results is a list of dicts or a single dict
@@ -86,19 +90,22 @@ def generate_cmd(args: argparse.Namespace):
         else:
             result = results
 
-        logging_info = result.get("logging_info", {})
+        timings_dict = result.get("timings")
+        if args.perf_dump_path and timings_dict:
+            # Reconstruct RequestTimings from dict for dumping
+            timings = RequestTimings(request_id=timings_dict.get("request_id"))
+            timings.stages = timings_dict.get("stages", {})
+            timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
 
-        PerformanceLogger.dump_benchmark_report(
-            file_path=args.perf_dump_path,
-            request_id=sampling_params.request_id,
-            total_duration_ms=result.get("generation_time", total_duration) * 1000,
-            logging_info=logging_info,
-            meta={
-                "prompt": sampling_params.prompt,
-                "model": server_args.model_path,
-            },
-            tag="cli_generate",
-        )
+            PerformanceLogger.dump_benchmark_report(
+                file_path=args.perf_dump_path,
+                timings=timings,
+                meta={
+                    "prompt": sampling_params.prompt,
+                    "model": server_args.model_path,
+                },
+                tag="cli_generate",
+            )
 
 
 class GenerateSubcommand(CLISubcommand):

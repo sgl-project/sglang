@@ -18,6 +18,28 @@ import sglang
 import sglang.multimodal_gen.envs as envs
 
 perf_logger: logging.Logger | None = None
+_perf_logger_initialized = False
+
+
+class RequestTimings:
+    """A lightweight data class to store performance timings for a single request."""
+
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        self.stages: Dict[str, float] = {}
+        self.total_duration_ms: float = 0.0
+
+    def record_stage(self, stage_name: str, duration_s: float):
+        """Records the duration of a pipeline stage."""
+        self.stages[stage_name] = duration_s * 1000  # Store as milliseconds
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes the timing data to a dictionary."""
+        return {
+            "request_id": self.request_id,
+            "stages": self.stages,
+            "total_duration_ms": self.total_duration_ms,
+        }
 
 
 def get_diffusion_perf_log_dir() -> str:
@@ -86,23 +108,15 @@ def get_git_commit_hash() -> str:
 
 class PerformanceLogger:
     """
-    A utility class for logging performance metrics.
+    A utility class for logging performance metrics for all request, categorized by request-id.
     Serves both as a runtime logger (stream to file) and a dump utility.
     """
-
-    def __init__(self, request_id: str):
-        self.request_id = request_id
-        self.start_time = time.monotonic()
-        self.step_timings = []
-        self.commit_hash = get_git_commit_hash()
 
     @classmethod
     def dump_benchmark_report(
         cls,
         file_path: str,
-        request_id: str,
-        total_duration_ms: float,
-        logging_info: Optional[Dict[str, Any]] = None,
+        timings: "RequestTimings",
         meta: Optional[Dict[str, Any]] = None,
         tag: str = "benchmark_dump",
     ):
@@ -110,31 +124,17 @@ class PerformanceLogger:
         Static method to dump a standardized benchmark report to a file.
         Eliminates duplicate logic in CLI/Client code.
         """
-        # Convert logging_info stages to steps format
-        formatted_steps = []
-        if logging_info:
-            stages = {}
-            if hasattr(logging_info, "stages"):
-                stages = logging_info.stages
-            elif isinstance(logging_info, dict):
-                stages = logging_info.get("stages", {})
-
-            if isinstance(stages, dict):
-                for name, info in stages.items():
-                    if not info:
-                        continue
-                    exec_time = info.get("execution_time")
-                    if exec_time is not None:
-                        formatted_steps.append(
-                            {"name": name, "duration_ms": exec_time * 1000}
-                        )
+        formatted_steps = [
+            {"name": name, "duration_ms": duration_ms}
+            for name, duration_ms in timings.stages.items()
+        ]
 
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
-            "request_id": request_id,
+            "request_id": timings.request_id,
             "commit_hash": get_git_commit_hash(),
             "tag": tag,
-            "total_duration_ms": total_duration_ms,
+            "total_duration_ms": timings.total_duration_ms,
             "steps": formatted_steps,
             "meta": meta or {},
         }
@@ -151,36 +151,60 @@ class PerformanceLogger:
             logging.getLogger(__name__).error(f"Dump failed: {e}")
 
     @classmethod
-    def log_stage_metric(cls, request_id: str, stage_name: str, duration_ms: float):
-        """Logs a single pipeline stage timing entry to the global log file."""
+    def log_request_summary(
+        cls,
+        timings: "RequestTimings",
+        tag: str = "total_inference_time",
+    ):
+        """Logs the stage metrics and total duration for a completed request."""
         _initialize_perf_logger()
-        log_entry = {
+
+        # 1. Log all stage metrics from timings
+        formatted_stages = [
+            {"name": name, "execution_time_ms": duration_ms}
+            for name, duration_ms in timings.stages.items()
+        ]
+
+        if formatted_stages:
+            stages_log_entry = {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "request_id": timings.request_id,
+                "commit_hash": get_git_commit_hash(),
+                "tag": "pipeline_stage_metrics",
+                "stages": formatted_stages,
+            }
+            if perf_logger is not None:
+                perf_logger.info(json.dumps(stages_log_entry))
+
+        # 2. Log total duration
+        total_duration_log_entry = {
             "timestamp": datetime.now(UTC).isoformat(),
-            "request_id": request_id,
+            "request_id": timings.request_id,
             "commit_hash": get_git_commit_hash(),
-            "tag": "pipeline_stage_metric",
-            "stage": stage_name,
-            "duration_ms": duration_ms,
+            "tag": tag,
+            "total_duration_ms": timings.total_duration_ms,
         }
-        perf_logger.info(json.dumps(log_entry))
+        if perf_logger is not None:
+            perf_logger.info(json.dumps(total_duration_log_entry))
 
 
 class StageProfiler:
     """
     A unified context manager for profiling and logging pipeline stage execution.
+    It records timing information (usually of a single Stage or a step) into a provided RequestTimings object.
     """
 
     def __init__(
         self,
         stage_name: str,
-        batch: Any = None,
-        logger: logging.Logger = None,
+        timings: Optional["RequestTimings"],
         simple_log: bool = False,
     ):
         self.stage_name = stage_name
-        self.batch = batch
+        self.timings = timings
         self.simple_log = simple_log
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger = logging.getLogger(__name__)
+        self.start_time = 0.0
 
         # Check env var at runtime to ensure we pick up changes (e.g. from CLI args)
         self.metrics_enabled = envs.SGLANG_DIFFUSION_STAGE_LOGGING
@@ -189,22 +213,22 @@ class StageProfiler:
         if self.simple_log:
             self.logger.info(f"[{self.stage_name}] started...")
 
-        if self.metrics_enabled or self.simple_log:
+        if (self.metrics_enabled and self.timings) or self.simple_log:
             self.start_time = time.perf_counter()
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not (self.metrics_enabled or self.simple_log):
+        if not ((self.metrics_enabled and self.timings) or self.simple_log):
             return False
 
-        execution_time = time.perf_counter() - self.start_time
+        execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
             self.logger.error(
                 "[%s] Error during execution after %.4f ms: %s",
                 self.stage_name,
-                execution_time * 1000,
+                execution_time_s * 1000,
                 exc_val,
             )
             if self.metrics_enabled:
@@ -217,41 +241,10 @@ class StageProfiler:
 
         if self.simple_log:
             self.logger.info(
-                f"[{self.stage_name}] finished in {execution_time:.4f} seconds"
+                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds"
             )
 
-        if self.metrics_enabled:
-            self._record_metrics(execution_time)
+        if self.metrics_enabled and self.timings:
+            self.timings.record_stage(self.stage_name, execution_time_s)
 
         return False
-
-    def _record_metrics(self, execution_time: float):
-        if self.batch is None:
-            return
-
-        # 1. Update internal logging info (used for Dump)
-        logging_info = getattr(self.batch, "logging_info", None)
-        if logging_info is not None:
-            try:
-                logging_info.add_stage_execution_time(self.stage_name, execution_time)
-            except Exception:
-                self.logger.warning(
-                    "[%s] Failed to record stage timing on batch.logging_info",
-                    self.stage_name,
-                    exc_info=True,
-                )
-
-        # 2. Update global perf logger (used for streaming logs)
-        request_id = getattr(self.batch, "request_id", "unknown")
-        try:
-            PerformanceLogger.log_stage_metric(
-                request_id=request_id,
-                stage_name=self.stage_name,
-                duration_ms=execution_time * 1000,
-            )
-        except Exception:
-            self.logger.warning(
-                "[%s] Failed to log stage metric to performance logger",
-                self.stage_name,
-                exc_info=True,
-            )

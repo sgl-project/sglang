@@ -809,7 +809,7 @@ class DenoisingStage(PipelineStage):
                     if hasattr(self, "interrupt") and self.interrupt:
                         continue
 
-                    with StageProfiler(f"denoising_step_{i}", batch):
+                    with StageProfiler(f"denoising_step_{i}", batch.timings):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
                         current_model, current_guidance_scale = (
