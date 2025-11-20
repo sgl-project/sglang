@@ -92,6 +92,10 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.mm_utils import (
+    external_mm_preprocess_routine,
+    should_use_external_mm_preprocess,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -2139,6 +2143,13 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+
+        if self.is_multimodal and should_use_external_mm_preprocess(self.model):
+            forward_batch = external_mm_preprocess_routine(
+                forward_batch=forward_batch,
+                multimodal_model=self.model,
+            )
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
