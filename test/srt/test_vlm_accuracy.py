@@ -2,14 +2,11 @@
 """
 
 import unittest
-from io import BytesIO
 from typing import List, Optional
 
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -24,6 +21,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.server_args import ServerArgs
+from sglang.test.test_utils import download_image_with_retry
 
 
 # Test the logits output between HF and SGLang
@@ -35,8 +33,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         cls.model_path = ""
         cls.chat_template = ""
         cls.processor = ""
-        response = requests.get(cls.image_url)
-        cls.main_image = Image.open(BytesIO(response.content))
+        cls.main_image = download_image_with_retry(cls.image_url)
 
     def compare_outputs(self, sglang_output: torch.Tensor, hf_output: torch.Tensor):
         # Convert to float32 for numerical stability if needed
