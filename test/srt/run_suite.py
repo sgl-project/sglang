@@ -229,6 +229,10 @@ suites = {
         TestFile("test_deepseek_v32_nsabackend.py", 600),
     ],
     "nightly-8-gpu-h20": [],
+    "__not_in_ci__": [
+        TestFile("test_bench_one_batch.py"),
+        TestFile("test_bench_serving.py"),
+    ],
 }
 
 # Add AMD tests
