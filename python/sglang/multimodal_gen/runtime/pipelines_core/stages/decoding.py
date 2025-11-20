@@ -218,7 +218,6 @@ class DecodingStage(PipelineStage):
             trajectory_decoded=trajectory_decoded,
             timings=batch.timings,
         )
-        print(f"{batch.timings=}")
 
         # Offload models if needed
         if hasattr(self, "maybe_free_model_hooks"):

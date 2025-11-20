@@ -6,7 +6,6 @@
 import argparse
 import dataclasses
 import os
-import time
 from typing import cast
 
 import sglang.multimodal_gen.envs as envs
@@ -59,6 +58,35 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     return parser
 
 
+def maybe_dump_performance(args: argparse.Namespace, server_args, sampling_params, results):
+    """dump performance if necessary"""
+    if not (args.perf_dump_path and results):
+        return
+
+    if isinstance(results, list):
+        result = results[0] if results else {}
+    else:
+        result = results
+
+    timings_dict = result.get("timings")
+    if not (args.perf_dump_path and timings_dict):
+        return
+
+    timings = RequestTimings(request_id=timings_dict.get("request_id"))
+    timings.stages = timings_dict.get("stages", {})
+    timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
+
+    PerformanceLogger.dump_benchmark_report(
+        file_path=args.perf_dump_path,
+        timings=timings,
+        meta={
+            "prompt": sampling_params.prompt,
+            "model": server_args.model_path,
+        },
+        tag="cli_generate",
+    )
+
+
 def generate_cmd(args: argparse.Namespace):
     """The entry point for the generate command."""
     # FIXME(mick): do not hard code
@@ -76,36 +104,11 @@ def generate_cmd(args: argparse.Namespace):
         model_path=server_args.model_path, server_args=server_args
     )
 
-    start_time = time.monotonic()
     results = generator.generate(
         prompt=sampling_params.prompt, sampling_params=sampling_params
     )
-    total_duration = time.monotonic() - start_time
-    print(f"{results=}")
-    # Handle performance dumping
-    if args.perf_dump_path and results:
-        # Assuming results is a list of dicts or a single dict
-        if isinstance(results, list):
-            result = results[0] if results else {}
-        else:
-            result = results
 
-        timings_dict = result.get("timings")
-        if args.perf_dump_path and timings_dict:
-            # Reconstruct RequestTimings from dict for dumping
-            timings = RequestTimings(request_id=timings_dict.get("request_id"))
-            timings.stages = timings_dict.get("stages", {})
-            timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
-
-            PerformanceLogger.dump_benchmark_report(
-                file_path=args.perf_dump_path,
-                timings=timings,
-                meta={
-                    "prompt": sampling_params.prompt,
-                    "model": server_args.model_path,
-                },
-                tag="cli_generate",
-            )
+    maybe_dump_performance(args, server_args, sampling_params, results)
 
 
 class GenerateSubcommand(CLISubcommand):
