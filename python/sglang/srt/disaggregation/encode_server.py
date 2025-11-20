@@ -139,8 +139,8 @@ class ImageEncoder:
 
     async def mm_send(
         self,
-        prefill_host,
-        prefill_url,
+        prefill_host: int,
+        embedding_port: int,
         embedding: torch.Tensor,
         mm_data: EmbeddingData,
         session_id=None,
@@ -157,17 +157,16 @@ class ImageEncoder:
             mm_data.embedding_list[mm_data.part_idx] = None
 
         # Send ack/data
-        if prefill_url in self.send_to_prefill_sockets:
-            socket = self.send_to_prefill_sockets[prefill_url]
+        if embedding_port in self.send_to_prefill_sockets:
+            socket = self.send_to_prefill_sockets[embedding_port]
         else:
-            embedding_port = await self.get_embedding_port(prefill_url)
             socket = get_zmq_socket(
                 self.context,
                 zmq.PUSH,
                 f"tcp://{prefill_host}:{embedding_port}",
                 False,
             )
-            self.send_to_prefill_sockets[prefill_url] = socket
+            self.send_to_prefill_sockets[embedding_port] = socket
         socket.send_pyobj(mm_data)
 
     @torch.inference_mode()
@@ -184,12 +183,12 @@ class ImageEncoder:
         return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
     async def send(
-        self, req_id, prefill_host, prefill_url, session_id=None, buffer_address=None
+        self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
     ):
         mm_data: EmbeddingData = self.embedding_to_send[req_id]
         await self.mm_send(
             prefill_host,
-            prefill_url,
+            embedding_port,
             mm_data.embedding,
             mm_data,
             session_id,
@@ -240,8 +239,8 @@ async def handle_encode_request(request: dict):
     elif encoder.server_args.mm_transfer_backend == "zmq":
         await encoder.send(
             req_id=request["req_id"],
-            prefill_host=request["bootstrap_host"],
-            prefill_url=request["prefill_url"],
+            prefill_host=request["prefill_host"],
+            embedding_port=request["embedding_port"],
         )
         return ORJSONResponse(content=None)
 
@@ -251,8 +250,8 @@ async def handle_send_request(request: dict):
     # mooncake backend
     await encoder.send(
         req_id=request["req_id"],
-        prefill_host=request["bootstrap_host"],
-        prefill_url=request["prefill_url"],
+        prefill_host=request["prefill_host"],
+        embedding_port=request["embedding_port"],
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
