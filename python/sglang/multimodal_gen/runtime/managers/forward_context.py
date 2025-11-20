@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadata
-    from sglang.multimodal_gen.runtime.pipelines import Req
+    from sglang.multimodal_gen.runtime.pipelines_core import Req
 
 logger = init_logger(__name__)
 
