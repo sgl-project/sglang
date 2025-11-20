@@ -32,11 +32,14 @@ from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
+import logging
+
 from sglang.srt.distributed.parallel_state import (
-    get_dcp_world_size, get_dcp_rank, get_tensor_model_parallel_rank
+    get_dcp_rank,
+    get_dcp_world_size,
+    get_tensor_model_parallel_rank,
 )
 
-import logging
 logger = logging.getLogger(__name__)
 
 
@@ -152,7 +155,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc(self, need_size: int, token_positions: Optional[torch.Tensor] = None):
         """
         Allocate token slots.
-        
+
         Args:
             need_size: Number of tokens to allocate
             token_positions: Optional tensor of shape (need_size,) containing
@@ -192,7 +195,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_indices.numel() > 0:
             select_index[token_rank_mask] = alloc_indices
 
-        #logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, select_index={select_index}, token_rank_mask={token_rank_mask}")
+        # logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, select_index={select_index}, token_rank_mask={token_rank_mask}")
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -515,7 +518,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         """
         Allocate token slots for extend phase.
-        
+
         Args:
             token_positions: Optional tensor of shape (extend_num_tokens,) containing
                 the position of each token in its sequence (0-indexed). Used for
@@ -552,7 +555,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        
+
         # Allocate indices for all tokens first (needed for kernel)
         alloc_extend_kernel[(bs,)](
             prefix_lens,
@@ -604,7 +607,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
             if self.need_sort:
                 self.free_pages, _ = torch.sort(self.free_pages)
-            #logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, out_indices={out_indices}, token_rank_mask={token_rank_mask}")
+            # logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, out_indices={out_indices}, token_rank_mask={token_rank_mask}")
 
         else:
             if num_new_pages > len(self.free_pages):
@@ -693,7 +696,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
             if self.need_sort:
                 self.free_pages, _ = torch.sort(self.free_pages)
-            #logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, out_indices={out_indices}, token_rank_mask={token_rank_mask}")
+            # logger.info(f"tp_rank={get_tensor_model_parallel_rank()}, out_indices={out_indices}, token_rank_mask={token_rank_mask}")
         else:
             if num_new_pages > len(self.free_pages):
                 return None

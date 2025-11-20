@@ -2239,8 +2239,6 @@ class Scheduler(
 
         self.maybe_send_health_check_signal()
 
-
-
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:
             # Return some signal for the health check.

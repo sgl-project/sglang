@@ -37,15 +37,15 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
+    get_dcp_group,
+    get_dcp_rank,
+    get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     parallel_state,
-    tensor_model_parallel_all_reduce,
-    get_dcp_group,
-    get_dcp_world_size,
-    get_dcp_rank,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -60,6 +60,7 @@ from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
+from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -140,7 +141,6 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
-from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -206,7 +206,6 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "ascend",
 ]
-
 
 
 def add_forward_absorb_core_attention_backend(backend_name):
@@ -1482,6 +1481,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         q_lora = None
         if self.q_lora_rank is not None:
             if (
@@ -1639,7 +1639,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     "cos_sin_cache": self.rotary_emb.cos_sin_cache,
                     "is_neox": self.rotary_emb.is_neox_style,
                 }
-            #TODO(augusto.yjh) 返回lse, correct attn_output
+            # TODO(augusto.yjh) 返回lse, correct attn_output
             attn_output, lse = self.attn_mqa(
                 q_nope_out,
                 k_nope,
@@ -1678,11 +1678,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         # TODO(augusto.yjh) all gather lse，订正attn_output
         # TODO(augusto.yjh) 执行reduce scatter, 先reduce拿到正确的 attn_output, 再按local_num_heads scatter attn_output
         if get_dcp_world_size() > 1:
-            attn_output = attn_output.view(-1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank)
+            attn_output = attn_output.view(
+                -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
+            )
             attn_output = attn_output.contiguous()
             attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-
 
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
