@@ -296,7 +296,6 @@
             "expected_avg_denoise_ms": 1386.08,
             "expected_median_denoise_ms": 1374.03
         },
-
         "wan2_2_i2v_a14b": {
             "stages_ms": {
                 "InputValidationStage": 33.55,

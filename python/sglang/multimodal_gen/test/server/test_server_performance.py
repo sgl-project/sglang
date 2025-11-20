@@ -406,7 +406,7 @@ Consider updating perf_baselines.json with the snippets below:
         summary = validator.collect_metrics(perf_record, stage_metrics)
 
         if is_baseline_generation_mode or missing_scenario:
-            self._dump_baseline_scenario(case, summary)
+            self._dump_baseline_for_testcase(case, summary)
             if missing_scenario:
                 pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
             return
@@ -417,7 +417,7 @@ Consider updating perf_baselines.json with the snippets below:
             validator.validate(perf_record, stage_metrics, case.num_frames)
         except AssertionError as e:
             logger.error(f"Performance validation failed for {case.id}:\n{e}")
-            self._dump_baseline_scenario(case, summary)
+            self._dump_baseline_for_testcase(case, summary)
             raise
 
         if case.modality == "video" and summary.frames_per_second:
@@ -505,9 +505,13 @@ Consider updating perf_baselines.json with the snippets below:
         threshold = BASELINE_CONFIG.improvement_threshold
 
         def is_sig_faster(actual, expected):
-            if expected == 0:
+            if expected == 0 or expected is None:
                 return False
             return actual < expected * (1 - threshold)
+
+        def safe_get_metric(metric_dict, key):
+            val = metric_dict.get(key)
+            return val if val is not None else float("inf")
 
         # Check for any significant improvement
         if (
@@ -522,15 +526,15 @@ Consider updating perf_baselines.json with the snippets below:
         # Combine metrics, always taking the better (lower) value
         new_stages = {
             stage: min(
-                summary.stage_metrics.get(stage, float("inf")),
-                scenario.stages_ms.get(stage, float("inf")),
+                safe_get_metric(summary.stage_metrics, stage),
+                safe_get_metric(scenario.stages_ms, stage),
             )
             for stage in set(summary.stage_metrics) | set(scenario.stages_ms)
         }
         new_denoise_steps = {
             step: min(
-                summary.all_denoise_steps.get(step, float("inf")),
-                scenario.denoise_step_ms.get(step, float("inf")),
+                safe_get_metric(summary.all_denoise_steps, step),
+                safe_get_metric(scenario.denoise_step_ms, step),
             )
             for step in set(summary.all_denoise_steps) | set(scenario.denoise_step_ms)
         }
@@ -568,7 +572,7 @@ Consider updating perf_baselines.json with the snippets below:
             }
             self._improved_baselines.append({"id": case.id, "baseline": new_baseline})
 
-    def _dump_baseline_scenario(
+    def _dump_baseline_for_testcase(
         self, case: DiffusionTestCase, summary: "PerformanceSummary"
     ) -> None:
         """Dump performance metrics as a JSON scenario for baselines."""
