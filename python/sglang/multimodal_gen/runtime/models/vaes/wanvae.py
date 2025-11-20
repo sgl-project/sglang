@@ -26,11 +26,14 @@ from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
     ParallelTiledVAE,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 
 CACHE_T = 2
 
@@ -516,6 +519,16 @@ class WanAttentionBlock(nn.Module):
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
 
+        self.attn = USPAttention(
+            num_heads=1,
+            head_size=dim,
+            causal=False,
+            supported_attention_backends=(
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            ),
+        )
+
     def forward(self, x):
         identity = x
         batch_size, channels, time, height, width = x.size()
@@ -530,7 +543,8 @@ class WanAttentionBlock(nn.Module):
         q, k, v = qkv.chunk(3, dim=-1)
 
         # apply attention
-        x = F.scaled_dot_product_attention(q, k, v)
+        # x = F.scaled_dot_product_attention(q, k, v)
+        x, _ = self.attn(q, k, v)
 
         x = (
             x.squeeze(1)
@@ -752,7 +766,11 @@ class WanEncoder3d(nn.Module):
             x = layer(x)
 
         ## middle
-        x = self.mid_block(x)
+        with set_forward_context(
+            current_timestep=0,
+            attn_metadata=None,
+        ):
+            x = self.mid_block(x)
 
         ## head
         x = self.norm_out(x)
@@ -1054,7 +1072,11 @@ class WanDecoder3d(nn.Module):
             x = self.conv_in(x)
 
         ## middle
-        x = self.mid_block(x)
+        with set_forward_context(
+            current_timestep=0,
+            attn_metadata=None,
+        ):
+            x = self.mid_block(x)
 
         ## upsamples
         for up_block in self.up_blocks:
