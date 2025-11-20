@@ -1171,30 +1171,30 @@ class NativeSparseAttnBackend(AttentionBackend):
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
-        
+
         # Determine required padding based on GPU architecture
         device_capability = torch.cuda.get_device_capability()
         is_blackwell = device_capability[0] >= 10
         required_padding = 128 if is_blackwell else 64
-        
+
         need_padding = num_heads % required_padding != 0
-        
+
         if need_padding:
             assert required_padding % num_heads == 0, (
                 f"num_heads {num_heads} cannot be padded to {required_padding}. "
                 f"TP size may be too large for this model."
             )
-            
+
             # Pad q to required size
             q_padded = q_all.new_empty((num_tokens, required_padding, head_dim))
             q_padded[:, :num_heads, :] = q_all
             q_input = q_padded
         else:
             q_input = q_all
-        
+
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
-        
+
         o, _, _ = flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
@@ -1202,11 +1202,11 @@ class NativeSparseAttnBackend(AttentionBackend):
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
-        
+
         # Trim output back to original num_heads if we padded
         if need_padding:
             o = o[:, :num_heads, :]
-        
+
         return o
 
     def _forward_flashmla_kv(
