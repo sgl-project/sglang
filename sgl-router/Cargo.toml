@@ -4,9 +4,7 @@ version = "0.2.2"
 edition = "2021"
 
 [features]
-default = ["grpc-client"]
-grpc-client = []
-grpc-server = []
+default = []
 vendored-openssl = ["openssl/vendored"]
 
 [lints.rust]
