@@ -297,20 +297,10 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+      - name: Setup CUDA Unit Test Environment
+        uses: ./.github/actions/setup-cuda-ut
         with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+          download_kernel_artifacts: ${{ needs.check-changes.outputs.sgl_kernel }}
 
       - name: Run test
         timeout-minutes: 10
@@ -331,20 +321,11 @@ jobs:
     if: (always() && !failure() && !cancelled()) && needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+      - name: Setup CUDA Unit Test Environment
+        uses: ./.github/actions/setup-cuda-ut
         with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+          download_kernel_artifacts: ${{ needs.check-changes.outputs.sgl_kernel }}
+          extra_install_args: "diffusion"
 
       - name: Run diffusion server tests
         timeout-minutes: 60
@@ -365,20 +346,10 @@ jobs:
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
+      - name: Setup CUDA Unit Test Environment
+        uses: ./.github/actions/setup-cuda-ut
         with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+          download_kernel_artifacts: ${{ needs.check-changes.outputs.sgl_kernel }}
 
       - name: Run test
         timeout-minutes: 30
