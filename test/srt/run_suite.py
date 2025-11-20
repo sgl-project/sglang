@@ -65,6 +65,7 @@ suites = {
         TestFile("test_eagle_infer_beta.py", 90),
         TestFile("test_constrained_decoding.py", 150),
         TestFile("test_eval_fp8_accuracy.py", 303),
+        TestFile("test_external_models.py", 155),
         TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
         TestFile("test_fp8_utils.py", 5),

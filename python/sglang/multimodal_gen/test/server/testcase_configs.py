@@ -1,5 +1,19 @@
 """
 Configuration and data structures for diffusion performance tests.
+
+Usage:
+
+pytest python/sglang/multimodal_gen/test/server/test_server_performance.py
+# for a single testcase, look for the name of the testcases in DIFFUSION_CASES
+pytest python/sglang/multimodal_gen/test/server/test_server_performance.py -k qwen_image_t2i
+
+
+To add a new testcase:
+1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_performance.py -k my_new_test_case_id`
+3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
+
+
 """
 
 from __future__ import annotations
@@ -78,34 +92,36 @@ class BaselineConfig:
 
 
 @dataclass(frozen=True)
-class DiffusionCase:
+class DiffusionTestCase:
     """Configuration for a single model/scenario test case."""
 
-    id: str  # pytest test id
+    id: str  # pytest test id and scenario name
     model_path: str  # HF repo or local path
-    scenario_name: str  # key into BASELINE_CONFIG.scenarios
     modality: str = "image"  # "image" or "video" or "3d"
-    prompt: str | None = None  # text prompt for generation
     output_size: str = "1024x1024"  # output image dimensions (or video resolution)
+
+    # inputs and conditioning
+    prompt: str | None = None  # text prompt for generation
+    edit_prompt: str | None = None  # prompt for editing
+    image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+
+    # duration
+    seconds: int = 4  # for video: duration in seconds
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
+
     warmup_text: int = 1  # number of text-to-image/video warmups
     warmup_edit: int = 0  # number of image/video-edit warmups
-    image_edit_prompt: str | None = None  # prompt for editing
-    image_edit_path: Path | str | None = (
-        None  # input image/video for editing (Path or URL)
-    )
     startup_grace_seconds: float = 0.0  # wait time after server starts
     custom_validator: str | None = None  # optional custom validator name
-    seconds: int = 4  # for video: duration in seconds
 
     def is_image_url(self) -> bool:
         """Check if image_edit_path is a URL."""
-        if self.image_edit_path is None:
+        if self.image_path is None:
             return False
-        return isinstance(self.image_edit_path, str) and (
-            self.image_edit_path.startswith("http://")
-            or self.image_edit_path.startswith("https://")
+        return isinstance(self.image_path, str) and (
+            self.image_path.startswith("http://")
+            or self.image_path.startswith("https://")
         )
 
 
@@ -128,12 +144,11 @@ IMAGE_INPUT_FILE = Path(__file__).resolve().parents[1] / "test_files" / "girl.jp
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
-DIFFUSION_CASES: list[DiffusionCase] = [
+DIFFUSION_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
-    DiffusionCase(
+    DiffusionTestCase(
         id="qwen_image_t2i",
         model_path="Qwen/Qwen-Image",
-        scenario_name="text_to_image",
         modality="image",
         prompt="A futuristic cityscape at sunset with flying cars",
         output_size="1024x1024",
@@ -141,10 +156,9 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         warmup_edit=0,
         startup_grace_seconds=30.0,
     ),
-    DiffusionCase(
+    DiffusionTestCase(
         id="flux_image_t2i",
         model_path="black-forest-labs/FLUX.1-dev",
-        scenario_name="text_to_image",
         modality="image",
         prompt="A futuristic cityscape at sunset with flying cars",
         output_size="1024x1024",
@@ -153,24 +167,23 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         startup_grace_seconds=30.0,
     ),
     # === Text and Image to Image (TI2I) ===
-    DiffusionCase(
+    DiffusionTestCase(
         id="qwen_image_edit_ti2i",
         model_path="Qwen/Qwen-Image-Edit",
-        scenario_name="image_edit",
         modality="image",
         prompt=None,  # not used for editing
         output_size="1024x1536",
         warmup_text=0,
         warmup_edit=1,
-        image_edit_prompt="Convert 2D style to 3D style",
-        image_edit_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        edit_prompt="Convert 2D style to 3D style",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         startup_grace_seconds=30.0,
     ),
     # === Text to Video (T2V) ===
-    DiffusionCase(
+    # TODO: FastWan2.1, FastWan2.2
+    DiffusionTestCase(
         id="fastwan2_1_t2v",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-        scenario_name="text_to_video",
         modality="video",
         prompt="A curious raccoon",
         output_size="848x480",
@@ -181,39 +194,64 @@ DIFFUSION_CASES: list[DiffusionCase] = [
         custom_validator="video",
     ),
     # === Image to Video (I2V) ===
-    DiffusionCase(
-        id="wan2_2_i2v",
+    DiffusionTestCase(
+        id="wan2_2_i2v_a14b",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        scenario_name="image_to_video",
         modality="video",
         prompt="generate",  # passing in something since failing if no prompt is passed
         warmup_text=0,  # warmups only for image gen models
         warmup_edit=0,
         output_size="832x1104",
-        image_edit_prompt="generate",
-        image_edit_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
+        edit_prompt="generate",
+        image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
         startup_grace_seconds=30.0,
         custom_validator="video",
         seconds=1,
     ),
     # === Text and Image to Video (TI2V) ===
-    DiffusionCase(
-        id="wan2_2_ti2v_5b",
-        model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        scenario_name="text_image_to_video",
+    DiffusionTestCase(
+        id="wan2_1_i2v_14b_480P",
+        model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        output_size="832x1104",
         modality="video",
         prompt="Animate this image",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        warmup_text=0,  # warmups only for image gen models
+        warmup_edit=0,
+        startup_grace_seconds=30.0,
+        custom_validator="video",
+        seconds=1,
+    ),
+    DiffusionTestCase(
+        id="wan2_2_i2v_14b_720P",
+        model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        modality="video",
+        prompt="Animate this image",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         output_size="832x1104",
         warmup_text=0,  # warmups only for image gen models
         warmup_edit=0,
-        image_edit_prompt="Add dynamic motion to the scene",
-        image_edit_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         startup_grace_seconds=30.0,
         custom_validator="video",
-        seconds=4,
+        seconds=1,
+    ),
+    DiffusionTestCase(
+        id="wan2_2_ti2v_5b",
+        model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        modality="video",
+        output_size="832x1104",
+        prompt="Animate this image",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        warmup_text=0,  # warmups only for image gen models
+        warmup_edit=0,
+        startup_grace_seconds=30.0,
+        custom_validator="video",
+        seconds=1,
     ),
 ]
-
 
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
