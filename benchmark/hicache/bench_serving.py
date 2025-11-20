@@ -331,6 +331,7 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
+
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
