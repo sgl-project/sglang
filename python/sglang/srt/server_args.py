@@ -500,6 +500,10 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
+    enable_torch_compile_fusion: bool = False
+    disable_rmsnorm_quant_pass: bool = False
+    disable_fused_activation_pass: bool = False
+    enable_torch_compile_graph_trace_logs: bool = False
     enable_piecewise_cuda_graph: bool = False
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: int = 4096
@@ -3414,6 +3418,26 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
+            "--enable-torch-compile-fusion",
+            action="store_true",
+            help="Enables operator fusion using custom torch compile/inductor passes. Experimental feature.",
+        )
+        parser.add_argument(
+            "--disable-rmsnorm-quant-pass",
+            action="store_true",
+            help="Enables the rmsnorm quant pass for torch compile fusion, to be used with --enable-torch-compile-fusion.",
+        )
+        parser.add_argument(
+            "--disable-fused-activation-pass",
+            action="store_true",
+            help="Enables the fused activation pass for torch compile fusion, to be used with --enable-torch-compile-fusion.",
+        )
+        parser.add_argument(
+            "--enable-torch-compile-graph-trace-logs",
+            action="store_true",
+            help="Enables logging of traced before and after graphs for fusion passes, to be use with log level debug.",
+        )
+        parser.add_argument(
             "--enable-piecewise-cuda-graph",
             action="store_true",
             help="Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature.",
@@ -3557,6 +3581,28 @@ class ServerArgs:
             nargs="+",
             help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
         )
+        parser.add_argument(
+            "--enable-torch-compile-fusion",
+            action="store_true",
+            help="Enables operator fusion using custom torch compile/inductor passes.",
+        )
+        parser.add_argument(
+            "--enable-rmsnorm-quant-pass",
+            action="store_true",
+            help="Enables the rmsnorm quant pass for torch compile fusion, to be used with --enable-torch-compile-fusion.",
+        )
+        parser.add_argument(
+            "--enable-fused-activation-pass",
+            action="store_true",
+            help="Enables the fused activation pass for torch compile fusion, to be used with --enable-torch-compile-fusion.",
+        )
+        parser.add_argument(
+            "--enable-torch-compile-graph-trace-logs",
+            action="store_true",
+            help="Enables logging of traced before and after graphs for fusion passes, to be use with log level debug.",
+        )
+
+        # Debug tensor dumps
         parser.add_argument(
             "--enable-deterministic-inference",
             action="store_true",
