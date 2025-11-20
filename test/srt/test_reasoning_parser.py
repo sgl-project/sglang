@@ -372,6 +372,7 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("kimi")
         self.assertIsInstance(parser.detector, KimiDetector)
+
         parser = ReasoningParser("olmo3")
         self.assertIsInstance(parser.detector, Olmo3Detector)
 

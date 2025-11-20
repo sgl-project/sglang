@@ -142,7 +142,9 @@ def string_overlap(a: str, b: str) -> Tuple[Optional[Indices], Optional[Indices]
     """
 
     def _build_prefix(pattern: str) -> list[int]:
-        """Prefix-function (π) for KMP: longest proper prefix == suffix for each prefix."""
+        """
+        Prefix-function (π) for KMP: longest proper prefix == suffix for each prefix.
+        """
         pi = [0] * len(pattern)
         for i in range(1, len(pattern)):
             j = pi[i - 1]
