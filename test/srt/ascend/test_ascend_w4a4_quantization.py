@@ -84,7 +84,7 @@ class TestAscendW4A4(CustomTestCase):
                 )
                 self.assertGreaterEqual(
                     metrics["output_throughput"],
-                    TEST_MODEL_MATRIX[model]["output_throughput"]
+                    TEST_MODEL_MATRIX[model]["output_throughput"],
                 )
 
     def run_decode(self, max_new_tokens):
