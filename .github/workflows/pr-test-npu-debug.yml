@@ -1,0 +1,291 @@
+name: PR Test For Innersource (DEBUG)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "test/**"
+
+concurrency:
+  group: pr-test-npu-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+   # per-commit-1-ascend-npu-debug:
+   #   if: (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') &&
+   #     github.event.pull_request.draft == false
+   #   runs-on: linux-aarch64-a3-2
+   #   container:
+   #     image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-a3-ubuntu22.04-py3.11
+   #   steps:
+   #     - name: Pre-config git access token
+   #       run: |
+   #         # as we use a proxy but checkout@v4 only set basic auth header for github.com
+   #         # so we set the extraheader manually
+   #         TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
+   #         git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
+
+   #     - name: Checkout code
+   #       uses: actions/checkout@v4
+
+   #     - name: Install dependencies
+   #       run: |
+   #         # speed up by using infra cache services
+   #         CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+   #         sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+   #         pip config set global.index-url http://${CACHING_URL}/pypi/simple
+   #         pip config set global.trusted-host ${CACHING_URL}
+
+   #         bash scripts/ci/npu_ci_install_dependency.sh a3
+   #         # copy required file from our daily cache
+   #         cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+   #         # copy download through proxy
+   #         curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+   #     - name: Print Log Information
+   #       run: |
+   #         bash scripts/ci/log_print.sh
+
+   #     - name: Run test
+   #       timeout-minutes: 60
+   #       env:
+   #         SGLANG_USE_MODELSCOPE: true
+   #         SGLANG_IS_IN_CI: true
+   #         HF_ENDPOINT: https://hf-mirror.com
+   #         TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+   #       run: |
+   #         pip install sentence_transformers accelerate
+   #         cd test/srt
+   #         python3 run_suite.py --suite per-commit-1-ascend-npu-debug --timeout-per-file 3600
+
+  # per-commit-2-ascend-npu-debug:
+  #   if: (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') &&
+  #     github.event.pull_request.draft == false
+  #   runs-on: linux-aarch64-a3-2
+  #   container:
+  #     image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
+  #   steps:
+  #     - name: Pre-config git access token
+  #       run: |
+  #         # as we use a proxy but checkout@v4 only set basic auth header for github.com
+  #         # so we set the extraheader manually
+  #         TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
+  #         git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Install dependencies
+  #       run: |
+  #         # speed up by using infra cache services
+  #         CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+  #         sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+  #         pip config set global.index-url http://${CACHING_URL}/pypi/simple
+  #         pip config set global.trusted-host ${CACHING_URL}
+  #         bash scripts/ci/npu_ci_install_dependency.sh a3
+  #         # copy required file from our daily cache
+  #         cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+  #         # copy download through proxy
+  #         curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+  #     - name: Print Log Information
+  #       run: |
+  #         bash scripts/ci/log_print.sh
+  #     - name: Run test
+  #       timeout-minutes: 60
+  #       env:
+  #         SGLANG_USE_MODELSCOPE: true
+  #         SGLANG_IS_IN_CI: true
+  #         HF_ENDPOINT: https://hf-mirror.com
+  #         TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+  #       run: |
+  #         cd test/srt
+  #         python3 run_suite.py --suite per-commit-2-ascend-npu-debug --timeout-per-file 3600
+
+
+  per-commit-4-ascend-npu-debug:
+    if: (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false
+    runs-on: linux-aarch64-a3-4
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
+    steps:
+      - name: Pre-config git access token
+        run: |
+          # as we use a proxy but checkout@v4 only set basic auth header for github.com
+          # so we set the extraheader manually
+          TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
+          git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host ${CACHING_URL}
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Print Log Information
+        run: |
+          bash scripts/ci/log_print.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+        run: |
+          hf download lmms-lab/MMMU --repo-type dataset
+          pip install sentence_transformers --upgrade-strategy only-if-needed
+          pip install torchaudio==2.8.0
+          pip install protobuf==3.20 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
+          pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 sacrebleu>=1.5.0 pytablewriter peft==0.2.0 black==24.1.0 isort==5.13.2 peft>=0.2.0 accelerate>=0.29.1
+          pip install jsonlines httpx==0.23.3 evaluate>=0.4.0 datasets==2.16.1 numexpr xgrammar==0.1.25 numpy==1.26.4
+          git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+          cd ./lmms-eval
+          nohup pip install . > lmmslog.txt 2>&1 &
+          sleep 120
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          cd ../
+          cd test/srt
+          python3 run_suite.py --suite per-commit-4-ascend-npu-debug --timeout-per-file 7200
+
+  # per-commit-8-ascend-npu-debug:
+  #   if: (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') &&
+  #     github.event.pull_request.draft == false
+  #   runs-on: linux-aarch64-a3-8
+  #   container:
+  #     image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
+  #   steps:
+  #     - name: Pre-config git access token
+  #       run: |
+  #         # as we use a proxy but checkout@v4 only set basic auth header for github.com
+  #         # so we set the extraheader manually
+  #         TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
+  #         git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
+
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Install dependencies
+  #       run: |
+  #         # speed up by using infra cache services
+  #         CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+  #         sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+  #         pip config set global.index-url http://${CACHING_URL}/pypi/simple
+  #         pip config set global.trusted-host ${CACHING_URL}
+
+  #         bash scripts/ci/npu_ci_install_dependency.sh a3
+  #         # copy required file from our daily cache
+  #         cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+  #         # copy download through proxy
+  #         curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+  #     - name: Print Log Information
+  #       run: |
+  #         bash scripts/ci/log_print.sh
+
+  #     - name: Run test
+  #       timeout-minutes: 60
+  #       env:
+  #         SGLANG_USE_MODELSCOPE: true
+  #         SGLANG_IS_IN_CI: true
+  #         HF_ENDPOINT: https://hf-mirror.com
+  #         TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+  #       run: |
+  #         hf download lmms-lab/MMMU --repo-type dataset
+  #         pip install sentence_transformers --upgrade-strategy only-if-needed
+  #         pip install torchaudio==2.8.0
+  #         pip install protobuf==3.20 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
+  #         pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 sacrebleu>=1.5.0 pytablewriter peft==0.2.0 black==24.1.0 isort==5.13.2 peft>=0.2.0 accelerate>=0.29.1
+  #         pip install jsonlines httpx==0.23.3 evaluate>=0.4.0 datasets==2.16.1 numexpr xgrammar==0.1.25 numpy==1.26.4
+  #         git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+  #         cd ./lmms-eval
+  #         nohup pip install . > lmmslog.txt 2>&1 &
+  #         sleep 120
+  #         export PYTHONPATH=$PYTHONPATH:$(pwd)
+  #         cd ../
+  #         cd test/srt
+  #         python3 run_suite.py --suite per-commit-8-ascend-npu-debug --timeout-per-file 3600
+
+  # per-commit-16-ascend-npu-debug:
+  #   if: (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') &&
+  #     github.event.pull_request.draft == false
+  #   runs-on: linux-aarch64-a3-16
+  #   container:
+  #     image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
+  #   steps:
+  #     - name: Pre-config git access token
+  #       run: |
+  #         # as we use a proxy but checkout@v4 only set basic auth header for github.com
+  #         # so we set the extraheader manually
+  #         TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
+  #         git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
+
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Install dependencies
+  #       run: |
+  #         # speed up by using infra cache services
+  #         CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+  #         sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+  #         pip config set global.index-url http://${CACHING_URL}/pypi/simple
+  #         pip config set global.trusted-host ${CACHING_URL}
+
+  #         bash scripts/ci/npu_ci_install_dependency.sh a3
+  #         # copy required file from our daily cache
+  #         cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+  #         # copy download through proxy
+  #         curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+  #     - name: Print Log Information
+  #       run: |
+  #         bash scripts/ci/log_print.sh
+
+  #     - name: Run test
+  #       timeout-minutes: 180
+  #       env:
+  #         SGLANG_USE_MODELSCOPE: true
+  #         SGLANG_IS_IN_CI: true
+  #         HF_ENDPOINT: https://hf-mirror.com
+  #         TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+  #       run: |
+  #         cd test/srt
+  #         python3 run_suite.py --suite per-commit-16-ascend-npu-debug --timeout-per-file 10800
+
+  # pr-test-npu-finish:
+  #   if: always()
+  #   needs:
+  #     - per-commit-1-ascend-npu-debug
+  #     - per-commit-2-ascend-npu-debug
+  #     - per-commit-4-ascend-npu-debug
+  #     - per-commit-8-ascend-npu-debug
+  #     - per-commit-16-ascend-npu-debug
+  #   runs-on: linux-amd64-cpu-1
+  #   container:
+  #     image: docker.m.daocloud.io/ubuntu:22.04
+  #   steps:
+  #     - name: Check all dependent job statuses
+  #       run: |
+  #         #!/bin/sh
+  #         results="${{ join(needs.*.result, ' ') }}"
+  #         set -- $results
+  #         for result in "$@"; do
+  #           if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+  #             echo "Job failed with result: $result"
+  #             exit 1
+  #           fi
+  #         done
+  #         echo "All jobs completed successfully"
+  #         exit 0
