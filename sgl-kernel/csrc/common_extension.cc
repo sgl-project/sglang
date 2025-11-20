@@ -107,15 +107,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
   m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
 
-  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths) -> ()");
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
   m.def(
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
-      "cu_seqlens_q) -> ()");
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
   m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
   m.def(
       "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
-      "topk_indices_offset) -> ()");
+      "topk_indices_offset, Tensor ? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
   /*
@@ -230,6 +230,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "moe_softcapping, Tensor? correction_bias) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
+  m.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
+
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
 
@@ -241,6 +246,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
+
+  m.def(
+      "kimi_k2_moe_fused_gate(Tensor input, Tensor bias, int topk, bool renormalize, "
+      "float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+      "(Tensor[])");
+  m.impl("kimi_k2_moe_fused_gate", torch::kCUDA, &kimi_k2_moe_fused_gate);
 
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "

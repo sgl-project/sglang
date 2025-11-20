@@ -514,7 +514,6 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
-    per_channel_quant = args.per_channel_quant
 
     topk_ids_dir = args.topk_ids_dir
     if args.batch_size is None:
@@ -602,7 +601,7 @@ def main(args: argparse.Namespace):
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
-        per_channel_quant,
+        False,
         block_shape,
     )
     print(
