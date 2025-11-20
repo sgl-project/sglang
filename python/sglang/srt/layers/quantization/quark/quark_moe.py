@@ -22,6 +22,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     set_weight_attrs,
+    get_torch_compile_disable_decorator,
 )
 
 if TYPE_CHECKING:
@@ -52,8 +53,6 @@ OCP_MX_BLOCK_SIZE = 32
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuarkConfig
-
-conditional_decorator = get_torch_compile_disable_decorator(_is_hip)
 
 class QuarkMoEMethod(FusedMoEMethodBase):
 
@@ -207,7 +206,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
     ):
         self.moe_runner_config = moe_runner_config
 
-    @conditional_decorator
+    @get_torch_compile_disable_decorator(_is_hip)
     def apply(
         self,
         layer: torch.nn.Module,

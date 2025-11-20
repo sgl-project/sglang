@@ -80,6 +80,7 @@ import requests
 import torch
 import torch.distributed
 import torch.distributed as dist
+import torch.fx.experimental._config as fx_config
 import triton
 import zmq
 from fastapi.responses import ORJSONResponse
@@ -3787,3 +3788,20 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def get_torch_compile_disable_decorator(is_disable) -> Callable:
+    if is_disable:
+        return torch._dynamo.disable
+    else:
+        return lambda func: func
+
+
+@contextmanager
+def disable_duck_shaping():
+    prev = fx_config.use_duck_shape
+    fx_config.use_duck_shape = False
+    try:
+        yield
+    finally:
+        fx_config.use_duck_shape = prev
