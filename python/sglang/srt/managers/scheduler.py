@@ -867,7 +867,7 @@ class Scheduler(
                 hidden_size=(
                     self.draft_worker.model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
-                    else 0
+                    else 64  # For safety reasons, won't be used
                 ),
                 hidden_states_dtype=(
                     self.draft_worker.model_config.dtype
@@ -920,7 +920,7 @@ class Scheduler(
                 hidden_size=(
                     self.draft_worker.model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
-                    else 0
+                    else 64  # For safety reasons, won't be used
                 ),
                 hidden_states_dtype=(
                     self.draft_worker.model_config.dtype
