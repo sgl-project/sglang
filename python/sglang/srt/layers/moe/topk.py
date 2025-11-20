@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import IntEnum, auto
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -111,42 +111,30 @@ class TopKOutputChecker:
 
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        return topk_output.format.is_standard()
+        return isinstance(topk_output, StandardTopKOutput)
 
     @staticmethod
     def format_is_triton_kernels(
         topk_output: TopKOutput,
     ) -> TypeGuard[TritonKernelTopKOutput]:
-        return topk_output.format.is_triton_kernels()
+        return isinstance(topk_output, TritonKernelTopKOutput)
 
     @staticmethod
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
-        return topk_output.format.is_bypassed()
+        return isinstance(topk_output, BypassedTopKOutput)
 
 
-class TopKOutputFormat(Enum):
+class TopKOutputFormat(IntEnum):
     STANDARD = auto()
     TRITON_KERNEL = auto()
     BYPASSED = auto()
-
-    def is_standard(self) -> bool:
-        return self == TopKOutputFormat.STANDARD
-
-    def is_triton_kernels(self) -> bool:
-        return self == TopKOutputFormat.TRITON_KERNEL
-
-    def is_bypassed(self) -> bool:
-        return self == TopKOutputFormat.BYPASSED
 
 
 @runtime_checkable
 class TopKOutput(Protocol):
     """Protocol for top-k outputs in different formats."""
 
-    @property
-    def format(self) -> TopKOutputFormat:
-        """The format of the output."""
-        ...
+    ...
 
 
 class StandardTopKOutput(NamedTuple):
@@ -156,10 +144,6 @@ class StandardTopKOutput(NamedTuple):
     topk_ids: torch.Tensor
     router_logits: torch.Tensor
 
-    @property
-    def format(self) -> TopKOutputFormat:
-        return TopKOutputFormat.STANDARD
-
 
 class TritonKernelTopKOutput(NamedTuple):
     """Triton kernel top-k output format."""
@@ -167,10 +151,6 @@ class TritonKernelTopKOutput(NamedTuple):
     routing_data: RoutingData
     gather_indx: GatherIndx
     scatter_indx: ScatterIndx
-
-    @property
-    def format(self) -> TopKOutputFormat:
-        return TopKOutputFormat.TRITON_KERNEL
 
 
 class BypassedTopKOutput(NamedTuple):
@@ -181,10 +161,6 @@ class BypassedTopKOutput(NamedTuple):
     topk_config: TopKConfig
     num_token_non_padded: Optional[torch.Tensor] = None
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None
-
-    @property
-    def format(self) -> TopKOutputFormat:
-        return TopKOutputFormat.BYPASSED
 
 
 # -------------------------------- TopK ---------------------------------------

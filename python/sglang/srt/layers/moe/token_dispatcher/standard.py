@@ -103,8 +103,9 @@ class StandardDispatcher(BaseDispatcher):
 
         if self.local_expert_mapping is not None and not _use_aiter:
             if TopKOutputChecker.format_is_standard(topk_output):
-                topk_output = topk_output._replace(
-                    topk_ids=self.local_expert_mapping[topk_output.topk_ids]
+                # Note: "topk_output = topk_output._replace(topk_ids=self.local_expert_mapping[topk_output.topk_ids])" is incompatible with piecewise cuda graph
+                topk_output.topk_ids.copy_(
+                    self.local_expert_mapping[topk_output.topk_ids]
                 )
             elif TopKOutputChecker.format_is_triton_kernels(topk_output):
                 raise NotImplementedError()
