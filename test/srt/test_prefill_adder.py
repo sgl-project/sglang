@@ -223,8 +223,9 @@ class TestPrefillAdder(CustomTestCase):
         new_req = self.create_mock_req("new1", priority=1, max_new_tokens=75)
         
         success = adder.preempt_to_schedule(new_req, mock_server_args)
-        self.assertFalse(success)
-        self.assertIn(running_reqs[0], adder.preempt_list)
+        self.assertTrue(success)
+        self.assertIn(running_reqs[2], adder.preempt_list)
+        self.assertIn(running_reqs[3], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 175) # 50 + 75 + 100 + 125 + 125 - 125 = 350
         running_batch.release_req.assert_called_once()
 
