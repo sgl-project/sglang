@@ -19,7 +19,6 @@ on:
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xpu.yml"
-    types: [synchronize]
   workflow_dispatch:
 
 concurrency:

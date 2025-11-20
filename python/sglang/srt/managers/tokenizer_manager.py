@@ -41,6 +41,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
@@ -210,6 +211,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
+            if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:
+                import_processors(
+                    envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
+                )
             try:
                 _processor = get_processor(
                     server_args.tokenizer_path,

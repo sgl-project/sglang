@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional, Set, Tuple
@@ -44,16 +43,6 @@ class LoRABatchInfo:
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
-
-
-def get_layer_id(name: str) -> int:
-    """
-    Extract integer id of layer from its name in string.
-    """
-    match = re.search(r"layers\.(\d+)\.", name)
-    if match is None:
-        return None
-    return int(match.group(1))
 
 
 def get_hidden_dim(

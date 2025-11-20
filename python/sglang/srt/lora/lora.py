@@ -19,13 +19,13 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 import logging
-import re
 from typing import Dict, List
 
 import torch
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -71,8 +71,6 @@ class LoRAAdapter(nn.Module):
             ]
         )
 
-        self.weights: Dict[str, torch.Tensor] = {}
-
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
@@ -83,12 +81,9 @@ class LoRAAdapter(nn.Module):
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
-            match = re.search(r"layers\.(\d+)\.", name)
-            if match is not None:
-                layer_id = int(match.group(1))
+            layer_id = get_layer_id(name)
+            if layer_id is not None:
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
-            else:
-                self.weights[name] = loaded_weight.cpu()
 
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:

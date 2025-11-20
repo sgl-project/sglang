@@ -641,21 +641,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            conv_states_to_use = conv_states.clone()
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
-            conv_states_to_use = conv_states
 
         if is_target_verify:
             batch_size = seq_len // draft_token_num
-            mixed_qkv_reshaped = (
-                mixed_qkv.view(batch_size, draft_token_num, -1)
-                .transpose(1, 2)
-                .contiguous()
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
-                conv_states_to_use,
+                conv_states,
                 conv_weights,
                 bias,
                 activation,
@@ -665,16 +661,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
-            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states_to_use,
+                conv_states=conv_states,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
