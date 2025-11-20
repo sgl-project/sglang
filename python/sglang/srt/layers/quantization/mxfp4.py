@@ -39,9 +39,9 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     direct_register_custom_op,
-    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_sm100_supported,
     is_triton_kernels_available,
@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
-_is_shuffle_moe_mxfp4 = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
+_is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 if _is_hip:
     # import aiter
@@ -804,14 +804,17 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
 
         # Pre-shuffle weight
-        if _is_shuffle_moe_mxfp4:
+        is_shuffled = _is_shuffle_moe_mxfp4
+        if is_shuffled:
             w13 = shuffle_weight(w13.contiguous(), (16, 16))
             w2 = shuffle_weight(w2.contiguous(), (16, 16))
 
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w13_weight.is_shuffled = is_shuffled
         layer.w13_weight_scale = torch.nn.Parameter(w13_mx_scales, requires_grad=False)
 
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w2_weight.is_shuffled = is_shuffled
         layer.w2_weight_scale = torch.nn.Parameter(w2_mx_scales, requires_grad=False)
 
     def create_moe_runner(
@@ -841,6 +844,10 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         else:
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
+
+        if hasattr(layer.w13_weight, "is_shuffled"):
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
 
         output = fused_moe(
             x,
