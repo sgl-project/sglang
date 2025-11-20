@@ -48,7 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_npu, LazyValue
+from sglang.srt.utils import LazyValue, add_prefix, is_npu
 
 _is_npu = is_npu()
 
@@ -612,7 +612,9 @@ class DeepseekForCausalLM(nn.Module):
                     ) and name not in params_dict:
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
         if _is_npu:
             # Lazy initialization of expert weights cache to avoid slowing down load_weights
