@@ -2,8 +2,12 @@ import functools
 from typing import Optional
 
 import torch
-from sgl_kernel.elementwise import silu_and_mul
+from sglang.srt.utils import is_cuda
 
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import silu_and_mul
 
 def get_scalar_type(num_bits: int, has_zp: bool):
     from sgl_kernel.scalar_type import scalar_types
