@@ -15,10 +15,9 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
-from sglang.multimodal_gen.configs.configs import PreprocessConfig
-from sglang.multimodal_gen.configs.pipelines import FluxPipelineConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, STA_Mode
-from sglang.multimodal_gen.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
@@ -251,7 +250,6 @@ class ServerArgs:
     dist_timeout: int | None = None  # timeout for torch.distributed
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
-    preprocess_config: PreprocessConfig | None = None
 
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
@@ -626,9 +624,6 @@ class ServerArgs:
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
 
-        # Add preprocessing configuration arguments
-        PreprocessConfig.add_cli_args(parser)
-
         # Logging
         parser.add_argument(
             "--log-level",
@@ -734,9 +729,6 @@ class ServerArgs:
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
-            elif attr == "preprocess_config":
-                preprocess_config = PreprocessConfig.from_kwargs(kwargs)
-                server_args_kwargs["preprocess_config"] = preprocess_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
@@ -772,7 +764,6 @@ class ServerArgs:
             kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
-        kwargs["preprocess_config"] = PreprocessConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
     @staticmethod
