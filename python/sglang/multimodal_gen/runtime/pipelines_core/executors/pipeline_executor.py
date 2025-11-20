@@ -6,7 +6,7 @@ Base class for all pipeline executors.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Any
+from typing import List
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage

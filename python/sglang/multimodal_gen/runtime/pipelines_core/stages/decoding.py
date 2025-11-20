@@ -122,8 +122,8 @@ class DecodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-                                   vae_dtype != torch.float32
-                               ) and not server_args.disable_autocast
+            vae_dtype != torch.float32
+        ) and not server_args.disable_autocast
         vae_arch_config = server_args.pipeline_config.vae_config.arch_config
 
         # scale and shift
@@ -216,7 +216,7 @@ class DecodingStage(PipelineStage):
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             trajectory_decoded=trajectory_decoded,
-            timings=batch.timings
+            timings=batch.timings,
         )
         print(f"{batch.timings=}")
 

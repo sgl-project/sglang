@@ -279,11 +279,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
-    "SGLANG_DIFFUSION_SERVER_DEV_MODE": lambda: get_bool_env_var("SGLANG_DIFFUSION_SERVER_DEV_MODE")
-    ,
+    "SGLANG_DIFFUSION_SERVER_DEV_MODE": lambda: get_bool_env_var(
+        "SGLANG_DIFFUSION_SERVER_DEV_MODE"
+    ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
-    "SGLANG_DIFFUSION_STAGE_LOGGING": lambda: get_bool_env_var("SGLANG_DIFFUSION_STAGE_LOGGING")
+    "SGLANG_DIFFUSION_STAGE_LOGGING": lambda: get_bool_env_var(
+        "SGLANG_DIFFUSION_STAGE_LOGGING"
+    ),
 }
 
 

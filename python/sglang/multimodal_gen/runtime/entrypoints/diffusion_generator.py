@@ -335,7 +335,9 @@ class DiffGenerator:
                         "size": (req.height, req.width, req.num_frames),
                         "generation_time": gen_time,
                         "timings": (
-                            output_batch.timings.to_dict() if output_batch.timings else {}
+                            output_batch.timings.to_dict()
+                            if output_batch.timings
+                            else {}
                         ),
                         "trajectory": output_batch.trajectory_latents,
                         "trajectory_timesteps": output_batch.trajectory_timesteps,

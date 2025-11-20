@@ -15,7 +15,6 @@ import psutil
 import torch
 import zmq
 
-
 # use the native logger to avoid circular import
 logger = logging.getLogger(__name__)
 

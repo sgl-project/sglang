@@ -116,6 +116,7 @@ class GPUWorker:
                 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
                     OutputBatch,
                 )
+
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:

@@ -122,14 +122,16 @@ def compare_benchmarks(
         # Format count string if aggregated
         count_str = ""
         if stage == "Denoising Loop":
-            count_str = f" ({n_count} steps)" if n_count == b_count else f" ({b_count}->{n_count} steps)"
+            count_str = (
+                f" ({n_count} steps)"
+                if n_count == b_count
+                else f" ({b_count}->{n_count} steps)"
+            )
 
         # Filter noise: show if diff is > 0.5ms OR if it's a major stage (like Denoising Loop)
         # We always show Denoising Loop or stages with significant duration/diff
         if abs(s_diff) > 0.5 or b_val > 100 or n_val > 100:
-            stage_rows.append(
-                (stage + count_str, b_val, n_val, s_diff, s_pct)
-            )
+            stage_rows.append((stage + count_str, b_val, n_val, s_diff, s_pct))
 
     if output_format == "markdown":
         print("### Performance Comparison Report\n")
