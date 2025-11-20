@@ -67,11 +67,13 @@ from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -163,6 +165,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
+_use_ag_after_qlora = get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA")
+_use_fia_nz = get_bool_env_var("SGLANG_USE_FIA_NZ") and is_mla_preprocess_enabled()
 
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
@@ -200,7 +204,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
-    import custom_ops  # noqa: F401
+    # import custom_ops  # noqa: F401
     import sgl_kernel_npu  # noqa: F401
     import torch_npu  # noqa: F401
 
@@ -1269,10 +1273,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 scaling_factor = rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
-            else:
+            elif not _is_npu:
                 self.rotary_emb.forward = self.rotary_emb.forward_native
         else:
             self.rotary_emb = None
+
+        self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
@@ -1427,12 +1433,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes,
     ):
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            layer_scatter_modes=layer_scatter_modes,
         )
         return self.forward_core(s)
 
@@ -1442,6 +1450,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes,
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1469,11 +1478,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             inner_state = self.forward_normal_one_shot_prepare(
@@ -1543,6 +1560,22 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             raise NotImplementedError
 
+    def scattered_to_tp_attn_full(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        hidden_states, local_hidden_states = (
+            torch.empty(
+                (forward_batch.input_ids.shape[0], hidden_states.shape[1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            ),
+            hidden_states,
+        )
+        attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
+        return hidden_states
+
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -1566,6 +1599,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes,
     ):
         if self.q_lora_rank is not None:
             q, latent_cache = (
@@ -1578,12 +1612,21 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
             # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
-
             if self.use_nsa:
                 q_lora = self.q_a_layernorm(q)
+                if (
+                    _use_ag_after_qlora
+                    and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                    and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+                ):
+                    q_lora = self.scattered_to_tp_attn_full(q_lora, forward_batch)
+                    latent_cache = self.scattered_to_tp_attn_full(
+                        latent_cache, forward_batch
+                    )
                 q = self.q_b_proj(q_lora)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
                 )
+
                 _ = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
@@ -1610,6 +1653,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
+                if (
+                    _use_ag_after_qlora
+                    and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                    and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+                ):
+                    q = self.scattered_to_tp_attn_full(q, forward_batch)
+                    latent_cache = self.scattered_to_tp_attn_full(
+                        latent_cache, forward_batch
+                    )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
         else:
@@ -1622,43 +1674,74 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
 
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-
-            kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
-                kv_a,
-                self.kv_a_layernorm.weight,
-                self.kv_a_layernorm.variance_epsilon,
-                None,
-                None,
-                None,
-                group_size=128,
-                dtype_quant=torch.float8_e4m3fn,
-                res1=None,
-                output_unquantized_inp1=True,  # return unqaunt kv_a
+        if _is_npu and self.use_deepseek_yarn_rope:
+            B, S = q.shape[0], 1
+            cos, sin = self.rotary_emb.get_cos_sin_cache(
+                positions, hidden_states.dtype, offsets=None
             )
-            kv = self.kv_b_proj(
-                kv_a_quanted,
-            )[0]
+            q_pe = torch_npu.npu_interleave_rope(
+                q_pe.reshape(B, -1, S, self.qk_rope_head_dim), cos, sin
+            )
+            q_pe = q_pe.reshape(B, -1, self.qk_rope_head_dim)
 
+            ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                self.layer_id
+            )
+            _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+                latent_cache.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+                self.kv_a_layernorm.weight,
+                cos,
+                sin,
+                forward_batch.out_cache_loc.to(torch.int64),
+                k_rope_cache,
+                ckv_cache,
+                k_rope_scale=None,
+                c_kv_scale=None,
+                k_rope_offset=None,
+                c_kv_offset=None,
+                epsilon=self.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if _use_fia_nz else "PA_BNSD",
+                is_output_kv=True,
+            )
+            k_pe = k_pe.reshape(B, -1, self.qk_rope_head_dim)
         else:
-            kv_a = self.kv_a_layernorm(kv_a)
-            kv = self.kv_b_proj(kv_a)[0]
+            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
 
-        # kv_a = self.kv_a_layernorm(kv_a)
+                kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
+                    kv_a,
+                    self.kv_a_layernorm.weight,
+                    self.kv_a_layernorm.variance_epsilon,
+                    None,
+                    None,
+                    None,
+                    group_size=128,
+                    dtype_quant=torch.float8_e4m3fn,
+                    res1=None,
+                    output_unquantized_inp1=True,  # return unqaunt kv_a
+                )
+                kv = self.kv_b_proj(
+                    kv_a_quanted,
+                )[0]
 
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
-        if self.rotary_emb is not None:
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            else:
+                kv_a = self.kv_a_layernorm(kv_a)
+                kv = self.kv_b_proj(kv_a)[0]
+
+            # kv_a = self.kv_a_layernorm(kv_a)
+
+            k_pe = latent_cache[:, :, self.kv_lora_rank :]
+            if self.rotary_emb is not None:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-        if (
-            forward_batch.mha_one_shot
-            and sum(forward_batch.extend_prefix_lens_cpu) != 0
-        ):
-            kv_a, k_pe = self._get_mla_kv_buffer(
-                forward_batch.fetch_mha_one_shot_kv_indices(), q.dtype, forward_batch
-            )
+        # self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        # if (
+        #     forward_batch.mha_one_shot
+        #     and sum(forward_batch.extend_prefix_lens_cpu) != 0
+        # ):
+        #     kv_a, k_pe = self._get_mla_kv_buffer(
+        #         forward_batch.fetch_mha_one_shot_kv_indices(), q.dtype, forward_batch
+        #     )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
@@ -1992,6 +2075,18 @@ class DeepseekV2AttentionMLA(nn.Module):
                 torch.bfloat16,
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif _is_npu:
+            attn_bmm_output = torch.empty(
+                (attn_output.shape[0], self.num_local_heads, self.v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            torch.ops.npu.batch_matmul_transpose(
+                attn_output, self.w_vc, attn_bmm_output
+            )
+            attn_bmm_output = attn_bmm_output.reshape(
+                attn_output.shape[0], self.num_local_heads * self.v_head_dim
+            )
         else:
             if is_in_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous
@@ -2577,6 +2672,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes,
     ):
         # In normal mha, the k and v tensors will become overly large when the prefix length is long.
         # To avoid this, we split the kv cache into chunks and process them one after another.
@@ -2586,7 +2682,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # First do normal mha forward to get output for extended part
         return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
+            positions, hidden_states, forward_batch, zero_allocator, layer_scatter_modes
         )
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
@@ -2654,9 +2750,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
         elif _is_npu:
+            return
             # To reduce a time-costing split operation
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a, k_pe
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -2892,6 +2989,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            layer_scatter_modes=self.layer_scatter_modes,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -3025,7 +3123,7 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=True,
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -3540,7 +3638,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
                 self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2).contiguous()
                 )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")

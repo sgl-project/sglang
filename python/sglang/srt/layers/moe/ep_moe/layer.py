@@ -113,6 +113,9 @@ class DeepEPMoE(FusedMoE):
             self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
+        import os
+
+        self.enable_fused_moe = os.environ.get("ENABLE_FUSED_MOE", "0") == "1"
 
         if (
             self.deepep_mode.enable_low_latency()
@@ -149,6 +152,19 @@ class DeepEPMoE(FusedMoE):
         alt_stream=None,
         disable_sbo=False,
     ):
+
+        if self.deepep_mode.is_low_latency() and self.enable_fused_moe:
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            hidden_states = self.fused_moe(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                self.w13_weight,
+                self.w13_weight_scale,
+                self.w2_weight,
+                self.w2_weight_scale,
+            )
+            return hidden_states
 
         if self.deprecate_flag:
             assert forward_shared_experts is None
@@ -243,6 +259,26 @@ class DeepEPMoE(FusedMoE):
             overlap_args=overlap_args,
         )
 
+    def fused_moe(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        gmm1_permuted_weight: torch.Tensor,
+        gmm1_permuted_weight_scale: torch.Tensor,
+        gmm2_weight: torch.Tensor,
+        gmm2_weight_scale: torch.Tensor,
+    ):
+        return self.dispatcher.fused_moe(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            gmm1_permuted_weight=gmm1_permuted_weight,
+            gmm1_permuted_weight_scale=gmm1_permuted_weight_scale,
+            gmm2_weight=gmm2_weight,
+            gmm2_weight_scale=gmm2_weight_scale,
+        )
+
     def forward_aiter(
         self,
         dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput],
@@ -328,6 +364,7 @@ class DeepEPMoE(FusedMoE):
         assert self.moe_runner_config.activation == "silu"
 
         import torch_npu
+        from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
@@ -345,7 +382,7 @@ class DeepEPMoE(FusedMoE):
             group_list = torch.tensor(num_recv_tokens_per_expert, dtype=torch.int64).to(
                 hidden_states.device
             )
-            if self.w13_weight.dtype != torch.int8:
+            if self.w13_weight.dtype == output_dtype:
                 # gmm1: gate_up_proj
                 hidden_states = torch_npu.npu_grouped_matmul(
                     x=[hidden_states],
@@ -368,7 +405,7 @@ class DeepEPMoE(FusedMoE):
                     group_list=group_list,
                     output_dtype=output_dtype,
                 )[0]
-            else:
+            elif self.w13_weight.dtype == torch.int8:
                 if not get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT"):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
                         hidden_states
@@ -404,6 +441,43 @@ class DeepEPMoE(FusedMoE):
                     group_list=group_list,
                     output_dtype=output_dtype,
                 )[0]
+            elif self.w13_weight.dtype == torch.int32:
+                if not get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT"):
+                    hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
+                        hidden_states
+                    )
+                # W4A8 MOE
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w13_weight],
+                    scale=[self.w13_weight_scale],
+                    bias=[self.w13_scale_bias],
+                    per_token_scale=[hidden_states_scale],
+                    group_list=group_list,
+                    split_item=2,
+                    group_type=0,
+                    group_list_type=group_list_type,
+                    output_dtype=output_dtype,
+                )[0]
+
+                # act_fn: swiglu
+                hidden_states = torch_npu.npu_swiglu(hidden_states)
+                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(
+                    hidden_states
+                )
+
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w2_weight],
+                    scale=[self.w2_weight_scale],
+                    bias=[self.w2_scale_bias],
+                    per_token_scale=[swiglu_out_scale],
+                    group_list=group_list,
+                    split_item=2,
+                    group_type=0,
+                    group_list_type=group_list_type,
+                    output_dtype=output_dtype,
+                )[0]
 
             return hidden_states
 
@@ -421,12 +495,12 @@ class DeepEPMoE(FusedMoE):
 
             group_list = group_list.to(torch.int64)
 
-            if self.w13_weight.dtype != torch.int8:
+            if self.w13_weight.dtype == output_dtype:
                 # gmm1: gate_up_proj
                 hidden_states = torch_npu.npu_grouped_matmul(
                     x=[hidden_states],
                     weight=[self.w13_weight.permute(0, 2, 1)],
-                    # per_token_scale=[hidden_states_scale],
+                    # per_token_scale=[per_token_scale],
                     split_item=2,
                     group_list_type=group_list_type,
                     group_type=0,
@@ -444,7 +518,7 @@ class DeepEPMoE(FusedMoE):
                     group_list=group_list,
                     output_dtype=output_dtype,
                 )[0]
-            else:
+            elif self.w13_weight.dtype == torch.int8:
                 # gmm1: gate_up_proj
                 hidden_states = torch_npu.npu_grouped_matmul(
                     x=[hidden_states],
@@ -481,7 +555,38 @@ class DeepEPMoE(FusedMoE):
                     group_list=group_list,
                     output_dtype=output_dtype,
                 )[0]
+            elif self.w13_weight.dtype == torch.int32:
+                # W4A8 MOE
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w13_weight],
+                    scale=[self.w13_weight_scale],
+                    bias=[self.w13_scale_bias],
+                    per_token_scale=[hidden_states_scale],
+                    group_list=group_list,
+                    split_item=2,
+                    group_type=0,
+                    group_list_type=group_list_type,
+                    output_dtype=output_dtype,
+                )[0]
 
+                # act_fn: swiglu
+                hidden_states, swiglu_out_scale = swiglu_quant(
+                    hidden_states, group_list, group_list_type
+                )
+
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w2_weight],
+                    scale=[self.w2_weight_scale],
+                    bias=[self.w2_scale_bias],
+                    per_token_scale=[swiglu_out_scale],
+                    group_list=group_list,
+                    split_item=2,
+                    group_type=0,
+                    group_list_type=group_list_type,
+                    output_dtype=output_dtype,
+                )[0]
             return hidden_states
 
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):

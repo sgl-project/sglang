@@ -1706,7 +1706,31 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        if True:
+            global_info_tensor = torch.empty(
+                (self.dp_size, self.attn_tp_size, 1),
+                dtype=torch.int64,
+                device="cpu",
+            )
+            current_running_stream = torch.Tensor(
+                [
+                    self.running_batch.batch_size(),
+                ],
+                device="cpu",
+                dtype=torch.int64,
+            )
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.flatten(),
+                current_running_stream,
+                group=self.tp_worker.get_tp_group().cpu_group,
+            )
+            tp0_info = global_info_tensor[:, 0, :]
+            if int(tp0_info[:, 0].max().item()) == 32:
+                new_batch = None
+            else:
+                new_batch = self.get_new_batch_prefill()
+        else:
+            new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
