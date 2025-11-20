@@ -151,9 +151,9 @@ def _correct_attn_cp_out_kernel(
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
     lse -= lse_max
-    lse_exp = tl.exp(lse)
+    lse_exp = tl.exp2(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    lse = tl.log(lse_acc)
+    lse = tl.log2(lse_acc)
     lse += lse_max
 
     lse_offsets = batch_idx * lses_stride_B + head_idx * lses_stride_H
@@ -177,7 +177,7 @@ def _correct_attn_cp_out_kernel(
         -float("inf"),
         lse_finally,
     )
-    factor = tl.exp(lse_finally)
+    factor = tl.exp2(lse_finally)
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
 
