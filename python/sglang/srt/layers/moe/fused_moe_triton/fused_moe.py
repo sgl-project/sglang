@@ -556,6 +556,11 @@ def fused_experts_impl(
                 vllm_ops.gelu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
+        elif activation == "relu":
+            # ReLU activation for SmallThinker models
+            # First half: Gate, Second half: Up, out = ReLU(gate) * up
+            intermediate_cache1 = intermediate_cache1.view(-1, N)
+            intermediate_cache2 = torch.relu(intermediate_cache1[:, :N//2]) * intermediate_cache1[:, N//2:]
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
