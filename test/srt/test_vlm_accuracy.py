@@ -30,7 +30,7 @@ from sglang.srt.server_args import ServerArgs
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.model_path = ""
         cls.chat_template = ""
