@@ -42,7 +42,6 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -279,17 +278,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.function.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                # Default to True for parallel_tool_calls (ChatCompletionRequest doesn't have this field)
+                parallel_tool_calls = getattr(request, "parallel_tool_calls", True)
                 tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice
+                    request.tool_choice, parallel_tool_calls=parallel_tool_calls
                 )
-            # Handle JSON schema constraint directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
-            ):
-                json_schema = get_json_schema_constraint(
-                    request.tools, request.tool_choice
-                )
-                tool_call_constraint = ("json_schema", json_schema)
 
         # Use chat template
         if self.template_manager.chat_template_name is None:

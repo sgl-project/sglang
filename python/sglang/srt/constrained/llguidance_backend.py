@@ -13,13 +13,12 @@
 # ==============================================================================
 """Constrained decoding with llguidance backend."""
 
-import json
 import logging
 import os
 from typing import List, Optional, Tuple
 
 import torch
-from llguidance import LLMatcher, LLTokenizer, StructTag, grammar_from
+from llguidance import LLMatcher, LLTokenizer, grammar_from
 from llguidance.hf import from_tokenizer
 from llguidance.torch import (
     allocate_token_bitmask,
@@ -32,7 +31,6 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
-from sglang.srt.constrained.utils import is_legacy_structural_tag
 
 logger = logging.getLogger(__name__)
 
@@ -159,20 +157,9 @@ class GuidanceBackend(BaseGrammarBackend):
             return INVALID_GRAMMAR_OBJ
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
-        try:
-            structural_tag = json.loads(key_string)
-            assert is_legacy_structural_tag(structural_tag)
-            tags = [
-                StructTag(
-                    begin=structure["begin"],
-                    grammar=structure["schema"],
-                    end=structure["end"],
-                    trigger=structural_tag["triggers"][0],  # TODO?
-                )
-                for structure in structural_tag["structures"]
-            ]
-            g = StructTag.to_grammar(tags)
-            return self._from_serialized(g)
-        except Exception as e:
-            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+        # llguidance backend does not support the new structural tag format
+        # This should not be called when using the new format
+        logging.error(
+            f"llguidance backend does not support new structural tag format: {key_string=}"
+        )
+        return INVALID_GRAMMAR_OBJ

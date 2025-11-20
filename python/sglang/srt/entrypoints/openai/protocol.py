@@ -129,25 +129,10 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
-class StructuresResponseFormat(BaseModel):
-    begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    end: str
-
-
-# NOTE(dark): keep this for backward compatibility
-class LegacyStructuralTagResponseFormat(BaseModel):
-    type: Literal["structural_tag"]
-    structures: List[StructuresResponseFormat]
-    triggers: List[str]
-
-
-StructuralTagResponseFormat: TypeAlias = Union[
-    LegacyStructuralTagResponseFormat, StructuralTag
-]
+StructuralTagResponseFormat: TypeAlias = StructuralTag
 
 ToolCallConstraint: TypeAlias = Union[
-    Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
+    Tuple[Literal["structural_tag"], Dict[str, Any]],  # New format only
     Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
 ]
 
@@ -248,7 +233,7 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
-    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    response_format: Optional[ResponseFormat] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
 
@@ -480,7 +465,7 @@ class ChatCompletionRequest(BaseModel):
     )
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
@@ -674,9 +659,8 @@ class ChatCompletionRequest(BaseModel):
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif self.response_format and self.response_format.type == "structural_tag":
-            sampling_params["structural_tag"] = convert_json_schema_to_str(
-                self.response_format.model_dump(by_alias=True)
-            )
+            # Structural tag format is now handled via tool_call_constraint
+            pass
 
         # Check if there are already existing output constraints
         has_existing_constraints = (
@@ -692,7 +676,7 @@ class ChatCompletionRequest(BaseModel):
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value.model_dump(by_alias=True)
+                    constraint_value  # type: ignore
                 )
             elif constraint_type == "json_schema":
                 sampling_params[constraint_type] = convert_json_schema_to_str(

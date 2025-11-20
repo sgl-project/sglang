@@ -162,12 +162,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             )
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
-        elif (
-            request.response_format and request.response_format.type == "structural_tag"
-        ):
-            sampling_params["structural_tag"] = convert_json_schema_to_str(
-                request.response_format.model_dump(by_alias=True)
-            )
 
         return sampling_params
 

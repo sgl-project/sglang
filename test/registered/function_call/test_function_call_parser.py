@@ -2593,13 +2593,6 @@ class TestJsonArrayParser(unittest.TestCase):
         ]
         self.detector = JsonArrayParser()
 
-    def test_json_detector_has_no_ebnf(self):
-        """JsonArrayParser no longer exposes EBNF generation helpers."""
-        self.assertFalse(
-            hasattr(self.detector, "build_ebnf"),
-            "JsonArrayParser should not expose EBNF helpers after cleanup",
-        )
-
     def test_parse_streaming_increment_malformed_json(self):
         """Test parsing with malformed JSON"""
         # Test with malformed JSON
