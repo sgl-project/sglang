@@ -78,8 +78,12 @@ class TestAscendW4A4(CustomTestCase):
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreaterEqual(metrics["accuracy"], TEST_MODEL_MATRIX[model]["accuracy"])
-        self.assertGreaterEqual(metrics["output_throughput"], TEST_MODEL_MATRIX[model]["output_throughput"])
+        self.assertGreaterEqual(
+            metrics["accuracy"], TEST_MODEL_MATRIX[model]["accuracy"]
+        )
+        self.assertGreaterEqual(
+            metrics["output_throughput"], TEST_MODEL_MATRIX[model]["output_throughput"]
+        )
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -107,6 +111,7 @@ class TestAscendW4A4(CustomTestCase):
 
         if is_in_ci():
             self.assertGreaterEqual(throughput, TEST_MODEL_MATRIX[model]["throughput"])
+
 
 if __name__ == "__main__":
     unittest.main()
