@@ -14,7 +14,9 @@
 
 """ Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights. """
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+import logging
+from itertools import islice
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -24,9 +26,11 @@ from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
 )
 
 from sglang.srt.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -36,16 +40,19 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import Ernie4_5_VLRotaryEmbedding
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 
 # from sglang.srt.models.llama import LlamaAttention as Ernie4_5_VLMoeAttention
 from sglang.srt.utils import add_prefix, make_layers
+
+logger = logging.getLogger(__name__)
 
 
 class Ernie4_5_VLMoeAttention(nn.Module):
@@ -361,21 +368,39 @@ class Ernie4_5_VLMoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_tokens", prefix),
-        )
-        self.layers = make_layers(
+        # self.padding_idx = config.pad_token_id
+        # self.vocab_size = config.vocab_size
+        self.pp_group = get_pp_group()
+
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not is_dp_attention_enabled(),
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Ernie4_5_VLMoeDecoderLayer(
-                config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
             ),
-            prefix="model.layers",
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=add_prefix("layers", prefix),
         )
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
     @torch.no_grad()
     def forward(
@@ -384,37 +409,51 @@ class Ernie4_5_VLMoeModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.get_input_embeddings(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
-        for layer in self.layers:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+
+        if hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
 
         return hidden_states
 
 
+# only used as text backbone for ernie4.5 vl
 class Ernie4_5_VLMoeForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
-    stacked_params_mapping = [
-        # (param_name, weight_name, shard_id)
-        (".qkv_proj", ".q_proj", "q"),
-        (".qkv_proj", ".k_proj", "k"),
-        (".qkv_proj", ".v_proj", "v"),
-        (".gate_up_proj", ".gate_proj", 0),
-        (".gate_up_proj", ".up_proj", 1),
-    ]
 
     def __init__(
         self,
@@ -423,6 +462,7 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.pp_group = get_pp_group()
         self.config: Ernie4_5_VLMoeConfig = config
         self.quant_config = quant_config
         self.model = Ernie4_5_VLMoeModel(
@@ -445,13 +485,34 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return hidden_states
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, weight_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -462,32 +523,63 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if name.startswith("model.mtp_"):
+            if "mtp" in name or "vision_model" in name or "resampler_model" in name:
                 continue
+
             if "moe_statics.e_score_correction_bias" in name:
                 name = name.replace("moe_statics", "gate")
-            for param_name, weight_name, shard_id in self.stacked_params_mapping:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+
+                # Distinguish between vision experts and text experts
+                if "mlp.experts" in name:
+                    moe_offset = int(name.split(".")[-3])
+                    vision_expert_start_idx = self.config.moe_num_experts[0]
+                    is_text_expert = moe_offset <= vision_expert_start_idx - 1
+                    if is_text_expert:
+                        name = name.replace(".experts.", ".text_experts.")
+                    else:
+                        name = name.replace(
+                            f".experts.{moe_offset}",
+                            f".vision_experts.{moe_offset - vision_expert_start_idx}",
+                        )
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
+
+                    # Distinguish between vision experts and text experts
+                    moe_offset = int(name.split(".")[-3])
+                    is_text_expert = moe_offset <= self.config.moe_num_experts[0] - 1
+
                     name = name.replace(weight_name, param_name)
+                    if is_text_expert:
+                        name = name.replace(".experts.", ".text_experts.")
+                    else:
+                        name = name.replace(".experts.", ".vision_experts.")
+
+                    # Skip loading extra bias for GPTQ models.
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
+
                     if name in params_dict.keys():
                         param = params_dict[name]
                         weight_loader = param.weight_loader
@@ -499,11 +591,29 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module):
                             expert_id=expert_id,
                         )
                     else:
-                        raise KeyError(
-                            f"Parameter '{name}'(replaced) not found in model."
-                        )
+                        logger.warning(f"Parameter {name} not found in params_dict")
                     break
                 else:
+                    # Distinguish between vision expert gate
+                    # and text expert gate
+                    if name.endswith("mlp.gate.weight"):
+                        name = name.replace("gate.weight", "text_experts_gate.weight")
+                        loaded_weight = loaded_weight.T
+                    elif name.endswith("mlp.gate.weight_1"):
+                        name = name.replace(
+                            "gate.weight_1", "vision_experts_gate.weight"
+                        )
+                        loaded_weight = loaded_weight.T
+
+                    if "e_score_correction_bias" in name:
+                        name = name.replace(".moe_statics.", ".")
+
+                    # Skip loading extra bias for GPTQ models.
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
+
                     if name in params_dict.keys():
                         param = params_dict[name]
                         weight_loader = getattr(
@@ -511,7 +621,7 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
                     else:
-                        raise KeyError(f"Parameter '{name}' not found in model.")
+                        logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
