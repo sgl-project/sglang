@@ -72,7 +72,12 @@ def auto_partition(files, rank, size):
     return [files[i] for i in indices]
 
 
-def run_per_commit(hw: HWBackend, suite: str, auto_partition_id: int = None, auto_partition_size: int = None):
+def run_per_commit(
+    hw: HWBackend,
+    suite: str,
+    auto_partition_id: int = None,
+    auto_partition_size: int = None,
+):
     files = glob.glob("per_commit/**/*.py", recursive=True)
     ci_tests = _filter_tests(collect_tests(files), hw, suite)
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
