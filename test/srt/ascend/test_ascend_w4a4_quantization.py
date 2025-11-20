@@ -50,7 +50,7 @@ class TestAscendW4A4(CustomTestCase):
                 "--tp-size",
                 "2",
                 "--mem-fraction-static",
-                "0.9"
+                "0.8",
             ],
         )
 
