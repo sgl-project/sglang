@@ -742,6 +742,7 @@ class Grok1ForCausalLM(nn.Module):
 
         self.loaded_param_names = set()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
