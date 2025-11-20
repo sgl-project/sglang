@@ -187,7 +187,6 @@ class HybridSWACompressedModelNextN(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        hidden_states[positions == 0] = 0
         if hidden_states.shape[0] > 0:
             hidden_states = self.eh_proj(
                 torch.cat(
