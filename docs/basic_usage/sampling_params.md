@@ -250,11 +250,16 @@ text = "<image>\nDescribe this image."
 processor_output = processor(images=[image], text=text, return_tensors="pt")
 
 # Pass processor output directly to SGLang
+# Note: For HTTP requests, tensors must be converted to lists. 
+# For Python Engine API, you can pass tensors directly.
+processor_output_dict = {k: v.tolist() if hasattr(v, "tolist") else v 
+                        for k, v in processor_output.items()}
+
 response = requests.post(
     "http://localhost:30000/generate",
     json={
-        "input_ids": processor_output["input_ids"][0].tolist(),
-        "image_data": [dict(processor_output, format="processor_output")],
+        "input_ids": processor_output_dict["input_ids"][0],
+        "image_data": [dict(processor_output_dict, format="processor_output")],
     },
 )
 ```
