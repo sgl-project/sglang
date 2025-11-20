@@ -319,15 +319,9 @@ class PerformanceValidator:
         Uses the larger of relative tolerance or absolute tolerance to prevent
         flaky failures on very fast operations.
         """
-        # Calculate limit based on relative tolerance
         rel_limit = expected * (1 + tolerance)
-
-        # Calculate limit based on absolute tolerance buffer
         abs_limit = expected + min_abs_tolerance_ms
-
-        # Take the more permissive limit (higher value)
         upper_bound = max(rel_limit, abs_limit)
-
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
             f"  - Actual:   {actual:.4f}ms\n"
