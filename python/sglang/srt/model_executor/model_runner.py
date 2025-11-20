@@ -357,6 +357,7 @@ class ModelRunner:
                 )
                 self.piecewise_cuda_graph_runner = None
             else:
+                print(f"[DEBUG] Initializing PiecewiseCudaGraphRunner")
                 self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
         else:
             self.piecewise_cuda_graph_runner = None

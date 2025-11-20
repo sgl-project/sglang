@@ -197,8 +197,8 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with set_compiled(True):
-                    self.warmup_and_capture()
+                # with set_compiled(True):
+                #     self.warmup_and_capture()
 
                 # Capture
                 try:

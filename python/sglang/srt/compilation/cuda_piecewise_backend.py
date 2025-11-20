@@ -141,6 +141,7 @@ class CUDAPiecewiseBackend:
             return self.compiled_graph_for_general_shape(*args)
 
         entry = self.concrete_size_entries[runtime_shape]
+        # print(f"[DEBUG] __call__ graph {self.piecewise_compile_index}, shape={runtime_shape}, backend_id={id(self)}, entry_id={id(entry)}, warmup={entry.num_finished_warmup}, has_cudagraph={entry.cudagraph is not None}")
 
         if entry.runnable is None:
             entry.runnable = self.compiled_graph_for_general_shape
@@ -169,7 +170,7 @@ class CUDAPiecewiseBackend:
         #     return entry.runnable(*args)
 
         if entry.cudagraph is None:
-            if entry.num_finished_warmup < 1:  # noqa
+            if entry.num_finished_warmup < 2:  # noqa
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 

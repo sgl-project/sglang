@@ -136,12 +136,13 @@ def install_torch_compiled(
 
     dyn_map = dynamic_arg_dims or _infer_dynamic_arg_dims_from_annotations(unbound_fwd)
 
+    # Create the backend instance once and reuse it
+    backend_instance = None
     if backend_factory is None:
         from sglang.srt.compilation.backend import SGLangBackend
 
-        backend_factory = lambda gm, ex: SGLangBackend(compile_config, graph_pool)(
-            gm, ex
-        )
+        backend_instance = SGLangBackend(compile_config, graph_pool)
+        backend_factory = lambda gm, ex: backend_instance(gm, ex)
 
     compiled_codes: list[type(original_code)] = []
     state = {"compiled": False, "compiled_callable": None}
