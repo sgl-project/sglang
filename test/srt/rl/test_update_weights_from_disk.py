@@ -267,21 +267,21 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         print(json.dumps(response.json()))
         return model_path
 
-    def run_update_weights(self, model_path, force=False):
+    def run_update_weights(self, model_path, flush_cache=True):
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
             json={
                 "model_path": model_path,
-                "force": force,
+                "flush_cache": flush_cache,
             },
         )
         ret = response.json()
         return ret
 
-    def pause_generation(self):
+    def pause_generation(self, mode):
         response = requests.post(
             self.base_url + "/pause_generation",
-            json={"abort_all": False, "retract_all": True},
+            json={"mode": mode},
         )
         ret = response.json()
         return ret
@@ -294,34 +294,36 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         ret = response.json()
         return ret
 
-    def test_update_weights_force(self):
+    def test_update_weights(self):
         origin_model_path = self.get_model_info()
         print(f"[Server Mode] origin_model_path: {origin_model_path}")
 
-        num_requests = 32
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [
-                executor.submit(self.run_decode, 1600) for _ in range(num_requests)
-            ]
+        modes = ['in_place', 'retract']
+        for mode in modes:
+            num_requests = 32
+            with ThreadPoolExecutor(num_requests) as executor:
+                futures = [
+                    executor.submit(self.run_decode, 1600) for _ in range(num_requests)
+                ]
 
-            # ensure the decode has been started
-            time.sleep(2)
+                # ensure the decode has been started
+                time.sleep(2)
 
-            new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
-            ret = self.pause_generation()
-            ret = self.run_update_weights(new_model_path, force=True)
-            self.assertTrue(ret["success"])
-            ret = self.continue_generation()
+                new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
+                ret = self.pause_generation(mode)
+                ret = self.run_update_weights(new_model_path, flush_cache=mode=='retract')
+                self.assertTrue(ret["success"])
+                ret = self.continue_generation()
 
-            for future in as_completed(futures):
-                self.assertNotEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
+                for future in as_completed(futures):
+                    self.assertNotEqual(
+                        future.result()["meta_info"]["finish_reason"]["type"], "abort"
+                    )
 
-        updated_model_path = self.get_model_info()
-        print(f"[Server Mode] updated_model_path: {updated_model_path}")
-        self.assertEqual(updated_model_path, new_model_path)
-        self.assertNotEqual(updated_model_path, origin_model_path)
+            updated_model_path = self.get_model_info()
+            print(f"[Server Mode] updated_model_path: {updated_model_path}")
+            self.assertEqual(updated_model_path, new_model_path)
+            self.assertNotEqual(updated_model_path, origin_model_path)
 
 
 ###############################################################################

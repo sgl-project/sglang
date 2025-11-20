@@ -1146,7 +1146,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
-            if not obj.abort_all:
+            if obj.mode != "abort":
                 await self.send_to_scheduler.send_pyobj(obj)
             else:
                 self.abort_request(abort_all=True)
@@ -1169,8 +1169,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if obj.force:
-            return await self._wait_for_model_update_from_disk(obj)
+        async with self.is_pause_cond:
+            if self.is_pause:
+                return await self._wait_for_model_update_from_disk(obj)
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)

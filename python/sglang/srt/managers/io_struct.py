@@ -21,7 +21,7 @@ import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Literal
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -1010,9 +1010,27 @@ class FlushCacheReqOutput(BaseReq):
 
 @dataclass
 class PauseGenerationReqInput(BaseReq):
-    abort_all: bool = True
-    retract_all: bool = False
+    """
+    abort: Abort all requests currently being processed.
 
+    in_place: Pause the scheduler's event_loop from performing inference;
+            only non-inference requests (e.g., control commands) will be handled.
+            Note: In 'inplace' mode, flush_cache will fail if there are any requests
+            in the running_batch.
+
+    retract: Pause the scheduler's event loop from performing inference;
+            only non-inference requests will be handled, and all currently running
+            requests will be retracted back to the waiting_queue.
+    """
+    mode: Literal["abort", "retract", "in_place"] = "abort"
+
+    def __post_init__(self):
+        allowed = ["abort", "retract", "in_place"]
+        if self.mode not in allowed:
+            raise ValueError(
+                f"Invalid mode: {self.mode!r}. "
+                f"Expected one of {allowed}."
+            )
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
@@ -1039,9 +1057,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
-    # Whether to wait for all ongoing inference requests to complete before updating
-    # weights, or update weights between two consecutive forward passes during decoding.
-    force: bool = False
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
 
 
 @dataclass
@@ -1065,9 +1082,6 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Whether to wait for all ongoing inference requests to complete before updating
-    # weights, or update weights between two consecutive forward passes during decoding.
-    force: bool = False
 
 
 @dataclass
@@ -1093,9 +1107,6 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Whether to wait for all ongoing inference requests to complete before updating
-    # weights, or update weights between two consecutive forward passes during decoding.
-    force: bool = False
 
 
 @dataclass

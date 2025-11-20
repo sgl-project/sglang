@@ -213,10 +213,10 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         print(json.dumps(response.json()))
         return model_path
 
-    def pause_generation(self):
+    def pause_generation(self, mode):
         response = requests.post(
             self.base_url + "/pause_generation",
-            json={"abort_all": False, "retract_all": True},
+            json={"mode": mode},
         )
         ret = response.json()
         return ret
@@ -229,52 +229,54 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         ret = response.json()
         return ret
 
-    def run_update_weights(self, named_tensors, force=False):
+    def run_update_weights(self, named_tensors, flush_cache=True):
         response = requests.post(
             self.base_url + "/update_weights_from_tensor",
             json={
                 "serialized_named_tensors": [
                     MultiprocessingSerializer.serialize(named_tensors, output_str=True)
                 ],
-                "force": force,
+                "flush_cache": flush_cache,
             },
         )
         ret = response.json()
         return ret
 
-    def test_update_weights_force(self):
-        num_requests = 32
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [
-                executor.submit(self.run_decode, 3000) for _ in range(num_requests)
-            ]
+    def test_update_weights(self):
+        modes = ['in_place', 'retract']
+        for mode in modes:
+            num_requests = 32
+            with ThreadPoolExecutor(num_requests) as executor:
+                futures = [
+                    executor.submit(self.run_decode, 3000) for _ in range(num_requests)
+                ]
 
-            # ensure the decode has been started
-            time.sleep(2)
+                # ensure the decode has been started
+                time.sleep(2)
 
-            param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
-            new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
-            named_tensors = [(x, new_tensor) for x in param_names]
+                param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
+                new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
+                named_tensors = [(x, new_tensor) for x in param_names]
 
-            ret = self.pause_generation()
-            ret = self.run_update_weights(named_tensors, force=True)
-            self.assertTrue(ret["success"])
-            ret = self.continue_generation()
+                ret = self.pause_generation(mode)
+                ret = self.run_update_weights(named_tensors, flush_cache=mode=='retract')
+                self.assertTrue(ret["success"])
+                ret = self.continue_generation()
 
-            for future in as_completed(futures):
-                self.assertNotEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
+                for future in as_completed(futures):
+                    self.assertNotEqual(
+                        future.result()["meta_info"]["finish_reason"]["type"], "abort"
+                    )
 
-            for param_name in param_names[:3]:
-                response = requests.post(
-                    self.base_url + "/get_weights_by_name",
-                    json={"name": param_name},
-                )
-                actual_values = torch.tensor(response.json())[0, :5]
-                assert torch.allclose(
-                    actual_values, torch.tensor([1.5] * 5), atol=0.002
-                ), f"{actual_values=}"
+                for param_name in param_names[:3]:
+                    response = requests.post(
+                        self.base_url + "/get_weights_by_name",
+                        json={"name": param_name},
+                    )
+                    actual_values = torch.tensor(response.json())[0, :5]
+                    assert torch.allclose(
+                        actual_values, torch.tensor([1.5] * 5), atol=0.002
+                    ), f"{actual_values=}"
 
 
 def _check_param(engine, param_name, expect_values):

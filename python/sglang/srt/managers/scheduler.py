@@ -2609,7 +2609,7 @@ class Scheduler(
             self.last_batch = None
             self.cur_batch = None  # TODO: to confirm
 
-        if recv_req.retract_all:
+        if recv_req.mode == "retract":
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
