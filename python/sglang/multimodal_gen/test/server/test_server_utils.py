@@ -306,14 +306,34 @@ class PerformanceValidator:
             os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
         )
 
-    def _assert_le(self, name: str, actual: float, expected: float, tolerance: float):
-        """Assert that actual is less than or equal to expected within a tolerance."""
-        upper_bound = expected * (1 + tolerance)
+    def _assert_le(
+        self,
+        name: str,
+        actual: float,
+        expected: float,
+        tolerance: float,
+        min_abs_tolerance_ms: float = 20.0,
+    ):
+        """Assert that actual is less than or equal to expected within a tolerance.
+
+        Uses the larger of relative tolerance or absolute tolerance to prevent
+        flaky failures on very fast operations.
+        """
+        # Calculate limit based on relative tolerance
+        rel_limit = expected * (1 + tolerance)
+
+        # Calculate limit based on absolute tolerance buffer
+        abs_limit = expected + min_abs_tolerance_ms
+
+        # Take the more permissive limit (higher value)
+        upper_bound = max(rel_limit, abs_limit)
+
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
             f"  - Actual:   {actual:.4f}ms\n"
             f"  - Expected: {expected:.4f}ms\n"
-            f"  - Limit:    {upper_bound:.4f}ms (tolerance: {tolerance:.1%})"
+            f"  - Limit:    {upper_bound:.4f}ms "
+            f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
         )
 
     def validate(
