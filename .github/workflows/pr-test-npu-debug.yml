@@ -3,7 +3,7 @@ name: PR Test For Innersource (DEBUG)
 on:
   workflow_dispatch:
   pull_request:
-    branches: [ upstream/251031 ]
+    branches: [ main ]
     paths:
       - "test/**"
 
