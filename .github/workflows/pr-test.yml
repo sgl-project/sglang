@@ -675,7 +675,6 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
-
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
