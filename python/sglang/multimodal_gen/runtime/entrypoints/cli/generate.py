@@ -5,8 +5,13 @@
 
 import argparse
 import dataclasses
+import json
 import os
+import time
+from datetime import datetime
 from typing import cast
+
+from dateutil.tz import UTC
 
 from sglang.multimodal_gen import DiffGenerator
 from sglang.multimodal_gen.configs.sample.base import (
@@ -19,6 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.performance_logger import get_git_commit_hash
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
@@ -32,6 +38,13 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
         default="",
         required=False,
         help="Read CLI options from a config JSON or YAML file. If provided, --model-path and --prompt are optional.",
+    )
+    parser.add_argument(
+        "--perf-dump-path",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to dump the performance metrics (JSON) for the run.",
     )
 
     parser = ServerArgs.add_cli_args(parser)
@@ -58,7 +71,63 @@ def generate_cmd(args: argparse.Namespace):
         model_path=server_args.model_path, server_args=server_args
     )
 
-    generator.generate(prompt=sampling_params.prompt, sampling_params=sampling_params)
+    start_time = time.monotonic()
+    results = generator.generate(
+        prompt=sampling_params.prompt, sampling_params=sampling_params
+    )
+    total_duration = time.monotonic() - start_time
+
+    # Handle performance dumping
+    if args.perf_dump_path and results:
+        # Assuming results is a list of dicts or a single dict
+        if isinstance(results, list):
+            result = results[0] if results else {}
+        else:
+            result = results
+
+        logging_info = result.get("logging_info", {})
+
+        # Convert logging_info stages to the format expected by compare_perf
+        formatted_steps = []
+        if hasattr(logging_info, "stages"):
+            stages = logging_info.stages
+        elif isinstance(logging_info, dict) and "stages" in logging_info:
+            stages = logging_info["stages"]
+        else:
+            stages = {}
+
+        if isinstance(stages, dict):
+            for name, info in stages.items():
+                if not info:
+                    continue
+                exec_time = info.get("execution_time")
+                if exec_time is not None:
+                    formatted_steps.append(
+                        {"name": name, "duration_ms": exec_time * 1000}
+                    )
+
+        # Construct report
+        report = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "request_id": sampling_params.request_id,
+            "commit_hash": get_git_commit_hash(),
+            "tag": "cli_generate",
+            "total_duration_ms": result.get("generation_time", total_duration) * 1000,
+            "steps": formatted_steps,
+            "meta": {
+                "prompt": sampling_params.prompt,
+                "model": server_args.model_path,
+            },
+        }
+
+        try:
+            dump_path = os.path.abspath(args.perf_dump_path)
+            os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+            with open(dump_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            print(f"[Performance] Metrics dumped to: {dump_path}")
+        except Exception as e:
+            logger.error(f"Failed to dump performance metrics: {e}")
 
 
 class GenerateSubcommand(CLISubcommand):

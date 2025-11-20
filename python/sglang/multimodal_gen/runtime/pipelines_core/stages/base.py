@@ -190,17 +190,11 @@ class PipelineStage(ABC):
         logging_info = getattr(batch, "logging_info", None)
 
         if envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-            logger.info("[%s] Starting execution", stage_name)
             start_time = time.perf_counter()
 
             try:
                 result = self.forward(batch, server_args)
                 execution_time = time.perf_counter() - start_time
-                logger.info(
-                    "[%s] Execution completed in %s ms",
-                    stage_name,
-                    execution_time * 1000,
-                )
                 if logging_info is not None:
                     try:
                         logging_info.add_stage_execution_time(
