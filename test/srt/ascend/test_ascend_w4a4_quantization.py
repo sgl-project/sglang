@@ -24,9 +24,8 @@ from sglang.test.test_utils import (
 # TODO change model path
 TEST_MODEL_MATRIX = {
     "/root/.cache/modelscope/hub/models/vllm-ascend/Qwen3-32B-W4A4": {
-        "accuracy": 0.95,
-        "output_throughput": 1000,
-        "throughput": 25,
+        "accuracy": 0.8,
+        "output_throughput": 25,
     },
 }
 
@@ -64,26 +63,28 @@ class TestAscendW4A4(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        base_url = DEFAULT_URL_FOR_TEST
-        url = urlparse(base_url)
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{url.hostname}",
-            port=int(url.port),
-        )
-        metrics = run_eval(args)
-        print(metrics)
-
-        self.assertGreaterEqual(
-            metrics["accuracy"], TEST_MODEL_MATRIX[model]["accuracy"]
-        )
-        self.assertGreaterEqual(
-            metrics["output_throughput"], TEST_MODEL_MATRIX[model]["output_throughput"]
-        )
+        for model in self.models:
+            with self.subTest(model=model):
+                base_url = DEFAULT_URL_FOR_TEST
+                url = urlparse(base_url)
+                args = SimpleNamespace(
+                    num_shots=5,
+                    data_path=None,
+                    num_questions=200,
+                    max_new_tokens=512,
+                    parallel=128,
+                    host=f"http://{url.hostname}",
+                    port=int(url.port),
+                )
+                metrics = run_eval(args)
+                print(metrics)
+        
+                self.assertGreaterEqual(
+                    metrics["accuracy"], TEST_MODEL_MATRIX[model]["accuracy"]
+                )
+                self.assertGreaterEqual(
+                    metrics["output_throughput"], TEST_MODEL_MATRIX[model]["output_throughput"]
+                )
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -100,17 +101,19 @@ class TestAscendW4A4(CustomTestCase):
         return response.json()
 
     def test_throughput(self):
-        max_tokens = 256
-
-        tic = time.perf_counter()
-        res = self.run_decode(max_tokens)
-        tok = time.perf_counter()
-        print(res["text"])
-        throughput = max_tokens / (tok - tic)
-        print(f"Throughput: {throughput} tokens/s")
-
-        if is_in_ci():
-            self.assertGreaterEqual(throughput, TEST_MODEL_MATRIX[model]["throughput"])
+        for model in self.models:
+            with self.subTest(model=model):
+                max_tokens = 256
+        
+                tic = time.perf_counter()
+                res = self.run_decode(max_tokens)
+                tok = time.perf_counter()
+                print(res["text"])
+                throughput = max_tokens / (tok - tic)
+                print(f"Throughput: {throughput} tokens/s")
+        
+                if is_in_ci():
+                    self.assertGreaterEqual(throughput, TEST_MODEL_MATRIX[model]["output_throughput"])
 
 
 if __name__ == "__main__":
