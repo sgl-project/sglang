@@ -319,6 +319,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # E Disaggregation
         if self.model_config.is_multimodal and self.server_args.language_only:
             self.mm_receiver = MMReceiver(
+                server_args.host,
+                server_args.encode_urls,
                 server_args.mm_transfer_backend,
                 server_args.disaggregation_ib_device,
                 self.model_config.dtype,
@@ -727,7 +729,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
             if self.server_args.language_only:
                 mm_inputs: Dict = await self.mm_receiver.recv_mm_data(
-                    obj.bootstrap_room,
+                    obj.image_data,
                     self.mm_processor,
                     input_text or input_ids,
                 )

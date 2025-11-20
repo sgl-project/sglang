@@ -260,6 +260,7 @@ class ServerArgs:
     mm_only: bool = False
     language_only: bool = False
     mm_transfer_backend: str = "zmq"
+    encode_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Quantization and data type
     dtype: str = "auto"
@@ -2273,6 +2274,13 @@ class ServerArgs:
             default=ServerArgs.mm_transfer_backend,
             choices=MM_TRANSFER_BACKEND_CHOICES,
             help="The backend for encoder disaggregation transfer. Default is zmq.",
+        )
+        parser.add_argument(
+            "--encode-urls",
+            nargs="+",
+            type=str,
+            default=[],
+            help="List of encode urls for encoder disaggregation",
         )
 
         # Quantization and data type
