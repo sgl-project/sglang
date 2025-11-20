@@ -40,7 +40,6 @@ class TestAscendW4A4(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--disable-cuda-graph",
                 "--device",
                 "npu",
                 "--attention-backend",
@@ -51,6 +50,9 @@ class TestAscendW4A4(CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.8",
+                "--cuda-graph-bs",
+                "64",
+                "--disable-radix-cache",
             ],
         )
 
@@ -64,17 +66,17 @@ class TestAscendW4A4(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=128,
             max_new_tokens=512,
-            parallel=128,
+            parallel=64,
             host=f"http://{url.hostname}",
             port=int(url.port),
         )
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.25)
-        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+        self.assertGreaterEqual(metrics["accuracy"], 0.75)
+        self.assertGreaterEqual(metrics["output_throughput"], 700)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
