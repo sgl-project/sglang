@@ -1947,6 +1947,13 @@ class Scheduler(
                 model_worker_batch = batch_or_worker_batch
                 self.record_batch_in_overlap(model_worker_batch)
                 forward_batch.record_stream(self.forward_stream)
+                if self.model_worker.can_run_graph(forward_batch):
+                    skip_attn_backend_init = True
+                    self.model_worker.model_runner.graph_runner.replay_prepare(
+                        forward_batch, None
+                    )
+                else:
+                    skip_attn_backend_init = False
 
                 # Sampling info will be modified during forward
                 model_worker_batch.sampling_info = (
@@ -1960,7 +1967,8 @@ class Scheduler(
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(forward_batch)
                     batch_result = self.model_worker.forward_batch_generation(
-                        forward_batch
+                        forward_batch,
+                        skip_attn_backend_init=skip_attn_backend_init,
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(

@@ -325,6 +325,16 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
+    def can_run_graph(self, forward_batch: ForwardBatch):
+        mode_check = (
+            forward_batch.forward_mode.is_cpu_graph
+            if self.device == "cpu"
+            else forward_batch.forward_mode.is_cuda_graph
+        )
+        if graph_runner := self.model_runner.graph_runner:
+            return mode_check() and graph_runner.can_run(forward_batch)
+        return False
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
