@@ -101,7 +101,7 @@
                 "TextEncodingStage": 87.36,
                 "ConditioningStage": 0.024,
                 "TimestepPreparationStage": 2.53,
-                "LatentPreparationStage": 4.95,
+                "LatentPreparationStage": 6.21,
                 "DenoisingStage": 8161.97,
                 "DecodingStage": 378.21
             },
@@ -224,7 +224,7 @@
                 "LatentPreparationStage": 10.0,
                 "ImageVAEEncodingStage": 2031.0,
                 "DenoisingStage": 278000.0,
-                "DecodingStage": 2700.0
+                "DecodingStage": 2849.6
             },
             "denoise_step_ms": {
                 "0": 24000.0,
@@ -302,7 +302,7 @@
                 "TextEncodingStage": 2321.27,
                 "ImageEncodingStage": 3244.34,
                 "ConditioningStage": 0.0234,
-                "TimestepPreparationStage": 1.98,
+                "TimestepPreparationStage": 2.73,
                 "LatentPreparationStage": 5.24,
                 "ImageVAEEncodingStage": 1887.64,
                 "DenoisingStage": 245826.78,
