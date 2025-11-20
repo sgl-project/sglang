@@ -23,6 +23,10 @@ enum coll_state {
   coll_allgather_naive__copy_in_done,
   coll_alt1_allgather_naive__copy_in_done,
   coll_alt2_allgather_naive__copy_in_done,
+  coll_reduce_scatter_naive__copy_in_done,
+  coll_reduce_scatter_naive__reduce_done,
+  coll_alt1_reduce_scatter_naive__copy_in_done,
+  coll_alt2_reduce_scatter_naive__copy_in_done,
 };
 
 // SHM building blocks
@@ -72,17 +76,32 @@ static int world_size;
 #define NAIVE_ALLREDUCE_THRESHOLD 1048576
 #define SHM_BUFFER_NAME "deepspeed_allreduce_buffer"
 struct allreduce_workspace {
-  enum coll_state states[2];  // idx=0 -- state for symmetric_naive_all_reduce
+  enum coll_state states[5];  // idx=0 -- state for symmetric_naive_all_reduce
                               // idx=1 -- state for distributed_naive_all_reduce
+                              // idx=2 -- state for all_gather
+                              // idx=3 -- state for all_gather_into_tensor
+                              // idx=4 -- state for reduce_scatter
   // double buffer to avoid syncing between rounds
   // offset=0 -- 2*NAIVE_ALLREDUCE_THRESHOLD : buffer for
   // symmetric_naive_all_reduce after that : buffer for
   // distributed_naive_all_reduce
-  char buffer[2 * NAIVE_ALLREDUCE_THRESHOLD + 2 * MAX_BUF_SIZE];
+  char buffer
+      [2 * NAIVE_ALLREDUCE_THRESHOLD +  // symmetric allreduce
+       2 * MAX_BUF_SIZE +               // distributed naive reduce
+       2 * MAX_BUF_SIZE +               // allgather
+       2 * MAX_BUF_SIZE +               // allgather_into_tensor
+       2 * MAX_BUF_SIZE                 // reduce_scatter
+  ];
 };
 
 #define BUFFER0_OFFSET(current_buffer) current_buffer* NAIVE_ALLREDUCE_THRESHOLD
 #define BUFFER1_OFFSET(current_buffer) 2 * NAIVE_ALLREDUCE_THRESHOLD + current_buffer* MAX_BUF_SIZE
+#define BUFFER2_OFFSET(current_buffer) \
+  (2 * NAIVE_ALLREDUCE_THRESHOLD + 2 * MAX_BUF_SIZE + current_buffer * MAX_BUF_SIZE)  // allgather
+#define BUFFER3_OFFSET(current_buffer) \
+  (2 * NAIVE_ALLREDUCE_THRESHOLD + 4 * MAX_BUF_SIZE + current_buffer * MAX_BUF_SIZE)  // allgather_into_tensor
+#define BUFFER4_OFFSET(current_buffer) \
+  (2 * NAIVE_ALLREDUCE_THRESHOLD + 6 * MAX_BUF_SIZE + current_buffer * MAX_BUF_SIZE)  // reduce_scatter
 
 struct allreduce_workspace** workspace;
 
@@ -90,6 +109,10 @@ struct allreduce_workspace** workspace;
 char** symmetric_buffer[2];
 // buffer for large messages, double buffer
 char** distributed_buffer[2];
+
+char** allgather_buffer[2];
+char** allgather_into_tensor_buffer[2];
+char** reduce_scatter_buffer[2];
 
 void wait_buffer_state_until_2(int index, enum coll_state state0, enum coll_state state1, int state_group) {
   volatile enum coll_state* state_ptr = &(workspace[index]->states[state_group]);
@@ -413,8 +436,13 @@ void shm_initialize(int size, int rank, const char* addr_string, const char* por
   snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, rank);
   shared_create(&allreduce_buffer, shm_name, workspace_buf, sizeof(struct allreduce_workspace));
   workspace_buf = (struct allreduce_workspace*)allreduce_buffer.bytes;
-  workspace_buf->states[0] = coll_alt2_allreduce_naive__copy_in_done;
-  workspace_buf->states[1] = coll_begin;
+  workspace_buf->states[STATE_GROUP_SYMMETRIC_ALLREDUCE] =
+      coll_alt2_allreduce_naive__copy_in_done;                            // symmetric_naive_all_reduce
+  workspace_buf->states[STATE_GROUP_DISTRIBUTED_ALLREDUCE] = coll_begin;  // distributed_naive_reduce
+  workspace_buf->states[STATE_GROUP_ALL_GATHER] = coll_alt2_allgather_naive__copy_in_done;  // all_gather
+  workspace_buf->states[STATE_GROUP_ALL_GATHER_INTO_TENSOR] =
+      coll_alt2_allgather_naive__copy_in_done;                     // all_gather_into_tensor
+  workspace_buf->states[STATE_GROUP_REDUCE_SCATTER] = coll_begin;  // reduce_scatter
 
   // create the workspace pointer list
   workspace = (struct allreduce_workspace**)malloc(size * sizeof(struct allreduce_workspace*));
@@ -422,6 +450,15 @@ void shm_initialize(int size, int rank, const char* addr_string, const char* por
   symmetric_buffer[1] = (char**)malloc(size * sizeof(char**));
   distributed_buffer[0] = (char**)malloc(size * sizeof(char**));
   distributed_buffer[1] = (char**)malloc(size * sizeof(char**));
+
+  allgather_buffer[0] = (char**)malloc(size * sizeof(char*));
+  allgather_buffer[1] = (char**)malloc(size * sizeof(char*));
+
+  allgather_into_tensor_buffer[0] = (char**)malloc(size * sizeof(char*));
+  allgather_into_tensor_buffer[1] = (char**)malloc(size * sizeof(char*));
+
+  reduce_scatter_buffer[0] = (char**)malloc(size * sizeof(char*));
+  reduce_scatter_buffer[1] = (char**)malloc(size * sizeof(char*));
 
   // map shm of all ranks
   for (int i = 0; i < size; i++) {
@@ -440,6 +477,15 @@ void shm_initialize(int size, int rank, const char* addr_string, const char* por
     symmetric_buffer[1][i] = workspace[i]->buffer + BUFFER0_OFFSET(1);
     distributed_buffer[0][i] = workspace[i]->buffer + BUFFER1_OFFSET(0);
     distributed_buffer[1][i] = workspace[i]->buffer + BUFFER1_OFFSET(1);
+
+    allgather_buffer[0][i] = workspace[i]->buffer + BUFFER2_OFFSET(0);
+    allgather_buffer[1][i] = workspace[i]->buffer + BUFFER2_OFFSET(1);
+
+    allgather_into_tensor_buffer[0][i] = workspace[i]->buffer + BUFFER3_OFFSET(0);
+    allgather_into_tensor_buffer[1][i] = workspace[i]->buffer + BUFFER3_OFFSET(1);
+
+    reduce_scatter_buffer[0][i] = workspace[i]->buffer + BUFFER4_OFFSET(0);
+    reduce_scatter_buffer[1][i] = workspace[i]->buffer + BUFFER4_OFFSET(1);
   }
 }
 
@@ -478,7 +524,7 @@ size_t slice_el_start(size_t chunk_el, int slice_idx) {
 }
 
 void symmetric_naive_all_reduce(char* data_ptr, c10::ScalarType scalar_type, size_t chunk_size, size_t chunk_el) {
-  const int state_group = 0;
+  const int state_group = STATE_GROUP_SYMMETRIC_ALLREDUCE;
   static int current_buffer = 0;
   static int state_idx = 0;
 
@@ -525,7 +571,7 @@ void symmetric_naive_all_reduce(char* data_ptr, c10::ScalarType scalar_type, siz
 
 // naive allreduce distributed, each rank do naive reduce on its slice
 void distributed_naive_reduce(char* data_ptr, c10::ScalarType scalar_type, size_t chunk_size, size_t chunk_el) {
-  const int state_group = 1;
+  const int state_group = STATE_GROUP_DISTRIBUTED_ALLREDUCE;
   static int current_buffer = 0;
   static int state_idx = 0;
 
@@ -602,10 +648,21 @@ void all_reduce_outer_loop(torch::Tensor& data, size_t numel, int data_size) {
   }
 }
 
+template <int STATE_GROUP>
 void naive_all_gather(char* result_ptr, char* data_ptr, size_t res_stride, size_t chunk_size, size_t chunk_el) {
-  const int state_group = 1;
   static int current_buffer = 0;
   static int state_idx = 0;
+
+  char*** buffer = nullptr;
+  if constexpr (STATE_GROUP == STATE_GROUP_ALL_GATHER) {
+    buffer = allgather_buffer;
+  } else if constexpr (STATE_GROUP == STATE_GROUP_ALL_GATHER_INTO_TENSOR) {
+    buffer = allgather_into_tensor_buffer;
+  } else {
+    static_assert(
+        STATE_GROUP == STATE_GROUP_ALL_GATHER || STATE_GROUP == STATE_GROUP_ALL_GATHER_INTO_TENSOR,
+        "Unsupported STATE_GROUP");
+  }
 
   // init states to case 0 to get rid of "maybe-uninitialized" warning.
   enum coll_state copy_current = coll_allgather_naive__copy_in_done;
@@ -629,20 +686,21 @@ void naive_all_gather(char* result_ptr, char* data_ptr, size_t res_stride, size_
   }
   state_idx = (state_idx + 1) % 3;
 
-  parallel_memcpy(distributed_buffer[current_buffer][world_rank], data_ptr, chunk_size);
+  parallel_memcpy(buffer[current_buffer][world_rank], data_ptr, chunk_size);
   std::atomic_thread_fence(std::memory_order_release);
-  workspace[world_rank]->states[state_group] = copy_current;
+  workspace[world_rank]->states[STATE_GROUP] = copy_current;
 
   for (int i = 0; i < world_size; i++) {
     // wait until all the other ranks copy the buffer
-    if (i != world_rank) wait_buffer_state_until_2(i, copy_current, copy_next, state_group);
+    if (i != world_rank) wait_buffer_state_until_2(i, copy_current, copy_next, STATE_GROUP);
   }
   for (int i = 0; i < world_size; i++) {
-    parallel_memcpy(result_ptr + i * res_stride, distributed_buffer[current_buffer][i], chunk_size);
+    parallel_memcpy(result_ptr + i * res_stride, buffer[current_buffer][i], chunk_size);
   }
   current_buffer = 1 - current_buffer;
 }
 
+template <int STATE_GROUP>
 torch::Tensor& all_gather(torch::Tensor& result, torch::Tensor& data, int dim, size_t numel, int data_size) {
   size_t dim_el = data.stride(dim) * data.size(dim);
   int dtype_size = data_size / numel;
@@ -654,7 +712,7 @@ torch::Tensor& all_gather(torch::Tensor& result, torch::Tensor& data, int dim, s
     for (size_t offset = 0; offset < dim_size; offset += MAX_BUF_SIZE) {
       size_t chunk_size = dim_size - offset > MAX_BUF_SIZE ? MAX_BUF_SIZE : dim_size - offset;
       size_t chunk_el = chunk_size / dtype_size;
-      naive_all_gather(
+      naive_all_gather<STATE_GROUP>(
           result_ptr + i * dim_size * world_size + offset,
           data_ptr + i * dim_size + offset,
           dim_size,
@@ -663,4 +721,79 @@ torch::Tensor& all_gather(torch::Tensor& result, torch::Tensor& data, int dim, s
     }
   }
   return result;
+}
+
+template torch::Tensor& all_gather<STATE_GROUP_ALL_GATHER>(torch::Tensor&, torch::Tensor&, int, size_t, int);
+template torch::Tensor&
+all_gather<STATE_GROUP_ALL_GATHER_INTO_TENSOR>(torch::Tensor&, torch::Tensor&, int, size_t, int);
+
+void naive_reduce_scatter(
+    char* output_ptr,
+    char* data_ptr,
+    c10::ScalarType scalar_type,
+    size_t chunk_size,
+    size_t chunk_el,
+    int element_size) {
+  const int state_group = STATE_GROUP_REDUCE_SCATTER;
+  static int current_buffer = 0;
+  static int state_idx = 0;
+
+  enum coll_state copy_current = coll_reduce_scatter_naive__copy_in_done;
+  enum coll_state copy_next = coll_alt1_reduce_scatter_naive__copy_in_done;
+
+  switch (state_idx) {
+    case 0:
+      copy_current = coll_reduce_scatter_naive__copy_in_done;
+      copy_next = coll_alt1_reduce_scatter_naive__copy_in_done;
+      break;
+    case 1:
+      copy_current = coll_alt1_reduce_scatter_naive__copy_in_done;
+      copy_next = coll_alt2_reduce_scatter_naive__copy_in_done;
+      break;
+    case 2:
+      copy_current = coll_alt2_reduce_scatter_naive__copy_in_done;
+      copy_next = coll_reduce_scatter_naive__copy_in_done;
+      break;
+    default:
+      assert(!"Should not get here.");
+  }
+  state_idx = (state_idx + 1) % 3;
+
+  // Step 1: copy local data to shared buffer
+  parallel_memcpy(reduce_scatter_buffer[current_buffer][world_rank], data_ptr, chunk_size);
+  std::atomic_thread_fence(std::memory_order_release);
+  workspace[world_rank]->states[state_group] = copy_current;
+
+  // Step 2: wait for all ranks to copy in
+  for (int i = 0; i < world_size; i++) {
+    if (i != world_rank) wait_buffer_state_until_2(i, copy_current, copy_next, state_group);
+  }
+
+  // // Step 3: do local reduce on this rank’s slice only
+  int start_el = slice_el_start(chunk_el, world_rank);
+  // each rank reduce its slice of buffer independently so therre is no need for
+  // synchronization afterward
+  reduce_all_buffers(
+      start_el,
+      slice_size(chunk_el, world_rank),
+      scalar_type,
+      world_rank,
+      output_ptr -
+          start_el * element_size,  // in reduce_all_buffers, the output_ptr is the buffer for all ranks, but here
+                                    // output_ptr is already the local buffer for one rank. Adjust it here.
+      reduce_scatter_buffer[current_buffer]);
+
+  // done
+  current_buffer = 1 - current_buffer;
+}
+
+void reduce_scatter_outer_loop(torch::Tensor& output, torch::Tensor& data, size_t numel, int data_size) {
+  for (int offset = 0; offset < data_size; offset += MAX_BUF_SIZE) {
+    auto data_ptr = ((char*)(data.data_ptr()) + offset);
+    auto output_ptr = ((char*)(output.data_ptr()) + offset);
+    size_t chunk_size = std::min((size_t)MAX_BUF_SIZE, (size_t)(data_size - offset));
+    size_t chunk_el = chunk_size / (data_size / numel);
+
+    naive_reduce_scatter(output_ptr, data_ptr, data.scalar_type(), chunk_size, chunk_el, data.element_size());
+  }
 }
