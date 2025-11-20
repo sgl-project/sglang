@@ -109,10 +109,9 @@ class TestDeepseek_w8a8(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=3000,
             other_args=other_args,
-            env=env,
-            timeout=3000,  
+            env=env, 
         )
 
     @classmethod
