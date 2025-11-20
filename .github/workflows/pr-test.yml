@@ -55,6 +55,18 @@ jobs:
               - "python/*.toml"
               - ".github/workflows/pr-test.yml"
 
+      - name: Show filter results in summary (table)
+        run: |
+          {
+            echo "## Change Detection"
+            echo ""
+            echo "| Component       | Changed |"
+            echo "|----------------|---------|"
+            echo "| main_package   | ${{ steps.filter.outputs.main_package }} |"
+            echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel }} |"
+            echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
   # =============================================== sgl-kernel ====================================================
 
   sgl-kernel-build-wheels:
@@ -244,8 +256,6 @@ jobs:
 
           echo "All benchmark tests completed!"
 
-  # =============================================== multimodal_gen ====================================================
-
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
   # cuda13-kernel-smoke-test:
@@ -310,15 +320,10 @@ jobs:
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
 
   multimodal-gen-test:
-    needs: [check-changes, stage-a-test-1, sgl-kernel-build-wheels]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: (always() && !failure() && !cancelled()) && needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -343,7 +348,7 @@ jobs:
           pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_performance.py
 
   unit-test-backend-1-gpu:
-    needs: [check-changes, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -377,7 +382,7 @@ jobs:
           python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
   unit-test-backend-2-gpu:
-    needs: [check-changes, unit-test-backend-1-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-1-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
@@ -410,7 +415,7 @@ jobs:
           python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-h100
@@ -443,7 +448,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu-h200:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
@@ -476,7 +481,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-backend-8-gpu-h20:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h20
@@ -510,7 +515,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
-    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -571,7 +576,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
   performance-test-1-gpu-part-2:
-    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -624,7 +629,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-1-gpu-part-3:
-    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -670,13 +675,8 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   performance-test-2-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
@@ -735,7 +735,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels, stage-a-test-1]
+    needs: [check-changes, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 1-gpu-runner
@@ -767,7 +767,7 @@ jobs:
           python3 test_eval_accuracy_large.py
 
   accuracy-test-2-gpu:
-    needs: [check-changes, accuracy-test-1-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, accuracy-test-1-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 2-gpu-runner
@@ -799,7 +799,7 @@ jobs:
           python3 test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-h100
@@ -828,7 +828,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep
 
   unit-test-deepep-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
@@ -857,7 +857,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
 
   unit-test-backend-4-gpu-b200:
-    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 4-gpu-b200
