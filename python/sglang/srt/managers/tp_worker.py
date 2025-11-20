@@ -50,7 +50,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
-from python.sglang.srt.managers.io_struct import ModelWorkerTask
+from sglang.srt.managers.io_struct import ModelWorkerTask
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
