@@ -205,7 +205,7 @@ class MMReceiver:
                 img_data = [img.url for img in img_data]
             asyncio.create_task(self.encode(req_id, img_data, "encode", "send"))
             return await asyncio.wait_for(
-                self._recv_mm_data(req_id, mm_processor, prompt), timeout=10
+                self._recv_mm_data(req_id, mm_processor, prompt), timeout=20
             )
         except asyncio.TimeoutError:
             logger.warning(f"Embedding recv timeout for request {req_id}")
