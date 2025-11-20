@@ -194,7 +194,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
-from python.sglang.srt.managers.io_struct import ModelWorkerTask, ModelWorkerTaskOutput
+from sglang.srt.managers.io_struct import ModelWorkerTask, ModelWorkerTaskOutput
 
 logger = logging.getLogger(__name__)
 
