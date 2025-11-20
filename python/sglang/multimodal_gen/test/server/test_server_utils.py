@@ -324,9 +324,9 @@ class PerformanceValidator:
         upper_bound = max(rel_limit, abs_limit)
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
-            f"  - Actual:   {actual:.4f}ms\n"
-            f"  - Expected: {expected:.4f}ms\n"
-            f"  - Limit:    {upper_bound:.4f}ms "
+            f"  Actual:   {actual:.4f}ms\n"
+            f"  Expected: {expected:.4f}ms\n"
+            f"  Limit:    {upper_bound:.4f}ms "
             f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
         )
 
