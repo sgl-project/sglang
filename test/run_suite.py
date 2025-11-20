@@ -14,16 +14,7 @@ HW_MAPPING = {
 LABEL_MAPPING = {
     HWBackend.CPU: ["default"],
     HWBackend.AMD: ["stage-a-test-1"],
-    HWBackend.CUDA: [
-        "stage-a-test-1",
-        "stage-a-test-2",
-        "stage-b-test-small-1-gpu",
-        "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
-        "stage-c-test-large-1-gpu",
-        "stage-c-test-large-2-gpu",
-        "stage-c-test-large-4-gpu",
-    ],
+    HWBackend.CUDA: ["stage-a-test-1"],
 }
 
 
@@ -39,51 +30,10 @@ def _filter_tests(
     return ret
 
 
-def auto_partition(files, rank, size):
-    """
-    Partition files into size sublists with approximately equal sums of estimated times
-    using stable sorting, and return the partition for the specified rank.
-    """
-    weights = [f.estimated_time for f in files]
-
-    if not weights or size <= 0 or size > len(weights):
-        return []
-
-    # Create list of (weight, original_index) tuples
-    indexed_weights = [(w, -i) for i, w in enumerate(weights)]
-    # Stable sort in descending order by weight
-    indexed_weights = sorted(indexed_weights, reverse=True)
-
-    # Extract original indices (negate back to positive)
-    indexed_weights = [(w, -i) for w, i in indexed_weights]
-
-    # Initialize partitions and their sums
-    partitions = [[] for _ in range(size)]
-    sums = [0.0] * size
-
-    # Greedy approach: assign each weight to partition with smallest current sum
-    for weight, idx in indexed_weights:
-        min_sum_idx = sums.index(min(sums))
-        partitions[min_sum_idx].append(idx)
-        sums[min_sum_idx] += weight
-
-    # Return the files corresponding to the indices in the specified rank's partition
-    indices = partitions[rank]
-    return [files[i] for i in indices]
-
-
-def run_per_commit(
-    hw: HWBackend,
-    suite: str,
-    auto_partition_id: int = None,
-    auto_partition_size: int = None,
-):
+def run_per_commit(hw: HWBackend, suite: str):
     files = glob.glob("per_commit/**/*.py", recursive=True)
     ci_tests = _filter_tests(collect_tests(files), hw, suite)
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
-
-    if auto_partition_size:
-        test_files = auto_partition(test_files, auto_partition_id, auto_partition_size)
 
     run_unittest_files(
         test_files,
@@ -107,19 +57,9 @@ def main():
         required=True,
         help="Test suite to run.",
     )
-    parser.add_argument(
-        "--auto-partition-id",
-        type=int,
-        help="Use auto load balancing. The part id.",
-    )
-    parser.add_argument(
-        "--auto-partition-size",
-        type=int,
-        help="Use auto load balancing. The number of parts.",
-    )
     args = parser.parse_args()
     hw = HW_MAPPING[args.hw]
-    run_per_commit(hw, args.suite, args.auto_partition_id, args.auto_partition_size)
+    run_per_commit(hw, args.suite)
 
 
 if __name__ == "__main__":
