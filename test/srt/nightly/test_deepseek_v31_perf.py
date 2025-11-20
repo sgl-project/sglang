@@ -14,7 +14,8 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
         cls.model = DEEPSEEK_V31_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 16, 64]
-        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
+        # Test both 4k and 32k input lengths
+        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096,32768"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
         # Define variant configurations
@@ -55,32 +56,18 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
         cls.runner.setup_profile_directory()
 
     def test_bench_one_batch(self):
-        failed_variants = []
+        results, success = self.runner.run_benchmark_for_model(
+            model_path=self.model,
+            batch_sizes=self.batch_sizes,
+            input_lens=self.input_lens,
+            output_lens=self.output_lens,
+            other_args=self.other_args,
+        )
 
-        try:
-            for variant_config in self.variants:
-                with self.subTest(variant=variant_config["name"]):
-                    results, success = self.runner.run_benchmark_for_model(
-                        model_path=self.model,
-                        batch_sizes=self.batch_sizes,
-                        input_lens=self.input_lens,
-                        output_lens=self.output_lens,
-                        other_args=variant_config["other_args"],
-                        variant=variant_config["name"],
-                    )
+        self.runner.write_final_report()
 
-                    if not success:
-                        failed_variants.append(variant_config["name"])
-
-                    self.runner.add_report(results)
-        finally:
-            self.runner.write_final_report()
-
-        if failed_variants:
-            raise AssertionError(
-                f"Benchmark failed for {self.model} with the following variants: "
-                f"{', '.join(failed_variants)}"
-            )
+        if not success:
+            raise AssertionError(f"Benchmark failed for {self.model}")
 
 
 if __name__ == "__main__":
