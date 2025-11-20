@@ -45,7 +45,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     import aiter
-    #from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
+
+    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
     from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
     from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 

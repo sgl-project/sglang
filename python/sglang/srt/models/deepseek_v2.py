@@ -167,8 +167,10 @@ _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
+    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
+    )
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
-    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
 
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
@@ -1818,12 +1820,12 @@ class DeepseekV2AttentionMLA(nn.Module):
 
                     q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=q_nope,
-                        WQ=self.w_kc.transpose(-1, -2),          
+                        WQ=self.w_kc.transpose(-1, -2),
                         w_scale=self.w_scale,
                         group_size=128,
-                        YQ=None,                                 # allocate (B, M, N)
-                        transpose_bm=False,                      # (B, M, N)
-                        transpose_bm_in=True,                    # (M, B, K)
+                        YQ=None,  # allocate (B, M, N)
+                        transpose_bm=False,  # (B, M, N)
+                        transpose_bm_in=True,  # (M, B, K)
                         dtype=torch.bfloat16,
                     )
 
@@ -2200,11 +2202,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                         q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                             X=q_nope,
                             WQ=self.w_kc.transpose(-1, -2),
-                            w_scale=self.w_scale,                    # 
+                            w_scale=self.w_scale,  #
                             group_size=128,
-                            YQ=None,                                 # allocate (B, M, N) 
-                            transpose_bm=False,                      # (B, M, N)
-                            transpose_bm_in=True,                    # (M, B, K)
+                            YQ=None,  # allocate (B, M, N)
+                            transpose_bm=False,  # (B, M, N)
+                            transpose_bm_in=True,  # (M, B, K)
                             dtype=torch.bfloat16,
                         )
                     else:
