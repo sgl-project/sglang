@@ -232,6 +232,7 @@ suites = {
     "__not_in_ci__": [
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
+        TestFile("test_eval_accuracy_large.py"),
     ],
 }
 
