@@ -41,7 +41,7 @@ jobs:
 
   build-and-test:
     needs: [check-changes]
-    if: github.event_name != 'pull_request' || needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: intel-bmg
     env:
       HF_HOME: /home/sdp/.cache/huggingface
