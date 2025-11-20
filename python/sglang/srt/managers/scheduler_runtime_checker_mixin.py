@@ -77,7 +77,7 @@ class SchedulerRuntimeCheckerMixin:
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         return memory_leak, token_msg
 
-    def _check_runtime_mem_leak(self: Scheduler):
+    def self_check_during_busy(self: Scheduler):
         current_batch: ScheduleBatch = self.last_batch
 
         if current_batch is None:
