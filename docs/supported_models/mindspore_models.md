@@ -6,8 +6,8 @@ MindSpore is a high-performance AI framework optimized for Ascend NPUs. This doc
 
 ## Requirements
 
-MindSpore currently only supports Ascend NPU devices. Users need to first install Ascend CANN software packages.
-The CANN software packages can be downloaded from the [Ascend Official Website](https://www.hiascend.com). The recommended version is 8.3.RC2.
+MindSpore currently only support Ascend NPU devices. Users need to first install Ascend CANN software packages.
+The CANN software packages can download from the [Ascend Official Website](https://www.hiascend.com). The recommended version is 8.3.RC1.
 
 ## Supported Models
 
@@ -27,6 +27,22 @@ cd sgl-mindspore
 pip install -e .
 ```
 
+<<<<<<< HEAD:docs/supported_models/mindspore_models.md
+=======
+You will need to install the following packages.
+
+```shell
+pip install "mindspore==2.7.1"
+pip install "torch==2.8"
+pip install "torch_npu==2.8"
+pip install triton_ascend
+```
+
+```shell
+cp python/pyproject_other.toml python/pyproject.toml
+pip install -e "python[all_npu]"
+```
+>>>>>>> edeb18c8b (update doc):docs/references/mindspore_models.md
 
 ## Run Model
 
