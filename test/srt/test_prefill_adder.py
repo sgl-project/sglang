@@ -226,7 +226,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
         self.assertIn(running_reqs[3], adder.preempt_list)
-        self.assertEqual(adder.rem_total_token_offset, 175) # 50 + 75 + 100 + 125 + 125 - 125 = 350
+        self.assertEqual(adder.rem_total_token_offset, 375) # 50 + 75 + 100 + 125 + 125 - 100 = 375
         running_batch.release_req.assert_called_once()
 
 if __name__ == "__main__":
