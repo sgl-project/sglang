@@ -170,7 +170,7 @@ class CUDAPiecewiseBackend:
         #     return entry.runnable(*args)
 
         if entry.cudagraph is None:
-            if entry.num_finished_warmup < 2:  # noqa
+            if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
