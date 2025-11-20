@@ -97,25 +97,69 @@
         },
         "flux_image_t2i": {
             "stages_ms": {
-                "InputValidationStage": 0.08,
-                "TextEncodingStage": 87.36,
-                "ConditioningStage": 0.024,
-                "TimestepPreparationStage": 2.53,
-                "LatentPreparationStage": 6.21,
-                "DenoisingStage": 8161.97,
-                "DecodingStage": 378.21
+                "InputValidationStage": 1.06,
+                "TextEncodingStage": 56.29,
+                "ConditioningStage": 0.01,
+                "TimestepPreparationStage": 1.91,
+                "LatentPreparationStage": 4.92,
+                "DenoisingStage": 8154.07,
+                "DecodingStage": 302.01
             },
             "denoise_step_ms": {
-                "0": 56.16,
-                "10": 163.54,
-                "20": 165.94,
-                "29": 165.26,
-                "39": 165.16,
-                "49": 165.36
+                "0": 56.03,
+                "1": 57.19,
+                "2": 162.79,
+                "3": 162.71,
+                "4": 163.85,
+                "5": 163.34,
+                "6": 170.21,
+                "7": 165.57,
+                "8": 163.95,
+                "9": 164.27,
+                "10": 163.75,
+                "11": 163.55,
+                "12": 166.11,
+                "13": 166.15,
+                "14": 166.15,
+                "15": 164.95,
+                "16": 163.63,
+                "17": 164.53,
+                "18": 165.59,
+                "19": 165.06,
+                "20": 165.73,
+                "21": 164.28,
+                "22": 164.29,
+                "23": 165.02,
+                "24": 165.53,
+                "25": 164.88,
+                "26": 165.92,
+                "27": 164.68,
+                "28": 164.75,
+                "29": 165.02,
+                "30": 164.16,
+                "31": 164.61,
+                "32": 165.43,
+                "33": 165.0,
+                "34": 164.6,
+                "35": 164.78,
+                "36": 165.14,
+                "37": 164.53,
+                "38": 165.46,
+                "39": 165.48,
+                "40": 164.8,
+                "41": 166.22,
+                "42": 166.08,
+                "43": 164.82,
+                "44": 165.29,
+                "45": 165.72,
+                "46": 165.4,
+                "47": 165.57,
+                "48": 164.96,
+                "49": 166.05
             },
-            "expected_e2e_ms": 8764.73,
-            "expected_avg_denoise_ms": 160.79,
-            "expected_median_denoise_ms": 165.14
+            "expected_e2e_ms": 8677.09,
+            "expected_avg_denoise_ms": 160.67,
+            "expected_median_denoise_ms": 164.96
         },
         "qwen_image_edit_ti2i": {
             "notes": "single uploaded reference image, Qwen/Qwen-Image-Edit",
@@ -235,7 +279,6 @@
                 "39": 7000.0
             }
         },
-
         "wan2_1_i2v_14b_480P": {
             "stages_ms": {
                 "per_frame_generation": null
