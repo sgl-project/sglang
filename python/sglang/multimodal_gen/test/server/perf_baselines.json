@@ -232,7 +232,7 @@
         "wan2_1_t2v_1.3b": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
-                "TextEncodingStage": 2352.7,
+                "TextEncodingStage": 2945.3,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.97,
                 "LatentPreparationStage": 6.85,
@@ -350,7 +350,7 @@
                 "38": 4897.7,
                 "39": 4888.4
             },
-            "expected_e2e_ms": 238587.95,
+            "expected_e2e_ms": 257132.95,
             "expected_avg_denoise_ms": 5791.06,
             "expected_median_denoise_ms": 4900.59
         },
@@ -418,7 +418,7 @@
             "stages_ms": {
                 "InputValidationStage": 53.67,
                 "TextEncodingStage": 2228.89,
-                "ImageEncodingStage": 1908.14,
+                "ImageEncodingStage": 2694.14,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 2.25,
                 "LatentPreparationStage": 5.27,
