@@ -53,13 +53,13 @@ class TestVLMModels(CustomTestCase):
 
     def _detect_eviction_in_logs(self, log_output: str) -> tuple[bool, int]:
         """Detect if eviction events occurred in the log output."""
-        eviction_keywords = ["Cache eviction"]
+        eviction_keyword = "Cache eviction"
 
         eviction_detected = False
         eviction_count = 0
 
         for line in log_output.split("\n"):
-            if any(keyword in line for keyword in eviction_keywords):
+            if eviction_keyword in line:
                 eviction_detected = True
                 eviction_count += 1
                 print(f"Eviction detected: {line.strip()}")
