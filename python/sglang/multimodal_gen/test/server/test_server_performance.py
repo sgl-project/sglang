@@ -607,7 +607,6 @@ the "scenarios" section of perf_baselines.json:
 "{case.id}": {json.dumps(baseline, indent=4)}
 
 """
-        print(output)
         logger.error(output)
 
     def test_diffusion_perf(
