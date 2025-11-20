@@ -26,9 +26,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Checkout code
-    - uses: actions/checkout@v4
-
     - name: Download artifacts
       if: ${{ inputs.download_kernel_artifacts == 'true' }}
       uses: actions/download-artifact@v4

@@ -297,6 +297,8 @@ jobs:
     env:
       RUNNER_LABELS: 1-gpu-runner
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Setup CUDA Unit Test Environment
         uses: ./.github/actions/setup-cuda-ut
         with:
@@ -321,6 +323,8 @@ jobs:
     if: (always() && !failure() && !cancelled()) && needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 1-gpu-runner
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Setup CUDA Unit Test Environment
         uses: ./.github/actions/setup-cuda-ut
         with:
@@ -346,6 +350,8 @@ jobs:
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Setup CUDA Unit Test Environment
         uses: ./.github/actions/setup-cuda-ut
         with:
