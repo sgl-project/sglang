@@ -11,6 +11,7 @@ in a functional manner, reducing the need for explicit parameter passing.
 
 from __future__ import annotations
 
+import os
 import pprint
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -186,6 +187,18 @@ class Req:
         # Adjust batch size for number of videos per prompt
         batch_size *= self.num_outputs_per_prompt
         return batch_size
+
+    def output_file_path(self, num_outputs, output_idx):
+        output_file_name = self.output_file_name
+        if num_outputs > 1 and output_file_name:
+            base, ext = os.path.splitext(output_file_name)
+            output_file_name = f"{base}_{output_idx}{ext}"
+
+        return (
+            os.path.join(self.output_path, output_file_name)
+            if output_file_name
+            else None
+        )
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
