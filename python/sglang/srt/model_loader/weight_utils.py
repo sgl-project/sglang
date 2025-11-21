@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -257,6 +258,133 @@ def get_quant_config(
         return quant_cls.from_config(config)
 
 
+def _validate_safetensors_file(file_path: str) -> bool:
+    """
+    Validate that a safetensors file is readable and not corrupted.
+
+    Args:
+        file_path: Path to the safetensors file
+
+    Returns:
+        True if the file is valid, False if corrupted
+    """
+    try:
+        # Attempt to open and read the header
+        # This will fail if the file is corrupted or incomplete
+        with safetensors.safe_open(file_path, framework="pt", device="cpu") as f:
+            # Just accessing the keys validates the header is readable
+            _ = list(f.keys())
+        return True
+    except Exception as e:
+        logger.warning(
+            "Corrupted safetensors file detected: %s - %s: %s",
+            file_path,
+            type(e).__name__,
+            str(e),
+        )
+        return False
+
+
+def _validate_sharded_model(
+    snapshot_dir: str, weight_files: List[str]
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validate that all model shards are present and not corrupted.
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+        weight_files: List of weight file paths
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    # Pattern for sharded files: model-00001-of-00009.safetensors
+    shard_pattern = re.compile(r"(.*?)-(\d+)-of-(\d+)\.(safetensors|bin)")
+
+    # Group files by shard pattern (prefix-*-of-N)
+    shard_groups = {}
+    for f in weight_files:
+        base_name = os.path.basename(f)
+        match = shard_pattern.match(base_name)
+        if match:
+            prefix = match.group(1)
+            total_shards_str = match.group(3)
+            suffix = match.group(4)
+
+            group_key = f"{prefix}-of-{total_shards_str}.{suffix}"
+            if group_key not in shard_groups:
+                shard_groups[group_key] = {
+                    "prefix": prefix,
+                    "total": int(total_shards_str),
+                    "suffix": suffix,
+                    "found_shards": [],
+                    "files": [],
+                }
+
+            shard_id = int(match.group(2))
+            shard_groups[group_key]["found_shards"].append(shard_id)
+            shard_groups[group_key]["files"].append(f)
+
+    # Validate each shard group
+    for group_key, group_info in shard_groups.items():
+        total_shards = group_info["total"]
+        found_shards = set(group_info["found_shards"])
+        expected_shards = set(range(1, total_shards + 1))
+
+        # Check for missing shards
+        missing_shards = expected_shards - found_shards
+        if missing_shards:
+            return False, f"Missing shards in {group_key}: {sorted(missing_shards)}"
+
+        # Validate safetensors files for corruption
+        if group_info["suffix"] == "safetensors":
+            for f in group_info["files"]:
+                if not _validate_safetensors_file(f):
+                    return False, f"Corrupted shard file: {os.path.basename(f)}"
+
+        # Check for required index file for safetensors shards
+        if group_info["suffix"] == "safetensors":
+            index_file = os.path.join(
+                snapshot_dir, f"{group_info['prefix']}.safetensors.index.json"
+            )
+            if not os.path.exists(index_file):
+                return False, f"Missing index file: {os.path.basename(index_file)}"
+
+    return True, None
+
+
+def _cleanup_corrupted_model_cache(
+    model_name_or_path: str, snapshot_dir: str, reason: str
+) -> None:
+    """
+    Remove corrupted model cache directory to force a clean re-download.
+
+    Args:
+        model_name_or_path: Model identifier
+        snapshot_dir: Path to the snapshot directory
+        reason: Reason for cleanup
+    """
+    # Navigate up to the model root directory: snapshots/hash -> snapshots -> model_root
+    repo_folder = os.path.abspath(os.path.join(snapshot_dir, "..", ".."))
+
+    try:
+        logger.warning(
+            "Removing corrupted cache for %s at %s. Reason: %s",
+            model_name_or_path,
+            repo_folder,
+            reason,
+        )
+        shutil.rmtree(repo_folder)
+        logger.info("Successfully removed corrupted cache directory")
+    except Exception as e:
+        logger.error(
+            "Failed to remove corrupted cache directory %s: %s. "
+            "Manual cleanup may be required.",
+            repo_folder,
+            e,
+        )
+
+
 def find_local_hf_snapshot_dir(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -304,20 +432,30 @@ def find_local_hf_snapshot_dir(
         except Exception as e:
             logger.warning("Failed to find local snapshot in default HF cache: %s", e)
 
-    # if any incomplete file exists, force re-download by returning None
+    # Check for incomplete files and clean up if found
     if found_local_snapshot_dir:
         repo_folder = os.path.abspath(
             os.path.join(found_local_snapshot_dir, "..", "..")
         )
         blobs_dir = os.path.join(repo_folder, "blobs")
-        if os.path.isdir(blobs_dir) and glob.glob(
-            os.path.join(blobs_dir, "*.incomplete")
-        ):
+
+        # Check for incomplete download markers
+        incomplete_files = []
+        if os.path.isdir(blobs_dir):
+            incomplete_files = glob.glob(os.path.join(blobs_dir, "*.incomplete"))
+
+        if incomplete_files:
             logger.info(
-                "Found .incomplete files in %s for %s. "
-                "Considering local snapshot incomplete.",
+                "Found %d .incomplete files in %s for %s. "
+                "Will clean up and re-download.",
+                len(incomplete_files),
                 blobs_dir,
                 model_name_or_path,
+            )
+            _cleanup_corrupted_model_cache(
+                model_name_or_path,
+                found_local_snapshot_dir,
+                f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
             )
             return None
 
@@ -344,45 +482,39 @@ def find_local_hf_snapshot_dir(
         )
         local_weight_files = []
 
-    # After we have a list of valid files, check for sharded model completeness.
-    # Check if all safetensors with name model-{i}-of-{n}.safetensors exists
-    checked_sharded_model = False
-    for f in local_weight_files:
-        if checked_sharded_model:
-            break
-        base_name = os.path.basename(f)
-        # Regex for files like model-00001-of-00009.safetensors
-        match = re.match(r"(.*?)-([0-9]+)-of-([0-9]+)\.(.*)", base_name)
-        if match:
-            prefix = match.group(1)
-            shard_id_str = match.group(2)
-            total_shards_str = match.group(3)
-            suffix = match.group(4)
-            total_shards = int(total_shards_str)
+    # Validate sharded models and check for corruption
+    if local_weight_files:
+        is_valid, error_msg = _validate_sharded_model(
+            found_local_snapshot_dir, local_weight_files
+        )
+        if not is_valid:
+            logger.info(
+                "Validation failed for %s: %s. Will clean up and re-download.",
+                model_name_or_path,
+                error_msg,
+            )
+            _cleanup_corrupted_model_cache(
+                model_name_or_path, found_local_snapshot_dir, error_msg
+            )
+            return None
 
-            # Check if all shards are present
-            missing_shards = []
-            for i in range(1, total_shards + 1):
-                # Reconstruct shard name, preserving padding of original shard id
-                shard_name = (
-                    f"{prefix}-{i:0{len(shard_id_str)}d}-of-{total_shards_str}.{suffix}"
-                )
-                expected_path = os.path.join(found_local_snapshot_dir, shard_name)
-                # os.path.exists returns False for broken symlinks, which is desired.
-                if not os.path.exists(expected_path):
-                    missing_shards.append(shard_name)
-
-            if missing_shards:
-                logger.info(
-                    "Found incomplete sharded model %s. Missing shards: %s. "
-                    "Will attempt download.",
-                    model_name_or_path,
-                    missing_shards,
-                )
-                return None
-
-            # If we found and verified one set of shards, we are done.
-            checked_sharded_model = True
+        # Also validate single (non-sharded) safetensors files
+        for f in local_weight_files:
+            base_name = os.path.basename(f)
+            # Check if this is a single model file (not sharded)
+            if base_name in ["model.safetensors", "pytorch_model.safetensors"]:
+                if not _validate_safetensors_file(f):
+                    logger.info(
+                        "Corrupted model file %s for %s. Will clean up and re-download.",
+                        base_name,
+                        model_name_or_path,
+                    )
+                    _cleanup_corrupted_model_cache(
+                        model_name_or_path,
+                        found_local_snapshot_dir,
+                        f"Corrupted model file: {base_name}",
+                    )
+                    return None
 
     if len(local_weight_files) > 0:
         logger.info(
