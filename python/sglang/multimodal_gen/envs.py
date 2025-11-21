@@ -55,6 +55,12 @@ def _is_musa():
         return False
 
 
+def _is_npu():
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return True
+    return False
+
+
 def _is_mps():
     return torch.backends.mps.is_available()
 
@@ -305,7 +311,7 @@ def __dir__():
 def get_torch_distributed_backend() -> str:
     if torch.cuda.is_available():
         return "nccl"
-    elif torch.npu.is_available():
+    elif _is_npu():
         return "hccl"
     elif _is_musa():
         return "mccl"
@@ -320,7 +326,7 @@ def get_torch_distributed_backend() -> str:
 def get_device(local_rank: int) -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda", local_rank)
-    elif torch.npu.is_available():
+    elif _is_npu():
         return torch.device("npu", local_rank)
     elif _is_musa():
         return torch.device("musa", local_rank)
