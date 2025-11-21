@@ -1198,12 +1198,6 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
-        if param_data.shape != loaded_weight.shape:
-            logger.error(
-                f"[QuantizedRL Debug] Shape mismatch in QKVParallelLinear weight_loader: "
-                f"param_data.shape={param_data.shape}, loaded_weight.shape={loaded_weight.shape}, "
-                f"param dtype={param_data.dtype}, loaded dtype={loaded_weight.dtype}"
-            )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 

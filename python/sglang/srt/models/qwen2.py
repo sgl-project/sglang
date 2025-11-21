@@ -666,24 +666,15 @@ class Qwen2ForCausalLM(nn.Module):
         # Check if this is a reload scenario for RL training with quantized models
         is_reload = QuantizedRLModelLoader.is_reload_scenario(self)
         if is_reload:
-            logger.info(
-                "[Qwen2] ========== RELOAD SCENARIO - Using rebinding_and_load_weights =========="
-            )
+            logger.info("RELOAD SCENARIO - Using rebinding_and_load_weights")
             # Use the fast path for RL training reloads
             # quantize_fn and quant_profile are retrieved from model inside rebinding_and_load_weights
             QuantizedRLModelLoader.rebinding_and_load_weights(
                 self, self._load_weights_impl, weights
             )
-            logger.info("[Qwen2] ========== RELOAD COMPLETE ==========")
         else:
-            logger.info(
-                "[Qwen2] ========== INITIAL LOAD SCENARIO - Using standard _load_weights_impl =========="
-            )
             # Standard weight loading path
             self._load_weights_impl(weights)
-            logger.info(
-                "[Qwen2] ========== INITIAL LOAD COMPLETE (weights loaded, quantization happens next) =========="
-            )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

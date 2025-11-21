@@ -282,12 +282,6 @@ class RowvLLMParameter(BasevLLMParameter):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        if self.data.shape != loaded_weight.shape:
-            logger.error(
-                f"[Weight Loader] Shape mismatch in load_row_parallel_weight: "
-                f"param.shape={self.data.shape}, loaded_weight.shape={loaded_weight.shape}, "
-                f"input_dim={self.input_dim}"
-            )
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 

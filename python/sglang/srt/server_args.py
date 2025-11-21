@@ -234,7 +234,7 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
-    quant_profile_path: Optional[str] = None  # For flash_rl load format
+    rl_quant_profile: Optional[str] = None  # For flash_rl load format
     flash_rl_model: Optional[str] = (
         None  # Pre-quantized model for flash_rl initial load
     )
@@ -2027,7 +2027,7 @@ class ServerArgs:
         parser.add_argument(
             "--quant-profile-path",
             type=str,
-            default=ServerArgs.quant_profile_path,
+            default=ServerArgs.rl_quant_profile,
             help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
         )
         parser.add_argument(

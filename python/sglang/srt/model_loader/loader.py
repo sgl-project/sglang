@@ -702,18 +702,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
     Workflow:
       1. Initial load: Load base model → Record state → Apply FP8 quantization
-      2. VERL trains Actor in BF16 (full precision)
-      3. Reload: VERL sends BF16 weights → Quantize to FP8 → Copy to original memory
+      2. Training Actor in full precision
+      3. Reload: Trainer sends full precision weights → Quantize to FP8 → Copy to original memory
       4. Use torch.as_strided to preserve memory locations across reloads
 
     Usage:
       --model-path Qwen/Qwen2.5-7B --quantization fp8 --load-format flash_rl
-
-    Key features:
-      - Profile-free FP8 quantization (no calibration needed)
-      - Single model path for both training and inference
-      - Memory-efficient reloading preserves GPU memory layout
-      - Compatible with VERL's on-policy training workflow
     """
 
     # Parameter attributes to record for weight reloading
@@ -732,7 +726,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     SKIP_QUANTIZATION_PARAMS = [
         "weight_scale",
         "input_scale",
-        "output_scale",  # FP8 metadata
+        "output_scale",
         ".bias",
         "lm_head.weight",
         "model.norm.weight",
@@ -773,7 +767,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         )
 
     @staticmethod
-    def _bond_method_to_cls(func, obj):
+    def _bind_method_to_cls(func, obj):
         """Bind function to object instance (for weight_loader methods)."""
         import types
 
@@ -792,6 +786,13 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         original_weights = dict(model.named_parameters())
 
         # Record pre-quantization state (shape/stride) for torch.as_strided reset
+        assert hasattr(
+            model, "original_weights_rebuild_keys"
+        ), "original_weights_rebuild_keys attribute does not exist"
+        assert hasattr(
+            model, "recorded_loader"
+        ), "recorded_loader attribute does not exist"
+
         model.original_weights_rebuild_keys = {}
         for name, p in original_weights.items():
             model.original_weights_rebuild_keys[name] = {
@@ -923,6 +924,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 [],
             )
             rows_per_shard = scale_param.data.shape[-1] // len(shard_names)
+            if rows_per_shard * len(shard_names) != scale_param.data.shape[-1]:
+                logger.warning(
+                    f"Scale param shape {scale_param.data.shape[-1]} not divisible by {len(shard_names)}"
+                )
             offset = 0
             for idx, shard in enumerate(shard_names):
                 shard_id = (
@@ -984,7 +989,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                                 setattr(
                                     param,
                                     k,
-                                    QuantizedRLModelLoader._bond_method_to_cls(
+                                    QuantizedRLModelLoader._bind_method_to_cls(
                                         loader, param
                                     ),
                                 )
@@ -1008,9 +1013,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     skip in name
                     for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
                 ):
-                    logger.info(f"[QuantizedRL] Skip: {name} ({weight.dtype})")
-                    yield (name, weight)
-                elif "embed_tokens" in name or "lm_head" in name:
                     logger.info(f"[QuantizedRL] Skip: {name} ({weight.dtype})")
                     yield (name, weight)
                 elif weight.dtype in [torch.bfloat16, torch.float32, torch.float16]:
@@ -2550,14 +2552,14 @@ def get_model_loader(
         )
         logger.info(
             "FP8 approach: Model loads with native SGLang FP8 quantization. "
-            "Same model path for both training (VERL) and inference (SGLang)."
+            "Same model path for both training and inference."
         )
 
         # Set quantization to FP8 for native SGLang support
         if model_config and not model_config.quantization:
             logger.info(
                 "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
-                "Model will be loaded with FP8 infrastructure, weights reloaded from VERL."
+                "Model will be loaded with FP8 infrastructure"
             )
             model_config.quantization = "fp8"
 
