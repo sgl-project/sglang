@@ -29,28 +29,18 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
 
 1.  **Baseline**: run the benchmark (for a single generation task)
     ```bash
-    sglang generate --model-path <model> --prompt "A benchmark prompt" --perf-dump-path baseline.json
+    $ sglang generate --model-path <model> --prompt "A benchmark prompt" --perf-dump-path baseline.json
     ```
 
 2.  **New**: run the same benchmark, without modifying any server_args or sampling_params
     ```bash
-    sglang generate --model-path <model> --prompt "A benchmark prompt" --perf-dump-path new.json
+    $ sglang generate --model-path <model> --prompt "A benchmark prompt" --perf-dump-path new.json
     ```
 
-3.  **Compare**: generate the Markdown table.
+3.  **Compare**: run the compare script, which will print a Markdown table to the console
     ```bash
-    python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json
+    $ python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json
+    ### Performance Comparison Report
+    ...
     ```
-
-4.  **Paste**: Copy the output Markdown table into your PR description.
-
-### Example PR Description
-
-```markdown
-### Motivation
-Optimize the VAE decode stage by removing redundant GPU syncs
-
-
-### Performance Impact
-${your_generated_report}
-```
+4. **Paste**: paste the table into the PR description
