@@ -6,7 +6,6 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
-import asyncio
 import json
 import unittest
 import uuid
@@ -21,6 +20,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.utils import get_or_create_event_loop
 
 
 class _MockTokenizerManager:
@@ -389,11 +389,7 @@ class ServingChatTestCase(unittest.TestCase):
                     break
                 return line
 
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            loop = get_or_create_event_loop()
             line = loop.run_until_complete(collect_first_tool_chunk())
             self.assertIsNotNone(line)
             self.assertTrue(line.startswith("data: "))
@@ -568,11 +564,7 @@ class ServingChatTestCase(unittest.TestCase):
                     break
                 return line
 
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            loop = get_or_create_event_loop()
             line = loop.run_until_complete(collect_first_tool_chunk())
             self.assertIsNotNone(line)
             self.assertTrue(line.startswith("data: "))
