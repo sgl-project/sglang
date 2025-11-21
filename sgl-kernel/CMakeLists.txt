@@ -323,6 +323,7 @@ set(SOURCES
     "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
+    "csrc/moe/moe_topk_sigmoid_kernels.cu"
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"

@@ -6,9 +6,12 @@ import os
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from dateutil.tz import UTC
+
+import sglang
 
 
 def get_diffusion_perf_log_dir() -> str:
@@ -26,7 +29,10 @@ def get_diffusion_perf_log_dir() -> str:
         return os.path.abspath(log_dir)
     if log_dir is None:
         # Not set, use default
-        return os.path.join(os.path.expanduser("~/.cache/sglang"), "logs")
+        sglang_path = Path(sglang.__file__).resolve()
+        # .gitignore
+        target_path = (sglang_path.parent / "../../.cache/logs").resolve()
+        return str(target_path)
     # Is set, but is an empty string
     return ""
 

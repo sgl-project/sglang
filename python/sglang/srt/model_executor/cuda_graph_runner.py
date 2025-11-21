@@ -318,6 +318,10 @@ class CudaGraphRunner:
         # Graph inputs
         with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.input_embeds = torch.zeros(
+                (self.max_num_token, self.model_runner.model_config.hidden_size),
+                dtype=self.model_runner.model_config.dtype,
+            )
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32

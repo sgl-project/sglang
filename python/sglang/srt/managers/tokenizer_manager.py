@@ -41,7 +41,8 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.lora.lora_registry import LoRARegistry
+from sglang.srt.environ import envs
+from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -59,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetLoadReqInput,
     HealthCheckOutput,
+    LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
@@ -210,6 +212,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
+            if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:
+                import_processors(
+                    envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
+                )
             try:
                 _processor = get_processor(
                     server_args.tokenizer_path,
@@ -352,6 +358,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
+        # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
+        # point to their latest LoRARef objects, so that they can be
+        # dynamically loaded if needed for inference
+        self.lora_ref_cache: Dict[str, LoRARef] = {}
+        if self.server_args.lora_paths is not None:
+            for lora_ref in self.server_args.lora_paths:
+                self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
         # Disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -443,6 +456,51 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         async with self.model_update_lock.reader_lock:
             if self.server_args.enable_lora and obj.lora_path:
+                if isinstance(obj.lora_path, str):
+                    unique_lora_paths = set([obj.lora_path])
+                else:
+                    unique_lora_paths = set(obj.lora_path)
+
+                if (
+                    self.server_args.max_loaded_loras is not None
+                    and len(unique_lora_paths) > self.server_args.max_loaded_loras
+                ):
+                    raise ValueError(
+                        f"Received request with {len(unique_lora_paths)} unique loras requested "
+                        f"but max loaded loras is {self.server_args.max_loaded_loras}"
+                    )
+
+                # Reload all existing LoRA adapters that have been dynamically unloaded
+                unregistered_loras = await self.lora_registry.get_unregistered_loras(
+                    unique_lora_paths
+                )
+                for lora_path in unregistered_loras:
+                    if lora_path is None:
+                        continue
+
+                    if lora_path not in self.lora_ref_cache:
+                        raise ValueError(
+                            f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+                            f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                        )
+
+                    logger.info(f"Reloading evicted adapter: {lora_path}")
+                    new_lora_ref = self.lora_ref_cache[lora_path]
+                    load_result = await self.load_lora_adapter(
+                        LoadLoRAAdapterReqInput(
+                            lora_name=new_lora_ref.lora_name,
+                            lora_path=new_lora_ref.lora_path,
+                            pinned=new_lora_ref.pinned,
+                        )
+                    )
+                    if (
+                        not load_result.success
+                        and "already loaded" not in load_result.error_message
+                    ):
+                        raise ValueError(
+                            f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
+                        )
+
                 # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 

@@ -306,6 +306,11 @@ class Envs:
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
 
+    # External models
+    SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
+    SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
+
     # fmt: on
 
 
