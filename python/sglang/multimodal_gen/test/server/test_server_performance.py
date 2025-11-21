@@ -16,6 +16,7 @@ import pytest
 from openai import OpenAI
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
@@ -34,11 +35,10 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
-    read_perf_records,
+    read_perf_logs,
     validate_image,
     validate_openai_video,
-    wait_for_perf_record,
-    wait_for_stage_metrics,
+    wait_for_req_perf_record,
 )
 
 logger = init_logger(__name__)
@@ -140,42 +140,32 @@ Consider updating perf_baselines.json with the snippets below:
             base_url=f"http://localhost:{ctx.port}/v1",
         )
 
-    def _run_and_collect(
+    def run_and_collect(
         self,
         ctx: ServerContext,
-        case: DiffusionTestCase,
-        generate_fn: Callable[[], None],
-    ) -> tuple[dict, dict]:
+        generate_fn: Callable[[], str],
+    ) -> RequestPerfRecord:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
-        prev_len = len(read_perf_records(log_path))
+        prev_len = len(read_perf_logs(log_path))
         log_wait_timeout = 1200
 
-        generate_fn()
+        rid = generate_fn()
 
-        perf_record, _ = wait_for_perf_record(
-            "total_inference_time",
+        req_perf_record, _ = wait_for_req_perf_record(
+            rid,
             prev_len,
             log_path,
             timeout=log_wait_timeout,
         )
 
-        stage_metrics = {}
-        if perf_record:
-            stage_metrics, _ = wait_for_stage_metrics(
-                perf_record.get("request_id", ""),
-                prev_len,
-                log_path,
-                timeout=log_wait_timeout,
-            )
+        return req_perf_record
 
-        return perf_record, stage_metrics
-
-    def _generate_for_case(
+    def get_generate_fn(
         self,
         ctx: ServerContext,
         case: DiffusionTestCase,
-    ) -> Callable[[], None]:
+    ) -> Callable[[], str]:
         """Return appropriate generation function for the case."""
         client = self._client(ctx)
 
@@ -186,7 +176,7 @@ Consider updating perf_baselines.json with the snippets below:
             prompt: str | None = None,
             seconds: int | None = None,
             input_reference: Any | None = None,
-        ) -> bytes:
+        ) -> str:
             """
             Create a video job via /v1/videos, poll until completion,
             then download the binary content and validate it.
@@ -231,7 +221,7 @@ Consider updating perf_baselines.json with the snippets below:
                         f"{case.id}: video job {video_id} timed out during baseline generation. "
                         "Attempting to collect performance data anyway."
                     )
-                    return b""
+                    return video_id
 
                 pytest.fail(f"{case.id}: video job {video_id} did not complete in time")
 
@@ -239,7 +229,7 @@ Consider updating perf_baselines.json with the snippets below:
             resp = client.videos.download_content(video_id=video_id)  # type: ignore[attr-defined]
             content = resp.read()
             validate_openai_video(content)
-            return content
+            return video_id
 
         # for all tests, seconds = case.seconds or fallback 4 seconds
         video_seconds = case.seconds or 4
@@ -248,20 +238,23 @@ Consider updating perf_baselines.json with the snippets below:
         # IMAGE MODE
         # -------------------------
 
-        def generate_image():
+        def generate_image() -> str:
             """T2I: Text to Image generation."""
             if not case.prompt:
                 pytest.skip(f"{case.id}: no text prompt configured")
-            result = client.images.generate(
+
+            response = client.images.with_raw_response.generate(
                 model=case.model_path,
                 prompt=case.prompt,
                 n=1,
                 size=case.output_size,
                 response_format="b64_json",
             )
+            result = response.parse()
             validate_image(result.data[0].b64_json)
+            return str(result.created)
 
-        def generate_image_edit():
+        def generate_image_edit() -> str:
             """TI2I: Text + Image ? Image edit."""
             if not case.edit_prompt or not case.image_path:
                 pytest.skip(f"{case.id}: no edit config")
@@ -275,7 +268,7 @@ Consider updating perf_baselines.json with the snippets below:
                     pytest.skip(f"{case.id}: file missing: {image_path}")
 
             with image_path.open("rb") as fh:
-                result = client.images.edit(
+                response = client.images.with_raw_response.edit(
                     model=case.model_path,
                     image=fh,
                     prompt=case.edit_prompt,
@@ -283,25 +276,30 @@ Consider updating perf_baselines.json with the snippets below:
                     size=case.output_size,
                     response_format="b64_json",
                 )
+            rid = response.headers.get("x-request-id", "")
+            print(f"{response=}")
+
+            result = response.parse()
             validate_image(result.data[0].b64_json)
+            return rid
 
         # -------------------------
         # VIDEO MODE
         # -------------------------
 
-        def generate_video():
+        def generate_video() -> str:
             """T2V: Text ? Video."""
             if not case.prompt:
                 pytest.skip(f"{case.id}: no text prompt configured")
 
-            _create_and_download_video(
+            return _create_and_download_video(
                 model=case.model_path,
                 prompt=case.prompt,
                 size=case.output_size,
                 seconds=video_seconds,
             )
 
-        def generate_image_to_video():
+        def generate_image_to_video() -> str:
             """I2V: Image ? Video (optional prompt)."""
             if not case.image_path:
                 pytest.skip(f"{case.id}: no input image configured")
@@ -315,7 +313,7 @@ Consider updating perf_baselines.json with the snippets below:
                     pytest.skip(f"{case.id}: file missing: {image_path}")
 
             with image_path.open("rb") as fh:
-                _create_and_download_video(
+                return _create_and_download_video(
                     model=case.model_path,
                     prompt=case.edit_prompt,
                     size=case.output_size,
@@ -323,7 +321,7 @@ Consider updating perf_baselines.json with the snippets below:
                     input_reference=fh,
                 )
 
-        def generate_text_image_to_video():
+        def generate_text_image_to_video() -> str:
             """TI2V: Text + Image ? Video."""
             if not case.edit_prompt or not case.image_path:
                 pytest.skip(f"{case.id}: no edit config")
@@ -337,7 +335,7 @@ Consider updating perf_baselines.json with the snippets below:
                     pytest.skip(f"{case.id}: file missing: {image_path}")
 
             with image_path.open("rb") as fh:
-                _create_and_download_video(
+                return _create_and_download_video(
                     model=case.model_path,
                     prompt=case.edit_prompt,
                     size=case.output_size,
@@ -362,8 +360,7 @@ Consider updating perf_baselines.json with the snippets below:
     def _validate_and_record(
         self,
         case: DiffusionTestCase,
-        perf_record: dict,
-        stage_metrics: dict,
+        perf_record: RequestPerfRecord,
     ) -> None:
         """Validate metrics and record results."""
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
@@ -395,7 +392,7 @@ Consider updating perf_baselines.json with the snippets below:
             step_fractions=BASELINE_CONFIG.step_fractions,
         )
 
-        summary = validator.collect_metrics(perf_record, stage_metrics)
+        summary = validator.collect_metrics(perf_record)
 
         if is_baseline_generation_mode or missing_scenario:
             self._dump_baseline_for_testcase(case, summary)
@@ -406,29 +403,11 @@ Consider updating perf_baselines.json with the snippets below:
         self._check_for_improvement(case, summary, scenario)
 
         try:
-            validator.validate(perf_record, stage_metrics, case.num_frames)
+            validator.validate(perf_record, case.num_frames)
         except AssertionError as e:
             logger.error(f"Performance validation failed for {case.id}:\n{e}")
             self._dump_baseline_for_testcase(case, summary)
             raise
-
-        if case.modality == "video" and summary.frames_per_second:
-            logger.info(
-                "[Perf] %s: E2E %.2f ms; Avg %.2f ms; FPS %.2f; Frames %d",
-                case.id,
-                summary.e2e_ms,
-                summary.avg_denoise_ms,
-                summary.frames_per_second,
-                summary.total_frames or 0,
-            )
-        else:
-            logger.info(
-                "[Perf] %s: E2E %.2f ms; Avg %.2f ms; Median %.2f ms",
-                case.id,
-                summary.e2e_ms,
-                summary.avg_denoise_ms,
-                summary.median_denoise_ms,
-            )
 
         result = {
             "test_name": case.id,
@@ -451,40 +430,6 @@ Consider updating perf_baselines.json with the snippets below:
             )
 
         self.__class__._perf_results.append(result)
-
-        logger.info("[BASELINE] %s expected_e2e_ms = %.2f", case.id, summary.e2e_ms)
-        logger.info(
-            "[BASELINE] %s expected_avg_denoise_ms = %.2f",
-            case.id,
-            summary.avg_denoise_ms,
-        )
-        logger.info(
-            "[BASELINE] %s expected_median_denoise_ms = %.2f",
-            case.id,
-            summary.median_denoise_ms,
-        )
-        logger.info("[BASELINE] %s stages_ms = %r", case.id, summary.stage_metrics)
-        logger.info(
-            "[BASELINE] %s denoise_step_ms = %r", case.id, summary.sampled_steps
-        )
-
-        # Only log video-specific metrics when they exist
-        if summary.frames_per_second is not None:
-            logger.info(
-                "[BASELINE] %s frames_per_second = %.2f",
-                case.id,
-                summary.frames_per_second,
-            )
-        if summary.total_frames is not None:
-            logger.info(
-                "[BASELINE] %s total_frames = %d", case.id, summary.total_frames
-            )
-        if summary.avg_frame_time_ms is not None:
-            logger.info(
-                "[BASELINE] %s avg_frame_time_ms = %.2f",
-                case.id,
-                summary.avg_frame_time_ms,
-            )
 
     def _check_for_improvement(
         self,
@@ -514,7 +459,6 @@ Consider updating perf_baselines.json with the snippets below:
             )
         ):
             is_improved = True
-
         # Combine metrics, always taking the better (lower) value
         new_stages = {
             stage: min(
@@ -528,7 +472,8 @@ Consider updating perf_baselines.json with the snippets below:
                 safe_get_metric(summary.all_denoise_steps, step),
                 safe_get_metric(scenario.denoise_step_ms, step),
             )
-            for step in set(summary.all_denoise_steps) | set(scenario.denoise_step_ms)
+            for step in set(summary.all_denoise_steps.keys())
+            | set(scenario.denoise_step_ms)
         }
 
         # Check for stage-level improvements
@@ -614,10 +559,9 @@ the "scenarios" section of perf_baselines.json:
         - test_diffusion_perf[qwen_image_edit]
         - etc.
         """
-        generate_fn = self._generate_for_case(diffusion_server, case)
-        perf_record, stage_metrics = self._run_and_collect(
+        generate_fn = self.get_generate_fn(diffusion_server, case)
+        perf_record = self.run_and_collect(
             diffusion_server,
-            case,
             generate_fn,
         )
-        self._validate_and_record(case, perf_record, stage_metrics)
+        self._validate_and_record(case, perf_record)
