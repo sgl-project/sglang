@@ -197,37 +197,7 @@ suites = {
         TestFile("test_quantization.py", 185),
         TestFile("test_gguf.py", 96),
     ],
-    # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
-    "nightly-1-gpu": [
-        TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
-        TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("lora/test_lora_radix_cache.py", 200),
-        TestFile("lora/test_lora_eviction_policy.py", 200),
-        TestFile("lora/test_lora_openai_api.py", 30),
-        TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
-        TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
-        TestFile("test_cpp_radix_cache.py", 60),
-        TestFile("test_deepseek_v3_deterministic.py", 240),
-    ],
-    "nightly-4-gpu-b200": [
-        TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
-        TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
-        TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
-        TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
-        TestFile("test_fp4_moe.py", 300),
-    ],
-    "nightly-8-gpu-b200": [
-        TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
-    ],
-    "nightly-4-gpu": [
-        TestFile("nightly/test_encoder_dp.py", 500),
-        TestFile("test_qwen3_next_deterministic.py", 200),
-    ],
-    "nightly-8-gpu": [],
-    "nightly-8-gpu-h200": [
-        TestFile("test_deepseek_v32_nsabackend.py", 600),
-    ],
-    "nightly-8-gpu-h20": [],
+    # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
         TestFile("ascend/test_ascend_w8a8_quantization.py"),
         TestFile("ascend/test_mindspore_models.py"),
@@ -412,7 +382,7 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "nightly-amd": [
-        TestFile("nightly/test_gsm8k_eval_amd.py"),
+        TestFile("../nightly/test_gsm8k_eval_amd.py"),
     ],
 }
 
