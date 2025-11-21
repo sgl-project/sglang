@@ -14,16 +14,27 @@
 
 import torch
 
-from sglang.srt.compilation.npu.npu_graph_compiler_backend import (
-    NpuGraphCompilerBackend,
-)
+from sglang.srt.compilation.compilation_config import CompilationConfig
+from sglang.srt.utils.common import get_compiler_backend
 
 
 class NpuGraphCompiler:
-    def __init__(self, model: torch.nn.Module, model_type: torch.dtype):
+    def __init__(
+        self,
+        model_runner,
+        model: torch.nn.Module,
+        compilation_config: CompilationConfig,
+    ):
         torch._dynamo.reset()
 
-        self.backend = NpuGraphCompilerBackend(model_type)
+        backend = get_compiler_backend(
+            (
+                "npugraph_fused"
+                if compilation_config is None or compilation_config.compiler is None
+                else compilation_config.compiler
+            ),
+            model_runner.model_config.dtype,
+        )
         self.compiled_callable = torch.compile(
-            model, fullgraph=True, dynamic=False, backend=self.backend
+            model, fullgraph=True, dynamic=False, backend=backend
         )

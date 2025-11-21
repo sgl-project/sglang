@@ -91,6 +91,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
@@ -1887,11 +1888,32 @@ def get_npu_compiler_config():
     return config
 
 
-def get_compiler_backend(mode=None) -> str:
+def get_compiler_backend(
+    mode=None,
+    model_runner=None,
+    compilation_config: CompilationConfig = None,
+    compilation_context=None,
+) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
+        if mode == "piecewise":
+            from sglang.srt.model_executor.compilation.piecewise_npu_graph_compiler_backend import (
+                PiecewiseNpuGraphCompilerBackend,
+            )
+
+            return PiecewiseNpuGraphCompilerBackend(
+                model_runner, compilation_config, compilation_context
+            )
+
+        if mode == "npugraph_fused":
+            from sglang.srt.compilation.npu.npu_graph_compiler_backend import (
+                NpuGraphCompilerBackend,
+            )
+
+            return NpuGraphCompilerBackend(model_runner)
+
         try:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
