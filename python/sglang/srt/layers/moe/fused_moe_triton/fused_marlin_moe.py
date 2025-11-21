@@ -92,9 +92,9 @@ def fused_marlin_moe(
         hidden_states.dtype == w2_scale.dtype
     ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
     assert num_bits in [4, 8]
-    # 🔧 修复: 添加 topk_weights dtype 检查
-    assert topk_weights.dtype == torch.float32, \
-        f"topk_weights must be float32, got {topk_weights.dtype}"
+    assert (
+        topk_weights.dtype == torch.float32
+    ), f"topk_weights must be float32, got {topk_weights.dtype}"
 
     M, K = hidden_states.shape
     E = w1.shape[0]
@@ -126,7 +126,6 @@ def fused_marlin_moe(
         device = hidden_states.device
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         max_workspace_size = min(max_workspace_size, sms * 4)
-        # 🔧 修复: 使用 torch.empty 代替 torch.zeros，避免不必要的初始化开销
         workspace = torch.empty(
             max_workspace_size, dtype=torch.int, device=device, requires_grad=False
         )
@@ -134,8 +133,6 @@ def fused_marlin_moe(
     scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
     scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
 
-    # 🔧 修复: 使用独立的 cache 避免内存重叠
-    # 参考 vLLM 的实现,分配独立的 tensor
     intermediate_cache1 = torch.empty(
         (M * topk_ids.shape[1], 2 * N),
         device=hidden_states.device,
