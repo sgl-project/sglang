@@ -246,8 +246,8 @@ def maybe_init_custom_mem_pool(
 def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
     # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
     # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
+    if len(tokens) and isinstance(tokens[0], tuple):
+        return tokens
     if len(tokens) < 2:
         return []
-    if isinstance(tokens[0], tuple):
-        return tokens
     return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
