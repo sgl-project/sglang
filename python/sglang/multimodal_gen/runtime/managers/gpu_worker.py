@@ -45,12 +45,10 @@ class GPUWorker:
         rank: int,
         master_port: int,
         server_args: ServerArgs,
-        nccl_port: int,
     ):
         self.local_rank = local_rank
         self.rank = rank
         self.master_port = master_port
-        self.nccl_port = nccl_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline = None
@@ -82,7 +80,7 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
-            distributed_init_method=f"tcp://127.0.0.1:{self.nccl_port}",
+            distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
         )
 
         self.pipeline = build_pipeline(self.server_args)
