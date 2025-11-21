@@ -136,6 +136,7 @@ class Envs:
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
@@ -192,6 +193,17 @@ class Envs:
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+
+    # Mooncake Store
+    SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
+    MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
+    MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
+    MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
+    MOONCAKE_PROTOCOL = EnvStr("tcp")
+    MOONCAKE_DEVICE = EnvStr("")
+    MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
+    MOONCAKE_CHECK_SERVER = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
@@ -293,6 +305,11 @@ class Envs:
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
+    # External models
+    SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
+    SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
     # fmt: on
 
