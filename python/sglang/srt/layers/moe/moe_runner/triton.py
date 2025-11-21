@@ -377,7 +377,10 @@ def pre_permute_standard_to_triton(
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    hidden_states, topk_output = dispatch_output
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
 
     assert TopKOutputChecker.format_is_standard(topk_output)
 
