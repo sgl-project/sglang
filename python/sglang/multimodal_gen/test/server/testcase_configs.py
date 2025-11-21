@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
 @dataclass
@@ -137,19 +140,70 @@ class DiffusionTestCase:
         )
 
 
+def sample_step_indices(
+    step_map: dict[int, float], fractions: Sequence[float]
+) -> list[int]:
+    if not step_map:
+        return []
+    max_idx = max(step_map.keys())
+    indices = set()
+    for fraction in fractions:
+        idx = min(max_idx, max(0, int(round(fraction * max_idx))))
+        if idx in step_map:
+            indices.add(idx)
+    return sorted(indices)
+
+
 @dataclass
 class PerformanceSummary:
-    """Summary of performance metrics."""
+    """Summary of performance of a request, built from RequestPerfRecord"""
 
     e2e_ms: float
     avg_denoise_ms: float
     median_denoise_ms: float
+    # { "stage_1": time_1, "stage_2": time_2 }
     stage_metrics: dict[str, float]
+    step_metrics: list[float]
     sampled_steps: dict[int, float]
     all_denoise_steps: dict[int, float]
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
+
+    @staticmethod
+    def from_req_perf_record(
+        record: RequestPerfRecord, step_fractions: Sequence[float]
+    ):
+        """Collect all performance metrics into a summary without validation."""
+        e2e_ms = record.total_duration_ms
+
+        step_durations = record.steps
+        avg_denoise = 0.0
+        median_denoise = 0.0
+        if step_durations:
+            avg_denoise = sum(step_durations) / len(step_durations)
+            median_denoise = statistics.median(step_durations)
+
+        per_step = {index: s for index, s in enumerate(step_durations)}
+        sample_indices = sample_step_indices(per_step, step_fractions)
+        sampled_steps = {idx: per_step[idx] for idx in sample_indices}
+
+        # convert from list to dict
+        stage_metrics = {}
+        for item in record.stages:
+            if isinstance(item, dict) and "name" in item:
+                val = item.get("execution_time_ms", 0.0)
+                stage_metrics[item["name"]] = val
+
+        return PerformanceSummary(
+            e2e_ms=e2e_ms,
+            avg_denoise_ms=avg_denoise,
+            median_denoise_ms=median_denoise,
+            stage_metrics=stage_metrics,
+            step_metrics=step_durations,
+            sampled_steps=sampled_steps,
+            all_denoise_steps=per_step,
+        )
 
 
 # Common paths

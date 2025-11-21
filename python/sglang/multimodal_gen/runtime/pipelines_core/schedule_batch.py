@@ -9,60 +9,26 @@ This module defines the dataclasses used to pass state between pipeline componen
 in a functional manner, reducing the need for explicit parameter passing.
 """
 
+from __future__ import annotations
+
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.base import DataType
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.performance_logger import PerformanceLogger
-
-if TYPE_CHECKING:
-    from torchcodec.decoders import VideoDecoder
-
-import time
-from collections import OrderedDict
-
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
+if TYPE_CHECKING:
+    from torchcodec.decoders import VideoDecoder
 
-class PipelineLoggingInfo:
-    """Simple approach using OrderedDict to track stage metrics."""
-
-    def __init__(self):
-        # OrderedDict preserves insertion order and allows easy access
-        self.stages: OrderedDict[str, dict[str, Any]] = OrderedDict()
-
-    def add_stage_execution_time(self, stage_name: str, execution_time: float):
-        """Add execution time for a stage."""
-        if stage_name not in self.stages:
-            self.stages[stage_name] = {}
-        self.stages[stage_name]["execution_time"] = execution_time
-        self.stages[stage_name]["timestamp"] = time.time()
-
-    def add_stage_metric(self, stage_name: str, metric_name: str, value: Any):
-        """Add any metric for a stage."""
-        if stage_name not in self.stages:
-            self.stages[stage_name] = {}
-        self.stages[stage_name][metric_name] = value
-
-    def get_stage_info(self, stage_name: str) -> dict[str, Any]:
-        """Get all info for a specific stage."""
-        return self.stages.get(stage_name, {})
-
-    def get_execution_order(self) -> list[str]:
-        """Get stages in execution order."""
-        return list(self.stages.keys())
-
-    def get_total_execution_time(self) -> float:
-        """Get total pipeline execution time."""
-        return sum(stage.get("execution_time", 0) for stage in self.stages.values())
+    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 
 
 @dataclass
@@ -191,10 +157,9 @@ class Req:
 
     # VSA parameters
     VSA_sparsity: float = 0.0
-    perf_logger: PerformanceLogger | None = None
 
     # stage logging
-    logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)
+    timings: Optional["RequestTimings"] = None
 
     # profile
     profile: bool = False
@@ -202,6 +167,8 @@ class Req:
 
     # debugging
     debug: bool = False
+    # dummy for now
+    perf_dump_path: str | None = None
 
     # results
     output: torch.Tensor | None = None
@@ -230,9 +197,6 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-        if self.perf_logger is None:
-            self.perf_logger = PerformanceLogger(self.request_id)
-
     def set_width_and_height(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
             width, height = server_args.pipeline_config.adjust_size(
@@ -249,10 +213,6 @@ class Req:
 
 
 @dataclass
-class ForwardBatch: ...
-
-
-@dataclass
 class OutputBatch:
     """
     Final output (after pipeline completion)
@@ -264,8 +224,8 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
 
-    # Logging info
-    logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)
+    # logged timings info, directly from Req.timings
+    timings: Optional["RequestTimings"] = None
 
 
 @dataclass
