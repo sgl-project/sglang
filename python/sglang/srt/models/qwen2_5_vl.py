@@ -57,11 +57,12 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -566,6 +567,25 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
+    def post_process(
+        self,
+        inputs_embeds,
+        modalities: List[Modality],
+        embeddings: List[torch.Tensor],
+        indices: List[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # Placeholder for post_process
+        new_embeddings = []
+        for i, (modality, embedding, index) in enumerate(
+            zip(modalities, embeddings, indices)
+        ):
+            if embedding is None or index is None:
+                continue
+
+            new_embeddings.append(embedding)
+        return new_embeddings, forward_batch
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -575,6 +595,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds=None,
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
@@ -603,11 +624,21 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        hidden_states = general_mm_embed_routine(
+        input_embeds = forward_batch.input_embeds
+        # It may seem strange to assign input_embeds again even after passing it as an argument.
+        # This is for compatibility considerations.
+        # In the 'extend' scenario, this forward function is called from two places:
+        # 1. model_runner calls forward directly,
+        # 2. piece_wise_cuda_graph_runner calls forward and replay.
+
+        # Currently,
+        # In 'extend', input_embeds is passed in.
+        # In 'decode', input_ids is passed in.
+
+        hidden_states = self.model(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
+            input_embeds=input_embeds,
             positions=positions,
             pp_proxy_tensors=pp_proxy_tensors,
         )

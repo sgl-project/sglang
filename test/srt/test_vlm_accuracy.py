@@ -2,14 +2,11 @@
 """
 
 import unittest
-from io import BytesIO
 from typing import List, Optional
 
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -24,19 +21,19 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.server_args import ServerArgs
+from sglang.test.test_utils import download_image_with_retry
 
 
 # Test the logits output between HF and SGLang
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.model_path = ""
         cls.chat_template = ""
         cls.processor = ""
-        response = requests.get(cls.image_url)
-        cls.main_image = Image.open(BytesIO(response.content))
+        cls.main_image = download_image_with_retry(cls.image_url)
 
     def compare_outputs(self, sglang_output: torch.Tensor, hf_output: torch.Tensor):
         # Convert to float32 for numerical stability if needed
