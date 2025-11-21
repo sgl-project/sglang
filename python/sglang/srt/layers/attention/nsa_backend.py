@@ -917,6 +917,11 @@ class NativeSparseAttnBackend(AttentionBackend):
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        # Align topk_indices with q dimensions
+        # This handles cases where q is padded (TP + partial DP attention)
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method()
         if NSA_FUSE_TOPK:
@@ -1053,6 +1058,10 @@ class NativeSparseAttnBackend(AttentionBackend):
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
+
+        # Align topk_indices with q dimensions
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
@@ -1381,6 +1390,27 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
         return o
+
+    def _pad_topk_indices(
+        self, topk_indices: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        current_tokens = topk_indices.shape[0]
+        if current_tokens == num_tokens:
+            return topk_indices
+
+        assert current_tokens <= num_tokens, (
+            f"topk_indices rows ({current_tokens}) > num_tokens ({num_tokens}); "
+            "this indicates a mismatch between indexer output and q layout."
+        )
+
+        pad_size = num_tokens - current_tokens
+        padding = torch.full(
+            (pad_size, topk_indices.shape[1]),
+            -1,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        return torch.cat([topk_indices, padding], dim=0)
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
