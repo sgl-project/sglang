@@ -13,7 +13,6 @@ from sglang.srt.sparsity2.backend.backend_adaptor import (
     BackendAdaptor,
     FlashAttentionAdaptor,
 )
-from sglang.srt.sparsity2.core.representation_pool import RepresentationPool
 from sglang.srt.sparsity2.core.sparse_coordinator import SparseConfig, SparseCoordinator
 
 logger = logging.getLogger(__name__)
@@ -60,9 +59,7 @@ def create_sparse_coordinator(
     **kwargs,
 ) -> SparseCoordinator:
     """Create a sparse coordinator."""
-    config = SparseConfig(
-        page_size=page_size, algorithm="page_mean_pooling"
-    )
+    config = SparseConfig(page_size=page_size, algorithm="page_mean_pooling")
 
     sparse_algorithm = create_sparse_algorithm(
         config, device, start_layer, end_layer, **kwargs

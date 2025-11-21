@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -22,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
 if TYPE_CHECKING:

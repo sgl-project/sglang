@@ -4,4 +4,3 @@ from sglang.srt.sparsity2.backend.backend_adaptor import (
 )
 
 __all__ = ["BackendAdaptor", "FlashAttentionAdaptor"]
-

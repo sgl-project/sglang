@@ -20,7 +20,7 @@ class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
         self, config, device: torch.device, start_layer: int, end_layer: int, **kwargs
     ):
         super().__init__(config, device, **kwargs)
-        #self.sparse_ratio = getattr(config, "sparse_ratio", 0.9)
+        # self.sparse_ratio = getattr(config, "sparse_ratio", 0.9)
         self.sparse_ratio = 0.9
         self.page_size = getattr(config, "page_size", 64)
         self.num_recent_pages = 4
@@ -169,25 +169,33 @@ class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
         num_pages = (seq_lens + self.page_size - 1) // self.page_size
         max_pages = int(torch.max(num_pages).item()) if num_pages.numel() > 0 else 1
 
-        selected_indices = torch.full((bs, max_pages), -1, dtype=torch.int32, device=device)
+        selected_indices = torch.full(
+            (bs, max_pages), -1, dtype=torch.int32, device=device
+        )
         valid_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
 
         effective_mask = sparse_mask & (num_pages > self.num_recent_pages)
         if not effective_mask.any():
             return selected_indices, valid_lengths
 
-        storage = self.repr_pool.get_layer_storage(layer_id, self.PAGE_REPR_STORAGE_NAME)
+        storage = self.repr_pool.get_layer_storage(
+            layer_id, self.PAGE_REPR_STORAGE_NAME
+        )
         repr_dim = storage.shape[1]
-        
+
         if queries.shape[1] != repr_dim:
-            queries = queries.view(bs, self.num_heads, -1, self.head_dim).mean(dim=2).reshape(bs, -1)
+            queries = (
+                queries.view(bs, self.num_heads, -1, self.head_dim)
+                .mean(dim=2)
+                .reshape(bs, -1)
+            )
 
         page_indices = torch.arange(max_pages, device=device).unsqueeze(0)
         page_starts = page_indices * self.page_size
-        
+
         first_tokens = self.req_to_token_pool.req_to_token[
             req_pool_indices.unsqueeze(1).expand(bs, max_pages),
-            page_starts.clamp(0, self.req_to_token_pool.req_to_token.shape[1] - 1)
+            page_starts.clamp(0, self.req_to_token_pool.req_to_token.shape[1] - 1),
         ]
         phys_pages = (first_tokens // self.page_size).clamp(0, storage.shape[0] - 1)
         page_reprs = storage[phys_pages].to(queries.dtype)
@@ -202,17 +210,25 @@ class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
         max_select = int(num_select.max().item())
 
         topk_indices = torch.topk(scores, k=max_select, dim=1, sorted=False)[1]
-        topk_mask = torch.arange(max_select, device=device).unsqueeze(0) < num_select.unsqueeze(1)
+        topk_mask = torch.arange(max_select, device=device).unsqueeze(
+            0
+        ) < num_select.unsqueeze(1)
         topk_indices = torch.where(topk_mask, topk_indices, -1)
 
-        recent_indices = recent_start.unsqueeze(1) + torch.arange(self.num_recent_pages, device=device)
-        recent_indices = torch.where(recent_indices < num_pages.unsqueeze(1), recent_indices, -1)
+        recent_indices = recent_start.unsqueeze(1) + torch.arange(
+            self.num_recent_pages, device=device
+        )
+        recent_indices = torch.where(
+            recent_indices < num_pages.unsqueeze(1), recent_indices, -1
+        )
 
         combined = torch.cat([topk_indices, recent_indices], dim=1)
         combined = torch.sort(combined, dim=1)[0]
-        
-        valid_lengths[:] = torch.where(effective_mask, (combined >= 0).sum(dim=1).int(), 0)
-        selected_indices[:, :combined.shape[1]] = torch.where(
+
+        valid_lengths[:] = torch.where(
+            effective_mask, (combined >= 0).sum(dim=1).int(), 0
+        )
+        selected_indices[:, : combined.shape[1]] = torch.where(
             effective_mask.unsqueeze(1), combined, -1
         )
 

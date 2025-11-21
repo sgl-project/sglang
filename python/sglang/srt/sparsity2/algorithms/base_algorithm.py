@@ -1,13 +1,12 @@
+import logging
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Dict, Optional, TYPE_CHECKING
-import logging
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.sparsity2.core.sparse_coordinator import RequestState
 
 logger = logging.getLogger(__name__)
 

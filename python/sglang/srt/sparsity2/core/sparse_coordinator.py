@@ -1,15 +1,15 @@
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.sparsity2.backend.backend_adaptor import BackendAdaptor
 from sglang.srt.sparsity2.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
     SparseMode,
 )
+from sglang.srt.sparsity2.backend.backend_adaptor import BackendAdaptor
 from sglang.srt.sparsity2.core.representation_pool import RepresentationPool
 
 if TYPE_CHECKING:
@@ -23,7 +23,10 @@ logger = logging.getLogger(__name__)
 class RequestTrackers:
     """Tensor-based state tracker for batch requests."""
 
-    def __init__(self, max_pool_size: int, device: torch.device):
+    def __init__(self, max_pool_size: int, device: torch.device, num_layers: int):
+        self.device = torch.device
+        self.num_layers = num_layers
+        self.top_k = 2048  # hardcode
         self.repr_constructed = torch.zeros(
             max_pool_size, dtype=torch.bool, device=device
         )
@@ -33,17 +36,36 @@ class RequestTrackers:
             max_pool_size, dtype=torch.int64, device=device
         )
 
+        self.full_host_indices = [
+            torch.tensor([], dtype=torch.int64, device=device)
+            for _ in range(max_pool_size)
+        ]
+        self.prev_top_k_result = torch.zeros(
+            [max_pool_size, num_layers, self.top_k], dtype=torch.int64, device=device
+        )
+        self.prev_device_indices = torch.zeros(
+            [max_pool_size, num_layers, self.top_k], dtype=torch.int64, device=device
+        )
+        self.extra_2_token = torch.zeros(
+            [max_pool_size, 2], dtype=torch.int64, device=device
+        )
+
     def register(self, idx: int, prompt_len: int):
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = prompt_len
         self.decode_steps[idx] = 0
         self.last_extracted_token[idx] = 0
+        self.full_host_indices[idx] = torch.tensor(
+            [], dtype=torch.int64, device=self.device
+        )
 
     def clear(self, idx: int):
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = 0
         self.decode_steps[idx] = 0
         self.last_extracted_token[idx] = 0
+        host_indices = self.full_host_indices[idx]
+        return host_indices
 
 
 @dataclass
@@ -70,6 +92,7 @@ class SparseCoordinator:
         backend_adaptor: Optional[BackendAdaptor],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: KVCache,
+        decode_offload_manager: Any,
         start_layer: int,
         end_layer: int,
         device: torch.device,
@@ -84,9 +107,15 @@ class SparseCoordinator:
         self.device = device
         self.page_size = config.page_size
         self.config = config
+        self.decode_offload_manager = decode_offload_manager
 
         max_pool_size = req_to_token_pool.req_to_token.shape[0]
-        self.states = RequestTrackers(max_pool_size=max_pool_size, device=device)
+        self.states = RequestTrackers(
+            max_pool_size=max_pool_size,
+            device=device,
+            num_layers=end_layer - start_layer,
+        )
+        self.decode_offload_manager.req_states = self.states
 
         self.repr_pool = RepresentationPool(
             total_num_pages=total_num_pages,
@@ -95,7 +124,6 @@ class SparseCoordinator:
             device=device,
         )
         self._register_representation_storage()
-
 
         if self.backend_adaptor is not None:
             self._backend_adaptor_method = (
@@ -126,8 +154,19 @@ class SparseCoordinator:
 
     def request_end(self, req: "Req") -> None:
         if req.req_pool_idx is not None:
-            self.states.clear(req.req_pool_idx)
+            host_indices = self.states.clear(req.req_pool_idx)
+            self.decode_offload_manager.decode_host_mem_pool.free(host_indices)
             logger.info(f"Request {req.rid} ended")
+
+    def offload_last_token_kv_cache(self, forward_batch: "ForwardBatch"):
+        return self.decode_offload_manager.offload_sparse_req_tokens(
+            forward_batch.req_pool_indices
+        )
+
+    def check_last_token_offload_progress(self, forward_batch: "ForwardBatch"):
+        return self.decode_offload_manager.check_sparse_offload_progress(
+            forward_batch.req_pool_indices
+        )
 
     def attention_begin(
         self,
@@ -172,8 +211,12 @@ class SparseCoordinator:
         self._maybe_construct_representations(layer_id, forward_batch)
 
         # Incremental update representations in decode step if needed
-        if layer_id == self.start_layer and forward_batch.forward_mode.is_decode_or_idle():
+        if (
+            layer_id == self.start_layer
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
             self.states.decode_steps[req_pool_indices] += 1
+        # TODO: Prefill requires updating meta information in req states.
 
         self._maybe_incremental_udpate_representations(layer_id, forward_batch)
 
@@ -212,6 +255,15 @@ class SparseCoordinator:
             sparse_mask=sparse_mask,
         )
 
+        # prefetch data from cpu
+        curr_device_indices = self.decode_offload_manager.transform_sparse_top_k_cache(
+            req_pool_indices=req_pool_indices,
+            req_states=self.states,
+            top_k_result=selected_indices,
+            layer_id=layer.layer_id,
+            valid_lengths=valid_lengths,
+        )
+
         # Adapt metadata for sparse attention
         if self.backend_adaptor is not None:
             self._backend_adaptor_method(
@@ -225,7 +277,9 @@ class SparseCoordinator:
                 layer_id=layer.layer_id,
             )
 
-    def _maybe_construct_representations(self, layer_id: int, forward_batch: "ForwardBatch") -> None:
+    def _maybe_construct_representations(
+        self, layer_id: int, forward_batch: "ForwardBatch"
+    ) -> None:
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
 
@@ -255,7 +309,9 @@ class SparseCoordinator:
                     updated_seq_lens // self.page_size * self.page_size
                 )
 
-    def _maybe_incremental_udpate_representations(self, layer_id: int, forward_batch: "ForwardBatch"):
+    def _maybe_incremental_udpate_representations(
+        self, layer_id: int, forward_batch: "ForwardBatch"
+    ):
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         is_decode = forward_batch.forward_mode.is_decode_or_idle()

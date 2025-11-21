@@ -1898,25 +1898,39 @@ class ModelRunner:
     def init_sparse_coordinator(self):
         """Initialize sparse attention coordinator if enabled."""
         self.sparse_coordinator = None
-        
+
         # Check if sparse attention is enabled
         if not self.server_args.enable_sparse_attn:
             return
-        
+
         try:
-            from sglang.srt.sparsity2 import (
-                create_sparse_coordinator
+            from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+                DecodeKVCacheOffloadManager,
             )
-            
+            from sglang.srt.sparsity2 import create_sparse_coordinator
+
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+
             self.sparse_coordinator = create_sparse_coordinator(
                 device=self.device,
                 page_size=self.server_args.page_size,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
+                decode_offload_manager=self.decode_offload_manager,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
-            
+
         except Exception as e:
             logger.error(f"[ModelRunner] Failed to initialize sparse coordinator: {e}")
             self.sparse_coordinator = None
@@ -2229,11 +2243,17 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
 
         if forward_batch.forward_mode.is_decode():
+            # TODO: need to overlap
+            if self.server_args.enable_sparse_attn:
+                self.sparse_coordinator.offload_last_token_kv_cache(forward_batch)
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            # TODO: need to overlap
+            if self.server_args.enable_sparse_attn:
+                self.sparse_coordinator.check_last_token_offload_progress(forward_batch)
         elif forward_batch.forward_mode.is_split_prefill():
             ret = self.forward_split_prefill(
                 forward_batch,

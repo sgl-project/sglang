@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 
@@ -12,7 +12,13 @@ class RepresentationPool:
     Supports algorithms registering multiple named storage slots with different shapes/dtypes.
     """
 
-    def __init__(self, total_num_pages: int, start_layer: int, end_layer: int, device: torch.device):
+    def __init__(
+        self,
+        total_num_pages: int,
+        start_layer: int,
+        end_layer: int,
+        device: torch.device,
+    ):
         self.total_num_pages = total_num_pages
         self.start_layer = start_layer
         self.end_layer = end_layer
@@ -27,7 +33,8 @@ class RepresentationPool:
 
         layer_pools = {
             layer_id: torch.zeros(
-                (self.total_num_pages, *shape), dtype=dtype, device=self.device)
+                (self.total_num_pages, *shape), dtype=dtype, device=self.device
+            )
             for layer_id in range(self.start_layer, self.end_layer)
         }
         self.storages[name] = layer_pools
@@ -68,7 +75,9 @@ class RepresentationPool:
         """Retrieve all storage slots for given pages."""
         result = {}
         for storage_name in self.storages.keys():
-            result[storage_name] = self.retrieve(layer_id, storage_name, physical_page_ids)
+            result[storage_name] = self.retrieve(
+                layer_id, storage_name, physical_page_ids
+            )
         return result
 
     def get_writable_slots(
@@ -81,9 +90,11 @@ class RepresentationPool:
         """
         result = {}
         for storage_name in self.storages.keys():
-            result[storage_name] = self.storages[storage_name][layer_id][physical_page_ids]
+            result[storage_name] = self.storages[storage_name][layer_id][
+                physical_page_ids
+            ]
         return result
-    
+
     def get_layer_storage(self, layer_id: int, storage_name: str) -> torch.Tensor:
         """
         Get the full storage tensor for a layer. Algorithm can directly index into it.
@@ -96,4 +107,3 @@ class RepresentationPool:
     def get_storage_names(self) -> list:
         """Get all registered storage names."""
         return list(self.storages.keys())
-

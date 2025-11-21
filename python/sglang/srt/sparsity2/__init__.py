@@ -36,4 +36,3 @@ __all__ = [
     "get_sparse_coordinator",
     "register_sparse_coordinator",
 ]
-
