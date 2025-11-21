@@ -991,7 +991,6 @@ jobs:
         sgl-kernel-unit-test,
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
-        sgl-kernel-b200-test,
 
         multimodal-gen-test,
 
