@@ -1,14 +1,43 @@
 import argparse
-import sys
+import glob
+import os
 from pathlib import Path
 
-# Add test/srt to path to import from run_suite.py
-sys.path.insert(0, str(Path(__file__).parent / "srt"))
+from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
-from sglang.test.ci.ci_utils import run_unittest_files
-
-# Import suites from test/srt/run_suite.py
-from run_suite import suites
+# Nightly test suites
+suites = {
+    "nightly-1-gpu": [
+        TestFile("test_nsa_indexer.py", 2),
+        TestFile("test_lora_qwen3.py", 97),
+        TestFile("test_lora_radix_cache.py", 200),
+        TestFile("test_lora_eviction_policy.py", 200),
+        TestFile("test_lora_openai_api.py", 30),
+        TestFile("test_lora_openai_compatible.py", 150),
+        TestFile("test_batch_invariant_ops.py", 10),
+        TestFile("test_cpp_radix_cache.py", 60),
+        TestFile("test_deepseek_v3_deterministic.py", 240),
+    ],
+    "nightly-4-gpu-b200": [
+        TestFile("test_flashinfer_trtllm_gen_moe_backend.py", 300),
+        TestFile("test_gpt_oss_4gpu_perf.py", 600),
+        TestFile("test_flashinfer_trtllm_gen_attn_backend.py", 300),
+        TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
+        TestFile("test_fp4_moe.py", 300),
+    ],
+    "nightly-8-gpu-b200": [
+        TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
+    ],
+    "nightly-4-gpu": [
+        TestFile("test_encoder_dp.py", 500),
+        TestFile("test_qwen3_next_deterministic.py", 200),
+    ],
+    "nightly-8-gpu": [],
+    "nightly-8-gpu-h200": [
+        TestFile("test_deepseek_v32_nsabackend.py", 600),
+    ],
+    "nightly-8-gpu-h20": [],
+}
 
 
 def main():
@@ -36,14 +65,16 @@ def main():
     if args.suite not in suites:
         print(f"Error: Suite '{args.suite}' not found in available suites")
         print(f"Available suites: {list(suites.keys())}")
-        sys.exit(1)
+        exit(1)
 
     files = suites[args.suite]
 
-    # Change directory to test/srt where the test files are located
-    srt_dir = Path(__file__).parent / "srt"
-    import os
-    os.chdir(srt_dir)
+    # Change directory to test/nightly where the test files are located
+    nightly_dir = Path(__file__).parent / "nightly"
+    os.chdir(nightly_dir)
+
+    print(f"Running {len(files)} tests from suite: {args.suite}")
+    print(f"Test files: {[f.name for f in files]}")
 
     run_unittest_files(
         files,
