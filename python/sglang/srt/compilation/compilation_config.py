@@ -1,18 +1,16 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/compilation_config.py
 
 import json
-from typing import List, Optional
+from typing import List
 
 
 # TODO(Yuwei): support better compile config support
 class CompilationConfig:
-    splitting_ops: Optional[list[str]] = None
-
     def __init__(
         self,
         capture_sizes: List[int] = [],
         compiler: str = "eager",
-        splitting_ops: list[str] = [],
+        splitting_ops: List[str] = [],
     ):
         self.traced_files = set()
         self.capture_sizes = capture_sizes

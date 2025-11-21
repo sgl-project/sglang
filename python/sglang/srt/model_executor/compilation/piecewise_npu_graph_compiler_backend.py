@@ -127,27 +127,6 @@ class SplitItem:
     graph: torch.fx.GraphModule
 
 
-class NpuAddRmsNormFuse:
-    def pattern(rms_norm_input, residual, rms_norm_weight, scale, offset, v1, v2, v3):
-        output = torch.ops.npu.npu_add_rms_norm(
-            rms_norm_input, residual, rms_norm_weight, 1e-6
-        )
-        out0 = output[0]
-        out2 = output[2]
-        quantized_output = torch.ops.npu.npu_quantize(out0, scale, offset, v1, v2, v3)
-        return quantized_output, out2
-
-    def replacement(
-        rms_norm_input, residual, rms_norm_weight, scale, offset, v1, v2, v3
-    ):
-        output = torch.ops.npu.npu_add_rms_norm_quant(
-            rms_norm_input, residual, rms_norm_weight, 1.0 / scale, offset, epsilon=1e-6
-        )
-        quantized_output = output[0]
-        out2 = output[2]
-        return quantized_output, out2
-
-
 class PiecewiseNpuGraphCompilerBackend(NpuGraphCompilerBackend):
     graph: torch.fx.GraphModule
 

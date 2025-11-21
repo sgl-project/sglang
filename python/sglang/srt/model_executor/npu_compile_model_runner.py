@@ -41,11 +41,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 
 class NPUCompileModelRunner:
     def __init__(self, model_runner: ModelRunner):
+        print(f"NPUCompileModelRunner::__init__", flush=True)
         self.model_runner = model_runner
         _, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.capture()
 
     def capture(self) -> None:
+        print(f"NPUCompileModelRunner::capture", flush=True)
         # Reverse the order to enable better memory sharing across cuda graphs.
         compile_range = (
             tqdm.tqdm(list(reversed(self.compile_bs)))
@@ -88,6 +90,7 @@ class NPUCompileModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        print(f"NPUCompileModelRunner::replay", flush=True)
         if not skip_attn_backend_init:
             forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
@@ -241,7 +244,6 @@ class NPUCompileModelRunner:
             mark_tensor_static(forward_batch.token_to_kv_pool.kv_buffer, is_cache=True)
 
     def can_run(self, forward_batch: ForwardBatch):
-        return (
-            forward_batch.forward_mode.is_decode()
-            and forward_batch.batch_size in self.compile_bs
+        return forward_batch.forward_mode.is_decode() and (
+            forward_batch.batch_size in self.compile_bs
         )
