@@ -623,8 +623,14 @@ class DenoisingStage(PipelineStage):
                 log_dir = f"./logs"
                 os.makedirs(log_dir, exist_ok=True)
 
+                rank_suffix = ""
+                try:
+                    rank_suffix = f"-rank{get_world_group().rank}"
+                except Exception:
+                    pass
+
                 trace_path = os.path.abspath(
-                    os.path.join(log_dir, f"{request_id}.trace.json.gz")
+                    os.path.join(log_dir, f"{request_id}{rank_suffix}.trace.json.gz")
                 )
                 logger.info(f"Saving profiler traces to: {trace_path}")
                 self.profiler.export_chrome_trace(trace_path)
