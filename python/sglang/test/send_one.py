@@ -37,6 +37,7 @@ class BenchArgs:
     profile: bool = False
     profile_steps: int = 3
     profile_by_stage: bool = False
+    profile_name_prefix: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -44,6 +45,9 @@ class BenchArgs:
         parser.add_argument("--port", type=int, default=BenchArgs.port)
         parser.add_argument("--batch-size", type=int, default=BenchArgs.batch_size)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
+        parser.add_argument(
+            "--profile-name-prefix", type=str, default=BenchArgs.profile_name_prefix
+        )
         parser.add_argument(
             "--max-new-tokens", type=int, default=BenchArgs.max_new_tokens
         )
@@ -133,6 +137,7 @@ def send_one_prompt(args):
             None,
             None,
             args.profile_by_stage,
+            args.profile_name_prefix,
         )
 
     response = requests.post(

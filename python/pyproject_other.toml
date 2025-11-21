@@ -27,6 +27,7 @@ runtime_common = [
   "datasets",
   "einops",
   "fastapi",
+  "gguf",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
