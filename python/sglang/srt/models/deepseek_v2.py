@@ -173,10 +173,14 @@ _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
+
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    from aiter.ops.triton.fused_fp8_quant import (
+        fused_flatten_fp8_group_quant,
+        fused_rms_fp8_group_quant,
+    )
 
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
@@ -2063,6 +2067,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
+            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                attn_bmm_output = attn_bmm_output.transpose(0, 1)
+                attn_bmm_output = fused_flatten_fp8_group_quant(
+                    attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
+                )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
