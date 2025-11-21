@@ -18,7 +18,6 @@ import sglang
 import sglang.multimodal_gen.envs as envs
 
 perf_logger: logging.Logger | None = None
-_perf_logger_initialized = False
 
 
 class RequestTimings:
@@ -83,8 +82,6 @@ def _initialize_perf_logger():
     except (OSError, PermissionError) as e:
         print(f"WARNING: Failed to initialize performance logger: {e}", file=sys.stderr)
         globals()["LOG_DIR"] = ""
-    finally:
-        _perf_logger_initialized = True
 
 
 @lru_cache(maxsize=1)

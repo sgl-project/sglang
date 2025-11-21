@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.performance_logger import (
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     RequestTimings,
 )

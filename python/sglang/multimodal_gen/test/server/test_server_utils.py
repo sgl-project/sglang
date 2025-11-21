@@ -18,6 +18,7 @@ from urllib.request import urlopen
 
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.utils import metrics
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -319,9 +320,9 @@ class PerformanceValidator:
         Uses the larger of relative tolerance or absolute tolerance to prevent
         flaky failures on very fast operations.
         """
-        rel_limit = expected * (1 + tolerance)
-        abs_limit = expected + min_abs_tolerance_ms
-        upper_bound = max(rel_limit, abs_limit)
+        upper_bound = metrics.calculate_upper_bound(
+            expected, tolerance, min_abs_tolerance_ms
+        )
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
             f"  Actual:   {actual:.4f}ms\n"

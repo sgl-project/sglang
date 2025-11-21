@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 if TYPE_CHECKING:
     from torchcodec.decoders import VideoDecoder
 
-    from sglang.multimodal_gen.runtime.utils.performance_logger import RequestTimings
+    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 
 
 @dataclass

@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_other_loggers,
 )
-from sglang.multimodal_gen.runtime.utils.performance_logger import (
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     RequestTimings,
 )
