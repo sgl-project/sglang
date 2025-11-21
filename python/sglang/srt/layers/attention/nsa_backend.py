@@ -169,6 +169,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         cu_seqlens_q: torch.Tensor = None,
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
+        topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel import (
             fast_topk_transform_fused,
@@ -176,7 +177,10 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             fast_topk_v2,
         )
 
-        if cu_seqlens_q is not None:
+        if topk_indices_offset_override is not None:
+            cu_topk_indices_offset = topk_indices_offset_override
+            cu_seqlens_q_topk = None
+        elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
             cu_topk_indices_offset = torch.repeat_interleave(
