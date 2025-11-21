@@ -1035,7 +1035,7 @@ class Scheduler(
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self._check_runtime_mem_leak()
+                self.self_check_during_busy()
 
     def recv_requests(
         self,
