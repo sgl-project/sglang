@@ -53,7 +53,9 @@ class EPLBManager:
     def rebalance(self):
         logger.info("[EPLBManager] rebalance start")
 
-        enable_timing = self._rebalance_layers_per_chunk is None and not self._enable_eplb_async_d2d
+        enable_timing = (
+            self._rebalance_layers_per_chunk is None and not self._enable_eplb_async_d2d
+        )
 
         if enable_timing:
             torch.get_device_module().synchronize()
@@ -79,7 +81,7 @@ class EPLBManager:
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
             if len(update_layer_ids_chunks) > 1:
                 yield
-            
+
             yield from self._model_runner.update_expert_location(
                 expert_location_metadata,
                 update_layer_ids=update_layer_ids,
