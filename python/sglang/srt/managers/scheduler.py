@@ -24,7 +24,7 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -338,7 +338,7 @@ class Scheduler(
 
         # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
         # algorithms should register their factory instead of patching this code.
-        if self.spec_algorithm.name in {"EAGLE", "EAGLE3"}:
+        if self.spec_algorithm.is_eagle():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
         self.draft_worker = self.spec_algorithm.create_draft_worker(
             **draft_worker_kwargs
@@ -382,10 +382,12 @@ class Scheduler(
         # avoiding any coupling with CUDA streams/devices.
         if self.server_args.enable_dp_attention:
             self.cpu_group = self.attn_tp_cpu_group
+            self.entry_rank = self.attn_tp_group.first_rank
             self.is_entry_rank = self.attn_tp_rank == 0
         else:
             self.cpu_group = self.tp_cpu_group
-            self.is_entry_rank = self.tp_group.rank == 0
+            self.entry_rank = self.tp_group.first_rank
+            self.is_entry_rank = self.tp_group.rank_in_group == 0
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -416,7 +418,6 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
-        self.init_kv_events(server_args.kv_events_config)
 
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
@@ -845,6 +846,15 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
+        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+            draft_token_to_kv_pool = None
+        elif self.spec_algorithm.is_eagle() and self.enable_overlap:
+            draft_token_to_kv_pool = (
+                self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
+            )
+        else:
+            draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -854,8 +864,16 @@ class Scheduler(
             )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
-                hidden_size=self.model_config.hf_text_config.hidden_size,
-                hidden_states_dtype=self.model_config.dtype,
+                hidden_size=(
+                    self.draft_worker.model_config.hidden_size
+                    if self.spec_algorithm.is_eagle()
+                    else 16  # minimal padding size for RDMA
+                ),
+                hidden_states_dtype=(
+                    self.draft_worker.model_config.dtype
+                    if self.spec_algorithm.is_eagle()
+                    else torch.float32
+                ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -873,11 +891,7 @@ class Scheduler(
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                draft_token_to_kv_pool=(
-                    None
-                    if self.draft_worker is None or self.spec_algorithm.is_ngram()
-                    else self.draft_worker.model_runner.token_to_kv_pool
-                ),
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
@@ -903,18 +917,22 @@ class Scheduler(
             )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
-                hidden_size=self.model_config.hf_text_config.hidden_size,
-                hidden_states_dtype=self.model_config.dtype,
+                hidden_size=(
+                    self.draft_worker.model_config.hidden_size
+                    if self.spec_algorithm.is_eagle()
+                    else 16  # minimal padding size for RDMA
+                ),
+                hidden_states_dtype=(
+                    self.draft_worker.model_config.dtype
+                    if self.spec_algorithm.is_eagle()
+                    else torch.float32
+                ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
-                draft_token_to_kv_pool=(
-                    None
-                    if self.draft_worker is None or self.spec_algorithm.is_ngram()
-                    else self.draft_worker.model_runner.token_to_kv_pool
-                ),
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,
@@ -934,6 +952,8 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
 
     def init_overlap(self):
+        self.future_map = None
+
         if not self.enable_overlap:
             return
 
@@ -1033,7 +1053,9 @@ class Scheduler(
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
                 self._check_runtime_mem_leak()
 
-    def recv_requests(self) -> List[Req]:
+    def recv_requests(
+        self,
+    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.recv_skipper is not None:
@@ -1220,7 +1242,7 @@ class Scheduler(
             if group_world_size > 1:
                 obj_list = [image_inputs]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=0, group=self.cpu_group
+                    obj_list, src=self.entry_rank, group=self.cpu_group
                 )
                 image_inputs = obj_list[0]
         else:
@@ -1228,13 +1250,19 @@ class Scheduler(
             if group_world_size > 1:
                 obj_list = [None]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=0, group=self.cpu_group
+                    obj_list, src=self.entry_rank, group=self.cpu_group
                 )
                 image_inputs = obj_list[0]
             else:
                 image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
 
         return image_inputs
+
+    def _get_multimodal_inputs(self, mm_inputs_dict: dict):
+        if self.server_args.enable_broadcast_mm_inputs_process:
+            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
+        else:
+            return MultimodalInputs.from_dict(mm_inputs_dict)
 
     def handle_generate_request(
         self,
@@ -1317,7 +1345,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.mm_inputs)
+            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
@@ -1552,7 +1580,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = self._process_and_broadcast_mm_inputs(recv_req.image_inputs)
+            image_inputs = self._get_multimodal_inputs(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -1803,7 +1831,7 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
-            running_bs = len(self.running_batch.reqs) - len(adder.preempt_list)
+            running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2401,7 +2429,10 @@ class Scheduler(
         exec = None
         try:
             func = getattr(self, recv_req.method)
-            func(recv_req.parameters)
+            if recv_req.parameters is not None:
+                func(**recv_req.parameters)
+            else:
+                func()
         except Exception as e:
             success = False
             exec = e
