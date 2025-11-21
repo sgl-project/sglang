@@ -30,7 +30,8 @@ class ToleranceConfig:
     """Tolerance ratios for performance validation."""
 
     e2e: float
-    stage: float
+    denoise_stage: float
+    non_denoise_stage: float
     denoise_step: float
     denoise_agg: float
 
@@ -54,6 +55,7 @@ class BaselineConfig:
     step_fractions: Sequence[float]
     warmup_defaults: dict[str, int]
     tolerances: ToleranceConfig
+    improvement_threshold: float
 
     @classmethod
     def load(cls, path: Path) -> BaselineConfig:
@@ -64,7 +66,15 @@ class BaselineConfig:
         tol_data = data["tolerances"]
         tolerances = ToleranceConfig(
             e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", tol_data["e2e"])),
-            stage=float(os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["stage"])),
+            denoise_stage=float(
+                os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["denoise_stage"])
+            ),
+            non_denoise_stage=float(
+                os.getenv(
+                    "SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE",
+                    tol_data["non_denoise_stage"],
+                )
+            ),
             denoise_step=float(
                 os.getenv("SGLANG_DENOISE_STEP_TOLERANCE", tol_data["denoise_step"])
             ),
@@ -88,6 +98,9 @@ class BaselineConfig:
             step_fractions=tuple(data["sampling"]["step_fractions"]),
             warmup_defaults=data["sampling"].get("warmup_requests", {}),
             tolerances=tolerances,
+            improvement_threshold=data.get("improvement_reporting", {}).get(
+                "threshold", 0.2
+            ),
         )
 
 
@@ -134,6 +147,7 @@ class PerformanceSummary:
     median_denoise_ms: float
     stage_metrics: dict[str, float]
     sampled_steps: dict[int, float]
+    all_denoise_steps: dict[int, float]
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
@@ -182,7 +196,7 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     # TODO: FastWan2.1, FastWan2.2
     DiffusionTestCase(
-        id="fastwan2_1_t2v",
+        id="wan2_1_t2v_1.3b",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         modality="video",
         prompt="A curious raccoon",
