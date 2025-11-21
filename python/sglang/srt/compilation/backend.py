@@ -300,7 +300,6 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                     runtime_shape=None,
                 )
             )
-
             self.module.__dict__[target] = CUDAPiecewiseBackend(
                 submod,
                 self.compile_config,
@@ -395,8 +394,17 @@ class SGLangBackend:
             local_cache_dir, disable_cache=False, prefix=""
         )
         compilation_counter.num_graphs_seen += 1
+        
+        # Print call stack trace
+        # import traceback
+        # print(f"[DEBUG] SGLangBackend __call__ invoked, backend_id={id(self)}")
+        # print("[DEBUG] Call stack:")
+        # for line in traceback.format_stack()[:-1]:  # Exclude current frame
+        #     print(line.rstrip())
 
-        assert not self._called, "SGLangBackend can only be called once"
+        # assert not self._called, "SGLangBackend can only be called once"
+        if (self._called):
+            return self.split_gm
 
         self.graph = graph
         self.configure_post_pass()
