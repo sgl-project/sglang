@@ -311,9 +311,15 @@ class HIPEnv(BaseEnv):
 class NPUEnv(BaseEnv):
     """Environment checker for Ascend NPU"""
 
+    EXTRA_PACKAGE_LIST = [
+        "torch_npu",
+        "sgl-kernel-npu",
+        "deep_ep",
+    ]
+
     def __init__(self):
         super().__init__()
-        self.package_list = ["torch_npu", "sgl-kernel-npu"] + self.package_list
+        self.package_list.extend(NPUEnv.EXTRA_PACKAGE_LIST)
 
     def get_info(self):
         cuda_info = {"NPU available": torch.npu.is_available()}
