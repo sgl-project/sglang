@@ -12,6 +12,7 @@ from sgl_kernel import weak_ref_tensor
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,9 @@ class CUDAPiecewiseBackend:
 
         self.sym_shape_indices = sym_shape_indices
 
-        self.is_debugging_mode = False
+        self.enable_torch_compile_debug_mode = (
+            get_global_server_args().enable_torch_compile_debug_mode
+        )
 
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
@@ -161,7 +164,7 @@ class CUDAPiecewiseBackend:
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
-            if self.is_debugging_mode:
+            if self.enable_torch_compile_debug_mode:
                 input_addresses = [
                     x.data_ptr() for x in args if isinstance(x, torch.Tensor)
                 ]
@@ -203,7 +206,7 @@ class CUDAPiecewiseBackend:
             # manage the memory during cuda graph capture
             return output
 
-        if self.is_debugging_mode:
+        if self.enable_torch_compile_debug_mode:
             # check if the input addresses are the same
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
