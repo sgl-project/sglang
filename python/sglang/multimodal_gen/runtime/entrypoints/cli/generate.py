@@ -62,7 +62,7 @@ def generate_cmd(args: argparse.Namespace):
 
 
 class GenerateSubcommand(CLISubcommand):
-    """The `generate` subcommand for the sgl-diffusion CLI"""
+    """The `generate` subcommand for the sglang-diffusion CLI"""
 
     def __init__(self) -> None:
         self.name = "generate"
