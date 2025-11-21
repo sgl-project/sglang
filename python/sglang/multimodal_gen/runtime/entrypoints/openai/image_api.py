@@ -69,15 +69,8 @@ def _build_sampling_params_from_request(
         num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
         save_output=True,
         server_args=server_args,
+        output_file_name=request_id,
     )
-    # FIXME: refactor this with set_output_file_ext
-    # Let SamplingParams auto-generate a file name, then force desired extension
-    if not sampling_params.output_file_name:
-        sampling_params.output_file_name = request_id
-    if not sampling_params.output_file_name.endswith(f".{ext}"):
-        # strip any existing extension and apply desired one
-        base = sampling_params.output_file_name.rsplit(".", 1)[0]
-        sampling_params.output_file_name = f"{base}.{ext}"
     return sampling_params
 
 

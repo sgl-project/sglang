@@ -70,6 +70,7 @@ def _build_sampling_params_from_request(
         image_path=request.input_reference,
         save_output=True,
         server_args=server_args,
+        output_file_name=request_id,
     )
 
     return sampling_params

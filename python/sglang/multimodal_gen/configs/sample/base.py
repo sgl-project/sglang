@@ -138,7 +138,7 @@ class SamplingParams:
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
 
-    def set_output_file_ext(self):
+    def _set_output_file_ext(self):
         # add extension if needed
         if not any(
             self.output_file_name.endswith(ext)
@@ -148,7 +148,7 @@ class SamplingParams:
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
             )
 
-    def set_output_file_name(self):
+    def _set_output_file_name(self):
         # settle output_file_name
         if (
             self.output_file_name is None
@@ -179,7 +179,7 @@ class SamplingParams:
         self.output_file_name = _sanitize_filename(self.output_file_name)
 
         # Ensure a proper extension is present
-        self.set_output_file_ext()
+        self._set_output_file_ext()
 
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
@@ -278,7 +278,7 @@ class SamplingParams:
                 self.num_frames
             )
 
-        self.set_output_file_ext()
+        self._set_output_file_name()
         self.log(server_args=server_args)
 
     def update(self, source_dict: dict[str, Any]) -> None:
@@ -315,7 +315,7 @@ class SamplingParams:
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         sampling_params = SamplingParams.from_pretrained(model_path)
-        sampling_params.set_output_file_name()
+        sampling_params._set_output_file_name()
         user_sampling_params = SamplingParams(*args, **kwargs)
         return sampling_params.from_user_sampling_params(
             user_sampling_params, server_args

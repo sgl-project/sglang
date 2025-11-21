@@ -264,7 +264,7 @@ class DiffGenerator:
             else DataType.VIDEO
         )
         pretrained_sampling_params.data_type = data_type
-        pretrained_sampling_params.set_output_file_name()
+        pretrained_sampling_params._set_output_file_name()
         pretrained_sampling_params.adjust(self.server_args)
 
         requests: list[Req] = []
