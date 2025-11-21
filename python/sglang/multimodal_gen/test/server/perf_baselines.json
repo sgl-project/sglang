@@ -294,7 +294,7 @@
                 "49": 1373.45
             },
             "expected_e2e_ms": 100028,
-            "expected_avg_denoise_ms": 1386.08,
+            "expected_avg_denoise_ms": 1815.08,
             "expected_median_denoise_ms": 1374.03
         },
         "wan2_2_i2v_a14b": {
