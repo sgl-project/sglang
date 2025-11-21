@@ -15,6 +15,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 )
 from sglang.multimodal_gen.utils import calculate_dimensions
 
+CONDITION_IMAGE_SIZE = 384 * 384
+VAE_IMAGE_SIZE = 1024 * 1024
+
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
     bool_mask = mask.bool()
@@ -275,6 +278,137 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         )
         image = image_processor.resize(image, calculated_height, calculated_width)
         return image
+
+    def adjust_size(self, width, height, image):
+        image_size = image[0].size if isinstance(image, list) else image.size
+        calculated_width, calculated_height, _ = calculate_dimensions(
+            1024 * 1024, image_size[0] / image_size[1]
+        )
+        height = height or calculated_height
+        width = width or calculated_width
+
+        multiple_of = self.get_vae_scale_factor() * 2
+        width = width // multiple_of * multiple_of
+        height = height // multiple_of * multiple_of
+        return width, height
+
+    def slice_noise_pred(self, noise, latents):
+        noise = noise[:, : latents.size(1)]
+        return noise
+
+
+class QwenImageEditPlusPipelineConfig(QwenImagePipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.I2I
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        batch_size = batch.latents.shape[0]
+        height = batch.height
+        width = batch.width
+        image = batch.pil_image
+        if not isinstance(image, list):
+            image = [image]
+        vae_image_sizes = []
+        for img in image:
+            image_width, image_height = img.size
+            vae_width, vae_height, _ = calculate_dimensions(
+                VAE_IMAGE_SIZE, image_width / image_height
+            )
+            vae_image_sizes.append((vae_width, vae_height))
+
+        vae_scale_factor = self.get_vae_scale_factor()
+        img_shapes = [
+            [
+                (1, height // vae_scale_factor // 2, width // vae_scale_factor // 2),
+                *[
+                    (
+                        1,
+                        vae_height // vae_scale_factor // 2,
+                        vae_width // vae_scale_factor // 2,
+                    )
+                    for vae_width, vae_height in vae_image_sizes
+                ],
+            ]
+        ] * batch_size
+        txt_seq_lens = [batch.prompt_embeds[0].shape[1]]
+        decoded_text = (
+            batch.extra.get("prompt_decoded_text", [None])[0]
+            if batch.extra.get("prompt_decoded_text")
+            else None
+        )
+        return {
+            "img_shapes": img_shapes,
+            "txt_seq_lens": txt_seq_lens,
+            "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
+                img_shapes, txt_seq_lens, rotary_emb, device, dtype
+            ),
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        batch_size = batch.latents.shape[0]
+        height = batch.height
+        width = batch.width
+        image = batch.pil_image
+        if not isinstance(image, list):
+            image = [image]
+        vae_image_sizes = []
+        for img in image:
+            image_width, image_height = img.size
+            vae_width, vae_height, _ = calculate_dimensions(
+                VAE_IMAGE_SIZE, image_width / image_height
+            )
+            vae_image_sizes.append((vae_width, vae_height))
+
+        vae_scale_factor = self.get_vae_scale_factor()
+        img_shapes = [
+            [
+                (1, height // vae_scale_factor // 2, width // vae_scale_factor // 2),
+                *[
+                    (
+                        1,
+                        vae_height // vae_scale_factor // 2,
+                        vae_width // vae_scale_factor // 2,
+                    )
+                    for vae_width, vae_height in vae_image_sizes
+                ],
+            ]
+        ] * batch_size
+        txt_seq_lens = [batch.negative_prompt_embeds[0].shape[1]]
+        decoded_text = (
+            batch.extra.get("negative_prompt_decoded_text", [None])[0]
+            if batch.extra.get("negative_prompt_decoded_text")
+            else None
+        )
+        return {
+            "img_shapes": img_shapes,
+            "txt_seq_lens": txt_seq_lens,
+            "freqs_cis": QwenImagePipelineConfig.get_freqs_cis(
+                img_shapes, txt_seq_lens, rotary_emb, device, dtype
+            ),
+        }
+
+    def prepare_latent_shape(self, batch, batch_size, num_frames):
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        height = 2 * (batch.height // (vae_scale_factor * 2))
+
+        width = 2 * (batch.width // (vae_scale_factor * 2))
+        num_channels_latents = self.dit_config.arch_config.in_channels // 4
+        shape = (batch_size, 1, num_channels_latents, height, width)
+        return shape
+
+    def preprocess_image(self, image, image_processor):
+        if not isinstance(image, list):
+            image = [image]
+        condition_images = []
+        for img in image:
+            image_width, image_height = img.size
+            condition_width, condition_height, _ = calculate_dimensions(
+                CONDITION_IMAGE_SIZE, image_width / image_height
+            )
+            condition_images.append(
+                image_processor.resize(img, condition_height, condition_width)
+            )
+
+        return condition_images
 
     def adjust_size(self, width, height, image):
         image_size = image[0].size if isinstance(image, list) else image.size
