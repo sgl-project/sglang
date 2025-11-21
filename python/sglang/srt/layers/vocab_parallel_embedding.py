@@ -19,7 +19,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -206,7 +210,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
         self.quant_config = quant_config
-
+        self.use_attn_tp_group = use_attn_tp_group
         self.enable_tp = enable_tp
         if self.enable_tp:
             if use_attn_tp_group:
@@ -473,18 +477,24 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         else:
             masked_input = input_
-
         # Get the embeddings.
         with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
-
+        # Mask the output embedding.
         if self.tp_size > 1:
-            # Mask the output embedding.
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            if not get_attn_tp_context().input_scattered:
-                # Reduce across all the model parallel GPUs.
-                output_parallel = tensor_model_parallel_all_reduce(output_parallel)
-        return output_parallel
+            # Reduce across all the model parallel GPUs.
+            if self.use_attn_tp_group:
+                torch.distributed.all_reduce(
+                    output_parallel, group=get_attention_tp_group().device_group
+                )
+                output = output_parallel
+            else:
+                if not get_attn_tp_context().input_scattered:
+                    output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+        return output
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
