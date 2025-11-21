@@ -685,7 +685,7 @@ class HiRadixCache(RadixCache):
 
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key.token_ids = self.key_convert_fn(key.token_ids)
+        key, _ = self.maybe_bigram_convert(key)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -849,7 +849,7 @@ class HiRadixCache(RadixCache):
         return new_node
 
     def insert(self, key: RadixKey, value=None, chunked=False):
-        key.token_ids = self.key_convert_fn(key.token_ids)
+        key, value = self.maybe_bigram_convert(key, value)
 
         if len(key) == 0:
             return 0
