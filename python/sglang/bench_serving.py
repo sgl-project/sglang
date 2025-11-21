@@ -1433,7 +1433,7 @@ def sample_image_requests(
     image_format: str,
     image_resolution: str,
     backend: str,
-    random_image_count: bool = False,  
+    random_image_count: bool = False,
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -1497,7 +1497,7 @@ def sample_image_requests(
     for i in range(num_requests):
         # Get the number of images for this request
         request_image_count = int(image_counts[i])
-        
+
         # Generate text prompt
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
@@ -1525,12 +1525,14 @@ def sample_image_requests(
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(f"#Total images: {total_images}")
-    
+
     if random_image_count:
-        print(f"#Images per request: min={np.min(image_counts)}, max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}")
+        print(
+            f"#Images per request: min={np.min(image_counts)}, max={np.max(image_counts)}, mean={np.mean(image_counts):.2f}"
+        )
     else:
         print(f"#Images per request: {image_count} (fixed)")
-    
+
     print(
         f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
     )
