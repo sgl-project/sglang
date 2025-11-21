@@ -25,7 +25,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -51,12 +51,18 @@ if TYPE_CHECKING:
 
 
 class RadixKey:
-
-    def __init__(self, token_ids: List[int], extra_key: Optional[str] = None):
+    def __init__(
+        self,
+        token_ids: List[int],
+        extra_key: Optional[str] = None,
+        is_bigram: bool = False,
+    ):
         # token ids sequence
         self.token_ids = token_ids
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
+        # is bigram key
+        self.is_bigram = is_bigram
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -211,11 +217,6 @@ class RadixCache(BasePrefixCache):
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
 
-        if is_eagle:
-            self.key_convert_fn = convert_to_bigram_key
-        else:
-            self.key_convert_fn = lambda key: key
-
         if eviction_policy.lower() == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
         elif eviction_policy.lower() == "lfu":
@@ -243,6 +244,16 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
+
+    def maybe_bigram_convert(
+        self, key: RadixKey, value: Optional[torch.Tensor] = None
+    ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
+        if self.is_eagle and not key.is_bigram:
+            key.token_ids = convert_to_bigram_key(key.token_ids)
+            if value is not None:
+                value = value[: len(key)]
+
+        return key, value
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -282,6 +293,7 @@ class RadixCache(BasePrefixCache):
                 to expose a precise boundary; this structural refinement improves
                 subsequent match efficiency and does not duplicate data.
         """
+        key, _ = self.maybe_bigram_convert(key)
 
         def empty_match_result():
             return MatchResult(
@@ -322,6 +334,8 @@ class RadixCache(BasePrefixCache):
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
+        key, value = self.maybe_bigram_convert(key, value)
+
         return self._insert_helper(self.root_node, key, value)
 
     def _page_align_keys(self, key: list) -> list:
@@ -347,16 +361,14 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = self.key_convert_fn(req.fill_ids)
+        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
+        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
-            new_prefix_len = self.insert(
-                RadixKey(keys, req.extra_key),
-                values,
-            )
+            new_prefix_len = self.insert(radix_key, values)
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
@@ -384,24 +396,19 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = self.key_convert_fn(req.fill_ids)
+        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
+        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(
-            RadixKey(keys, req.extra_key),
-            values,
-            chunked=chunked,
-        )
+        new_prefix_len = self.insert(radix_key, values, chunked=chunked)
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(
-            RadixKey(keys, req.extra_key)
-        )
+        new_indices, new_last_node, _, _ = self.match_prefix(radix_key)
         assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
 
         self.req_to_token_pool.write(
