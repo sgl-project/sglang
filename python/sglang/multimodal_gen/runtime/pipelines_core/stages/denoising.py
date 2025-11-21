@@ -900,7 +900,7 @@ class DenoisingStage(PipelineStage):
 
         if num_timesteps > 0:
             self.log_info(
-                "Average time per step: %.4f seconds",
+                "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
 
