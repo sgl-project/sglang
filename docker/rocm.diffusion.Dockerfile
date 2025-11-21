@@ -212,7 +212,8 @@ RUN git clone ${SGL_REPO} \
     && python -m pip install --upgrade pip \
     && git submodule update --init --recursive \
     && cd .. \
-    && python -m pip --no-cache-dir install -e "python[all_hip,diffusion]" --no-build-isolation ${NO_DEPS_FLAG}
+    && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
+    && python -m pip --no-cache-dir install -e "python[all_hip,diffusion]" ${NO_DEPS_FLAG}
 
 RUN python -m pip cache purge
 
@@ -228,9 +229,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 
 # Build and install sgl-router
 RUN python3 -m pip install --no-cache-dir setuptools-rust \
-    && cd /sgl-workspace/sglang/sgl-router \
+    && cd /sgl-workspace/sglang/sgl-router/bindings/python \
     && cargo build --release \
-    && python3 -m pip install --no-cache-dir bindings/python \
+    && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
 
 # -----------------------
