@@ -152,12 +152,8 @@ class GraphInputBuffers:
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
 
-        if require_gathered_buffer and self.global_num_tokens_gpu is not None:
+        if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
-        if (
-            require_gathered_buffer
-            and self.global_num_tokens_for_logprob_gpu is not None
-        ):
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
 
         if enable_num_token_non_padded_flag:
