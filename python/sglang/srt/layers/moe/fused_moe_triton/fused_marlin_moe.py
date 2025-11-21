@@ -1,3 +1,4 @@
+import functools
 from typing import Optional
 
 import torch
@@ -70,8 +71,10 @@ def fused_marlin_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
-    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+    from sglang.srt.layers.moe.fused_moe_triton import (
+        moe_align_block_size,
+        try_get_optimal_moe_config,
+    )
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
@@ -95,11 +98,17 @@ def fused_marlin_moe(
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        w1.shape,
+        w2.shape,
+        topk_ids.shape[1],
+        None,
+        is_marlin=True,
+    )
+    config = get_config_func(M)
+
+    block_size_m = config["BLOCK_SIZE_M"]
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -108,7 +117,15 @@ def fused_marlin_moe(
     )
 
     if workspace is None:
-        workspace = marlin_make_workspace(hidden_states.device, 4)
+        max_workspace_size = (max(2 * N, K) // 64) * (
+            sorted_token_ids.size(0) // block_size_m
+        )
+        device = hidden_states.device
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        max_workspace_size = min(max_workspace_size, sms * 4)
+        workspace = torch.zeros(
+            max_workspace_size, dtype=torch.int, device=device, requires_grad=False
+        )
 
     scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
     scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
