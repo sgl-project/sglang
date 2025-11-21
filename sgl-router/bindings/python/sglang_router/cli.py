@@ -32,11 +32,7 @@ def create_parser() -> argparse.ArgumentParser:
         "launch",
         help="Launch router only (requires existing worker URLs)",
         description="Launch the SGLang router with existing worker instances",
-    )
-    launch_parser.add_argument(
-        "router_args",
-        nargs="*",
-        help="Arguments to pass to the router (use -- to separate)",
+        add_help=False,  # Let router handle --help
     )
 
     # Launch server + router subcommand
@@ -44,11 +40,7 @@ def create_parser() -> argparse.ArgumentParser:
         "server",
         help="Launch router and server processes together",
         description="Launch both SGLang router and server processes",
-    )
-    server_parser.add_argument(
-        "server_args",
-        nargs="*",
-        help="Arguments to pass to server/router (use -- to separate)",
+        add_help=False,  # Let server handle --help
     )
 
     return parser
@@ -72,9 +64,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         # Import and call launch_router functions directly
         from sglang_router.launch_router import launch_router, parse_router_args
 
-        # Combine router_args with unknown args and parse
-        router_argv = args.router_args + unknown
-        router_args = parse_router_args(router_argv)
+        # All router args are in unknown
+        router_args = parse_router_args(unknown)
         launch_router(router_args)
 
     elif args.command == "server":
@@ -86,10 +77,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         # Preserve original sys.argv
         original_argv = sys.argv
         try:
-            # Combine server_args with unknown args
-            server_argv = args.server_args + unknown
+            # All server args are in unknown
             prog_name = os.path.basename(sys.argv[0]) if sys.argv else "smg"
-            sys.argv = [f"{prog_name} server"] + server_argv
+            sys.argv = [f"{prog_name} server"] + unknown
             launch_server_module.main()
         finally:
             # Restore original sys.argv

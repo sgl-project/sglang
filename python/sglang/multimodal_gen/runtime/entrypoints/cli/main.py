@@ -21,7 +21,7 @@ def cmd_init() -> list[CLISubcommand]:
 
 
 def main() -> None:
-    parser = FlexibleArgumentParser(description="sgl-diffusion CLI")
+    parser = FlexibleArgumentParser(description="sglang-diffusion CLI")
     parser.add_argument("-v", "--version", action="version", version="0.1.0")
 
     subparsers = parser.add_subparsers(required=False, dest="subparser")

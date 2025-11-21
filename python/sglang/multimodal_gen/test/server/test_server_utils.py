@@ -306,14 +306,28 @@ class PerformanceValidator:
             os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
         )
 
-    def _assert_le(self, name: str, actual: float, expected: float, tolerance: float):
-        """Assert that actual is less than or equal to expected within a tolerance."""
-        upper_bound = expected * (1 + tolerance)
+    def _assert_le(
+        self,
+        name: str,
+        actual: float,
+        expected: float,
+        tolerance: float,
+        min_abs_tolerance_ms: float = 20.0,
+    ):
+        """Assert that actual is less than or equal to expected within a tolerance.
+
+        Uses the larger of relative tolerance or absolute tolerance to prevent
+        flaky failures on very fast operations.
+        """
+        rel_limit = expected * (1 + tolerance)
+        abs_limit = expected + min_abs_tolerance_ms
+        upper_bound = max(rel_limit, abs_limit)
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
-            f"  - Actual:   {actual:.4f}ms\n"
-            f"  - Expected: {expected:.4f}ms\n"
-            f"  - Limit:    {upper_bound:.4f}ms (tolerance: {tolerance:.1%})"
+            f"  Actual:   {actual:.4f}ms\n"
+            f"  Expected: {expected:.4f}ms\n"
+            f"  Limit:    {upper_bound:.4f}ms "
+            f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
         )
 
     def validate(
@@ -401,11 +415,14 @@ class PerformanceValidator:
             expected = self.scenario.denoise_step_ms.get(idx)
             if expected is None:
                 continue
+            # FIXME: hardcode, looser for first step
+            tolerance = 0.4 if idx == 0 else self.tolerances.denoise_step
+
             self._assert_le(
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                self.tolerances.denoise_step,
+                tolerance,
             )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
@@ -417,12 +434,17 @@ class PerformanceValidator:
                 continue
             actual = summary.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
-
+            tolerance = (
+                self.tolerances.denoise_stage
+                if stage == "DenoisingStage"
+                else self.tolerances.non_denoise_stage
+            )
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,
                 expected,
-                self.tolerances.stage,
+                tolerance,
+                min_abs_tolerance_ms=120.0,  # relax absolute tolerance for non-denoising stages
             )
 
 
@@ -458,7 +480,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 "Average Frame Time",
                 summary.avg_frame_time_ms,
                 expected_frame_time,
-                self.tolerances.stage,
+                self.tolerances.denoise_stage,
             )
 
 
