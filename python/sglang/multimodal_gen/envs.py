@@ -163,7 +163,7 @@ def maybe_convert_int(value: str | None) -> int | None:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
-    # Target device of sgl-diffusion, supporting [cuda (by default),
+    # Target device of sglang-diffusion, supporting [cuda (by default),
     # rocm, neuron, cpu, openvino]
     "SGLANG_DIFFUSION_TARGET_DEVICE": lambda: os.getenv(
         "SGLANG_DIFFUSION_TARGET_DEVICE", "cuda"
