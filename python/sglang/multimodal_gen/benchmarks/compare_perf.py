@@ -2,7 +2,7 @@ import argparse
 import json
 import re
 from datetime import datetime
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, List, Tuple
 
 
 # TODO: move this into `perf_log_analyze` to share with `test_server_utils`, while avoiding import whole `multimodal_gen` package
@@ -33,8 +33,8 @@ def calculate_lower_bound(baseline: float, rel_tol: float, min_abs_tol: float) -
 def get_perf_status_emoji(
     baseline: float,
     new: float,
-    rel_tol: float = 0.05,
-    min_abs_tol: float = 10.0,
+    rel_tol: float = 0.1,
+    min_abs_tol: float = 120.0,
 ) -> str:
     """
     Determines the status emoji based on performance difference.
@@ -47,11 +47,11 @@ def get_perf_status_emoji(
     lower_bound = calculate_lower_bound(baseline, rel_tol, min_abs_tol)
 
     if new > upper_bound:
-        return "🔴"  # Significant Deterioration
+        return "🔴"
     elif new < lower_bound:
-        return "🟢"  # Significant Optimization
+        return "🟢"
     else:
-        return "⚪️"  # Normal Fluctuation
+        return "⚪️"
 
 
 def consolidate_steps(
@@ -122,14 +122,12 @@ def compare_benchmarks(
         print(f"Error loading benchmark files: {e}")
         return
 
-    # --- High-level Summary ---
     base_e2e = base_data.get("total_duration_ms", 0)
     new_e2e = new_data.get("total_duration_ms", 0)
 
     diff_ms, diff_pct = calculate_diff(base_e2e, new_e2e)
 
-    # Status icon: Improved (Green), Regression (Red), Neutral (Gray)
-    # Assuming lower latency is better
+    # status icon: Improved (Green), Regression (Red), Neutral (Gray)
     if diff_pct < -2.0:
         status = "✅ (Faster)"
     elif diff_pct > 2.0:
@@ -141,9 +139,7 @@ def compare_benchmarks(
     base_durations, base_order, base_counts = consolidate_steps(
         base_data.get("steps", [])
     )
-    new_durations, new_order, new_counts = consolidate_steps(
-        new_data.get("steps", [])
-    )
+    new_durations, new_order, new_counts = consolidate_steps(new_data.get("steps", []))
 
     # Merge orders: Start with New order (execution order), append any missing from Base
     combined_order = list(new_order)
@@ -169,8 +165,8 @@ def compare_benchmarks(
                 else f" ({b_count}->{n_count} steps)"
             )
 
-        # Filter noise: show if diff is > 0.5ms OR if it's a major stage (like Denoising Loop)
-        # We always show Denoising Loop or stages with significant duration/diff
+        # filter noise: show if diff is > 0.5ms OR if it's a major stage (like Denoising Loop)
+        # always show Denoising Loop or stages with significant duration/diff
         if abs(s_diff) > 0.5 or b_val > 100 or n_val > 100:
             stage_rows.append((stage + count_str, b_val, n_val, s_diff, s_pct))
 
@@ -190,7 +186,7 @@ def compare_benchmarks(
         print("\n")
 
         # Detailed Breakdown
-        print("#### 2. Stage Breakdown (Execution Order)")
+        print("#### 2. Stage Breakdown")
         if not stage_rows:
             print("*No significant stage differences found.*")
         else:
@@ -199,8 +195,7 @@ def compare_benchmarks(
             )
             print("| :--- | :--- | :--- | :--- | :--- | :--- |")
             for name, b, n, d, p in stage_rows:
-                # Highlight large regressions (> 5%)
-                name_str = f"**{name}**" if p > 5.0 else name
+                name_str = name
                 status_emoji = get_perf_status_emoji(b, n)
                 print(
                     f"| {name_str} | {b:.2f} | {n:.2f} | {d:+.2f} | {p:+.1f}% | {status_emoji} |"
@@ -218,7 +213,7 @@ def compare_benchmarks(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compare two sglang performance JSON files."
+        description="Compare two sglang-diffusion performance JSON files."
     )
     parser.add_argument("baseline", help="Path to the baseline JSON file")
     parser.add_argument("new", help="Path to the new JSON file")

@@ -320,9 +320,7 @@ class PerformanceValidator:
         Uses the larger of relative tolerance or absolute tolerance to prevent
         flaky failures on very fast operations.
         """
-        upper_bound = calculate_upper_bound(
-            expected, tolerance, min_abs_tolerance_ms
-        )
+        upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance_ms)
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
             f"  Actual:   {actual:.4f}ms\n"
