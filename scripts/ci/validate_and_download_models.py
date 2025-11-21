@@ -66,11 +66,16 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "Qwen/Qwen3-Embedding-8B",
         "Qwen/QwQ-32B-AWQ",
         "Qwen/Qwen3-30B-A3B",
+        "Skywork/Skywork-Reward-Llama-3.1-8B-v0.2",
+        # diffusion
         "Qwen/Qwen-Image",
         "Qwen/Qwen-Image-Edit",
-        "Skywork/Skywork-Reward-Llama-3.1-8B-v0.2",
-        "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "black-forest-labs/FLUX.1-dev",
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
         "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
     ],
     "2-gpu-runner": [
         "mistralai/Mixtral-8x7B-Instruct-v0.1",

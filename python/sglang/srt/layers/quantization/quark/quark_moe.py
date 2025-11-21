@@ -13,7 +13,12 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -24,8 +29,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_is_hip = is_hip()
-_is_shuffle_moe_mxfp4 = get_bool_env_var("AITER_MXFP4_MOE_SF") and _is_hip
+_is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 
@@ -190,6 +194,8 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             layer.w2_weight.data = shuffle_weight(
                 layer.w2_weight.contiguous(), (16, 16)
             )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -219,6 +225,10 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         else:
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
+
+        if hasattr(layer.w13_weight, "is_shuffled"):
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
 
         output = fused_moe(
             x,

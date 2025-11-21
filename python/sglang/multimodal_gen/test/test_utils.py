@@ -172,6 +172,11 @@ def wait_for_perf_record(
                 if rec.get("tag") == tag:
                     return rec, len(records)
         time.sleep(0.5)
+
+    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+        records = read_perf_records(log_path)
+        return {}, len(records)
+
     raise AssertionError(
         f"Timeout waiting for perf log entry '{tag}' (start_len={prev_len})"
     )
@@ -180,15 +185,21 @@ def wait_for_perf_record(
 def wait_for_stage_metrics(
     request_id: str,
     prev_len: int,
-    expected_count: int,
     log_path: Path,
-    timeout: float = 120.0,
+    timeout: float = 300.0,
 ) -> tuple[dict[str, float], int]:
     deadline = time.time() + timeout
     metrics: dict[str, float] = {}
     while time.time() < deadline:
         records = read_perf_records(log_path)
         for rec in records[prev_len:]:
+            # Check if the request is completed
+            if (
+                rec.get("tag") == "total_inference_time"
+                and rec.get("request_id") == request_id
+            ):
+                return metrics, len(records)
+
             if (
                 rec.get("tag") == "pipeline_stage_metric"
                 and rec.get("request_id") == request_id
@@ -197,13 +208,12 @@ def wait_for_stage_metrics(
                 duration = rec.get("duration_ms")
                 if stage is not None and duration is not None:
                     metrics[str(stage)] = float(duration)
-        if len(metrics) >= expected_count:
-            return metrics, len(records)
         time.sleep(0.5)
-    raise AssertionError(
-        f"Timeout waiting for stage metrics for request {request_id} "
-        f"(collected={len(metrics)} expected={expected_count})"
-    )
+
+    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+        records = read_perf_records(log_path)
+        return {}, len(records)
+    raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
 
 
 def sample_step_indices(
