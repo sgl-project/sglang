@@ -599,6 +599,50 @@ def apply_awq_marlin_linear(
     return output.reshape(out_shape)
 
 
+def pack_quantized_values_into_int32(w_q: torch.Tensor,
+                                     wtype: ScalarType,
+                                     packed_dim: int = 0):
+    # move dim to pack to the end
+    perm = (*[i for i in range(len(w_q.shape)) if i != packed_dim], packed_dim)
+    inv_perm = tuple(perm.index(i) for i in range(len(perm)))
+    w_q_perm = w_q.permute(perm)
+
+    pack_factor = 32 // wtype.size_bits
+    mask = (1 << wtype.size_bits) - 1
+
+    new_shape_perm = list(w_q_perm.shape)
+    assert w_q_perm.shape[-1] % pack_factor == 0
+    new_shape_perm[-1] //= pack_factor
+
+    res = torch.zeros(new_shape_perm, dtype=torch.int32, device=w_q.device)
+    for i in range(pack_factor):
+        res |= (w_q_perm[..., i::pack_factor] & mask) << wtype.size_bits * i
+
+    return res.permute(inv_perm)
+
+
+def unpack_quantized_values_into_int32(w_q: torch.Tensor,
+                                       wtype: ScalarType,
+                                       packed_dim: int = 0):
+    # move dim to pack to the end
+    perm = (*[i for i in range(len(w_q.shape)) if i != packed_dim], packed_dim)
+    inv_perm = tuple(perm.index(i) for i in range(len(perm)))
+    w_q_perm = w_q.permute(perm)
+
+    pack_factor = 32 // wtype.size_bits
+    mask = (1 << wtype.size_bits) - 1
+
+    new_shape_perm = list(w_q_perm.shape)
+    new_shape_perm[-1] *= pack_factor
+
+    res = torch.zeros(new_shape_perm, dtype=torch.int32, device=w_q.device)
+    for i in range(pack_factor):
+        res[..., i::pack_factor] = (w_q_perm >> wtype.size_bits * i) & mask
+
+    return res.permute(inv_perm)
+
+
+
 class MarlinConfig(QuantizationConfig):
     """Config class for Marlin.
 
