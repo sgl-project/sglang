@@ -56,12 +56,10 @@ def _build_sampling_params_from_request(
 ) -> SamplingParams:
     width, height = _parse_size(size)
     ext = _choose_ext(output_format, background)
-
     server_args = get_global_server_args()
-    sampling_params = SamplingParams.from_pretrained(server_args.model_path)
-
     # Build user params
-    user_params = SamplingParams(
+    sampling_params = SamplingParams.from_user_sampling_params_args(
+        model_path=server_args.model_path,
         request_id=request_id,
         prompt=prompt,
         image_path=image_path,
@@ -70,18 +68,16 @@ def _build_sampling_params_from_request(
         height=height,
         num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
         save_output=True,
+        server_args=server_args,
     )
-
+    # FIXME: refactor this with set_output_file_ext
     # Let SamplingParams auto-generate a file name, then force desired extension
-    sampling_params = sampling_params.from_user_sampling_params(user_params)
     if not sampling_params.output_file_name:
         sampling_params.output_file_name = request_id
     if not sampling_params.output_file_name.endswith(f".{ext}"):
         # strip any existing extension and apply desired one
         base = sampling_params.output_file_name.rsplit(".", 1)[0]
         sampling_params.output_file_name = f"{base}.{ext}"
-
-    sampling_params.log(server_args)
     return sampling_params
 
 
@@ -107,7 +103,6 @@ def _build_req_from_sampling(s: SamplingParams) -> Req:
 async def generations(
     request: ImageGenerationsRequest,
 ):
-
     request_id = generate_request_id()
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
@@ -118,7 +113,6 @@ async def generations(
         background=request.background,
     )
     batch = prepare_request(
-        prompt=request.prompt,
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
@@ -175,7 +169,6 @@ async def edits(
     background: Optional[str] = Form("auto"),
     user: Optional[str] = Form(None),
 ):
-
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array

@@ -5,6 +5,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os.path
 import re
 import time
@@ -195,6 +196,91 @@ class SamplingParams:
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError("prompt_path must be a txt file")
 
+    # called after merged with user params
+    def adjust(
+        self,
+        server_args: ServerArgs,
+    ):
+        pipeline_config = server_args.pipeline_config
+        if not isinstance(self.prompt, str):
+            raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
+
+        # Process negative prompt
+        if self.negative_prompt is not None and not self.negative_prompt.isspace():
+            # avoid stripping default negative prompt: ' ' for qwen-image
+            self.negative_prompt = self.negative_prompt.strip()
+
+        # Validate dimensions
+        if self.num_frames <= 0:
+            raise ValueError(
+                f"height, width, and num_frames must be positive integers, got "
+                f"height={self.height}, width={self.width}, "
+                f"num_frames={self.num_frames}"
+            )
+
+        if pipeline_config.task_type.is_image_gen():
+            # settle num_frames
+            logger.debug(f"Setting num_frames to 1 because this is a image-gen model")
+            self.num_frames = 1
+            self.data_type = DataType.IMAGE
+        else:
+            # Adjust number of frames based on number of GPUs for video task
+            use_temporal_scaling_frames = (
+                pipeline_config.vae_config.use_temporal_scaling_frames
+            )
+            num_frames = self.num_frames
+            num_gpus = server_args.num_gpus
+            temporal_scale_factor = (
+                pipeline_config.vae_config.arch_config.temporal_compression_ratio
+            )
+
+            if use_temporal_scaling_frames:
+                orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
+            else:  # stepvideo only
+                orig_latent_num_frames = self.num_frames // 17 * 3
+
+            if orig_latent_num_frames % server_args.num_gpus != 0:
+                # Adjust latent frames to be divisible by number of GPUs
+                if self.num_frames_round_down:
+                    # Ensure we have at least 1 batch per GPU
+                    new_latent_num_frames = (
+                        max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                    )
+                else:
+                    new_latent_num_frames = (
+                        math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+                    )
+
+                if use_temporal_scaling_frames:
+                    # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
+                    new_num_frames = (
+                        new_latent_num_frames - 1
+                    ) * temporal_scale_factor + 1
+                else:  # stepvideo only
+                    # Find the least common multiple of 3 and num_gpus
+                    divisor = math.lcm(3, num_gpus)
+                    # Round up to the nearest multiple of this LCM
+                    new_latent_num_frames = (
+                        (new_latent_num_frames + divisor - 1) // divisor
+                    ) * divisor
+                    # Convert back to actual frames using the StepVideo formula
+                    new_num_frames = new_latent_num_frames // 3 * 17
+
+                logger.info(
+                    "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
+                    self.num_frames,
+                    new_num_frames,
+                    server_args.num_gpus,
+                )
+                self.num_frames = new_num_frames
+
+            self.num_frames = server_args.pipeline_config.adjust_num_frames(
+                self.num_frames
+            )
+
+        self.set_output_file_ext()
+        self.log(server_args=server_args)
+
     def update(self, source_dict: dict[str, Any]) -> None:
         for key, value in source_dict.items():
             if hasattr(self, key):
@@ -220,10 +306,20 @@ class SamplingParams:
             sampling_params = cls(**kwargs)
         return sampling_params
 
-    def from_user_sampling_params(self, user_params):
+    def from_user_sampling_params(self, user_params, server_args):
         sampling_params = deepcopy(self)
         sampling_params._merge_with_user_params(user_params)
+        sampling_params.adjust(server_args)
         return sampling_params
+
+    @staticmethod
+    def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
+        sampling_params = SamplingParams.from_pretrained(model_path)
+        sampling_params.set_output_file_name()
+        user_sampling_params = SamplingParams(*args, **kwargs)
+        return sampling_params.from_user_sampling_params(
+            user_sampling_params, server_args
+        )
 
     @staticmethod
     def add_cli_args(parser: Any) -> Any:

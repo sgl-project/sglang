@@ -265,6 +265,7 @@ class DiffGenerator:
         )
         pretrained_sampling_params.data_type = data_type
         pretrained_sampling_params.set_output_file_name()
+        pretrained_sampling_params.adjust(self.server_args)
 
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
@@ -272,7 +273,6 @@ class DiffGenerator:
             current_sampling_params.prompt = p
             requests.append(
                 prepare_request(
-                    p,
                     server_args=self.server_args,
                     sampling_params=current_sampling_params,
                 )
