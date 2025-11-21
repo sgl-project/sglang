@@ -16,8 +16,12 @@ void es_sm100_mxfp8_blockscaled_grouped_quant(
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
 
   auto groups = problem_sizes.size(0);
-  TORCH_CHECK(expert_offsets.dim() == 1 && expert_offsets.size(0) == groups, "problem_sizes must be 2D tensor");
-  TORCH_CHECK(blockscale_offsets.dim() == 1 && blockscale_offsets.size(0) == groups, "problem_sizes must be 2D tensor");
+  TORCH_CHECK(
+      expert_offsets.dim() == 1 && expert_offsets.size(0) == groups,
+      "expert_offsets must be 1D and have size equal to the number of groups");
+  TORCH_CHECK(
+      blockscale_offsets.dim() == 1 && blockscale_offsets.size(0) == groups,
+      "blockscale_offsets must be 1D and have size equal to the number of groups");
 
   auto stream = at::cuda::getCurrentCUDAStream();
   if (input.dtype() == torch::kBFloat16) {

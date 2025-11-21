@@ -141,7 +141,7 @@ template <
     typename TiledCopyR2G,
     typename TiledCopyR2S>
 __inline__ __device__ void mxfp8_group_quant_tile(
-    TensorS& tensor_s,  // TODO: Convert to reference type
+    TensorS& tensor_s,
     TensorP& tensor_p,
     TensorD& tensor_d,
     TensorSharedSF& tensor_shared_sf,
@@ -242,7 +242,6 @@ __inline__ __device__ void mxfp8_group_quant_tile(
   cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);  // b)
   __syncthreads();
 
-  // TODO: Move sync func to next loop
   if (threadIdx.x == 0) {
     cuda::ptx::cp_async_bulk(
         cuda::ptx::space_global,

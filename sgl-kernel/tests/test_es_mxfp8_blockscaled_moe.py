@@ -1,5 +1,4 @@
 import random
-from typing import Tuple
 
 import pytest
 import torch
@@ -100,12 +99,12 @@ def test_es_sm100_mxfp8_blockscaled_grouped_mm(num_experts, out_dtype):
         device=device, dtype=torch.int32
     )
 
-    a_quant = torch.zeros_like(a, device=device)
+    a_quant = torch.zeros_like(a, dtype=torch.float8_e4m3fn, device=device)
     a_scale_factor = torch.zeros(
         (a_blockscale_offset, k_g // 32), dtype=torch.uint8, device=device
     )
 
-    b_quant = torch.zeros_like(b, device=device)
+    b_quant = torch.zeros_like(b, dtype=torch.float8_e4m3fn, device=device)
     b_scale_factor = torch.zeros(
         (num_experts, n_g, k_g // 32), dtype=torch.uint8, device=device
     )

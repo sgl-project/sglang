@@ -1,8 +1,6 @@
 #pragma once
 #include <cuda.h>
 
-#include <iostream>
-
 #include "cute/tensor.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "es_sm100_mxfp8_blockscaled_traits.cuh"
@@ -120,9 +118,9 @@ struct Sm100Mxfp8BlockScaledStrideFunctor {
   }
 };
 
-template <typename OffsetFunctor, typename LayoutFunctor, typename StrideFuncotr>
+template <typename OffsetFunctor, typename LayoutFunctor, typename StrideFunctor>
 __global__ void sm100Mxfp8BlockscaledGroupedGemmPreComputeKernel(
-    int* problem_sizes, OffsetFunctor offset_functor, LayoutFunctor layout_functor, StrideFuncotr stride_functor) {
+    int* problem_sizes, OffsetFunctor offset_functor, LayoutFunctor layout_functor, StrideFunctor stride_functor) {
   int64_t expert_id = static_cast<int64_t>(threadIdx.x);
   int m = problem_sizes[expert_id * 3 + 0];
   int n = problem_sizes[expert_id * 3 + 1];

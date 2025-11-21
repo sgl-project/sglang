@@ -50,7 +50,7 @@ void es_sm100_mxfp8_blockscaled_group_mm_pre_compute(
   using StrideD = typename StrideFunctor::StrideD;
 
   int num_experts = (int)expert_offsets.size(0);
-  TORCH_CHECK(num_experts <= 1024, "Expert more than 1024");  // Max threads per block is 1024
+  TORCH_CHECK(num_experts <= 1024, "Number of experts cannot exceed 1024, the maximum number of threads per block.");
 
   OffsetFunctor offset_functor(
       reinterpret_cast<int*>(expert_offsets.data_ptr()),
@@ -149,7 +149,7 @@ void es_sm100_mxfp8_blockscaled_group_mm(
 }
 
 template <typename OutType>
-void es_sm100_mxfp8_blockscaled_group_mm_distpatch_out_dtype(
+void es_sm100_mxfp8_blockscaled_group_mm_dispatch_out_dtype(
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& sfa,
