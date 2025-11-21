@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -312,8 +313,11 @@ class Olmo2DecoderLayer(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.enable_dp_comm = is_dp_attention_enabled()
+
         # Attention block.
         self.self_attn = Olmo2Attention(
             config,
@@ -326,14 +330,33 @@ class Olmo2DecoderLayer(nn.Module):
         # MLP block.
         self.mlp = Olmo2MLP(config, quant_config, prefix=add_prefix("mlp", prefix))
 
-        # RMSNorm
+        # RMSNorms match the original Olmo2 / Olmo3 architecture:
+        # h := x + RMSNorm(Attention(x))
+        # h_out := h + RMSNorm(MLP(h))
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+        # Optional communicator for DP-attention; use comm_only=True so that
+        # it only handles scatter/gather and does not change LN/residual math.
+        if self.enable_dp_comm:
+            self.layer_scatter_modes = LayerScatterModes.init_new(
+                layer_id=layer_id,
+                num_layers=config.num_hidden_layers,
+                is_layer_sparse=False,
+                is_previous_layer_sparse=False,
+            )
+            self.layer_communicator = LayerCommunicator(
+                layer_scatter_modes=self.layer_scatter_modes,
+                input_layernorm=self.post_attention_layernorm,
+                post_attention_layernorm=self.post_feedforward_layernorm,
+                comm_only=True,
+            )
+        else:
+            self.layer_communicator = None
 
     def forward(
         self,
@@ -341,17 +364,47 @@ class Olmo2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Attention block.
+        # Use communicator (if enabled) to handle DP/TP communication only.
+        comm_residual: Optional[torch.Tensor] = hidden_states
+        if self.layer_communicator is not None:
+            # In comm_only mode, this adjusts sharding/group sizes for attention
+            # inputs without applying any layernorm or residual math.
+            hidden_states, comm_residual = self.layer_communicator.prepare_attn(
+                hidden_states, comm_residual, forward_batch
+            )
+
+        # Attention block (keep Olmo2 semantics).
         residual = hidden_states
-        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
+        if hidden_states.shape[0] != 0:
+            # Note: DP attention may give some ranks zero tokens; we skip kernels there.
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = hidden_states + residual
+
+        # Prepare tokens for MLP in DP-attention mode without changing math.
+        if self.layer_communicator is not None:
+            hidden_states, comm_residual = self.layer_communicator.prepare_mlp(
+                hidden_states,
+                comm_residual,
+                forward_batch,
+            )
 
         # MLP block.
         residual = hidden_states
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = hidden_states + residual
+
+        # Scatter tokens back to the layer output layout when using DP attention.
+        if self.layer_communicator is not None:
+            hidden_states, comm_residual = self.layer_communicator.postprocess_layer(
+                hidden_states, comm_residual, forward_batch
+            )
         return hidden_states
 
 
@@ -410,7 +463,7 @@ class Olmo2Model(nn.Module):
             hidden_states = input_embeds
 
         # Apply blocks one-by-one.
-        for layer_id, decoder_layer in enumerate(self.layers):
+        for _, decoder_layer in enumerate(self.layers):
             # shape: (batch_size, seq_len, d_model)
             hidden_states = decoder_layer(
                 positions,
@@ -420,7 +473,8 @@ class Olmo2Model(nn.Module):
 
         # Apply final layer norm.
         # shape: (batch_size, seq_len or 1, d_model)
-        hidden_states = self.norm(hidden_states)
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
