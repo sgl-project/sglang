@@ -29,6 +29,8 @@ from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.test.test_utils import CustomTestCase
 
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+
 
 class TestModelOptModelLoader(CustomTestCase):
     """Test cases for ModelOptModelLoader functionality."""
@@ -64,7 +66,7 @@ class TestModelOptModelLoader(CustomTestCase):
 
         self.model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         self.load_config = LoadConfig()
-        self.device_config = DeviceConfig(device="cuda")
+        self.device_config = DeviceConfig(device=device_type)
 
         # Create a basic model config with unified quantization flag
         self.model_config = ModelConfig(

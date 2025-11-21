@@ -7,6 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
+from sglang.srt.utils import is_cuda, is_xpu
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -17,6 +18,16 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 from sglang.utils import terminate_process
+
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+
+
+def get_gpu_rank():
+    if is_xpu():
+        gpu_rank = torch.xpu.device_count()
+    elif is_cuda():
+        gpu_rank = torch.cuda.device_count()
+    return gpu_rank
 
 
 def _process_return(ret):
@@ -32,7 +43,7 @@ class TestGetWeightsByName(CustomTestCase):
     def init_hf_model(self, model_name, tie_word_embeddings):
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype="bfloat16", tie_word_embeddings=tie_word_embeddings
-        ).to("cuda:0")
+        ).to(device_type)
 
     def init_backend(self, backend, dp, tp, model_name):
         self.backend = backend
@@ -61,7 +72,10 @@ class TestGetWeightsByName(CustomTestCase):
     def clean_up(self):
         del self.hf_model
         gc.collect()
-        torch.cuda.empty_cache()
+        if is_cuda():
+            torch.cuda.empty_cache()
+        elif is_xpu():
+            torch.xpu.empty_cache()
         if self.backend == "Engine":
             self.engine.shutdown()
         else:
@@ -132,11 +146,11 @@ class TestGetWeightsByName(CustomTestCase):
                 ("Runtime", 1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
                 ("Engine", 1, 1, DEFAULT_MODEL_NAME_FOR_TEST),
             ]
-            if torch.cuda.device_count() >= 2:
+            if get_gpu_rank() >= 2:
                 test_suits.append(("Engine", 1, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST))
                 test_suits.append(("Runtime", 2, 1, DEFAULT_MODEL_NAME_FOR_TEST))
 
-            if torch.cuda.device_count() >= 4:
+            if get_gpu_rank() >= 4:
                 test_suits.extend(
                     [
                         ("Engine", 2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST),

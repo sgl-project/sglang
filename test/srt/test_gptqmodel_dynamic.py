@@ -13,6 +13,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+torch.set_default_device(device_type)
+
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from sglang.srt.configs.device_config import DeviceConfig
@@ -46,7 +49,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
     model_config = ModelConfig.from_server_args(server_args)
 
     load_config = LoadConfig()
-    device_config = DeviceConfig("cuda")
+    device_config = DeviceConfig(device_type)
     model = get_model(
         model_config=model_config, load_config=load_config, device_config=device_config
     )

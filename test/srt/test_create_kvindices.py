@@ -6,34 +6,33 @@ import torch
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.test.test_utils import CustomTestCase
 
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
 
 class TestCreateKvIndices(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA is not available")
-        torch.set_default_device("cuda")
+        torch.set_default_device(device_type)
 
     def _run_test(self, batch, max_batch, max_context_len):
         req_to_token = torch.arange(
-            max_batch * max_context_len, dtype=torch.int32, device="cuda"
+            max_batch * max_context_len, dtype=torch.int32, device=device_type
         ).reshape((max_batch, max_context_len))
         req_pool_indices = torch.tensor(
             torch.from_numpy(
                 np.random.choice(range(max_batch), size=batch, replace=False)
             ),
             dtype=torch.int32,
-            device="cuda",
+            device=device_type,
         )
         paged_kernel_lens = torch.tensor(
             torch.from_numpy(
                 np.random.choice(range(max_context_len), size=batch, replace=False)
             ),
             dtype=torch.int32,
-            device="cuda",
+            device=device_type,
         )
 
-        kv_indptr = torch.zeros((batch + 1,), dtype=torch.int32, device="cuda")
+        kv_indptr = torch.zeros((batch + 1,), dtype=torch.int32, device=device_type)
         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         # ref
@@ -48,7 +47,7 @@ class TestCreateKvIndices(CustomTestCase):
         ).contiguous()
 
         # triton
-        kv_indices_triton = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+        kv_indices_triton = torch.empty(kv_indptr[-1], dtype=torch.int32, device=device_type)
         create_flashinfer_kv_indices_triton[(batch,)](
             req_to_token,
             req_pool_indices,
