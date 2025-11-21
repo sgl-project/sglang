@@ -10,7 +10,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     HunyuanConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.stepvideo import StepVideoT2VConfig
-from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
