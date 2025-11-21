@@ -14,6 +14,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -2493,6 +2494,7 @@ def normal_decode_set_metadata(
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def update_draft_decode_set_expand_metadata_with_page_size(
     cache_seqlens_int32: torch.Tensor,  # Modifies
     page_table: torch.Tensor,  # Modifies
@@ -2512,7 +2514,10 @@ def update_draft_decode_set_expand_metadata_with_page_size(
     )
     expand_page_table -= last_page_lens_broadcast
     expand_page_table = (
-        expand_page_table[:, strided_indices_expand[:decode_length]] // page_size
+        expand_page_table[
+            :, strided_indices_expand[: (decode_length + page_size - 1) // page_size]
+        ]
+        // page_size
     )
     max_seq_pages_expand = (decode_length + page_size - 1) // page_size
-    page_table[:,].copy_(expand_page_table[:, :max_seq_pages_expand])
+    page_table[:, :max_seq_pages_expand].copy_(expand_page_table)
