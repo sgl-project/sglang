@@ -809,21 +809,25 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
 
-        current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
+        event0 = torch.cuda.Event()
+        event1 = torch.cuda.Event()
+
+        event0.record()
         shared_output = self._forward_shared_experts(
             hidden_states, gemm_output_zero_allocator
         )
 
         with torch.cuda.stream(self.alt_stream):
+            event0.wait()
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
+            event1.record()
+        event1.wait()
 
-        current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
         if (
             self.tp_size > 1
