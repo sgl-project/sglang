@@ -117,6 +117,9 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+[tool.uv.sources]
+sglang = { workspace = true }
+
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
