@@ -27,7 +27,7 @@ class TestWaveAttnBackend(CustomTestCase):
                 "--attention-backend",
                 "wave",
                 "--enable-torch-compile",
-                "--disable-cuda-graph"
+                "--disable-cuda-graph",
             ],
         )
 

@@ -1,16 +1,10 @@
 import random
 import unittest
-
-import torch
 from typing import List, Optional
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
-    decode_attention_fwd_grouped as triton_decode_attention_fwd_grouped,
-)
-from sglang.srt.layers.attention.triton_ops.extend_attention import (
-    extend_attention_fwd,
-    redundant_attention,
-)
+import torch
+
+from sglang.srt.layers.attention.triton_ops.extend_attention import redundant_attention
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )

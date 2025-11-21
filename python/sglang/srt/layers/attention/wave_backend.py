@@ -470,7 +470,7 @@ class WaveAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        
+
         if cuda_graph_num_kv_splits_buf is None:
             self.cuda_graph_num_kv_splits = torch.full(
                 (max_num_tokens,),
@@ -807,7 +807,7 @@ class WaveAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
-    
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
