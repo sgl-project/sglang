@@ -1937,8 +1937,10 @@ def get_gpu_count():
 def empty_gpu_cache():
     if is_xpu():
         torch.xpu.empty_cache()
-    elif is_cuda():
+    elif is_cuda() or is_rocm():
         torch.cuda.empty_cache()
+    else:
+        print("There is no suitable GPU")
 
 
 def get_gpu_memory_gb():
