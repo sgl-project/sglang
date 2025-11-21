@@ -382,7 +382,7 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "nightly-amd": [
-        TestFile("../nightly/test_gsm8k_eval_amd.py"),
+        TestFile("nightly/test_gsm8k_eval_amd.py"),
     ],
 }
 
