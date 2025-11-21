@@ -30,15 +30,17 @@ def _filter_tests(
     return ret
 
 
-def run_per_commit(hw: HWBackend, suite: str):
+def run_per_commit(
+    hw: HWBackend, suite: str, timeout_per_file: int = 1200, continue_on_error: bool = False
+):
     files = glob.glob("per_commit/**/*.py", recursive=True)
     ci_tests = _filter_tests(collect_tests(files), hw, suite)
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
     run_unittest_files(
         test_files,
-        timeout_per_file=1200,
-        continue_on_error=False,
+        timeout_per_file=timeout_per_file,
+        continue_on_error=continue_on_error,
     )
 
 
@@ -57,9 +59,21 @@ def main():
         required=True,
         help="Test suite to run.",
     )
+    parser.add_argument(
+        "--timeout-per-file",
+        type=int,
+        default=1200,
+        help="The time limit for running one file in seconds (default: 1200).",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (default: False, useful for nightly tests).",
+    )
     args = parser.parse_args()
     hw = HW_MAPPING[args.hw]
-    run_per_commit(hw, args.suite)
+    run_per_commit(hw, args.suite, args.timeout_per_file, args.continue_on_error)
 
 
 if __name__ == "__main__":
