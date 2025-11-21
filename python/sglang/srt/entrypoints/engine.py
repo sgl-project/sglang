@@ -136,9 +136,12 @@ class Engine(EngineBase):
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
-        self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-        )
+        if self.server_args.node_rank == 0:
+            self.send_to_rpc = get_zmq_socket(
+                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
+            )
+        else:
+            self.send_to_rpc = None
 
         # Enable tracing
         if server_args.enable_trace:
