@@ -239,6 +239,3 @@ class GptOssDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError("structure_info not used with HarmonyParser")
-
-    def build_ebnf(self, tools: List[Tool]) -> str:
-        raise NotImplementedError("build_ebnf not used with HarmonyParser")

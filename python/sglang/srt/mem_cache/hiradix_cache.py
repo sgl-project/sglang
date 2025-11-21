@@ -376,11 +376,7 @@ class HiRadixCache(RadixCache):
                 assert node.backuped
                 self._evict_backuped(node)
 
-        if num_evicted > 0 and self.metrics_collector is not None:
-            self.metrics_collector.observe_eviction_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
+        self.update_eviction_metrics(num_evicted, start_time)
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host

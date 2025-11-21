@@ -12,7 +12,7 @@ on-the-fly to convert high-precision weights into a lower-precision format.
 **Note: For better performance, usability and convenience, offline quantization is recommended over online quantization.**
 
 If you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time.
-For popular pre-quantized models, please visit [ModelCloud](https://huggingface.co/collections/ModelCloud/vortex-673743382af0a52b2a8b9fe2)
+For popular pre-quantized models, please visit [Unsloth](https://huggingface.co/unsloth), [ModelCloud](https://huggingface.co/collections/ModelCloud/vortex-673743382af0a52b2a8b9fe2)
 or [NeuralMagic](https://huggingface.co/collections/neuralmagic) collections on HF for some
 popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
 to guard against abnormal quantization loss regressions.
@@ -39,6 +39,10 @@ python3 -m sglang.launch_server \
 ```
 
 ### Examples of Offline Model Quantization
+
+#### Using [Unsloth](https://docs.unsloth.ai/basics/inference-and-deployment/sglang-guide)
+
+We strongly suggest the use of Unsloth to quantize and load the model. Please refer to [SGLang Deployment & Inference Guide with Unsloth](https://docs.unsloth.ai/basics/inference-and-deployment/sglang-guide).
 
 #### Using [auto-round](https://github.com/intel/auto-round)
 
