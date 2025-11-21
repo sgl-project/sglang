@@ -265,7 +265,6 @@ class TestPrefillAdder(CustomTestCase):
         )  # 50 + 75 + 100 + 125 + 125 - 100 = 375
         running_batch.release_req.assert_called_once()
 
-
     def test_preempt_success_low_priority_values_first_exact_twice(self):
         params = [
             ("run1", 0, 50),
@@ -301,6 +300,7 @@ class TestPrefillAdder(CustomTestCase):
             adder.rem_total_token_offset, 375
         )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
         self.assertEqual(running_batch.release_req.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
