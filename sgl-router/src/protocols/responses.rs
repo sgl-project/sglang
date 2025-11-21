@@ -7,11 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use validator::Validate;
 
-// Import shared types from common module
-use super::common::{
-    default_model, default_true, ChatLogProbs, Function, GenerationRequest, PromptTokenUsageInfo,
-    StringOrArray, ToolChoice, UsageInfo,
+use super::{
+    common::{
+        default_model, default_true, validate_stop, ChatLogProbs, Function, GenerationRequest,
+        PromptTokenUsageInfo, StringOrArray, ToolChoice, ToolChoiceValue, ToolReference, UsageInfo,
+    },
+    sampling_params::{validate_top_k_value, validate_top_p_value},
 };
+use crate::protocols::{builders::ResponsesResponseBuilder, validated::Normalizable};
 
 // ============================================================================
 // Response Tools (MCP and others)
@@ -273,7 +276,7 @@ pub enum Truncation {
     Disabled,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
     Queued,
@@ -291,18 +294,39 @@ pub struct ReasoningInfo {
     pub summary: Option<String>,
 }
 
+// ============================================================================
+// Text Format (structured outputs)
+// ============================================================================
+
+/// Text configuration for structured output requests
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResponseTextFormat {
-    pub format: TextFormatType,
+pub struct TextConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<TextFormat>,
 }
 
+/// Text format: text (default), json_object (legacy), or json_schema (recommended)
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TextFormatType {
-    #[serde(rename = "type")]
-    pub format_type: String,
+#[serde(tag = "type")]
+pub enum TextFormat {
+    #[serde(rename = "text")]
+    Text,
+
+    #[serde(rename = "json_object")]
+    JsonObject,
+
+    #[serde(rename = "json_schema")]
+    JsonSchema {
+        name: String,
+        schema: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum IncludeField {
     #[serde(rename = "code_interpreter_call.outputs")]
@@ -461,6 +485,7 @@ pub struct ResponsesRequest {
     pub include: Option<Vec<IncludeField>>,
 
     /// Input content - can be string or structured items
+    #[validate(custom(function = "validate_response_input"))]
     pub input: ResponseInput,
 
     /// System instructions for the model
@@ -469,10 +494,12 @@ pub struct ResponsesRequest {
 
     /// Maximum number of output tokens
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
     pub max_output_tokens: Option<u32>,
 
     /// Maximum number of tool calls
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
     pub max_tool_calls: Option<u32>,
 
     /// Additional metadata
@@ -517,6 +544,7 @@ pub struct ResponsesRequest {
         default = "default_temperature",
         skip_serializing_if = "Option::is_none"
     )]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
 
     /// Tool choice behavior
@@ -525,19 +553,27 @@ pub struct ResponsesRequest {
 
     /// Available tools
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_response_tools"))]
     pub tools: Option<Vec<ResponseTool>>,
 
     /// Number of top logprobs to return
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0, max = 20))]
     pub top_logprobs: Option<u32>,
 
     /// Top-p sampling parameter
     #[serde(default = "default_top_p", skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
     /// Truncation behavior
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Truncation>,
+
+    /// Text format for structured outputs (text, json_object, json_schema)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_text_format"))]
+    pub text: Option<TextConfig>,
 
     /// User identifier
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -553,26 +589,32 @@ pub struct ResponsesRequest {
 
     /// Frequency penalty
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
 
     /// Presence penalty
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
 
     /// Stop sequences
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_stop"))]
     pub stop: Option<StringOrArray>,
 
     /// Top-k sampling parameter (SGLang extension)
     #[serde(default = "default_top_k")]
+    #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: i32,
 
     /// Min-p sampling parameter (SGLang extension)
     #[serde(default)]
+    #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: f32,
 
     /// Repetition penalty (SGLang extension)
     #[serde(default = "default_repetition_penalty")]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: f32,
 }
 
@@ -607,6 +649,7 @@ impl Default for ResponsesRequest {
             top_logprobs: None,
             top_p: None,
             truncation: None,
+            text: None,
             user: None,
             request_id: None,
             priority: 0,
@@ -616,6 +659,37 @@ impl Default for ResponsesRequest {
             top_k: default_top_k(),
             min_p: 0.0,
             repetition_penalty: default_repetition_penalty(),
+        }
+    }
+}
+
+impl Normalizable for ResponsesRequest {
+    /// Normalize the request by applying defaults:
+    /// 1. Apply tool_choice defaults based on tools presence
+    /// 2. Apply parallel_tool_calls defaults
+    /// 3. Apply store field defaults
+    fn normalize(&mut self) {
+        // 1. Apply tool_choice defaults
+        if self.tool_choice.is_none() {
+            if let Some(tools) = &self.tools {
+                let choice_value = if !tools.is_empty() {
+                    ToolChoiceValue::Auto
+                } else {
+                    ToolChoiceValue::None
+                };
+                self.tool_choice = Some(ToolChoice::Value(choice_value));
+            }
+            // If tools is None, leave tool_choice as None (don't set it)
+        }
+
+        // 2. Apply default for parallel_tool_calls if tools are present
+        if self.parallel_tool_calls.is_none() && self.tools.is_some() {
+            self.parallel_tool_calls = Some(true);
+        }
+
+        // 3. Ensure store defaults to true if not specified
+        if self.store.is_none() {
+            self.store = Some(true);
         }
     }
 }
@@ -725,80 +799,259 @@ pub fn validate_conversation_id(conv_id: &str) -> Result<(), validator::Validati
     Ok(())
 }
 
+/// Validates tool_choice requires tools and references exist
+fn validate_tool_choice_with_tools(
+    request: &ResponsesRequest,
+) -> Result<(), validator::ValidationError> {
+    let Some(tool_choice) = &request.tool_choice else {
+        return Ok(());
+    };
+
+    let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
+
+    // Check if tool_choice requires tools but none are provided
+    if is_some_choice && !has_tools {
+        let mut e = validator::ValidationError::new("tool_choice_requires_tools");
+        e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
+        return Err(e);
+    }
+
+    // Validate tool references exist when tools are present
+    if !has_tools {
+        return Ok(());
+    }
+
+    // Extract function tool names from ResponseTools
+    let tools = request.tools.as_ref().unwrap();
+    let function_tool_names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| match t.r#type {
+            ResponseToolType::Function => t.function.as_ref().map(|f| f.name.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // Validate tool references exist
+    match tool_choice {
+        ToolChoice::Function { function, .. } => {
+            if !function_tool_names.contains(&function.name.as_str()) {
+                let mut e = validator::ValidationError::new("tool_choice_function_not_found");
+                e.message = Some(
+                    format!(
+                        "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+                        function.name
+                    )
+                    .into(),
+                );
+                return Err(e);
+            }
+        }
+        ToolChoice::AllowedTools {
+            mode,
+            tools: allowed_tools,
+            ..
+        } => {
+            // Validate mode is "auto" or "required"
+            if mode != "auto" && mode != "required" {
+                let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
+                e.message = Some(
+                    format!(
+                        "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{}'.",
+                        mode
+                    )
+                    .into(),
+                );
+                return Err(e);
+            }
+
+            // Validate that all function tool references exist
+            for tool_ref in allowed_tools {
+                if let ToolReference::Function { name } = tool_ref {
+                    if !function_tool_names.contains(&name.as_str()) {
+                        let mut e = validator::ValidationError::new("tool_choice_tool_not_found");
+                        e.message = Some(
+                            format!(
+                                "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
+                                name
+                            )
+                            .into(),
+                        );
+                        return Err(e);
+                    }
+                }
+                // Note: MCP and hosted tools don't need existence validation here
+                // as they are resolved dynamically at runtime
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 /// Schema-level validation for cross-field dependencies
 fn validate_responses_cross_parameters(
     request: &ResponsesRequest,
 ) -> Result<(), validator::ValidationError> {
-    use super::common::{ToolChoice, ToolReference};
+    // 1. Validate tool_choice requires tools (enhanced)
+    validate_tool_choice_with_tools(request)?;
 
-    // Only validate if both tools and tool_choice are present
-    if let (Some(tools), Some(tool_choice)) = (&request.tools, &request.tool_choice) {
-        // Extract function tool names from ResponseTools
-        let function_tool_names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| match t.r#type {
-                ResponseToolType::Function => t.function.as_ref().map(|f| f.name.as_str()),
-                _ => None,
-            })
-            .collect();
+    // 2. Validate top_logprobs requires include field
+    if request.top_logprobs.is_some() {
+        let has_logprobs_include = request
+            .include
+            .as_ref()
+            .is_some_and(|inc| inc.contains(&IncludeField::MessageOutputTextLogprobs));
 
-        match tool_choice {
-            ToolChoice::Function { function, .. } => {
-                // Validate the specific function exists
-                if !function_tool_names.contains(&function.name.as_str()) {
-                    let mut e = validator::ValidationError::new("tool_choice_function_not_found");
-                    e.message = Some(
-                        format!(
-                            "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
-                            function.name
-                        )
-                        .into(),
-                    );
+        if !has_logprobs_include {
+            let mut e = validator::ValidationError::new("top_logprobs_requires_include");
+            e.message = Some(
+                "top_logprobs requires include field with 'message.output_text.logprobs'".into(),
+            );
+            return Err(e);
+        }
+    }
+
+    // 3. Validate background/stream conflict
+    if request.background == Some(true) && request.stream == Some(true) {
+        let mut e = validator::ValidationError::new("background_conflicts_with_stream");
+        e.message = Some("Cannot use background mode with streaming".into());
+        return Err(e);
+    }
+
+    // 4. Validate conversation and previous_response_id are mutually exclusive
+    if request.conversation.is_some() && request.previous_response_id.is_some() {
+        let mut e = validator::ValidationError::new("mutually_exclusive_parameters");
+        e.message = Some("Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.".into());
+        return Err(e);
+    }
+
+    // 5. Validate input items structure
+    if let ResponseInput::Items(items) = &request.input {
+        // Check for at least one valid input message
+        let has_valid_input = items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseInputOutputItem::Message { .. }
+                    | ResponseInputOutputItem::SimpleInputMessage { .. }
+            )
+        });
+
+        if !has_valid_input {
+            let mut e = validator::ValidationError::new("input_missing_user_message");
+            e.message = Some("Input items must contain at least one message".into());
+            return Err(e);
+        }
+    }
+
+    // 6. Validate text format conflicts (for future structured output constraints)
+    // Currently, Responses API doesn't have regex/ebnf like Chat API,
+    // but this is here for completeness and future-proofing
+
+    Ok(())
+}
+
+// ============================================================================
+// Field-Level Validation Functions
+// ============================================================================
+
+/// Validates response input is not empty and has valid content
+fn validate_response_input(input: &ResponseInput) -> Result<(), validator::ValidationError> {
+    match input {
+        ResponseInput::Text(text) => {
+            if text.is_empty() {
+                let mut e = validator::ValidationError::new("input_text_empty");
+                e.message = Some("Input text cannot be empty".into());
+                return Err(e);
+            }
+        }
+        ResponseInput::Items(items) => {
+            if items.is_empty() {
+                let mut e = validator::ValidationError::new("input_items_empty");
+                e.message = Some("Input items cannot be empty".into());
+                return Err(e);
+            }
+            // Validate each item has valid content
+            for item in items {
+                validate_input_item(item)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates individual input items have valid content
+fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), validator::ValidationError> {
+    match item {
+        ResponseInputOutputItem::Message { content, .. } => {
+            if content.is_empty() {
+                let mut e = validator::ValidationError::new("message_content_empty");
+                e.message = Some("Message content cannot be empty".into());
+                return Err(e);
+            }
+        }
+        ResponseInputOutputItem::SimpleInputMessage { content, .. } => match content {
+            StringOrContentParts::String(s) if s.is_empty() => {
+                let mut e = validator::ValidationError::new("message_content_empty");
+                e.message = Some("Message content cannot be empty".into());
+                return Err(e);
+            }
+            StringOrContentParts::Array(parts) if parts.is_empty() => {
+                let mut e = validator::ValidationError::new("message_content_empty");
+                e.message = Some("Message content parts cannot be empty".into());
+                return Err(e);
+            }
+            _ => {}
+        },
+        ResponseInputOutputItem::Reasoning { .. } => {
+            // Reasoning content can be empty - no validation needed
+        }
+        ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
+            if output.is_empty() {
+                let mut e = validator::ValidationError::new("function_output_empty");
+                e.message = Some("Function call output cannot be empty".into());
+                return Err(e);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validates ResponseTool structure based on tool type
+fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), validator::ValidationError> {
+    for tool in tools {
+        match tool.r#type {
+            ResponseToolType::Function => {
+                if tool.function.is_none() {
+                    let mut e = validator::ValidationError::new("function_tool_missing_function");
+                    e.message = Some("Function tool must have a function definition".into());
                     return Err(e);
                 }
             }
-            ToolChoice::AllowedTools {
-                mode,
-                tools: allowed_tools,
-                ..
-            } => {
-                // Validate mode is "auto" or "required"
-                if mode != "auto" && mode != "required" {
-                    let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
-                    e.message = Some(
-                        format!(
-                            "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{}'.",
-                            mode
-                        )
-                        .into(),
-                    );
+            ResponseToolType::Mcp => {
+                if tool.server_url.is_none() {
+                    let mut e = validator::ValidationError::new("mcp_tool_missing_server_url");
+                    e.message = Some("MCP tool must have a server_url".into());
                     return Err(e);
-                }
-
-                // Validate that all function tool references exist
-                for tool_ref in allowed_tools {
-                    if let ToolReference::Function { name } = tool_ref {
-                        if !function_tool_names.contains(&name.as_str()) {
-                            let mut e =
-                                validator::ValidationError::new("tool_choice_tool_not_found");
-                            e.message = Some(
-                                format!(
-                                    "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
-                                    name
-                                )
-                                .into(),
-                            );
-                            return Err(e);
-                        }
-                    }
-                    // Note: MCP and hosted tools don't need existence validation here
-                    // as they are resolved dynamically at runtime
                 }
             }
             _ => {}
         }
     }
+    Ok(())
+}
 
+/// Validates text format configuration (JSON schema name cannot be empty)
+fn validate_text_format(text: &TextConfig) -> Result<(), validator::ValidationError> {
+    if let Some(TextFormat::JsonSchema { name, .. }) = &text.format {
+        if name.is_empty() {
+            let mut e = validator::ValidationError::new("json_schema_name_empty");
+            e.message = Some("JSON schema name cannot be empty".into());
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
@@ -906,7 +1159,7 @@ pub struct ResponsesResponse {
 
     /// Text format settings
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextFormat>,
+    pub text: Option<TextConfig>,
 
     /// Tool choice setting
     #[serde(default = "default_tool_choice")]
@@ -950,6 +1203,11 @@ fn default_tool_choice() -> String {
 }
 
 impl ResponsesResponse {
+    /// Create a builder for constructing a ResponsesResponse
+    pub fn builder(id: impl Into<String>, model: impl Into<String>) -> ResponsesResponseBuilder {
+        ResponsesResponseBuilder::new(id, model)
+    }
+
     /// Check if the response is complete
     pub fn is_complete(&self) -> bool {
         matches!(self.status, ResponseStatus::Completed)

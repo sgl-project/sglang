@@ -129,6 +129,7 @@ class SamplingParams:
 
     # Debugging
     debug: bool = False
+    perf_dump_path: str | None = None
 
     # Misc
     save_output: bool = True
@@ -205,14 +206,12 @@ class SamplingParams:
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
-        from sglang.multimodal_gen.configs.sample.registry import (
-            get_sampling_param_cls_for_name,
-        )
+        from sglang.multimodal_gen.registry import get_model_info
 
-        sampling_cls = get_sampling_param_cls_for_name(model_path)
-        logger.debug(f"Using pretrained SamplingParam: {sampling_cls}")
-        if sampling_cls is not None:
-            sampling_params: SamplingParams = sampling_cls(**kwargs)
+        model_info = get_model_info(model_path)
+        logger.debug(f"Found model info: {model_info}")
+        if model_info is not None:
+            sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         else:
             logger.warning(
                 "Couldn't find an optimal sampling param for %s. Using the default sampling param.",
@@ -415,9 +414,6 @@ class SamplingParams:
         if user_params is None:
             return
 
-        # Get fields defined directly in the subclass (not inherited)
-        subclass_defined_fields = set(type(self).__annotations__.keys())
-
         # Compare against current instance to avoid constructing a default instance
         default_params = SamplingParams()
 
@@ -434,7 +430,7 @@ class SamplingParams:
                 if field_name != "output_file_name"
                 else user_params.output_file_path is not None
             )
-            if is_user_modified and field_name not in subclass_defined_fields:
+            if is_user_modified:
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
 

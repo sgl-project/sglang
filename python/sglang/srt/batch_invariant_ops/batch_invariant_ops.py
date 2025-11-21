@@ -18,6 +18,10 @@ if ENABLE_JIT_DEEPGEMM:
 _ENABLE_MM_DEEPGEMM = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
 )
+# If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
+_ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0"
+)
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
 )
@@ -241,7 +245,15 @@ def _matmul_persistent_deepgemm(
     dtype = a.dtype
     out = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    deep_gemm.bf16_gemm_nn(a, b, out)
+    try:
+        deep_gemm.bf16_gemm_nn(a, b, out)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"DeepGEMM failed for matrix shapes M={M}, N={N}, K={K}. "
+            f"This typically occurs when dimensions are too small for DeepGEMM's TMA descriptors. "
+            f"Consider increasing MIN_DEEPGEMM_DIM in matmul_persistent() or disabling DeepGEMM "
+            f"for small matrices. Original error: {e}"
+        ) from e
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -253,6 +265,11 @@ def _matmul_persistent_deepgemm(
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
+    K, N = b.shape
+
+    # DeepGEMM has minimum dimension requirements for TMA descriptors
+    MIN_DEEPGEMM_DIM = 16
+
     if (
         _ENABLE_MM_DEEPGEMM
         and ENABLE_JIT_DEEPGEMM
@@ -260,6 +277,7 @@ def matmul_persistent(
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
+        and N >= MIN_DEEPGEMM_DIM
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
@@ -277,6 +295,9 @@ def matmul_persistent(
             return out_deepgemm
 
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+
+    if _ENABLE_MM_FALLBACK_VARIANT:
+        return torch.einsum("ik,kj->ij", a, b)
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
@@ -302,8 +323,16 @@ def _log_softmax_kernel(
     output_row_start_ptr = output_ptr + row_idx * output_row_stride
 
     # Step 1: Find maximum value in the row for numerical stability
-    max_val = -float("inf")
-    for col_offset in range(0, n_cols, BLOCK_SIZE):
+    # Load first block to infer dtype and initialize max_val with correct type
+    col_idx_init = tl.arange(0, BLOCK_SIZE)
+    mask_init = col_idx_init < n_cols
+    vals_init = tl.load(
+        row_start_ptr + col_idx_init, mask=mask_init, other=-float("inf")
+    )
+    max_val = tl.max(vals_init)
+
+    # Continue with remaining blocks
+    for col_offset in range(BLOCK_SIZE, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
 
@@ -314,7 +343,9 @@ def _log_softmax_kernel(
         max_val = tl.max(tl.maximum(vals, max_val))
 
     # Step 2: Compute sum of exp(x - max_val)
-    sum_exp = 0.0
+    # Initialize sum_exp with correct dtype by using tl.sum on a zero vector
+    sum_exp = tl.sum(tl.zeros([1], dtype=max_val.dtype))
+
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols

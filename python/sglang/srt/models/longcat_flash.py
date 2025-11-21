@@ -80,6 +80,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.utils import (
+    maybe_executor_submit,
+    should_async_load,
+    should_deepgemm_weight_requant_ue8m0,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.server_args import get_global_server_args
@@ -773,11 +778,8 @@ class LongcatFlashForCausalLM(nn.Module):
         # TODO(linguoyuan) EPMoE not support DEEPGEMM_BLACKWELL, DeepEP needs to be supported in the future
         deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 = False
 
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and hasattr(self.quant_config, "weight_block_size")
-            and self.quant_config.weight_block_size is not None
+        if should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=getattr(self.quant_config, "weight_block_size", None)
         ):
             self._weight_requant_ue8m0()
 
@@ -854,6 +856,7 @@ class LongcatFlashForCausalLM(nn.Module):
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
+                use_async_loading = should_async_load(loaded_weight)
                 if "mtp" in name:
                     continue
                 weight_names.append(name)
@@ -877,8 +880,12 @@ class LongcatFlashForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
+                    maybe_executor_submit(
+                        executor=executor,
+                        futures=futures,
+                        use_async=use_async_loading,
+                        func=weight_loader,
+                        func_args=(param, loaded_weight, shard_id),
                     )
                     break
                 else:
@@ -889,15 +896,16 @@ class LongcatFlashForCausalLM(nn.Module):
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        futures.append(
-                            executor.submit(
-                                weight_loader,
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
+                        maybe_executor_submit(
+                            executor=executor,
+                            futures=futures,
+                            use_async=use_async_loading,
+                            func=weight_loader,
+                            func_args=(param, loaded_weight, name),
+                            func_kwargs={
+                                "shard_id": shard_id,
+                                "expert_id": expert_id,
+                            },
                         )
                         break
                     else:
@@ -951,8 +959,12 @@ class LongcatFlashForCausalLM(nn.Module):
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                futures.append(
-                                    executor.submit(weight_loader, param, fused_weight)
+                                maybe_executor_submit(
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(param, fused_weight),
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
@@ -977,8 +989,12 @@ class LongcatFlashForCausalLM(nn.Module):
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            futures.append(
-                                executor.submit(weight_loader, param, loaded_weight)
+                            maybe_executor_submit(
+                                executor=executor,
+                                futures=futures,
+                                use_async=use_async_loading,
+                                func=weight_loader,
+                                func_args=(param, loaded_weight),
                             )
 
             # Wait for all tasks to complete and raise any exceptions.

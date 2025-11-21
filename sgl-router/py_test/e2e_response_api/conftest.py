@@ -19,6 +19,7 @@ def pytest_collection_modifyitems(config, items):
     - MCPTests
     - StateManagementTests
     - FunctionCallingBaseTest
+    - StructuredOutputBaseTest
     """
     base_class_names = {
         "StateManagementBaseTest",
@@ -27,6 +28,7 @@ def pytest_collection_modifyitems(config, items):
         "MCPTests",
         "StateManagementTests",
         "FunctionCallingBaseTest",
+        "StructuredOutputBaseTest",
     }
 
     # Filter out tests from base classes

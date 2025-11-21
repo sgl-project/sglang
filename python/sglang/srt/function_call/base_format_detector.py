@@ -337,30 +337,3 @@ class BaseFormatDetector(ABC):
             A function that takes a tool name (str) and returns StructureInfo
         """
         raise NotImplementedError()
-
-    @abstractmethod
-    def build_ebnf(self, tools: List[Tool]) -> str:
-        """
-        Build an EBNF grammar for constrained generation of function calls.
-
-        This method generates an Extended Backus-Naur Form (EBNF) grammar that
-        constrains the model's output to valid function calls in this format.
-        The grammar should include all available tools and their parameter schemas.
-
-        Args:
-            tools: List of available tools/functions that can be called
-
-        Returns:
-            A string containing the EBNF grammar for this function call format
-
-        The EBNF grammar should:
-            - Define the overall structure of function calls in this format
-            - Include all tool names from the provided tools list
-            - Define valid JSON structures for function arguments
-            - Handle multiple function calls if the format supports them
-
-        Note:
-            Most implementations use EBNFComposer.build_ebnf() utility with
-            format-specific parameters rather than writing EBNF from scratch.
-        """
-        raise NotImplementedError()

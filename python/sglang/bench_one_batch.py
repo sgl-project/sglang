@@ -68,7 +68,7 @@ from sglang.srt.distributed.parallel_state import destroy_distributed_environmen
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -391,15 +391,13 @@ def decode(input_token_ids, batch, model_runner):
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
     if require_mlp_sync(model_runner.server_args):
-        Scheduler.prepare_mlp_sync_batch_raw(
+        prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=1,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            speculative_num_draft_tokens=None,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
             offload_tags=set(),

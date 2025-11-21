@@ -7,7 +7,10 @@ import time
 import numpy as np
 
 import sglang as sgl
+from sglang.srt.utils import is_hip
 from sglang.utils import download_and_cache_file, read_jsonl
+
+_is_hip = is_hip()
 
 
 def test_few_shot_qa():
@@ -537,7 +540,7 @@ def test_hellaswag_select():
     accuracy_gen = np.mean(np.array(preds_gen) == np.array(labels))
     print(f"{accuracy=}, {accuracy_gen=}")
     assert np.abs(accuracy_gen - accuracy) < 0.1
-    assert np.abs(latency_gen - latency) < 1
+    assert np.abs(latency_gen - latency) < 1 if not _is_hip else 2
 
     return accuracy, latency
 

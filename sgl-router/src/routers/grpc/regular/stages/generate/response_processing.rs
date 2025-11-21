@@ -4,6 +4,7 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 
 use crate::routers::grpc::{
     common::stages::PipelineStage,
@@ -52,19 +53,26 @@ impl GenerateResponseProcessingStage {
         let is_streaming = ctx.is_streaming();
 
         // Extract execution result
-        let execution_result = ctx
-            .state
-            .response
-            .execution_result
-            .take()
-            .ok_or_else(|| error::internal_error("No execution result"))?;
+        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+            error!(
+                function = "GenerateResponseProcessingStage::execute",
+                "No execution result"
+            );
+            error::internal_error("No execution result")
+        })?;
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
         let dispatch = ctx
             .state
             .dispatch
             .as_ref()
-            .ok_or_else(|| error::internal_error("Dispatch metadata not set"))?
+            .ok_or_else(|| {
+                error!(
+                    function = "GenerateResponseProcessingStage::execute",
+                    "Dispatch metadata not set"
+                );
+                error::internal_error("Dispatch metadata not set")
+            })?
             .clone();
 
         if is_streaming {
@@ -82,12 +90,13 @@ impl GenerateResponseProcessingStage {
         let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
         let generate_request = ctx.generate_request_arc();
 
-        let stop_decoder = ctx
-            .state
-            .response
-            .stop_decoder
-            .as_mut()
-            .ok_or_else(|| error::internal_error("Stop decoder not initialized"))?;
+        let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
+            error!(
+                function = "GenerateResponseProcessingStage::execute",
+                "Stop decoder not initialized"
+            );
+            error::internal_error("Stop decoder not initialized")
+        })?;
 
         let result_array = self
             .processor

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 
-from sglang.srt import single_batch_overlap
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -22,7 +21,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -68,6 +66,7 @@ class DeepEPMoE(FusedMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        **kwargs,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -81,6 +80,7 @@ class DeepEPMoE(FusedMoE):
             prefix=prefix,
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
         )
 
         if _use_aiter or _is_npu:
@@ -143,29 +143,24 @@ class DeepEPMoE(FusedMoE):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        forward_shared_experts=None,
-        alt_stream=None,
-        disable_sbo=False,
     ):
 
         if self.deprecate_flag:
-            assert forward_shared_experts is None
-            assert alt_stream is None
             return super().forward(
                 hidden_states,
                 topk_output,
             )
 
-        # We have to call SBO inside MoE to be compatible with hooks used in offloading
-        return single_batch_overlap.execute_sbo(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-            # SBO args
-            experts=self,
-            forward_shared_experts=forward_shared_experts,
-            alt_stream=alt_stream,
-            disable_sbo=disable_sbo,
+        # TODO: can we call super().forward here?
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
         )
+        combine_input = self.run_moe_core(dispatch_output)
+        hidden_states = self.dispatcher.combine(
+            combine_input=combine_input,
+        )
+
+        return hidden_states
 
     def dispatch(
         self,
@@ -180,11 +175,9 @@ class DeepEPMoE(FusedMoE):
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
     ):
 
         if self.deprecate_flag:
-            assert down_gemm_overlap_args is None
             return super().run_moe_core(
                 dispatch_output,
             )
@@ -208,9 +201,7 @@ class DeepEPMoE(FusedMoE):
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 and self.quant_config.get_name() == "modelopt_fp4"
             ):
-                output = self.forward_flashinfer_cutedsl(
-                    dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
-                )
+                output = self.forward_flashinfer_cutedsl(dispatch_output)
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
@@ -278,7 +269,6 @@ class DeepEPMoE(FusedMoE):
     def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLDispatchOutput,
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
     ):
         hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
         assert self.quant_method is not None
@@ -289,7 +279,6 @@ class DeepEPMoE(FusedMoE):
             x=(hidden_states, hidden_states_scale),
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
-            down_gemm_overlap_args=down_gemm_overlap_args,
         )
         return output
 

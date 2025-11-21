@@ -86,310 +86,199 @@ class SocketMapping:
         self._mapping[ipc_name].send_pyobj(output)
 
 
+def _extract_field_by_index(
+    output: Any, field_name: str, index: int, check_length: bool = True
+) -> Any:
+    """Extract a field value from output by index, handling None and length checks.
+
+    Args:
+        output: The output object containing the field
+        field_name: The name of the field to extract
+        index: The index to access in the field list
+        check_length: If True, check both field existence and length. If False, only check field existence.
+
+    Returns:
+        A list containing the field value at index, or None if not available.
+    """
+    field = getattr(output, field_name, None)
+    if field is None:
+        return None
+
+    if check_length:
+        if len(field) <= index:
+            return None
+
+    return [field[index]]
+
+
 def _handle_output_by_index(output, i):
     """NOTE: A maintainable method is better here."""
     if isinstance(output, BatchTokenIDOutput):
         new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
-            spec_verify_ct=(
-                [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
+            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
+            spec_accepted_tokens=_extract_field_by_index(
+                output, "spec_accepted_tokens", i
             ),
-            spec_accepted_tokens=(
-                [output.spec_accepted_tokens[i]]
-                if len(output.spec_accepted_tokens) > i
-                else None
+            queue_time=_extract_field_by_index(output, "queue_time", i),
+            forward_entry_time=_extract_field_by_index(output, "forward_entry_time", i),
+            prefill_launch_delay=_extract_field_by_index(
+                output, "prefill_launch_delay", i
             ),
-            queue_time=[output.queue_time[i]] if len(output.queue_time) > i else None,
-            forward_entry_time=(
-                [output.forward_entry_time[i]]
-                if len(output.forward_entry_time) > i
-                else None
+            prefill_launch_latency=_extract_field_by_index(
+                output, "prefill_launch_latency", i
             ),
-            prefill_delay=(
-                [output.prefill_delay[i]] if len(output.prefill_delay) > i else None
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
+            decode_ids=_extract_field_by_index(output, "decode_ids", i),
+            read_offsets=_extract_field_by_index(output, "read_offsets", i),
+            output_ids=_extract_field_by_index(output, "output_ids", i),
+            skip_special_tokens=_extract_field_by_index(
+                output, "skip_special_tokens", i
             ),
-            prefill_latency=(
-                [output.prefill_latency[i]] if len(output.prefill_latency) > i else None
+            spaces_between_special_tokens=_extract_field_by_index(
+                output, "spaces_between_special_tokens", i
             ),
-            finished_reasons=(
-                [output.finished_reasons[i]]
-                if len(output.finished_reasons) > i
-                else None
+            no_stop_trim=_extract_field_by_index(output, "no_stop_trim", i),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            input_token_logprobs_val=_extract_field_by_index(
+                output, "input_token_logprobs_val", i, check_length=False
             ),
-            decoded_texts=(
-                [output.decoded_texts[i]] if len(output.decoded_texts) > i else None
+            input_token_logprobs_idx=_extract_field_by_index(
+                output, "input_token_logprobs_idx", i, check_length=False
             ),
-            decode_ids=([output.decode_ids[i]] if len(output.decode_ids) > i else None),
-            read_offsets=(
-                [output.read_offsets[i]] if len(output.read_offsets) > i else None
+            output_token_logprobs_val=_extract_field_by_index(
+                output, "output_token_logprobs_val", i, check_length=False
             ),
-            output_ids=(
-                [output.output_ids[i]]
-                if output.output_ids and len(output.output_ids) > i
-                else None
+            output_token_logprobs_idx=_extract_field_by_index(
+                output, "output_token_logprobs_idx", i, check_length=False
             ),
-            skip_special_tokens=(
-                [output.skip_special_tokens[i]]
-                if len(output.skip_special_tokens) > i
-                else None
+            input_top_logprobs_val=_extract_field_by_index(
+                output, "input_top_logprobs_val", i, check_length=False
             ),
-            spaces_between_special_tokens=(
-                [output.spaces_between_special_tokens[i]]
-                if len(output.spaces_between_special_tokens) > i
-                else None
+            input_top_logprobs_idx=_extract_field_by_index(
+                output, "input_top_logprobs_idx", i, check_length=False
             ),
-            no_stop_trim=(
-                [output.no_stop_trim[i]] if len(output.no_stop_trim) > i else None
+            output_top_logprobs_val=_extract_field_by_index(
+                output, "output_top_logprobs_val", i, check_length=False
             ),
-            prompt_tokens=(
-                [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
+            output_top_logprobs_idx=_extract_field_by_index(
+                output, "output_top_logprobs_idx", i, check_length=False
             ),
-            completion_tokens=(
-                [output.completion_tokens[i]]
-                if len(output.completion_tokens) > i
-                else None
+            input_token_ids_logprobs_val=_extract_field_by_index(
+                output, "input_token_ids_logprobs_val", i, check_length=False
             ),
-            cached_tokens=(
-                [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+            input_token_ids_logprobs_idx=_extract_field_by_index(
+                output, "input_token_ids_logprobs_idx", i, check_length=False
             ),
-            input_token_logprobs_val=(
-                [output.input_token_logprobs_val[i]]
-                if output.input_token_logprobs_val
-                else None
+            output_token_ids_logprobs_val=_extract_field_by_index(
+                output, "output_token_ids_logprobs_val", i, check_length=False
             ),
-            input_token_logprobs_idx=(
-                [output.input_token_logprobs_idx[i]]
-                if output.input_token_logprobs_idx
-                else None
+            output_token_ids_logprobs_idx=_extract_field_by_index(
+                output, "output_token_ids_logprobs_idx", i, check_length=False
             ),
-            output_token_logprobs_val=(
-                [output.output_token_logprobs_val[i]]
-                if output.output_token_logprobs_val
-                else None
+            output_token_entropy_val=_extract_field_by_index(
+                output, "output_token_entropy_val", i, check_length=False
             ),
-            output_token_logprobs_idx=(
-                [output.output_token_logprobs_idx[i]]
-                if output.output_token_logprobs_idx
-                else None
-            ),
-            input_top_logprobs_val=(
-                [output.input_top_logprobs_val[i]]
-                if output.input_top_logprobs_val
-                else None
-            ),
-            input_top_logprobs_idx=(
-                [output.input_top_logprobs_idx[i]]
-                if output.input_top_logprobs_idx
-                else None
-            ),
-            output_top_logprobs_val=(
-                [output.output_top_logprobs_val[i]]
-                if output.output_top_logprobs_val
-                else None
-            ),
-            output_top_logprobs_idx=(
-                [output.output_top_logprobs_idx[i]]
-                if output.output_top_logprobs_idx
-                else None
-            ),
-            input_token_ids_logprobs_val=(
-                [output.input_token_ids_logprobs_val[i]]
-                if output.input_token_ids_logprobs_val
-                else None
-            ),
-            input_token_ids_logprobs_idx=(
-                [output.input_token_ids_logprobs_idx[i]]
-                if output.input_token_ids_logprobs_idx
-                else None
-            ),
-            output_token_ids_logprobs_val=(
-                [output.output_token_ids_logprobs_val[i]]
-                if output.output_token_ids_logprobs_val
-                else None
-            ),
-            output_token_ids_logprobs_idx=(
-                [output.output_token_ids_logprobs_idx[i]]
-                if output.output_token_ids_logprobs_idx
-                else None
-            ),
-            output_token_entropy_val=(
-                [output.output_token_entropy_val[i]]
-                if output.output_token_entropy_val
-                else None
-            ),
-            output_hidden_states=(
-                [output.output_hidden_states[i]]
-                if output.output_hidden_states
-                else None
+            output_hidden_states=_extract_field_by_index(
+                output, "output_hidden_states", i, check_length=False
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            token_steps=([output.token_steps[i]] if output.token_steps else None),
+            token_steps=_extract_field_by_index(
+                output, "token_steps", i, check_length=False
+            ),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
             rids=[output.rids[i]],
-            finished_reasons=(
-                [output.finished_reasons[i]]
-                if len(output.finished_reasons) > i
-                else None
-            ),
-            embeddings=([output.embeddings[i]] if len(output.embeddings) > i else None),
-            prompt_tokens=(
-                [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
-            ),
-            cached_tokens=(
-                [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-            ),
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            embeddings=_extract_field_by_index(output, "embeddings", i),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
-            spec_verify_ct=(
-                [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
+            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
+            spec_accepted_tokens=_extract_field_by_index(
+                output, "spec_accepted_tokens", i
             ),
-            spec_accepted_tokens=(
-                [output.spec_accepted_tokens[i]]
-                if len(output.spec_accepted_tokens) > i
-                else None
+            queue_time=_extract_field_by_index(output, "queue_time", i),
+            forward_entry_time=_extract_field_by_index(output, "forward_entry_time", i),
+            prefill_launch_delay=_extract_field_by_index(
+                output, "prefill_launch_delay", i
             ),
-            queue_time=[output.queue_time[i]] if len(output.queue_time) > i else None,
-            forward_entry_time=(
-                [output.forward_entry_time[i]]
-                if len(output.forward_entry_time) > i
-                else None
+            prefill_launch_latency=_extract_field_by_index(
+                output, "prefill_launch_latency", i
             ),
-            prefill_delay=(
-                [output.prefill_delay[i]] if len(output.prefill_delay) > i else None
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            output_strs=_extract_field_by_index(output, "output_strs", i),
+            output_ids=_extract_field_by_index(output, "output_ids", i),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            input_token_logprobs_val=_extract_field_by_index(
+                output, "input_token_logprobs_val", i, check_length=False
             ),
-            prefill_latency=(
-                [output.prefill_latency[i]] if len(output.prefill_latency) > i else None
+            input_token_logprobs_idx=_extract_field_by_index(
+                output, "input_token_logprobs_idx", i, check_length=False
             ),
-            finished_reasons=(
-                [output.finished_reasons[i]]
-                if len(output.finished_reasons) > i
-                else None
+            output_token_logprobs_val=_extract_field_by_index(
+                output, "output_token_logprobs_val", i, check_length=False
             ),
-            output_strs=(
-                [output.output_strs[i]] if len(output.output_strs) > i else None
+            output_token_logprobs_idx=_extract_field_by_index(
+                output, "output_token_logprobs_idx", i, check_length=False
             ),
-            output_ids=(
-                [output.output_ids[i]]
-                if output.output_ids and len(output.output_ids) > i
-                else None
+            input_top_logprobs_val=_extract_field_by_index(
+                output, "input_top_logprobs_val", i, check_length=False
             ),
-            prompt_tokens=(
-                [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
+            input_top_logprobs_idx=_extract_field_by_index(
+                output, "input_top_logprobs_idx", i, check_length=False
             ),
-            completion_tokens=(
-                [output.completion_tokens[i]]
-                if len(output.completion_tokens) > i
-                else None
+            output_top_logprobs_val=_extract_field_by_index(
+                output, "output_top_logprobs_val", i, check_length=False
             ),
-            cached_tokens=(
-                [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+            output_top_logprobs_idx=_extract_field_by_index(
+                output, "output_top_logprobs_idx", i, check_length=False
             ),
-            input_token_logprobs_val=(
-                [output.input_token_logprobs_val[i]]
-                if output.input_token_logprobs_val
-                else None
+            input_token_ids_logprobs_val=_extract_field_by_index(
+                output, "input_token_ids_logprobs_val", i, check_length=False
             ),
-            input_token_logprobs_idx=(
-                [output.input_token_logprobs_idx[i]]
-                if output.input_token_logprobs_idx
-                else None
+            input_token_ids_logprobs_idx=_extract_field_by_index(
+                output, "input_token_ids_logprobs_idx", i, check_length=False
             ),
-            output_token_logprobs_val=(
-                [output.output_token_logprobs_val[i]]
-                if output.output_token_logprobs_val
-                else None
+            output_token_ids_logprobs_val=_extract_field_by_index(
+                output, "output_token_ids_logprobs_val", i, check_length=False
             ),
-            output_token_logprobs_idx=(
-                [output.output_token_logprobs_idx[i]]
-                if output.output_token_logprobs_idx
-                else None
+            output_token_ids_logprobs_idx=_extract_field_by_index(
+                output, "output_token_ids_logprobs_idx", i, check_length=False
             ),
-            input_top_logprobs_val=(
-                [output.input_top_logprobs_val[i]]
-                if output.input_top_logprobs_val
-                else None
+            output_token_entropy_val=_extract_field_by_index(
+                output, "output_token_entropy_val", i, check_length=False
             ),
-            input_top_logprobs_idx=(
-                [output.input_top_logprobs_idx[i]]
-                if output.input_top_logprobs_idx
-                else None
-            ),
-            output_top_logprobs_val=(
-                [output.output_top_logprobs_val[i]]
-                if output.output_top_logprobs_val
-                else None
-            ),
-            output_top_logprobs_idx=(
-                [output.output_top_logprobs_idx[i]]
-                if output.output_top_logprobs_idx
-                else None
-            ),
-            input_token_ids_logprobs_val=(
-                [output.input_token_ids_logprobs_val[i]]
-                if output.input_token_ids_logprobs_val
-                else None
-            ),
-            input_token_ids_logprobs_idx=(
-                [output.input_token_ids_logprobs_idx[i]]
-                if output.input_token_ids_logprobs_idx
-                else None
-            ),
-            output_token_ids_logprobs_val=(
-                [output.output_token_ids_logprobs_val[i]]
-                if output.output_token_ids_logprobs_val
-                else None
-            ),
-            output_token_ids_logprobs_idx=(
-                [output.output_token_ids_logprobs_idx[i]]
-                if output.output_token_ids_logprobs_idx
-                else None
-            ),
-            output_token_entropy_val=(
-                [output.output_token_entropy_val[i]]
-                if output.output_token_entropy_val
-                else None
-            ),
-            output_hidden_states=(
-                [output.output_hidden_states[i]]
-                if output.output_hidden_states
-                else None
+            output_hidden_states=_extract_field_by_index(
+                output, "output_hidden_states", i, check_length=False
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            retraction_counts=(
-                [output.retraction_counts[i]]
-                if len(output.retraction_counts) > i
-                else None
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            token_steps=_extract_field_by_index(
+                output, "token_steps", i, check_length=False
             ),
-            token_steps=([output.token_steps[i]] if output.token_steps else None),
         )
     elif isinstance(output, BatchMultimodalOutput):
         new_output = BatchMultimodalOutput(
             rids=[output.rids[i]],
-            finished_reasons=(
-                [output.finished_reasons[i]]
-                if len(output.finished_reasons) > i
-                else None
-            ),
-            outputs=([output.outputs[i]] if len(output.outputs) > i else None),
-            prompt_tokens=(
-                [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
-            ),
-            completion_tokens=(
-                [output.completion_tokens[i]]
-                if len(output.completion_tokens) > i
-                else None
-            ),
-            cached_tokens=(
-                [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-            ),
+            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+            outputs=_extract_field_by_index(output, "outputs", i),
+            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )

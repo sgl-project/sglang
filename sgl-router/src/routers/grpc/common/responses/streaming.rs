@@ -617,45 +617,14 @@ impl ResponseStreamEventEmitter {
             ResponsesUsage::Classic(usage_info)
         });
 
-        // Get original request fields or use defaults
-        let req = self.original_request.as_ref();
-
-        // Convert tool_choice to String
-        let tool_choice = req
-            .and_then(|r| r.tool_choice.as_ref())
-            .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
-            .unwrap_or_else(|| "auto".to_string());
-
-        ResponsesResponse {
-            id: self.response_id.clone(),
-            object: "response".to_string(),
-            created_at: self.created_at as i64,
-            status: ResponseStatus::Completed,
-            error: None,
-            incomplete_details: None,
-            instructions: req.and_then(|r| r.instructions.clone()),
-            max_output_tokens: req.and_then(|r| r.max_output_tokens),
-            model: self.model.clone(),
-            output,
-            parallel_tool_calls: req.and_then(|r| r.parallel_tool_calls).unwrap_or(true),
-            previous_response_id: req.and_then(|r| r.previous_response_id.clone()),
-            reasoning: None, // TODO: Extract from output items if needed
-            store: req.and_then(|r| r.store).unwrap_or(true),
-            temperature: req.and_then(|r| r.temperature),
-            text: None,
-            tool_choice,
-            tools: req
-                .map(|r| r.tools.clone().unwrap_or_default())
-                .unwrap_or_default(),
-            top_p: req.and_then(|r| r.top_p),
-            truncation: None, // Convert from Truncation to String if needed
-            usage: responses_usage,
-            metadata: req
-                .map(|r| r.metadata.clone().unwrap_or_default())
-                .unwrap_or_default(),
-            user: req.and_then(|r| r.user.clone()),
-            safety_identifier: None,
-        }
+        // Build response using builder
+        ResponsesResponse::builder(&self.response_id, &self.model)
+            .created_at(self.created_at as i64)
+            .status(ResponseStatus::Completed)
+            .output(output)
+            .maybe_copy_from_request(self.original_request.as_ref())
+            .maybe_usage(responses_usage)
+            .build()
     }
 
     /// Emit reasoning item wrapper events (added + done)

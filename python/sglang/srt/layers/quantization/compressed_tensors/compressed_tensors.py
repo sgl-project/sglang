@@ -19,13 +19,11 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
@@ -71,8 +69,6 @@ class DeviceCapability(NamedTuple):
 
 
 class CompressedTensorsConfig(QuantizationConfig):
-    DeepSeekFP8Config = None
-
     def __init__(
         self,
         target_scheme_map: Dict[str, Any],
@@ -83,6 +79,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        linear_fp8_config: Optional[Any] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -94,6 +91,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
+        # FP8 config for linear layers, compressed tensor currently does not support block fp8, this is used for ktransformers
+        self.linear_fp8_config = linear_fp8_config
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
@@ -128,10 +127,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             return None
 
         if isinstance(layer, LinearBase):
-            if CompressedTensorsConfig.DeepSeekFP8Config is not None:
-                return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
-            if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
-                return UnquantizedLinearMethod()
+            # If linear_fp8_config is set, use FP8 for linear layers
+            # This allows mixed quantization: experts with int4, linear layers with fp8
+            if self.linear_fp8_config is not None:
+                return Fp8LinearMethod(self.linear_fp8_config)
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
@@ -140,7 +139,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            # Ktransformers use CompressedTensorsWNA16AMXMOEMethod if AMX weights are provided
             return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
@@ -154,6 +152,23 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         packed_modules_mapping = config.get("packed_modules_mapping", {})
 
+        # Parse linear_fp8_config if present (for mixed quantization scenarios)
+        # Format: {"activation_scheme": "dynamic", "fmt": "e4m3",
+        #          "quant_method": "fp8", "weight_block_size": [128, 128]}
+        linear_fp8_config = None
+        if "linear_fp8_config" in config:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            fp8_cfg = config["linear_fp8_config"]
+            # Check if it's fp8 format based on quant_method field
+            is_fp8 = fp8_cfg.get("quant_method") == "fp8"
+            linear_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=is_fp8,
+                activation_scheme=fp8_cfg.get("activation_scheme", "dynamic"),
+                ignored_layers=fp8_cfg.get("ignored_layers"),
+                weight_block_size=fp8_cfg.get("weight_block_size"),
+            )
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -162,6 +177,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_ignore_list=sparsity_ignore_list,
             config=config,
             packed_modules_mapping=packed_modules_mapping,
+            linear_fp8_config=linear_fp8_config,
         )
 
     @classmethod

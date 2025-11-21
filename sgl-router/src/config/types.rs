@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use super::ConfigResult;
 use crate::core::ConnectionMode;
@@ -53,6 +54,9 @@ pub struct RouterConfig {
     /// Required when history_backend = "oracle"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle: Option<OracleConfig>,
+    /// Required when history_backend = "postgres"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<PostgresConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
@@ -123,6 +127,7 @@ pub enum HistoryBackend {
     Memory,
     None,
     Oracle,
+    Postgres,
 }
 
 /// Oracle history backend configuration
@@ -179,6 +184,54 @@ impl std::fmt::Debug for OracleConfig {
             .field("pool_max", &self.pool_max)
             .field("pool_timeout_secs", &self.pool_timeout_secs)
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PostgresConfig {
+    // Database connection URL,
+    // postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
+    pub db_url: String,
+    // Database pool max size
+    pub pool_max: usize,
+}
+
+impl PostgresConfig {
+    pub fn default_pool_max() -> usize {
+        16
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let s = self.db_url.trim();
+        if s.is_empty() {
+            return Err("is it db-url should be not empty".to_string());
+        }
+
+        let url = Url::parse(s).map_err(|e| format!("invalid db_url: {}", e))?;
+
+        let scheme = url.scheme();
+        if scheme != "postgres" && scheme != "postgresql" {
+            return Err(format!("don't support URL scheme: {}", scheme));
+        }
+
+        if url.host().is_none() {
+            return Err("db_url must need host".to_string());
+        }
+
+        let path = url.path();
+        let dbname = path
+            .strip_prefix('/')
+            .filter(|p| !p.is_empty())
+            .map(|s| s.to_string());
+        if dbname.is_none() {
+            return Err("db_url must need database name".to_string());
+        }
+
+        if self.pool_max == 0 {
+            return Err("pool_max must be greater 1, default is 16".to_string());
+        }
+
+        Ok(())
     }
 }
 
@@ -263,6 +316,16 @@ pub enum PolicyConfig {
 
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
+
+    #[serde(rename = "bucket")]
+    Bucket {
+        /// Absolute load difference threshold for load balancing
+        balance_abs_threshold: usize,
+        /// Relative load ratio threshold for load balancing
+        balance_rel_threshold: f32,
+        /// Interval between bucket boundary adjustment cycles (seconds)
+        bucket_adjust_interval_secs: usize,
+    },
 }
 
 impl PolicyConfig {
@@ -272,6 +335,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::Bucket { .. } => "bucket",
         }
     }
 }
@@ -403,9 +467,9 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 3001,
-            max_payload_size: 536_870_912, // 512MB
-            request_timeout_secs: 1800,    // 30 minutes
-            worker_startup_timeout_secs: 600,
+            max_payload_size: 536_870_912,     // 512MB
+            request_timeout_secs: 1800,        // 30 minutes
+            worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             api_key: None,
@@ -431,6 +495,7 @@ impl Default for RouterConfig {
             chat_template: None,
             history_backend: default_history_backend(),
             oracle: None,
+            postgres: None,
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
@@ -515,7 +580,7 @@ mod tests {
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.request_timeout_secs, 1800);
-        assert_eq!(config.worker_startup_timeout_secs, 600);
+        assert_eq!(config.worker_startup_timeout_secs, 1800);
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert!(config.discovery.is_none());
         assert!(config.metrics.is_none());
@@ -725,6 +790,28 @@ mod tests {
                 assert_eq!(load_check_interval_secs, 120);
             }
             _ => panic!("Expected PowerOfTwo"),
+        }
+    }
+
+    #[test]
+    fn test_bucket_parameters() {
+        let bucket = PolicyConfig::Bucket {
+            balance_abs_threshold: 20,
+            balance_rel_threshold: 2.0,
+            bucket_adjust_interval_secs: 5,
+        };
+
+        match bucket {
+            PolicyConfig::Bucket {
+                balance_abs_threshold,
+                balance_rel_threshold,
+                bucket_adjust_interval_secs,
+            } => {
+                assert_eq!(balance_abs_threshold, 20);
+                assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
+                assert_eq!(bucket_adjust_interval_secs, 5);
+            }
+            _ => panic!("Expected Bucket"),
         }
     }
 

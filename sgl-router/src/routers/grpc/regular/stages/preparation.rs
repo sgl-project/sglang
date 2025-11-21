@@ -5,11 +5,13 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 
 use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
 use crate::routers::grpc::{
     common::stages::PipelineStage,
     context::{RequestContext, RequestType},
+    error as grpc_error,
 };
 
 /// Preparation stage (delegates to endpoint-specific implementations)
@@ -40,8 +42,13 @@ impl PipelineStage for PreparationStage {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
             RequestType::Responses(_) => {
-                // Responses API has its own preparation handled elsewhere
-                Ok(None)
+                error!(
+                    function = "PreparationStage::execute",
+                    "RequestType::Responses reached regular preparation stage"
+                );
+                Err(grpc_error::internal_error(
+                    "RequestType::Responses reached regular preparation stage",
+                ))
             }
         }
     }

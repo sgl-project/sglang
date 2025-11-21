@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use tracing::info;
+use url::Url;
 
 use super::{
     core::{ConversationItemStorage, ConversationStorage, ResponseStorage},
@@ -14,7 +15,13 @@ use super::{
     noop::{NoOpConversationItemStorage, NoOpConversationStorage, NoOpResponseStorage},
     oracle::{OracleConversationItemStorage, OracleConversationStorage, OracleResponseStorage},
 };
-use crate::config::{HistoryBackend, OracleConfig, RouterConfig};
+use crate::{
+    config::{HistoryBackend, OracleConfig, PostgresConfig, RouterConfig},
+    data_connector::postgres::{
+        PostgresConversationItemStorage, PostgresConversationStorage, PostgresResponseStorage,
+        PostgresStore,
+    },
+};
 
 /// Type alias for the storage tuple returned by factory functions.
 /// This avoids clippy::type_complexity warnings while keeping Arc explicit.
@@ -68,6 +75,33 @@ pub fn create_storage(config: &RouterConfig) -> Result<StorageTuple, String> {
             info!("Data connector initialized successfully: Oracle ATP");
             Ok(storages)
         }
+        HistoryBackend::Postgres => {
+            let postgres_cfg = config
+                .postgres
+                .clone()
+                .ok_or("Postgres configuration is required when history_backend=postgres")?;
+
+            let log_db_url = match Url::parse(&postgres_cfg.db_url) {
+                Ok(mut url) => {
+                    if url.password().is_some() {
+                        let _ = url.set_password(Some("****"));
+                    }
+                    url.to_string()
+                }
+                Err(_) => "<redacted>".to_string(),
+            };
+
+            info!(
+                "Initializing data connector: Postgres (db_url: {}, pool_max: {})",
+                log_db_url, postgres_cfg.pool_max
+            );
+
+            let storages = create_postgres_storage(&postgres_cfg)?;
+
+            info!("Data connector initialized successfully: Postgres");
+
+            Ok(storages)
+        }
     }
 }
 
@@ -86,5 +120,21 @@ fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageTuple, Stri
         Arc::new(response_storage),
         Arc::new(conversation_storage),
         Arc::new(conversation_item_storage),
+    ))
+}
+
+fn create_postgres_storage(postgres_cfg: &PostgresConfig) -> Result<StorageTuple, String> {
+    let store = PostgresStore::new(postgres_cfg.clone())?;
+    let postgres_resp = PostgresResponseStorage::new(store.clone())
+        .map_err(|err| format!("failed to initialize Postgres response storage: {err}"))?;
+    let postgres_conv = PostgresConversationStorage::new(store.clone())
+        .map_err(|err| format!("failed to initialize Postgres conversation storage: {err}"))?;
+    let postgres_item = PostgresConversationItemStorage::new(store.clone())
+        .map_err(|err| format!("failed to initialize Postgres conversation item storage: {err}"))?;
+
+    Ok((
+        Arc::new(postgres_resp),
+        Arc::new(postgres_conv),
+        Arc::new(postgres_item),
     ))
 }

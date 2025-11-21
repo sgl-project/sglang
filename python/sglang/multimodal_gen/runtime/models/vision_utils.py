@@ -15,6 +15,8 @@ import requests
 import torch
 from packaging import version
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import suppress_other_loggers
+
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
         "linear": PIL.Image.Resampling.BILINEAR,
@@ -108,7 +110,8 @@ def load_image(
     """
     if isinstance(image, str):
         if image.startswith("http://") or image.startswith("https://"):
-            image = PIL.Image.open(requests.get(image, stream=True).raw)
+            with suppress_other_loggers(not_suppress_on_main_rank=True):
+                image = PIL.Image.open(requests.get(image, stream=True).raw)
         elif os.path.isfile(image):
             image = PIL.Image.open(image)
         else:

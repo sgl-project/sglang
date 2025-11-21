@@ -100,6 +100,9 @@ pub struct HarmonyChannelOutput {
 
     /// Matched stop token (if any)
     pub matched_stop: Option<Value>,
+
+    /// Number of reasoning tokens (from analysis and commentary channels)
+    pub reasoning_token_count: u32,
 }
 
 /// Streaming delta for SSE responses

@@ -2,13 +2,14 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::debug;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::routers::grpc::{
     common::stages::{helpers, PipelineStage},
     context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
     error,
+    proto_wrapper::ProtoGenerateRequest,
 };
 
 /// Harmony Request Building stage: Convert Harmony tokens to gRPC request
@@ -30,28 +31,44 @@ impl HarmonyRequestBuildingStage {
 impl PipelineStage for HarmonyRequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         // Get preparation output
-        let prep = ctx
-            .state
-            .preparation
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Preparation not completed"))?;
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(
+                function = "HarmonyRequestBuildingStage::execute",
+                "Preparation stage not completed"
+            );
+            error::internal_error("Preparation not completed")
+        })?;
 
         // Get clients
-        let clients = ctx
-            .state
-            .clients
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Client acquisition not completed"))?;
+        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
+            error!(
+                function = "HarmonyRequestBuildingStage::execute",
+                "Client acquisition stage not completed"
+            );
+            error::internal_error("Client acquisition not completed")
+        })?;
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
         };
+
+        // Harmony model support not yet implemented for vLLM
+        if builder_client.is_vllm() {
+            return Err(error::not_implemented(
+                "Harmony model support is not yet implemented for vLLM backend. \
+                 Please use runtime_type: sglang for Harmony models.",
+            ));
+        }
 
         // Generate request_id based on request type
         let request_id = match &ctx.input.request_type {
             RequestType::Chat(_) => format!("chatcmpl-{}", Uuid::new_v4()),
             RequestType::Responses(_) => format!("responses-{}", Uuid::new_v4()),
             RequestType::Generate(_) => {
+                error!(
+                    function = "HarmonyRequestBuildingStage::execute",
+                    "Generate request type not supported for Harmony models"
+                );
                 return Err(error::bad_request(
                     "Generate requests are not supported with Harmony models".to_string(),
                 ));
@@ -61,13 +78,15 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         // Build gRPC request using token_ids directly (Harmony encoding already handled message rendering)
         let placeholder_processed_text = "[harmony]".to_string();
 
-        let mut proto_request = match &ctx.input.request_type {
+        // Harmony is SGLang-only, so we can safely unwrap as SGLang
+        let sglang_client = builder_client.as_sglang();
+        let proto_request_inner = match &ctx.input.request_type {
             RequestType::Chat(request) => {
                 // Use filtered request if present from preparation; otherwise original
                 let body = prep.filtered_request.as_ref().unwrap_or(request.as_ref());
 
-                builder_client
-                    .build_generate_request(
+                sglang_client
+                    .build_generate_request_from_chat(
                         request_id,
                         body,
                         placeholder_processed_text,
@@ -75,9 +94,16 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                         None,
                         prep.tool_constraints.clone(),
                     )
-                    .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?
+                    .map_err(|e| {
+                        error!(
+                            function = "HarmonyRequestBuildingStage::execute",
+                            error = %e,
+                            "Failed to build generate request from chat"
+                        );
+                        error::bad_request(format!("Invalid request parameters: {}", e))
+                    })?
             }
-            RequestType::Responses(request) => builder_client
+            RequestType::Responses(request) => sglang_client
                 .build_generate_request_from_responses(
                     request_id,
                     request.as_ref(),
@@ -86,15 +112,25 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     prep.harmony_stop_ids.clone(),
                     prep.tool_constraints.clone(),
                 )
-                .map_err(|e| error::bad_request(format!("Invalid request parameters: {}", e)))?,
+                .map_err(|e| {
+                    error!(
+                        function = "HarmonyRequestBuildingStage::execute",
+                        error = %e,
+                        "Failed to build generate request from responses"
+                    );
+                    error::bad_request(format!("Invalid request parameters: {}", e))
+                })?,
             _ => unreachable!(),
         };
+
+        let mut proto_request = ProtoGenerateRequest::Sglang(Box::new(proto_request_inner));
 
         // Inject Harmony stop token IDs into sampling params for ALL Harmony requests
         // These stop tokens (<|return|> and <|call|>) prevent the model from generating
         // malformed Harmony sequences
         if let Some(harmony_stops) = &prep.harmony_stop_ids {
-            if let Some(params) = proto_request.sampling_params.as_mut() {
+            let sglang_req = proto_request.as_sglang_mut();
+            if let Some(params) = sglang_req.sampling_params.as_mut() {
                 params.stop_token_ids.extend_from_slice(harmony_stops);
                 debug!(
                     stop_token_count = harmony_stops.len(),

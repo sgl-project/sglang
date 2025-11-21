@@ -1,9 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/utils.py
 
 """Utilities for selecting and loading models."""
+import concurrent.futures
 import contextlib
 import logging
-from typing import Tuple, Type
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
 
 import torch
 import transformers
@@ -11,6 +12,7 @@ from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.layers import deep_gemm_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +99,9 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     supported_archs = ModelRegistry.get_supported_archs()
     is_native_supported = any(arch in supported_archs for arch in architectures)
 
-    if not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
+    if model_config.model_impl == ModelImpl.MINDSPORE:
+        architectures = ["MindSporeForCausalLM"]
+    elif not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
     return ModelRegistry.resolve_model_cls(architectures)
 
@@ -116,3 +120,52 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
             model.post_load_weights(is_nextn=True)
         else:
             model.post_load_weights()
+
+
+def should_deepgemm_weight_requant_ue8m0(weight_block_size):
+    """Should we requant fp8 weights into UE8M0 format when loading the model"""
+    return (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and weight_block_size is not None
+    )
+
+
+def should_async_load(weight: torch.Tensor) -> bool:
+    """Return True if we should load the given weight asynchronously.
+
+    For host (CPU) tensors, using a threadpool can overlap H2D copies
+    and improve throughput. For device tensors, threading often adds overhead
+    (e.g., GIL contention) without benefit, so we do it synchronously.
+    """
+    device = getattr(weight, "device", None)
+    if device is None:
+        return False
+    return device.type == "cpu"
+
+
+def maybe_executor_submit(
+    *,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    futures: List[concurrent.futures.Future],
+    use_async: bool,
+    func: Callable[..., Any],
+    func_args: Iterable[Any] = (),
+    func_kwargs: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Submit a task to the executor if async loading is enabled.
+
+    Parameters (keyword-only):
+    - executor: ThreadPoolExecutor used to submit background tasks
+    - futures: a list collecting the submitted Future objects
+    - use_async: whether to submit to executor or run inline
+    - func: the callable to run
+    - func_args: positional args for the callable (defaults to empty tuple)
+    - func_kwargs: keyword args for the callable (defaults to empty dict)
+    """
+    if func_kwargs is None:
+        func_kwargs = {}
+    if use_async:
+        futures.append(executor.submit(func, *func_args, **func_kwargs))
+    else:
+        func(*func_args, **func_kwargs)
