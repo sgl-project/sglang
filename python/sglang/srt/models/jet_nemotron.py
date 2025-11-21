@@ -545,6 +545,9 @@ class JetNemotronForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping: list[tuple[str, str, str | int]] = [
             # (param_name, shard_weight_name, shard_id)

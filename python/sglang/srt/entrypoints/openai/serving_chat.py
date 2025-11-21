@@ -324,6 +324,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
+                return_dict=False,
             )
         except Exception:
             # This except branch will be triggered when the chosen model
@@ -343,6 +344,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
+                return_dict=False,
             )
 
         if assistant_prefix:

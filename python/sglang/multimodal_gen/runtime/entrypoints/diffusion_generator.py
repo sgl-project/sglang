@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 """
-DiffGenerator module for sgl-diffusion.
+DiffGenerator module for sglang-diffusion.
 
 This module provides a consolidated interface for generating videos using
 diffusion models.
@@ -21,8 +21,8 @@ import torch
 import torchvision
 from einops import rearrange
 
-from sglang.multimodal_gen.runtime.pipelines import Req
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 # Suppress verbose logging from imageio, which is triggered when saving images.
 logging.getLogger("imageio").setLevel(logging.WARNING)
@@ -259,7 +259,7 @@ class DiffGenerator:
         # TODO: simplify
         data_type = (
             DataType.IMAGE
-            if self.server_args.pipeline_config.task_type.is_image_task()
+            if self.server_args.pipeline_config.task_type.is_image_gen()
             or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )
@@ -334,7 +334,11 @@ class DiffGenerator:
                         "prompts": req.prompt,
                         "size": (req.height, req.width, req.num_frames),
                         "generation_time": gen_time,
-                        "logging_info": output_batch.logging_info,
+                        "timings": (
+                            output_batch.timings.to_dict()
+                            if output_batch.timings
+                            else {}
+                        ),
                         "trajectory": output_batch.trajectory_latents,
                         "trajectory_timesteps": output_batch.trajectory_timesteps,
                         "trajectory_decoded": output_batch.trajectory_decoded,

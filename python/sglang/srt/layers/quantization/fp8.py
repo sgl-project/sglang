@@ -10,35 +10,12 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
-
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
-    )
-
-    MARLIN_FP8_AVAILABLE = True
-except ImportError:
-    MARLIN_FP8_AVAILABLE = False
-
-    def dummy_func(*args, **kwargs):
-        raise ImportError(
-            "marlin FP8 requires some operators from vllm. Please install vllm."
-        )
-
-    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
-
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -69,6 +46,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -87,7 +68,6 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
-    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -229,7 +209,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
-        if _is_cuda and MARLIN_FP8_AVAILABLE:
+        if _is_cuda:
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
@@ -516,16 +496,6 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )
-
-
-def get_tile_tokens_dim(num_tokens, top_k, num_experts):
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = (num_tokens * top_k) // num_experts
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-    return tile_tokens_dim
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -1221,9 +1191,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else topk_config.correction_bias.to(x.dtype)
         )
 
-        routing_method_type = getattr(
-            layer, "routing_method_type", RoutingMethodType.DeepSeekV3
-        )
+        routing_method_type = getattr(layer, "routing_method_type")
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1256,9 +1224,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 routed_scaling_factor=(
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
-                tile_tokens_dim=get_tile_tokens_dim(
-                    x.shape[0], topk_config.top_k, layer.num_experts
-                ),
+                tile_tokens_dim=None,
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=False,
             )
