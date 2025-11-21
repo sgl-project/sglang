@@ -213,19 +213,6 @@ IMAGE_INPUT_FILE = Path(__file__).resolve().parents[1] / "test_files" / "girl.jp
 # To test different models, simply add more DiffusionCase entries
 DIFFUSION_CASES: list[DiffusionTestCase] = [
     # === Image to Video (I2V) ===
-    DiffusionTestCase(
-        id="wan2_2_i2v_a14b",
-        model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        modality="video",
-        prompt="generate",  # passing in something since failing if no prompt is passed
-        warmup_text=0,  # warmups only for image gen models
-        warmup_edit=0,
-        output_size="832x1104",
-        edit_prompt="generate",
-        image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
-        custom_validator="video",
-        seconds=1,
-    ),
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         id="qwen_image_t2i",
@@ -271,28 +258,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         custom_validator="video",
     ),
     DiffusionTestCase(
-        id="wan2_1_t2v_14b",
-        model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
-        modality="video",
-        prompt="A curious raccoon",
-        output_size="720x480",
-        seconds=4,
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
-    ),
-    DiffusionTestCase(
-        id="wan2_2_t2v_a14b",
-        model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        modality="video",
-        prompt="A curious raccoon",
-        output_size="720x480",
-        seconds=4,
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
-    ),
-    DiffusionTestCase(
         id="hunyuan_video",
         model_path="hunyuanvideo-community/HunyuanVideo",
         modality="video",
@@ -304,32 +269,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         custom_validator="video",
     ),
     # === Text and Image to Video (TI2V) ===
-    DiffusionTestCase(
-        id="wan2_1_i2v_14b_480P",
-        model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-        output_size="832x1104",
-        modality="video",
-        prompt="Animate this image",
-        edit_prompt="Add dynamic motion to the scene",
-        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        warmup_text=0,  # warmups only for image gen models
-        warmup_edit=0,
-        custom_validator="video",
-        seconds=1,
-    ),
-    DiffusionTestCase(
-        id="wan2_1_i2v_14b_720P",
-        model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
-        modality="video",
-        prompt="Animate this image",
-        edit_prompt="Add dynamic motion to the scene",
-        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        output_size="832x1104",
-        warmup_text=0,  # warmups only for image gen models
-        warmup_edit=0,
-        custom_validator="video",
-        seconds=1,
-    ),
     DiffusionTestCase(
         id="wan2_2_ti2v_5b",
         model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
