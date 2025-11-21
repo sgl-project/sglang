@@ -157,6 +157,7 @@ jobs:
           sleep 120
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           cd ../
+          modelscope download --model aleoyang/Qwen3-32B-w8a8-MindIE
           cd test/srt
           python3 run_suite.py --suite per-commit-4-ascend-npu-debug --timeout-per-file 7200
 
