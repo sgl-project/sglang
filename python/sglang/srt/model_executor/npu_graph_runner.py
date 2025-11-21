@@ -48,16 +48,17 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.update_attr_name = None
+        self.update_attr_type = None
+        self.model_runner = model_runner
         self._init_arch_map()
-        self.update_attr_name = self._get_update_attr_name(model_runner)
-        self.update_attr_type = self._get_update_attr_type(model_runner)
 
     def _init_arch_map(self):
-        self.update_attr_name: Dict[str, str] = {
+        self.attr_name: Dict[str, str] = {
             AttentionArch.MLA: "actual_seq_lengths_kv",
             AttentionArch.MHA: "context_lens",
         }
-        self.update_attr_type: Dict[str, Union[list, torch.Tensor]] = {
+        self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
         }
@@ -76,10 +77,14 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self, model_runner):
-        return self.update_attr_name[model_runner.model_config.attention_arch]
+        if self.bs == 1:
+            return self.attr_name[AttentionArch.MLA]
+        return self.attr_name[model_runner.model_config.attention_arch]
 
     def _get_update_attr_type(self, model_runner):
-        return self.update_attr_type[model_runner.model_config.attention_arch]
+        if self.bs == 1:
+            return self.attr_type[AttentionArch.MLA]
+        return self.attr_type[model_runner.model_config.attention_arch]
 
     def _update_inputs(self, seq_lens):
         if isinstance(self.update_attr_type, torch.Tensor):
@@ -132,7 +137,8 @@ class NPUGraphRunner(CudaGraphRunner):
             # In speculative decoding, these two fields are still needed.
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
-
+        self.update_attr_name = self._get_update_attr_name(self.model_runner)
+        self.update_attr_type = self._get_update_attr_type(self.model_runner)
         # Replay
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():
