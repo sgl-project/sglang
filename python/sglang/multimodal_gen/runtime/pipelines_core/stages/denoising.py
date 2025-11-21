@@ -19,10 +19,9 @@ import torch.profiler
 from einops import rearrange
 from tqdm.auto import tqdm
 
-from sglang.multimodal_gen.runtime.utils.common import is_cuda, is_npu
+from sglang.multimodal_gen.runtime.utils.common import is_cuda
 
 _is_cuda = is_cuda()
-_is_npu = is_npu()
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.runtime.distributed import (
