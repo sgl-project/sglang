@@ -776,6 +776,39 @@ class Req:
                 ),
             )
             self.cache_protected_len = len(self.prefix_indices)
+
+        if (
+            self.is_retracted
+            and self.multimodal_inputs is not None
+            and self.multimodal_inputs.mrope_positions is not None
+        ):
+            output_ids_len = len(self.output_ids)
+            if output_ids_len > 0:
+                # Get the last position value corresponding to origin_input_ids
+                # mrope_positions shape: (3, origin_input_ids_len)
+                last_position = self.multimodal_inputs.mrope_positions[
+                    :, -1
+                ]  # shape: (3,)
+
+                # Generate pure text mrope positions for output_ids
+                # All three dimensions for pure text are the same incremental sequence
+                start_pos = last_position[0] + 1  # Start from last position + 1
+                output_positions = (
+                    torch.arange(
+                        start_pos,
+                        start_pos + output_ids_len,
+                        dtype=torch.int64,
+                        device=self.multimodal_inputs.mrope_positions.device,
+                    )
+                    .unsqueeze(0)
+                    .expand(3, -1)
+                )  # shape: (3, output_ids_len)
+
+                # Concatenate to the original mrope_positions
+                self.multimodal_inputs.mrope_positions = torch.cat(
+                    [self.multimodal_inputs.mrope_positions, output_positions], dim=1
+                )
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
