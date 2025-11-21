@@ -209,6 +209,7 @@ suites = {
         TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("test_cpp_radix_cache.py", 60),
         TestFile("test_deepseek_v3_deterministic.py", 240),
+        TestFile("test_vlm_memory_leak.py", 400),
     ],
     "nightly-4-gpu-b200": [
         TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
