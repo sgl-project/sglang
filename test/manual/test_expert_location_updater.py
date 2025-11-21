@@ -12,9 +12,7 @@ from torch.multiprocessing import Process
 from sglang.srt.eplb import expert_location_updater
 from sglang.test.test_utils import CustomTestCase, find_available_port
 from sglang.utils import is_in_ci
-
-device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
-torch.set_default_device(device_type)
+from sglang.srt.utils import get_device
 
 
 @dataclass
@@ -64,7 +62,7 @@ class TestExpertLocationUpdater(CustomTestCase):
     def test_gpu(self):
         if is_in_ci():
             return
-        self._test_common(device=device_type)
+        self._test_common(device=get_device())
 
     def _test_common(self, device):
         infos = []

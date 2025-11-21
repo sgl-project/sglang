@@ -9,14 +9,11 @@ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import is_hip
-from sglang.test.test_utils import CustomTestCase, empty_gpu_cache, get_gpu_capability
+from sglang.srt.utils import is_hip, get_device, get_device_capability
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
-
-device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
-torch.set_default_device(device_type)
 
 
 class TestFusedMOE(CustomTestCase):
@@ -36,7 +33,7 @@ class TestFusedMOE(CustomTestCase):
         Returns:
             torch.Tensor: Randomly initialized Torch(device) tensor
         """
-        return torch.empty(shape, dtype=dtype, device=device_type).normal_(mean, std)
+        return torch.empty(shape, dtype=dtype, device=get_device()).normal_(mean, std)
 
     def get_tolerance(self, dtype):
         """Get tolerance values for different data types
@@ -108,7 +105,7 @@ class TestFusedMOE(CustomTestCase):
 
         if use_fp8_w8a8:
             # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-            capability = get_gpu_capability()
+            capability = get_device_capability()
             if not _is_hip and not (capability[0] >= 9 or capability == (8, 9)):
                 return
 

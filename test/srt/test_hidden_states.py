@@ -5,8 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
-
-device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+from sglang.srt.utils import get_device
 
 
 class TestHiddenState(CustomTestCase):
@@ -48,7 +47,7 @@ class TestHiddenState(CustomTestCase):
         )
 
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map=device_type
+            model_path, torch_dtype=torch.bfloat16, device_map=get_device()
         )
 
         for input_id, output in zip(input_ids, outputs):
@@ -66,7 +65,7 @@ class TestHiddenState(CustomTestCase):
                     i.unsqueeze(0) if len(i.shape) == 1 else i
                     for i in output["meta_info"]["hidden_states"]
                 ]
-            ).to(device_type)
+            ).to(get_device())
             print("=== SRT Hiddens ===")
             print(sg_hidden_states)
 

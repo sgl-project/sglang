@@ -21,10 +21,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
-
-device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
-torch.set_default_device(device_type)
 
 
 class TestForwardSplitPrefill(CustomTestCase):
@@ -35,7 +33,7 @@ class TestForwardSplitPrefill(CustomTestCase):
         """Set up the test environment once for all tests."""
         cls.model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.tp_size = 1
-        cls.device = device_type
+        cls.device = get_device()
 
         # Initialize server args
         cls.server_args = ServerArgs(

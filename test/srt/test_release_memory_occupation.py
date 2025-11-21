@@ -48,11 +48,10 @@ from sglang.test.test_utils import (
     get_gpu_memory_gb,
     get_gpu_rank,
 )
+from sglang.srt.utils import get_device
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = False
-
-device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
 
 
 class TestReleaseMemoryOccupation(CustomTestCase):
@@ -150,7 +149,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             hf_model_new = AutoModelForCausalLM.from_pretrained(
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
                 torch_dtype="bfloat16",
-                device=device_type,
+                device=get_device(),
             )
             engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
@@ -305,7 +304,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             hf_model_new = AutoModelForCausalLM.from_pretrained(
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
                 torch_dtype="bfloat16",
-                device=device_type,
+                device=get_device(),
             )
             gpu_memory_usage_after_loaded_hf_model = get_gpu_memory_gb()
             engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
@@ -384,7 +383,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         hf_model_new = AutoModelForCausalLM.from_pretrained(
             DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
             torch_dtype="bfloat16",
-            device=device_type,
+            device=get_device(),
         )
         engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 

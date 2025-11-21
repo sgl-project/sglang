@@ -1922,14 +1922,16 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
     return decorator
 
 
-def get_gpu_rank():
+def get_gpu_count():
     if is_xpu():
-        gpu_rank = torch.xpu.device_count()
+        gpu_count = torch.xpu.device_count()
     elif is_cuda():
-        gpu_rank = torch.cuda.device_count()
+        gpu_count = torch.cuda.device_count()
     elif is_rocm():
-        gpu_rank = torch.rocm.device_count()
-    return gpu_rank
+        gpu_count = torch.rocm.device_count()
+    else:
+        gpu_count = 0
+    return gpu_count
 
 
 def empty_gpu_cache():
@@ -1943,11 +1945,7 @@ def get_gpu_memory_gb():
     if is_cuda():
         return torch.cuda.device_memory_used() / 1024**3
     elif is_xpu():
-        return torch.xpu.device_memory_used() / 1024**3
+        return torch.xpu.memory_allocated() / 1024**3
+    else:
+        return 0
 
-
-def get_gpu_capability():
-    if is_cuda():
-        return torch.cuda.get_device_capability()
-    elif is_xpu():
-        return torch.xpu.get_device_capability()

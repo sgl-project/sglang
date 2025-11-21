@@ -21,9 +21,7 @@ from sglang.srt.layers.attention.wave_ops.extend_attention import extend_attenti
 from sglang.srt.layers.attention.wave_ops.prefill_attention import (
     prefill_attention_wave,
 )
-
-device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
-torch.set_default_device(device_type)
+from sglang.srt.utils import get_device
 
 
 class TestWaveAttention(unittest.TestCase):
@@ -46,24 +44,24 @@ class TestWaveAttention(unittest.TestCase):
         extend_seq_len = 1024
 
         b_seq_len_prefix = torch.full(
-            (B,), N_CTX // B, dtype=torch.int32, device=device_type
+            (B,), N_CTX // B, dtype=torch.int32, device=get_device()
         )
         b_seq_len_extend = torch.full(
-            (B,), extend_seq_len, dtype=torch.int32, device=device_type
+            (B,), extend_seq_len, dtype=torch.int32, device=get_device()
         )
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
 
-        b_req_idx = torch.arange(B, dtype=torch.int32, device=device_type)
-        b_start_loc = torch.zeros((B,), dtype=torch.int32, device=device_type)
+        b_req_idx = torch.arange(B, dtype=torch.int32, device=get_device())
+        b_start_loc = torch.zeros((B,), dtype=torch.int32, device=get_device())
         b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
-        b_start_loc_extend = torch.zeros((B,), dtype=torch.int32, device=device_type)
+        b_start_loc_extend = torch.zeros((B,), dtype=torch.int32, device=get_device())
         b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
 
-        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device_type)
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=get_device())
         kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len_prefix[:B], dim=0)
         kv_indices = torch.zeros(
-            (b_seq_len_prefix.sum().item(),), dtype=torch.int32, device=device_type
+            (b_seq_len_prefix.sum().item(),), dtype=torch.int32, device=get_device()
         )
 
         for i in range(B):
@@ -74,20 +72,20 @@ class TestWaveAttention(unittest.TestCase):
         total_token_num = torch.sum(b_seq_len).item()
         extend_token_num = torch.sum(b_seq_len_extend).item()
         k_buffer = torch.empty(
-            (total_token_num, H_KV, D), dtype=dtype, device=device_type
+            (total_token_num, H_KV, D), dtype=dtype, device=get_device()
         ).normal_(mean=0.1, std=0.2)
         v_buffer = torch.empty(
-            (total_token_num, H_KV, D), dtype=dtype, device=device_type
+            (total_token_num, H_KV, D), dtype=dtype, device=get_device()
         ).normal_(mean=0.1, std=0.2)
 
         k_extend = torch.empty(
-            (extend_token_num, H_KV, D), dtype=dtype, device=device_type
+            (extend_token_num, H_KV, D), dtype=dtype, device=get_device()
         )
         v_extend = torch.empty(
-            (extend_token_num, H_KV, D), dtype=dtype, device=device_type
+            (extend_token_num, H_KV, D), dtype=dtype, device=get_device()
         )
         q_extend = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device=device_type
+            (extend_token_num, H_Q, D), dtype=dtype, device=get_device()
         )
         for i in range(B):
             extend_start_in_buffer = b_start_loc[i] + b_seq_len_prefix[i]
@@ -101,22 +99,22 @@ class TestWaveAttention(unittest.TestCase):
                 extend_start_in_buffer:extend_end_in_buffer
             ]
             q_extend[extend_start:extend_end] = torch.empty(
-                (b_seq_len_extend[i], H_Q, D), dtype=dtype, device=device_type
+                (b_seq_len_extend[i], H_Q, D), dtype=dtype, device=get_device()
             ).normal_(mean=0.1, std=0.2)
 
         o_extend = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device=device_type
+            (extend_token_num, H_Q, D), dtype=dtype, device=get_device()
         )
         o_extend_mask = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device=device_type
+            (extend_token_num, H_Q, D), dtype=dtype, device=get_device()
         )
         o_redundant = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device=device_type
+            (extend_token_num, H_Q, D), dtype=dtype, device=get_device()
         )
 
         b_seq_len_extend = b_seq_len - b_seq_len_prefix
         max_len_extend = torch.max(b_seq_len_extend, 0)[0].item()
-        qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device_type)
+        qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=get_device())
         qo_indptr[1 : B + 1] = torch.cumsum(b_seq_len_extend[:B], dim=0)
 
         custom_mask = None
@@ -137,7 +135,7 @@ class TestWaveAttention(unittest.TestCase):
         is_causal = True
 
         o_extend = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device=device_type
+            (extend_token_num, H_Q, D), dtype=dtype, device=get_device()
         )
         extend_attention_fwd(
             q_extend,
@@ -156,7 +154,7 @@ class TestWaveAttention(unittest.TestCase):
         )
 
         o_wave = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device=device_type
+            (extend_token_num, H_Q, D), dtype=dtype, device=get_device()
         )
         extend_attention_wave(
             q_extend,
@@ -192,33 +190,33 @@ class TestWaveAttention(unittest.TestCase):
         total_tokens = B * seq_len
         sm_scale = 1.0 / (D**0.5)
         max_kv_splits = 8
-        num_kv_splits = torch.full((B,), 4, dtype=torch.int32, device=device_type)
+        num_kv_splits = torch.full((B,), 4, dtype=torch.int32, device=get_device())
 
         # q represents the new token being generated, one per batch
-        q = torch.randn(B, H_Q, D, dtype=dtype, device=device_type)
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=get_device())
 
         # k_buffer and v_buffer represent all previous tokens
-        k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device_type)
-        v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=device_type)
+        k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=get_device())
+        v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=get_device())
 
         # o will have the same shape as q
-        o_triton = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device_type)
-        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device_type)
+        o_triton = torch.zeros(B, H_Q, D_V, dtype=dtype, device=get_device())
+        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=get_device())
 
-        req_to_token = torch.arange(total_tokens, device=device_type, dtype=torch.int32)
-        b_req_idx = torch.zeros(B + 1, device=device_type, dtype=torch.int32)
-        b_seq_len = torch.full((B,), seq_len, device=device_type, dtype=torch.int32)
+        req_to_token = torch.arange(total_tokens, device=get_device(), dtype=torch.int32)
+        b_req_idx = torch.zeros(B + 1, device=get_device(), dtype=torch.int32)
+        b_seq_len = torch.full((B,), seq_len, device=get_device(), dtype=torch.int32)
         b_req_idx[1 : B + 1] = torch.cumsum(b_seq_len, dim=0)
 
         attn_logits = torch.empty(
             (B, H_Q, max_kv_splits, D_V + 1),
             dtype=torch.float32,
-            device=device_type,
+            device=get_device(),
         )
         attn_lse = torch.empty(
             (B, H_Q, max_kv_splits),
             dtype=torch.float32,
-            device=device_type,
+            device=get_device(),
         )
 
         logit_cap = 0.0
@@ -244,13 +242,13 @@ class TestWaveAttention(unittest.TestCase):
         attn_logits = torch.empty(
             attn_logits_shape,
             dtype=torch.float32,
-            device=device_type,
+            device=get_device(),
         )
 
         attn_logits_max = torch.empty(
             attn_logits_max_shape,
             dtype=torch.float32,
-            device=device_type,
+            device=get_device(),
         )
 
         decode_attention_wave(
@@ -300,24 +298,24 @@ class TestWaveAttention(unittest.TestCase):
 
         # Create random input tensors
         q = torch.randn(
-            sum(seq_lens), num_heads, head_dim, dtype=dtype, device=device_type
+            sum(seq_lens), num_heads, head_dim, dtype=dtype, device=get_device()
         )
         k = torch.randn(
-            sum(seq_lens), kv_heads, head_dim, dtype=dtype, device=device_type
+            sum(seq_lens), kv_heads, head_dim, dtype=dtype, device=get_device()
         )
         v = torch.randn(
-            sum(seq_lens), kv_heads, head_dim, dtype=dtype, device=device_type
+            sum(seq_lens), kv_heads, head_dim, dtype=dtype, device=get_device()
         )
         o_triton = torch.zeros(
-            sum(seq_lens), num_heads, head_dim, dtype=dtype, device=device_type
+            sum(seq_lens), num_heads, head_dim, dtype=dtype, device=get_device()
         )
         o = torch.zeros(
-            sum(seq_lens), num_heads, head_dim, dtype=dtype, device=device_type
+            sum(seq_lens), num_heads, head_dim, dtype=dtype, device=get_device()
         )
 
         # Create b_start_loc and b_seq_len tensors
-        b_start_loc = torch.tensor([0, seq_lens[0]], device=device_type)
-        b_seq_len = torch.tensor(seq_lens, device=device_type)
+        b_start_loc = torch.tensor([0, seq_lens[0]], device=get_device())
+        b_seq_len = torch.tensor(seq_lens, device=get_device())
 
         context_attention_fwd(
             q, k, v, o_triton, b_start_loc, b_seq_len, max_seq_len, is_causal=is_causal
