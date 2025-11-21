@@ -38,6 +38,7 @@ dependencies = [
   "ninja",
   "numpy",
   "nvidia-cutlass-dsl==4.2.1",
+  "nvidia-cudnn-cu12==9.16.0.29",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
   "orjson",
