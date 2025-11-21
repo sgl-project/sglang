@@ -85,5 +85,51 @@ class TestNorm(CustomTestCase):
                 self._l2norm_test(*params)
 
 
+class TestFusedRMSNormGated(CustomTestCase):
+    M = [4096, 1024]
+    N = [4096, 4096 + 13]
+    dtype = [torch.float16, torch.bfloat16]
+
+    def _forward_native(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float = 1e-6,
+        gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
+        hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
+        hidden_states = weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * torch.nn.functional.silu(gate.to(torch.float32))
+
+        return hidden_states.to(input_dtype)
+
+    def _norm_test(self, m, n, dtype):
+
+        x = torch.randn([m, n], dtype=dtype)
+        x = make_non_contiguous(x)
+        batch_size = x.size(0)
+        hidden_size = x.size(-1)
+        weight = torch.randn(hidden_size, dtype=dtype)
+        variance_epsilon = 1e-6
+        gate = torch.randn([batch_size, hidden_size], dtype=dtype)
+
+        out = torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
+            x, weight, gate, variance_epsilon
+        )
+        ref_out = self._forward_native(x, weight, variance_epsilon, gate)
+
+        atol = rtol = precision[ref_out.dtype] * 2
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+
+    def test_norm(self):
+        for params in itertools.product(self.M, self.N, self.dtype):
+            with self.subTest(m=params[0], n=params[1], dtype=params[2]):
+                self._norm_test(*params)
+
+
 if __name__ == "__main__":
     unittest.main()

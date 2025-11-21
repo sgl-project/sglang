@@ -1,11 +1,8 @@
 import json
 import unittest
-from io import BytesIO
 from typing import Optional
 
-import requests
 import torch
-from PIL import Image
 from transformers import (
     AutoProcessor,
     Gemma3ForConditionalGeneration,
@@ -15,8 +12,9 @@ from transformers import (
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.test.test_utils import download_image_with_retry
 
-TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
 
 
 class VLMInputTestBase:
@@ -31,8 +29,7 @@ class VLMInputTestBase:
         assert cls.chat_template is not None, "Set chat_template in subclass"
         cls.image_url = TEST_IMAGE_URL
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        response = requests.get(cls.image_url)
-        cls.main_image = Image.open(BytesIO(response.content))
+        cls.main_image = download_image_with_retry(cls.image_url)
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True, use_fast=True
         )
