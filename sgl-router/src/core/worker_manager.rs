@@ -152,8 +152,14 @@ impl WorkerManager {
                         if let Some(array) = json.as_array() {
                             let mut rank_tokens = HashMap::new();
                             for entry in array {
-                                let dp_rank = entry.get("dp_rank").and_then(|v| v.as_i64()).map(|rank| rank as isize);
-                                let num_tokens = entry.get("num_tokens").and_then(|v| v.as_i64()).map(|rank| rank as isize);
+                                let dp_rank = entry
+                                    .get("dp_rank")
+                                    .and_then(|v| v.as_i64())
+                                    .map(|rank| rank as isize);
+                                let num_tokens = entry
+                                    .get("num_tokens")
+                                    .and_then(|v| v.as_i64())
+                                    .map(|rank| rank as isize);
                                 if let (Some(rank), Some(tokens)) = (dp_rank, num_tokens) {
                                     rank_tokens.insert(rank, tokens);
                                 }
@@ -412,7 +418,9 @@ impl LoadMonitor {
             interval_timer.tick().await;
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
 
-            if power_of_two_policies.is_empty() && !policy_registry.is_dp_minimum_tokens_scheduler_enabled() {
+            if power_of_two_policies.is_empty() 
+                && !policy_registry.is_dp_minimum_tokens_scheduler_enabled()
+            {
                 debug!("No PowerOfTwo policies found, skipping load fetch");
                 continue;
             }

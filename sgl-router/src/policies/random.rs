@@ -1,13 +1,10 @@
 //! Random load balancing policy
 
-use std::{
-    sync::Arc,
-    collections::HashMap,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use rand::Rng;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, DPLoadManager};
+use super::{get_healthy_worker_indices, DPLoadManager, LoadBalancingPolicy};
 use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Random selection policy

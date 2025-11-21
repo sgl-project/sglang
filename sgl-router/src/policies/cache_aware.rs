@@ -59,17 +59,15 @@
     during the next eviction cycle.
 */
 
-use std::{sync::Arc,
-    thread,
-    time::Duration,
-    collections::HashMap
-};
+use std::{collections::HashMap, sync::Arc, thread, time::Duration};
 
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy, DPLoadManager};
+use super::{
+    get_healthy_worker_indices, tree::Tree, CacheAwareConfig, DPLoadManager, LoadBalancingPolicy,
+};
 use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Cache-aware routing policy
@@ -128,8 +126,7 @@ impl CacheAwarePolicy {
     /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by model
-        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> =
-            HashMap::new();
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
             // Use "default" for unknown/empty model_ids for backward compatibility
             let model_id = worker.model_id();

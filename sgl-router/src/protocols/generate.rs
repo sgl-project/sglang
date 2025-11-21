@@ -133,7 +133,7 @@ pub struct GenerateRequest {
     pub data_parallel_rank: Option<i32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decode_dp_rank:Option<i32>,
+    pub decode_dp_rank: Option<i32>,
 
     /// Background response
     #[serde(default)]

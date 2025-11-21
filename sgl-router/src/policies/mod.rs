@@ -3,8 +3,12 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc, sync::RwLock};
-use std::collections::{HashMap};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, RwLock},
+};
+
 use tracing::{debug};
 
 use crate::core::Worker;
@@ -165,7 +169,8 @@ impl DPLoadManager {
     pub fn get_lowest_dp_load(&self, worker: &dyn Worker) -> Option<isize> {
         if let Ok(cached_loads) = self.dp_cached_loads.read() {
             if let Some(loads) = cached_loads.get(worker.url()) {
-                return loads.iter()
+                return loads
+                    .iter()
                     .min_by_key(|&(_, load)| load)
                     .map(|(&rand_id, _)| rand_id);
             }
@@ -197,7 +202,7 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usi
 }
 
 #[cfg(test)]
-mod dp_load_manager_tests{
+mod dp_load_manager_tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
@@ -237,7 +242,7 @@ mod dp_load_manager_tests{
 
     #[test]
     fn test_get_lowest_dp_load() {
-        let worker1 =  BasicWorkerBuilder::new("http://worker1:8080")
+        let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
             .worker_type(WorkerType::Regular)
             .api_key("test_api_key2")
             .build();
@@ -258,7 +263,7 @@ mod dp_load_manager_tests{
 
     #[test]
     fn test_load_increment() {
-        let worker2 =  BasicWorkerBuilder::new("http://worker2:8080")
+        let worker2 = BasicWorkerBuilder::new("http://worker2:8080")
             .worker_type(WorkerType::Regular)
             .api_key("test_api_key2")
             .build();
@@ -279,7 +284,9 @@ mod dp_load_manager_tests{
         // load increment
         manager.load_increment(&worker2, 0, 5);
         let cached = manager.dp_cached_loads.read().expect("Rwlock read2 failed");
-        let worker2_cache = cached.get(worker2.url()).expect("worker2 not found in cache");
+        let worker2_cache = cached
+            .get(worker2.url())
+            .expect("worker2 not found in cache");
         // 2 + 5 = 7
         assert_eq!(worker2_cache.get(&0), Some(&7));
     }

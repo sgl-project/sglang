@@ -1,9 +1,8 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
-        RwLock,
         atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
     },
 };
 
@@ -59,7 +58,8 @@ impl PolicyRegistry {
     }
 
     pub fn enable_dp_minimum_tokens_scheduler(&self) {
-        self.dp_minimum_tokens_scheduler.store(true, Ordering::Relaxed);
+        self.dp_minimum_tokens_scheduler
+            .store(true, Ordering::Relaxed);
     }
 
     pub fn is_dp_minimum_tokens_scheduler_enabled(&self) -> bool {
