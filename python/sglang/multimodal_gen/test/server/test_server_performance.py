@@ -65,14 +65,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     )
     ctx = manager.start()
 
-    if case.startup_grace_seconds > 0:
-        logger.info(
-            "[server-test] Waiting %.1fs for %s to settle",
-            case.startup_grace_seconds,
-            case.id,
-        )
-        time.sleep(case.startup_grace_seconds)
-
     try:
         warmup = WarmupRunner(
             port=ctx.port,
