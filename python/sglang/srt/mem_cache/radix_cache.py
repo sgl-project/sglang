@@ -610,7 +610,7 @@ class RadixCache(BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         self._record_remove_event(child)
         new_node = TreeNode(priority=child.priority)
-        new_node.children = {self.get_child_key_fn(child.key[split_len:]): child}
+        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
