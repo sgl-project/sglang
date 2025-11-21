@@ -6,7 +6,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.utils import ceil_div, is_blackwell_supported, offloader
+from sglang.srt.utils import ceil_div, offloader
 
 try:
     from vllm import _custom_ops as ops
@@ -32,6 +32,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_device_sm,
+    is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -130,35 +132,41 @@ def cutlass_block_fp8_supported() -> bool:
     if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
         return False
     if _is_cuda:
-        major, minor = torch.cuda.get_device_capability()
-        sm_version = major * 10 + minor
-        cuda_version = tuple(map(int, torch.version.cuda.split(".")))
-        if cuda_version >= (12, 0) and sm_version >= 90:
-            return True
+        sm_version = get_device_sm()
+        cuda_version = get_cuda_version()
+        return cuda_version >= (12, 0) and sm_version >= 90
     return False
 
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
-ENABLE_FLASHINFER_FP8_GEMM = (
+
+FLASHINFER_FP8_GEMM_SUPPORTED = is_blackwell_supported() and is_flashinfer_available()
+
+ENABLE_FLASHINFER_FP8_GEMM = FLASHINFER_FP8_GEMM_SUPPORTED and (
     envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
-    and is_blackwell_supported()
-    and is_flashinfer_available()
+    or (
+        not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and not envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.is_set()
+    )
 )
 if ENABLE_FLASHINFER_FP8_GEMM:
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
+    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return deepgemm_w8a8_block_fp8_linear_with_fallback
+
     if ENABLE_FLASHINFER_FP8_GEMM:
         return flashinfer_gemm_w8a8_block_fp8_linear
-    elif CUTLASS_BLOCK_FP8_SUPPORTED:
+
+    if CUTLASS_BLOCK_FP8_SUPPORTED:
         return cutlass_w8a8_block_fp8_linear_with_fallback
-    elif _use_aiter:
+
+    if _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        return deepgemm_w8a8_block_fp8_linear_with_fallback
-    else:
-        return triton_w8a8_block_fp8_linear
+
+    return triton_w8a8_block_fp8_linear
 
 
 def flashinfer_gemm_w8a8_block_fp8_linear(
