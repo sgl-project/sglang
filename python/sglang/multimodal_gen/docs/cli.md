@@ -15,7 +15,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
 - `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
-- `--sp-size {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
+- `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
 
