@@ -17,7 +17,7 @@ import torch
 from packaging import version
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
 
@@ -88,3 +88,29 @@ def monkey_patch_torch_compile():
 
         af.auto_functionalized_v2._cacheable = True
         af.auto_functionalized._cacheable = True
+
+
+def register_fake_if_exists(op_name):
+    """
+    Decorator factory to conditionally register a fake for a custom op if it exists.
+    Parses op_name (e.g., 'sgl_kernel::gptq_gemm'), checks if the op exists via hasattr
+    on the namespace attribute of torch.ops. Registers the fake if present; otherwise,
+    returns the function unchanged.
+    Args:
+        op_name (str): Full operator name (e.g., 'sgl_kernel::gptq_gemm').
+    Returns:
+        callable: Decorator for the fake function.
+    Example:
+        @register_fake_if_exists('sgl_kernel::gptq_gemm')
+        def fake_gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
+            return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
+    """
+
+    def decorator(func):
+        namespace, bare_op = op_name.split("::")
+        ops_namespace = getattr(torch.ops, namespace, None)
+        if ops_namespace and hasattr(ops_namespace, bare_op):
+            torch.library.register_fake(op_name, func)
+        return func
+
+    return decorator

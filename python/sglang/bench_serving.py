@@ -995,7 +995,10 @@ async def get_mooncake_request_over_time(
             # Form the full prompt from history
             try:
                 full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history, tokenize=False, add_generation_prompt=True
+                    chat_history,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    return_dict=False,
                 )
             except Exception:
                 full_prompt_text = "\n".join(
@@ -1161,6 +1164,7 @@ def sample_sharegpt_requests(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 tokenize=False,
+                return_dict=False,
             )
             if tokenizer.bos_token:
                 prompt = prompt.replace(tokenizer.bos_token, "")
@@ -1383,6 +1387,7 @@ def create_mm_data_row(
     vision_prompt_len = prompt_len - text_prompt_len
 
     use_raw_prompt = backend in [
+        "sglang",
         "sglang-oai",
         "sglang-oai-chat",
         "vllm",
@@ -1462,7 +1467,11 @@ def sample_image_requests(
     total_image_bytes = 0
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+        text_prompt = gen_mm_prompt(
+            processor.tokenizer,
+            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            int(input_lens[i]),
+        )
 
         # Generate image list
         images, images_base64, images_bytes = zip(
@@ -1498,6 +1507,15 @@ def get_available_tokens(tokenizer):
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    if image_pad_id:
+        all_available_tokens.remove(image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -2099,6 +2117,7 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
+            "total_throughput": metrics.total_throughput,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
