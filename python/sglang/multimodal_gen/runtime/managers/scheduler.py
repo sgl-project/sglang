@@ -55,7 +55,6 @@ class Scheduler:
             master_port=port_args.master_port,
             rank=gpu_id,
             server_args=server_args,
-            nccl_port=port_args.nccl_port,
         )
         self.worker = worker
         self.task_pipes_to_slaves = task_pipes_to_slaves
