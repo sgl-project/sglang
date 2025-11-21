@@ -234,6 +234,17 @@ class ReplicatedLinear(LinearBase):
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         # If the weight on disk does not have a shape, give it one
         # (such scales for AutoFp8).
+        # Special case for GGUF
+
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
@@ -244,7 +255,6 @@ class ReplicatedLinear(LinearBase):
                     loaded_weight = loaded_weight[:1]
                 else:
                     raise ValueError(f"{loaded_weight} are not all equal")
-
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
@@ -364,7 +374,11 @@ class ColumnParallelLinear(LinearBase):
 
         # Materialize GGUF UninitializedParameter
         if is_gguf_weight and isinstance(param, UninitializedParameter):
-            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            final_shape = list(loaded_weight.shape)
+            if output_dim is not None:
+                assert final_shape[output_dim] % self.tp_size == 0
+                final_shape[output_dim] = final_shape[output_dim] // self.tp_size
+            param.materialize(final_shape, dtype=loaded_weight.dtype)
 
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
 
@@ -516,8 +530,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type:
-            param.data[loaded_shard_id].copy_(loaded_weight)
-            param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            if loaded_shard_id is not None:
+                param.data[loaded_shard_id].copy_(loaded_weight)
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            else:
+                param.shard_weight_type = {
+                    i: loaded_weight.item() for i, _ in enumerate(self.output_sizes)
+                }
             return
 
         if is_gguf_weight:
@@ -525,12 +544,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_size = loaded_weight.size(output_dim) // self.tp_size
             start_idx = self.tp_rank * shard_size
 
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-            param.shard_id.append(loaded_shard_id)
-            param.shard_id_map[loaded_shard_id] = len(param.data_container)
-            param.data_container.append(loaded_weight)
-            return
+            if loaded_shard_id is not None:
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                param.shard_id.append(loaded_shard_id)
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+                return
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
@@ -993,8 +1012,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type and loaded_shard_id is not None:
             idx_map = {"q": 0, "k": 1, "v": 2}
-            param.data[idx_map[loaded_shard_id]].copy_(loaded_weight)
-            param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            if loaded_shard_id is not None:
+                param.data[idx_map[loaded_shard_id]].copy_(loaded_weight)
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            else:
+                param.shard_weight_type = {k: loaded_weight.item() for k in idx_map}
             return
 
         if is_gguf_weight:
@@ -1002,12 +1024,12 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_size = loaded_weight.size(output_dim) // self.tp_size
             start_idx = self.tp_rank * shard_size
 
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-            param.shard_id.append(loaded_shard_id)
-            param.shard_id_map[loaded_shard_id] = len(param.data_container)
-            param.data_container.append(loaded_weight)
-            return
+            if loaded_shard_id is not None:
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                param.shard_id.append(loaded_shard_id)
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+                return
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)

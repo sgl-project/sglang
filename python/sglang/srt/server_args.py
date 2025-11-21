@@ -230,6 +230,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     tokenizer_worker_num: int = 1
+    hf_config_path: Optional[str] = None
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -1989,6 +1990,12 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
+        )
+        parser.add_argument(
+            "--hf-config-path",
+            type=str,
+            default=ServerArgs.hf_config_path,
+            help="Name or path of the huggingface config to use. If unspecified, model name or path will be used.",
         )
         parser.add_argument(
             "--load-format",
@@ -3815,7 +3822,7 @@ class ServerArgs:
     def get_hf_config(self):
         kwargs = {}
         hf_config = get_config(
-            self.model_path,
+            self.hf_config_path or self.model_path,
             trust_remote_code=self.trust_remote_code,
             revision=self.revision,
             model_override_args=orjson.loads(self.json_model_override_args),

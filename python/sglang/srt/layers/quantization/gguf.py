@@ -529,6 +529,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        print(topk_output)
 
         moe_runner_config = self.moe_runner_config
 

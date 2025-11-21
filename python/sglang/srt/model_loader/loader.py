@@ -1457,6 +1457,20 @@ class GGUFModelLoader(BaseModelLoader):
             # Gemma3 models use "gemma3_text" in HuggingFace but
             # "gemma3" in GGUF architecture naming
             model_type = "gemma3"
+        if model_type == "gpt_oss":
+            # GGUF layer map assumes that we will have a merged expert weights
+            # so we need to map them manually
+            model_type = "gpt-oss"
+            for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
