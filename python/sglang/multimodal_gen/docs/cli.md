@@ -1,11 +1,11 @@
-# sgl-diffusion CLI Inference
+# SGLang diffusion CLI Inference
 
-The sgl-diffusion CLI provides a quick way to access the sgl-diffusion inference pipeline for image and video generation.
+The SGLang-diffusion CLI provides a quick way to access the inference pipeline for image and video generation.
 
 ## Prerequisites
 
-- A working sgl-diffusion installation and the `sgl-diffusion` CLI available in `$PATH`.
-- Python 3.10+ if you plan to use the OpenAI Python SDK.
+- A working SGLang diffusion installation and the `sglang` CLI available in `$PATH`.
+- Python 3.11+ if you plan to use the OpenAI Python SDK.
 
 
 ## Supported Arguments
@@ -127,7 +127,7 @@ sglang generate --help
 
 ## Serve
 
-Launch the sgl-diffusion HTTP server and interact with it using the OpenAI SDK and curl. The server implements an OpenAI-compatible subset for Videos under the `/v1/videos` namespace.
+Launch the SGLang diffusion HTTP server and interact with it using the OpenAI SDK and curl. The server implements an OpenAI-compatible subset for Videos under the `/v1/videos` namespace.
 
 ### Start the server
 
