@@ -27,7 +27,7 @@ python3 -m sglang.launch_server \
   - **AMD GPUs**: `aiter`
   - **Intel XPU**: `intel_xpu`
   - **Other platforms**: `triton` (fallback)
-  
+
   To override the auto-selection, explicitly specify `--attention-backend` with one of the supported backends: `fa3`, `aiter`, `triton`, `trtllm_mha`, or `intel_xpu`.
 
 - **Chat Template**: Add `--chat-template llama-4` for chat completion tasks.
