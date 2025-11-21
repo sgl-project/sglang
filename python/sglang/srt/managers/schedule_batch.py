@@ -921,7 +921,7 @@ class Req:
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        # 这个判断逻辑应该不能放到这里，否则会造成当前是N轮生成的结果是eos，但是处理的是非eos的token但是被判定结束了。
+        # This judgment logic should not be placed here, otherwise it will cause the current result of the Nth round of generation to be eos, but the non-eos tokens are being processed but are judged to have ended.
         # if self.grammar is not None:
         #     if self.grammar.is_terminated():
         #         self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])

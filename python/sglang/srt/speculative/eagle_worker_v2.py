@@ -629,7 +629,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
-            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output) # 比较奇怪的是为什么draft extend after decode的和之前用的是一样的grammar词表mask
+            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
     def verify(
