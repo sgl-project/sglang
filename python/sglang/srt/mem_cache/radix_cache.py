@@ -432,6 +432,8 @@ class RadixCache(BasePrefixCache):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
             )
+        else:
+            req.prefix_indices = new_indices
 
         req.last_node = new_last_node
 
