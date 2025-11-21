@@ -40,6 +40,11 @@ dev = [
     "requests>=2.25.0",
 ]
 
+[project.scripts]
+smg = "sglang_router.cli:main"
+amg = "sglang_router.cli:main"
+sglang-router = "sglang_router.cli:main"
+
 
 [tool.maturin]
 python-source = "."
