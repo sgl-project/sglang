@@ -19,9 +19,7 @@ import torch
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.npu.compilation_context import CompilationContext
-from sglang.srt.model_executor.compilation.piecewise_npu_graph_compiler_backend import (
-    PiecewiseNpuGraphCompilerBackend,
-)
+from sglang.srt.utils.common import get_compiler_backend
 
 
 class PiecewiseNpuGraphCompiler:
@@ -31,17 +29,21 @@ class PiecewiseNpuGraphCompiler:
         model: torch.nn.Module,
         compilation_config: CompilationConfig,
         compilation_context: CompilationContext,
-        page_size: int,
     ):
-        self.backend = PiecewiseNpuGraphCompilerBackend(
-            model_runner, compilation_config, compilation_context, page_size
+        backend = get_compiler_backend(
+            (
+                "piecewise"
+                if compilation_config.compiler is None
+                else compilation_config.compiler
+            ),
+            model_runner,
+            compilation_config,
+            compilation_context,
         )
-        self.model = model
-
         torch._dynamo.reset()
         torch.compiler.allow_in_graph(sys.intern)
         torch.compiler.allow_in_graph(pathlib.Path)
 
         self.compiled_callable = torch.compile(
-            self.model, fullgraph=True, dynamic=False, backend=self.backend
+            model, fullgraph=True, dynamic=False, backend=backend
         )

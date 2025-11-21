@@ -103,7 +103,9 @@ class NPUGraphRunner(CudaGraphRunner):
         if self.enable_torch_compile and (not self.compile_bs or bs in self.compile_bs):
             self.model_runner.attn_backend.enable_torch_compile = True
             compiler = NpuGraphCompiler(
-                run_once_fn, self.model_runner.model_config.dtype
+                self.model_runner,
+                run_once_fn,
+                get_global_server_args().compilation_config,
             )
 
             patch_dynamo_context_call()

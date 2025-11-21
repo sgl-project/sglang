@@ -45,6 +45,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import get_available_gpu_memory, rank0_log
 
@@ -90,9 +91,7 @@ class CompiledGraph:
 class PiecewiseNPUGraphRunnerDecode:
     """A PiecewiseNPUGraphRunnerDecode runs the forward pass of a model with npu graph and torch.compile."""
 
-    def __init__(
-        self, model_runner: ModelRunner, compilation_config: CompilationConfig
-    ):
+    def __init__(self, model_runner: ModelRunner):
         model_runner.attn_backend.enable_piecewise_npu_graph_decode = True
 
         patch_dynamo_context()
@@ -102,9 +101,11 @@ class PiecewiseNPUGraphRunnerDecode:
 
         # Parse args
         self.model_runner = model_runner
+        compilation_config = get_global_server_args().compilation_config
         if compilation_config is None:
-            compilation_config = CompilationConfig()
-            compilation_config.splitting_ops = ["atb._npu_paged_attention"]
+            compilation_config = CompilationConfig(
+                compiler="piecewise", splitting_ops=["atb._npu_paged_attention"]
+            )
         self.compilation_config = compilation_config
         self.compilation_context = CompilationContext()
 
@@ -413,7 +414,6 @@ class PiecewiseNPUGraphRunnerDecode:
             self.model_runner.model,
             self.compilation_config,
             self.compilation_context,
-            self.model_runner.page_size,
         )
 
         patch_dynamo_context_call()
@@ -527,7 +527,6 @@ class PiecewiseNPUGraphRunnerDecode:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.replay_prepare(forward_batch, pp_proxy_tensors)
-        compiled_graph = self.graphs[self.bs]
 
         def init():
             attn_backend = self.model_runner.attn_backend

@@ -135,7 +135,6 @@ class PiecewiseNpuGraphCompilerBackend(NpuGraphCompilerBackend):
         model_runner,
         compilation_config: CompilationConfig,
         compilation_context: CompilationContext,
-        page_size: int,
     ):
         super().__init__(model_runner.model_config.dtype)
 
@@ -143,7 +142,7 @@ class PiecewiseNpuGraphCompilerBackend(NpuGraphCompilerBackend):
         self.model_config = model_runner.model.config
 
         self.compilation_config = compilation_config
-        self.page_size = page_size
+        self.page_size = model_runner.page_size
         self.compilation_context = compilation_context
 
         self.split_gm = None
