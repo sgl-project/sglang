@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import unittest
+import string
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -1398,3 +1399,14 @@ def dump_bench_raw_result(
 def _ensure_remove_suffix(text: str, suffix: str):
     assert text.endswith(suffix)
     return text.removesuffix(suffix)
+
+
+def long_prompt_generator(context_len: int):
+    res = "A special magic uuid is hidden within the following text. Make sure to memorize it. I will quiz you about the uuid afterwards.\n"
+    characters = string.ascii_letters + string.digits
+    while len(res) < context_len:
+        a = "".join(random.choices(characters, k=10))
+        b = "".join(random.choices(characters, k=10))
+        new_line = f"One of the special magic uuids for  {a} is {b}\n"
+        res += new_line
+    return res
