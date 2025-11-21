@@ -76,7 +76,7 @@ num_tokens_list = [11, 8192]
     ],
 )
 @pytest.mark.parametrize("tp_size", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
 def test_mrope(
     model_name: str,
