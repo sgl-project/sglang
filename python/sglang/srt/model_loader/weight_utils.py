@@ -287,7 +287,7 @@ def _validate_safetensors_file(file_path: str) -> bool:
 
 def _validate_sharded_model(
     snapshot_dir: str, weight_files: List[str]
-) -> Tuple[bool, Optional[str]]:
+) -> Tuple[bool, Optional[str], List[str]]:
     """
     Validate that all model shards are present and not corrupted.
 
@@ -296,7 +296,8 @@ def _validate_sharded_model(
         weight_files: List of weight file paths
 
     Returns:
-        Tuple of (is_valid, error_message)
+        Tuple of (is_valid, error_message, corrupted_files)
+        - corrupted_files: List of file paths that are corrupted (for selective cleanup)
     """
     # Pattern for sharded files: model-00001-of-00009.safetensors
     shard_pattern = re.compile(r"(.*?)-(\d+)-of-(\d+)\.(safetensors|bin)")
@@ -325,6 +326,9 @@ def _validate_sharded_model(
             shard_groups[group_key]["found_shards"].append(shard_id)
             shard_groups[group_key]["files"].append(f)
 
+    # Track corrupted files for selective cleanup
+    corrupted_files = []
+
     # Validate each shard group
     for group_key, group_info in shard_groups.items():
         total_shards = group_info["total"]
@@ -334,13 +338,17 @@ def _validate_sharded_model(
         # Check for missing shards
         missing_shards = expected_shards - found_shards
         if missing_shards:
-            return False, f"Missing shards in {group_key}: {sorted(missing_shards)}"
+            return (
+                False,
+                f"Missing shards in {group_key}: {sorted(missing_shards)}",
+                [],
+            )
 
         # Validate safetensors files for corruption
         if group_info["suffix"] == "safetensors":
             for f in group_info["files"]:
                 if not _validate_safetensors_file(f):
-                    return False, f"Corrupted shard file: {os.path.basename(f)}"
+                    corrupted_files.append(f)
 
         # Check for required index file for safetensors shards
         if group_info["suffix"] == "safetensors":
@@ -348,16 +356,92 @@ def _validate_sharded_model(
                 snapshot_dir, f"{group_info['prefix']}.safetensors.index.json"
             )
             if not os.path.exists(index_file):
-                return False, f"Missing index file: {os.path.basename(index_file)}"
+                return (
+                    False,
+                    f"Missing index file: {os.path.basename(index_file)}",
+                    [],
+                )
 
-    return True, None
+    if corrupted_files:
+        return (
+            False,
+            f"Corrupted shard files: {[os.path.basename(f) for f in corrupted_files]}",
+            corrupted_files,
+        )
+
+    return True, None, []
+
+
+def _cleanup_corrupted_files_selective(
+    model_name_or_path: str, corrupted_files: List[str]
+) -> int:
+    """
+    Selectively remove corrupted files and their blobs to force re-download.
+
+    This is more efficient than removing the entire model cache as it only
+    re-downloads corrupted files rather than the entire model.
+
+    Args:
+        model_name_or_path: Model identifier
+        corrupted_files: List of corrupted file paths (symlinks in snapshot)
+
+    Returns:
+        Number of files successfully cleaned up
+    """
+    cleaned_count = 0
+
+    for file_path in corrupted_files:
+        try:
+            # Resolve symlink to get blob path before deleting symlink
+            if os.path.islink(file_path):
+                blob_path = os.path.realpath(file_path)
+
+                # Delete the symlink
+                os.remove(file_path)
+                logger.info(
+                    "Removed corrupted symlink: %s", os.path.basename(file_path)
+                )
+
+                # Delete the blob (the actual corrupted data)
+                if os.path.exists(blob_path):
+                    os.remove(blob_path)
+                    logger.info(
+                        "Removed corrupted blob: %s", os.path.basename(blob_path)
+                    )
+
+                cleaned_count += 1
+            elif os.path.exists(file_path):
+                # Not a symlink, just delete the file
+                os.remove(file_path)
+                logger.info("Removed corrupted file: %s", os.path.basename(file_path))
+                cleaned_count += 1
+
+        except Exception as e:
+            logger.error(
+                "Failed to remove corrupted file %s: %s",
+                os.path.basename(file_path),
+                e,
+            )
+
+    if cleaned_count > 0:
+        logger.warning(
+            "Removed %d corrupted file(s) for %s. "
+            "These will be re-downloaded on next load.",
+            cleaned_count,
+            model_name_or_path,
+        )
+
+    return cleaned_count
 
 
 def _cleanup_corrupted_model_cache(
     model_name_or_path: str, snapshot_dir: str, reason: str
 ) -> None:
     """
-    Remove corrupted model cache directory to force a clean re-download.
+    Remove entire corrupted model cache directory to force a clean re-download.
+
+    This is used when we cannot selectively clean (e.g., missing shards, incomplete
+    downloads with unknown affected files).
 
     Args:
         model_name_or_path: Model identifier
@@ -369,7 +453,7 @@ def _cleanup_corrupted_model_cache(
 
     try:
         logger.warning(
-            "Removing corrupted cache for %s at %s. Reason: %s",
+            "Removing entire cache for %s at %s. Reason: %s",
             model_name_or_path,
             repo_folder,
             reason,
@@ -484,19 +568,33 @@ def find_local_hf_snapshot_dir(
 
     # Validate sharded models and check for corruption
     if local_weight_files:
-        is_valid, error_msg = _validate_sharded_model(
+        is_valid, error_msg, corrupted_files = _validate_sharded_model(
             found_local_snapshot_dir, local_weight_files
         )
         if not is_valid:
-            logger.info(
-                "Validation failed for %s: %s. Will clean up and re-download.",
-                model_name_or_path,
-                error_msg,
-            )
-            _cleanup_corrupted_model_cache(
-                model_name_or_path, found_local_snapshot_dir, error_msg
-            )
-            return None
+            if corrupted_files:
+                # Selective cleanup: only remove corrupted files
+                logger.info(
+                    "Found %d corrupted file(s) for %s: %s. "
+                    "Will selectively clean and re-download only these files.",
+                    len(corrupted_files),
+                    model_name_or_path,
+                    error_msg,
+                )
+                _cleanup_corrupted_files_selective(model_name_or_path, corrupted_files)
+                return None
+            else:
+                # Cannot selectively clean (e.g., missing shards) - remove entire cache
+                logger.info(
+                    "Validation failed for %s: %s. "
+                    "Will remove entire cache and re-download.",
+                    model_name_or_path,
+                    error_msg,
+                )
+                _cleanup_corrupted_model_cache(
+                    model_name_or_path, found_local_snapshot_dir, error_msg
+                )
+                return None
 
         # Also validate single (non-sharded) safetensors files
         for f in local_weight_files:
@@ -505,15 +603,13 @@ def find_local_hf_snapshot_dir(
             if base_name in ["model.safetensors", "pytorch_model.safetensors"]:
                 if not _validate_safetensors_file(f):
                     logger.info(
-                        "Corrupted model file %s for %s. Will clean up and re-download.",
+                        "Corrupted model file %s for %s. "
+                        "Will selectively clean and re-download this file.",
                         base_name,
                         model_name_or_path,
                     )
-                    _cleanup_corrupted_model_cache(
-                        model_name_or_path,
-                        found_local_snapshot_dir,
-                        f"Corrupted model file: {base_name}",
-                    )
+                    # Selective cleanup for single file
+                    _cleanup_corrupted_files_selective(model_name_or_path, [f])
                     return None
 
     if len(local_weight_files) > 0:
