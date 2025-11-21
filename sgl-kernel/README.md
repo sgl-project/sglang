@@ -9,7 +9,7 @@
 
 </div>
 
-SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernels for operations.
+SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernel operations.
 
 ## Installation
 Requires torch == 2.8.0

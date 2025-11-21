@@ -342,7 +342,10 @@ def pre_permute_standard_to_deep_gemm(
 
     from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
 
-    hidden_states, topk_output = dispatch_output
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
     topk_weights, topk_ids, _ = topk_output
 
     hidden_states_shape = hidden_states.shape
