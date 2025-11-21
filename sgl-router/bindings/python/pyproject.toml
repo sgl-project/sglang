@@ -12,7 +12,7 @@ authors = [
     {name = "Keyang Ru", email = "rukeyang@gmail.com"}
 ]
 requires-python = ">=3.8"
-readme = "../../README.md"
+readme = "README.md"
 license = { text = "Apache-2.0" }
 classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
