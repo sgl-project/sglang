@@ -213,10 +213,6 @@ class Req:
 
 
 @dataclass
-class ForwardBatch(Req): ...
-
-
-@dataclass
 class OutputBatch:
     """
     Final output (after pipeline completion)

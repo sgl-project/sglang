@@ -409,24 +409,6 @@ Consider updating perf_baselines.json with the snippets below:
             self._dump_baseline_for_testcase(case, summary)
             raise
 
-        if case.modality == "video" and summary.frames_per_second:
-            logger.info(
-                "[Perf] %s: E2E %.2f ms; Avg %.2f ms; FPS %.2f; Frames %d",
-                case.id,
-                summary.e2e_ms,
-                summary.avg_denoise_ms,
-                summary.frames_per_second,
-                summary.total_frames or 0,
-            )
-        else:
-            logger.info(
-                "[Perf] %s: E2E %.2f ms; Avg %.2f ms; Median %.2f ms",
-                case.id,
-                summary.e2e_ms,
-                summary.avg_denoise_ms,
-                summary.median_denoise_ms,
-            )
-
         result = {
             "test_name": case.id,
             "modality": case.modality,
@@ -448,40 +430,6 @@ Consider updating perf_baselines.json with the snippets below:
             )
 
         self.__class__._perf_results.append(result)
-
-        logger.info("[BASELINE] %s expected_e2e_ms = %.2f", case.id, summary.e2e_ms)
-        logger.info(
-            "[BASELINE] %s expected_avg_denoise_ms = %.2f",
-            case.id,
-            summary.avg_denoise_ms,
-        )
-        logger.info(
-            "[BASELINE] %s expected_median_denoise_ms = %.2f",
-            case.id,
-            summary.median_denoise_ms,
-        )
-        logger.info("[BASELINE] %s stages_ms = %r", case.id, summary.stage_metrics)
-        logger.info(
-            "[BASELINE] %s denoise_step_ms = %r", case.id, summary.sampled_steps
-        )
-
-        # Only log video-specific metrics when they exist
-        if summary.frames_per_second is not None:
-            logger.info(
-                "[BASELINE] %s frames_per_second = %.2f",
-                case.id,
-                summary.frames_per_second,
-            )
-        if summary.total_frames is not None:
-            logger.info(
-                "[BASELINE] %s total_frames = %d", case.id, summary.total_frames
-            )
-        if summary.avg_frame_time_ms is not None:
-            logger.info(
-                "[BASELINE] %s avg_frame_time_ms = %.2f",
-                case.id,
-                summary.avg_frame_time_ms,
-            )
 
     def _check_for_improvement(
         self,
@@ -511,8 +459,6 @@ Consider updating perf_baselines.json with the snippets below:
             )
         ):
             is_improved = True
-        print(f"{summary.stage_metrics=}")
-        print(f"{scenario.stages_ms=}")
         # Combine metrics, always taking the better (lower) value
         new_stages = {
             stage: min(
