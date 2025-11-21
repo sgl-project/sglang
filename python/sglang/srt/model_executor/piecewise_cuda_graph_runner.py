@@ -149,6 +149,7 @@ class PiecewiseCudaGraphRunner:
         self.compile_config = CompilationConfig(
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
+            self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
 
