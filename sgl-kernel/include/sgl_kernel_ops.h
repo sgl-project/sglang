@@ -317,6 +317,13 @@ void topk_softmax(
     double moe_softcapping,
     const c10::optional<torch::Tensor>& correction_bias);
 
+void topk_sigmoid(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
+    const c10::optional<torch::Tensor>& correction_bias);
+
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
@@ -328,6 +335,14 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
+
+std::vector<at::Tensor> kimi_k2_moe_fused_gate(
+    at::Tensor& input,
+    at::Tensor& bias,
+    int64_t topk,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output);
 

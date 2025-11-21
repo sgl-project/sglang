@@ -39,6 +39,7 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
 )
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -258,6 +259,7 @@ class CudaGraphRunner:
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -308,11 +310,18 @@ class CudaGraphRunner:
             set_torch_compile_config()
 
         if self.model_runner.server_args.enable_lora:
-            self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
+            self.model_runner.lora_manager.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=self.max_bs,
+                num_tokens_per_bs=self.num_tokens_per_bs,
+            )
 
         # Graph inputs
         with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.input_embeds = torch.zeros(
+                (self.max_num_token, self.model_runner.model_config.hidden_size),
+                dtype=self.model_runner.model_config.dtype,
+            )
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
@@ -833,7 +842,7 @@ class CudaGraphRunner:
             self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
         if enable_num_token_non_padded(self.model_runner.server_args):
             num_token_non_padded = forward_batch.num_token_non_padded
-            if self.require_gathered_buffer:
+            if self.require_gathered_buffer and not self.nsa_enable_prefill_cp:
                 tokens_per_rank = bs // self.attn_tp_size * self.num_tokens_per_bs
                 num_local_token_non_padded = torch.clamp(
                     num_token_non_padded - tokens_per_rank * self.attn_tp_rank,

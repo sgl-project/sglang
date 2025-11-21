@@ -21,7 +21,7 @@ This error may result from kernel errors or out-of-memory issues:
 - If the server hangs during initialization or running, it can be memory issues (out of memory), network issues (nccl errors), or other bugs in sglang.
     - If it is out of memory, you might see that `avail mem` is very low during the initialization or right after initialization. In this case,
       you can try to decrease `--mem-fraction-static`, decrease `--cuda-graph-max-bs`, or decrease `--chunked-prefill-size`.
-- Other bugs, please raise a Github issue to us.
+- Other bugs, please file an issue on GitHub.
 
 
 ## Frequently Asked Questions
@@ -34,6 +34,6 @@ From our initial investigation, this indeterminism arises from two factors: dyna
 
 To achieve more deterministic outputs in the current code, you can add `--disable-radix-cache` and send only one request at a time. The results will be mostly deterministic under this setting.
 
-**Note**:
-Recently, we also introduced a deterministic mode, you can enable it with `--enable-deterministic-inference`. It might not work for all cases.
+**Update**:
+Recently, we also introduced a deterministic mode, you can enable it with `--enable-deterministic-inference`.
 Please find more details in this blog post: https://lmsys.org/blog/2025-09-22-sglang-deterministic/
