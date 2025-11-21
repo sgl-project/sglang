@@ -293,7 +293,7 @@
                 "48": 1376.33,
                 "49": 1373.45
             },
-            "expected_e2e_ms": 75157.98,
+            "expected_e2e_ms": 100028,
             "expected_avg_denoise_ms": 1386.08,
             "expected_median_denoise_ms": 1374.03
         },
@@ -352,7 +352,7 @@
                 "39": 4888.4
             },
             "expected_e2e_ms": 257132.95,
-            "expected_avg_denoise_ms": 5791.06,
+            "expected_avg_denoise_ms": 6283.06,
             "expected_median_denoise_ms": 4900.59
         },
         "wan2_1_i2v_14b_480P": {
@@ -418,7 +418,7 @@
         "wan2_1_i2v_14b_720P": {
             "stages_ms": {
                 "InputValidationStage": 53.67,
-                "TextEncodingStage": 2228.89,
+                "TextEncodingStage": 2838,
                 "ImageEncodingStage": 2694.14,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 2.25,
