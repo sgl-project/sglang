@@ -315,9 +315,26 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
+        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
+        TestFile("hicache/test_hicache_storage.py", 127),
+        TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
+        TestFile("layers/attention/mamba/test_mamba_ssm.py", 50),
+        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 20),
+        TestFile("lora/test_lora_backend.py", 99),
+        TestFile("lora/test_lora_spec_decoding.py", 150),
+        TestFile("lora/test_lora_update.py", 600),
+        TestFile("models/test_cross_encoder_models.py", 100),
+        TestFile("models/test_embedding_models.py", 73),
+        TestFile("models/test_generation_models.py", 103),
+        TestFile("quant/test_autoround.py", 60),
+        TestFile("quant/test_fp8_kernel.py", 8),
+        TestFile("quant/test_int8_kernel.py", 8),
+        TestFile("quant/test_triton_scaled_mm.py", 8),
+        TestFile("quant/test_w8a8_quantization.py", 160),
+        TestFile("rl/test_fp32_lm_head.py", 30),
+        TestFile("test_build_eagle_tree.py", 8),
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
-        # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         TestFile("lora/test_lora.py", 665),
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
@@ -361,6 +378,9 @@ suite_amd = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
+        TestFile("test_model_hooks.py", 3),
+        TestFile("test_multi_tokenizer.py", 230),
+        TestFile("test_no_overlap_scheduler.py", 234),
         # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("test_no_chunked_prefill.py", 108),
