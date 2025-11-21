@@ -148,7 +148,7 @@ class TestDeepseek_w8a8(CustomTestCase):
         )
         run_command("mkdir ./benchmark/ais_bench/datasets/gsm8k")
         run_command(
-            "\cp /root/.cache/modelscope/hub/datasets/Howeee/GSM8K-in3584-bs8192/test.jsonl ./benchmark/ais_bench/datasets/gsm8k/"
+            "\cp Howeee/GSM8K-in3584-bs8192/test.jsonl ./benchmark/ais_bench/datasets/gsm8k/"
         )
         run_command("touch ./benchmark/ais_bench/datasets/gsm8k/train.jsonl")
         ais_res = run_command("pip3 install -e ./benchmark/")
