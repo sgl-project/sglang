@@ -681,7 +681,6 @@ class ModelConfig:
 
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
-        print(quant_cfg)
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
