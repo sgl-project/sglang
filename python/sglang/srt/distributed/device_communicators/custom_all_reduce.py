@@ -21,16 +21,6 @@ from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
 
-try:
-    # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-    import sgl_kernel  # noqa: F401
-
-    custom_ar = True
-except ImportError:
-    # For CPUs
-    custom_ar = False
-
-
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
@@ -78,7 +68,7 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self.disabled = True
 
-        if not custom_ar:
+        if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
             return
