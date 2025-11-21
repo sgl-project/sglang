@@ -56,15 +56,15 @@ impl LoadBalancingPolicy for RandomPolicy {
     }
 
     fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
-        return self.dp_load_manager.update_dp_loads(loads);
+        self.dp_load_manager.update_dp_loads(loads);
     }
 
     fn get_lowest_dp_load(&self, worker: &dyn Worker) -> Option<isize> {
-        return self.dp_load_manager.get_lowest_dp_load(worker);
+        self.dp_load_manager.get_lowest_dp_load(worker)
     }
 
     fn load_increment(&self, worker: &dyn Worker, dp_rank: isize, tokens: isize) {
-        return self.dp_load_manager.load_increment(worker, dp_rank, tokens);
+        self.dp_load_manager.load_increment(worker, dp_rank, tokens);
     }
 }
 
