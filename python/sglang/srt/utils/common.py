@@ -267,7 +267,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 try:
@@ -3618,12 +3618,6 @@ def cached_triton_kernel(key_fn=None):
     """
 
     def decorator(fn):
-        # Auto-enable the custom kernel cache for CUDA, where it is
-        # known to be compatible.
-        if is_cuda() and not envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.is_set():
-            logger.debug("Detected platform CUDA, using custom triton kernel cache.")
-            return CachedKernel(fn, key_fn)
-
         if envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
             logger.debug(
                 f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = True. Using custom triton kernel cache."
