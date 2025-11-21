@@ -391,15 +391,10 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
-<<<<<<< HEAD
-
     # Dynamic speculative decoding
     enable_dynamic_spec: bool = False  
     speculative_batch_size_threshold: int = 8  
-=======
     speculative_moe_runner_backend: Optional[str] = None
->>>>>>> upstream/main
-
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -2899,7 +2894,7 @@ class ServerArgs:
             default=ServerArgs.speculative_attention_mode,
         )
         parser.add_argument(
-<<<<<<< HEAD
+
             "--enable-dynamic-spec",
             action="store_true",
             help="Enable dynamic speculative decoding based on batch size. When enabled, speculative decoding will be automatically disabled when decode batch size exceeds the threshold.",
@@ -2909,13 +2904,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_batch_size_threshold,
             help="The batch size threshold for dynamic speculative decoding. Speculative decoding will only be used when decode batch size is <= this threshold.",
-=======
+        )
+        parser.add_argument(
             "--speculative-moe-runner-backend",
             type=str,
             choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
->>>>>>> upstream/main
+
         )
         # Ngram speculative decoding
         parser.add_argument(
