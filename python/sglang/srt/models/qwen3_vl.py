@@ -38,6 +38,10 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -45,6 +49,7 @@ from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model, init_all_vision_forward_metadata
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -64,14 +69,21 @@ class Qwen3_VisionMLP(nn.Module):
         hidden_act="silu",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
@@ -79,6 +91,8 @@ class Qwen3_VisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.act = ACT2FN[hidden_act]
 
@@ -132,6 +146,7 @@ class Qwen3_VisionBlock(nn.Module):
         attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -168,6 +183,7 @@ class Qwen3_VisionBlock(nn.Module):
             flatten_batch=flatten_batch,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            use_data_parallel=use_data_parallel,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -176,6 +192,7 @@ class Qwen3_VisionBlock(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -210,11 +227,15 @@ class Qwen3_VisionPatchMerger(nn.Module):
         use_postshuffle_norm: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
+
+        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
 
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
@@ -227,6 +248,8 @@ class Qwen3_VisionPatchMerger(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
@@ -235,6 +258,8 @@ class Qwen3_VisionPatchMerger(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -257,6 +282,7 @@ class Qwen3_VisionTransformer(nn.Module):
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = vision_config.hidden_size
@@ -269,6 +295,8 @@ class Qwen3_VisionTransformer(nn.Module):
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
+        self.use_data_parallel = use_data_parallel
+        self.out_hidden_size = vision_config.out_hidden_size * (1 + len(self.deepstack_visual_indexes))
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
@@ -285,6 +313,7 @@ class Qwen3_VisionTransformer(nn.Module):
                     attn_implementation="flash_attention_3",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                    use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -296,6 +325,7 @@ class Qwen3_VisionTransformer(nn.Module):
             spatial_merge_size=self.spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
+            use_data_parallel=use_data_parallel,
         )
 
         self.deepstack_merger_list = nn.ModuleList(
@@ -308,6 +338,7 @@ class Qwen3_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=add_prefix(f"deepstack_merger_list.{layer_idx}", prefix),
+                    use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
@@ -676,16 +707,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        if _use_aiter:
-            for i, block in enumerate(self.visual.blocks):
-                if i == 0:
-                    vision_forward_metadata = block.attn.init_vision_forward_metadata(
-                        image_grid_thw, pixel_values
-                    )
-                else:
-                    block.attn.set_vision_forward_metadata(vision_forward_metadata)
+        
 
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+            )
+        else:
+            init_all_vision_forward_metadata(self.visual, image_grid_thw, pixel_values)
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -705,7 +735,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 else:
                     block.attn.set_vision_forward_metadata(vision_forward_metadata)
 
-        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+            )
+        else:
+            init_all_vision_forward_metadata(self.visual, video_grid_thw, pixel_values)
+            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
     def get_input_embeddings(self):

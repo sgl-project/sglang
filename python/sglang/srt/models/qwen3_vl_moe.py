@@ -59,6 +59,8 @@ from sglang.srt.models.qwen3_vl import (
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+
 logger = logging.getLogger(__name__)
 
 cached_get_processor = lru_cache(get_processor)
@@ -165,6 +167,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ):
         super(Qwen3VLForConditionalGeneration, self).__init__()
         self.config = config
+        self.use_data_parallel = global_server_args_dict['mm_enable_dp_encoder']
 
         self.visual = Qwen3_VisionTransformer(
             config.vision_config,
@@ -173,6 +176,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
 
         self.model = Qwen3MoeLLMModel(
