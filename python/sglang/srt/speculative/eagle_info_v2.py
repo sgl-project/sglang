@@ -94,6 +94,8 @@ class EagleDraftInputV2Mixin:
         num_needed_tokens = 0
         for r in batch.reqs:
             x = self.ALLOC_LEN_PER_DECODE + r.kv_allocate_offset
+            y = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
+            x = max(x, y)
             cur_kv_allocated_len.append(r.kv_allocated_len)
             nxt_kv_allocated_len.append(r.kv_allocated_len + x)
             num_needed_tokens += x

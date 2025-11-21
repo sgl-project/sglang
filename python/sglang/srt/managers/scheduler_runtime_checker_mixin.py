@@ -86,44 +86,57 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
 
-        extend_size = 0
+        uncached_size = 0
         for i, req in enumerate(current_batch.reqs):
-            seq_len = len(req.origin_input_ids) + len(req.output_ids)
-            fill_len = len(req.fill_ids) if req.fill_ids is not None else 0
+            assert req.kv_committed_freed == req.kv_overallocated_freed
             prefix_len = (
                 len(req.prefix_indices) if req.prefix_indices is not None else 0
             )
+            uncached_len = 0
+            if not req.kv_committed_freed:
+                uncached_len = req.kv_allocated_len - prefix_len
 
-            if current_batch.forward_mode.is_decode():
-                if req.finished():
-                    unreleased_len = 1
-                else:
-                    unreleased_len = seq_len - prefix_len
-            else:
-                unreleased_len = fill_len - prefix_len
+            uncached_size += uncached_len
 
-            extend_size += unreleased_len
+            logger.info(
+                f"[Self Check During Busy] {req.rid=}\n"
+                f"[Self Check During Busy] {req.kv_committed_len=}\n"
+                f"[Self Check During Busy] {req.kv_allocated_len=}\n"
+                f"[Self Check During Busy] {req.kv_committed_freed=}\n"
+                f"[Self Check During Busy] {req.kv_overallocated_freed=}\n"
+                f"[Self Check During Busy] {prefix_len=}, {uncached_len=}"
+            )
 
         if (
             current_batch.forward_mode.is_extend()
             and self.running_batch is not None
             and not self.running_batch.is_empty()
-            and self.running_batch.forward_mode.is_decode()
         ):
             for i, req in enumerate(self.running_batch.reqs):
-                seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                assert req.kv_committed_freed == req.kv_overallocated_freed
                 prefix_len = (
                     len(req.prefix_indices) if req.prefix_indices is not None else 0
                 )
+                uncached_len = 0
+                if not req.kv_committed_freed:
+                    uncached_len = req.kv_allocated_len - prefix_len
 
-                if req.finished():
-                    unreleased_len = 0
-                else:
-                    unreleased_len = seq_len - prefix_len - 1
+                uncached_size += uncached_len
 
-                extend_size += unreleased_len
+                logger.info(
+                    f"[Self Check During Busy] {req.rid=}\n"
+                    f"[Self Check During Busy] {req.kv_committed_len=}\n"
+                    f"[Self Check During Busy] {req.kv_allocated_len=}\n"
+                    f"[Self Check During Busy] {req.kv_committed_freed=}\n"
+                    f"[Self Check During Busy] {req.kv_overallocated_freed=}\n"
+                    f"[Self Check During Busy] {prefix_len=}, {uncached_len=}"
+                )
 
-        total_tokens = available_size + evictable_size + protected_size + extend_size
+        logger.info(
+            f"[Self Check During Busy] {available_size=}, {evictable_size=}, {protected_size=}, {uncached_size=}"
+        )
+
+        total_tokens = available_size + evictable_size + protected_size + uncached_size
 
         assert (
             total_tokens == self.max_total_num_tokens

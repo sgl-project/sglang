@@ -1528,7 +1528,9 @@ def _execute_server_warmup(
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        json_data["text"] = [
+            "The capital city of France is Paris, the capital city of CN is"
+        ] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]

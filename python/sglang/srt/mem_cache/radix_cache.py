@@ -372,10 +372,10 @@ class RadixCache(BasePrefixCache):
         )
 
         old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
-            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
-            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
-            old_prefix_len -= 1
+        # if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+        #     # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+        #     # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
+        #     old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -429,10 +429,10 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
         old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
-            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
-            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
-            old_prefix_len -= 1
+        # if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+        #     # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+        #     # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
+        #     old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
@@ -467,13 +467,14 @@ class RadixCache(BasePrefixCache):
                 [new_indices, kv_indices[len(new_indices) :]]
             )
         else:
-            if self.is_eagle:
-                # Attach the kv index of the last token for EAGLE, it can be used in chunked prefill
-                req.prefix_indices = torch.cat(
-                    [new_indices, kv_indices[actual_kv_len:]]
-                )
-            else:
-                req.prefix_indices = new_indices
+            req.prefix_indices = new_indices
+            # if self.is_eagle:
+            #     # Attach the kv index of the last token for EAGLE, it can be used in chunked prefill
+            #     req.prefix_indices = torch.cat(
+            #         [new_indices, kv_indices[actual_kv_len:]]
+            #     )
+            # else:
+            #     req.prefix_indices = new_indices
         req.last_node = new_last_node
 
     def pretty_print(self):
@@ -517,8 +518,8 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.key)
-                self.protected_size_ += len(node.key)
+                self.evictable_size_ -= len(node.value)
+                self.protected_size_ += len(node.value)
                 delta -= len(node.key)
             node.lock_ref += 1
             node = node.parent
@@ -531,8 +532,8 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                self.evictable_size_ += len(node.key)
-                self.protected_size_ -= len(node.key)
+                self.evictable_size_ += len(node.value)
+                self.protected_size_ -= len(node.value)
                 delta += len(node.key)
             node.lock_ref -= 1
             if node.parent is None:
@@ -637,7 +638,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            self.evictable_size_ += len(key)
+            self.evictable_size_ += len(value)
             self._record_store_event(new_node)
         return total_prefix_length
 
@@ -664,7 +665,7 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.evictable_size_ -= len(node.key)
+        self.evictable_size_ -= len(node.value)
 
     def _total_size_helper(self):
         total_size = 0
