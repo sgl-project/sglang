@@ -236,7 +236,6 @@ suites = {
         TestFile("test_gpt_oss_common.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_vision_openai_server_common.py"),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
 }
 
@@ -397,7 +396,6 @@ suite_ascend = {
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
-        # TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
 }
 
