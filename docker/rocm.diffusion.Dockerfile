@@ -57,7 +57,6 @@ FROM ${GPU_ARCH}
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
-ENV SGL_DIFFUSION_TARGET_DEVICE="rocm"
 
 ARG SGL_REPO="https://github.com/zyzshishui/sglang.git"
 ARG SGL_DEFAULT="main"
