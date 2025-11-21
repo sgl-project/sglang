@@ -33,11 +33,11 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
-    _convert_to_bigram_key,
     _key_match_page_size1,
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -359,7 +359,7 @@ class SWARadixCache(BasePrefixCache):
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
 
         if is_eagle:
-            self.key_convert_fn = _convert_to_bigram_key
+            self.key_convert_fn = convert_to_bigram_key
         else:
             self.key_convert_fn = lambda key: key
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +25,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Iterator, List, Optional, Union
 
 import torch
 
@@ -174,16 +176,6 @@ def get_child_key(key: RadixKey, page_size: int = 1):
         return (key.extra_key, plain_key)
 
 
-def _convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
-    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
-    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
-    if len(tokens) < 2:
-        return []
-    if isinstance(tokens[0], tuple):
-        return tokens
-    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
-
-
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -220,7 +212,7 @@ class RadixCache(BasePrefixCache):
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
 
         if is_eagle:
-            self.key_convert_fn = _convert_to_bigram_key
+            self.key_convert_fn = convert_to_bigram_key
         else:
             self.key_convert_fn = lambda key: key
 
