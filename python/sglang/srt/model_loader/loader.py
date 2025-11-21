@@ -923,7 +923,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 ),
                 [],
             )
-            rows_per_shard = scale_param.data.shape[-1] // len(shard_names)
+            rows_per_shard = scale_param.data.shape[-1] // len(shard_names, 1)
             if rows_per_shard * len(shard_names) != scale_param.data.shape[-1]:
                 logger.warning(
                     f"Scale param shape {scale_param.data.shape[-1]} not divisible by {len(shard_names)}"
@@ -971,6 +971,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in updated_param_names and name in existing_params:
                 existing_params[name].data = torch.as_strided(
+                    # Note: avoid clone here
                     existing_params[name].data.clone(),
                     rebuild_info["shape"],
                     rebuild_info["stride"],
