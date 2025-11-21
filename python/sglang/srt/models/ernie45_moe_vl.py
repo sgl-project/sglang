@@ -21,9 +21,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
-    Ernie4_5_VLMoeConfig,
-)
+from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -32,7 +30,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -58,7 +60,7 @@ logger = logging.getLogger(__name__)
 class Ernie4_5_VLMoeAttention(nn.Module):
     def __init__(
         self,
-        config: Ernie4_5_VLMoeConfig,
+        config: PretrainedConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -177,7 +179,7 @@ class MoEGate(nn.Module):
 class Ernie4_5_VLMoeMoE(nn.Module):
     def __init__(
         self,
-        config: Ernie4_5_VLMoeConfig,
+        config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -186,35 +188,123 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         self.layer_id = layer_id
         self.tp_size = get_tensor_model_parallel_world_size()
         self.moe_num_shared_experts = getattr(config, "moe_num_shared_experts", 0)
+        self.hidden_size = config.hidden_size
 
-        if config.hidden_act != "silu":
+        moe_num_experts = config.moe_num_experts
+        max_moe_num_experts = max(moe_num_experts)
+
+        if self.tp_size > max_moe_num_experts:
             raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {moe_num_experts}."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        moe_layer_start_index = config.moe_layer_start_index
+        text_moe_layer_start_index = moe_layer_start_index[0]
+        vision_moe_layer_start_index = moe_layer_start_index[1]
+        moe_layer_end_index = config.moe_layer_end_index
+        moe_layer_end_index = getattr(
+            config,
+            "moe_layer_end_index",
+            [config.num_hidden_layers - 1, config.num_hidden_layers - 1],
+        )
+        text_moe_layer_end_index = moe_layer_end_index[0]
+        vision_moe_layer_end_index = moe_layer_end_index[1]
 
-        self.topk = TopK(
-            top_k=config.moe_k,
-            renormalize=True,
-            use_grouped_topk=False,
-            correction_bias=self.gate.e_score_correction_bias,
+        assert config.moe_num_experts[0] == config.moe_num_experts[1]
+        self.e_score_correction_bias = nn.Parameter(
+            torch.empty(2, config.moe_num_experts[0], dtype=torch.float32)
         )
 
-        self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.moe_num_experts,
-            top_k=config.moe_k,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            layer_id=self.layer_id,
-            quant_config=quant_config,
-            prefix=add_prefix("experts", prefix),
-        )
+        assert text_moe_layer_start_index <= text_moe_layer_end_index
+
+        # TODO 文本专家和视觉专家
+        if (
+            layer_id >= text_moe_layer_start_index
+            and layer_id <= text_moe_layer_end_index
+        ):
+            self.text_experts_gate = ReplicatedLinear(
+                config.hidden_size,
+                config.moe_num_experts[0],
+                bias=False,
+                params_dtype=torch.float32,
+                quant_config=quant_config,
+                prefix=add_prefix("text_experts_gate", prefix),
+            )
+
+            self.text_experts_topk = TopK(
+                top_k=config.moe_k,
+                renormalize=True,
+                use_grouped_topk=False,
+                correction_bias=self.e_score_correction_bias[
+                    0
+                ],  # TODO 这个bias最后要确定下是否正确
+            )
+
+            self.text_experts = get_moe_impl_class(quant_config)(
+                num_experts=config.moe_num_experts[0],
+                top_k=config.moe_k,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size[0],
+                layer_id=self.layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("text_experts", prefix),
+            )
+        # else:
+        #     self.text_experts = Ernie4_5_VLMoeMLP(
+        #         hidden_size=config.hidden_size,
+        #         intermediate_size=config.intermediate_size,
+        #         hidden_act=config.hidden_act,
+        #         use_bias=getattr(config, "use_bias", False),
+        #         quant_config=quant_config,
+        #         prefix=add_prefix("mlp", prefix),
+        #     )
+
+        assert vision_moe_layer_start_index <= vision_moe_layer_end_index
+        if (
+            layer_id >= vision_moe_layer_start_index
+            and layer_id <= vision_moe_layer_end_index
+        ):
+            self.vision_experts_gate = ReplicatedLinear(
+                config.hidden_size,
+                config.moe_num_experts[1],
+                bias=False,
+                params_dtype=torch.float32,
+                quant_config=quant_config,
+                prefix=add_prefix("vision_experts_gate", prefix),
+            )
+
+            self.vision_experts_topk = TopK(
+                top_k=config.moe_k,
+                renormalize=True,
+                use_grouped_topk=False,
+                correction_bias=self.e_score_correction_bias[
+                    1
+                ],  # TODO 这个bias最后要确定下是否正确
+            )
+
+            self.vision_experts = get_moe_impl_class(quant_config)(
+                num_experts=config.moe_num_experts[1],
+                top_k=config.moe_k,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size[1],
+                layer_id=self.layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("vision_experts", prefix),
+            )
+        # else:
+        #     self.vision_experts = Ernie4_5_VLMoeMLP(
+        #         hidden_size=config.hidden_size,
+        #         intermediate_size=config.intermediate_size,
+        #         hidden_act=config.hidden_act,
+        #         use_bias=getattr(config, "use_bias", False),
+        #         quant_config=quant_config,
+        #         prefix=add_prefix("mlp", prefix),
+        #     )
 
         if self.moe_num_shared_experts > 0:
             intermediate_size = (
-                config.moe_intermediate_size * config.moe_num_shared_experts
+                config.moe_intermediate_size[0] * config.moe_num_shared_experts
             )
             # disable tp for shared experts when enable deepep moe
             self.shared_experts = Ernie4_5_VLMoeMLP(
@@ -237,17 +327,70 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             if self.moe_num_shared_experts > 0
             else None
         )
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+
+        orig_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if visual_token_mask is not None and visual_token_mask.all():
+            # vision modal input processing directly
+            vision_router_logits, _ = self.vision_experts_gate(hidden_states)
+            vision_topk_output = self.vision_experts_topk(
+                hidden_states, vision_router_logits
+            )
+            final_hidden_states = self.vision_experts(
+                hidden_states=hidden_states, topk_output=vision_topk_output
+            )
+        elif visual_token_mask is not None and visual_token_mask.any():
+            # assert visual_token_mask.shape[0] != hidden_states.shape[0]
+            visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()
+            text_token_mask = ~visual_token_mask
+            final_hidden_states = torch.zeros_like(hidden_states)
+
+            text_hidden_states = hidden_states[text_token_mask].reshape(
+                -1, self.hidden_size
+            )
+            vision_hidden_states = hidden_states[visual_token_mask].reshape(
+                -1, self.hidden_size
+            )
+
+            text_router_logits, _ = self.text_experts_gate(text_hidden_states)
+            text_topk_output = self.text_experts_topk(
+                text_hidden_states, text_router_logits
+            )
+            final_hidden_states[text_token_mask] = self.text_experts(
+                hidden_states=text_hidden_states, topk_output=text_topk_output
+            ).flatten()
+
+            vision_router_logits, _ = self.vision_experts_gate(vision_hidden_states)
+            vision_topk_output = self.vision_experts_topk(
+                vision_hidden_states, vision_router_logits
+            )
+            final_hidden_states[visual_token_mask] = self.vision_experts(
+                hidden_states=vision_hidden_states, topk_output=vision_topk_output
+            ).flatten()
+        else:
+            # text modal input processing directly
+            text_router_logits, _ = self.text_experts_gate(hidden_states)
+            topk_output = self.text_experts_topk(hidden_states, text_router_logits)
+            final_hidden_states = self.text_experts(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
+
+        # # router_logits: (num_tokens, n_experts)
+        # router_logits = self.gate(hidden_states)
+        # topk_output = self.topk(hidden_states, router_logits)
+        # final_hidden_states = self.experts(
+        #     hidden_states=hidden_states, topk_output=topk_output
+        # )
+
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        return final_hidden_states
+
+        return final_hidden_states.view(orig_shape)
 
 
 class Ernie4_5_VLMoeDecoderLayer(nn.Module):
@@ -362,7 +505,7 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
 class Ernie4_5_VLMoeModel(nn.Module):
     def __init__(
         self,
-        config: Ernie4_5_VLMoeConfig,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -457,13 +600,13 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Ernie4_5_VLMoeConfig,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.pp_group = get_pp_group()
-        self.config: Ernie4_5_VLMoeConfig = config
+        self.config = config
         self.quant_config = quant_config
         self.model = Ernie4_5_VLMoeModel(
             config, quant_config, add_prefix("model", prefix)
