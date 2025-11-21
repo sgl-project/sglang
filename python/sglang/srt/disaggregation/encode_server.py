@@ -133,10 +133,10 @@ class ImageEncoder:
                 continue
             mm_item.set(k, _convert(v))
         with torch.inference_mode():
-            mm_embedding = self.model.get_image_feature([mm_item])
+            mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
         if len(mm_embedding.shape) != 2:
             mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
-        return _get_image_grid_dim(images_input), mm_embedding
+        return _get_image_grid_dim(images_input), mm_embedding.cpu()
 
     async def mm_send(
         self,
@@ -158,16 +158,12 @@ class ImageEncoder:
             mm_data.embedding_list[mm_data.part_idx] = None
 
         # Send ack/data
-        if embedding_port in self.send_to_prefill_sockets:
-            socket = self.send_to_prefill_sockets[embedding_port]
-        else:
-            socket = get_zmq_socket(
-                self.context,
-                zmq.PUSH,
-                f"tcp://{prefill_host}:{embedding_port}",
-                False,
-            )
-            self.send_to_prefill_sockets[embedding_port] = socket
+        socket = get_zmq_socket(
+            self.context,
+            zmq.PUSH,
+            f"tcp://{prefill_host}:{embedding_port}",
+            False,
+        )
         socket.send_pyobj(mm_data)
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
