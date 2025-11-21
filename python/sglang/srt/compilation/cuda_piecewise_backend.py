@@ -96,7 +96,7 @@ class CUDAPiecewiseBackend:
 
         self.sym_shape_indices = sym_shape_indices
 
-        self.is_debugging_mode = True
+        self.is_debugging_mode = False
 
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
@@ -161,10 +161,11 @@ class CUDAPiecewiseBackend:
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            entry.input_addresses = input_addresses
+            if self.is_debugging_mode:
+                input_addresses = [
+                    x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+                ]
+                entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
