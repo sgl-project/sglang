@@ -804,8 +804,8 @@ def biased_grouped_topk_gpu(
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
-            gating_output.to(dtype=torch.float32),
-            correction_bias,
+            gating_output,
+            correction_bias.to(dtype=gating_output.dtype),
             topk_weights,
             topk_ids,
             num_expert_group,
@@ -991,7 +991,6 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    # TODO: fused ops of shared experts in topk function itself when num_fused_shared_experts > 0.
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
         scale_factor = (
@@ -1000,30 +999,17 @@ def select_experts(
             else fused_shared_experts_scaling_factor
         )
 
-        topk_ids = torch.cat(
-            [
-                topk_ids,
-                torch.arange(
-                    N,
-                    N + num_fused_shared_experts,
-                    dtype=topk_ids.dtype,
-                    device=topk_ids.device,
-                ).expand(M, -1),
-            ],
-            dim=1,
+        # Lazy import to avoid circular-import issues
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+            fused_append_shared_experts,
         )
 
-        topk_weights = torch.cat(
-            [
-                topk_weights,
-                torch.full(
-                    (topk_weights.size(0), num_fused_shared_experts),
-                    scale_factor,
-                    dtype=topk_weights.dtype,
-                    device=topk_weights.device,
-                ),
-            ],
-            dim=1,
+        topk_ids, topk_weights = fused_append_shared_experts(
+            topk_ids,
+            topk_weights,
+            num_fused_shared_experts,
+            scale_factor,
+            N,  # base id for shared experts
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
