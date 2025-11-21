@@ -295,6 +295,8 @@ class LongcatFlashMoE(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and not getattr(x, "_sglang_require_global_experts", False)
+            and not name.endswith("_blockscale_swizzled")
         ]
 
 
