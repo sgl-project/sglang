@@ -2,6 +2,14 @@
 set -euo pipefail
 HOSTNAME_VALUE=$(hostname)
 GPU_ARCH="mi30x"   # default
+OPTIONAL_DEPS="${1:-}"
+
+# Build python extras
+EXTRAS="dev_hip"
+if [ -n "$OPTIONAL_DEPS" ]; then
+    EXTRAS="dev_hip,${OPTIONAL_DEPS}"
+fi
+echo "Installing python extras: [${EXTRAS}]"
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
 if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
@@ -21,7 +29,7 @@ case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-    docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]" --no-deps # TODO: only for mi35x
+    docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]" --no-deps # TODO: only for mi35x
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . --no-deps # TODO: only for mi35x
@@ -29,7 +37,7 @@ case "${GPU_ARCH}" in
   mi30x|mi300|mi325)
     echo "Runner uses ${GPU_ARCH}; will fetch mi30x image."
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-    docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]"
+    docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
