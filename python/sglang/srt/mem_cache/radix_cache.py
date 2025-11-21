@@ -352,7 +352,7 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
 
         old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+        if self.is_eagle and old_prefix_len > req.cache_protected_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
@@ -393,7 +393,7 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
 
         old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+        if self.is_eagle and old_prefix_len > req.cache_protected_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
@@ -417,11 +417,11 @@ class RadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        # The last_matched_prefix_len is not always equal to len(req.prefix_indices)
+        # The cache_protected_len is not always equal to len(req.prefix_indices)
         # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
         # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
-        # So we introduce this `last_matched_prefix_len` field to make sure the partial part can be freed correctly.
-        req.last_matched_prefix_len = len(new_indices)
+        # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
+        req.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
