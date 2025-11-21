@@ -32,10 +32,6 @@ from sglang.srt.layers.quantization.utils.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-<<<<<<< HEAD
-<<<<<<< HEAD
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
-=======
 
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -43,8 +39,6 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 
-=======
->>>>>>> 6dec3690d (support deepep for wfp8afp8 wint4afp8)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -56,7 +50,6 @@ from sglang.srt.utils import (
     is_sm100_supported,
     set_weight_attrs,
 )
->>>>>>> d9d83e985 (support wInt4aFp8 moe for llm-compressor)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -100,11 +93,8 @@ __all__ = [
     "CompressedTensorsMoEMethod",
     "CompressedTensorsW8A8Fp8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
-<<<<<<< HEAD
-=======
     "CompressedTensorsWNA16AMXEPMoEMethod",  # for Ktransformers
     "CompressedTensorsWInt4AFp8MoEMethod",
->>>>>>> d9d83e985 (support wInt4aFp8 moe for llm-compressor)
 ]
 
 
@@ -123,10 +113,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
 
-<<<<<<< HEAD
-        weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
-        input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
-=======
         if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
             match = re.search(r"(\d+)\.mlp", prefix)
             if not match:
@@ -154,7 +140,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             weight_quant = scheme_dict.get("weights")
             input_quant = scheme_dict.get("input_activations")
 
->>>>>>> d9d83e985 (support wInt4aFp8 moe for llm-compressor)
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
 
             logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
@@ -568,10 +553,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
 
-<<<<<<< HEAD
-        if _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
-            assert not moe_runner_config.no_combine, "unsupported"
-=======
         if self.use_cutlass_fused_experts_fp8:
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
@@ -605,34 +586,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and moe_runner_config.apply_router_weight_on_input
         ):
-<<<<<<< HEAD
->>>>>>> d9d83e985 (support wInt4aFp8 moe for llm-compressor)
-            topk_weights, topk_ids, _ = topk_output
-            if moe_runner_config.apply_router_weight_on_input:
-                assert (
-                    topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-                _, topk = topk_weights.shape
-                assert (
-                    topk == 1
-                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(
-                    topk_weights, dtype=torch.float32
-                )  # topk_weights must be FP32 (float32)
-            output = fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                activation=(
-                    ActivationType.Silu
-                    if moe_runner_config.activation == "silu"
-                    else ActivationType.Gelu
-                ),
-                quant_type=QuantType.per_Token,
-=======
             topk_weights, topk_ids, _ = dispatch_output.topk_output
             output = rocm_fused_experts_tkw1(
                 hidden_states=x,
@@ -645,7 +598,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 use_fp8_w8a8=True,
                 per_channel_quant=self.weight_quant.strategy
                 == QuantizationStrategy.CHANNEL,
->>>>>>> 6dec3690d (support deepep for wfp8afp8 wint4afp8)
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
@@ -1003,8 +955,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
         return StandardCombineInput(hidden_states=output)
-<<<<<<< HEAD
-=======
 
 
 class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
@@ -1668,4 +1618,3 @@ class CompressedTensorsWInt4AFp8MoEMethod(CompressedTensorsMoEMethod):
             )
         else:
             return hidden_states
->>>>>>> d9d83e985 (support wInt4aFp8 moe for llm-compressor)

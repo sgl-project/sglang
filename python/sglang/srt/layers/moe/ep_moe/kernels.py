@@ -188,7 +188,11 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
     for idx in range(topk):
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id != num_local_experts:
-            scale = 1.0 / tl.load(a1_scales_ptr)
+            if a1_scales_ptr is not None:
+                scale = 1.0 / tl.load(a1_scales_ptr)
+            else:
+                scale = 1.0
+
             dst_idx_int32 = tl.load(src2dst_ptr + idx)
             dst_idx = dst_idx_int32.to(tl.int64)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
