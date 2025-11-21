@@ -129,6 +129,13 @@ Latency: 25.109 s
 Output throughput: 5226.235 token/s
 ```
 
+To test long-context accuracy, run gsm8k with `--num-shots 20`. The results are very close to the 8 shots results:
+```
+Accuracy: 0.956
+Invalid: 0.000
+Latency: 29.545 s
+Output throughput: 4418.617 token/s
+```
 
 ### Accuracy Test with `gpqa-diamond`
 
@@ -142,3 +149,82 @@ The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in offi
 Repeat: 8, mean: 0.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
+
+### Accuracy Test with `aime 2025`
+
+Prepare the environment by installing NeMo-Skills in the docker or your own virtual environment:
+
+```
+pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
+```
+
+Modify the [`jinja chat_template`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/tokenizer_config.json#L34) by replacing
+
+```
+{% set thinking = false %}
+```
+with
+```
+{% set thinking = true %}
+```
+and save it to `chat_template_thinking.jinja`.
+
+Launch the SGLang server with the modified chat-template file:
+```
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention --chat-template chat_template_thinking.jinja
+```
+
+Run the following script to evaluate AIME 2025:
+```
+#! /bin/bash
+export NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1
+
+ns prepare_data aime25
+
+PORT=30000
+BACKEND=sglang
+MODEL="deepseek-ai/DeepSeek-V3.2-Exp"
+MODEL_NAME="dsv32-fp8"
+
+echo "Starting AIME25 evaluation with model $MODEL on port $PORT using backend $BACKEND..."
+ns eval \
+  --benchmarks=aime25:4 \
+  --server_type=$BACKEND \
+  --model=$MODEL \
+  --server_address=http://localhost:${PORT}/v1 \
+  --output_dir=nemo_skills_aime25_${MODEL_NAME}_output_${BACKEND}_$(date +%Y%m%d_%H%M%S) \
+  ++max_concurrent_requests=512 \
+  ++server.api_key=dummy \
+  ++inference.tokens_to_generate=64000
+```
+
+Test results:
+
+
+| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct     | no_answer |
+|--------------------|-------------|------------|-------------|-----------------------|-----------|
+| pass@1[avg-of-4]   | 30          | 14410      | 1758        | 85.83% ± 4.19%        | 0.00%     |
+| majority@4         | 30          | 14410      | 1758        | 90.00%                | 0.00%     |
+| pass@4             | 30          | 14410      | 1758        | 93.33%                | 0.00%     |
+
+Note that the result of problem#3 with id `aime25-2` is marked as false by nemo-skills  but is actually correct because nemo-skills fails to match predicted_answer `016` with expected_answer `16`. If we add 1/30 = 3.33% to the results, the pass@1[avg-of-4] result matches with reference which is 89.3.
+
+
+## DSA long sequence context parallel optimization(experimental)
+
+Accuracy benchmark on long context can be tested on GPQA-diamond dataset with long output tokens and thinking enabled:
+
+Example usage:
+```bash
+# Launch with EP + DP
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --max-running-requests 32
+```
+### Context-parallel Tips
+`CP_size` reuses `atten_tp_size`, which is equal to `TP_size` / `DP_size`.
+Some features are still not supported at present.
+- **Multi-batch prefill**: Currently, only single-request processing is supported during the prefill process.
+- **disaggregation**: P/D disaggregation.
+- **Cross-machine support**: - Currently only tested on a single machine (TP=8,EP=8).
+- **Other Args**: Currently only supports moe_dense_tp_size=1, kv_cache_dtype = "bf16", moe_a2a_backend = "deepep",
+- **DP_size**: `CP_size` reuses `atten_tp_size`, which is equal to `TP_size` / `DP_size`. For the cp function to work correctly, `TP_size` must be divisible by `DP_size`, and TP_size / DP_size > 1 (to ensure CP_size > 1).
+- **Detailed design reference**: https://github.com/sgl-project/sglang/pull/12065

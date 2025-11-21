@@ -3,8 +3,8 @@ import unittest
 from typing import Callable
 
 import torch
-from flashinfer import fp4_quantize
-from sgl_kernel import scaled_fp4_grouped_quant, scaled_fp4_quant
+from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
+from sgl_kernel import scaled_fp4_quant
 from torch.nn import functional as F
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -370,18 +370,18 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                         (num_experts,), dtype=torch.float32, device=hidden_states.device
                     )  # assume intermediate scale is 1.0
 
-                    w1_fp4, w1_blockscale = scaled_fp4_grouped_quant(
+                    w1_fp4, w1_blockscale = scaled_fp4_grouped_quantize(
                         w1,
-                        w1_global_scale,
                         torch.ones(num_experts, dtype=torch.int32, device=w1.device)
                         * 2
                         * inter_dim,
+                        w1_global_scale,
                     )
-                    w2_fp4, w2_blockscale = scaled_fp4_grouped_quant(
+                    w2_fp4, w2_blockscale = scaled_fp4_grouped_quantize(
                         w2,
-                        w2_global_scale,
                         torch.ones(num_experts, dtype=torch.int32, device=w2.device)
                         * hidden_dim,
+                        w2_global_scale,
                     )
 
                     w1_alpha = 1.0 / (input_global_scale * w1_global_scale)

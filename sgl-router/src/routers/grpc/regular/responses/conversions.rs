@@ -9,7 +9,7 @@
 
 use crate::{
     protocols::{
-        chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, UserMessageContent},
+        chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
         common::{
             FunctionCallResponse, JsonSchemaFormat, ResponseFormat, StreamOptions, ToolCall,
             UsageInfo,
@@ -38,7 +38,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     // 1. Add system message if instructions provided
     if let Some(instructions) = &req.instructions {
         messages.push(ChatMessage::System {
-            content: instructions.clone(),
+            content: MessageContent::Text(instructions.clone()),
             name: None,
         });
     }
@@ -48,7 +48,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
         ResponseInput::Text(text) => {
             // Simple text input → user message
             messages.push(ChatMessage::User {
-                content: UserMessageContent::Text(text.clone()),
+                content: MessageContent::Text(text.clone()),
                 name: None,
             });
         }
@@ -111,7 +111,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                         // Add tool result message if output exists
                         if let Some(output_text) = output {
                             messages.push(ChatMessage::Tool {
-                                content: output_text.clone(),
+                                content: MessageContent::Text(output_text.clone()),
                                 tool_call_id: id.clone(),
                             });
                         }
@@ -140,7 +140,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
                         // Note: The function name is looked up from prev_outputs in Harmony path
                         // For Chat path, we just use the call_id
                         messages.push(ChatMessage::Tool {
-                            content: output.clone(),
+                            content: MessageContent::Text(output.clone()),
                             tool_call_id: call_id.clone(),
                         });
                     }
@@ -213,23 +213,23 @@ fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
 fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
     match role {
         "user" => ChatMessage::User {
-            content: UserMessageContent::Text(text),
+            content: MessageContent::Text(text),
             name: None,
         },
         "assistant" => ChatMessage::Assistant {
-            content: Some(text),
+            content: Some(MessageContent::Text(text)),
             name: None,
             tool_calls: None,
             reasoning_content: None,
         },
         "system" => ChatMessage::System {
-            content: text,
+            content: MessageContent::Text(text),
             name: None,
         },
         _ => {
             // Unknown role, treat as user message
             ChatMessage::User {
-                content: UserMessageContent::Text(text),
+                content: MessageContent::Text(text),
                 name: None,
             }
         }
