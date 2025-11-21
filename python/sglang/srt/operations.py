@@ -92,13 +92,12 @@ class _StageExecutor:
 
         stage = self._stages[self._index]
 
-        if self._global_dp_buffer_len is not None:
-            set_dp_buffer_len(
-                self._global_dp_buffer_len,
-                self._local_dp_buffer_len,
-                self._is_dp_max_padding,
-                self._global_num_tokens,
-            )
+        set_dp_buffer_len(
+            self._global_dp_buffer_len,
+            self._local_dp_buffer_len,
+            self._is_dp_max_padding,
+            self._global_num_tokens,
+        )
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:

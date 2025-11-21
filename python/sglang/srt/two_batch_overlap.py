@@ -15,12 +15,8 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
-from sglang.srt.layers.moe import (
-    get_deepep_mode,
-    get_moe_a2a_backend,
-    get_tbo_token_distribution_threshold,
-    is_tbo_enabled,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend, is_tbo_enabled
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
@@ -90,14 +86,7 @@ def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
     if extend_lens is None:
         return False
 
-    vanilla_split_seq_index = _split_array_by_balanced_sum(extend_lens)
-    left_sum = sum(extend_lens[:vanilla_split_seq_index])
-    overall_sum = sum(extend_lens)
-    threshold = get_tbo_token_distribution_threshold()
-    assert threshold <= 0.5, f"{threshold=}"
-    return left_sum < overall_sum * threshold or left_sum > overall_sum * (
-        1 - threshold
-    )
+    return True
 
 
 def _split_extend_seqs(arr: Sequence[int]) -> int:
@@ -110,7 +99,8 @@ def _split_extend_seqs(arr: Sequence[int]) -> int:
 def _split_array_by_cum_less_than_half(arr: Sequence[int]) -> int:
     left_sum = 0
     overall_sum = sum(arr)
-    half_sum = overall_sum // 2
+    attn_tp_size = get_attention_tp_size()
+    half_sum = (overall_sum // 2 + attn_tp_size - 1) // attn_tp_size * attn_tp_size
     chosen_index = 0
 
     for i in range(len(arr)):
@@ -263,7 +253,13 @@ def compute_split_token_index(
     if forward_mode == ForwardMode.EXTEND:
         assert extend_seq_lens is not None
         if _is_two_chunk_split_enabled(extend_seq_lens):
-            return sum(extend_seq_lens) // 2
+            attn_tp_size = get_attention_tp_size()
+            half_sum = (
+                (sum(extend_seq_lens) // 2 + attn_tp_size - 1)
+                // attn_tp_size
+                * attn_tp_size
+            )
+            return half_sum
         return sum(extend_seq_lens[:split_seq_index])
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
