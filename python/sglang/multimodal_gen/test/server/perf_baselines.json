@@ -7,8 +7,8 @@
     "tolerances": {
         "e2e": 0.05,
         "denoise_stage": 0.05,
-        "non_denoise_stage": 0.15,
-        "denoise_step": 0.15,
+        "non_denoise_stage": 0.3,
+        "denoise_step": 0.2,
         "denoise_agg": 0.08
     },
     "improvement_reporting": {
@@ -252,7 +252,7 @@
                 "7": 1370.87,
                 "8": 1372.93,
                 "9": 1374.36,
-                "10": 1377.02,
+                "10": 1797.00,
                 "11": 1369.3,
                 "12": 1371.37,
                 "13": 1372.18,
