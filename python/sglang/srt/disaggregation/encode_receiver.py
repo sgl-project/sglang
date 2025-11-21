@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import random
-from typing import Dict
 
 import aiohttp
 import torch
@@ -65,13 +64,7 @@ class MMReceiver:
     def __init__(
         self, host, encode_urls, mm_transfer_backend, disaggregation_ib_device, dtype
     ):
-        context = zmq.asyncio.Context(2)
-        self.embedding_port = get_free_port()
-        self.recv_from_encoder = get_zmq_socket(
-            context, zmq.PULL, f"tcp://*:{self.embedding_port}", True
-        )
-        self.received_data: Dict[int, EmbeddingData] = dict()
-        self.embeddings_lock = asyncio.Lock()
+        self.context = zmq.asyncio.Context(20)
         self.mm_transfer_backend = mm_transfer_backend
         self.dtype = dtype
         self.encode_urls = encode_urls
@@ -85,7 +78,9 @@ class MMReceiver:
             )
             self.embeddings_buffer = dict()
 
-    async def encode(self, req_id, img_data, endpoint_encode, endpoint_send):
+    async def encode(
+        self, req_id, img_data, embedding_port, endpoint_encode, endpoint_send
+    ):
         if len(img_data) == 0:
             return
 
@@ -109,7 +104,7 @@ class MMReceiver:
                     "part_idx": cum_idx,
                     "req_id": req_id,
                     "prefill_host": self.host,
-                    "embedding_port": self.embedding_port,
+                    "embedding_port": embedding_port,
                 }
             )
             cum_idx += 1
@@ -175,13 +170,6 @@ class MMReceiver:
                 offset += embedding_size_list_sort[idx]
             await asyncio.gather(*metadata_tasks)
 
-    async def handle_embedding(self):
-        recv_obj = await self.recv_from_encoder.recv_pyobj()
-        if recv_obj.req_id not in self.received_data:
-            self.received_data[recv_obj.req_id] = recv_obj
-        else:
-            self.received_data[recv_obj.req_id].add(recv_obj)
-
     async def allocate_embedding_buffer(self, req_id, embedding_length, embedding_dim):
         embeddings = torch.zeros(
             (embedding_length, embedding_dim),
@@ -199,48 +187,52 @@ class MMReceiver:
             if len(self.encode_urls) == 0:
                 return None
             req_id = _generate_id()
+            embedding_port = get_free_port()
             if type(img_data) != list:
                 img_data = [img_data.url]
             else:
                 img_data = [img.url for img in img_data]
-            asyncio.create_task(self.encode(req_id, img_data, "encode", "send"))
+            asyncio.create_task(
+                self.encode(req_id, img_data, embedding_port, "encode", "send")
+            )
             return await asyncio.wait_for(
-                self._recv_mm_data(req_id, mm_processor, prompt), timeout=20
+                self._recv_mm_data(req_id, embedding_port, mm_processor, prompt),
+                timeout=20,
             )
         except asyncio.TimeoutError:
             logger.warning(f"Embedding recv timeout for request {req_id}")
-            if req_id in self.received_data:
-                del self.received_data[req_id]
             if hasattr(self, "embeddings_buffer") and req_id in self.embeddings_buffer:
                 del self.embeddings_buffer[req_id]
             return None
 
-    async def _recv_mm_data(self, req_id, mm_processor, prompt):
+    async def _recv_mm_data(self, req_id, embedding_port, mm_processor, prompt):
         # Bypass MMReceiver
         if req_id is None:
             return None
 
-        # E Disaggregation
         recv_embedding = None
-        img_grid_thw = None
 
-        # Use async lock to avoid race condition
-        async with self.embeddings_lock:
-            while (
-                req_id not in self.received_data or not self.received_data[req_id].ready
-            ):
-                await self.handle_embedding()
+        recv_socket = get_zmq_socket(
+            self.context, zmq.PULL, f"tcp://*:{embedding_port}", True
+        )
 
-            recv_embedding_data = self.received_data[req_id]
-            if self.mm_transfer_backend == "mooncake":
-                recv_embedding = self.embeddings_buffer[req_id]
-                self.embeddings_engine.deregister(recv_embedding.data_ptr())
-            elif self.mm_transfer_backend == "zmq":
-                recv_embedding = recv_embedding_data.get_embedding()
-            img_grid_thw = recv_embedding_data.get_img_grid()
-            del self.received_data[req_id]
-            if self.mm_transfer_backend == "mooncake":
-                del self.embeddings_buffer[req_id]
+        recv_embedding_data: EmbeddingData = None
+
+        while recv_embedding_data is None or not recv_embedding_data.ready:
+            recv_obj = await recv_socket.recv_pyobj()
+            if recv_embedding_data is None:
+                recv_embedding_data = recv_obj
+            else:
+                recv_embedding_data.add(recv_obj)
+
+        if self.mm_transfer_backend == "mooncake":
+            recv_embedding = self.embeddings_buffer[req_id]
+            del self.embeddings_buffer[req_id]
+            self.embeddings_engine.deregister(recv_embedding.data_ptr())
+        elif self.mm_transfer_backend == "zmq":
+            recv_embedding = recv_embedding_data.get_embedding()
+
+        img_grid_thw = recv_embedding_data.get_img_grid()
 
         mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
         return mm_inputs
