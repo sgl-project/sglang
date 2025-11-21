@@ -18,7 +18,7 @@ from urllib.request import urlopen
 
 from openai import OpenAI
 
-from sglang.multimodal_gen.runtime.utils import metrics
+from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -320,7 +320,7 @@ class PerformanceValidator:
         Uses the larger of relative tolerance or absolute tolerance to prevent
         flaky failures on very fast operations.
         """
-        upper_bound = metrics.calculate_upper_bound(
+        upper_bound = calculate_upper_bound(
             expected, tolerance, min_abs_tolerance_ms
         )
         assert actual <= upper_bound, (

@@ -16,22 +16,14 @@ def calculate_diff(base: float, new: float) -> Tuple[float, float]:
     return diff, percent
 
 
-def calculate_upper_bound(
-    baseline: float,
-    rel_tol: float,
-    min_abs_tol: float
-) -> float:
+def calculate_upper_bound(baseline: float, rel_tol: float, min_abs_tol: float) -> float:
     """Calculates the upper bound for performance regression check."""
     rel_limit = baseline * (1 + rel_tol)
     abs_limit = baseline + min_abs_tol
     return max(rel_limit, abs_limit)
 
 
-def calculate_lower_bound(
-    baseline: float,
-    rel_tol: float,
-    min_abs_tol: float
-) -> float:
+def calculate_lower_bound(baseline: float, rel_tol: float, min_abs_tol: float) -> float:
     """Calculates the lower bound for performance improvement check."""
     rel_lower = baseline * (1 - rel_tol)
     abs_lower = baseline - min_abs_tol
