@@ -230,7 +230,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertFalse(success_by_capacity_check)
 
-    def test_over_preempt_success_low_priority_values_first(self):
+    def test_preempt_success_low_priority_values_first_exact_once(self):
         params = [
             ("run1", 0, 50),
             ("run2", 1, 75),
@@ -260,12 +260,47 @@ class TestPrefillAdder(CustomTestCase):
         success = adder.preempt_to_schedule(new_req, mock_server_args)
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
-        self.assertIn(running_reqs[3], adder.preempt_list)
         self.assertEqual(
             adder.rem_total_token_offset, 375
         )  # 50 + 75 + 100 + 125 + 125 - 100 = 375
         running_batch.release_req.assert_called_once()
 
+
+    def test_preempt_success_low_priority_values_first_exact_twice(self):
+        params = [
+            ("run1", 0, 50),
+            ("run2", 1, 75),
+            ("run3", 2, 100),
+            ("run4", 2, 125),
+            ("run4", 2, 125),
+        ]
+        running_reqs = [
+            self.create_mock_req(rid, priority, max_new_tokens)
+            for rid, priority, max_new_tokens in params
+        ]
+        mock_server_args = self.create_server_args(
+            schedule_low_priority_values_first=True
+        )
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+
+        self.assertEqual(adder.rem_total_token_offset, 475)
+
+        self.mock_token_allocator.full_available_size.return_value = (
+            475  # full occupation of GRam
+        )
+        self.mock_token_allocator.available_size.return_value = 475
+
+        new_req = self.create_mock_req("new1", priority=1, max_new_tokens=200)
+
+        success = adder.preempt_to_schedule(new_req, mock_server_args)
+        self.assertTrue(success)
+        self.assertIn(running_reqs[2], adder.preempt_list)
+        self.assertIn(running_reqs[3], adder.preempt_list)
+        self.assertEqual(
+            adder.rem_total_token_offset, 375
+        )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
+        self.assertEqual(running_batch.release_req.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()
