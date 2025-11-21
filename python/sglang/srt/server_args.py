@@ -471,6 +471,9 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # For encoder dp
+    mm_enable_dp_encoder: bool = False
+
     def get_attention_backends(server_args):
         prefill_attention_backend_str = (
             server_args.prefill_attention_backend
@@ -2930,6 +2933,12 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action=DeprecatedAction,
             help="NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead.",
+        )
+        parser.add_argument(
+            "--mm-enable-dp-encoder",
+            action="store_true",
+            default=ServerArgs.mm_enable_dp_encoder,
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         )
 
         # Configuration file support

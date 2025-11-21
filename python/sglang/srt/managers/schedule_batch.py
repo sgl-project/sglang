@@ -116,6 +116,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "nsa_prefill",
     "nsa_decode",
     "multi_item_scoring_delimiter",
+    "mm_enable_dp_encoder",
 ]
 
 # Put some global args for easy access
