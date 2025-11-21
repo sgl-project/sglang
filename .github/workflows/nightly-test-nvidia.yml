@@ -31,7 +31,7 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test
-          python3 run_suite.py --suite nightly-1-gpu --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-1-gpu --continue-on-error
 
   # General tests - 4 GPU H100
   nightly-test-general-4-gpu-h100:
@@ -49,7 +49,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test
-          python3 run_suite.py --suite nightly-4-gpu --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-4-gpu --continue-on-error
 
   # General tests - 8 GPU H200
   nightly-test-general-8-gpu-h200:
@@ -71,7 +71,7 @@ jobs:
           GPU_CONFIG: "8-gpu-h200"
         run: |
           cd test
-          python3 run_suite.py --suite nightly-8-gpu-h200 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --continue-on-error
 
   # General tests - 8 GPU H20
   nightly-test-general-8-gpu-h20:
@@ -93,7 +93,7 @@ jobs:
           GPU_CONFIG: "8-gpu-h20"
         run: |
           cd test
-          python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h20 --continue-on-error
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
@@ -209,7 +209,7 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test
-          python3 run_suite.py --suite nightly-4-gpu-b200 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --continue-on-error
 
   # B200 Performance tests - 8 GPU
   nightly-test-perf-8-gpu-b200:
