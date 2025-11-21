@@ -52,12 +52,7 @@ if _is_npu:
     import torch_npu
 
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        awq_marlin_moe_repack,
-        awq_marlin_repack,
-        fused_marlin_moe,
-    )
+    from sgl_kernel import awq_dequantize, awq_marlin_moe_repack, awq_marlin_repack
 
 
 elif _is_hip:
@@ -835,6 +830,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
