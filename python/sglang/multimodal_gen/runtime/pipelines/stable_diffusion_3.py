@@ -7,8 +7,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
     DenoisingStage,
-    ImageEncodingStage,
-    ImageVAEEncodingStage,
     InputValidationStage,
     LatentPreparationStage,
     TextEncodingStage,
