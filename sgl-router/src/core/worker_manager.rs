@@ -418,7 +418,7 @@ impl LoadMonitor {
             interval_timer.tick().await;
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
 
-            if power_of_two_policies.is_empty() 
+            if power_of_two_policies.is_empty()
                 && !policy_registry.is_dp_minimum_tokens_scheduler_enabled()
             {
                 debug!("No PowerOfTwo policies found, skipping load fetch");
