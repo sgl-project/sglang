@@ -106,17 +106,43 @@ class TestDeepseek_w8a8(CustomTestCase):
         else:
             env = None
 
+        out_log_file = open("./out_log.txt", "w+", encoding="utf-8")
+        err_log_file = open("./err_log.txt", "w+", encoding="utf-8")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=3000,
             other_args=other_args,
             env=env, 
+            return_stdout_stderr=(out_log_file, err_log_file),
         )
+        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
+        self.assertEqual(response.status_code, 200)
+
+        response = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Paris", response.text)
+        out_log_file.seek(0)
+        content = out_log_file.read()
+        print("=========================================req response================================================")
+        print(content)
 
     @classmethod
     def tearDownClass(cls):
+        content = out_log_file.read()
+        print("=========================================sgl log================================================")
+        print(content)
         kill_process_tree(cls.process.pid)
+        out_log_file.close()
+        err_log_file.close()
+        os.remove("./out_log.txt")
+        os.remove("./err_log.txt")
 
     def test_k8s(self):
         run_command("rm -rf ./benchmark")
@@ -160,6 +186,9 @@ class TestDeepseek_w8a8(CustomTestCase):
         metrics = run_command(
             "ais_bench --models vllm_api_stream_chat --datasets gsm8k_gen_0_shot_cot_str_perf --debug --summarizer default_perf --mode perf | tee ./gsm8k_deepseek_log.txt"
         )
+        content = out_log_file.read()
+        print("=========================================sgl log================================================")
+        print(content)
         print("metrics is " + str(metrics))
         tpot = run_command(
             "cat ./gsm8k_deepseek_log.txt | grep TPOT | awk '{print $6}'"
