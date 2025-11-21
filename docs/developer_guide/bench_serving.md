@@ -352,4 +352,4 @@ python3 -m sglang.bench_serving \
 ### Notes
 
 - The script raises the file descriptor soft limit (`RLIMIT_NOFILE`) to help with many concurrent connections.
-- For sglang, `/get_server_info` is queried post-run to report speculative decoding accept length when available.
+- For sglang, `/server_info` is queried post-run to report speculative decoding accept length when available.
