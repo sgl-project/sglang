@@ -5,7 +5,7 @@ Expert Parallelism (EP) is a vital parallelization strategy in SGLang for high-p
 1. MoE models' vast expert weights exceed single GPU memory, and routing tokens across devices incurs complex All-to-All communication overhead. EP partitions expert weights across GPUs to eliminate memory bottlenecks. SGLang integrates [DeepEP](https://github.com/deepseek-ai/DeepEP), a specialized communication library, with Two-Batch Overlap (TBO) to aggressively overlap All-to-All communication latency with expert computation, minimizing overhead and boosting throughput.
 2. Real-world inference traffic often leads to uneven expert usage. SGLang's Expert Parallelism Load Balancer ([EPLB](https://github.com/deepseek-ai/eplb)) dynamically monitors expert usage, reassigns experts to balance workload, and maximizes GPU utilization for consistent high performance.
 
-##  Synergy with Prefill-Decode (PD) Disaggregation
+## Synergy with Prefill-Decode (PD) Disaggregation
 
 SGLang synergizes Expert Parallelism with Prefill-Decode Disaggregation by applying tailored parallelization strategies:
 
@@ -20,19 +20,19 @@ To enable Expert Parallelism in SGLang, use the relevant flags in your server la
 
 ### Example
 
-The following command deploys an MoE model across 8 GPUs, enabling EP, DP Attention, and the EPLB for dynamic load balancing:
+The following commands demonstrate deploying an MoE model across 8 GPUs with Expert Parallelism:
+
+**Note:** These examples are demonstrated on a single H200 GPU node.
 
 #### 1. deepseek-ai/DeepSeek-V3
 
 ```bash
 # Assuming an 8-GPU node configuration
-python3 -m sglang.launch_server \
+ python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V3 \
-  --ep-size 8 \ # Sets the Expert Parallelism size to 8 GPUs
-  --enable-dp-attention \ # Activates Data Parallelism for Attention layers
-  --enable-eplb \ # Enables the Expert Parallelism Load Balancer
-  --expert-distribution-recorder-mode stat \ # Configures EPLB to use aggregated statistics
-  --trust-remote-code
+  --ep-size 8 \ # Expert Parallelism size - number of GPUs for expert weights.
+  --tp-size 8 \ # Tensor Parallelism size  - often aligned with EP for MoE performance.
+  --trust-remote-code # Required for loading custom code models from Hugging Face Hub.
 ```
 
 #### 2. moonshotai/Kimi-K2-Thinking
@@ -41,11 +41,9 @@ python3 -m sglang.launch_server \
 # Assuming an 8-GPU node configuration
 python3 -m sglang.launch_server \
   --model-path moonshotai/Kimi-K2-Thinking \
-  --ep-size 8 \ # Sets the Expert Parallelism size to 8 GPUs
-  --enable-dp-attention \ # Activates Data Parallelism for Attention layers
-  --enable-eplb \ # Enables the Expert Parallelism Load Balancer
-  --expert-distribution-recorder-mode stat \ # Configures EPLB to use aggregated statistics
-  --trust-remote-code
+  --ep-size 8 \ # Expert Parallelism size - number of GPUs for expert weights.
+  --tp-size 8 \ # Tensor Parallelism size - often aligned with EP for MoE performance.
+  --trust-remote-code # Required for loading custom code models from Hugging Face Hub.
 ```
 
 #### 3. Qwen/Qwen3-VL-235B-A22B-Instruct
@@ -54,12 +52,8 @@ python3 -m sglang.launch_server \
 # Assuming an 8-GPU node configuration
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3-VL-235B-A22B-Instruct \
-  --ep-size 8 \ # Sets the Expert Parallelism size to 8 GPUs
-  --enable-dp-attention \ # Activates Data Parallelism for Attention layers
-  --enable-eplb \ # Enables the Expert Parallelism Load Balancer
-  --expert-distribution-recorder-mode stat \ # Configures EPLB to use aggregated statistics
-  --trust-remote-code
+  --ep-size 8 \ # Expert Parallelism size - number of GPUs for expert weights.
+  --tp-size 8 \ # Tensor Parallelism size - often aligned with EP for MoE performance.
+  --trust-remote-code # Required for loading custom code models from Hugging Face Hub.
 ```
-
-**Note:** These examples are demonstrated on a single H200 GPU node.
 
