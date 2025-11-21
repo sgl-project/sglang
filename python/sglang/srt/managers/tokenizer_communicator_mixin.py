@@ -402,6 +402,7 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             if self.is_pause:
                 result = (await self.update_weights_from_distributed_communicator(obj))[
@@ -462,6 +463,7 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             if self.is_pause:
                 result = (await self.update_weights_from_tensor_communicator(obj))[0]

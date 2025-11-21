@@ -2528,7 +2528,7 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
             self.last_batch = None
-            self.cur_batch = None  # TODO: to confirm
+            self.cur_batch = None
 
         if recv_req.mode == "retract":
             self.running_batch.filter_batch()
