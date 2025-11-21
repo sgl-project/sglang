@@ -13,7 +13,7 @@
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-"""sgl-diffusion distributed state.
+"""sglang-diffusion distributed state.
 
 It takes over the control of the distributed environment from PyTorch.
 The typical workflow is:

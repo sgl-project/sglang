@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 """
-DiffGenerator module for sgl-diffusion.
+DiffGenerator module for sglang-diffusion.
 
 This module provides a consolidated interface for generating videos using
 diffusion models.
@@ -334,7 +334,11 @@ class DiffGenerator:
                         "prompts": req.prompt,
                         "size": (req.height, req.width, req.num_frames),
                         "generation_time": gen_time,
-                        "logging_info": output_batch.logging_info,
+                        "timings": (
+                            output_batch.timings.to_dict()
+                            if output_batch.timings
+                            else {}
+                        ),
                         "trajectory": output_batch.trajectory_latents,
                         "trajectory_timesteps": output_batch.trajectory_timesteps,
                         "trajectory_decoded": output_batch.trajectory_decoded,
