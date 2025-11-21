@@ -82,6 +82,7 @@ def get_model_config(
             not in [
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4vMoeForConditionalGeneration",
                 "MistralLarge3ForCausalLM",
             ]
             else 1
