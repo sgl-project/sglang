@@ -1,5 +1,8 @@
+import asyncio
 import logging
-from typing import Optional
+import multiprocessing as mp
+import traceback
+from typing import List, Optional
 
 import aiohttp
 import numpy as np
@@ -29,7 +32,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
+from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +62,18 @@ def _get_image_grid_dim(images_input):
     )
 
 
-class ImageEncoder:
-    def __init__(self, server_args: ServerArgs):
+class MMEncoder:
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        schedule_path=None,
+        dist_init_method=None,
+        rank: int = 0,
+    ):
+        logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
+        self.rank = rank
 
         self.image_processor = AutoImageProcessor.from_pretrained(
             server_args.model_path,
@@ -83,39 +94,55 @@ class ImageEncoder:
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
 
-        port_args = PortArgs.init_new(server_args)
-        if server_args.dist_init_addr:
-            dist_init_method = f"tcp://{server_args.dist_init_addr}"
-        else:
-            dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
+        self.device = server_args.device
+        self.gpu_id = server_args.base_gpu_id + rank
+
+        self.device_config = DeviceConfig(
+            device=self.device,
+            gpu_id=self.gpu_id,
+        )
+
+        torch.get_device_module(self.device).set_device(self.gpu_id)
 
         init_distributed_environment(
-            world_size=1, rank=0, distributed_init_method=dist_init_method
+            world_size=server_args.tp_size,
+            rank=rank,
+            distributed_init_method=dist_init_method,
+            local_rank=rank,
         )
-        initialize_model_parallel()
+        initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
         initialize_dp_attention(server_args, self.model_config)
 
         self.model = get_model(
             model_config=self.model_config,
             load_config=self.load_config,
-            device_config=DeviceConfig(),
+            device_config=self.device_config,
         )
 
-        logger.info(f"Using transfer backend: {self.server_args.mm_transfer_backend}")
+        self.context = zmq.asyncio.Context(2)
 
-        if self.server_args.mm_transfer_backend == "mooncake":
-            self.local_ip = get_local_ip_auto()
-
-            self.engine = MooncakeTransferEngine(
-                hostname=self.local_ip,
-                gpu_id=None,
-                ib_device=server_args.disaggregation_ib_device,
+        if schedule_path is not None:
+            self.schedule_socket = get_zmq_socket(
+                self.context, zmq.PULL, schedule_path, True
             )
 
-        self.context = zmq.asyncio.Context(2)
-        self.send_to_prefill_sockets = dict()
+        if self.rank == 0:
+            logger.info(
+                f"Using transfer backend: {self.server_args.mm_transfer_backend}"
+            )
 
-        self.embedding_to_send = dict()
+            if self.server_args.mm_transfer_backend == "mooncake":
+                self.local_ip = get_local_ip_auto()
+
+                self.engine = MooncakeTransferEngine(
+                    hostname=self.local_ip,
+                    gpu_id=None,
+                    ib_device=server_args.disaggregation_ib_device,
+                )
+
+            self.embedding_to_send = dict()
+
+        logger.info(f"rank {rank} init finish ")
 
     async def mm_encode(self, mm_items) -> torch.Tensor:
         images = load_images(mm_items)
@@ -168,14 +195,15 @@ class ImageEncoder:
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
         image_grid_dim, mm_embedding = await self.mm_encode(mm_items)
-        mm_data = EmbeddingData(
-            req_id,
-            num_parts,
-            part_idx,
-            image_grid_dim,
-            mm_embedding,
-        )
-        self.embedding_to_send[mm_data.req_id] = mm_data
+        if self.rank == 0:
+            mm_data = EmbeddingData(
+                req_id,
+                num_parts,
+                part_idx,
+                image_grid_dim,
+                mm_embedding,
+            )
+            self.embedding_to_send[mm_data.req_id] = mm_data
         return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
     async def send(
@@ -205,17 +233,63 @@ class ImageEncoder:
 
 
 app = FastAPI()
-encoder: Optional[ImageEncoder] = None
+encoder: Optional[MMEncoder] = None
+send_sockets: List[zmq.Socket] = []
+
+
+async def run_encoder(
+    server_args: ServerArgs, schedule_path, dist_init_method, rank: int
+):
+    encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
+    while True:
+        request = await encoder.schedule_socket.recv_pyobj()
+        await encoder.encode(
+            mm_items=request["mm_items"],
+            req_id=request["req_id"],
+            num_parts=request["num_parts"],
+            part_idx=request["part_idx"],
+        )
+
+
+def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+    try:
+        asyncio.run(run_encoder(server_args, schedule_path, dist_init_method, rank))
+    except KeyboardInterrupt:
+        logger.info(f"Exit rank {rank}")
+    except Exception:
+        traceback.print_exc()
 
 
 def launch_server(server_args: ServerArgs):
     global encoder
-    encoder = ImageEncoder(server_args)
+    ctx = mp.get_context("spawn")
+    zmq_ctx = zmq.Context(10)
+    ipc_path_prefix = random_uuid()
+    port_args = PortArgs.init_new(server_args)
+    if server_args.dist_init_addr:
+        dist_init_method = f"tcp://{server_args.dist_init_addr}"
+    else:
+        dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
+    for rank in range(1, server_args.tp_size):
+        schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
+        send_sockets.append(
+            get_zmq_socket(zmq_ctx, zmq.PUSH, schedule_path, bind=False)
+        )
+        ctx.Process(
+            target=launch_encoder,
+            args=(server_args, schedule_path, dist_init_method, rank),
+            daemon=True,
+        ).start()
+    encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
 @app.post("/encode")
 async def handle_encode_request(request: dict):
+    # broadcast request
+    for socket in send_sockets:
+        socket.send_pyobj(request)
+
     nbytes, embedding_len, embedding_dim = await encoder.encode(
         mm_items=request["mm_items"],
         req_id=request["req_id"],
@@ -252,8 +326,3 @@ async def handle_send_request(request: dict):
         buffer_address=request["buffer_address"],
     )
     return ORJSONResponse(content=None)
-
-
-@app.get("/health_check")
-async def handle_health_check_request():
-    return ORJSONResponse(content={"is_alive": True})
