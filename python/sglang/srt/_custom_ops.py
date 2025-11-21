@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
-IS_CUSTOM_AR_AVAILABLE = _is_cuda and _is_hip
+IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip
 IS_QUICK_AR_AVAILABLE = _is_hip
 # TODO(zyksir): mscclpp is untested on AMD and therefore disabled.
 IS_MSCCLPP_AR_AVAILABLE = _is_cuda
