@@ -2714,7 +2714,10 @@ class BumpAllocator:
 def log_info_on_rank0(logger, msg):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-    if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+    try:
+        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+            logger.info(msg)
+    except:
         logger.info(msg)
 
 
@@ -3615,6 +3618,12 @@ def cached_triton_kernel(key_fn=None):
     """
 
     def decorator(fn):
+        # Auto-enable the custom kernel cache for CUDA, where it is
+        # known to be compatible.
+        if is_cuda() and not envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.is_set():
+            logger.debug("Detected platform CUDA, using custom triton kernel cache.")
+            return CachedKernel(fn, key_fn)
+
         if envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
             logger.debug(
                 f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = True. Using custom triton kernel cache."
@@ -3646,3 +3655,13 @@ def get_current_device_stream_fast():
     if cached_device_index == -1:
         cached_device_index = torch.get_device_module().current_device()
     return torch.get_device_module().current_stream(cached_device_index)
+
+
+def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
+    if strict:
+        raise ValueError(message)
+    else:
+        count = getattr(obj, counter_name, 0)
+        if count % log_interval == 0:
+            logger.warning(message)
+        setattr(obj, counter_name, count + 1)

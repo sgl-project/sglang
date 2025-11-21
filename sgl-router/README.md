@@ -70,20 +70,23 @@ pip install maturin
 
 # Fast development mode (debug build, no wheel, instant)
 # Uses system OpenSSL (requires libssl-dev/openssl-devel)
+cd bindings/python
 maturin develop
 
 # Production build (optimized, creates wheel)
 # Uses vendored OpenSSL (cross-platform compatibility)
-maturin build --release --features vendored-openssl
+cd bindings/python
+maturin build --release --out dist --features vendored-openssl
 pip install --force-reinstall dist/*.whl
 
 # Development build with system OpenSSL (faster)
 # Requires: apt install libssl-dev pkg-config (Ubuntu/Debian)
 #       or: yum install openssl-devel (RHEL/CentOS)
-maturin build --release
+cd bindings/python
+maturin build --release --out dist
 pip install --force-reinstall dist/*.whl
 ```
-> **Note:** Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
+> **Note:** Python bindings are located in `bindings/python/` with their own Cargo.toml. Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
 ## Quick Start
 ### Regular HTTP Routing
@@ -574,12 +577,68 @@ cargo build
 cargo test
 
 # Fast Python development (rebuilds and installs in debug mode)
-maturin develop
+cd bindings/python && maturin develop
 
 # Run Python tests
-pytest
+cd ../..  # Back to sgl-router root
+pytest py_test/
 ```
-For production builds, use `maturin build --release` to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+
+---
+
+## Release Management
+
+### Creating Gateway Releases
+
+Create releases for the Gateway/Router component with filtered commits:
+
+```bash
+# Using make
+make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0
+
+# Save to file
+make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 OUTPUT=RELEASE_NOTES.md
+
+# Create draft release (requires gh CLI, DEFAULT behavior)
+make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1
+
+# Publish release immediately (requires gh CLI)
+make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1 DRAFT=0
+```
+
+**Tag Naming**: Use `gateway-*` or `router-*` prefixes to avoid triggering unrelated CI workflows.
+
+### Release Workflow
+
+1. **Create and push tag**:
+   ```bash
+   git tag -a gateway-v1.0.0 <commit-hash> -m "Gateway release v1.0.0"
+   git push origin gateway-v1.0.0
+   ```
+
+2. **Generate release notes** (automatically filters gateway-related commits):
+   ```bash
+   make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0
+   ```
+
+3. **Create GitHub release**:
+   ```bash
+   # Create draft (DEFAULT - review before publishing)
+   make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1
+
+   # Or publish immediately (skip draft)
+   make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1 DRAFT=0
+   ```
+
+### Filtered Paths
+
+Release notes only include commits touching:
+- `sgl-router/` - Router codebase
+- `python/sglang/srt/grpc/` - gRPC protocol
+- `python/sglang/srt/entrypoints/grpc_server.py` - gRPC server
+
+The script automatically extracts author attribution, PR links, and identifies new contributors.
 
 ---
 
