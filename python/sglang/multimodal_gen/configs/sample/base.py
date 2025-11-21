@@ -405,9 +405,7 @@ class SamplingParams:
         """
         Merges parameters from a user-provided SamplingParams object.
 
-        This method updates the current object with values from `user_params`,
-        but skips any fields that are explicitly defined in the current object's
-        subclass. This is to preserve model-specific optimal parameters.
+        This method updates the current object with values from `user_params`.
         It also skips fields that the user has not changed from the default
         in `user_params`.
         """
