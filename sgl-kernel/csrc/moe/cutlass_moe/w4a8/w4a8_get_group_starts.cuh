@@ -34,6 +34,40 @@ __global__ void int4_fp8_get_group_gemm_starts(
   b_scales_offsets[expert_id] = b_scales_base_as_int + (per_out_ch ? expert_id * n * k / 128 : expert_id);
 }
 
+template <typename ElementA, typename ElementB, typename ElementC, typename ElementAccumulator>
+__global__ void int4_fp8_get_group_gemm_starts_3d(
+    ElementA** a_offsets,
+    ElementB** b_offsets,
+    ElementC** out_offsets,
+    ElementAccumulator** a_scales_offsets,
+    cutlass::bfloat16_t** b_scales_offsets,
+    ElementA* a_base_as_int,
+    ElementB* b_base_as_int,
+    ElementC* out_base_as_int,
+    ElementAccumulator* a_scales_base_as_int,
+    cutlass::bfloat16_t* b_scales_base_as_int,
+    int64_t n,
+    int64_t m,
+    int64_t k,
+    bool per_act_token,
+    bool per_out_ch,
+    int num_experts) {
+  int expert_id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (expert_id >= num_experts) return;
+
+  int64_t a_offset = expert_id * m * k;
+  int64_t b_offset = expert_id * k * n / 2;
+  int64_t out_offset = expert_id * m * n;
+  int64_t a_scales_offset = 0;
+  int64_t b_scales_offset = per_out_ch ? expert_id * n * 4 * k / 512 : expert_id;
+
+  a_offsets[expert_id] = a_base_as_int + a_offset;
+  b_offsets[expert_id] = b_base_as_int + b_offset;
+  out_offsets[expert_id] = out_base_as_int + out_offset;
+  a_scales_offsets[expert_id] = a_scales_base_as_int + a_scales_offset;
+  b_scales_offsets[expert_id] = b_scales_base_as_int + b_scales_offset;
+}
+
 #define __CALL_W4A8_GET_STARTS_KERNEL(TENSOR_C_TYPE, C_TYPE)                              \
   else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                        \
     int4_fp8_get_group_gemm_starts<cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float> \
@@ -53,6 +87,28 @@ __global__ void int4_fp8_get_group_gemm_starts(
             a_tensors.size(1),                                                            \
             per_act_token,                                                                \
             per_out_ch);                                                                  \
+  }
+
+#define __CALL_W4A8_GET_STARTS_KERNEL_3D(TENSOR_C_TYPE, C_TYPE)                              \
+  else if (out_tensors.dtype() == TENSOR_C_TYPE) {                                           \
+    int4_fp8_get_group_gemm_starts_3d<cutlass::float_e4m3_t, cutlass::int8_t, C_TYPE, float> \
+        <<<1, num_experts, 0, stream>>>(                                                     \
+            static_cast<cutlass::float_e4m3_t**>(a_ptrs.data_ptr()),                         \
+            static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),                               \
+            static_cast<C_TYPE**>(out_ptrs.data_ptr()),                                      \
+            static_cast<float**>(a_scales_ptrs.data_ptr()),                                  \
+            static_cast<cutlass::bfloat16_t**>(b_scales_ptrs.data_ptr()),                    \
+            static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),                       \
+            static_cast<cutlass::int8_t*>(b_tensors.data_ptr()),                             \
+            static_cast<C_TYPE*>(out_tensors.data_ptr()),                                    \
+            static_cast<float*>(a_scales.data_ptr()),                                        \
+            static_cast<cutlass::bfloat16_t*>(b_scales.data_ptr()),                          \
+            out_tensors.size(2),                                                             \
+            a_tensors.size(1),                                                               \
+            a_tensors.size(2),                                                               \
+            per_act_token,                                                                   \
+            per_out_ch,                                                                      \
+            num_experts);                                                                    \
   }
 
 namespace {
@@ -80,12 +136,22 @@ void run_int4_fp8_get_group_gemm_starts(
 
   auto stream = at::cuda::getCurrentCUDAStream(expert_offsets.device().index());
 
-  if (false) {
-  }
-  __CALL_W4A8_GET_STARTS_KERNEL(torch::kBFloat16, cutlass::bfloat16_t)
-  __CALL_W4A8_GET_STARTS_KERNEL(torch::kFloat16, half)
-  else {
-    TORCH_CHECK(false, "Invalid output type (must be float16 or bfloat16)");
+  if (a_tensors.dim() == 3) {
+    if (false) {
+    }
+    __CALL_W4A8_GET_STARTS_KERNEL_3D(torch::kBFloat16, cutlass::bfloat16_t)
+    __CALL_W4A8_GET_STARTS_KERNEL_3D(torch::kFloat16, half)
+    else {
+      TORCH_CHECK(false, "Invalid output type (must be float16 or bfloat16)");
+    }
+  } else {
+    if (false) {
+    }
+    __CALL_W4A8_GET_STARTS_KERNEL(torch::kBFloat16, cutlass::bfloat16_t)
+    __CALL_W4A8_GET_STARTS_KERNEL(torch::kFloat16, half)
+    else {
+      TORCH_CHECK(false, "Invalid output type (must be float16 or bfloat16)");
+    }
   }
 }
 

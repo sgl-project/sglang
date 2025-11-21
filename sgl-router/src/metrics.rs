@@ -530,6 +530,39 @@ impl RouterMetrics {
         )
         .increment(1);
     }
+
+    pub fn set_job_queue_depth(depth: usize) {
+        gauge!("sgl_router_job_queue_depth").set(depth as f64);
+    }
+
+    pub fn record_job_duration(job_type: &str, duration: Duration) {
+        histogram!("sgl_router_job_duration_seconds",
+            "job_type" => job_type.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_job_success(job_type: &str) {
+        counter!("sgl_router_job_success_total",
+            "job_type" => job_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_job_failure(job_type: &str) {
+        counter!("sgl_router_job_failure_total",
+            "job_type" => job_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_job_queue_full() {
+        counter!("sgl_router_job_queue_full_total").increment(1);
+    }
+
+    pub fn record_job_shutdown_rejected() {
+        counter!("sgl_router_job_shutdown_rejected_total").increment(1);
+    }
 }
 
 impl TokenizerMetrics {

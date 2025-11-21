@@ -23,7 +23,7 @@ use crate::{
     metrics::RouterMetrics,
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
@@ -127,7 +127,7 @@ impl PDRouter {
         }
     }
 
-    pub async fn new(ctx: &Arc<crate::server::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -1099,10 +1099,10 @@ impl RouterTrait for PDRouter {
         let request_text = if self.policies_need_request_text() {
             body.messages.first().and_then(|msg| match msg {
                 ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(_) => None,
+                    MessageContent::Text(text) => Some(text.clone()),
+                    MessageContent::Parts(_) => None,
                 },
-                ChatMessage::System { content, .. } => Some(content.clone()),
+                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
                 _ => None,
             })
         } else {

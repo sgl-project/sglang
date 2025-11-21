@@ -15,6 +15,7 @@
 import multiprocessing as mp
 import random
 import unittest
+from typing import Optional
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -69,6 +70,7 @@ class TestEmbeddingModels(CustomTestCase):
         tp_size,
         torch_dtype,
         prefill_tolerance,
+        matryoshka_dim: Optional[int] = None,
     ) -> None:
         truncated_prompts = self._truncate_prompts(prompts, model_path)
 
@@ -76,6 +78,7 @@ class TestEmbeddingModels(CustomTestCase):
             model_path,
             torch_dtype=torch_dtype,
             model_type="embedding",
+            matryoshka_dim=matryoshka_dim,
         ) as hf_runner:
             hf_outputs = hf_runner.forward(truncated_prompts)
 
@@ -86,8 +89,13 @@ class TestEmbeddingModels(CustomTestCase):
             torch_dtype=torch_dtype,
             model_type="embedding",
             attention_backend=attention_backend,
+            json_model_override_args=(
+                {"matryoshka_dimensions": [matryoshka_dim]} if matryoshka_dim else None
+            ),
         ) as srt_runner:
-            srt_outputs = srt_runner.forward(truncated_prompts)
+            srt_outputs = srt_runner.forward(
+                truncated_prompts, dimensions=matryoshka_dim
+            )
 
         for i in range(len(prompts)):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
@@ -111,6 +119,25 @@ class TestEmbeddingModels(CustomTestCase):
             for torch_dtype in TORCH_DTYPES:
                 self.assert_close_prefill_logits(
                     DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
+                )
+
+    def test_matryoshka_embedding(self):
+        models_to_test = [
+            model
+            for model in MODELS
+            if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == model[0]
+        ]
+        assert len(models_to_test) == 1
+
+        for model, tp_size, prefill_tolerance in models_to_test:
+            for torch_dtype in TORCH_DTYPES:
+                self.assert_close_prefill_logits(
+                    DEFAULT_PROMPTS,
+                    model,
+                    tp_size,
+                    torch_dtype,
+                    prefill_tolerance,
+                    matryoshka_dim=128,
                 )
 
 

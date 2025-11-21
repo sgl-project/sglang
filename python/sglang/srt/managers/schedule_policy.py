@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -363,6 +364,7 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -565,11 +567,17 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # TODO support cp with multiple requests
+        # Enabling context parallelism currently presents precision issues;
+        # therefore, the prefill-batch setting is temporarily set to 1.
+        if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
+            return AddReqResult.OTHER
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size

@@ -179,6 +179,9 @@ benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
 
+# Torch Compile logs
+tl_out/
+
 # Plots
 *.png
 *.pdf
@@ -238,3 +241,6 @@ compile_commands.json
 Cargo.lock
 
 lmms-eval
+
+**/.claude/
+**/.serena/

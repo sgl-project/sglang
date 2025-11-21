@@ -43,7 +43,6 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
 ## Installation
-
 ### Prerequisites
 - **Rust and Cargo**
   ```bash
@@ -67,17 +66,29 @@ cargo build --release
 
 ### Python Package
 ```bash
-pip install setuptools-rust wheel build
-python -m build
-pip install dist/*.whl
+pip install maturin
 
-# Rebuild & reinstall in one step during development
-python -m build && pip install --force-reinstall dist/*.whl
+# Fast development mode (debug build, no wheel, instant)
+# Uses system OpenSSL (requires libssl-dev/openssl-devel)
+cd bindings/python
+maturin develop
+
+# Production build (optimized, creates wheel)
+# Uses vendored OpenSSL (cross-platform compatibility)
+cd bindings/python
+maturin build --release --out dist --features vendored-openssl
+pip install --force-reinstall dist/*.whl
+
+# Development build with system OpenSSL (faster)
+# Requires: apt install libssl-dev pkg-config (Ubuntu/Debian)
+#       or: yum install openssl-devel (RHEL/CentOS)
+cd bindings/python
+maturin build --release --out dist
+pip install --force-reinstall dist/*.whl
 ```
-> **Note:** Editable installs (`pip install -e .`) are currently not supported; prefer wheel builds for development.
+> **Note:** Python bindings are located in `bindings/python/` with their own Cargo.toml. Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
 ## Quick Start
-
 ### Regular HTTP Routing
 - **Rust binary**
   ```bash
@@ -206,6 +217,121 @@ python3 -m sglang_router.launch_router \
 - Provide exactly one `--worker-urls` entry per router instance.
 - The Rust binary supports the same flags (`./target/release/sglang-router --backend openai ...`).
 
+### MCP Integration
+The SGL Model Gateway provides native Model Context Protocol (MCP) client integration, enabling tool calling across STDIO, SSE, and Streamable transports. MCP servers are configured via a YAML configuration file and registered at startup through the workflow engine.
+
+#### Basic Usage
+```bash
+# Rust binary
+./target/release/sglang-router \
+  --mcp-config-path /path/to/mcp-config.yaml \
+  --worker-urls http://worker1:8000
+
+# Python launcher
+python3 -m sglang_router.launch_router \
+  --mcp-config-path /path/to/mcp-config.yaml \
+  --worker-urls http://worker1:8000
+```
+
+#### MCP Configuration File
+Create an MCP configuration file to define servers, transports, and connection settings:
+
+```yaml
+servers:
+  - name: "filesystem"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    required: false
+
+  - name: "github"
+    url: "https://api.github.com/mcp"
+    token: "ghp_xxxxx"
+    transport: "sse"
+    required: false
+
+  - name: "custom-tools"
+    url: "https://tools.example.com/mcp"
+    transport: "streamable"
+    required: true
+
+pool:
+  max_connections: 100
+  idle_timeout: 300  # seconds
+
+proxy:
+  http: "http://proxy.internal:8080"
+  https: "https://proxy.internal:8443"
+  no_proxy: "localhost,127.0.0.1,*.internal"
+
+inventory:
+  enable_refresh: true
+  tool_ttl: 300  # seconds - how long tools are considered fresh
+  refresh_interval: 300  # seconds - background refresh interval
+```
+
+#### Configuration Options
+
+**Server Configuration** (`servers` array):
+- `name`: Unique identifier for the MCP server
+- `command` + `args`: For STDIO transport (local process execution)
+- `url`: For SSE or Streamable transports (HTTP/HTTPS endpoints)
+- `token`: Optional authentication token for HTTP-based transports
+- `transport`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
+- `required`: If `true`, router fails to start if server is unreachable (default: `false`)
+- `envs`: Environment variables for STDIO processes (optional)
+- `proxy`: Per-server proxy override (set to `null` to bypass global proxy)
+
+**Connection Pool** (`pool`):
+- `max_connections`: Maximum pooled connections for dynamic servers (default: 100)
+- `idle_timeout`: Idle connection timeout in seconds before cleanup (default: 300)
+
+**Proxy Configuration** (`proxy`):
+- `http`/`https`: Proxy URLs for MCP server connections (not LLM traffic)
+- `no_proxy`: Comma-separated hosts to exclude from proxying (supports wildcards)
+- **Note**: Proxy settings are currently ignored for `streamable` transport. Use STDIO or SSE transports if proxy support is required.
+
+**Inventory Settings** (`inventory`):
+- `enable_refresh`: Enable automatic background refresh of tool inventory (default: true)
+- `tool_ttl`: Tool cache TTL in seconds - how long tools are considered fresh (default: 300)
+- `refresh_interval`: Background refresh interval in seconds - proactive inventory refresh (default: 300)
+
+#### Transport Types
+
+**STDIO** (Local Process):
+```yaml
+name: "local-tools"
+command: "python"
+args: ["-m", "my_mcp_server"]
+envs:
+  API_KEY: "secret"
+  DEBUG: "true"
+```
+
+**SSE** (Server-Sent Events):
+```yaml
+name: "remote-sse"
+url: "https://mcp.example.com/events"
+token: "bearer-token"
+transport: "sse"
+```
+
+**Streamable** (Bidirectional Streaming):
+```yaml
+name: "streaming-tools"
+url: "https://mcp.example.com/stream"
+transport: "streamable"
+required: true
+```
+
+#### Server Lifecycle
+- MCP servers are registered via the workflow engine with retry logic (100 attempts, 2-hour timeout for STDIO servers)
+- Discovery phase identifies tools, prompts, and resources
+- Tool inventory is cached with configurable TTL and periodic refresh
+- Failed optional servers log warnings; required servers halt startup
+- Static servers (from config) are permanent; dynamic servers (per-request) use connection pooling
+
+Check Prometheus metrics for MCP activity (`mcp_*` metrics) and workflow job status via the admin API.
+
 ### Python Launcher (Router + Workers)
 Launch router and SGLang worker processes together; `launch_server` spins up workers (HTTP or gRPC) and the router in one shot.
 ```bash
@@ -259,9 +385,6 @@ Use upstream SGLang binaries to start dedicated worker processes.
 | `GET`    | `/workers`       | List workers with health, load, policy metadata, and queued job status.                                                                                   |
 | `GET`    | `/workers/{url}` | Inspect a specific worker or job queue entry.                                                                                                             |
 | `DELETE` | `/workers/{url}` | Queue worker removal.                                                                                                                                     |
-| `POST`   | `/add_worker`    | Legacy immediate worker registration using query params. Returns synchronously. **Deprecated soon**—use `POST /workers` instead.                          |
-| `POST`   | `/remove_worker` | Legacy immediate removal. **Deprecated soon**—use `DELETE /workers/{url}` instead.                                                                        |
-| `GET`    | `/list_workers`  | Legacy list of worker URLs. **Deprecated soon**—use `GET /workers` instead.                                                                               |
 | `POST`   | `/flush_cache`   | Trigger cache flush across HTTP workers with success/failure breakdown.                                                                                   |
 | `GET`    | `/get_loads`     | Sample current load reported by each worker.                                                                                                              |
 
@@ -447,20 +570,75 @@ curl -X POST "http://localhost:8080/add_worker?url=http://worker3:8000&api_key=w
 
 ## Development & Testing
 ```bash
-# Build Rust components
+# Build Rust components (debug mode, fast)
 cargo build
 
 # Run Rust tests
 cargo test
 
-# Build & install Python bindings
-python -m build
-pip install --force-reinstall dist/*.whl
+# Fast Python development (rebuilds and installs in debug mode)
+cd bindings/python && maturin develop
 
 # Run Python tests
-pytest
+cd ../..  # Back to sgl-router root
+pytest py_test/
 ```
-When modifying runtime behavior, rebuild the wheel or run the binary directly. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
+
+---
+
+## Release Management
+
+### Creating Gateway Releases
+
+Create releases for the Gateway/Router component with filtered commits:
+
+```bash
+# Using make
+make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0
+
+# Save to file
+make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 OUTPUT=RELEASE_NOTES.md
+
+# Create draft release (requires gh CLI, DEFAULT behavior)
+make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1
+
+# Publish release immediately (requires gh CLI)
+make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1 DRAFT=0
+```
+
+**Tag Naming**: Use `gateway-*` or `router-*` prefixes to avoid triggering unrelated CI workflows.
+
+### Release Workflow
+
+1. **Create and push tag**:
+   ```bash
+   git tag -a gateway-v1.0.0 <commit-hash> -m "Gateway release v1.0.0"
+   git push origin gateway-v1.0.0
+   ```
+
+2. **Generate release notes** (automatically filters gateway-related commits):
+   ```bash
+   make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0
+   ```
+
+3. **Create GitHub release**:
+   ```bash
+   # Create draft (DEFAULT - review before publishing)
+   make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1
+
+   # Or publish immediately (skip draft)
+   make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1 DRAFT=0
+   ```
+
+### Filtered Paths
+
+Release notes only include commits touching:
+- `sgl-router/` - Router codebase
+- `python/sglang/srt/grpc/` - gRPC protocol
+- `python/sglang/srt/entrypoints/grpc_server.py` - gRPC server
+
+The script automatically extracts author attribution, PR links, and identifies new contributors.
 
 ---
 

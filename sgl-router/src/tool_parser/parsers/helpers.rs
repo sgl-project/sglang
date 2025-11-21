@@ -217,8 +217,18 @@ pub fn handle_json_tool_streaming(
         }
     };
 
-    // Check if JSON is complete
-    let is_complete = end_idx == json_str.len() && serde_json::from_str::<Value>(json_str).is_ok();
+    // Check if JSON is complete - validate only the parsed portion
+    // Ensure end_idx is on a valid UTF-8 character boundary
+    let safe_end_idx = if json_str.is_char_boundary(end_idx) {
+        end_idx
+    } else {
+        // Find the nearest valid character boundary before end_idx
+        (0..end_idx)
+            .rev()
+            .find(|&i| json_str.is_char_boundary(i))
+            .unwrap_or(0)
+    };
+    let is_complete = serde_json::from_str::<Value>(&json_str[..safe_end_idx]).is_ok();
 
     // Validate tool name if present
     if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {

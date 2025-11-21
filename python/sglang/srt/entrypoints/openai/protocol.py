@@ -37,7 +37,11 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
-from xgrammar import StructuralTag
+
+try:
+    from xgrammar import StructuralTag
+except:
+    StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str
 
@@ -54,6 +58,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    parent: Optional[str] = None
     max_model_len: Optional[int] = None
 
 
@@ -108,6 +113,7 @@ class UsageInfo(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+    continuous_usage_stats: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -204,7 +210,10 @@ class BatchResponse(BaseModel):
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str = DEFAULT_MODEL_NAME
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -240,6 +249,8 @@ class CompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    custom_params: Optional[Dict] = None
+    custom_logit_processor: Optional[str] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -377,7 +388,7 @@ class ToolCall(BaseModel):
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool", "function"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
+    content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
     )
     tool_call_id: Optional[str] = None
@@ -441,7 +452,10 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str = DEFAULT_MODEL_NAME
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -497,6 +511,10 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+
+    # Custom logit processor for advanced sampling control
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    custom_params: Optional[Dict] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -630,6 +648,7 @@ class ChatCompletionRequest(BaseModel):
             "ignore_eos": self.ignore_eos,
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
+            "custom_params": self.custom_params,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -1099,7 +1118,7 @@ class ResponsesResponse(BaseModel):
                 Union[
                     ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall
                 ]
-            ]
+            ],
         ) -> bool:
             if not items:
                 return False

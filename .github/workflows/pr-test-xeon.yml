@@ -5,19 +5,22 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
+      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xeon.yml"
+      - "docker/xeon.Dockerfile"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
+      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-xeon.yml"
-    types: [synchronize, labeled]
+      - "docker/xeon.Dockerfile"
   workflow_dispatch:
 
 concurrency:
@@ -47,7 +50,7 @@ jobs:
           docker build \
             ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
             ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
-            . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
+            . -f docker/xeon.Dockerfile  -t sglang_xeon --no-cache
 
       - name: Run container
         run: |

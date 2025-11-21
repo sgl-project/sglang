@@ -36,6 +36,7 @@ class GrammarStats:
     is_grammar_aborted: bool = False
     tree_traversal_time: List[float] = field(default_factory=list)
     dispatch_type: Optional[str] = None
+    num_timeout: int = 0
 
 
 class BaseGrammarObject:

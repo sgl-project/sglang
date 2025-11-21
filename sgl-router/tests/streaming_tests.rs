@@ -8,7 +8,6 @@ use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::{
     config::{RouterConfig, RoutingMode},
-    core::WorkerManager,
     routers::{RouterFactory, RouterTrait},
 };
 
@@ -21,16 +20,12 @@ struct TestContext {
 
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
-        let mut config = RouterConfig {
-            chat_template: None,
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            port: 3004,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            ..Default::default()
-        };
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .port(3004)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .build_unchecked();
 
         let mut workers = Vec::new();
         let mut worker_urls = Vec::new();
@@ -50,14 +45,7 @@ impl TestContext {
             worker_urls: worker_urls.clone(),
         };
 
-        let app_context = common::create_test_context(config.clone());
-
-        // Initialize workers in the registry before creating router
-        if !worker_urls.is_empty() {
-            WorkerManager::initialize_workers(&config, &app_context.worker_registry, None)
-                .await
-                .expect("Failed to initialize workers");
-        }
+        let app_context = common::create_test_context(config.clone()).await;
 
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);

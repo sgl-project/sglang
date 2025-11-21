@@ -48,6 +48,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    replace_prefix,
+    replace_substrings,
 )
 from sglang.srt.utils import add_prefix, make_layers_non_pp
 from sglang.utils import logger
@@ -155,6 +157,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             activation=config.mamba_hidden_act,
             quant_config=quant_config,
+            prefix=f"{prefix}.mixer",
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -381,15 +384,18 @@ class NemotronHModel(nn.Module):
 
 
 class NemotronHForCausalLM(nn.Module):
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+    ]
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    }
+
     remap_prefix = {"backbone": "model"}
     remap_substr = {"A_log": "A", "embeddings": "embed_tokens"}
-
-    # LoRA specific attributes
-    embedding_modules = {
-        "embed_tokens": "input_embeddings",
-        "lm_head": "output_embeddings",
-    }
-    embedding_padding_modules = ["lm_head"]
 
     def __init__(
         self,
@@ -432,7 +438,9 @@ class NemotronHForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        return NemotronHModel(config=config, quant_config=quant_config, prefix=prefix)
+        return NemotronHModel(
+            config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -460,21 +468,10 @@ class NemotronHForCausalLM(nn.Module):
         return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
         updated_weights = []
         for name, loaded_weight in weights:
-            for prefix, new_key in self.remap_prefix.items():
-                if name.startswith(prefix):
-                    name = name.replace(prefix, new_key)
-            for substr, new_key in self.remap_substr.items():
-                if substr in name:
-                    name = name.replace(substr, new_key)
+            name = replace_prefix(name, self.remap_prefix)
+            name = replace_substrings(name, self.remap_substr)
             updated_weights.append((name, loaded_weight))
         params_dict = dict(self.named_parameters())
 
@@ -484,7 +481,7 @@ class NemotronHForCausalLM(nn.Module):
                 if name is None:
                     continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)

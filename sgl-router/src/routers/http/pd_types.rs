@@ -70,4 +70,9 @@ pub enum PDSelectionPolicy {
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
     },
+    Bucket {
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        bucket_adjust_interval_secs: usize,
+    },
 }

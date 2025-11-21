@@ -206,6 +206,8 @@ def _quantize_k_cache_fast_kernel(
 
 
 if __name__ == "__main__":
+    import dequant_k_cache
+
     for num_blocks, block_size in [
         (1, 1),
         (10, 64),
@@ -217,21 +219,9 @@ if __name__ == "__main__":
             dtype=torch.bfloat16,
             device="cuda",
         )
-        # temp debug
-        # input_k_cache = (576 - torch.arange(num_blocks * block_size * 1 * dim_nope_and_rope, device="cuda")).to(torch.bfloat16).reshape(num_blocks, block_size, 1, dim_nope_and_rope)
 
         ref_quant = _quantize_k_cache_slow(input_k_cache)
         actual_quant = _quantize_k_cache_fast_wrapped(input_k_cache)
-        # print(f"{input_k_cache=}")
-        # print(f"{ref_quant=}")
-        # print(f"{actual_quant=}")
-        # print(f"{ref_quant == actual_quant=}")
-        # print(f"{actual_quant.to(torch.float32) - ref_quant.to(torch.float32)=}")
-        # print(f"{ref_quant.view(torch.bfloat16)=}")
-        # print(f"{actual_quant.view(torch.bfloat16)=}")
-        # assert torch.all(ref_quant == actual_quant)
-
-        import dequant_k_cache
 
         ref_ref_dequant = dequant_k_cache._dequantize_k_cache_slow(ref_quant)
         ref_actual_dequant = dequant_k_cache._dequantize_k_cache_fast_wrapped(ref_quant)
@@ -252,4 +242,46 @@ if __name__ == "__main__":
             ref_ref_dequant, actual_actual_dequant, atol=0.2, rtol=0.2
         )
 
+        # test dequant_k_cache_paged
+        page_table_1 = torch.arange(
+            num_blocks * block_size, dtype=torch.int32, device="cuda"
+        )
+        actual_dequant_paged = dequant_k_cache.dequantize_k_cache_paged(
+            actual_quant, page_table_1
+        ).reshape(actual_actual_dequant.shape)
+        print(f"{torch.mean(actual_actual_dequant - actual_dequant_paged)=}")
+        torch.testing.assert_close(
+            ref_ref_dequant, actual_dequant_paged, atol=0.2, rtol=0.2
+        )
+
     print("Passed")
+    print("Do benchmark...")
+
+    for num_blocks, block_size in [
+        (1, 64),
+        (64, 64),
+        (128, 64),
+        (256, 64),
+        (512, 64),
+        (1024, 64),
+        (2048, 64),
+    ]:
+        dim_nope_and_rope = 512 + 64
+
+        input_k_cache = torch.randn(
+            (num_blocks, block_size, 1, dim_nope_and_rope),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+        actual_quant = _quantize_k_cache_fast_wrapped(input_k_cache)
+
+        page_table_1 = torch.arange(
+            num_blocks * block_size, dtype=torch.int32, device="cuda"
+        )
+
+        def run_ans():
+            return dequant_k_cache.dequantize_k_cache_paged(actual_quant, page_table_1)
+
+        ans_time: float = triton.testing.do_bench(run_ans, warmup=10, rep=20) / 1000  # type: ignore
+        print(f"seq_kv: {num_blocks * block_size}, time: {ans_time * 1e6: 4.0f} us")

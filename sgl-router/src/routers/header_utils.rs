@@ -81,6 +81,7 @@ pub fn apply_request_headers(
             key_str == "keep-alive" ||
             key_str == "te" ||
             key_str == "trailers" ||
+            key_str == "accept-encoding" ||
             key_str == "upgrade" ||
             (skip_content_headers && (key_str == "content-type" || key_str == "content-length"));
 

@@ -18,7 +18,7 @@ use rustls;
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{core::WorkerManager, protocols::worker_spec::WorkerConfigRequest, server::AppContext};
+use crate::{app_context::AppContext, core::Job, protocols::worker_spec::WorkerConfigRequest};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -157,6 +157,7 @@ impl PodInfo {
     }
 
     pub fn worker_url(&self, port: u16) -> String {
+        // Default to http:// prefix; workflow will detect actual protocol (HTTP vs gRPC)
         format!("http://{}:{}", self.ip, port)
     }
 }
@@ -375,17 +376,26 @@ async fn handle_pod_event(
                 worker_type,
                 priority: None,
                 cost: None,
+                runtime: None,
                 labels: HashMap::new(),
                 bootstrap_port,
                 tokenizer_path: None,
                 reasoning_parser: None,
                 tool_parser: None,
                 chat_template: None,
-                api_key: None,
+                api_key: app_context.router_config.api_key.clone(),
+                health_check_timeout_secs: app_context.router_config.health_check.timeout_secs,
+                health_check_interval_secs: app_context
+                    .router_config
+                    .health_check
+                    .check_interval_secs,
+                health_success_threshold: app_context.router_config.health_check.success_threshold,
+                health_failure_threshold: app_context.router_config.health_check.failure_threshold,
+                max_connection_attempts: app_context.router_config.health_check.success_threshold
+                    * 20,
+                dp_aware: false,
             };
 
-            // Submit job for async worker addition
-            use crate::core::Job;
             let job = Job::AddWorker {
                 config: Box::new(config.clone()),
             };
@@ -440,8 +450,24 @@ async fn handle_pod_deletion(
             pod_info.name, pod_info.pod_type, worker_url
         );
 
-        if let Err(e) = WorkerManager::remove_worker(&worker_url, &app_context) {
-            error!("Failed to remove worker {}: {}", worker_url, e);
+        let job = Job::RemoveWorker {
+            url: worker_url.clone(),
+        };
+
+        if let Some(job_queue) = app_context.worker_job_queue.get() {
+            if let Err(e) = job_queue.submit(job).await {
+                error!(
+                    "Failed to submit worker removal job for {}: {}",
+                    worker_url, e
+                );
+            } else {
+                debug!("Submitted worker removal job for {}", worker_url);
+            }
+        } else {
+            error!(
+                "JobQueue not initialized, cannot remove worker {}",
+                worker_url
+            );
         }
     } else {
         debug!(
@@ -540,10 +566,9 @@ mod tests {
     async fn create_test_app_context() -> Arc<AppContext> {
         use crate::{config::RouterConfig, middleware::TokenBucket};
 
-        let router_config = RouterConfig {
-            worker_startup_timeout_secs: 1,
-            ..Default::default()
-        };
+        let router_config = RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .build_unchecked();
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
@@ -568,6 +593,8 @@ mod tests {
             configured_reasoning_parser: None,
             configured_tool_parser: None,
             worker_job_queue: Arc::new(std::sync::OnceLock::new()),
+            workflow_engine: Arc::new(std::sync::OnceLock::new()),
+            mcp_manager: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -813,19 +840,6 @@ mod tests {
             bootstrap_port: None,
         };
         assert!(!not_running_pod.is_healthy());
-    }
-
-    #[test]
-    fn test_pod_info_worker_url() {
-        let pod_info = PodInfo {
-            name: "p1".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
-            is_ready: true,
-            pod_type: None,
-            bootstrap_port: None,
-        };
-        assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
     }
 
     #[test]
