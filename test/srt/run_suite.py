@@ -56,6 +56,7 @@ suites = {
         TestFile("rl/test_update_weights_from_disk.py", 210),
         TestFile("rl/test_update_weights_from_tensor.py", 80),
         TestFile("test_abort.py", 190),
+        TestFile("test_auto_weights_loader.py", 5),
         TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_chunked_prefill.py", 410),
         TestFile("test_create_kvindices.py", 2),
