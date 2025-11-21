@@ -11,7 +11,6 @@ import re
 import time
 import unicodedata
 import uuid
-from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
@@ -196,11 +195,13 @@ class SamplingParams:
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError("prompt_path must be a txt file")
 
-    # called after merged with user params
     def adjust(
         self,
         server_args: ServerArgs,
     ):
+        """
+        final adjustment, called after merged with user params
+        """
         pipeline_config = server_args.pipeline_config
         if not isinstance(self.prompt, str):
             raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
@@ -306,20 +307,16 @@ class SamplingParams:
             sampling_params = cls(**kwargs)
         return sampling_params
 
-    def from_user_sampling_params(self, user_params, server_args):
-        sampling_params = deepcopy(self)
-        sampling_params._merge_with_user_params(user_params)
-        sampling_params.adjust(server_args)
-        return sampling_params
-
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         sampling_params = SamplingParams.from_pretrained(model_path)
-        sampling_params._set_output_file_name()
+
         user_sampling_params = SamplingParams(*args, **kwargs)
-        return sampling_params.from_user_sampling_params(
-            user_sampling_params, server_args
-        )
+        sampling_params._merge_with_user_params(user_sampling_params)
+
+        sampling_params.adjust(server_args)
+
+        return sampling_params
 
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
