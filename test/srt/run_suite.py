@@ -95,7 +95,7 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
-        TestFile("test_piecewise_cuda_graph.py", 750),
+        TestFile("test_piecewise_cuda_graph.py", 850),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -180,7 +180,7 @@ suites = {
     "per-commit-8-gpu-b200": [],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
-        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 590),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),

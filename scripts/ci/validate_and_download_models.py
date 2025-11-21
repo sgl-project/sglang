@@ -67,6 +67,8 @@ RUNNER_LABEL_MODEL_MAP: Dict[str, List[str]] = {
         "Qwen/QwQ-32B-AWQ",
         "Qwen/Qwen3-30B-A3B",
         "Skywork/Skywork-Reward-Llama-3.1-8B-v0.2",
+        "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
+        "lmms-lab/llava-onevision-qwen2-7b-ov",
         # diffusion
         "Qwen/Qwen-Image",
         "Qwen/Qwen-Image-Edit",
