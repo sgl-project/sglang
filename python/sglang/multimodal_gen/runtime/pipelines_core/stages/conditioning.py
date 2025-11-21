@@ -7,6 +7,9 @@ Conditioning stage for diffusion pipelines.
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs import (
+    StableDiffusion3PipelineConfig,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -15,7 +18,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.configs.pipelines_config import StableDiffusion3PipelineConfig
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

@@ -16,7 +16,10 @@ from sglang.multimodal_gen.configs.models.encoders import (
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
+    PipelineConfig,
+)
 
 
 def t5_preprocess_text(prompt: str) -> str:
