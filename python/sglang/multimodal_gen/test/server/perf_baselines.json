@@ -415,7 +415,7 @@
             "expected_avg_denoise_ms": 4912.17,
             "expected_median_denoise_ms": 4899.69
         },
-        "wan2_2_i2v_14b_720P": {
+        "wan2_1_i2v_14b_720P": {
             "stages_ms": {
                 "InputValidationStage": 53.67,
                 "TextEncodingStage": 2228.89,
