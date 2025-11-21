@@ -29,6 +29,11 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -79,20 +84,22 @@ class Olmo2Attention(nn.Module):
         self.total_num_heads = config.num_attention_heads
 
         assert self.hidden_size % self.total_num_heads == 0
-        assert self.total_num_heads % self.tp_size == 0
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
 
-        self.num_heads = self.total_num_heads // self.tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = self.config.num_key_value_heads
 
-        if self.total_num_kv_heads >= self.tp_size:
+        if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % self.tp_size == 0
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
 
         self.head_dim = self.hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
@@ -108,6 +115,8 @@ class Olmo2Attention(nn.Module):
             total_num_kv_heads=self.total_num_kv_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -157,42 +166,70 @@ class Olmo2Attention(nn.Module):
             self.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
+            # Use the attention TP group; keep default reduction behaviour so
+            # outputs stay fully reduced for models without LayerCommunicator.
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.tp_size > 1:
+        # For DP attention we must not all-gather/split by the full TP group.
+        if not is_dp_attention_enabled() and self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
             k = tensor_model_parallel_all_gather(k.contiguous())
 
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
+            if self.alt_stream is not None and get_is_capture_mode():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
 
-            q_shape = q.shape
-            k_shape = k.shape
+                q_shape = q.shape
+                k_shape = k.shape
 
-            q_by_last = q.reshape(-1, q_shape[-1])
-            q_by_last = self.q_norm(q_by_last)
+                q_by_last = q.reshape(-1, q_shape[-1])
+                q_by_last = self.q_norm(q_by_last)
 
-            with torch.cuda.stream(self.alt_stream):
-                k_by_last = k.reshape(-1, k_shape[-1])
-                k_by_last = self.k_norm(k_by_last)
+                with torch.cuda.stream(self.alt_stream):
+                    k_by_last = k.reshape(-1, k_shape[-1])
+                    k_by_last = self.k_norm(k_by_last)
 
-            current_stream.wait_stream(self.alt_stream)
+                current_stream.wait_stream(self.alt_stream)
 
-            q = q_by_last.view(q_shape)
-            k = k_by_last.view(k_shape)
-        else:
-            q = self.q_norm.forward_native(q)
-            k = self.k_norm.forward_native(k)
+                q = q_by_last.view(q_shape)
+                k = k_by_last.view(k_shape)
+            else:
+                q = self.q_norm.forward_native(q)
+                k = self.k_norm.forward_native(k)
 
-        if self.tp_size > 1:
             splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
             q = splitter(q)[self.tp_rank]
             k = splitter(k)[self.tp_rank]
+        else:
+            # DP attention or no-TP path: just normalize locally, still overlapping
+            # q/k on separate streams when available.
+            if self.alt_stream is not None and get_is_capture_mode():
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+
+                q_shape = q.shape
+                k_shape = k.shape
+
+                q_by_last = q.reshape(-1, q_shape[-1])
+                q_by_last = self.q_norm(q_by_last)
+
+                with torch.cuda.stream(self.alt_stream):
+                    k_by_last = k.reshape(-1, k_shape[-1])
+                    k_by_last = self.k_norm(k_by_last)
+
+                current_stream.wait_stream(self.alt_stream)
+
+                q = q_by_last.view(q_shape)
+                k = k_by_last.view(k_shape)
+            else:
+                q = self.q_norm.forward_native(q)
+                k = self.k_norm.forward_native(k)
         return q, k
 
     def forward(
@@ -336,6 +373,9 @@ class Olmo2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            # Disable TP for embeddings when DP attention is enabled, to match
+            # Qwen-style DP attention behavior.
+            enable_tp=not is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = make_layers(
