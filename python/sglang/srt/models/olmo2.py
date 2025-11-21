@@ -329,8 +329,6 @@ class Olmo2Model(nn.Module):
     ):
         super().__init__()
         self.config = config
-        # If no alt_stream is provided, initialize one on CUDA so that
-        # Q/K RMSNorm overlap is enabled by default (mirrors Qwen3 behaviour).
         if alt_stream is None and _is_cuda:
             alt_stream = torch.cuda.Stream()
         self.alt_stream = alt_stream
