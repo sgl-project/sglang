@@ -24,11 +24,7 @@ class Timer(StageProfiler):
     """
 
     def __init__(self, name="Stage"):
-        # Enable simple_log to mimic old Timer behavior (logging start/end info)
-        # Pass `timings=None` as this timer is not for metric collection.
-        super().__init__(stage_name=name, timings=None, simple_log=True)
-        # Old Timer exposed these attributes, though StageProfiler doesn't publicize them as much
-        # We can add properties if needed, but usually users just use the context manager.
+        super().__init__(stage_name=name, timings=None, simple_log=True, logger=logger)
 
 
 class PipelineExecutor(ABC):

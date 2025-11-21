@@ -34,14 +34,14 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    FlashAttentionBackend,
-)
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionBackend,
+)
+from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -217,8 +217,8 @@ class DenoisingStage(PipelineStage):
         # Setup precision and autocast settings
         target_dtype = torch.bfloat16
         autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                               target_dtype != torch.float32
+                           ) and not server_args.disable_autocast
 
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
@@ -310,8 +310,8 @@ class DenoisingStage(PipelineStage):
             # z: [B, C, 1, H, W], reserved_frames_mask: [1, C, T, H, W]
             # Both will broadcast correctly
             latents = (
-                1.0 - reserved_frames_mask
-            ) * z + reserved_frames_mask * latent_model_input
+                          1.0 - reserved_frames_mask
+                      ) * z + reserved_frames_mask * latent_model_input
             assert latents.ndim == 5
             latents = latents.to(get_local_torch_device())
             batch.latents = latents
@@ -746,8 +746,8 @@ class DenoisingStage(PipelineStage):
                 # Unsqueeze mask to [1, C, T_local, H, W] for broadcasting.
                 # z will broadcast along the time dimension.
                 latents = (
-                    1.0 - reserved_frames_mask.unsqueeze(0)
-                ) * z + reserved_frames_mask.unsqueeze(0) * latents
+                              1.0 - reserved_frames_mask.unsqueeze(0)
+                          ) * z + reserved_frames_mask.unsqueeze(0) * latents
 
         return latents
 
@@ -809,7 +809,7 @@ class DenoisingStage(PipelineStage):
                     if hasattr(self, "interrupt") and self.interrupt:
                         continue
 
-                    with StageProfiler(f"denoising_step_{i}", batch.timings):
+                    with StageProfiler(f"denoising_step_{i}", logger=logger, timings=batch.timings):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
                         current_model, current_guidance_scale = (
@@ -826,7 +826,7 @@ class DenoisingStage(PipelineStage):
                         if batch.image_latent is not None:
                             assert (
                                 not server_args.pipeline_config.task_type
-                                == ModelTaskType.TI2V
+                                    == ModelTaskType.TI2V
                             ), "image latents should not be provided for TI2V task"
                             latent_model_input = torch.cat(
                                 [latent_model_input, batch.image_latent], dim=1
@@ -1202,9 +1202,9 @@ class DenoisingStage(PipelineStage):
 
         logger.info("STA_mode: %s", STA_mode)
         if (batch.num_frames, batch.height, batch.width) != (
-            69,
-            768,
-            1280,
+                69,
+                768,
+                1280,
         ) and STA_mode != "STA_inference":
             raise NotImplementedError(
                 "STA mask search/tuning is not supported for this resolution"
