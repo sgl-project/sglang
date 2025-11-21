@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEM
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -252,6 +253,10 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.routing_method_type = routing_method_type
+
+        # overlap args
+        self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
+        self.meta_overlap_args: Optional[dict] = None
 
     def _load_per_tensor_weight_scale(
         self,
@@ -856,7 +861,7 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -875,7 +880,6 @@ class FusedMoE(torch.nn.Module):
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
-            **kwargs,
         )
 
         with use_symmetric_memory(
@@ -893,12 +897,11 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def run_moe_core(self, dispatch_output: DispatchOutput, **kwargs) -> CombineInput:
+    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
-            **kwargs,
         )
 
     @classmethod
@@ -992,6 +995,16 @@ class FusedMoE(torch.nn.Module):
             for expert_id in range(num_experts)
             for shard_id in ["w1", "w2", "w3"]
         ]
+
+    def set_overlap_args(
+        self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
+    ):
+        self.down_gemm_overlap_args = down_gemm_overlap_args
+        self.meta_overlap_args = meta_overlap_args
+
+    def clear_overlap_args(self) -> None:
+        self.down_gemm_overlap_args = None
+        self.meta_overlap_args = None
 
 
 class FlashInferFusedMoE(FusedMoE):

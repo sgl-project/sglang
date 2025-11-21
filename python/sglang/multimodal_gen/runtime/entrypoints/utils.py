@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 """
-DiffGenerator module for sgl-diffusion.
+DiffGenerator module for sglang-diffusion.
 
 This module provides a consolidated interface for generating videos using
 diffusion models.
@@ -16,7 +16,7 @@ logging.getLogger("imageio").setLevel(logging.WARNING)
 logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
 
 from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import shallow_asdict
@@ -45,12 +45,12 @@ def prepare_sampling_params(
     # Validate dimensions
     if sampling_params.num_frames <= 0:
         raise ValueError(
-            f"Height, width, and num_frames must be positive integers, got "
+            f"height, width, and num_frames must be positive integers, got "
             f"height={sampling_params.height}, width={sampling_params.width}, "
             f"num_frames={sampling_params.num_frames}"
         )
 
-    if pipeline_config.task_type.is_image_task():
+    if pipeline_config.task_type.is_image_gen():
         # settle num_frames
         logger.debug(f"Setting num_frames to 1 because this is a image-gen model")
         sampling_params.num_frames = 1
@@ -103,6 +103,10 @@ def prepare_sampling_params(
                 server_args.num_gpus,
             )
             sampling_params.num_frames = new_num_frames
+
+        sampling_params.num_frames = server_args.pipeline_config.adjust_num_frames(
+            sampling_params.num_frames
+        )
 
     sampling_params.set_output_file_ext()
     sampling_params.log(server_args=server_args)

@@ -42,6 +42,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -89,6 +90,27 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+    def __str__(self):
+        if self == ForwardMode.EXTEND:
+            return "EXTEND"
+        elif self == ForwardMode.DECODE:
+            return "DECODE"
+        elif self == ForwardMode.MIXED:
+            return "MIXED"
+        elif self == ForwardMode.IDLE:
+            return "IDLE"
+        elif self == ForwardMode.TARGET_VERIFY:
+            return "TARGET_VERIFY"
+        elif self == ForwardMode.DRAFT_EXTEND:
+            return "DRAFT_EXTEND"
+        elif self == ForwardMode.DRAFT_EXTEND_V2:
+            return "DRAFT_EXTEND_V2"
+        elif self == ForwardMode.PREBUILT:
+            return "PREBUILT"
+        elif self == ForwardMode.SPLIT_PREFILL:
+            return "SPLIT_PREFILL"
+        return "UNKNOWN"
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -100,6 +122,17 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+        )
+
+    def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.MIXED
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
         )
 
     def is_decode(self):
@@ -338,6 +371,9 @@ class ForwardBatch:
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
+
+    # Record the split metadata of the sequence number of NSA context parallels.
+    nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
     @classmethod
     def init_new(
