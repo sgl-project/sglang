@@ -988,6 +988,9 @@ class Scheduler(
 
             self.last_batch = batch
 
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
