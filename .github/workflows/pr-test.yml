@@ -55,6 +55,18 @@ jobs:
               - "python/*.toml"
               - ".github/workflows/pr-test.yml"
 
+      - name: Show filter results in summary (table)
+        run: |
+          {
+            echo "## Change Detection"
+            echo ""
+            echo "| Component       | Changed |"
+            echo "|----------------|---------|"
+            echo "| main_package   | ${{ steps.filter.outputs.main_package }} |"
+            echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel }} |"
+            echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
   # =============================================== sgl-kernel ====================================================
 
   sgl-kernel-build-wheels:
@@ -244,6 +256,36 @@ jobs:
 
           echo "All benchmark tests completed!"
 
+  sgl-kernel-b200-test:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    runs-on: 4-gpu-b200
+    env:
+      RUNNER_LABELS: 4-gpu-b200
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run sgl-kernel unit tests on B200
+        timeout-minutes: 30
+        run: |
+          cd sgl-kernel
+          pytest tests/
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
   # cuda13-kernel-smoke-test:
@@ -307,11 +349,6 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-a-test-1
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default
-
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
 
 
   multimodal-gen-test:
@@ -668,11 +705,6 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
-      - name: Cleanup logs directory
-        if: always()
-        run: |
-          rm -rf python/sglang/logs || true
-
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu]
     if: always() && !failure() && !cancelled() &&
@@ -929,6 +961,7 @@ jobs:
         sgl-kernel-unit-test,
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
+        sgl-kernel-b200-test,
 
         multimodal-gen-test,
 

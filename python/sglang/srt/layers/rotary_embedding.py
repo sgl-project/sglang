@@ -120,7 +120,10 @@ class RotaryEmbedding(CustomOp):
         ):
             from vllm._custom_ops import rotary_embedding
 
-            self.vllm_rotary_embedding = rotary_embedding
+            self.use_fallback_kernel = True
+            self.fallback_rotary_embedding = rotary_embedding
+        else:
+            self.use_fallback_kernel = False
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
@@ -273,7 +276,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+        if not self.use_fallback_kernel:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -293,7 +296,7 @@ class RotaryEmbedding(CustomOp):
                 fused_set_kv_buffer_arg is None
             ), "save kv cache is not supported for vllm_rotary_embedding."
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            self.vllm_rotary_embedding(
+            self.fallback_rotary_embedding(
                 positions,
                 query,
                 key,

@@ -864,7 +864,6 @@ class Qwen3NextForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
-        self.lm_head = self.lm_head.float()
         self.logits_processor = LogitsProcessor(config)
 
         self._routed_experts_weights_of_layer = LazyValue(

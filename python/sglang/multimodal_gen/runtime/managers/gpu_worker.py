@@ -62,7 +62,7 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        setproctitle(f"sgl_diffusion::scheduler:{self.local_rank}")
+        setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
         torch.cuda.set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"

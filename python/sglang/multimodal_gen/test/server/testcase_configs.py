@@ -30,7 +30,8 @@ class ToleranceConfig:
     """Tolerance ratios for performance validation."""
 
     e2e: float
-    stage: float
+    denoise_stage: float
+    non_denoise_stage: float
     denoise_step: float
     denoise_agg: float
 
@@ -54,6 +55,7 @@ class BaselineConfig:
     step_fractions: Sequence[float]
     warmup_defaults: dict[str, int]
     tolerances: ToleranceConfig
+    improvement_threshold: float
 
     @classmethod
     def load(cls, path: Path) -> BaselineConfig:
@@ -64,7 +66,15 @@ class BaselineConfig:
         tol_data = data["tolerances"]
         tolerances = ToleranceConfig(
             e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", tol_data["e2e"])),
-            stage=float(os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["stage"])),
+            denoise_stage=float(
+                os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["denoise_stage"])
+            ),
+            non_denoise_stage=float(
+                os.getenv(
+                    "SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE",
+                    tol_data["non_denoise_stage"],
+                )
+            ),
             denoise_step=float(
                 os.getenv("SGLANG_DENOISE_STEP_TOLERANCE", tol_data["denoise_step"])
             ),
@@ -88,6 +98,9 @@ class BaselineConfig:
             step_fractions=tuple(data["sampling"]["step_fractions"]),
             warmup_defaults=data["sampling"].get("warmup_requests", {}),
             tolerances=tolerances,
+            improvement_threshold=data.get("improvement_reporting", {}).get(
+                "threshold", 0.2
+            ),
         )
 
 
@@ -112,7 +125,6 @@ class DiffusionTestCase:
 
     warmup_text: int = 1  # number of text-to-image/video warmups
     warmup_edit: int = 0  # number of image/video-edit warmups
-    startup_grace_seconds: float = 0.0  # wait time after server starts
     custom_validator: str | None = None  # optional custom validator name
 
     def is_image_url(self) -> bool:
@@ -134,6 +146,7 @@ class PerformanceSummary:
     median_denoise_ms: float
     stage_metrics: dict[str, float]
     sampled_steps: dict[int, float]
+    all_denoise_steps: dict[int, float]
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
@@ -145,6 +158,20 @@ IMAGE_INPUT_FILE = Path(__file__).resolve().parents[1] / "test_files" / "girl.jp
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 DIFFUSION_CASES: list[DiffusionTestCase] = [
+    # === Image to Video (I2V) ===
+    DiffusionTestCase(
+        id="wan2_2_i2v_a14b",
+        model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        modality="video",
+        prompt="generate",  # passing in something since failing if no prompt is passed
+        warmup_text=0,  # warmups only for image gen models
+        warmup_edit=0,
+        output_size="832x1104",
+        edit_prompt="generate",
+        image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
+        custom_validator="video",
+        seconds=1,
+    ),
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         id="qwen_image_t2i",
@@ -154,7 +181,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         output_size="1024x1024",
         warmup_text=1,
         warmup_edit=0,
-        startup_grace_seconds=30.0,
     ),
     DiffusionTestCase(
         id="flux_image_t2i",
@@ -164,7 +190,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         output_size="1024x1024",
         warmup_text=1,
         warmup_edit=0,
-        startup_grace_seconds=30.0,
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
@@ -177,12 +202,11 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         warmup_edit=1,
         edit_prompt="Convert 2D style to 3D style",
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        startup_grace_seconds=30.0,
     ),
     # === Text to Video (T2V) ===
     # TODO: FastWan2.1, FastWan2.2
     DiffusionTestCase(
-        id="fastwan2_1_t2v",
+        id="wan2_1_t2v_1.3b",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         modality="video",
         prompt="A curious raccoon",
@@ -190,23 +214,7 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         seconds=4,
         warmup_text=0,  # warmups only for image gen models
         warmup_edit=0,
-        startup_grace_seconds=30.0,
         custom_validator="video",
-    ),
-    # === Image to Video (I2V) ===
-    DiffusionTestCase(
-        id="wan2_2_i2v_a14b",
-        model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        modality="video",
-        prompt="generate",  # passing in something since failing if no prompt is passed
-        warmup_text=0,  # warmups only for image gen models
-        warmup_edit=0,
-        output_size="832x1104",
-        edit_prompt="generate",
-        image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
-        startup_grace_seconds=30.0,
-        custom_validator="video",
-        seconds=1,
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
@@ -219,12 +227,11 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         warmup_text=0,  # warmups only for image gen models
         warmup_edit=0,
-        startup_grace_seconds=30.0,
         custom_validator="video",
         seconds=1,
     ),
     DiffusionTestCase(
-        id="wan2_2_i2v_14b_720P",
+        id="wan2_1_i2v_14b_720P",
         model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
         modality="video",
         prompt="Animate this image",
@@ -233,7 +240,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         output_size="832x1104",
         warmup_text=0,  # warmups only for image gen models
         warmup_edit=0,
-        startup_grace_seconds=30.0,
         custom_validator="video",
         seconds=1,
     ),
@@ -247,7 +253,6 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         warmup_text=0,  # warmups only for image gen models
         warmup_edit=0,
-        startup_grace_seconds=30.0,
         custom_validator="video",
         seconds=1,
     ),

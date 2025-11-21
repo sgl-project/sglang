@@ -31,7 +31,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -39,7 +38,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -124,40 +122,6 @@ class MiniMaxM2RMSNormTP(nn.Module):
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = (x * self.weight).to(orig_dtype)
 
-        return x
-
-
-class MiniMaxM2MLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "mlp",
-    ) -> None:
-        super().__init__()
-
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.act_fn = SiluAndMul()
-        return
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
         return x
 
 

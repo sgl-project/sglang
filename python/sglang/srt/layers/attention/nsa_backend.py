@@ -455,7 +455,14 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ]
             )
 
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            # Generate page_table_1_flattened when needed:
+            mha_dequantize_needed = (
+                self.nsa_kv_cache_store_fp8 and max_seqlen_k <= self.nsa_index_topk
+            )
+            if (
+                topk_transform_method == TopkTransformMethod.RAGGED
+                or mha_dequantize_needed
+            ):
                 page_table_1_flattened = torch.cat(
                     [
                         page_table[i, :kv_len]
@@ -468,6 +475,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                     page_table_1_flattened.shape[0] == forward_batch.seq_lens_sum
                 ), f"{page_table_1_flattened.shape[0] = } must be the same as {forward_batch.seq_lens_sum = }"
 
+            if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = torch.repeat_interleave(
                     cu_seqlens_k[:-1],
                     forward_batch.extend_seq_lens,

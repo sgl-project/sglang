@@ -3,22 +3,8 @@ name: PR Test (XPU)
 on:
   push:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "!python/sglang/multimodal_gen/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-xpu.yml"
   pull_request:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "!python/sglang/multimodal_gen/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-xpu.yml"
   workflow_dispatch:
 
 concurrency:
@@ -26,8 +12,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
+  # ==================== Check Changes ==================== #
+  check-changes:
+    needs: [pr-gate]
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/**"
+              - "!python/sglang/multimodal_gen/**"
+              - "scripts/ci/**"
+              - "test/**"
+              - "sgl-kernel/**"
+              - ".github/workflows/pr-test-xpu.yml"
+
   build-and-test:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [check-changes]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: intel-bmg
     env:
       HF_HOME: /home/sdp/.cache/huggingface
