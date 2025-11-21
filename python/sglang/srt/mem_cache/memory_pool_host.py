@@ -668,7 +668,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_lora_rank + self.qk_rope_head_dim
         ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        
+
         if self.host_register:
             buffer = torch.empty(
                 dims,
