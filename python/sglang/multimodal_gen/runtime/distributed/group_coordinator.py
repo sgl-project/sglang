@@ -44,10 +44,10 @@ def get_local_torch_device() -> torch.device:
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     if current_platform.is_cuda_alike():
-        torch.device(f"cuda:{envs.LOCAL_RANK}")
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     if current_platform.is_npu():
-        torch.device(f"npu:{envs.LOCAL_RANK}")
+        return torch.device(f"npu:{envs.LOCAL_RANK}")
 
     return torch.device("mps")
 
