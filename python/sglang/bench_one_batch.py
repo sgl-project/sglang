@@ -115,7 +115,10 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
         if "CPU" in profile_activities:
             activities.append(torch.profiler.ProfilerActivity.CPU)
         if "GPU" in profile_activities:
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
+            if is_cuda_alike():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            elif is_xpu():
+                activities.append(torch.profiler.ProfilerActivity.XPU)
         if activities:
             profiler = torch.profiler.profile(
                 activities=activities,
