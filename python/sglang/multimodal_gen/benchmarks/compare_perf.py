@@ -5,7 +5,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 
-# TODO: move this into `perf_log_analyze` to share with `test_server_utils`, while avoiding import whole `multimodal_gen` package
 def calculate_diff(base: float, new: float) -> Tuple[float, float]:
     """Returns (diff, diff_percent)."""
     diff = new - base
