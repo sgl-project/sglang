@@ -114,10 +114,7 @@ class MultiModalStaticCache(MultimodalCache):
             evicted_bytes += freed
         if evicted_bytes > 0:
             logger.debug(
-                "Cache eviction: evicted %s bytes, remaining size: %s/%s bytes",
-                evicted_bytes,
-                self.current_size,
-                self.max_size,
+                f"Cache eviction: evicted {evicted_bytes} bytes, remaining size: {self.current_size}/{self.max_size} bytes"
             )
 
         self.mm_cache[mm_hash] = embedding
