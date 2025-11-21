@@ -171,7 +171,9 @@ class PerformanceSummary:
     avg_frame_time_ms: float | None = None
 
     @staticmethod
-    def from_req_perf_record(record: RequestPerfRecord, step_fractions: Sequence[float]):
+    def from_req_perf_record(
+        record: RequestPerfRecord, step_fractions: Sequence[float]
+    ):
         """Collect all performance metrics into a summary without validation."""
         e2e_ms = record.total_duration_ms
 
@@ -182,10 +184,7 @@ class PerformanceSummary:
             avg_denoise = sum(step_durations) / len(step_durations)
             median_denoise = statistics.median(step_durations)
 
-        per_step = {
-            index: s
-            for index, s in enumerate(step_durations)
-        }
+        per_step = {index: s for index, s in enumerate(step_durations)}
         sample_indices = sample_step_indices(per_step, step_fractions)
         sampled_steps = {idx: per_step[idx] for idx in sample_indices}
 

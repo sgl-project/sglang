@@ -185,7 +185,7 @@ class PipelineStage(ABC):
                 raise
 
         # Execute the actual stage logic with unified profiling
-        with StageProfiler(stage_name, logger = logger, timings= batch.timings):
+        with StageProfiler(stage_name, logger=logger, timings=batch.timings):
             result = self.forward(batch, server_args)
 
         if enable_verification:

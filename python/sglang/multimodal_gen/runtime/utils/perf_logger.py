@@ -174,7 +174,7 @@ class StageProfiler:
 
         if self.metrics_enabled and self.timings:
             if "denoising_step_" in self.stage_name:
-                index = int(self.stage_name[len("denoising_step_"):])
+                index = int(self.stage_name[len("denoising_step_") :])
                 self.timings.record_steps(index, execution_time_s)
             else:
                 self.timings.record_stage(self.stage_name, execution_time_s)
@@ -226,7 +226,6 @@ class PerformanceLogger:
             print(f"[Performance] Metrics dumped to: {abs_path}")
         except IOError as e:
             print(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
-            # Log error but don't crash the program
             logging.getLogger(__name__).error(f"Dump failed: {e}")
 
     @classmethod

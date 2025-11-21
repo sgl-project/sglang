@@ -17,7 +17,10 @@ from PIL import Image
 from sglang.multimodal_gen.configs.sample.base import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import get_diffusion_perf_log_dir, RequestPerfRecord
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    RequestPerfRecord,
+    get_diffusion_perf_log_dir,
+)
 
 logger = init_logger(__name__)
 
@@ -164,7 +167,7 @@ def wait_for_req_perf_record(
     timeout: float = 300.0,
 ) -> tuple[RequestPerfRecord | None, int]:
     """
-        the stage metrics of this request should be in the performance_log file with {request-id}
+    the stage metrics of this request should be in the performance_log file with {request-id}
     """
     logger.info(f"Waiting for req perf record with request id: {request_id}")
     deadline = time.time() + timeout

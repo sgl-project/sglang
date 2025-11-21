@@ -507,8 +507,8 @@ Consider updating perf_baselines.json with the snippets below:
             is_sig_faster(summary.e2e_ms, scenario.expected_e2e_ms)
             or is_sig_faster(summary.avg_denoise_ms, scenario.expected_avg_denoise_ms)
             or is_sig_faster(
-            summary.median_denoise_ms, scenario.expected_median_denoise_ms
-        )
+                summary.median_denoise_ms, scenario.expected_median_denoise_ms
+            )
         ):
             is_improved = True
         print(f"{summary.stage_metrics=}")
@@ -526,7 +526,8 @@ Consider updating perf_baselines.json with the snippets below:
                 safe_get_metric(summary.all_denoise_steps, step),
                 safe_get_metric(scenario.denoise_step_ms, step),
             )
-            for step in set(summary.all_denoise_steps.keys()) | set(scenario.denoise_step_ms)
+            for step in set(summary.all_denoise_steps.keys())
+            | set(scenario.denoise_step_ms)
         }
 
         # Check for stage-level improvements

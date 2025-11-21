@@ -26,10 +26,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     ToleranceConfig,
 )
-from sglang.multimodal_gen.test.test_utils import (
-    prepare_perf_log,
-    validate_image,
-)
+from sglang.multimodal_gen.test.test_utils import prepare_perf_log, validate_image
 
 logger = init_logger(__name__)
 
@@ -48,7 +45,7 @@ def download_image_from_url(url: str) -> Path:
     # Determine file extension from URL
     ext = ".jpg"  # default
     if url.lower().endswith((".png", ".jpeg", ".jpg", ".webp", ".gif")):
-        ext = url[url.rfind("."):]
+        ext = url[url.rfind(".") :]
 
     # Create temporary file
     temp_file = (
