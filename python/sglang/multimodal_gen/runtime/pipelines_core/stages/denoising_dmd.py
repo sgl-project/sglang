@@ -268,7 +268,7 @@ class DmdDenoisingStage(DenoisingStage):
         denoising_loop_end_time = time.time()
         if len(timesteps) > 0:
             self.log_info(
-                "Average time per step: %.4f seconds",
+                "average time per step: %.4f seconds",
                 (denoising_loop_end_time - denoising_loop_start_time) / len(timesteps),
             )
 

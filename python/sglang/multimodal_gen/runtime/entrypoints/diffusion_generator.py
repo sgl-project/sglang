@@ -347,7 +347,10 @@ class DiffGenerator:
                     results.append(result_item)
             except Exception as e:
                 logger.error(
-                    "Failed to generate output for prompt %d: %s", request_idx + 1, e
+                    "Failed to generate output for prompt %d: %s",
+                    request_idx + 1,
+                    e,
+                    exc_info=True,
                 )
                 continue
 
