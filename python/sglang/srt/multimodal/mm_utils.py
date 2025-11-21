@@ -357,7 +357,6 @@ def process_images(images, image_processor, model_cfg):
     return new_images
 
 
-
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def get_dp_encoder_lb_assignment(
     sizes: list[int],
@@ -540,7 +539,9 @@ def run_dp_sharded_mrope_vision_model(
             )
     else:
         if pixel_values_local.shape[0] > 0:
-            init_all_vision_forward_metadata(vision_model, torch.tensor(local_grid_thw_list), pixel_values_local)
+            init_all_vision_forward_metadata(
+                vision_model, torch.tensor(local_grid_thw_list), pixel_values_local
+            )
             image_embeds_local = vision_model(
                 pixel_values_local, torch.tensor(local_grid_thw_list)
             )
@@ -617,14 +618,15 @@ def run_dp_sharded_mrope_vision_model(
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings
 
+
 def init_all_vision_forward_metadata(vision_model, image_grid_thw, pixel_values):
     vision_attn_modules_found = False
     for name, module in vision_model.named_modules():
-        if hasattr(module, 'init_vision_forward_metadata'):
+        if hasattr(module, "init_vision_forward_metadata"):
             if not vision_attn_modules_found:
                 vision_attn_modules_found = True
                 vision_forward_metadata = module.init_vision_forward_metadata(
-                image_grid_thw, pixel_values
-            )
+                    image_grid_thw, pixel_values
+                )
             else:
                 module.set_vision_forward_metadata(vision_forward_metadata)
