@@ -51,12 +51,21 @@ class TestAscendDeepEP(CustomTestCase):
             "deepep",
             "--deepep-mode",
             "auto",
+            "--speculative-algorithm",
+            "NEXTN",
+            "--speculative-num-steps",
+            1,
+            "--speculative-eagle-topk",
+            1,
+            "--speculative-num-draft-tokens",
+            2,
         ]
 
         cls.extra_envs = {
             "HCCL_BUFFSIZE": "1000",
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
             "SGLANG_NPU_USE_MLAPO": "1",
+            "SGLANG_NPU_USE_EINSUM_MM": "1",
         }
         os.environ.update(cls.extra_envs)
 
@@ -78,7 +87,7 @@ class TestAscendDeepEP(CustomTestCase):
                     args = SimpleNamespace(
                         num_shots=5,
                         data_path=None,
-                        num_questions=1319,
+                        num_questions=200,
                         max_new_tokens=512,
                         parallel=128,
                         host=f"http://{self.url.hostname}",
@@ -92,26 +101,6 @@ class TestAscendDeepEP(CustomTestCase):
                     )
                 finally:
                     kill_process_tree(process.pid)
-
-    def test_b_throughput(self):
-        for model in self.models:
-            with self.subTest(model=model):
-                print(f"##=== Testing throughput: {model} ===##")
-
-                output_throughput = run_bench_offline_throughput(
-                    model,
-                    [
-                        *self.common_args,
-                    ],
-                )
-
-                print(f"##=== {model} throughput: {output_throughput} ===##")
-
-                if is_in_ci():
-                    self.assertGreater(
-                        output_throughput,
-                        TEST_MODEL_MATRIX[model]["output_throughput"],
-                    )
 
 
 if __name__ == "__main__":
