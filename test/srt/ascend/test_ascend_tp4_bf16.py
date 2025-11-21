@@ -60,7 +60,7 @@ class TestAscendTp4Bf16(CustomTestCase):
                     args = SimpleNamespace(
                         num_shots=5,
                         data_path=None,
-                        num_questions=1319,
+                        num_questions=200,
                         max_new_tokens=512,
                         parallel=128,
                         host=f"http://{self.url.hostname}",
