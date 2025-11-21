@@ -261,6 +261,7 @@ jobs:
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
         run: |
+          modelscope dataset download  --dataset vllm-ascend/GSM8K-in3500-bs2800
           cd test/srt
           python3 run_suite.py --suite per-commit-16-ascend-npu-debug --timeout-per-file 10800
 
