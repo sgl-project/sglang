@@ -21,6 +21,20 @@ def _cache_from_str(json_str: str):
     return dill.loads(bytes.fromhex(data["callable"]))
 
 
+@lru_cache(maxsize=None)
+def _cache_from_class_path(class_path: str):
+    """Get the processor directly from the class path."""
+    class_path_split_list = class_path.split(":")
+    if len(class_path_split_list) != 2:
+        raise ValueError(
+            f"Invalid class path: {class_path}. It should be in the format 'module_path:ClassName'."
+        )
+    module_path, class_name = class_path_split_list[0], class_path_split_list[1]
+    module = importlib.import_module(module_path)
+    clz = getattr(module, class_name)
+    return clz()
+
+
 class CustomLogitProcessor(ABC):
     """Abstract base class for callable functions."""
 
@@ -42,7 +56,7 @@ class CustomLogitProcessor(ABC):
     def from_str(cls, json_str: str):
         """Deserialize a callable function from a JSON string."""
         try:
-            return cls.from_class_path(json_str)
+            return _cache_from_class_path(json_str)
         except Exception as from_class_path_error:
             try:
                 clz = _cache_from_str(json_str)
@@ -53,19 +67,6 @@ class CustomLogitProcessor(ABC):
                     "The custom_logit_processor parameter should be a valid built-in class path or a serialized string of a class. "
                     f"Please check the errors:\n{from_class_path_error}\n{from_cache_error}"
                 )
-
-    @classmethod
-    def from_class_path(cls, class_path: str):
-        """Get the processor directly from the class path."""
-        class_path_split_list = class_path.split(":")
-        if len(class_path_split_list) != 2:
-            raise ValueError(
-                f"Invalid class path: {class_path}. It should be in the format 'module_path:ClassName'."
-            )
-        module_path, class_name = class_path_split_list[0], class_path_split_list[1]
-        module = importlib.import_module(module_path)
-        clz = getattr(module, class_name)
-        return clz()
 
 
 class DeterministicLogitProcessor(CustomLogitProcessor):
