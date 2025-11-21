@@ -126,13 +126,12 @@ def compare_benchmarks(
 
     diff_ms, diff_pct = calculate_diff(base_e2e, new_e2e)
 
-    # status icon: Improved (Green), Regression (Red), Neutral (Gray)
     if diff_pct < -2.0:
-        status = "✅ (Faster)"
+        status = "✅"
     elif diff_pct > 2.0:
-        status = "❌ (Slower)"
+        status = "❌"
     else:
-        status = "➖ (Similar)"
+        status = ""
 
     # --- Stage Breakdown ---
     base_durations, base_order, base_counts = consolidate_steps(
@@ -166,8 +165,7 @@ def compare_benchmarks(
 
         # filter noise: show if diff is > 0.5ms OR if it's a major stage (like Denoising Loop)
         # always show Denoising Loop or stages with significant duration/diff
-        if abs(s_diff) > 0.5 or b_val > 100 or n_val > 100:
-            stage_rows.append((stage + count_str, b_val, n_val, s_diff, s_pct))
+        stage_rows.append((stage + count_str, b_val, n_val, s_diff, s_pct))
 
     if output_format == "markdown":
         print("### Performance Comparison Report\n")
@@ -186,19 +184,16 @@ def compare_benchmarks(
 
         # Detailed Breakdown
         print("#### 2. Stage Breakdown")
-        if not stage_rows:
-            print("*No significant stage differences found.*")
-        else:
+        print(
+            "| Stage Name | Baseline (ms) | New (ms) | Diff (ms) | Diff (%) | Status |"
+        )
+        print("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for name, b, n, d, p in stage_rows:
+            name_str = name
+            status_emoji = get_perf_status_emoji(b, n)
             print(
-                "| Stage Name | Baseline (ms) | New (ms) | Diff (ms) | Diff (%) | Status |"
+                f"| {name_str} | {b:.2f} | {n:.2f} | {d:+.2f} | {p:+.1f}% | {status_emoji} |"
             )
-            print("| :--- | :--- | :--- | :--- | :--- | :--- |")
-            for name, b, n, d, p in stage_rows:
-                name_str = name
-                status_emoji = get_perf_status_emoji(b, n)
-                print(
-                    f"| {name_str} | {b:.2f} | {n:.2f} | {d:+.2f} | {p:+.1f}% | {status_emoji} |"
-                )
         print("\n")
 
         # Metadata
