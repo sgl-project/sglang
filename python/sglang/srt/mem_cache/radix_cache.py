@@ -351,12 +351,6 @@ class RadixCache(BasePrefixCache):
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
 
-        old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.cache_protected_len:
-            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
-            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
-            old_prefix_len -= 1
-
         # Radix Cache takes one ref in memory pool
         if is_insert:
             new_prefix_len = self.insert(
@@ -365,10 +359,12 @@ class RadixCache(BasePrefixCache):
             )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
-                kv_indices[old_prefix_len:new_prefix_len]
+                kv_indices[req.cache_protected_len : new_prefix_len]
             )
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len : len(keys)])
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : len(keys)]
+            )
 
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
@@ -392,19 +388,15 @@ class RadixCache(BasePrefixCache):
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
 
-        old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.cache_protected_len:
-            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
-            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
-            old_prefix_len -= 1
-
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
             RadixKey(keys, req.extra_key),
             values,
             chunked=chunked,
         )
-        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[req.cache_protected_len : new_prefix_len]
+        )
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
@@ -413,8 +405,8 @@ class RadixCache(BasePrefixCache):
         assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
-            new_indices[old_prefix_len:],
+            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+            new_indices[req.cache_protected_len :],
         )
 
         # The cache_protected_len is not always equal to len(req.prefix_indices)
