@@ -40,13 +40,18 @@ class FutureMap:
     ):
         self.future_ct = 0
         # For long-text requests in chunked_prefill computation mode, the input is split into multiple chunks. Each chunk generates
-        # a next_token_id stored in the buffer. When processing multiple requests concurrently, there is a possibility that 
-        # subsequently processed chunks may overwrite the next_token_ids generated during the prefill stage of earlier requests. 
-        # These overwritten IDs serve as the first input_ids in the decode phase, potentially causing errors. Therefore, the 
-        # buffer size should be determined based on both the text length limit and the chunked_prefill_size to ensure it can 
+        # a next_token_id stored in the buffer. When processing multiple requests concurrently, there is a possibility that
+        # subsequently processed chunks may overwrite the next_token_ids generated during the prefill stage of earlier requests.
+        # These overwritten IDs serve as the first input_ids in the decode phase, potentially causing errors. Therefore, the
+        # buffer size should be determined based on both the text length limit and the chunked_prefill_size to ensure it can
         # accommodate all possible next_token_ids during concurrent processing
         # Additionally, to avoid collisions in the circular buffer, the future_limit must be set to a value greater than or equal to three.
-        self.future_limit = max_running_requests * max(3, (context_len + chunked_prefill_size -1)//chunked_prefill_size) if chunked_prefill_size else 3 * max_running_requests
+        self.future_limit = (
+            max_running_requests
+            * max(3, (context_len + chunked_prefill_size - 1) // chunked_prefill_size)
+            if chunked_prefill_size
+            else 3 * max_running_requests
+        )
         # Adding 2 * max_running_requests to future_limit ensures the buffer is sufficiently large.
         self.future_buffer_len = self.future_limit + 2 * max_running_requests
         self.device = device
