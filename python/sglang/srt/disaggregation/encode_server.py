@@ -144,7 +144,7 @@ class MMEncoder:
 
         logger.info(f"rank {rank} init finish ")
 
-    async def mm_encode(self, mm_items) -> torch.Tensor:
+    async def _encode(self, mm_items) -> torch.Tensor:
         images = load_images(mm_items)
 
         images_input = self.image_processor(images=images)
@@ -165,7 +165,7 @@ class MMEncoder:
             mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
         return _get_image_grid_dim(images_input), mm_embedding.cpu()
 
-    async def mm_send(
+    async def _send(
         self,
         prefill_host: int,
         embedding_port: int,
@@ -194,7 +194,7 @@ class MMEncoder:
         socket.send_pyobj(mm_data)
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
-        image_grid_dim, mm_embedding = await self.mm_encode(mm_items)
+        image_grid_dim, mm_embedding = await self._encode(mm_items)
         if self.rank == 0:
             mm_data = EmbeddingData(
                 req_id,
@@ -210,7 +210,7 @@ class MMEncoder:
         self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
     ):
         mm_data: EmbeddingData = self.embedding_to_send[req_id]
-        await self.mm_send(
+        await self._send(
             prefill_host,
             embedding_port,
             mm_data.embedding,
