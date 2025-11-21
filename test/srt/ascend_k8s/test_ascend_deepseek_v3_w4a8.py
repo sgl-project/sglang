@@ -49,7 +49,7 @@ class TestDeepseek_w8a8(CustomTestCase):
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "6699",
+                "6000",
                 "--cuda-graph-bs",
                 "8",
                 "16",
@@ -163,7 +163,7 @@ class TestDeepseek_w8a8(CustomTestCase):
             'sed -i \'s/host_ip = "[^"]*"/host_ip = "127.0.0.1"/\' ./benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py'
         )
         run_command(
-            f"sed -i 's/host_port = [^\"]*/host_port = 6699,/' ./benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py"
+            f"sed -i 's/host_port = [^\"]*/host_port = 6000,/' ./benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py"
         )
         run_command(
             "sed -i 's/max_out_len = [^\"]*/max_out_len = 1500,/' ./benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py"
