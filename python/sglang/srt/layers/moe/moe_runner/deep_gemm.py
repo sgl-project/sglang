@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -40,6 +40,7 @@ if not (_is_npu or _is_hip):
 
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
+_DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -84,6 +85,8 @@ class DeepGemmRunnerInput(RunnerInput):
 @dataclass
 class DeepGemmRunnerOutput(RunnerOutput):
     hidden_states: torch.Tensor
+    block_m: int = None
+    threshold: int = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -98,6 +101,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    down_gemm_overlap_args: Optional[Any] = None
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -116,11 +120,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_states = self._run_contiguous_gemm(
                 runner_input, quant_info, running_state
             )
+            return DeepGemmRunnerOutput(hidden_states=hidden_states)
         else:
-            hidden_states = self._run_masked_gemm(
+            hidden_states, block_m, threshold = self._run_masked_gemm(
                 runner_input, quant_info, running_state
             )
-        return DeepGemmRunnerOutput(hidden_states=hidden_states)
+            return DeepGemmRunnerOutput(
+                hidden_states=hidden_states, block_m=block_m, threshold=threshold
+            )
 
     def _run_contiguous_gemm(
         self,
@@ -317,15 +324,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+
+        if quant_info.down_gemm_overlap_args is not None:
+            quant_info.down_gemm_overlap_args.start_event.record()
+
+        max_block_n = (
+            160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
+        )
+
+        block_m, threshold = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,
             masked_m,
             expected_m,
+            quant_info.down_gemm_overlap_args,
+            max_block_n,
         )
 
-        return down_output
+        return down_output, block_m, threshold
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -463,6 +480,8 @@ def post_permute_deep_gemm_to_deepep_ll(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
+        block_m=runner_output.block_m,
+        threshold=runner_output.threshold,
     )
 
 

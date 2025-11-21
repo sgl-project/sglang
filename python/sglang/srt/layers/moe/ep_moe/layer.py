@@ -150,9 +150,11 @@ class DeepEPMoE(FusedMoE):
         disable_sbo=False,
     ):
 
-        if self.deprecate_flag:
-            assert forward_shared_experts is None
-            assert alt_stream is None
+        if (
+            self.deprecate_flag
+            and forward_shared_experts is None
+            and alt_stream is None
+        ):
             return super().forward(
                 hidden_states,
                 topk_output,
@@ -186,9 +188,10 @@ class DeepEPMoE(FusedMoE):
     ):
 
         if self.deprecate_flag:
-            assert down_gemm_overlap_args is None
+            # assert down_gemm_overlap_args is None
             return super().run_moe_core(
                 dispatch_output,
+                down_gemm_overlap_args=down_gemm_overlap_args,
             )
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
