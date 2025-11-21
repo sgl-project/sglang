@@ -505,12 +505,15 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             return FusedMoE
         try:
             # Check the quantization argument directly
-            if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-                from sglang.srt.layers.moe.fused_moe_triton.layer import (
-                    FlashInferFP4MoE,
-                )
+            if quant_config is not None:
+                if quant_config.get_name() == "modelopt_fp4":
+                    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+                        FlashInferFP4MoE,
+                    )
 
-                return FlashInferFP4MoE
+                    return FlashInferFP4MoE
+                elif quant_config.get_name() == "mxfp4":
+                    return FusedMoE
         except:
             pass
 

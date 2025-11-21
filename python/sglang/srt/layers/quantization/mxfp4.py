@@ -47,6 +47,7 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
+    next_power_of_2,
     round_up,
     set_weight_attrs,
 )
@@ -57,6 +58,7 @@ has_triton_kernels = is_triton_kernels_available()
 
 if is_flashinfer_available():
     from flashinfer import (
+        block_scale_interleave,
         mxfp8_quantize,
         shuffle_matrix_a,
         shuffle_matrix_sf_a,
@@ -271,10 +273,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.topk_indices_dtype = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
-        self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        self.enable_flashinfer_cutlass_moe = (
+            get_moe_runner_backend().is_flashinfer_cutlass()
+        )
+        self.use_flashinfer = (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or self.enable_flashinfer_cutlass_moe
+        )
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
+
+        self.weight_dtype = (
+            torch.int64 if self.enable_flashinfer_cutlass_moe else torch.uint8
+        )
+        self.initial_weight_dtype = torch.uint8
+        self.initial_scale_dtype = torch.uint8
+        self.scale_dtype = (
+            torch.int32 if self.enable_flashinfer_cutlass_moe else torch.uint8
+        )
+        self.weight_alignment = 128 if self.enable_flashinfer_cutlass_moe else 256
+        self.weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
+        self.scaling_vector_size = 32
 
     def create_weights(
         self,
@@ -287,10 +307,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         self.num_experts = num_experts
-        weight_dtype = torch.uint8
-        scale_dtype = torch.uint8
         self.with_bias = with_bias
-        mxfp4_block = 32
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -298,9 +315,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if _is_sm100_supported:
             if self.use_flashinfer:
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, 256
+                    intermediate_size_per_partition, self.weight_alignment
                 )
-                hidden_size = round_up(hidden_size, 256)
+                hidden_size = round_up(hidden_size, self.weight_alignment)
             else:
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, 64
@@ -310,7 +327,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # intermediate_size_per_partition_after_pad the same as the
             # per_rank_intermediate_size during weight loading
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, mxfp4_block
+                intermediate_size_per_partition, self.scaling_vector_size
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
@@ -321,20 +338,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition_after_pad,
-                hidden_size // 2,
-                dtype=weight_dtype,
+                hidden_size // self.weight_vec_size,
+                dtype=self.weight_dtype,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
-
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition_after_pad,
-                hidden_size // mxfp4_block,
-                dtype=scale_dtype,
+                hidden_size // self.scaling_vector_size,
+                dtype=self.initial_scale_dtype,
             ),
             requires_grad=False,
         )
@@ -357,8 +373,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 layer.num_local_experts,
                 hidden_size,
-                intermediate_size_per_partition_after_pad // 2,
-                dtype=weight_dtype,
+                intermediate_size_per_partition_after_pad // self.weight_vec_size,
+                dtype=self.weight_dtype,
             ),
             requires_grad=False,
         )
@@ -369,8 +385,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 layer.num_local_experts,
                 hidden_size,
-                intermediate_size_per_partition_after_pad // mxfp4_block,
-                dtype=scale_dtype,
+                intermediate_size_per_partition_after_pad // self.scaling_vector_size,
+                dtype=self.initial_scale_dtype,
             ),
             requires_grad=False,
         )
@@ -385,11 +401,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        if self.use_flashinfer:
-            log_info_on_rank0(
-                logger,
-                f"Shuffling MoE weights for FlashInfer MXFP4 moe kernel (layer: {self.prefix}), it might take a while...",
+        if self.enable_flashinfer_cutlass_moe:
+            fake_input_scale = torch.nn.Parameter(
+                torch.ones(layer.num_local_experts, dtype=torch.float32),
+                requires_grad=False,
             )
+            layer.register_parameter("fake_input_scale", fake_input_scale)
+
+        if self.use_flashinfer:
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
@@ -403,34 +422,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.tensor([7.0] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,
             )
-            sf_block_size = 32  # mxfp4 block size
 
             assert (
                 layer.w13_weight.dim() == 3
                 and layer.w13_weight.shape[0] == self.num_experts
                 and layer.w13_weight.shape[1]
                 == self.intermediate_size_per_partition * 2
-                and layer.w13_weight.shape[2] == self.hidden_size // 2
+                and layer.w13_weight.shape[2]
+                == self.hidden_size // self.weight_vec_size
             )
             assert (
                 layer.w13_weight_scale.dim() == 3
                 and layer.w13_weight_scale.shape[0] == self.num_experts
                 and layer.w13_weight_scale.shape[1]
                 == self.intermediate_size_per_partition * 2
-                and layer.w13_weight_scale.shape[2] == self.hidden_size // sf_block_size
+                and layer.w13_weight_scale.shape[2]
+                == self.hidden_size // self.scaling_vector_size
             )
             assert (
                 layer.w2_weight.dim() == 3
                 and layer.w2_weight.shape[0] == self.num_experts
                 and layer.w2_weight.shape[1] == self.hidden_size
                 and layer.w2_weight.shape[2]
-                == self.intermediate_size_per_partition // 2
+                == self.intermediate_size_per_partition // self.weight_vec_size
             )
             assert (
                 layer.w2_weight_scale.dim() == 3
                 and layer.w2_weight_scale.shape[1] == self.hidden_size
                 and layer.w2_weight_scale.shape[2]
-                == self.intermediate_size_per_partition // sf_block_size
+                == self.intermediate_size_per_partition // self.scaling_vector_size
             )
             assert (
                 layer.w13_weight_bias.dim() == 2
@@ -448,100 +468,160 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight_scale = layer.w2_weight_scale.data
             w13_weight = layer.w13_weight.data
             w2_weight = layer.w2_weight.data
-            w13_bias = layer.w13_weight_bias.data.to(torch.float32)
-            w2_bias = layer.w2_weight_bias.data.to(torch.float32)
+            w13_bias = layer.w13_weight_bias.data
+            w2_bias = layer.w2_weight_bias.data
 
-            # Swap w1 and w3 as the definition of
-            # swiglu is different in the trtllm-gen
-            def swap_every_two_rows(x, axis=-1):
-                shape = x.shape
-                if axis < 0:
-                    axis = len(shape) + axis
-
-                # Create a new shape with pairs swapped along specified axis
-                new_shape = list(shape)
-                new_shape[axis] = shape[axis] // 2
-                new_shape.insert(axis + 1, 2)
-
-                # Reshape to expose pairs, swap them, and reshape back
-                x = x.reshape(*new_shape)
-                x = x.flip(axis + 1)
-                new_shape = list(shape)
-                return x.reshape(*new_shape)
-
-            w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
-            w13_weight = swap_every_two_rows(w13_weight, -2)
-            w13_bias = swap_every_two_rows(w13_bias, -1)
-
-            # Shuffle weights and scaling factors for transposed mma output
-            gemm1_weights_mxfp4_shuffled = []
-            gemm1_scales_mxfp4_shuffled = []
-            gemm2_weights_mxfp4_shuffled = []
-            gemm2_scales_mxfp4_shuffled = []
-            gemm1_bias_shuffled = []
-            gemm2_bias_shuffled = []
-            epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
-            for i in range(self.num_experts):
-                gemm1_weights_mxfp4_shuffled.append(
-                    shuffle_matrix_a(w13_weight[i].view(torch.uint8), epilogue_tile_m)
+            if self.enable_flashinfer_cutlass_moe:
+                # Deinterleave gate and up
+                gate_weight, up_weight = w13_weight[:, ::2, :], w13_weight[:, 1::2, :]
+                w13_weight = torch.cat([up_weight, gate_weight], dim=-2)
+                gate_weight_scale, up_weight_scale = (
+                    w13_weight_scale[:, ::2, :],
+                    w13_weight_scale[:, 1::2, :],
                 )
-                gemm1_scales_mxfp4_shuffled.append(
-                    shuffle_matrix_sf_a(
-                        w13_weight_scale[i].view(torch.uint8), epilogue_tile_m
+                w13_weight_scale = torch.cat(
+                    [up_weight_scale, gate_weight_scale], dim=-2
+                )
+                gate_bias, up_bias = w13_bias[:, ::2], w13_bias[:, 1::2]
+                w13_bias = torch.cat([up_bias, gate_bias], dim=-1)
+
+                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
+
+                w13_original_shape = w13_weight_scale.shape
+                w2_original_shape = w2_weight_scale.shape
+                interleaved_w13_weight_scale = []
+                interleaved_w2_weight_scale = []
+                for i in range(self.num_experts):
+                    interleaved_w13_weight_scale.append(
+                        block_scale_interleave(w13_weight_scale[i])
                     )
-                )
-                gemm1_bias_shuffled.append(
-                    shuffle_matrix_a(
-                        w13_bias[i].clone().reshape(-1, 1), epilogue_tile_m
+                    interleaved_w2_weight_scale.append(
+                        block_scale_interleave(w2_weight_scale[i])
                     )
+
+                w13_weight_scale = (
+                    torch.stack(interleaved_w13_weight_scale)
+                    .reshape(w13_original_shape)
+                    .view(self.scale_dtype)
+                )
+                w2_weight_scale = (
+                    torch.stack(interleaved_w2_weight_scale)
+                    .reshape(w2_original_shape)
+                    .view(self.scale_dtype)
+                )
+                layer.w13_weight_scale = Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+            else:
+                log_info_on_rank0(
+                    logger,
+                    f"Shuffling MoE weights for FlashInfer MXFP4 moe kernel (layer: {self.prefix}), it might take a while...",
                 )
 
-                gemm2_weights_mxfp4_shuffled.append(
-                    shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
-                )
-                gemm2_scales_mxfp4_shuffled.append(
-                    shuffle_matrix_sf_a(
-                        w2_weight_scale[i].view(torch.uint8), epilogue_tile_m
+                # Swap w1 and w3 as the definition of
+                # swiglu is different in the trtllm-gen
+                def swap_every_two_rows(x, axis=-1):
+                    shape = x.shape
+                    if axis < 0:
+                        axis = len(shape) + axis
+
+                    # Create a new shape with pairs swapped along specified axis
+                    new_shape = list(shape)
+                    new_shape[axis] = shape[axis] // 2
+                    new_shape.insert(axis + 1, 2)
+
+                    # Reshape to expose pairs, swap them, and reshape back
+                    x = x.reshape(*new_shape)
+                    x = x.flip(axis + 1)
+                    new_shape = list(shape)
+                    return x.reshape(*new_shape)
+
+                w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
+                w13_weight = swap_every_two_rows(w13_weight, -2)
+                w13_bias = swap_every_two_rows(w13_bias, -1)
+
+                # Shuffle weights and scaling factors for transposed mma output
+                gemm1_weights_mxfp4_shuffled = []
+                gemm1_scales_mxfp4_shuffled = []
+                gemm2_weights_mxfp4_shuffled = []
+                gemm2_scales_mxfp4_shuffled = []
+                gemm1_bias_shuffled = []
+                gemm2_bias_shuffled = []
+                epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
+                w13_bias = w13_bias.to(torch.float32)
+                w2_bias = w2_bias.to(torch.float32)
+                for i in range(self.num_experts):
+                    gemm1_weights_mxfp4_shuffled.append(
+                        shuffle_matrix_a(
+                            w13_weight[i].view(torch.uint8), epilogue_tile_m
+                        )
                     )
-                )
-                gemm2_bias_shuffled.append(
-                    shuffle_matrix_a(w2_bias[i].clone().reshape(-1, 1), epilogue_tile_m)
+                    gemm1_scales_mxfp4_shuffled.append(
+                        shuffle_matrix_sf_a(
+                            w13_weight_scale[i].view(torch.uint8), epilogue_tile_m
+                        )
+                    )
+                    gemm1_bias_shuffled.append(
+                        shuffle_matrix_a(
+                            w13_bias[i].clone().reshape(-1, 1), epilogue_tile_m
+                        )
+                    )
+
+                    gemm2_weights_mxfp4_shuffled.append(
+                        shuffle_matrix_a(
+                            w2_weight[i].view(torch.uint8), epilogue_tile_m
+                        )
+                    )
+                    gemm2_scales_mxfp4_shuffled.append(
+                        shuffle_matrix_sf_a(
+                            w2_weight_scale[i].view(torch.uint8), epilogue_tile_m
+                        )
+                    )
+                    gemm2_bias_shuffled.append(
+                        shuffle_matrix_a(
+                            w2_bias[i].clone().reshape(-1, 1), epilogue_tile_m
+                        )
+                    )
+
+                w13_weight = torch.stack(gemm1_weights_mxfp4_shuffled)
+                w13_weight_scale = (
+                    torch.stack(gemm1_scales_mxfp4_shuffled)
+                    .reshape(
+                        self.num_experts,
+                        2 * self.intermediate_size_per_partition,
+                        self.hidden_size // self.scaling_vector_size,
+                    )
+                    .view(torch.float8_e4m3fn)
                 )
 
-            w13_weight = torch.stack(gemm1_weights_mxfp4_shuffled)
-            w13_weight_scale = (
-                torch.stack(gemm1_scales_mxfp4_shuffled)
-                .reshape(
-                    self.num_experts,
-                    2 * self.intermediate_size_per_partition,
-                    self.hidden_size // sf_block_size,
+                w2_weight = torch.stack(gemm2_weights_mxfp4_shuffled)
+                w2_weight_scale = (
+                    torch.stack(gemm2_scales_mxfp4_shuffled)
+                    .reshape(
+                        self.num_experts,
+                        self.hidden_size,
+                        self.intermediate_size_per_partition
+                        // self.scaling_vector_size,
+                    )
+                    .view(torch.float8_e4m3fn)
                 )
-                .view(torch.float8_e4m3fn)
-            )
 
-            w2_weight = torch.stack(gemm2_weights_mxfp4_shuffled)
-            w2_weight_scale = (
-                torch.stack(gemm2_scales_mxfp4_shuffled)
-                .reshape(
-                    self.num_experts,
-                    self.hidden_size,
-                    self.intermediate_size_per_partition // sf_block_size,
+                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale = Parameter(
+                    w13_weight_scale, requires_grad=False
                 )
-                .view(torch.float8_e4m3fn)
-            )
-
-            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
-            layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-            layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
-            layer.w13_weight_bias = Parameter(
-                torch.stack(gemm1_bias_shuffled).reshape(self.num_experts, -1),
-                requires_grad=False,
-            )
-            layer.w2_weight_bias = Parameter(
-                torch.stack(gemm2_bias_shuffled).reshape(self.num_experts, -1),
-                requires_grad=False,
-            )
+                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+                layer.w13_weight_bias = Parameter(
+                    torch.stack(gemm1_bias_shuffled).reshape(self.num_experts, -1),
+                    requires_grad=False,
+                )
+                layer.w2_weight_bias = Parameter(
+                    torch.stack(gemm2_bias_shuffled).reshape(self.num_experts, -1),
+                    requires_grad=False,
+                )
             return
 
         if self.use_triton_kernels:
@@ -633,12 +713,55 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         value=0.0,
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
-                x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
+                x_quant, x_scale = mxfp8_quantize(
+                    x,
+                    self.enable_flashinfer_cutlass_moe,
+                    alignment=self.weight_alignment,
+                )
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
             else:
                 raise NotImplementedError()
 
             assert x_quant.shape[-1] == self.hidden_size
+
+        if self.enable_flashinfer_cutlass_moe:
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            output_dtype = x.dtype
+
+            # Lazy import of flashinfer backend
+            from flashinfer.fused_moe import (
+                cutlass_fused_moe as flashinfer_cutlass_fused_moe,
+            )
+
+            output = flashinfer_cutlass_fused_moe(
+                input=x_quant,
+                token_selected_experts=topk_ids.to(torch.int),
+                token_final_scales=topk_weights,
+                fc1_expert_weights=layer.w13_weight,
+                fc1_expert_biases=layer.w13_weight_bias,
+                fc2_expert_weights=layer.w2_weight,
+                fc2_expert_biases=layer.w2_weight_bias,
+                output_dtype=output_dtype,
+                input_sf=x_scale,
+                swiglu_alpha=layer.gemm1_alpha,
+                swiglu_beta=layer.gemm1_beta,
+                swiglu_limit=layer.gemm1_clamp_limit,
+                quant_scales=[
+                    layer.w13_weight_scale,
+                    layer.fake_input_scale,
+                    layer.w2_weight_scale,
+                    layer.fake_input_scale,
+                ],
+                ep_size=layer.moe_ep_size,
+                ep_rank=layer.moe_ep_rank,
+                tp_size=layer.moe_tp_size,
+                tp_rank=layer.moe_tp_rank,
+                tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                use_mxfp8_act_scaling=True,
+            )[0]
+            return output
+
+        if self.use_flashinfer:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
             top_k = topk_output.topk_config.top_k
