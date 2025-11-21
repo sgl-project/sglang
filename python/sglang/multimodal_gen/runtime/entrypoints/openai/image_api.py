@@ -69,7 +69,7 @@ def _build_sampling_params_from_request(
         num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
         save_output=True,
         server_args=server_args,
-        output_file_name=request_id,
+        output_file_name=f"{request_id}.{ext}",
     )
     return sampling_params
 

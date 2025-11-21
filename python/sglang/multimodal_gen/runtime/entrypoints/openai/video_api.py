@@ -58,7 +58,6 @@ def _build_sampling_params_from_request(
         request.num_frames if request.num_frames is not None else derived_num_frames
     )
     server_args = get_global_server_args()
-    # TODO: should we cache this sampling_params?
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         request_id=request_id,
