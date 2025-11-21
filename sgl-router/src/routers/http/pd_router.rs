@@ -302,7 +302,7 @@ impl PDRouter {
                                     json_request,
                                     prefill.as_ref(),
                                     decode.as_ref(),
-                                    context.request_text.as_deref()
+                                    context.request_text.as_deref(),
                                 )
                                 .await
                             {
@@ -571,7 +571,7 @@ impl PDRouter {
         mut original: Value,
         prefill_worker: &dyn Worker,
         decode_worker: &dyn Worker,
-        request_text: Option<&str>
+        request_text: Option<&str>,
     ) -> Result<Value, String> {
         let obj = original
             .as_object_mut()
