@@ -474,7 +474,9 @@ suite_ascend = {
     ],
     # "per-commit-1-ascend-npu-debug": [],
     # "per-commit-2-ascend-npu-debug": [],
-    "per-commit-4-ascend-npu-debug": [ascend_k8s/test_ascend_llm_models_Qwen3_32B_w8a8_int8.py],
+    "per-commit-4-ascend-npu-debug": [
+        TestFile("ascend_k8s/test_ascend_llm_models_Qwen3_32B_w8a8_int8.py", 400),
+    ],
     # "per-commit-8-ascend-npu-debug": [],
     # "per-commit-16-ascend-npu-debug": [],
 }
