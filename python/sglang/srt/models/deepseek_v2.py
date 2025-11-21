@@ -421,11 +421,7 @@ def handle_attention_nsa(attn, forward_batch):
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
     backend = forward_batch.attn_backend
-    if (
-        hasattr(backend, "use_mha")
-        and backend.use_mha
-        and (not is_nsa_enable_prefill_cp())
-    ):
+    if hasattr(backend, "use_mha") and backend.use_mha:
         return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
 

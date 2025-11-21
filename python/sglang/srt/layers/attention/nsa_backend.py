@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
     NSA_FUSE_TOPK,
     compute_nsa_seqlens,
+    is_nsa_enable_prefill_cp,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -884,16 +885,13 @@ class NativeSparseAttnBackend(AttentionBackend):
         causal = not layer.is_cross_attention
         assert causal, "NSA is causal only"
 
-        # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {}
-
-        # Detect MHA mode: multi KV heads (vs MLA with single KV head)
-        is_mha_mode = (layer.tp_k_head_num == layer.tp_q_head_num) and (
-            layer.tp_k_head_num > 1
-        )
-
         # Use MHA kernel if in MHA_ONE_SHOT mode
-        if is_mha_mode and k is not None and v is not None and q_rope is None:
+        if self.use_mha:
+            assert k is not None and v is not None
+            assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
+            assert (
+                layer.tp_k_head_num == layer.tp_q_head_num > 1
+            ), "MHA_ONE_SHOT requires dense multi-head config"
             return self._forward_standard_mha(
                 q=q,
                 k=k,
@@ -1385,6 +1383,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
+                and (not is_nsa_enable_prefill_cp())  # CP not enabled
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
