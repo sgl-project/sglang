@@ -135,6 +135,7 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
    fi \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+      python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     else \
