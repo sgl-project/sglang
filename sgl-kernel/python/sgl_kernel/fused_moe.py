@@ -124,6 +124,9 @@ def fused_marlin_moe(
         moe_align_block_size,
         try_get_optimal_moe_config,
     )
+    from sglang.srt.layers.quantization.marlin_utils import (
+        should_use_atomic_add_reduce,
+    )
 
     # Check constraints.
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
@@ -195,10 +198,16 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
-    use_atomic_add = (
-        hidden_states.dtype == torch.half
-        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    )
+    def _should_use_atomic_add(m: int, n: int, k: int) -> bool:
+        return should_use_atomic_add_reduce(
+            m=m,
+            n=n,
+            k=k,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+    use_atomic_add_first = _should_use_atomic_add(M, 2 * N, K)
 
     intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
         hidden_states,
@@ -222,7 +231,7 @@ def fused_marlin_moe(
         size_n=2 * N,
         size_k=K,
         is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
+        use_atomic_add=use_atomic_add_first,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
@@ -231,6 +240,8 @@ def fused_marlin_moe(
 
     if expert_map is not None:
         intermediate_cache3.zero_()
+
+    use_atomic_add_second = _should_use_atomic_add(M * topk, K, N)
 
     intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
         intermediate_cache2,
@@ -254,7 +265,7 @@ def fused_marlin_moe(
         size_n=K,
         size_k=N,
         is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
+        use_atomic_add=use_atomic_add_second,
         use_fp32_reduce=True,
         is_zp_float=False,
     ).view(-1, topk, K)
