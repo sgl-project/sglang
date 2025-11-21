@@ -243,6 +243,9 @@ class Scheduler(
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
+        self.schedule_dp_policy = server_args.schedule_dp_policy
+        # self.stable_flag = False
+        self.stable_count = 0
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
@@ -1706,31 +1709,7 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        if True:
-            global_info_tensor = torch.empty(
-                (self.dp_size, self.attn_tp_size, 1),
-                dtype=torch.int64,
-                device="cpu",
-            )
-            current_running_stream = torch.tensor(
-                [
-                    self.running_batch.batch_size(),
-                ],
-                device="cpu",
-                dtype=torch.int64,
-            )
-            torch.distributed.all_gather_into_tensor(
-                global_info_tensor.flatten(),
-                current_running_stream,
-                group=self.tp_worker.get_tp_group().cpu_group,
-            )
-            tp0_info = global_info_tensor[:, 0, :]
-            if int(tp0_info[:, 0].max().item()) == 32:
-                new_batch = None
-            else:
-                new_batch = self.get_new_batch_prefill()
-        else:
-            new_batch = self.get_new_batch_prefill()
+        new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1768,6 +1747,46 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        if self.schedule_dp_policy == "fcfs_full_decode":
+            global_info_tensor = torch.empty(
+                (self.dp_size, self.attn_tp_size, 1),
+                dtype=torch.int64,
+                device="cpu",
+            )
+            current_running_stream = torch.tensor(
+                [
+                    self.running_batch.batch_size(),
+                ],
+                device="cpu",
+                dtype=torch.int64,
+            )
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.flatten(),
+                current_running_stream,
+                group=self.tp_worker.get_tp_group().cpu_group,
+            )
+            tp0_info = global_info_tensor[:, 0, :]
+            # print(f"{tp0_info=}")
+            # print(f"{self.running_batch.forward_mode=}")
+            if (
+                int(tp0_info[:, 0].min().item()) < self.max_running_requests
+                and int(tp0_info[:, 0].max().item()) == self.max_running_requests
+            ):
+                # self.stable_flag = False
+                self.stable_count += 1
+                if self.stable_count < 50:
+                    return None
+                else:
+                    self.stable_count = 0
+            # d_time, p_time = 100, 100
+            # d_waste_time = self.d_waste_time + d_time *(self.max_running_requests * self.dp_size - sum(tp0_info[:, 0]))
+            # p_waste_time = self.p_waste_time + p_time * sum(tp0_info[:, 0])
+            # if int(tp0_info[:, 0].min().item()) < self.max_running_requests and int(tp0_info[:, 0].max().item()) == self.max_running_requests:
+            #     if p_waste_time >= d_waste_time:
+            #         # print(f"{p_waste_time=}")
+            #         # print(f"{d_waste_time=}")
+            #         self.p_waste_time, self.d_waste_time = p_waste_time, d_waste_time
+            #         return  None
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
