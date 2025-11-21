@@ -182,9 +182,7 @@ class SchedulePolicy:
             cached_key = RadixKey(token_ids=prefix_ids, extra_key=extra_key)
             # NOTE: the prefix_indices must always be aligned with last_node
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
-                self.tree_cache.match_prefix(
-                    rid=r.rid, key=cached_key
-                )
+                self.tree_cache.match_prefix(rid=r.rid, key=cached_key)
             )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -258,7 +256,10 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
         if enable_priority_scheduling:
             waiting_queue.sort(
-                key=lambda x: (x.priority * priority_sign, -x.sampling_params.max_new_tokens)
+                key=lambda x: (
+                    x.priority * priority_sign,
+                    -x.sampling_params.max_new_tokens,
+                )
             )
         else:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
@@ -274,7 +275,10 @@ class SchedulePolicy:
     ) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
         waiting_queue.sort(
-            key=lambda x: (x.priority * priority_sign, x.time_stats.wait_queue_entry_time)
+            key=lambda x: (
+                x.priority * priority_sign,
+                x.time_stats.wait_queue_entry_time,
+            )
         )
 
     @staticmethod
@@ -641,7 +645,10 @@ class PrefillAdder:
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
         sorted_running_reqs = sorted(
             self.running_batch.reqs,
-            key=lambda x: (x.priority * (- priority_sign), -x.time_stats.wait_queue_entry_time),
+            key=lambda x: (
+                x.priority * (-priority_sign),
+                -x.time_stats.wait_queue_entry_time,
+            ),
         )
         preemptible_reqs = []
         min_tokens_to_remove = (
