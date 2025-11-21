@@ -46,7 +46,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
+
+_is_cuda = is_cuda()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -327,6 +329,11 @@ class Olmo2Model(nn.Module):
     ):
         super().__init__()
         self.config = config
+        # If no alt_stream is provided, initialize one on CUDA so that
+        # Q/K RMSNorm overlap is enabled by default (mirrors Qwen3 behaviour).
+        if alt_stream is None and _is_cuda:
+            alt_stream = torch.cuda.Stream()
+        self.alt_stream = alt_stream
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -340,7 +347,7 @@ class Olmo2Model(nn.Module):
                 layer_id=idx,
                 quant_config=quant_config,
                 prefix=prefix,
-                alt_stream=alt_stream,
+                alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
         )
