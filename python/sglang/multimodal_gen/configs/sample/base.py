@@ -129,6 +129,7 @@ class SamplingParams:
 
     # Debugging
     debug: bool = False
+    perf_dump_path: str | None = None
 
     # Misc
     save_output: bool = True

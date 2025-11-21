@@ -334,7 +334,11 @@ class DiffGenerator:
                         "prompts": req.prompt,
                         "size": (req.height, req.width, req.num_frames),
                         "generation_time": gen_time,
-                        "logging_info": output_batch.logging_info,
+                        "timings": (
+                            output_batch.timings.to_dict()
+                            if output_batch.timings
+                            else {}
+                        ),
                         "trajectory": output_batch.trajectory_latents,
                         "trajectory_timesteps": output_batch.trajectory_timesteps,
                         "trajectory_decoded": output_batch.trajectory_decoded,
@@ -343,7 +347,10 @@ class DiffGenerator:
                     results.append(result_item)
             except Exception as e:
                 logger.error(
-                    "Failed to generate output for prompt %d: %s", request_idx + 1, e
+                    "Failed to generate output for prompt %d: %s",
+                    request_idx + 1,
+                    e,
+                    exc_info=True,
                 )
                 continue
 
