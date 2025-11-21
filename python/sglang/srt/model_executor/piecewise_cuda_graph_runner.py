@@ -60,6 +60,27 @@ if TYPE_CHECKING:
 
 
 @contextmanager
+def disable_ca_comm(tp_group):
+    """
+    Context manager to temporarily disable custom allreduce communication.
+
+    This is used during Piecewise CUDA graph capture to avoid custom allreduce operations
+    that may not be compatible with graph capture.
+
+    TODO(yuwei): Fix this
+    """
+    old_disabled = None
+    try:
+        if tp_group.ca_comm is not None:
+            old_disabled = tp_group.ca_comm.disabled
+            tp_group.ca_comm.disabled = True
+        yield
+    finally:
+        if tp_group.ca_comm is not None and old_disabled is not None:
+            tp_group.ca_comm.disabled = old_disabled
+
+
+@contextmanager
 def freeze_gc(enable_cudagraph_gc: bool):
     """
     Optimize garbage collection during CUDA graph capture.
@@ -207,7 +228,7 @@ class PiecewiseCudaGraphRunner:
                 )
 
                 with set_compiled(True):
-                    self.warmup_and_capture()
+                    self.warmup_torch_compile()
 
                 # Capture
                 try:
@@ -219,7 +240,8 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
-    def warmup_and_capture(self):
+    def warmup_torch_compile(self):
+        """Warmup the model with a simple forward pass before CUDA graph capture."""
         num_tokens = 2
         with torch.device(self.device):
             forward_batch = ForwardBatch(
@@ -283,7 +305,7 @@ class PiecewiseCudaGraphRunner:
 
         with set_forward_context(
             forward_batch, self.attention_layers, self.quant_config
-        ):
+        ), disable_ca_comm(self.model_runner.tp_group):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -311,10 +333,9 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            if self.model_runner.tp_group.ca_comm is not None:
-                old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
-                self.model_runner.tp_group.ca_comm.disabled = True
+        with freeze_gc(
+            self.model_runner.server_args.enable_cudagraph_gc
+        ), disable_ca_comm(self.model_runner.tp_group):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -342,8 +363,6 @@ class PiecewiseCudaGraphRunner:
 
                 # Save gemlite cache after each capture
                 save_gemlite_cache()
-            if self.model_runner.tp_group.ca_comm is not None:
-                self.model_runner.tp_group.ca_comm.disabled = old_ca_disable
 
     def capture_one_batch_size(self, num_tokens: int):
         bs = 1
@@ -565,10 +584,7 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        with enable_piecewise_cuda_graph():
-            if self.model_runner.tp_group.ca_comm is not None:
-                old_ca_disable = self.model_runner.tp_group.ca_comm.disabled
-                self.model_runner.tp_group.ca_comm.disabled = True
+        with enable_piecewise_cuda_graph(), disable_ca_comm(self.model_runner.tp_group):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
@@ -599,8 +615,6 @@ class PiecewiseCudaGraphRunner:
                     raise NotImplementedError(
                         "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
                     )
-            if self.model_runner.tp_group.ca_comm is not None:
-                self.model_runner.tp_group.ca_comm.disabled = old_ca_disable
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
