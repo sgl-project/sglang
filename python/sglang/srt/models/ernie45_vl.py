@@ -25,6 +25,7 @@ import logging
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -33,9 +34,9 @@ from transformers.models.qwen2_vl.configuration_qwen2_vl import Ernie4_5_VLVisio
 
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
@@ -45,7 +46,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2 import Ernie4_5_Model
+from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeForCausalLM
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -257,6 +258,190 @@ class Ernie4_5_VisionPatchMerger(nn.Module):
         return out
 
 
+class VariableResolutionResamplerModel(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        spatial_conv_size,
+        temporal_conv_size,
+        config,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.config = config
+        self.spatial_conv_size = spatial_conv_size
+        self.temporal_conv_size = temporal_conv_size
+        self.use_temporal_conv = config.use_temporal_conv
+
+        # compress 2d conv(picture) to 1d
+        self.spatial_dim = self.in_dim * self.spatial_conv_size * self.spatial_conv_size
+        # compress 3d conv(video) to 1d
+        self.temporal_dim = (
+            self.in_dim
+            * self.spatial_conv_size
+            * self.spatial_conv_size
+            * self.temporal_conv_size
+        )
+
+        self.spatial_linear1 = ColumnParallelLinear(
+            self.spatial_dim,
+            self.spatial_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=getattr(config, "quant_config", None),
+            prefix=f"{prefix}.spatial_linear1",
+        )
+
+        self.spatial_gelu = nn.GELU()
+
+        self.spatial_linear2 = ColumnParallelLinear(
+            self.spatial_dim,
+            self.spatial_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=getattr(config, "quant_config", None),
+            prefix=f"{prefix}.spatial_linear2",
+        )
+
+        self.spatial_norm = nn.LayerNorm(self.spatial_dim, eps=1e-6)
+
+        if self.use_temporal_conv:
+            self.temporal_linear1 = ColumnParallelLinear(
+                self.temporal_dim,
+                self.spatial_dim,
+                bias=True,
+                gather_output=True,
+                quant_config=getattr(config, "quant_config", None),
+                prefix=f"{prefix}.temporal_linear1",
+            )
+
+            self.temporal_gelu = nn.GELU()
+
+            self.temporal_linear2 = ColumnParallelLinear(
+                self.spatial_dim,
+                self.spatial_dim,
+                bias=True,
+                gather_output=True,
+                quant_config=getattr(config, "quant_config", None),
+                prefix=f"{prefix}.temporal_linear2",
+            )
+
+            self.temporal_norm = nn.LayerNorm(self.spatial_dim, eps=1e-6)
+
+        self.mlp = ColumnParallelLinear(
+            self.spatial_dim,
+            self.out_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=getattr(config, "quant_config", None),
+            prefix=f"{prefix}.mlp",
+        )
+
+        self.after_norm = RMSNorm(
+            hidden_size=out_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
+        )
+
+    def spatial_conv_reshape(self, x, spatial_conv_size):
+        S, C = x.shape
+        x = x.reshape([-1, C * (spatial_conv_size**2)])
+        return x
+
+    def forward(self, x, grid_thw):
+        def fwd_spatial(x):
+            x = self.spatial_conv_reshape(x, self.spatial_conv_size)
+
+            x, _ = self.spatial_linear1(x)
+            x = self.spatial_gelu(x)
+            x, _ = self.spatial_linear2(x)
+            x = self.spatial_norm(x)
+
+            return x
+
+        def fwd_placeholder(x, grid_thw, to_tensor=False):
+            grid_thw_cpu = grid_thw.cpu().numpy()
+            grid_t, grid_hw = grid_thw_cpu[:, 0], grid_thw_cpu[:, 1:]
+            grid_hw_after_conv = grid_hw.prod(-1) // (self.spatial_conv_size**2)
+
+            tokens_per_img_or_vid = grid_thw_cpu.prod(-1) // (self.spatial_conv_size**2)
+            batch_offset = np.empty(
+                tokens_per_img_or_vid.size, dtype=tokens_per_img_or_vid.dtype
+            )
+            batch_offset[0] = 0
+            batch_offset[1:] = tokens_per_img_or_vid.cumsum()[:-1]
+
+            slice_offsets = []
+            for temporoal_size, spatial_size, b_offset in zip(
+                grid_t, grid_hw_after_conv, batch_offset
+            ):
+                for temp_offset in range(0, temporoal_size, 2):
+                    slice_offsets.append(
+                        np.arange(
+                            b_offset + (temp_offset) * spatial_size,
+                            b_offset + (temp_offset + 1) * spatial_size,
+                        )
+                    )
+            slice_offsets = torch.tensor(np.concatenate(slice_offsets, axis=-1)).to(
+                x.device
+            )
+
+            slice_offsets2 = []
+            for temporoal_size, spatial_size, b_offset in zip(
+                grid_t, grid_hw_after_conv, batch_offset
+            ):
+                for temp_offset in range(
+                    1 if temporoal_size > 1 else 0, temporoal_size, 2
+                ):
+                    slice_offsets2.append(
+                        np.arange(
+                            b_offset + (temp_offset) * spatial_size,
+                            b_offset + (temp_offset + 1) * spatial_size,
+                        )
+                    )
+            slice_offsets2 = torch.tensor(np.concatenate(slice_offsets2, axis=-1)).to(
+                x.device
+            )
+
+            x_timestep_1 = torch.index_select(x, dim=0, index=slice_offsets)
+            x_timestep_2 = torch.index_select(x, dim=0, index=slice_offsets2)
+            x = torch.concat([x_timestep_1, x_timestep_2], dim=-1)
+            return x
+
+        def fwd_temporal(x):
+            x, _ = self.temporal_linear1(x)
+            x = self.temporal_gelu(x)
+            x, _ = self.temporal_linear2(x)
+            x = self.temporal_norm(x)
+            return x
+
+        def fwd_mlp(x):
+            x, _ = self.mlp(x)
+            x = self.after_norm(x)
+            return x
+
+        x = fwd_spatial(x)
+        if self.use_temporal_conv:
+            x = fwd_placeholder(x, grid_thw)
+            x = fwd_temporal(x)
+        x = fwd_mlp(x)
+        return x
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            if name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
 class Ernie4_5_VisionRotaryEmbedding(nn.Module):
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
@@ -449,15 +634,24 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Ernie4_5_VisionTransformer(
+        self.vision_model = Ernie4_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
+            prefix=add_prefix("vision_model", prefix),
         )
 
-        self.model = Ernie4_5_Model(
+        self.model = Ernie4_5_VLMoeForCausalLM(
             config, quant_config, prefix=add_prefix("model", prefix)
+        )
+
+        self.resampler_model = VariableResolutionResamplerModel(
+            self.config.pixel_hidden_size,
+            self.config.hidden_size,
+            self.config.spatial_conv_size,
+            self.config.temporal_conv_size,
+            config=self.config,
+            prefix=add_prefix("resampler_model", prefix),
         )
 
         if config.tie_word_embeddings:
@@ -472,7 +666,25 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
         self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        # self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+        if getattr(self.config, "im_patch_id", None):
+            visual_token_ids = [
+                token_id
+                for token_id in [
+                    self.config.im_patch_id,
+                    getattr(self.config, "image_start_token_id", None),
+                    getattr(self.config, "image_end_token_id", None),
+                    getattr(self.config, "video_start_token_id", None),
+                    getattr(self.config, "video_end_token_id", None),
+                ]
+                if token_id is not None
+            ]
+            self._visual_token_ids_tensor_cache = torch.tensor(
+                visual_token_ids, dtype=torch.long
+            )
+        else:
+            self._visual_token_ids_tensor_cache = None
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -545,20 +757,48 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
+
+        if self._visual_token_ids_tensor_cache is None:
+            visual_token_mask = None
+        else:
+            visual_token_ids_tensor = self._visual_token_ids_tensor_cache.to(
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
+            visual_token_mask = torch.isin(input_ids, visual_token_ids_tensor).reshape(
+                -1, 1
+            )
+
+        # TODO 计算 视觉mask
+        if visual_token_mask is not None:
+            if visual_token_mask.shape[0] != input_ids.shape[0]:
+                padding_len = input_ids.shape[0] - visual_token_mask.shape[0]
+                # right pad False
+                pad = torch.zeros(
+                    (padding_len, visual_token_mask.shape[1]),
+                    dtype=visual_token_mask.dtype,
+                    device=visual_token_mask.device,
+                )
+                visual_token_mask = torch.cat([visual_token_mask, pad], dim=0)
+
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.model,
             multimodal_model=self,
             positions=positions,
+            visual_token_mask=visual_token_mask,
         )
 
-        if get_embedding:
-            return self.pooler(hidden_states, forward_batch)
-        else:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
+        # if get_embedding:
+        #     return self.pooler(hidden_states, forward_batch)
+        # else:
+        #     return self.logits_processor(
+        #         input_ids, hidden_states, self.lm_head, forward_batch
+        #     )
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
