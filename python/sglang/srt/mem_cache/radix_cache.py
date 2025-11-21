@@ -426,20 +426,13 @@ class RadixCache(BasePrefixCache):
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        if self.page_size != 1:
-            # Handle partial page, the partial part should be freed in the next cache_unfinished_req and final cache_finished_req.
+        # - page_size != 1: there is a partial page at the end, keep the full kv_indices
+        # - eagle case: bigram keys will only cache len - 1 kv indices
+        if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
             )
-        else:
-            if self.is_eagle:
-                # Attach the kv index of the last token for EAGLE, it can be used in chunked prefill
-                assert len(token_ids) == len(keys) + 1
-                req.prefix_indices = torch.cat(
-                    [new_indices, kv_indices[len(new_indices) :]]
-                )
-            else:
-                req.prefix_indices = new_indices
+
         req.last_node = new_last_node
 
     def pretty_print(self):
