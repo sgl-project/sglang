@@ -1363,7 +1363,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
     def set_nsa_prefill_impl(self, forward_batch: Optional[ForwardBatch] = None):
         """
-        Decide all strategies for this batch.
+        Decide all attention prefill dispatch strategies for this batch.
         """
         from sglang.srt.utils import get_device_sm, is_blackwell
 
