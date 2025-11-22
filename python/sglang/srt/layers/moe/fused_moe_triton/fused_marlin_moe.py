@@ -154,13 +154,15 @@ def fused_marlin_moe(
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     )
 
-    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    import vllm._custom_ops as ops
+
+    intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
         w1,
-        # None,
+        None,
         w1_scale,
-        # None,
+        None,
         w1_zeros,
         g_idx1,
         sort_indices1,
@@ -173,7 +175,7 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
-        b_q_type_id=scalar_type1.id,
+        b_q_type=scalar_type1,
         size_m=M,
         size_n=2 * N,
         size_k=K,
@@ -188,13 +190,13 @@ def fused_marlin_moe(
     if expert_map is not None:
         intermediate_cache3.zero_()
 
-    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache3 = ops.moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
         w2,
-        # None,
+        None,
         w2_scale,
-        # None,
+        None,
         w2_zeros,
         g_idx2,
         sort_indices2,
@@ -207,7 +209,7 @@ def fused_marlin_moe(
         top_k=1,
         mul_topk_weights=True,
         is_ep=expert_map is not None,
-        b_q_type_id=scalar_type2.id,
+        b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
         size_k=N,
