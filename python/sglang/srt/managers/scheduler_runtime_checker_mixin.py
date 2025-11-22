@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils.common import (
+    ceil_align,
     disable_request_logging,
     pyspy_dump_schedulers,
     raise_error_or_warn,
@@ -83,7 +84,11 @@ class SchedulerRuntimeCheckerMixin:
             assert req.kv_committed_freed == req.kv_overallocated_freed
             uncached_len = 0
             if not req.kv_committed_freed:
-                uncached_len = req.kv_allocated_len - req.cache_protected_len
+                allocated_len = req.kv_allocated_len
+                if self.page_size > 1:
+                    allocated_len = ceil_align(allocated_len, self.page_size)
+                    assert req.cache_protected_len % self.page_size == 0
+                uncached_len = allocated_len - req.cache_protected_len
 
             ret += uncached_len
 
