@@ -51,7 +51,7 @@ struct dtype_trait<T> {
 
 inline constexpr auto kAnyDeviceID = -1;
 inline constexpr auto kAnySize = static_cast<int64_t>(-1);
-inline constexpr auto kNullSize = static_cast<int64_t>(0);
+inline constexpr auto kNullSize = static_cast<int64_t>(-1);
 inline constexpr auto kNullDType = static_cast<DLDataTypeCode>(18u);
 inline constexpr auto kNullDevice = static_cast<DLDeviceType>(-1);
 
@@ -142,7 +142,7 @@ struct SymbolicSize {
     m_value = value;
   }
   auto has_value() const -> bool {
-    return m_value != 0;
+    return m_value != details::kNullSize;
   }
   auto get_value() const -> std::optional<int64_t> {
     return this->has_value() ? std::optional{m_value} : std::nullopt;
