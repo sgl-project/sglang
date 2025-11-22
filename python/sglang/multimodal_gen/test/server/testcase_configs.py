@@ -304,7 +304,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
-        id="wan2_2_i2v_a14b",
+        id="wan2_2_i2v_a14b_2gpu",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
         modality="video",
         prompt="generate",
@@ -318,7 +318,7 @@ TWO_GPU_CASES = [
         num_frames=1,
     ),
     DiffusionTestCase(
-        id="wan2_2_t2v_a14b",
+        id="wan2_2_t2v_a14b_2gpu",
         model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         modality="video",
         prompt="A curious raccoon",
@@ -329,7 +329,7 @@ TWO_GPU_CASES = [
         num_gpus=2,
     ),
     DiffusionTestCase(
-        id="wan2_1_t2v_14b",
+        id="wan2_1_t2v_14b_2gpu",
         model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
         modality="video",
         prompt="A curious raccoon",
@@ -340,7 +340,7 @@ TWO_GPU_CASES = [
         num_gpus=2,
     ),
     DiffusionTestCase(
-        id="wan2_1_i2v_14b_480P",
+        id="wan2_1_i2v_14b_480P_2gpu",
         model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
         output_size="832x1104",
         modality="video",
@@ -353,7 +353,7 @@ TWO_GPU_CASES = [
         num_gpus=2,
     ),
     DiffusionTestCase(
-        id="wan2_1_i2v_14b_720P",
+        id="wan2_1_i2v_14b_720P_2gpu",
         model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
         modality="video",
         prompt="Animate this image",
