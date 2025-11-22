@@ -11,13 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import ray
 import torch
 import triton
-from utils import (
-    BenchmarkConfig,
-    get_configs_compute_bound,
-    get_default_batch_sizes,
-    get_model_config,
-    sort_config,
-)
 from ray.experimental.tqdm_ray import tqdm
 
 from sglang.srt.layers.moe.fused_moe_triton import override_config
@@ -25,6 +18,13 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.utils import is_hip
+from sglang.tune.utils import (
+    BenchmarkConfig,
+    get_configs_compute_bound,
+    get_default_batch_sizes,
+    get_model_config,
+    sort_config,
+)
 
 _is_hip = is_hip()
 
