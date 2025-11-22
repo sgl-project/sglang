@@ -130,7 +130,7 @@ RUN  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
       echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
    ; \
    fi \
- && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && python3 -m pip install -e "python[all]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && python3 -m pip install vllm==0.10.2 --no-deps \
  && python3 -m pip install cachetools cbor2 \
  && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
@@ -145,7 +145,7 @@ RUN  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     else \
       echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
     fi \
- && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+ && FLASHINFER_CUBIN_DOWNLOAD_THREADS=8 FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 # Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
