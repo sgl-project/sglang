@@ -37,6 +37,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs import (
+    BailingMoeLinearConfig,
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
@@ -81,6 +82,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DeepseekVLV2Config,
     JetNemotronConfig,
     JetVLMConfig,
+    BailingMoeLinearConfig,
 ]
 
 _CONFIG_REGISTRY = {
