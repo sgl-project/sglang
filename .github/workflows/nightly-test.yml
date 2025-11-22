@@ -9,6 +9,13 @@ on:
     paths:
       - "python/sglang/version.py"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: nightly-test-${{ github.ref }}
@@ -21,6 +28,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -38,6 +47,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -67,6 +78,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -84,6 +97,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -116,6 +131,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -133,6 +150,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -152,6 +171,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -171,6 +192,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -181,6 +204,29 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
+
+  nightly-test-8-gpu-b200:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-b200
+    env:
+      RUNNER_LABELS: 8-gpu-b200
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 45
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
@@ -193,6 +239,7 @@ jobs:
       - nightly-test-4-gpu
       - nightly-test-8-gpu-h200
       - nightly-test-8-gpu-h20
+      - nightly-test-8-gpu-b200
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
