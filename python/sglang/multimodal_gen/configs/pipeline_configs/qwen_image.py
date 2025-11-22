@@ -10,8 +10,9 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConf
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ImagePipelineConfig,
     ModelTaskType,
-    PipelineConfig,
+    shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.utils import calculate_dimensions
 
