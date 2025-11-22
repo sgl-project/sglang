@@ -37,6 +37,7 @@ from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
     load_token_map,
+    update_hybrid_gdn_state_after_verify,
 )
 from sglang.srt.utils.common import (
     empty_context,
@@ -707,39 +708,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if self.target_worker.model_runner.hybrid_gdn_config is not None:
-            if verify_input.topk > 1 and accept_index.shape[0] > 0:
-                cumulative_accepted_lengths = torch.cumsum(accept_length, dim=0)
-                req_start_positions = torch.cat(
-                    [
-                        torch.zeros(
-                            1,
-                            dtype=cumulative_accepted_lengths.dtype,
-                            device=cumulative_accepted_lengths.device,
-                        ),
-                        cumulative_accepted_lengths[:-1],
-                    ]
-                )
-                first_token_indices_per_req = accept_index[req_start_positions]
-                last_token_indices_per_req = accept_index[
-                    cumulative_accepted_lengths - 1
-                ]
-                max_relative_indices_per_req = (
-                    last_token_indices_per_req - first_token_indices_per_req
-                )
-            else:
-                max_relative_indices_per_req = accept_length
-
-            if (
-                self.target_worker.model_runner.jet_nemotron_config is not None
-                and verify_input.topk == 1
-            ):
-                self.target_worker.model_runner.attn_backend.update_jet_nemotron_topk1_state_after_mtp_verify(
-                    accept_length, self.target_worker.model_runner.model
-                )
-            else:
-                self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                    max_relative_indices_per_req, self.target_worker.model_runner.model
-                )
+            update_hybrid_gdn_state_after_verify(
+                verify_input.topk,
+                accept_index,
+                accept_length,
+                self.target_worker.model_runner,
+            )
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
