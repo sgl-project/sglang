@@ -15,7 +15,10 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.utils.logging_utils import _SGLDiffusionLogger, get_is_main_process
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    _SGLDiffusionLogger,
+    get_is_main_process,
+)
 
 
 @dataclasses.dataclass

@@ -176,7 +176,7 @@ def wait_for_req_perf_record(
         records = read_perf_logs(log_path)
         print(f"{records=}")
         print(f"{len(records)=}")
-        if len(records) == prev_len + 1:
+        if len(records) > prev_len + 1:
             # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
             # potential error when there are multiple servers
             return records[-1], len(records)
