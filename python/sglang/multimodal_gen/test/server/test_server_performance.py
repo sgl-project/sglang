@@ -28,7 +28,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
-    DIFFUSION_CASES,
+    ONE_GPU_CASES,
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
@@ -44,24 +44,21 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 
-@pytest.fixture(params=DIFFUSION_CASES, ids=lambda c: c.id)
-def case(request) -> DiffusionTestCase:
-    """Provide a DiffusionTestCase for each test."""
-    return request.param
-
-
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
 
+    extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
+    extra_args += f" --num-gpus {case.num_gpus} --ulysses-degree {case.num_gpus}"
+
     # start server
     manager = ServerManager(
         model=case.model_path,
         port=port,
         wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
-        extra_args=os.environ.get("SGLANG_TEST_SERVE_ARGS", ""),
+        extra_args=extra_args,
     )
     ctx = manager.start()
 
@@ -98,10 +95,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         ctx.cleanup()
 
 
-class TestDiffusionPerformance:
+class TestDiffusionPerformanceBase:
     """Performance tests for all diffusion models/scenarios.
 
-    This single test class runs against all cases defined in DIFFUSION_CASES.
+    This single test class runs against all cases defined in ONE_GPU_CASES.
     Each case gets its own server instance via the parametrized fixture.
     """
 
@@ -553,7 +550,7 @@ the "scenarios" section of perf_baselines.json:
     ):
         """Single parametrized test that runs for all cases.
 
-        Pytest will execute this test once per case in DIFFUSION_CASES,
+        Pytest will execute this test once per case in ONE_GPU_CASES,
         with test IDs like:
         - test_diffusion_perf[qwen_image_text]
         - test_diffusion_perf[qwen_image_edit]
@@ -565,3 +562,12 @@ the "scenarios" section of perf_baselines.json:
             generate_fn,
         )
         self._validate_and_record(case, perf_record)
+
+
+class TestDiffusionPerformanceOneGpu(TestDiffusionPerformanceBase):
+    """Performance tests for 1-GPU diffusion cases."""
+
+    @pytest.fixture(params=ONE_GPU_CASES, ids=lambda c: c.id)
+    def case(request) -> DiffusionTestCase:
+        """Provide a DiffusionTestCase for each test."""
+        return request.param

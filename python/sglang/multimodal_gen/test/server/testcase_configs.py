@@ -214,7 +214,7 @@ IMAGE_INPUT_FILE = Path(__file__).resolve().parents[1] / "test_files" / "girl.jp
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
-DIFFUSION_CASES: list[DiffusionTestCase] = [
+ONE_GPU_CASES: list[DiffusionTestCase] = [
     # === Image to Video (I2V) ===
     # === Text to Image (T2I) ===
     DiffusionTestCase(
@@ -287,7 +287,7 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
     ),
 ]
 
-SP_CASES = [
+TWO_GPU_CASES = [
     DiffusionTestCase(
         id="wan2_2_i2v_a14b",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
