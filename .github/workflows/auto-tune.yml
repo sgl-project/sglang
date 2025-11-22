@@ -77,10 +77,17 @@ jobs:
           mkdir -p python/sglang/srt/layers/moe/fused_moe_triton/configs
           rsync -a downloaded-configs/ python/sglang/srt/layers/moe/fused_moe_triton/configs/
 
-      - name: Commit and push tuned configs
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add python/sglang/srt/layers/moe/fused_moe_triton/configs
-          git commit -m "Auto-tune fused MoE configs (all runners)" || echo "No changes to commit"
-          git push
+      - name: Create PR with tuned configs
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Auto-tune fused MoE configs (all runners)"
+          title: "Auto-tuned fused MoE configs"
+          body: |
+            Auto-tuned fused MoE Triton configs aggregated from all runners.
+
+            Trigger: `${{ github.workflow }} (#${{ github.run_number }})`, run_id `${{ github.run_id }}`.
+          branch: auto-tune/configs-${{ github.ref_name }}-${{ github.run_id }}
+          delete-branch: true
+          add-paths: |
+            python/sglang/srt/layers/moe/fused_moe_triton/configs/**
