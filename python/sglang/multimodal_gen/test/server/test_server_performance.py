@@ -568,6 +568,6 @@ class TestDiffusionPerformanceOneGpu(TestDiffusionPerformanceBase):
     """Performance tests for 1-GPU diffusion cases."""
 
     @pytest.fixture(params=ONE_GPU_CASES, ids=lambda c: c.id)
-    def case(request) -> DiffusionTestCase:
-        """Provide a DiffusionTestCase for each test."""
+    def case(self, request) -> DiffusionTestCase:
+        """Provide a DiffusionTestCase for each 1-GPU test."""
         return request.param
