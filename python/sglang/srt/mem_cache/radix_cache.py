@@ -22,6 +22,7 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
+import sys
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -43,6 +44,7 @@ from sglang.srt.mem_cache.evict_policy import (
     LFUStrategy,
     LRUStrategy,
     MRUStrategy,
+    PriorityStrategy,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -84,7 +86,7 @@ class TreeNode:
 
     counter = 0
 
-    def __init__(self, id: Optional[int] = None):
+    def __init__(self, id: Optional[int] = None, priority: int = 0):
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: RadixKey = None
@@ -101,6 +103,8 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # priority for priority-aware eviction
+        self.priority = priority
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -193,6 +197,7 @@ class RadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
         is_eagle: bool = False,
+        disable_finished_insert: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -201,6 +206,7 @@ class RadixCache(BasePrefixCache):
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
         self.is_eagle = is_eagle
+        self.disable_finished_insert = disable_finished_insert
 
         if enable_metrics:
             self.init_metrics_collector()
@@ -227,16 +233,19 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
         elif eviction_policy.lower() == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
+        elif eviction_policy.lower() == "priority":
+            self.eviction_strategy: EvictionStrategy = PriorityStrategy()
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
             )
         self.reset()
 
     ##### Public API #####
 
     def reset(self):
-        self.root_node = TreeNode()
+        # Initialize root with minimum priority so any real priority overrides it
+        self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=[], extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
@@ -327,7 +336,7 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: RadixKey, value=None, chunked=False):
+    def insert(self, key: RadixKey, value=None, chunked=False, priority: int = 0):
         if self.disable:
             return 0
 
@@ -336,7 +345,7 @@ class RadixCache(BasePrefixCache):
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        return self._insert_helper(self.root_node, key, value)
+        return self._insert_helper(self.root_node, key, value, priority)
 
     def _page_align_keys(self, key: list) -> list:
         if self.page_size == 1:
@@ -346,6 +355,10 @@ class RadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
+        # In deterministic mode, disable finished request insertion to radix cache
+        if self.disable_finished_insert:
+            is_insert = False
+
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -368,7 +381,8 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
-            new_prefix_len = self.insert(radix_key, values)
+            priority = getattr(req, "priority", 0) or 0
+            new_prefix_len = self.insert(radix_key, values, priority=priority)
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
@@ -402,7 +416,13 @@ class RadixCache(BasePrefixCache):
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(radix_key, values, chunked=chunked)
+        new_prefix_len = self.insert(
+            radix_key,
+            values,
+            chunked=chunked,
+            priority=getattr(req, "priority", 0) or 0,
+        )
+
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
         )
@@ -551,8 +571,9 @@ class RadixCache(BasePrefixCache):
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
+        # New node inherits child's priority (represents shared prefix)
         self._record_remove_event(child)
-        new_node = TreeNode()
+        new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -568,9 +589,14 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value):
+    def _insert_helper(self, node: TreeNode, key: RadixKey, value, priority: int = 0):
+        # Convert None priority to 0
+        if priority is None:
+            priority = 0
         access_time = time.monotonic()
         node.last_access_time = access_time
+        # Update priority along the path (take max to propagate higher priority)
+        node.priority = max(node.priority, priority)
         if len(key) == 0:
             return 0
 
@@ -587,13 +613,16 @@ class RadixCache(BasePrefixCache):
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
+                new_node.priority = max(new_node.priority, priority)
                 node = new_node
+            else:
+                node.priority = max(node.priority, priority)
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode()
+            new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = value
