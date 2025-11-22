@@ -238,7 +238,7 @@ class DeepEPMoE(FusedMoE):
 
     def _is_marlin_moe(self) -> bool:
         """Check if the current quantization method is Marlin MoE (CompressedTensors WNA16)."""
-        from sglang.srt.layers.quantization.compressed_tensors import (
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
             CompressedTensorsConfig,
         )
         from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
