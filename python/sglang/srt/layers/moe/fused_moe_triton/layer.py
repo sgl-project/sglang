@@ -1110,7 +1110,19 @@ class FlashInferFP4MoE(FusedMoE):
 
         hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
 
-        router_logits = router_logits.to(torch.float32)
+        routing_method_type = self.routing_method_type
+        assert (
+            routing_method_type is not None
+        ), "flashinfer trtllm moe nvfp4 backend has not been adapted for the current moe layer, you can set routing_method_type (See definition of RoutingMethodType please) for the moe layer explicitly for a quick adaptation."
+
+        if routing_method_type == RoutingMethodType.DeepSeekV3:
+            router_logits = router_logits.to(torch.float32)
+
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(hidden_states.dtype)
+        )
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1124,9 +1136,10 @@ class FlashInferFP4MoE(FusedMoE):
             symm_output = torch.empty(
                 num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
             )
+
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
-            routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
+            routing_bias=correction_bias,
             hidden_states=hs_fp4,
             hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
             gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
@@ -1154,7 +1167,7 @@ class FlashInferFP4MoE(FusedMoE):
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             tile_tokens_dim=None,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
+            routing_method_type=routing_method_type,
             do_finalize=True,
             output=symm_output,
         )[0]
