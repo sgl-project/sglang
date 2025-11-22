@@ -231,7 +231,13 @@ Consider updating perf_baselines.json with the snippets below:
             tmp_path = f"{video_id}.mp4"
             with open(tmp_path, "wb") as f:
                 f.write(content)
-            upload_file_to_slack(tmp_path, title=model, message=prompt)
+            upload_file_to_slack(
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.prompt,
+                file_path=tmp_path,
+                origin_file_path=case.image_path,
+            )
             os.remove(tmp_path)
 
             return video_id
@@ -262,7 +268,12 @@ Consider updating perf_baselines.json with the snippets below:
             tmp_path = f"{result.created}.png"
             with open(tmp_path, "wb") as f:
                 f.write(img_data)
-            upload_file_to_slack(tmp_path, title=case.model_path, message=case.prompt)
+            upload_file_to_slack(
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.prompt,
+                file_path=tmp_path,
+            )
             os.remove(tmp_path)
 
             return str(result.created)
@@ -299,7 +310,11 @@ Consider updating perf_baselines.json with the snippets below:
             with open(tmp_path, "wb") as f:
                 f.write(img_data)
             upload_file_to_slack(
-                tmp_path, title=case.model_path, message=case.edit_prompt
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.edit_prompt,
+                file_path=tmp_path,
+                origin_file_path=case.image_path,
             )
             os.remove(tmp_path)
 
