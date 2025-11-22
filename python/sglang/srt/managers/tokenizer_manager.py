@@ -41,7 +41,8 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.lora.lora_registry import LoRARegistry
+from sglang.srt.environ import envs
+from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -59,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetLoadReqInput,
     HealthCheckOutput,
+    LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
@@ -69,6 +71,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
 from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -82,6 +85,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
+    extract_trace_headers,
     trace_get_proc_propagate_context,
     trace_req_finish,
     trace_req_start,
@@ -208,6 +212,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
+            if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:
+                import_processors(
+                    envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
+                )
             try:
                 _processor = get_processor(
                     server_args.tokenizer_path,
@@ -322,6 +330,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
+        # Initialize performance metrics loggers with proper skip names
+        _, obj_skip_names, out_skip_names = self.log_request_metadata
+        self.request_metrics_exporter_manager = RequestMetricsExporterManager(
+            self.server_args, obj_skip_names, out_skip_names
+        )
+
         # Session
         self.session_futures = {}  # session_id -> asyncio event
 
@@ -344,6 +358,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
+        # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
+        # point to their latest LoRARef objects, so that they can be
+        # dynamically loaded if needed for inference
+        self.lora_ref_cache: Dict[str, LoRARef] = {}
+        if self.server_args.lora_paths is not None:
+            for lora_ref in self.server_args.lora_paths:
+                self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
         # Disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -411,14 +432,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        if request and "trace_context" in request.headers:
-            trace_set_remote_propagate_context(request.headers["trace_context"])
+        external_trace_header = None
+        if request:
+            if "trace_context" in request.headers:
+                trace_set_remote_propagate_context(request.headers["trace_context"])
+            else:
+                external_trace_header = extract_trace_headers(request.headers)
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
         if self.enable_trace:
-            self._trace_request_start(obj, created_time)
+            self._trace_request_start(obj, created_time, external_trace_header)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -431,6 +456,51 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         async with self.model_update_lock.reader_lock:
             if self.server_args.enable_lora and obj.lora_path:
+                if isinstance(obj.lora_path, str):
+                    unique_lora_paths = set([obj.lora_path])
+                else:
+                    unique_lora_paths = set(obj.lora_path)
+
+                if (
+                    self.server_args.max_loaded_loras is not None
+                    and len(unique_lora_paths) > self.server_args.max_loaded_loras
+                ):
+                    raise ValueError(
+                        f"Received request with {len(unique_lora_paths)} unique loras requested "
+                        f"but max loaded loras is {self.server_args.max_loaded_loras}"
+                    )
+
+                # Reload all existing LoRA adapters that have been dynamically unloaded
+                unregistered_loras = await self.lora_registry.get_unregistered_loras(
+                    unique_lora_paths
+                )
+                for lora_path in unregistered_loras:
+                    if lora_path is None:
+                        continue
+
+                    if lora_path not in self.lora_ref_cache:
+                        raise ValueError(
+                            f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+                            f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                        )
+
+                    logger.info(f"Reloading evicted adapter: {lora_path}")
+                    new_lora_ref = self.lora_ref_cache[lora_path]
+                    load_result = await self.load_lora_adapter(
+                        LoadLoRAAdapterReqInput(
+                            lora_name=new_lora_ref.lora_name,
+                            lora_path=new_lora_ref.lora_path,
+                            pinned=new_lora_ref.pinned,
+                        )
+                    )
+                    if (
+                        not load_result.success
+                        and "already loaded" not in load_result.error_message
+                    ):
+                        raise ValueError(
+                            f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
+                        )
+
                 # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
@@ -995,6 +1065,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
 
+                if self.request_metrics_exporter_manager.exporter_enabled():
+                    # Asynchronously write metrics for this request using the exporter manager.
+                    asyncio.create_task(
+                        self.request_metrics_exporter_manager.write_record(obj, out)
+                    )
+
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     finish_reason = out["meta_info"]["finish_reason"]
@@ -1172,7 +1248,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def pause_generation(self):
         async with self.is_pause_cond:
             self.is_pause = True
-            self.abort_request(abort_all=True)
+            # we are using the model_update_lock to check if there is still on-going requests.
+            while True:
+                # TODO: maybe make it async instead of fire-and-forget
+                self.abort_request(abort_all=True)
+                is_locked = await self.model_update_lock.is_locked()
+                if not is_locked:
+                    break
+                await asyncio.sleep(1.0)
 
     async def continue_generation(self):
         async with self.is_pause_cond:
@@ -1198,7 +1281,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
-                return await self._wait_for_model_update_from_disk(obj)
+                success, message, num_paused_requests = (
+                    await self._wait_for_model_update_from_disk(obj)
+                )
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message, num_paused_requests
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
@@ -1753,6 +1844,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
+                meta_info["spec_accept_token_num"] = accepted_tokens
+                meta_info["spec_draft_token_num"] = total_draft_tokens
+                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
     def _calculate_timing_metrics(
         self,
@@ -2301,6 +2395,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
+        external_trace_header: Optional[Dict] = None,
     ):
         if obj.is_single:
             bootstrap_room = (
@@ -2311,6 +2406,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 bootstrap_room,
                 ts=int(created_time * 1e9),
                 role=self.server_args.disaggregation_mode,
+                external_trace_header=external_trace_header,
             )
             trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
         else:
@@ -2325,6 +2421,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     bootstrap_room,
                     ts=int(created_time * 1e9),
                     role=self.server_args.disaggregation_mode,
+                    external_trace_header=external_trace_header,
                 )
                 trace_slice_start(
                     "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True

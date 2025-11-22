@@ -4,7 +4,7 @@
 
 # Adapted from torchtune
 # Copyright 2024 The TorchTune Authors.
-# Copyright 2025 The sgl-diffusion Authors.
+# Copyright 2025 The sglang-diffusion Authors.
 
 import contextlib
 from collections.abc import Callable, Generator
