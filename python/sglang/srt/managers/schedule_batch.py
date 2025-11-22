@@ -486,8 +486,6 @@ class Req:
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
-        self.kv_allocate_offset = 0
-
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
