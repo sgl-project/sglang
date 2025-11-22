@@ -1,3 +1,4 @@
+import contextlib
 import logging
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
@@ -49,6 +50,7 @@ class LoRAMemoryPool:
         self,
         base_hf_config: AutoConfig,
         max_loras_per_batch: int,
+        max_loras_prefetch: int,
         dtype: torch.dtype,
         tp_size: int,
         tp_rank: int,
@@ -60,6 +62,7 @@ class LoRAMemoryPool:
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
+        self.max_loras_prefetch: int = max_loras_prefetch
         self.dtype: torch.dtype = dtype
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
@@ -71,9 +74,9 @@ class LoRAMemoryPool:
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
-        #   (max_loras_per_batch, stacked_num * max_lora_dim, input_dim)
+        #   (max_loras_per_batch + max_loras_prefetch, stacked_num * max_lora_dim, input_dim)
         # B_buffer contains num_layer number of column-major tensors with shape
-        #   (stacked_num, max_loras_per_batch, output_dim, max_lora_dim)
+        #   (stacked_num, max_loras_per_batch + max_loras_prefetch, output_dim, max_lora_dim)
         self.A_buffer: Dict[str, List[torch.Tensor]] = {}
         self.B_buffer: Dict[str, List[torch.Tensor]] = {}
 
@@ -83,9 +86,15 @@ class LoRAMemoryPool:
         # Buffer idx -> lora uid in memory pool
         # All uids are initialized as `EmptySlot` for empty buffer slots
         # Here we don't initialize to None since None is a valid uid
-        self.buffer_id_to_uid: List[Union[str, None, EmptySlot]] = [
-            EMPTY_SLOT
-        ] * self.max_loras_per_batch
+        self.buffer_id_to_uid: List[Union[str, None, EmptySlot]] = [EMPTY_SLOT] * (
+            self.max_loras_per_batch + self.max_loras_prefetch
+        )
+
+        self.device = next(base_model.parameters()).device
+        if self.device.type == "cuda":
+            self.prefetch_stream = torch.cuda.Stream(device=self.device)
+        else:
+            self.prefetch_stream = None
 
         self.init_buffers(base_model)
 
@@ -125,7 +134,7 @@ class LoRAMemoryPool:
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
         return (
-            self.max_loras_per_batch,
+            self.max_loras_per_batch + self.max_loras_prefetch,
             max_lora_dim * c,
             input_dim,
         )
@@ -146,7 +155,7 @@ class LoRAMemoryPool:
         if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             output_dim = divide(output_dim, self.tp_size)
         return (
-            self.max_loras_per_batch,
+            self.max_loras_per_batch + self.max_loras_prefetch,
             output_dim,
             max_lora_dim,
         )
@@ -192,10 +201,30 @@ class LoRAMemoryPool:
         lora_adapters: Dict[str, LoRAAdapter],
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         lora_refs: Dict[str, LoRARef],
+        prefetch: bool,
     ):
+        stream_ctx = (
+            torch.cuda.stream(self.prefetch_stream)
+            if prefetch and self.prefetch_stream is not None
+            else (
+                torch.cuda.stream(torch.cuda.current_stream(self.device))
+                if self.device.type == "cuda"
+                else contextlib.nullcontext()
+            )
+        )
+
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
-            for buffer_id in range(self.max_loras_per_batch):
+            start_slot, stop_slot = (
+                (0, self.max_loras_per_batch)
+                if not prefetch
+                else (
+                    self.max_loras_per_batch,
+                    self.max_loras_per_batch + self.max_loras_prefetch,
+                )
+            )
+
+            for buffer_id in range(start_slot, stop_slot):
                 if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
 
@@ -235,19 +264,20 @@ class LoRAMemoryPool:
             )
             return victim_buffer_id
 
-        # Mark all adapters in current batch as used (for LRU tracking)
-        for uid in cur_uids:
-            self.eviction_policy.mark_used(uid)
+        with stream_ctx:
+            # Mark all adapters in current batch as used (for LRU tracking)
+            for uid in cur_uids:
+                self.eviction_policy.mark_used(uid)
 
-        for uid in cur_uids:
-            if uid not in self.uid_to_buffer_id:
-                buffer_id = get_available_buffer_slot()
-                lora_adapter = lora_adapters.get(uid, None)
-                self.load_lora_weight_to_buffer(
-                    uid, buffer_id, lora_adapter, lora_modules
-                )
-                self.uid_to_buffer_id[uid] = buffer_id
-                self.buffer_id_to_uid[buffer_id] = uid
+            for uid in cur_uids:
+                if uid not in self.uid_to_buffer_id:
+                    buffer_id = get_available_buffer_slot()
+                    lora_adapter = lora_adapters.get(uid, None)
+                    self.load_lora_weight_to_buffer(
+                        uid, buffer_id, lora_adapter, lora_modules
+                    )
+                    self.uid_to_buffer_id[uid] = buffer_id
+                    self.buffer_id_to_uid[buffer_id] = uid
 
     def load_lora_weight_to_buffer(
         self,

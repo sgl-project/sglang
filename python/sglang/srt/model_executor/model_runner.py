@@ -1348,6 +1348,7 @@ class ModelRunner:
             base_model=self.model,
             base_hf_config=self.model_config.hf_config,
             max_loras_per_batch=self.server_args.max_loras_per_batch,
+            max_loras_prefetch=self.server_args.max_loras_prefetch,
             load_config=self.load_config,
             dtype=self.dtype,
             lora_backend=self.server_args.lora_backend,
@@ -1357,6 +1358,21 @@ class ModelRunner:
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
             server_args=self.server_args,
+        )
+
+    def prefetch_lora_batch(self, prefetch_batch: ForwardBatch):
+        """Prefetch LoRA adapters for the given batch"""
+
+        logger.info(
+            f"LoRA adapter prefetch starts for batch size: {prefetch_batch.batch_size}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        self.lora_manager.prepare_lora_batch(prefetch_batch, prefetch=True)
+
+        logger.info(
+            f"LoRA adapter prefetch completes for batch size: {prefetch_batch.batch_size}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
