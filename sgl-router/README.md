@@ -466,7 +466,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 - **Memory** (default): In-memory storage, fast but ephemeral.
 - **None**: No storage, minimal overhead.
 - **Oracle**: Persistent storage backed by Oracle Autonomous Database.
-- **Postgre**: Persistent storage backed by Postgresql Database.
+- **Postgres**: Persistent storage backed by PostgreSQL Database.
 
 ```bash
 # Memory backend (default)
