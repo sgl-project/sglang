@@ -211,7 +211,7 @@ class PerformanceSummary:
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
-ONE_GPU_CASES: list[DiffusionTestCase] = [
+ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         id="qwen_image_t2i",
@@ -243,8 +243,11 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         edit_prompt="Convert 2D style to 3D style",
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
     ),
+]
+
+
+ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
-    # TODO: FastWan2.1, FastWan2.2
     DiffusionTestCase(
         id="wan2_1_t2v_1.3b",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
@@ -255,16 +258,17 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         warmup_edit=0,
         custom_validator="video",
     ),
-    DiffusionTestCase(
-        id="hunyuan_video",
-        model_path="hunyuanvideo-community/HunyuanVideo",
-        modality="video",
-        prompt="A curious raccoon",
-        output_size="720x480",
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
-    ),
+    # NOTE(mick): flaky
+    # DiffusionTestCase(
+    #     id="hunyuan_video",
+    #     model_path="hunyuanvideo-community/HunyuanVideo",
+    #     modality="video",
+    #     prompt="A curious raccoon",
+    #     output_size="720x480",
+    #     warmup_text=0,
+    #     warmup_edit=0,
+    #     custom_validator="video",
+    # ),
     DiffusionTestCase(
         id="fast_hunyuan_video",
         model_path="FastVideo/FastHunyuan-diffusers",

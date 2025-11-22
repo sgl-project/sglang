@@ -28,7 +28,6 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
-    ONE_GPU_CASES,
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
@@ -403,7 +402,7 @@ Consider updating perf_baselines.json with the snippets below:
             validator.validate(perf_record, case.num_frames)
         except AssertionError as e:
             logger.error(f"Performance validation failed for {case.id}:\n{e}")
-            self._dump_baseline_for_testcase(case, summary)
+            self._dump_baseline_for_testcase(case, summary, missing_scenario)
             raise
 
         result = {
@@ -564,12 +563,3 @@ Consider updating perf_baselines.json with the snippets below:
             generate_fn,
         )
         self._validate_and_record(case, perf_record)
-
-
-class TestDiffusionPerformanceOneGpu(DiffusionPerformanceBase):
-    """Performance tests for 1-GPU diffusion cases."""
-
-    @pytest.fixture(params=ONE_GPU_CASES, ids=lambda c: c.id)
-    def case(self, request) -> DiffusionTestCase:
-        """Provide a DiffusionTestCase for each 1-GPU test."""
-        return request.param
