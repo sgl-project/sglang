@@ -42,7 +42,7 @@ import re
 import time
 from enum import Enum, auto
 from http import HTTPStatus
-from itertools import chain
+from itertools import accumulate, chain
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -1111,6 +1111,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    # Dynamic Spec Decode
+    # Enable/disable speculative decoding from batch to batch
+    is_spec_enabled_for_batch: bool = False
+    # Turn off: need to extract last output_ids, set to False once
+    # output_ids handled.
+    turning_off_specdecode: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1160,6 +1166,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            is_spec_enabled_for_batch=(not spec_algorithm.is_none()),
         )
 
     def batch_size(self):
@@ -1626,9 +1633,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
-        if not self.spec_algorithm.is_none():
-            # if spec decoding is used, the decode batch is prepared inside
-            # `forward_batch_speculative_generation` after running draft models.
+        if not self.spec_algorithm.is_none() and self.is_spec_enabled_for_batch:
+            # if spec decoding is used and enabled for the batch, the decode
+            # batch is prepared inside `forward_batch_speculative_generation`
+            # after running draft models.
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
@@ -1654,8 +1662,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.output_ids.to(torch.int64)
                 )
 
-        # Update fields
-        self.input_ids = self.output_ids
+        if self.turning_off_specdecode:
+            # In the case of changing from spec decode to regular decode, we merge
+            # previously verified tokens with the extend generated tokens from different
+            # requests.
+            if (
+                self.spec_info is not None
+                and self.spec_info.accept_length_cpu is not None
+            ):
+                if isinstance(self.spec_info.accept_length_cpu, torch.Tensor):
+                    accept_length_cpu = self.spec_info.accept_length_cpu.tolist()
+                else:
+                    accept_length_cpu = self.spec_info.accept_length_cpu
+                accept_length = [acc + 1 for acc in accept_length_cpu]
+                # Expand for the newly merged in request.
+                accept_length.extend([1] * (bs - len(accept_length)))
+                kept_output_ids = [idx - 1 for idx in list(accumulate(accept_length))]
+                assert len(kept_output_ids) == bs
+                self.input_ids = self.output_ids[kept_output_ids]
+            else:
+                self.input_ids = self.output_ids
+            self.turning_off_specdecode = False
+        else:
+            self.input_ids = self.output_ids
+
         self.output_ids = None
 
         if self.model_config.is_encoder_decoder:
@@ -1753,6 +1783,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered = False
             else:
                 has_been_filtered = True
+            if not self.is_spec_enabled_for_batch:
+                has_been_filtered = False
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
@@ -1885,6 +1917,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            is_spec_enabled_for_batch=self.is_spec_enabled_for_batch,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,

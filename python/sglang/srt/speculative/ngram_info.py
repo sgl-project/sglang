@@ -57,6 +57,7 @@ class NgramVerifyInput(SpecInput):
         retrive_next_token: torch.Tensor,
         retrive_next_sibling: torch.Tensor,
         draft_token_num: int,
+        accept_length_cpu: torch.Tensor,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -67,6 +68,7 @@ class NgramVerifyInput(SpecInput):
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
+        self.accept_length_cpu = accept_length_cpu
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -155,13 +157,16 @@ class NgramVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: torch.Tensor,
     ):
-        accept_index_cpu = self.accept_index.tolist()
+        accept_index_cpu = self.accept_index.cpu()
+        accept_index_cpu_list = accept_index_cpu.tolist()
         predict_cpu = self.predict.tolist()
         has_finished = False
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
-        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+        for i, (req, accept_index_row) in enumerate(
+            zip(batch.reqs, accept_index_cpu_list)
+        ):
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
@@ -187,8 +192,8 @@ class NgramVerifyInput(SpecInput):
             req.spec_verify_ct += 1
         if has_finished:
             self.accept_length = (self.accept_index != -1).sum(dim=1) - 1
+            self.accept_length_cpu = (accept_index_cpu != -1).sum(dim=1) - 1
         self.accept_index = self.accept_index[self.accept_index != -1]
-
         logits_output.next_token_logits = logits_output.next_token_logits[
             self.accept_index
         ]
@@ -426,13 +431,13 @@ class NgramVerifyInput(SpecInput):
 
         self._fill_requests(batch, logits_output)
 
-        accept_length_cpu = self.accept_length.cpu()
-        num_accepted_tokens = accept_length_cpu.sum().item()
+        self.accept_length_cpu = self.accept_length.cpu()
+        num_accepted_tokens = self.accept_length_cpu.sum().item()
 
-        self._free_cache(batch, page_size, accept_length_cpu)
+        self._free_cache(batch, page_size, self.accept_length_cpu)
 
         batch.seq_lens.add_(self.accept_length + 1)
-        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+        batch.seq_lens_cpu.add_(self.accept_length_cpu + 1)
 
         return logits_output, self.verified_id, num_accepted_tokens
 

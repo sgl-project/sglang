@@ -401,6 +401,8 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    # Dynamic speculative decoding
+    speculative_batch_size_threshold: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -886,6 +888,15 @@ class ServerArgs:
             )
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+
+        if self.speculative_batch_size_threshold is not None:
+            # Split the two
+            self.capture_bs_for_decode = [
+                bs for bs in capture_bs if bs > self.speculative_batch_size_threshold
+            ]
+            capture_bs = [
+                bs for bs in capture_bs if bs <= self.speculative_batch_size_threshold
+            ]
 
         return capture_bs
 
@@ -1735,6 +1746,13 @@ class ServerArgs:
                 # TODO: support dp attention for ngram speculative decoding
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
+                )
+            if (
+                self.speculative_batch_size_threshold is not None
+                and self.speculative_algorithm != "NGRAM"
+            ):
+                raise ValueError(
+                    "Only Ngram speculative decoding supporting setting batch size threshold."
                 )
 
     def _handle_load_format(self):
@@ -2942,7 +2960,13 @@ class ServerArgs:
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
         )
-
+        # Dynamic Speculative Decoding
+        parser.add_argument(
+            "--speculative-batch-size-threshold",
+            type=int,
+            default=ServerArgs.speculative_batch_size_threshold,
+            help="The threshold batch size to turn off speculative decode afterwards.",
+        )
         # Expert parallelism
         parser.add_argument(
             "--expert-parallel-size",

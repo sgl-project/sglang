@@ -343,7 +343,6 @@ class Scheduler(
         self.draft_worker = self.spec_algorithm.create_draft_worker(
             **draft_worker_kwargs
         )
-
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
@@ -846,7 +845,7 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+        if self.spec_algorithm.is_none_or_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
             draft_token_to_kv_pool = (
@@ -1991,6 +1990,16 @@ class Scheduler(
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
+        # Update speculative decoding enablement flag for the current batch
+        if not self.spec_algorithm.is_none() and batch is not None:
+            threshold = self.server_args.speculative_batch_size_threshold
+            previous_enabled = batch.is_spec_enabled_for_batch
+            batch.is_spec_enabled_for_batch = (
+                threshold is None or batch.batch_size() <= threshold
+            )
+            if previous_enabled and not batch.is_spec_enabled_for_batch:
+                batch.turning_off_specdecode = True
+
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
@@ -2370,9 +2379,11 @@ class Scheduler(
             self.tp_worker.model_runner.graph_mem_usage, 2
         )
 
-        if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
+        if not self.spec_algorithm.is_none():
             ret["avg_spec_accept_length"] = (
-                self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
+                (self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct)
+                if self.spec_total_num_forward_ct > 0
+                else 0
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict

@@ -173,6 +173,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_ngram(self) -> bool:
         return self._has_flag("NGRAM")
 
+    def is_none_or_ngram(self) -> bool:
+        return self.is_none() or self.is_ngram()
+
     def create_draft_worker(self, **factory_kwargs: Any) -> Any:
         if self._draft_worker_factory is None:
             return None

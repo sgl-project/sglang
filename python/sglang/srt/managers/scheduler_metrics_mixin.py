@@ -266,12 +266,14 @@ class SchedulerMetricsMixin:
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or not batch.is_spec_enabled_for_batch:
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
             spec_accept_length = (
-                self.spec_num_accepted_tokens / self.spec_num_forward_ct
+                (self.spec_num_accepted_tokens / self.spec_num_forward_ct)
+                if self.spec_num_forward_ct > 0
+                else 0
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
             draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1

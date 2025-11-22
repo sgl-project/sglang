@@ -248,7 +248,7 @@ class CudaGraphRunner:
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
+        self.speculative_algorithm = model_runner.spec_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -272,9 +272,9 @@ class CudaGraphRunner:
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
         if (
-            model_runner.spec_algorithm.is_eagle()
-            or model_runner.spec_algorithm.is_standalone()
-            or model_runner.spec_algorithm.is_ngram()
+            self.speculative_algorithm.is_eagle()
+            or self.speculative_algorithm.is_standalone()
+            or self.speculative_algorithm.is_ngram()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -350,7 +350,7 @@ class CudaGraphRunner:
                 }
 
             # Speculative_inference
-            if model_runner.spec_algorithm.is_eagle3():
+            if self.speculative_algorithm.is_eagle3():
                 self.model_runner.model.set_eagle3_layers_to_capture()
 
             if self.is_encoder_decoder:
@@ -415,7 +415,7 @@ class CudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
+                if self.speculative_algorithm.is_eagle()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -465,7 +465,7 @@ class CudaGraphRunner:
                 forward_batch.batch_size * self.num_tokens_per_bs
                 == forward_batch.input_ids.numel()
             )
-            if self.model_runner.spec_algorithm.is_ngram()
+            if self.speculative_algorithm.is_ngram()
             else True
         )
 
@@ -688,7 +688,7 @@ class CudaGraphRunner:
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=mrope_positions,
-            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_algorithm=self.speculative_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=self.num_token_non_padded,
@@ -803,7 +803,7 @@ class CudaGraphRunner:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
+                if self.speculative_algorithm.is_eagle()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -813,7 +813,6 @@ class CudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
-
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
@@ -921,8 +920,8 @@ class CudaGraphRunner:
     def get_spec_info(self, num_tokens: int):
         spec_info = None
         if (
-            self.model_runner.spec_algorithm.is_eagle()
-            or self.model_runner.spec_algorithm.is_standalone()
+            self.speculative_algorithm.is_eagle()
+            or self.speculative_algorithm.is_standalone()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -945,7 +944,7 @@ class CudaGraphRunner:
                     seq_lens_cpu=None,
                 )
 
-        elif self.model_runner.spec_algorithm.is_ngram():
+        elif self.speculative_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
             spec_info = NgramVerifyInput(
@@ -956,6 +955,7 @@ class CudaGraphRunner:
                 retrive_next_token=None,
                 retrive_next_sibling=None,
                 draft_token_num=self.num_tokens_per_bs,
+                accept_length_cpu=None,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
