@@ -40,6 +40,67 @@ else:
 logger = logging.getLogger(__name__)
 
 
+@triton.jit
+def shift_append_input_ids_kernel(
+    input_ids_ptr,
+    next_ids_ptr,
+    offsets_ptr,
+    lens_ptr,
+    n_seq,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= n_seq:
+        return
+
+    offset = tl.load(offsets_ptr + pid)
+    length = tl.load(lens_ptr + pid)
+    n = tl.maximum(length - 1, 0)
+
+    base_src = input_ids_ptr + offset + 1
+    base_dst = input_ids_ptr + offset
+
+    start = 0
+    while start < n:
+        idx = start + tl.arange(0, BLOCK)
+        mask = idx < n
+        src = tl.load(base_src + idx, mask=mask, other=0)
+        tl.store(base_dst + idx, src, mask=mask)
+        start += BLOCK
+
+    if length > 0:
+        last_pos = offset + length - 1
+        last_val = tl.load(next_ids_ptr + pid)
+        tl.store(input_ids_ptr + last_pos, last_val)
+
+
+def shift_append_input_ids_triton(
+    input_ids: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    next_token_ids: torch.Tensor,
+):
+    if input_ids.numel() == 0:
+        return
+    assert input_ids.is_contiguous()
+
+    bs = extend_seq_lens.shape[0]
+    lens_i32 = extend_seq_lens.to(dtype=torch.int32)
+    offsets = torch.cumsum(lens_i32, dim=0) - lens_i32
+
+    shift_append_input_ids_kernel[(bs,)](
+        input_ids, next_token_ids, offsets, lens_i32, bs, BLOCK=128
+    )
+
+
+def warmup_eagle_triton_kernels(device: torch.device):
+    B, L = 4, 8
+    dummy_input_ids = torch.zeros(B * L, dtype=torch.int64, device=device)
+    dummy_lens = torch.full((B,), L, dtype=torch.int64, device=device)
+    dummy_next_ids = torch.zeros(B, dtype=torch.int64, device=device)
+    shift_append_input_ids_triton(dummy_input_ids, dummy_lens, dummy_next_ids)
+    torch.cuda.synchronize(device)
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()

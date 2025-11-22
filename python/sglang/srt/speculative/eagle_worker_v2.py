@@ -37,6 +37,8 @@ from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
     load_token_map,
+    shift_append_input_ids_triton,
+    warmup_eagle_triton_kernels,
 )
 from sglang.srt.utils.common import (
     empty_context,
@@ -142,6 +144,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+        # Warmup Triton kernels to avoid JIT compilation overhead
+        self._warmup_triton_kernels()
+
     def init_token_map(self):
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -209,6 +214,10 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
+
+    def _warmup_triton_kernels(self):
+        if self.device == "cuda" and not _is_npu:
+            warmup_eagle_triton_kernels(self.device)
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -432,31 +441,36 @@ class EagleDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
-        # Construct input_ids
-        if not batch.forward_mode.is_idle():
-            pt = 0
-            for i, extend_len in enumerate(batch.extend_seq_lens):
-                input_ids = batch.input_ids[pt : pt + extend_len]
-                batch.input_ids[pt : pt + extend_len] = torch.cat(
-                    (input_ids[1:], next_token_ids[i].reshape(1))
-                )
-                pt += extend_len
-
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
             allocate_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 num token per batch
             num_tokens_per_batch=1,
             num_tokens_for_logprob_per_batch=1,
         )
-
         batch.spec_info = next_draft_input
 
-        # Run forward
+        # Create ForwardBatch first to reuse extend_seq_lens
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+
+        # Construct input_ids (in-place)
+        if not batch.forward_mode.is_idle():
+            if self.device == "cuda" and not _is_npu:
+                shift_append_input_ids_triton(
+                    batch.input_ids, forward_batch.extend_seq_lens, next_token_ids
+                )
+            else:
+                pt = 0
+                for i, extend_len in enumerate(batch.extend_seq_lens):
+                    input_ids = batch.input_ids[pt : pt + extend_len]
+                    batch.input_ids[pt : pt + extend_len] = torch.cat(
+                        (input_ids[1:], next_token_ids[i].reshape(1))
+                    )
+                    pt += extend_len
+
+        # Run forward
         logits_output, _ = self.draft_runner.forward(forward_batch)
 
         # Update spec_info for the next draft step
