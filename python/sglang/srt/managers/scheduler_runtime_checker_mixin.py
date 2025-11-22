@@ -81,12 +81,9 @@ class SchedulerRuntimeCheckerMixin:
         ret = 0
         for req in batch.reqs:
             assert req.kv_committed_freed == req.kv_overallocated_freed
-            prefix_len = (
-                len(req.prefix_indices) if req.prefix_indices is not None else 0
-            )
             uncached_len = 0
             if not req.kv_committed_freed:
-                uncached_len = req.kv_allocated_len - prefix_len
+                uncached_len = req.kv_allocated_len - req.cache_protected_len
 
             ret += uncached_len
 
