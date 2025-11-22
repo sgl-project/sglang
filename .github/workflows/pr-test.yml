@@ -407,7 +407,7 @@ jobs:
         timeout-minutes: 60
         run: |
           cd python
-          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_2_gpu.py
+          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_perf_2_gpu.py
 
   unit-test-backend-1-gpu:
     needs: [check-changes, stage-a-test-1]
