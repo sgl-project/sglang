@@ -139,7 +139,7 @@ class TestStateManagement:
         assert list_resp.data is not None
         items = list_resp.data
         # Should have at least 6 items (3 inputs + 3 outputs)
-        assert len(items) > 6
+        assert len(items) >= 6
 
     def test_mutually_exclusive_parameters(self, setup_backend):
         """Test that previous_response_id and conversation are mutually exclusive."""
