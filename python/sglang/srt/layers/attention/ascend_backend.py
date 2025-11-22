@@ -376,7 +376,7 @@ class AscendAttnBackend(AttentionBackend):
                             num_key_value_heads=layer.tp_k_head_num,
                             input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
                             atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3,
+                            sparse_mode=3 if q_len != 1 else 0,
                             scale=layer.scaling,
                             next_tokens=0,
                         )[0]

@@ -1,10 +1,12 @@
 # How to Support New Diffusion Models
 
-This document explains how to add support for new diffusion models in SGLang Diffusion.
+This document explains how to add support for new diffusion models in SGLang diffusion.
 
 ## Architecture Overview
 
-SGLang Diffusion is engineered for both performance and flexibility, built upon a modular pipeline architecture. This design allows developers to easily construct complex, customized pipelines for various diffusion models by combining and reusing different components.
+SGLang diffusion is engineered for both performance and flexibility, built upon a modular pipeline architecture. This
+design allows developers to easily construct complex, customized pipelines for various diffusion models by combining and
+reusing different components.
 
 At its core, the architecture revolves around two key concepts, as highlighted in our [blog post](https://lmsys.org/blog/2025-11-07-sglang-diffusion/#architecture):
 
@@ -101,4 +103,5 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
 5.  **Register Configs**:
     - Register the configs in the central registry ([`registry.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)) via `_register_configs` to enable automatic loading and instantiation for the model. Modules are automatically loaded and injected based on the config and repository structure.
 
-By following this modular pattern of defining configurations and composing pipelines, you can integrate new diffusion models into SGLang with clarity and ease.
+By following this pattern of defining configurations and composing pipelines, you can integrate new diffusion models
+into SGLang with ease.

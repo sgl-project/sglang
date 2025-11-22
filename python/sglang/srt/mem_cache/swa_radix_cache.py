@@ -33,11 +33,11 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
-    _convert_to_bigram_key,
     _key_match_page_size1,
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -359,7 +359,7 @@ class SWARadixCache(BasePrefixCache):
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
 
         if is_eagle:
-            self.key_convert_fn = _convert_to_bigram_key
+            self.key_convert_fn = convert_to_bigram_key
         else:
             self.key_convert_fn = lambda key: key
 
@@ -474,7 +474,7 @@ class SWARadixCache(BasePrefixCache):
         )
 
         old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+        if self.is_eagle and old_prefix_len > req.cache_protected_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
@@ -536,7 +536,7 @@ class SWARadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
         old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+        if self.is_eagle and old_prefix_len > req.cache_protected_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
@@ -562,7 +562,7 @@ class SWARadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        req.last_matched_prefix_len = len(new_indices)
+        req.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
         swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
