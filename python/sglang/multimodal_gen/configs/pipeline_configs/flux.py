@@ -23,7 +23,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
     clip_preprocess_text,
 )
-from sglang.multimodal_gen.configs.pipelines.qwen_image import _pack_latents
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
