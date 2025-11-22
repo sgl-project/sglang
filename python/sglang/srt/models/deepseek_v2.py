@@ -417,7 +417,7 @@ def handle_attention_aiter(attn, forward_batch):
 
 def handle_attention_nsa(attn, forward_batch):
     """
-    Dispatch logic is centralized in NativeSparseAttnBackend and executed
+    Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
     backend = forward_batch.attn_backend
