@@ -164,7 +164,7 @@ def wait_for_req_perf_record(
     request_id: str,
     prev_len: int,
     log_path: Path,
-    timeout: float = 300.0,
+    timeout: float = 30.0,
 ) -> tuple[RequestPerfRecord | None, int]:
     """
     the stage metrics of this request should be in the performance_log file with {request-id}
@@ -183,6 +183,8 @@ def wait_for_req_perf_record(
     if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
         records = read_perf_logs(log_path)
         return None, len(records)
+
+    logger.error(f"record: {records}")
     raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
 
 

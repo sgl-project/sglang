@@ -209,13 +209,9 @@ class PerformanceSummary:
         )
 
 
-# Common paths
-IMAGE_INPUT_FILE = Path(__file__).resolve().parents[1] / "test_files" / "girl.jpg"
-
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [
-    # === Image to Video (I2V) ===
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         id="qwen_image_t2i",
@@ -256,7 +252,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         prompt="A curious raccoon",
         output_size="848x480",
         seconds=4,
-        warmup_text=0,  # warmups only for image gen models
+        warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
     ),
@@ -291,7 +287,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         prompt="Animate this image",
         edit_prompt="Add dynamic motion to the scene",
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        warmup_text=0,  # warmups only for image gen models
+        warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
         seconds=1,
@@ -304,7 +300,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         prompt="Animate this image",
         edit_prompt="Add dynamic motion to the scene",
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        warmup_text=0,  # warmups only for image gen models
+        warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
         seconds=1,
@@ -316,8 +312,8 @@ TWO_GPU_CASES = [
         id="wan2_2_i2v_a14b",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
         modality="video",
-        prompt="generate",  # passing in something since failing if no prompt is passed
-        warmup_text=0,  # warmups only for image gen models
+        prompt="generate",
+        warmup_text=0,
         warmup_edit=0,
         output_size="832x1104",
         edit_prompt="generate",
@@ -358,7 +354,7 @@ TWO_GPU_CASES = [
         prompt="Animate this image",
         edit_prompt="Add dynamic motion to the scene",
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        warmup_text=0,  # warmups only for image gen models
+        warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
         seconds=1,
@@ -372,7 +368,7 @@ TWO_GPU_CASES = [
         edit_prompt="Add dynamic motion to the scene",
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         output_size="832x1104",
-        warmup_text=0,  # warmups only for image gen models
+        warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
         seconds=1,
