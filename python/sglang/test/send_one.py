@@ -44,6 +44,7 @@ class BenchArgs:
         parser.add_argument("--host", type=str, default=BenchArgs.host)
         parser.add_argument("--port", type=int, default=BenchArgs.port)
         parser.add_argument("--batch-size", type=int, default=BenchArgs.batch_size)
+        parser.add_argument("--different-prompts", action="store_true")
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
         parser.add_argument(
             "--profile-name-prefix", type=str, default=BenchArgs.profile_name_prefix
@@ -110,7 +111,10 @@ def send_one_prompt(args):
         json_schema = None
 
     if args.batch_size > 1:
-        prompt = [prompt] * args.batch_size
+        if not args.different_prompts:
+            prompt = [prompt] * args.batch_size
+        else:
+            prompt = [f"Test case {i+1}: " + prompt for i in range(args.batch_size)]
 
     json_data = {
         "text": prompt,
