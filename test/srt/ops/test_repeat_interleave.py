@@ -1,6 +1,8 @@
 import time
+from typing import Tuple
 
 import numpy as np
+import pytest
 import torch
 
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy as cpu_numpy_impl
@@ -36,118 +38,104 @@ def benchmark_once(fn, grid_thw, iters: int = 1000):
     return (end - start), out
 
 
-def check_correctness_cpu():
+# (T, repeat_min, repeat_max)
+GRID_TEST_CONFIGS: list[Tuple[int, int, int]] = [
+    (16, 1, 4),  # small T, small repeat counts
+    (128, 0, 4),  # allow repeat=0 to test edge cases
+    (512, 1, 8),
+    (1024, 1, 16),
+]
+
+NUM_CASES_PER_CONFIG = 10
+
+
+def _generate_random_grid(T: int, repeat_min: int, repeat_max: int) -> torch.Tensor:
     """
-    Perform multiple CPU-side correctness checks:
-    - Different sizes of grid_thw
-    - Different ranges of repeat counts
-    - Check that inputs are not modified
-    - Check shape, dtype, and values are exactly the same
-      between torch_ref_impl and numpy_impl_cpu
+    grid_thw: [T, 3]
+    col0: repeat count
+    col1, col2: arbitrary positive integers (here 1..16)
     """
-    torch.manual_seed(0)
-    np.random.seed(0)
+    repeats = torch.randint(repeat_min, repeat_max + 1, (T, 1), dtype=torch.int32)
+    th = torch.randint(1, 17, (T, 1), dtype=torch.int32)
+    tw = torch.randint(1, 17, (T, 1), dtype=torch.int32)
+    grid_thw = torch.cat([repeats, th, tw], dim=1)
+    return grid_thw
 
-    # (T, repeat_min, repeat_max)
-    test_configs = [
-        (16, 1, 4),  # small T, small repeat counts
-        (128, 0, 4),  # allow repeat=0 to test edge cases
-        (512, 1, 8),
-        (1024, 1, 16),
-    ]
 
-    num_cases_per_config = 10
+class TestRepeatInterleave:
+    @classmethod
+    def setup_class(cls):
+        torch.set_num_threads(1)
 
-    for T, repeat_min, repeat_max in test_configs:
-        for _ in range(num_cases_per_config):
-            # grid_thw: [T, 3]
-            # col0: repeat count
-            # col1, col2: arbitrary positive integers (here 1..16)
-            repeats = torch.randint(
-                repeat_min, repeat_max + 1, (T, 1), dtype=torch.int32
+    def setup_method(self, method):
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+    @pytest.mark.parametrize(
+        "T,repeat_min,repeat_max",
+        GRID_TEST_CONFIGS,
+    )
+    @pytest.mark.parametrize("case_idx", range(NUM_CASES_PER_CONFIG))
+    def test_cpu_correctness_random_cases(
+        self,
+        T: int,
+        repeat_min: int,
+        repeat_max: int,
+        case_idx: int,
+    ):
+        torch.manual_seed(case_idx)
+        np.random.seed(case_idx)
+
+        grid_thw = _generate_random_grid(T, repeat_min, repeat_max)
+
+        grid_clone = grid_thw.clone()
+
+        out_torch = torch_ref_impl(grid_thw)
+        out_numpy = cpu_numpy_impl(grid_thw)
+
+        assert torch.equal(grid_thw, grid_clone), "Function modified input grid_thw!"
+
+        assert (
+            out_torch.shape == out_numpy.shape
+        ), f"Shape mismatch: torch={out_torch.shape}, numpy={out_numpy.shape}"
+
+        assert (
+            out_torch.dtype == torch.int32
+        ), f"Unexpected torch dtype: {out_torch.dtype}"
+        assert (
+            out_numpy.dtype == torch.int32
+        ), f"Unexpected numpy impl dtype: {out_numpy.dtype}"
+
+        if not torch.equal(out_torch.cpu(), out_numpy.cpu()):
+            diff_idx = (out_torch.cpu() != out_numpy.cpu()).nonzero(as_tuple=False)
+            idx0 = diff_idx[0].item()
+            pytest.fail(
+                f"Value mismatch, T={T}, case_idx={case_idx}, first differing index={idx0}, "
+                f"torch={out_torch[idx0].item()}, "
+                f"numpy={out_numpy[idx0].item()}"
             )
-            th = torch.randint(1, 17, (T, 1), dtype=torch.int32)
-            tw = torch.randint(1, 17, (T, 1), dtype=torch.int32)
-            grid_thw = torch.cat([repeats, th, tw], dim=1)
 
-            # Save a copy to ensure functions do not modify inputs
-            grid_clone = grid_thw.clone()
-
-            out_torch = torch_ref_impl(grid_thw)
-            out_numpy = cpu_numpy_impl(grid_thw)
-
-            # Input should not be modified
-            assert torch.equal(
-                grid_thw, grid_clone
-            ), "Function modified input grid_thw!"
-
-            # Shapes must be the same
-            assert (
-                out_torch.shape == out_numpy.shape
-            ), f"Shape mismatch: torch={out_torch.shape}, numpy={out_numpy.shape}"
-
-            # Dtypes must be the same (should both be int32)
-            assert (
-                out_torch.dtype == out_numpy.dtype == torch.int32
-            ), f"dtype mismatch: torch={out_torch.dtype}, numpy={out_numpy.dtype}"
-
-            # Values must be exactly the same
-            if not torch.equal(out_torch.cpu(), out_numpy.cpu()):
-                diff_idx = (out_torch.cpu() != out_numpy.cpu()).nonzero(as_tuple=False)
-                idx0 = diff_idx[0].item()
-                raise AssertionError(
-                    f"Value mismatch, T={T}, first differing index={idx0}, "
-                    f"torch={out_torch[idx0].item()}, "
-                    f"numpy={out_numpy[idx0].item()}"
-                )
-
-    print("CPU correctness check: PASSED.")
-
-
-def main():
-    # Setting number of threads to reduce noise from thread scheduling;
-    # you can comment this out if you prefer default behavior.
-    torch.set_num_threads(1)
-
-    # --------------- Correctness check ---------------
-    check_correctness_cpu()
-    print("\nAll correctness checks passed. Starting benchmark...\n")
-
-    # --------------- Performance benchmark ---------------
-    # Typical scales:
-    # T = number of rows in grid_thw
-    # H, W only participate in multiplication
-    configs = [
-        (128, 8, 8),
-        (512, 8, 8),
-        (2048, 8, 8),
-        (8192, 8, 8),
-    ]
-
-    iters = 2000  # number of iterations per configuration
-
-    print("=== CPU benchmark ===")
-    for T, H, W in configs:
-        # Construct grid_thw: [T, 3]
-        # col0: repeat count
-        # col1, col2: multiplicative factors
-        grid_thw = torch.randint(1, 5, (T, 3), dtype=torch.int32)
-        grid_thw[:, 1] = H
-        grid_thw[:, 2] = W
-
-        t_torch, out_torch = benchmark_once(torch_ref_impl, grid_thw, iters=iters)
-        t_numpy, out_numpy = benchmark_once(cpu_numpy_impl, grid_thw, iters=iters)
-
-        # Additional safety check: results should match
-        same = torch.equal(out_torch.cpu(), out_numpy.cpu())
-
-        print(
-            f"[CPU] T={T:5d}, iters={iters:4d} | "
-            f"torch={t_torch*1e3:7.2f} ms, "
-            f"numpy={t_numpy*1e3:7.2f} ms, "
-            f"same={same}"
+    def test_zero_repeat_edge_case(self):
+        T = 4
+        grid_thw = torch.tensor(
+            [
+                [0, 4, 4],
+                [1, 2, 3],  # 6
+                [2, 1, 5],  # 5, 5
+                [0, 7, 7],  # 0
+            ],
+            dtype=torch.int32,
         )
 
+        grid_clone = grid_thw.clone()
 
-if __name__ == "__main__":
-    main()
+        out_torch = torch_ref_impl(grid_thw)
+        out_numpy = cpu_numpy_impl(grid_thw)
+
+        assert torch.equal(
+            grid_thw, grid_clone
+        ), "Function modified input grid_thw with zero repeats!"
+
+        assert torch.equal(
+            out_torch.cpu(), out_numpy.cpu()
+        ), f"Zero-repeat case mismatch: torch={out_torch}, numpy={out_numpy}"
