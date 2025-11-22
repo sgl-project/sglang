@@ -121,7 +121,7 @@ RUN  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
       python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
    ; \
    elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
+      python3 -m pip install sgl-kernel==0.3.17.post2 \
    ; \
    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
       python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
