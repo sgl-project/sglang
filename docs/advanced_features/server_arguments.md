@@ -285,6 +285,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | `None` | Type: str |
 | `--init-expert-location` | Initial location of EP experts. | `trivial` | Type: str |
 | `--enable-eplb` | Enable EPLB algorithm | `False` | bool flag (set to enable) |
+| `--enable-eplb-async-d2d` | Enable expert asynchronous transfer when EPLB is active. | `False` | bool flag (set to enable) |
 | `--eplb-algorithm` | Chosen EPLB algorithm | `auto` | Type: str |
 | `--eplb-rebalance-num-iterations` | Number of iterations to automatically trigger a EPLB re-balance. | `1000` | Type: int |
 | `--eplb-rebalance-layers-per-chunk` | Number of layers to rebalance per forward pass. | `None` | Type: int |
