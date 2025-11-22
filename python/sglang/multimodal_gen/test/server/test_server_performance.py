@@ -95,7 +95,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         ctx.cleanup()
 
 
-class TestDiffusionPerformanceBase:
+class DiffusionPerformanceBase:
     """Performance tests for all diffusion models/scenarios.
 
     This single test class runs against all cases defined in ONE_GPU_CASES.
@@ -564,7 +564,7 @@ the "scenarios" section of perf_baselines.json:
         self._validate_and_record(case, perf_record)
 
 
-class TestDiffusionPerformanceOneGpu(TestDiffusionPerformanceBase):
+class TestDiffusionPerformanceOneGpu(DiffusionPerformanceBase):
     """Performance tests for 1-GPU diffusion cases."""
 
     @pytest.fixture(params=ONE_GPU_CASES, ids=lambda c: c.id)
