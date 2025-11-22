@@ -69,6 +69,7 @@ from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -449,6 +450,8 @@ class MiMoV2Attention(nn.Module):
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        if get_bool_env_var("SGLANG_O_PROJ_FP8_QUANT") == False:
+            quant_config = None
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
