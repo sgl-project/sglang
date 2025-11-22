@@ -53,7 +53,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -110,9 +110,15 @@ class GptOssSparseMoeBlock(nn.Module):
         self.gemm1_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.gemm1_clamp_limit = config.swiglu_limit
 
+        # GGUF GPT-OSS model use STANDARD output format for TopK
+        if quant_config is not None and quant_config.get_name() == "gguf":
+            output_format = TopKOutputFormat.STANDARD
+        else:
+            output_format = None
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
+            output_format=output_format,
         )
 
         self.top_k = config.num_experts_per_tok

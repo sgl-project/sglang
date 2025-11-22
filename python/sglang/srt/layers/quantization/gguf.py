@@ -33,7 +33,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -43,7 +43,7 @@ if _is_cuda:
         ggml_mul_mat_vec_a8,
     )
 else:
-    warnings.warn(f"Only CUDA support GGUF q uantization currently.")
+    warnings.warn(f"Only CUDA support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -188,12 +188,16 @@ def fused_moe_gguf(
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if activation == "silu":
-            silu_and_mul(out, x)
+            silu_and_mul(x, out)
         elif activation == "gelu":
-            gelu_and_mul(out, x)
+            gelu_and_mul(x, out)
         else:
             raise ValueError(f"Unsupported activation: {activation}")
         return out
+
+    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+        moe_align_block_size,
+    )
 
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
@@ -517,8 +521,6 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.fused_experts is None
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
@@ -527,6 +529,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        print(topk_output)
 
         moe_runner_config = self.moe_runner_config
 

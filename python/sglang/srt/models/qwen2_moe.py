@@ -532,6 +532,7 @@ class Qwen2MoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
