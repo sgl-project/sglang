@@ -139,9 +139,7 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 )
 
 # TODO make it true by default when the DeepEP PR is merged
-CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
-    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
-)
+MOE_NVFP4_DISPATCH = get_bool_env_var("SGLANG_MOE_NVFP4_DISPATCH", "false")
 FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
@@ -1492,7 +1490,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)
 
-            if CUTEDSL_MOE_NVFP4_DISPATCH:
+            if MOE_NVFP4_DISPATCH:
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
         else:
@@ -1518,7 +1516,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant if CUTEDSL_MOE_NVFP4_DISPATCH else None
+                    layer.w13_input_scale_quant if MOE_NVFP4_DISPATCH else None
                 )
             }
         )
@@ -1740,7 +1738,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         out = flashinfer_cutedsl_moe_masked(
             hidden_states=x,
             input_global_scale=(
-                None if CUTEDSL_MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
+                None if MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
             ),
             w1=layer.w13_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
