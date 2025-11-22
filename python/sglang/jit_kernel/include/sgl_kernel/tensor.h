@@ -56,9 +56,9 @@ inline constexpr auto kNullDType = static_cast<DLDataTypeCode>(18u);
 inline constexpr auto kNullDevice = static_cast<DLDeviceType>(-1);
 
 template <typename... Ts>
-inline constexpr auto kDTypeList = std::array{dtype_trait<Ts>::value...};
+inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{dtype_trait<Ts>::value...};
 
-template <auto... Codes>
+template <DLDeviceType... Codes>
 inline constexpr auto kDeviceList = std::array<DLDevice, sizeof...(Codes)>{
     DLDevice{.device_type = static_cast<DLDeviceType>(Codes), .device_id = kAnyDeviceID}...};
 
@@ -69,9 +69,8 @@ struct PrintAbleSpan {
 };
 
 // define DLDataType comparison and printing in root namespace
-template <void* = nullptr>
 inline constexpr auto kDeviceStringMap = [] {
-  constexpr auto map = std::array{
+  constexpr auto map = std::array<std::pair<DLDeviceType, const char*>, 16>{
       std::pair{DLDeviceType::kDLCPU, "cpu"},
       std::pair{DLDeviceType::kDLCUDA, "cuda"},
       std::pair{DLDeviceType::kDLCUDAHost, "cuda_host"},
@@ -102,7 +101,7 @@ struct PrintableDevice {
 };
 
 inline auto& operator<<(std::ostream& os, DLDevice device) {
-  const auto& mapping = kDeviceStringMap<>;
+  const auto& mapping = kDeviceStringMap;
   const auto entry = static_cast<std::size_t>(device.device_type);
   host::RuntimeCheck(entry < mapping.size());
   const auto name = mapping[entry];
@@ -460,7 +459,7 @@ struct TensorMatcher {
     } else {
       host::RuntimeCheck(view.is_contiguous(), "Tensor is not contiguous as expected");
     }
-    // since we may double verify, we will force to check
+    // since we may use the same matcher to verify again, we will force to check
     m_dtype->verify(view.dtype());
     m_device->verify(view.device());
   }
