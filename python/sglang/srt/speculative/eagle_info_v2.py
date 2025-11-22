@@ -84,8 +84,7 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # TODO(lsyin): implement over-allocation
-        # Now seq_lens and allocate_lens are correct
+        # Now seq_lens is correct
         batch.maybe_wait_verify_done()
 
         page_size = batch.token_to_kv_pool_allocator.page_size

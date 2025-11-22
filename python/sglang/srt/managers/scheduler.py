@@ -2074,8 +2074,6 @@ class Scheduler(
                     # batch.spec_info = EagleDraftInput(
                     #     future_indices=future_indices,
                     #     verify_done=batch_result.next_draft_input.verify_done,
-                    #     # FIXME(lsyin): remove the allocate_lens in EagleDraftInput
-                    #     allocate_lens=batch_result.next_draft_input.allocate_lens,
                     # )
 
                     # The future value, usually for next batch preparation
