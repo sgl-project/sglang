@@ -131,20 +131,16 @@ class TensorWrapper:
         self.shape = list(tensor.shape)
         self.dtype = tensor.dtype
 
-        # Create buffer view
+        # Create buffer view based on Python version
         if sys.version_info >= (3, 12):
             data_ptr = tensor.data_ptr()
             total_bytes = tensor.numel() * tensor.element_size()
-            self.buffer = memoryview(
+            self._buffer = memoryview(
                 (ctypes.c_char * total_bytes).from_address(data_ptr)
             )
         else:
-            self.buffer = np.asarray(tensor)
-
-    # Make it work with ZMQ zero-copy
-    def __buffer__(self, flag):
-        return self.buffer
-
+            # For Python 3.10, just use numpy - it already supports buffer protocol
+            self._buffer = np.asarray(tensor)
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
     is_cross_node = server_args.dist_init_addr
@@ -1069,7 +1065,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 pickle.dumps(feature_infos),
             ]
             # Add wrappers - they keep tensors alive and provide buffer interface
-            parts.extend(feature_wrappers)
+            for wrapper in feature_wrappers:
+                parts.append(wrapper._buffer)
+
 
             self.send_to_scheduler.send_multipart(parts, copy=False)
         else:
