@@ -25,7 +25,7 @@ MODELS: List[str] = [
 ]
 TP_SIZES: List[int] = [1, 2, 4, 8]
 EP_SIZES: List[int] = [1, 2, 4, 8]
-DTYPES: List[str] = ["fp8_w8a8", "int8_w8a8", "int8_w8a16"]
+DTYPES: List[str] = ["auto", "fp8_w8a8", "int8_w8a8", "int8_w8a16"]
 PER_CHANNEL_QUANT: List[bool] = [True, False]
 BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
 SEEDS: List[int] = [0]
