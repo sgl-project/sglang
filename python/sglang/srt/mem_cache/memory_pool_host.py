@@ -9,6 +9,9 @@ import torch
 
 from sglang.jit_kernel.hicache import can_use_hicache_jit_kernel
 from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
+)
+from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
@@ -391,16 +394,17 @@ class MHATokenToKVPoolHost(HostKVCache):
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
-                    for layer_id in range(self.layer_num):
-                        jit_transfer_hicache_one_layer(
-                            k_cache_dst=self.k_buffer[layer_id],
-                            v_cache_dst=self.v_buffer[layer_id],
-                            k_cache_src=device_pool.k_buffer[layer_id],
-                            v_cache_src=device_pool.v_buffer[layer_id],
-                            indices_dst=host_indices,
-                            indices_src=device_indices,
-                            element_dim=self.element_dim,
-                        )
+                    jit_transfer_hicache_all_layer(
+                        k_ptr_dst=self.k_data_ptrs,
+                        v_ptr_dst=self.v_data_ptrs,
+                        indices_dst=host_indices,
+                        k_ptr_src=device_pool.k_data_ptrs,
+                        v_ptr_src=device_pool.v_data_ptrs,
+                        indices_src=device_indices,
+                        kv_cache_dst_stride_bytes=self.token_stride_size,
+                        kv_cache_src_stride_bytes=self.token_stride_size,
+                        element_size=self.element_dim * self.dtype.itemsize,
+                    )
                 else:
                     transfer_kv_all_layer(
                         src_k_layers=device_pool.k_data_ptrs,

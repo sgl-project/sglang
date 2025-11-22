@@ -27,7 +27,10 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         "hicache",
         *args,
         cuda_files=["hicache.cuh"],
-        cuda_wrappers=[("launch_one", f"HiCacheKernel<{args}>::run_one")],
+        cuda_wrappers=[
+            ("launch_one", f"HiCacheKernel<{args}>::run_one"),
+            ("launch_all", f"HiCacheKernel<{args}>::run_all"),
+        ],
     )
 
 
@@ -105,9 +108,9 @@ def transfer_hicache_all_layer(
     k_ptr_src: torch.Tensor,
     v_ptr_src: torch.Tensor,
     indices_src: torch.Tensor,
+    *,
     kv_cache_src_stride_bytes: int,
     kv_cache_dst_stride_bytes: int,
-    *,
     element_size: int | None = None,
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
