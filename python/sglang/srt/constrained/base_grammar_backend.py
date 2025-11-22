@@ -126,7 +126,7 @@ class CacheEntry:
 class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], CacheEntry] = {}
+        self.cache: Dict[Tuple[str, str, bool], CacheEntry] = {}
 
     def _not_supported(self, key_type: str, key_string: str) -> None:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
@@ -151,9 +151,11 @@ class BaseGrammarBackend:
     def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("structural_tag", key_string)
 
-    def _init_value_dispatch(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
+    def _init_value_dispatch(
+        self, key: Tuple[str, str, bool]
+    ) -> Optional[BaseGrammarObject]:
         s = time.perf_counter()
-        key_type, key_string = key
+        key_type, key_string, may_can_reasoning = key
         if key_type == "json":
             grammar = self.dispatch_json(key_string)
         elif key_type == "regex":
@@ -173,16 +175,14 @@ class BaseGrammarBackend:
             grammar.grammar_stats.compilation_time = time.perf_counter() - s
         return grammar
 
-    def get_cached_or_future_value(
-        self, key: Tuple[str, str]
-    ) -> Optional[BaseGrammarObject]:
+    def get_cached_or_future_value(self, key: Tuple[str, str, bool]):
         value = self.cache.get(key)
         if value:
             return value.copy(), True
         value = self.executor.submit(self._init_value_dispatch, key)
         return value, False
 
-    def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+    def set_cache(self, key: Tuple[str, str, bool], value: BaseGrammarObject):
         self.cache[key] = value
 
     def reset(self):
