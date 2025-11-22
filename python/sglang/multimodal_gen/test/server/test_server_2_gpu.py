@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.multimodal_gen.test.server.test_server_performance import (
+from sglang.multimodal_gen.test.server.test_server_performance import (  # noqa: F401
     DiffusionPerformanceBase,
     diffusion_server,
 )
