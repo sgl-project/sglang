@@ -1,56 +1,61 @@
 import logging
 import os
+import tempfile
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def upload_file_to_slack(
-    file_path: str,
-    title: str = None,
-    message: str = None,
+    case_id: str = None,
+    model: str = None,
+    prompt: str = None,
+    file_path: str = None,
     origin_file_path: str = None,
 ) -> bool:
+    temp_path = None
     try:
         from slack_sdk import WebClient
-        from slack_sdk.errors import SlackApiError
-    except ImportError as e:
-        logger.warning(f"Failed to import slack_sdk: {str(e)}. Skipping Slack upload.")
-        return False
 
-    run_id = os.getenv("GITHUB_RUN_ID", "maybe local test")
-    channel_id = "C0A02NDF7UY"  # diffusion-ci
-    token = os.environ.get("SGLANG_DIFFUSION_SLACK_TOKEN")
+        run_id = os.getenv("GITHUB_RUN_ID", "local")
 
-    if not token:
-        logger.warning("SGLANG_DIFFUSION_SLACK_TOKEN not found. Skipping Slack upload.")
-        return False
+        token = os.environ.get("SGLANG_DIFFUSION_SLACK_TOKEN")
+        if not token or not file_path or not os.path.exists(file_path):
+            return False
 
-    if not os.path.exists(file_path):
-        logger.error(f"File not found: {file_path}")
-        return False
+        if origin_file_path and origin_file_path.startswith(("http", "https")):
+            suffix = os.path.splitext(urlparse(origin_file_path).path)[1] or ".tmp"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+                with urlopen(origin_file_path) as response:
+                    tf.write(response.read())
+                temp_path = tf.name
+                origin_file_path = temp_path
 
-    client = WebClient(token=token)
+        uploads = [{"file": file_path, "title": "Generated Image"}]
+        if origin_file_path and os.path.exists(origin_file_path):
+            uploads.insert(0, {"file": origin_file_path, "title": "Original Image"})
 
-    if title and message:
-        message = f"GITHUB_RUN_ID: {run_id}\nModel: {title}\nPrompt: {message}\n"
+        message = (
+            f"*GitHub Run ID:* {run_id}\n"
+            f"*Case ID:* `{case_id}`\n"
+            f"*Model:* `{model}`\n"
+            f"*Prompt:* {prompt}"
+        )
 
-    try:
-        logger.info(f"Uploading file to Slack: {file_path}")
-
-        client.files_upload_v2(
-            channel=channel_id,
-            file_uploads=file_path,
-            title=title if title else os.path.basename(file_path),
+        WebClient(token=token).files_upload_v2(
+            channel="C0A02NDF7UY",
+            file_uploads=uploads,
             initial_comment=message,
         )
 
         logger.info(f"File uploaded successfully: {os.path.basename(file_path)}")
         return True
 
-    except SlackApiError as e:
-        logger.error(f"Slack API error: {e.response['error']}")
-        return False
     except Exception as e:
-        logger.error(f"Unknown error during Slack upload: {str(e)}")
+        logger.error(f"Slack upload failed: {e}")
         return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
