@@ -105,7 +105,7 @@ def run_auto_tune(args: argparse.Namespace) -> None:
         )
         triton_version_dir = f"triton_{triton.__version__.replace('.', '_')}"
         output_path = (
-            Path(__file__).resolve().parent.parent
+            Path(__file__).resolve().parent
             / "srt"
             / "layers"
             / "moe"
