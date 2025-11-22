@@ -453,7 +453,6 @@ class BaseMultimodalProcessor(ABC):
 
     @staticmethod
     def validate_mm_data(
-        self,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
         audio_data: Optional[list] = None,
