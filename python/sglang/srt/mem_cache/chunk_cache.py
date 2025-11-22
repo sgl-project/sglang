@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
+    NSAHybridTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
@@ -58,8 +59,15 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool_allocator.free(kv_indices)
         self.protected_size_ -= len(req.prefix_indices)
+
+        if isinstance(self.token_to_kv_pool_allocator, NSAHybridTokenToKVPoolAllocator):
+            index_k_indices = self.req_to_token_pool.req_to_nsa_index_k[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free((kv_indices, index_k_indices))
+        else:
+            self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[

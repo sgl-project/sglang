@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.allocator import NSAHybridTokenToKVPoolAllocator
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils.common import disable_request_logging, pyspy_dump_schedulers
@@ -57,6 +58,30 @@ class SchedulerRuntimeCheckerMixin:
             f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
             f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
         )
+        return memory_leak, token_msg
+
+    def _check_nsa_memory(self: Scheduler):
+        """Check memory for NSA hybrid allocator (KV cache + index_k buffer)"""
+        _, _, available_size, evictable_size = self._get_token_info()
+        protected_size = self.tree_cache.protected_size()
+
+        # Check KV cache
+        kv_memory_leak = (available_size + evictable_size) != (
+            self.max_total_num_tokens - protected_size
+        )
+
+        # Check index_k buffer
+        index_k_available = self.token_to_kv_pool_allocator.index_k_available_size()
+        index_k_expected = self.max_total_num_tokens
+        index_k_memory_leak = index_k_available != index_k_expected
+
+        memory_leak = kv_memory_leak or index_k_memory_leak
+
+        token_msg = (
+            f"[KV Cache] {self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+            f"[Index K] {index_k_expected=}, {index_k_available=}\n"
+        )
+
         return memory_leak, token_msg
 
     def _check_radix_cache_memory(self: Scheduler):
@@ -145,6 +170,10 @@ class SchedulerRuntimeCheckerMixin:
             memory_leak, token_msg = self._check_hybrid_memory()
         elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
             memory_leak, token_msg = self._check_mamba_memory()
+        elif isinstance(
+            self.token_to_kv_pool_allocator, NSAHybridTokenToKVPoolAllocator
+        ):
+            memory_leak, token_msg = self._check_nsa_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
 

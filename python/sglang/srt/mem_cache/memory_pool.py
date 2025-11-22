@@ -337,6 +337,35 @@ class MambaPool:
         return data_ptrs, data_lens, item_lens
 
 
+class NSAReqToTokenPool(ReqToTokenPool):
+    """NSA ReqToTokenPool: separate mapping for KV cache and nsa indexer_k"""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+    ):
+        super().__init__(size, max_context_len, device, enable_memory_saver)
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.req_to_nsa_index_k = torch.zeros(
+                (size, max_context_len), dtype=torch.int32, device=device
+            )
+
+    def write_index_token(self, indices, values):
+        """Write indexer_k mapping"""
+        self.req_to_nsa_index_k[indices] = values
+
+    def clear(self):
+        super().clear()
+        self.req_to_nsa_index_k.zero_()
+
+
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
@@ -1647,6 +1676,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        """
+        Write index_k and scale to buffer
+
+        Args:
+            loc: indexer_k physical token IDs
+        """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale

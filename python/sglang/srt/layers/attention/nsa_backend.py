@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     compute_nsa_seqlens,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.mem_cache.memory_pool import NSAReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
 
@@ -102,6 +103,9 @@ class NSAMetadata:
     nsa_cu_seqlens_k: torch.Tensor  # cumsum of `nsa_cache_seqlens_int32`
     nsa_extend_seq_lens_list: List[int]
     nsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
+
+    # Separate page table for indexer_k (when enable hierarchical NSA)
+    index_real_page_table: Optional[torch.Tensor] = None
     nsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
     flashmla_metadata: Optional[NSAFlashMLAMetadata] = None
@@ -131,6 +135,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         return self.attn_metadata.cache_seqlens_int32
 
     def get_page_table_64(self) -> torch.Tensor:
+        if self.attn_metadata.index_real_page_table is not None:
+            return self.attn_metadata.index_real_page_table
         return self.attn_metadata.real_page_table
 
     def get_seqlens_expanded(self) -> torch.Tensor:
@@ -218,6 +224,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
 
         global NSA_PREFILL_IMPL, NSA_DECODE_IMPL
         NSA_PREFILL_IMPL = model_runner.server_args.nsa_prefill_backend
@@ -291,6 +298,13 @@ class NativeSparseAttnBackend(AttentionBackend):
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
+
+        # Build index_page_table for indexer_k if enabling hierarchical NSA
+        index_page_table = None
+        if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
+            index_page_table = self.req_to_token_pool.req_to_nsa_index_k[
+                forward_batch.req_pool_indices, :max_seqlen_k
+            ]
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -426,6 +440,11 @@ class NativeSparseAttnBackend(AttentionBackend):
             nsa_seqlens_expanded=seqlens_expanded,
             nsa_extend_seq_lens_list=extend_seq_lens_cpu,
             real_page_table=self._transform_table_1_to_real(page_table),
+            index_real_page_table=(
+                self._transform_table_1_to_real(index_page_table)
+                if index_page_table is not None
+                else None
+            ),
             nsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
         )
@@ -453,6 +472,12 @@ class NativeSparseAttnBackend(AttentionBackend):
             ),
             # fake page_table for sparse_prefill
             "page_table": torch.zeros(
+                max_num_tokens,
+                self.max_context_len,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "index_page_table": torch.zeros(
                 max_num_tokens,
                 self.max_context_len,
                 dtype=torch.int32,
@@ -638,6 +663,11 @@ class NativeSparseAttnBackend(AttentionBackend):
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
+        if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
+            index_real_page_table = torch.zeros_like(real_page_table)
+        else:
+            index_real_page_table = None
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -652,6 +682,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
             nsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
+            index_real_page_table=index_real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -795,6 +826,18 @@ class NativeSparseAttnBackend(AttentionBackend):
             real_table = self._transform_table_1_to_real(page_indices)
             new_len = real_table.shape[1]
             metadata.real_page_table[:, :new_len].copy_(real_table)
+
+            # Update index_real_page_table
+            if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
+                index_page_indices = self.req_to_token_pool.req_to_nsa_index_k[
+                    req_pool_indices, :max_len
+                ]
+                index_real_table = self._transform_table_1_to_real(index_page_indices)
+                if metadata.index_real_page_table is None:
+                    metadata.index_real_page_table = torch.zeros_like(
+                        metadata.real_page_table
+                    )
+                metadata.index_real_page_table[:, :new_len].copy_(index_real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
 

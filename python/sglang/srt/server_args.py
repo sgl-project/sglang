@@ -440,6 +440,7 @@ class ServerArgs:
 
     # Sparse Attn
     enable_sparse_attn: bool = False
+    enable_hierarchical_nsa: bool = False
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -3037,6 +3038,12 @@ class ServerArgs:
             "--enable-sparse-attn",
             action="store_true",
             help="Enable sparse attention",
+        )
+        parser.add_argument(
+            "--enable-hierarchical-nsa",
+            action="store_true",
+            default=ServerArgs.enable_hierarchical_nsa,
+            help="Enable hierarchical NSA (NSA models only).",
         )
 
         # Ktransformer server args

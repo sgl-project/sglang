@@ -1039,6 +1039,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # The output locations of the nsa indexer_k (when enabling hierarchical NSA)
+    out_index_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For multimodal inputs
@@ -1289,9 +1291,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
-        )
+        (
+            out_cache_loc,
+            req_pool_indices_tensor,
+            req_pool_indices,
+            out_index_cache_loc,
+        ) = alloc_for_extend(self)
+        self.out_index_cache_loc = out_index_cache_loc
 
         # Set fields
         input_embeds = []
@@ -1656,7 +1662,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.prepare_encoder_info_decode()
 
         # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc, self.out_index_cache_loc = alloc_for_decode(
+            self, token_per_req=1
+        )
 
         # Update req-level memory management fields
         for req in self.reqs:
@@ -1728,6 +1736,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
+        self.out_index_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[keep_indices_device]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
@@ -1773,6 +1782,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
+        self.out_index_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
@@ -1824,6 +1834,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
+            out_index_cache_loc=self.out_index_cache_loc,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
@@ -1916,6 +1927,8 @@ class ModelWorkerBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
+    # NSA: indices of output tokens for indexer_k
+    out_index_cache_loc: Optional[torch.Tensor]
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int

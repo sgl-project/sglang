@@ -92,6 +92,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
+    NSAHybridTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -105,6 +106,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    NSAReqToTokenPool,
     NSATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
@@ -1689,13 +1691,28 @@ class ModelRunner:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
-                self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                )
+                # Check if we should use NSA ReqToTokenPool
+                is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+                if (
+                    self.server_args.enable_hierarchical_nsa
+                    and is_nsa_model
+                    and self.page_size > 1
+                ):
+                    self.req_to_token_pool = NSAReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                    )
+                else:
+                    self.req_to_token_pool = ReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                    )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
@@ -1870,14 +1887,35 @@ class ModelRunner:
                         )
                 else:
                     assert not self.is_hybrid
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                    # Check if we should use NSA hybrid allocator
+                    if (
+                        self.server_args.enable_hierarchical_nsa
+                        and is_nsa_model
+                        and isinstance(self.token_to_kv_pool, NSATokenToKVPool)
+                    ):
+                        self.token_to_kv_pool_allocator = (
+                            NSAHybridTokenToKVPoolAllocator(
+                                kv_size=self.max_total_num_tokens,
+                                index_k_size=self.max_total_num_tokens,
+                                page_size=self.page_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
+                        )
+                        logger.info(
+                            "Using NSAHybridTokenToKVPoolAllocator with separate KV and indexer_k allocation"
+                        )
+                    else:
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
         else:
             assert self.is_draft_worker
 
@@ -1904,6 +1942,8 @@ class ModelRunner:
             return
 
         try:
+            from sglang.srt.sparsity2 import create_sparse_coordinator
+
             from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
                 DecodeKVCacheOffloadManager,
             )
@@ -2243,17 +2283,11 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
 
         if forward_batch.forward_mode.is_decode():
-            # TODO: need to overlap
-            if self.server_args.enable_sparse_attn:
-                self.sparse_coordinator.offload_last_token_kv_cache(forward_batch)
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            # TODO: need to overlap
-            if self.server_args.enable_sparse_attn:
-                self.sparse_coordinator.check_last_token_offload_progress(forward_batch)
         elif forward_batch.forward_mode.is_split_prefill():
             ret = self.forward_split_prefill(
                 forward_batch,
