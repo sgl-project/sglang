@@ -379,7 +379,7 @@ jobs:
 
 
   multimodal-gen-test-2-gpu:
-    needs: [check-changes, sgl-kernel-build-wheels, multimodal-gen-test]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: (always() && !failure() && !cancelled()) && needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: 2-gpu-runner
     steps:
