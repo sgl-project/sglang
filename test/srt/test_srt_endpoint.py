@@ -15,7 +15,10 @@ from typing import Optional
 import numpy as np
 import requests
 
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    CustomLogitProcessor,
+    DeterministicLogitProcessor,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -308,29 +311,43 @@ class TestSRTEndpoint(CustomTestCase):
 
         self.assertTrue(all(x is not None for x in logprobs))
 
-    def run_custom_logit_processor(self, target_token_id: Optional[int] = None):
+    def run_custom_logit_processor(
+        self,
+        target_token_id: Optional[int] = None,
+        custom_logit_processor: str = DeterministicLogitProcessor.to_str(),
+    ):
+        """Test custom logit processor with custom params.
+
+        If target_token_id is None, the custom logit processor won't be passed in.
+        """
+
+        custom_response = self.generate_with_custom_logit_processor(
+            target_token_id=target_token_id,
+            custom_logit_processor=custom_logit_processor,
+        )
+        output_token_logprobs = custom_response["meta_info"]["output_token_logprobs"]
+        sampled_tokens = [x[1] for x in output_token_logprobs]
+
+        # The logit processor should always sample the given token as the logits is deterministic.
+        if target_token_id is not None:
+            custom_params = {"token_id": target_token_id}
+            self.assertTrue(
+                all(x == custom_params["token_id"] for x in sampled_tokens),
+                # Print the detailed test case info if the test fails.
+                f"{target_token_id=}\n{sampled_tokens=}\n{custom_response=}",
+            )
+
+    def generate_with_custom_logit_processor(
+        self,
+        target_token_id: Optional[int] = None,
+        custom_logit_processor: str = DeterministicLogitProcessor.to_str(),
+    ):
         """Test custom logit processor with custom params.
 
         If target_token_id is None, the custom logit processor won't be passed in.
         """
 
         custom_params = {"token_id": target_token_id}
-
-        class DeterministicLogitProcessor(CustomLogitProcessor):
-            """A dummy logit processor that changes the logits to always
-            sample the given token id.
-            """
-
-            def __call__(self, logits, custom_param_list):
-                assert logits.shape[0] == len(custom_param_list)
-                key = "token_id"
-
-                for i, param_dict in enumerate(custom_param_list):
-                    # Mask all other tokens
-                    logits[i, :] = -float("inf")
-                    # Assign highest probability to the specified token
-                    logits[i, param_dict[key]] = 0.0
-                return logits
 
         prompts = "Question: Is Paris the Capital of France? Answer:"
 
@@ -345,7 +362,7 @@ class TestSRTEndpoint(CustomTestCase):
         custom_json = base_json.copy()
         # Only set the custom logit processor if target_token_id is not None.
         if target_token_id is not None:
-            custom_json["custom_logit_processor"] = DeterministicLogitProcessor.to_str()
+            custom_json["custom_logit_processor"] = custom_logit_processor
             custom_json["sampling_params"]["custom_params"] = custom_params
 
         custom_response = requests.post(
@@ -353,16 +370,7 @@ class TestSRTEndpoint(CustomTestCase):
             json=custom_json,
         ).json()
 
-        output_token_logprobs = custom_response["meta_info"]["output_token_logprobs"]
-        sampled_tokens = [x[1] for x in output_token_logprobs]
-
-        # The logit processor should always sample the given token as the logits is deterministic.
-        if target_token_id is not None:
-            self.assertTrue(
-                all(x == custom_params["token_id"] for x in sampled_tokens),
-                # Print the detailed test case info if the test fails.
-                f"{target_token_id=}\n{sampled_tokens=}\n{custom_response=}",
-            )
+        return custom_response
 
     def run_stateful_custom_logit_processor(
         self, first_token_id: int | None, delay: int = 2
@@ -437,6 +445,27 @@ class TestSRTEndpoint(CustomTestCase):
     def test_custom_logit_processor(self):
         """Test custom logit processor with a single request."""
         self.run_custom_logit_processor(target_token_id=5)
+
+    def test_custom_logit_processor_from_class_path(self):
+        self.run_custom_logit_processor(
+            target_token_id=5,
+            custom_logit_processor="sglang.srt.sampling.custom_logit_processor:DeterministicLogitProcessor",
+        )
+
+    def test_custom_logit_processor_from_class_path_error(self):
+        res = self.generate_with_custom_logit_processor(
+            target_token_id=5,
+            custom_logit_processor="wrong_module_path:DeterministicLogitProcessor",
+        )
+        self.assertIn("No module named 'wrong_module_path'", res["error"]["message"])
+        res = self.generate_with_custom_logit_processor(
+            target_token_id=5,
+            custom_logit_processor="wrong_module_path.DeterministicLogitProcessor",
+        )
+        self.assertIn(
+            "It should be in the format 'module_path:ClassName'",
+            res["error"]["message"],
+        )
 
     def test_custom_logit_processor_batch_mixed(self):
         """Test a batch of requests mixed of requests with and without custom logit processor."""
