@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.bench_serving import run_benchmark
+from sglang.bench_serving_video import benchmark as run_video_benchmark
 from sglang.global_config import global_config
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -841,6 +842,58 @@ def run_bench_serving(
         kill_process_tree(process.pid)
 
     assert res["completed"] == num_prompts
+    return res
+
+
+def run_bench_serving_video(
+    model: str,
+    other_server_args: List[str],
+    num_prompts: int = 1,
+    video_seconds: float = 2.0,
+    unique_video: bool = False,
+    output_len: int = 16,
+    request_rate: float = float("inf"),
+    device="auto",
+):
+    if device == "auto":
+        device = auto_config_device()
+    # Launch the server
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+
+    _, host, port = base_url.split(":")
+    host = host[2:]
+
+    # Run benchmark
+    args = SimpleNamespace(
+        backend="sglang",
+        host=host,
+        port=port,
+        model=model,
+        num_prompts=num_prompts,
+        output_len=output_len,
+        video_seconds=video_seconds,
+        video_width=240,
+        video_height=240,
+        video_fps=24,
+        unique_video=unique_video,
+        extra_request_body=None,
+        output_file=None,
+        disable_tqdm=True,
+        request_rate=request_rate,
+    )
+
+    try:
+        res = asyncio.run(run_video_benchmark(args))
+    finally:
+        kill_process_tree(process.pid)
+
+    assert res is not None
     return res
 
 
