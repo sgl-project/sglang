@@ -721,6 +721,7 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
+        load = self.get_load()
 
         queue_times = []
         forward_entry_times = []
@@ -768,6 +769,7 @@ class SchedulerOutputProcessorMixin:
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
                 should_output = True
+                load.num_finished_reqs += 1
             else:
                 if req.stream:
                     stream_interval = (
@@ -962,6 +964,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    load=load,
                 )
             )
 
