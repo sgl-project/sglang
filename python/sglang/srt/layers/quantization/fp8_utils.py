@@ -161,6 +161,24 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
+def dispatch_w8a8_block_fp8_quant() -> Callable:
+    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return deepgemm_w8a8_block_fp8_quant_with_fallback
+    else:
+        raise RuntimeError(
+            f"fp8 quant-only function is only supported on deepgemm backend yet."
+        )
+
+
+def dispatch_w8a8_block_fp8_gemm() -> Callable:
+    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return deepgemm_w8a8_block_fp8_gemm_with_fallback
+    else:
+        raise RuntimeError(
+            f"fp8 gemm function is only supported on deepgemm backend yet."
+        )
+
+
 def flashinfer_gemm_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -224,6 +242,62 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+def deepgemm_w8a8_block_fp8_quant_with_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    dtype_supported = input.dtype == torch.bfloat16
+
+    # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+
+    if not (shape_supported and dtype_supported):
+        raise RuntimeError(
+            "fp8 block quant is not supported yet. "
+            "Please check the weight shape and dtype."
+        )
+
+    input_2d = input.view(-1, input.shape[-1])
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d,
+        block_size[1],
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    return q_input, x_scale
+
+
+def deepgemm_w8a8_block_fp8_gemm_with_fallback(
+    q_input: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    dtype: torch.dtype,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    dtype_supported = dtype == torch.bfloat16
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+
+    if not (shape_supported and dtype_supported):
+        raise RuntimeError(
+            "fp8 block quant is not supported yet. "
+            "Please check the weight shape and dtype."
+        )
+
+    output_shape = [*q_input.shape[:-1], weight.shape[0]]
+
+    output = w8a8_block_fp8_matmul_deepgemm(
+        q_input, weight, x_scale, weight_scale, block_size, output_dtype=dtype
+    )
+    if bias is not None:
+        output += bias
+    return output.to(dtype=dtype).view(*output_shape)
 
 
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
