@@ -140,6 +140,7 @@ class DenoisingStage(PipelineStage):
             dtype=torch.float16,  # TODO(will): hack
             supported_attention_backends={
                 AttentionBackendEnum.SLIDING_TILE_ATTN,
+                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.VIDEO_SPARSE_ATTN,
                 AttentionBackendEnum.VMOBA_ATTN,
                 AttentionBackendEnum.FA,
