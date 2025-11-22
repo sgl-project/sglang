@@ -358,7 +358,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         self.quant_config, "weight_block_size", None
                     ),
                     layer=layer,
-                ):
+                ) and not getattr(layer, "_executed_weight_requant_ue8m0", False):
                     requant_weight_ue8m0_inplace(
                         layer.weight,
                         layer.weight_scale_inv,

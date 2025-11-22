@@ -3711,7 +3711,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = True
 
         # Requant the weights and scales of MoE layers
-        self._maybe_moe_weight_requant_ue8m0(is_nextn)
+        if get_moe_runner_backend().is_deep_gemm():
+            self._maybe_moe_weight_requant_ue8m0(is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._transform_scale_nextn_moe_ue8m0()
 
