@@ -112,8 +112,9 @@ class SchedulerRuntimeCheckerMixin:
         ):
             uncached_size += self._get_batch_uncached_size(self.running_batch)
 
-        log_msg = f"[Mem Check (BUSY)] {available_size=}, {evictable_size=}, {protected_size=}, {uncached_size=}"
-        logger.info(log_msg)
+        if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
+            log_msg = f"[Mem Check (BUSY)] {available_size=}, {evictable_size=}, {protected_size=}, {uncached_size=}"
+            logger.info(log_msg)
 
         total_tokens = available_size + evictable_size + protected_size + uncached_size
         assert (
