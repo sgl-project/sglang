@@ -122,7 +122,7 @@ class DiffusionTestCase:
     image_path: Path | str | None = None  # input image/video for editing (Path or URL)
 
     # duration
-    seconds: int = 4  # for video: duration in seconds
+    seconds: int = 1  # for video: duration in seconds
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
 
@@ -251,7 +251,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         modality="video",
         prompt="A curious raccoon",
         output_size="848x480",
-        seconds=4,
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
@@ -262,7 +261,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         modality="video",
         prompt="A curious raccoon",
         output_size="720x480",
-        seconds=4,
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
@@ -273,7 +271,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         modality="video",
         prompt="A curious raccoon",
         output_size="720x480",
-        seconds=4,
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
@@ -290,7 +287,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
-        seconds=1,
     ),
     DiffusionTestCase(
         id="fastwan2_2_ti2v_5b",
@@ -303,7 +299,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
-        seconds=1,
     ),
 ]
 
@@ -319,7 +314,6 @@ TWO_GPU_CASES = [
         edit_prompt="generate",
         image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
         custom_validator="video",
-        seconds=1,
         num_gpus=2,
     ),
     DiffusionTestCase(
@@ -328,7 +322,6 @@ TWO_GPU_CASES = [
         modality="video",
         prompt="A curious raccoon",
         output_size="720x480",
-        seconds=4,
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
@@ -340,7 +333,6 @@ TWO_GPU_CASES = [
         modality="video",
         prompt="A curious raccoon",
         output_size="720x480",
-        seconds=4,
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
@@ -357,7 +349,6 @@ TWO_GPU_CASES = [
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
-        seconds=1,
         num_gpus=2,
     ),
     DiffusionTestCase(
@@ -371,7 +362,6 @@ TWO_GPU_CASES = [
         warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
-        seconds=1,
         num_gpus=2,
     ),
 ]
