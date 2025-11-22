@@ -10,14 +10,15 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.base import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.performance_logger import (
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    RequestPerfRecord,
     get_diffusion_perf_log_dir,
 )
 
@@ -142,92 +143,47 @@ def prepare_perf_log() -> tuple[Path, Path]:
     return log_dir, log_path
 
 
-def read_perf_records(log_path: Path) -> list[dict]:
+def read_perf_logs(log_path: Path) -> list[RequestPerfRecord]:
     if not log_path.exists():
         return []
-    records: list[dict] = []
+    records: list[RequestPerfRecord] = []
     with log_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                record_dict = json.loads(line)
+                records.append(RequestPerfRecord(**record_dict))
             except json.JSONDecodeError:
                 continue
     return records
 
 
-def wait_for_perf_record(
-    tag: str,
-    prev_len: int,
-    log_path: Path,
-    timeout: float = 120.0,
-) -> tuple[dict, int]:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        records = read_perf_records(log_path)
-        if len(records) > prev_len:
-            for rec in records[prev_len:]:
-                if rec.get("tag") == tag:
-                    return rec, len(records)
-        time.sleep(0.5)
-
-    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
-        records = read_perf_records(log_path)
-        return {}, len(records)
-
-    raise AssertionError(
-        f"Timeout waiting for perf log entry '{tag}' (start_len={prev_len})"
-    )
-
-
-def wait_for_stage_metrics(
+def wait_for_req_perf_record(
     request_id: str,
     prev_len: int,
     log_path: Path,
     timeout: float = 300.0,
-) -> tuple[dict[str, float], int]:
+) -> tuple[RequestPerfRecord | None, int]:
+    """
+    the stage metrics of this request should be in the performance_log file with {request-id}
+    """
+    logger.info(f"Waiting for req perf record with request id: {request_id}")
     deadline = time.time() + timeout
-    metrics: dict[str, float] = {}
     while time.time() < deadline:
-        records = read_perf_records(log_path)
-        for rec in records[prev_len:]:
-            # Check if the request is completed
-            if (
-                rec.get("tag") == "total_inference_time"
-                and rec.get("request_id") == request_id
-            ):
-                return metrics, len(records)
+        records = read_perf_logs(log_path)
+        if len(records) == prev_len + 1:
+            # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
+            # potential error when there are multiple servers
+            return records[-1], len(records)
 
-            if (
-                rec.get("tag") == "pipeline_stage_metric"
-                and rec.get("request_id") == request_id
-            ):
-                stage = rec.get("stage")
-                duration = rec.get("duration_ms")
-                if stage is not None and duration is not None:
-                    metrics[str(stage)] = float(duration)
         time.sleep(0.5)
 
     if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
-        records = read_perf_records(log_path)
-        return {}, len(records)
+        records = read_perf_logs(log_path)
+        return None, len(records)
     raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
-
-
-def sample_step_indices(
-    step_map: dict[int, float], fractions: Sequence[float]
-) -> list[int]:
-    if not step_map:
-        return []
-    max_idx = max(step_map.keys())
-    indices = set()
-    for fraction in fractions:
-        idx = min(max_idx, max(0, int(round(fraction * max_idx))))
-        if idx in step_map:
-            indices.add(idx)
-    return sorted(indices)
 
 
 def validate_image(b64_json: str) -> None:

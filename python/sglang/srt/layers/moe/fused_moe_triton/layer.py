@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEM
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -147,6 +148,7 @@ class FusedMoE(torch.nn.Module):
         use_weight_loader_fused: bool = False,
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
+        is_gated: bool = True,
     ):
         super().__init__()
         if params_dtype is None:
@@ -210,6 +212,7 @@ class FusedMoE(torch.nn.Module):
             routed_scaling_factor=routed_scaling_factor,
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
+            is_gated=is_gated,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -252,6 +255,10 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.routing_method_type = routing_method_type
+
+        # overlap args
+        self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
+        self.meta_overlap_args: Optional[dict] = None
 
     def _load_per_tensor_weight_scale(
         self,
@@ -339,10 +346,12 @@ class FusedMoE(torch.nn.Module):
             # if this weight is a bias, the last dimension must be the sharded dimension
             shard_dim = -1
 
-        if shard_id in {"w1", "w3"}:
+        if shard_id in {"w1", "w3"} and self.moe_runner_config.is_gated:
             # non-fused version
             shard_size = expert_data.shape[shard_dim] // 2
-        elif shard_id in {"w13"}:
+        elif shard_id in {"w13"} or (
+            shard_id in {"w1", "w3"} and not self.moe_runner_config.is_gated
+        ):
             # fused version
             shard_size = expert_data.shape[shard_dim]
         else:
@@ -539,9 +548,12 @@ class FusedMoE(torch.nn.Module):
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:
+            require_global_experts = getattr(
+                param, "_sglang_require_global_experts", False
+            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
-                    self.layer_id, expert_id
+                    self.layer_id, expert_id, require_global_experts
                 )
             )
 
@@ -615,9 +627,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(
-                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
-            )
+            raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
         if get_moe_runner_backend().is_flashinfer_trtllm() and (
@@ -816,7 +826,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         if shard_id not in ("w13", "w2"):
-            raise ValueError(f"shard_id must be ['w13','w2'] but " f"got {shard_id}.")
+            raise ValueError(f"shard_id must be ['w13','w2'] but got {shard_id}.")
 
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
@@ -856,7 +866,7 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -875,7 +885,6 @@ class FusedMoE(torch.nn.Module):
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
-            **kwargs,
         )
 
         with use_symmetric_memory(
@@ -893,12 +902,11 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def run_moe_core(self, dispatch_output: DispatchOutput, **kwargs) -> CombineInput:
+    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
-            **kwargs,
         )
 
     @classmethod
@@ -993,6 +1001,16 @@ class FusedMoE(torch.nn.Module):
             for shard_id in ["w1", "w2", "w3"]
         ]
 
+    def set_overlap_args(
+        self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
+    ):
+        self.down_gemm_overlap_args = down_gemm_overlap_args
+        self.meta_overlap_args = meta_overlap_args
+
+    def clear_overlap_args(self) -> None:
+        self.down_gemm_overlap_args = None
+        self.meta_overlap_args = None
+
 
 class FlashInferFusedMoE(FusedMoE):
     def __init__(self, *args, **kwargs):
@@ -1009,6 +1027,9 @@ class FlashInferFusedMoE(FusedMoE):
         assert (
             self.num_fused_shared_experts == 0
         ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+        assert (
+            self.moe_runner_config.is_gated
+        ), "Only gated MoEs are supported for flashinfer blockscale fp8 moe"
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -1075,6 +1096,10 @@ class FlashInferFP4MoE(FusedMoE):
             topk_output: TopKOutput object with Bypassed format
         """
         assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+
+        assert (
+            self.moe_runner_config.is_gated
+        ), "Only gated MoEs are supported for flashinfer fp4 moe"
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 

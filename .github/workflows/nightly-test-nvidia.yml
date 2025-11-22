@@ -30,8 +30,8 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-1-gpu --continue-on-error
+          cd test
+          python3 run_suite_nightly.py --suite nightly-1-gpu --continue-on-error
 
   # General tests - 4 GPU H100
   nightly-test-general-4-gpu-h100:
@@ -48,8 +48,8 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-4-gpu --continue-on-error
+          cd test
+          python3 run_suite_nightly.py --suite nightly-4-gpu --continue-on-error
 
   # General tests - 8 GPU H200
   nightly-test-general-8-gpu-h200:
@@ -70,8 +70,8 @@ jobs:
         env:
           GPU_CONFIG: "8-gpu-h200"
         run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-8-gpu-h200 --continue-on-error
+          cd test
+          python3 run_suite_nightly.py --suite nightly-8-gpu-h200 --continue-on-error
 
   # General tests - 8 GPU H20
   nightly-test-general-8-gpu-h20:
@@ -92,8 +92,8 @@ jobs:
         env:
           GPU_CONFIG: "8-gpu-h20"
         run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-8-gpu-h20 --continue-on-error
+          cd test
+          python3 run_suite_nightly.py --suite nightly-8-gpu-h20 --continue-on-error
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
@@ -110,7 +110,7 @@ jobs:
       - name: Run eval test for text models
         timeout-minutes: 120
         run: |
-          cd test/srt
+          cd test
           python3 nightly/test_text_models_gsm8k_eval.py
 
   # Text model performance tests
@@ -132,7 +132,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "2-gpu-runner"
         run: |
-          cd test/srt
+          cd test
           rm -rf performance_profiles_text_models/
           python3 nightly/test_text_models_perf.py
 
@@ -159,7 +159,7 @@ jobs:
       - name: Run eval test for VLM models (fixed MMMU-100)
         timeout-minutes: 240
         run: |
-          cd test/srt
+          cd test
           python3 nightly/test_vlms_mmmu_eval.py
 
   # VLM performance tests
@@ -181,7 +181,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "2-gpu-runner"
         run: |
-          cd test/srt
+          cd test
           rm -rf performance_profiles_vlms/
           python3 nightly/test_vlms_perf.py
 
@@ -208,8 +208,8 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          cd test/srt
-          python3 run_suite.py --suite nightly-4-gpu-b200 --continue-on-error
+          cd test
+          python3 run_suite_nightly.py --suite nightly-4-gpu-b200 --continue-on-error
 
   # B200 Performance tests - 8 GPU
   nightly-test-perf-8-gpu-b200:
@@ -233,7 +233,7 @@ jobs:
           GPU_CONFIG: "8-gpu-b200"
         run: |
           rm -rf test/srt/performance_profiles_deepseek_v31/
-          cd test/srt
+          cd test
           IS_BLACKWELL=1 python3 nightly/test_deepseek_v31_perf.py
 
       - name: Publish DeepSeek v3.1 traces to storage repo
@@ -252,7 +252,7 @@ jobs:
           GPU_CONFIG: "8-gpu-b200"
         run: |
           rm -rf test/srt/performance_profiles_deepseek_v32/
-          cd test/srt
+          cd test
           IS_BLACKWELL=1 python3 nightly/test_deepseek_v32_perf.py
 
       - name: Publish DeepSeek v3.2 traces to storage repo

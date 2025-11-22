@@ -129,6 +129,7 @@ class SamplingParams:
 
     # Debugging
     debug: bool = False
+    perf_dump_path: str | None = None
 
     # Misc
     save_output: bool = True
@@ -413,9 +414,6 @@ class SamplingParams:
         if user_params is None:
             return
 
-        # Get fields defined directly in the subclass (not inherited)
-        subclass_defined_fields = set(type(self).__annotations__.keys())
-
         # Compare against current instance to avoid constructing a default instance
         default_params = SamplingParams()
 
@@ -432,7 +430,7 @@ class SamplingParams:
                 if field_name != "output_file_name"
                 else user_params.output_file_path is not None
             )
-            if is_user_modified and field_name not in subclass_defined_fields:
+            if is_user_modified:
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
 

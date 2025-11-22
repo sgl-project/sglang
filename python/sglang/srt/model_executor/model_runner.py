@@ -94,6 +94,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.mm_utils import (
     external_mm_preprocess_routine,
+    resolve_external_mm_data_embedding_funcs,
     should_use_external_mm_preprocess,
 )
 from sglang.srt.mem_cache.allocator import (
@@ -2145,9 +2146,11 @@ class ModelRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
 
         if self.is_multimodal and should_use_external_mm_preprocess(self.model):
+            data_embedding_funcs = resolve_external_mm_data_embedding_funcs(self.model)
             forward_batch = external_mm_preprocess_routine(
                 forward_batch=forward_batch,
                 multimodal_model=self.model,
+                data_embedding_funcs=data_embedding_funcs,
             )
 
         kwargs = {}
