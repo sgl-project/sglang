@@ -131,6 +131,8 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
    ; \
    fi \
  && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && python3 -m pip install vllm==0.10.2 --no-deps \
+ && python3 -m pip install cachetools cbor2 \
  && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
       python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
    fi \
