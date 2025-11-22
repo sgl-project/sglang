@@ -9,6 +9,7 @@ def upload_file_to_slack(
     file_path: str,
     title: str = None,
     message: str = None,
+    origin_file_path: str = None,
 ) -> bool:
     try:
         from slack_sdk import WebClient
@@ -17,8 +18,9 @@ def upload_file_to_slack(
         logger.warning(f"Failed to import slack_sdk: {str(e)}. Skipping Slack upload.")
         return False
 
+    run_id = os.getenv("GITHUB_RUN_ID", "maybe local test")
+    channel_id = "C0A02NDF7UY"  # diffusion-ci
     token = os.environ.get("SGLANG_DIFFUSION_SLACK_TOKEN")
-    channel_id = "C0A02NDF7UY"
 
     if not token:
         logger.warning("SGLANG_DIFFUSION_SLACK_TOKEN not found. Skipping Slack upload.")
@@ -30,12 +32,15 @@ def upload_file_to_slack(
 
     client = WebClient(token=token)
 
+    if title and message:
+        message = f"GITHUB_RUN_ID: {run_id}\nModel: {title}\nPrompt: {message}\n"
+
     try:
         logger.info(f"Uploading file to Slack: {file_path}")
 
         client.files_upload_v2(
             channel=channel_id,
-            file=file_path,
+            file_uploads=file_path,
             title=title if title else os.path.basename(file_path),
             initial_comment=message,
         )
