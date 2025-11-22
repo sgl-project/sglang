@@ -1,9 +1,31 @@
-name: Auto Tune Kernels 
+name: Auto Tune Kernels
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch/tag/SHA) to checkout; defaults to the triggering ref.'
+        required: false
+        type: string
 
 jobs:
-  2-gpu-runner-auto-tune:
+  auto-tune-matrix:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 2-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - 4-gpu-a10
+          - 4-gpu-b200
+          - 4-gpu-gb200
+          - 4-gpu-h100
+          - 8-gpu-b200
+          - 8-gpu-h20
+          - 8-gpu-h200
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,7 +42,45 @@ jobs:
           python3 scripts/auto_tune.py
           pip install "triton==3.2.0"
           python3 scripts/auto_tune.py
-          pip install "triton==3.3.0"
+          pip install "triton==3.3.1"
           python3 scripts/auto_tune.py
           pip install "triton==3.4.0"
           python3 scripts/auto_tune.py
+
+      - name: Upload tuned configs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fused-moe-triton-configs-${{ matrix.runner }}-${{ github.run_id }}
+          path: python/sglang/srt/layers/moe/fused_moe_triton/configs/**
+          if-no-files-found: warn
+
+  commit-configs:
+    if: github.repository == 'sgl-project/sglang'
+    needs: auto-tune-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download tuned configs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fused-moe-triton-configs-*
+          path: downloaded-configs
+          merge-multiple: true
+
+      - name: Sync configs into repo
+        run: |
+          mkdir -p python/sglang/srt/layers/moe/fused_moe_triton/configs
+          rsync -a downloaded-configs/ python/sglang/srt/layers/moe/fused_moe_triton/configs/
+
+      - name: Commit and push tuned configs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add python/sglang/srt/layers/moe/fused_moe_triton/configs
+          git commit -m "Auto-tune fused MoE configs (all runners)" || echo "No changes to commit"
+          git push
