@@ -88,38 +88,36 @@ class EagleDraftInputV2Mixin:
         batch.maybe_wait_verify_done()
 
         page_size = batch.token_to_kv_pool_allocator.page_size
-        cur_kv_allocated_len = []
-        nxt_kv_allocated_len = []
+        cur_kv_lens_cpu = []
+        nxt_kv_lens_cpu = []
         num_needed_tokens = 0
         for r in batch.reqs:
             # Over-allocation happens here
             x = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
-            cur_kv_allocated_len.append(r.kv_allocated_len)
-            nxt_kv_allocated_len.append(r.kv_allocated_len + x)
+            cur_kv_lens_cpu.append(r.kv_allocated_len)
+            nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
             r.kv_allocated_len += x
 
-        alloc_prev_lens_cpu = torch.tensor(
-            cur_kv_allocated_len, dtype=torch.int32, device="cpu"
-        )
-        alloc_next_lens_cpu = torch.tensor(
-            nxt_kv_allocated_len, dtype=torch.int32, device="cpu"
-        )
+        cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
+        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
+            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
+            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
-                cur_kv_allocated_len,
+                cur_kv_lens,
             )
             out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
-                alloc_prev_lens_cpu.to(device=batch.device),
-                alloc_prev_lens_cpu,
-                alloc_next_lens_cpu.to(device=batch.device),
-                alloc_next_lens_cpu,
+                cur_kv_lens,
+                cur_kv_lens_cpu,
+                nxt_kv_lens,
+                nxt_kv_lens_cpu,
                 last_loc,
                 num_needed_tokens,
             )
@@ -127,8 +125,8 @@ class EagleDraftInputV2Mixin:
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            alloc_prev_lens_cpu.to(device=batch.device),
-            alloc_next_lens_cpu.to(device=batch.device),
+            cur_kv_lens_cpu.to(device=batch.device),
+            nxt_kv_lens_cpu.to(device=batch.device),
             out_cache_loc,
             bs,
         )
