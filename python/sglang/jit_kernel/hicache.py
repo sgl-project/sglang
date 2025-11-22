@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,27 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         cuda_files=["hicache.cuh"],
         cuda_wrappers=[("launch_one", f"HiCacheKernel<{args}>::run_one")],
     )
+
+
+def can_use_hicache_jit_kernel(
+    *,
+    element_size: int,
+    unroll: int | None = None,  # can be tuned for performance
+    block_quota: int | None = None,  # can be tuned for less interference
+) -> bool:
+    try:
+        unroll = unroll or _default_unroll(element_size)
+        block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+        _jit_hicache_module(
+            element_size=element_size,
+            unroll=unroll,
+            block_quota=block_quota,
+        )
+        return True
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Failed to load JIT HiCache kernel: {e}")
+        return False
 
 
 def _default_unroll(element_size: int) -> int:
