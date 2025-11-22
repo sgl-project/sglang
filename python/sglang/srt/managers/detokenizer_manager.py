@@ -136,8 +136,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Trim stop token.
         if isinstance(matched, int) and isinstance(output, list):
-            # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
-            if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
+            # HarmonyParser used for gpt-oss model relies on end tokens to detect if events are complete
+            if self.is_tool_call_parser_gpt_oss:
                 return output
             assert len(output) > 0
             # NOTE: We can always assume the last token is the matched stop token
