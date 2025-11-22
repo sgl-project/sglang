@@ -414,7 +414,6 @@ class SamplingParams:
         if user_params is None:
             return
 
-        # Get fields defined directly in the subclass (not inherited)Add a comment on  line L416Add diff commentMarkdown input:  edit mode selected.WritePreviewHeadingBoldItalicQuoteCodeLinkUnordered listNumbered listTask listMentionReferenceSaved repliesAdd FilesPaste, drop, or click to add filesCancelCommentStart a reviewReturn to code
         subclass_defined_fields = set(type(self).__annotations__.keys())
 
         # Compare against current instance to avoid constructing a default instance
