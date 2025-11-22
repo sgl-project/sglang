@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
 class TestNvidiaNemotronNanoV2(CustomTestCase):
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     accuracy = 0.87
+    additional_args = []
 
     @classmethod
     def setUpClass(cls):
@@ -25,6 +26,7 @@ class TestNvidiaNemotronNanoV2(CustomTestCase):
             other_args=[
                 "--max-mamba-cache-size",
                 "256",
+                *cls.additional_args,
             ],
         )
 
@@ -56,6 +58,30 @@ class TestNvidiaNemotronNanoV2FP8(TestNvidiaNemotronNanoV2):
 class TestNvidiaNemotronNanoV2NVFP4(TestNvidiaNemotronNanoV2):
     accuracy = 0.855
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4"
+
+
+class TestNvidiaNemotronNanoV2SpeculativeDecoding(TestNvidiaNemotronNanoV2):
+    accuracy = 0.87
+    additional_args = [
+        "--speculative-algorithm",
+        "STANDALONE",
+        "--speculative-num-steps",
+        "2",
+        "--speculative-eagle-topk",
+        "3",
+        "--speculative-num-draft-tokens",
+        "5",
+        "--speculative-draft-model-path",
+        "meta-llama/Llama-3.2-1B",
+        "--speculative-draft-load-format",
+        "dummy",
+        "--max-running-requests",
+        "8",
+        "--max-total-tokens",
+        "2048",
+        "--json-model-override-args",
+        '{"vocab_size": 131072}',
+    ]
 
 
 if __name__ == "__main__":
