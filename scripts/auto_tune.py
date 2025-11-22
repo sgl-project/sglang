@@ -29,6 +29,7 @@ PER_CHANNEL_QUANT: List[bool] = [True, False]
 BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
 SEEDS: List[int] = [0]
 DISABLE_SHARED_EXPERTS_FUSION: List[bool] = [True, False]
+NUM_ITERS: List[int] = [10]
 
 
 def build_cmd(
@@ -41,6 +42,7 @@ def build_cmd(
     batch_size: int | None,
     seed: int,
     disable_shared_experts_fusion: bool,
+    num_iters: int,
     auto_tune_py: Path,
 ) -> list[str]:
     cmd = [sys.executable, str(auto_tune_py)]
@@ -56,6 +58,7 @@ def build_cmd(
         cmd += ["--seed", str(seed)]
     if disable_shared_experts_fusion:
         cmd.append("--disable-shared-experts-fusion")
+    cmd += ["--num-iters", str(num_iters)]
     return cmd
 
 
@@ -63,11 +66,11 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     auto_tune_py = repo_root / "python" / "sglang" / "auto_tune.py"
 
-    lengths = {len(MODELS), len(TP_SIZES), len(EP_SIZES), len(DTYPES), len(PER_CHANNEL_QUANT), len(BATCH_SIZES), len(SEEDS), len(DISABLE_SHARED_EXPERTS_FUSION)}
+    lengths = {len(MODELS), len(TP_SIZES), len(EP_SIZES), len(DTYPES), len(PER_CHANNEL_QUANT), len(BATCH_SIZES), len(SEEDS), len(DISABLE_SHARED_EXPERTS_FUSION), len(NUM_ITERS)}
     if len(lengths) != 1:
         raise SystemExit("All config lists must have the same length.")
 
-    for idx, (model, tp, ep, dtype, pcq, batch, seed, disable_fusion) in enumerate(
+    for idx, (model, tp, ep, dtype, pcq, batch, seed, disable_fusion, num_iters) in enumerate(
         zip(
             MODELS,
             TP_SIZES,
@@ -77,6 +80,7 @@ def main() -> None:
             BATCH_SIZES,
             SEEDS,
             DISABLE_SHARED_EXPERTS_FUSION,
+            NUM_ITERS,
         )
     ):
         if not model or str(model).startswith("FILL_ME_MODEL"):
@@ -92,6 +96,7 @@ def main() -> None:
             batch_size=batch,
             seed=seed,
             disable_shared_experts_fusion=disable_fusion,
+            num_iters=num_iters,
             auto_tune_py=auto_tune_py,
         )
 

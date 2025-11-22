@@ -35,7 +35,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
+    parser.add_argument(
+        "--num-iters",
+        type=int,
+        default=10,
+        help="Number of iterations per config during tuning",
+    )
     return parser
+    
 
 def run_auto_tune(args: argparse.Namespace) -> None:
     config_path, best_configs = tune_fused_moe_triton(
@@ -47,6 +54,7 @@ def run_auto_tune(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         seed=args.seed,
         disable_shared_experts_fusion=args.disable_shared_experts_fusion,
+        num_iters=args.num_iters,
     )
 
 

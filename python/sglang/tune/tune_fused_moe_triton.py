@@ -219,6 +219,7 @@ class BenchmarkWorker:
         per_channel_quant: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
+        num_iters: int,
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
@@ -238,7 +239,7 @@ class BenchmarkWorker:
                         use_int8_w8a16,
                         per_channel_quant,
                         block_shape,
-                        num_iters=10,
+                        num_iters=num_iters,
                     )
                 except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     # Some configurations may be invalid and fail to compile.
@@ -263,6 +264,7 @@ def tune_fused_moe_triton(
     batch_size: Optional[int],
     seed: int,
     disable_shared_experts_fusion: bool,
+    num_iters: int,
 ) -> Tuple[str, Dict[int, BenchmarkConfig]]:
     """Run fused MoE Triton tuning programmatically.
 
@@ -359,6 +361,7 @@ def tune_fused_moe_triton(
                 per_channel_quant,
                 block_shape,
                 search_space,
+                num_iters,
             )
             for batch_size in batch_sizes
         ],
