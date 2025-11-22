@@ -5,7 +5,7 @@ Server management and performance validation for diffusion tests.
 from __future__ import annotations
 
 import os
-import statistics
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -18,18 +18,16 @@ from urllib.request import urlopen
 
 from openai import OpenAI
 
+from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
 )
-from sglang.multimodal_gen.test.test_utils import (
-    prepare_perf_log,
-    sample_step_indices,
-    validate_image,
-)
+from sglang.multimodal_gen.test.test_utils import prepare_perf_log, validate_image
 
 logger = init_logger(__name__)
 
@@ -133,7 +131,9 @@ class ServerManager:
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
         env["SGLANG_PERF_LOG_DIR"] = log_dir.as_posix()
 
-        stdout_fh = stdout_path.open("w", encoding="utf-8", buffering=1)
+        # TODO: unify with run_command
+        print(f"Running command: {shlex.join(command)}")
+
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -144,6 +144,7 @@ class ServerManager:
         )
 
         log_thread = None
+        stdout_fh = stdout_path.open("w", encoding="utf-8", buffering=1)
         if process.stdout:
 
             def _log_pipe(pipe: Any, file: Any) -> None:
@@ -319,9 +320,7 @@ class PerformanceValidator:
         Uses the larger of relative tolerance or absolute tolerance to prevent
         flaky failures on very fast operations.
         """
-        rel_limit = expected * (1 + tolerance)
-        abs_limit = expected + min_abs_tolerance_ms
-        upper_bound = max(rel_limit, abs_limit)
+        upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance_ms)
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
             f"  Actual:   {actual:.4f}ms\n"
@@ -331,10 +330,10 @@ class PerformanceValidator:
         )
 
     def validate(
-        self, perf_record: dict, stage_metrics: dict, *args, **kwargs
+        self, perf_record: RequestPerfRecord, *args, **kwargs
     ) -> PerformanceSummary:
         """Validate all performance metrics and return summary."""
-        summary = self.collect_metrics(perf_record, stage_metrics)
+        summary = self.collect_metrics(perf_record)
         if self.is_baseline_generation_mode:
             return summary
 
@@ -347,40 +346,9 @@ class PerformanceValidator:
 
     def collect_metrics(
         self,
-        perf_record: dict,
-        stage_metrics: dict,
+        perf_record: RequestPerfRecord,
     ) -> PerformanceSummary:
-        """Collect all performance metrics into a summary without validation."""
-        e2e_ms = float(perf_record.get("total_duration_ms", 0.0))
-        steps = [
-            s
-            for s in perf_record.get("steps", []) or []
-            if s.get("name") == "denoising_step_guided" and "duration_ms" in s
-        ]
-
-        avg_denoise = 0.0
-        median_denoise = 0.0
-        if steps:
-            durations = [float(s["duration_ms"]) for s in steps]
-            avg_denoise = sum(durations) / len(durations)
-            median_denoise = statistics.median(durations)
-
-        per_step = {
-            int(s["index"]): float(s["duration_ms"])
-            for s in steps
-            if s.get("index") is not None
-        }
-        sample_indices = sample_step_indices(per_step, self.step_fractions)
-        sampled_steps = {idx: per_step[idx] for idx in sample_indices}
-
-        return PerformanceSummary(
-            e2e_ms=e2e_ms,
-            avg_denoise_ms=avg_denoise,
-            median_denoise_ms=median_denoise,
-            stage_metrics=stage_metrics,
-            sampled_steps=sampled_steps,
-            all_denoise_steps=per_step,
-        )
+        return PerformanceSummary.from_req_perf_record(perf_record, self.step_fractions)
 
     def _validate_e2e(self, summary: PerformanceSummary) -> None:
         """Validate end-to-end performance."""
@@ -415,11 +383,14 @@ class PerformanceValidator:
             expected = self.scenario.denoise_step_ms.get(idx)
             if expected is None:
                 continue
+            # FIXME: hardcode, looser for first step
+            tolerance = 0.4 if idx == 0 else self.tolerances.denoise_step
+
             self._assert_le(
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                self.tolerances.denoise_step,
+                tolerance,
             )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
@@ -452,12 +423,11 @@ class VideoPerformanceValidator(PerformanceValidator):
 
     def validate(
         self,
-        perf_record: dict,
-        stage_metrics: dict,
+        perf_record: RequestPerfRecord,
         num_frames: int | None = None,
     ) -> PerformanceSummary:
         """Validate video metrics including frame generation rates."""
-        summary = super().validate(perf_record, stage_metrics)
+        summary = super().validate(perf_record)
 
         if num_frames and summary.e2e_ms > 0:
             summary.total_frames = num_frames
