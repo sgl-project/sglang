@@ -197,7 +197,7 @@ Consider updating perf_baselines.json with the snippets below:
             is_baseline_generation_mode = (
                 os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
             )
-            timeout = 3600.0 if is_baseline_generation_mode else 600.0
+            timeout = 3600.0 if is_baseline_generation_mode else 1200.0
             deadline = time.time() + timeout
             while True:
                 page = client.videos.list()  # type: ignore[attr-defined]
@@ -392,7 +392,7 @@ Consider updating perf_baselines.json with the snippets below:
         summary = validator.collect_metrics(perf_record)
 
         if is_baseline_generation_mode or missing_scenario:
-            self._dump_baseline_for_testcase(case, summary)
+            self._dump_baseline_for_testcase(case, summary, missing_scenario)
             if missing_scenario:
                 pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
             return
@@ -507,7 +507,10 @@ Consider updating perf_baselines.json with the snippets below:
             self._improved_baselines.append({"id": case.id, "baseline": new_baseline})
 
     def _dump_baseline_for_testcase(
-        self, case: DiffusionTestCase, summary: "PerformanceSummary"
+        self,
+        case: DiffusionTestCase,
+        summary: "PerformanceSummary",
+        missing_scenario: bool = False,
     ) -> None:
         """Dump performance metrics as a JSON scenario for baselines."""
         import json
@@ -533,10 +536,9 @@ Consider updating perf_baselines.json with the snippets below:
                     if summary.avg_frame_time_ms
                     else None
                 )
-
+        action = "add" if missing_scenario else "update"
         output = f"""
-To add this baseline, copy the following JSON snippet into
-the "scenarios" section of perf_baselines.json:
+{action} this baseline in the "scenarios" section of perf_baselines.json:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
