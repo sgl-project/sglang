@@ -75,7 +75,7 @@ jobs:
       - name: Sync configs into repo
         run: |
           mkdir -p python/sglang/srt/layers/moe/fused_moe_triton/configs
-          rsync -a downloaded-configs/ python/sglang/srt/layers/moe/fused_moe_triton/configs/
+          rsync -a downloaded-configs/python/sglang/srt/layers/moe/fused_moe_triton/configs/ python/sglang/srt/layers/moe/fused_moe_triton/configs/
 
       - name: Create PR with tuned configs
         uses: peter-evans/create-pull-request@v6

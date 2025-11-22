@@ -76,6 +76,9 @@ def main() -> None:
         SEEDS,
         DISABLE_SHARED_EXPERTS_FUSION,
     ):
+        if tp % ep != 0:
+            continue
+
         cmd = build_cmd(
             model=model,
             tp=tp,
