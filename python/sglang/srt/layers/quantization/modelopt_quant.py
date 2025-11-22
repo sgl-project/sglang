@@ -139,7 +139,7 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 )
 
 # TODO make it true by default when the DeepEP PR is merged
-MOE_NVFP4_DISPATCH = get_bool_env_var("SGLANG_MOE_NVFP4_DISPATCH", "false")
+MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
