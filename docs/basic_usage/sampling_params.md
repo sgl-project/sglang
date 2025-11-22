@@ -198,124 +198,21 @@ SGLang supports three different formats for `image_data` to accommodate various 
 ##### 1. Raw Images (Basic Usage)
 
 The simplest way to pass images - SGLang will handle all preprocessing automatically.
-
-```python
-import requests
-from PIL import Image
-
-# File path
-response = requests.post(
-    "http://localhost:30000/generate",
-    json={
-        "text": "<image>\nWhat's in this image?",
-        "image_data": "example_image.png",
-    },
-)
-
-# URL
-response = requests.post(
-    "http://localhost:30000/generate",
-    json={
-        "text": "<image>\nWhat's in this image?",
-        "image_data": "https://example.com/image.jpg",
-    },
-)
-
-# Multiple images
-response = requests.post(
-    "http://localhost:30000/generate",
-    json={
-        "text": "<image><image>\nCompare these two images.",
-        "image_data": ["image1.png", "image2.png"],
-    },
-)
-```
-
 **Use case**: Quick prototyping, simple applications, when you don't need fine control over preprocessing.
 
 ##### 2. Processor Output (Advanced)
 
 Pass the output from a HuggingFace processor directly, bypassing SGLang's preprocessing.
-
-```python
-import requests
-from transformers import AutoProcessor
-from PIL import Image
-
-processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
-image = Image.open("example.png")
-text = "<image>\nDescribe this image."
-
-# Preprocess with HuggingFace processor
-processor_output = processor(images=[image], text=text, return_tensors="pt")
-
-# Pass processor output directly to SGLang
-# Note: For HTTP requests, tensors must be converted to lists.
-# For Python Engine API, you can pass tensors directly.
-processor_output_dict = {k: v.tolist() if hasattr(v, "tolist") else v
-                        for k, v in processor_output.items()}
-
-response = requests.post(
-    "http://localhost:30000/generate",
-    json={
-        "input_ids": processor_output_dict["input_ids"][0],
-        "image_data": [dict(processor_output_dict, format="processor_output")],
-    },
-)
-```
-
 **Use case**: When you need precise control over image preprocessing, custom image transformations, or when integrating with existing preprocessing pipelines.
-
-**Note**: When using `processor_output` format:
-- You must pass `input_ids` instead of `text`
-- The processor output must include all required fields (e.g., `pixel_values`, `image_grid_thw` for Qwen-VL)
-- Use exactly one dict per batch (don't mix with other formats)
 
 ##### 3. Precomputed Embeddings (High Performance)
 
 Pre-calculate visual embeddings to avoid redundant vision encoder computation, ideal for caching or serving the same image multiple times.
-
-```python
-import requests
-import torch
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-from PIL import Image
-
-# Load vision encoder once
-processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
-vision_encoder = model.visual.cuda().eval()
-
-# Precompute embeddings (can be cached)
-image = Image.open("example.png")
-processor_output = processor(images=[image], text="<image>\n", return_tensors="pt")
-
-with torch.inference_mode():
-    precomputed_embeddings = vision_encoder(
-        processor_output["pixel_values"].cuda(),
-        processor_output["image_grid_thw"].cuda()
-    )
-
-# Use precomputed embeddings for inference
-response = requests.post(
-    "http://localhost:30000/generate",
-    json={
-        "input_ids": processor_output["input_ids"][0].tolist(),
-        "image_data": [dict(
-            processor_output,
-            format="precomputed_embedding",
-            feature=precomputed_embeddings.cpu().tolist(),  # Convert to list for JSON
-        )],
-    },
-)
-```
-
 **Use case**:
 - High-throughput serving with repeated image queries
 - Caching visual embeddings for frequently used images
 - Reducing latency when the same image is used across multiple requests
 - Multi-turn conversations with the same image
-
 **Performance benefits**:
 - Avoids redundant vision encoder computation (can save 30-50% of total inference time)
 - Enables efficient caching strategies
@@ -329,7 +226,7 @@ response = requests.post(
 | Processor Output | Manual | Automatic | Custom preprocessing pipelines |
 | Precomputed Embeddings | Manual | Pre-computed | High performance, caching |
 
-For detailed examples and model-specific usage, see [VLM Query Guide](../advanced_features/vlm_query.ipynb).
+For detailed examples and model-specific usage, see [VLM Query Guide](https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/vlm_query.ipynb).
 
 ### Structured Outputs (JSON, Regex, EBNF)
 
