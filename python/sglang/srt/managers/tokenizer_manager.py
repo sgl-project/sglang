@@ -33,6 +33,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import numpy as np
 import orjson
 import torch
 import uvloop
@@ -129,9 +130,14 @@ class TensorWrapper:
         self.dtype = tensor.dtype
 
         # Create buffer view
-        data_ptr = tensor.data_ptr()
-        total_bytes = tensor.numel() * tensor.element_size()
-        self.buffer = memoryview((ctypes.c_char * total_bytes).from_address(data_ptr))
+        if sys.version_info >= (3, 12):
+            data_ptr = tensor.data_ptr()
+            total_bytes = tensor.numel() * tensor.element_size()
+            self.buffer = memoryview(
+                (ctypes.c_char * total_bytes).from_address(data_ptr)
+            )
+        else:
+            self.buffer = np.asarray(tensor)
 
     # Make it work with ZMQ zero-copy
     def __buffer__(self, flag):
