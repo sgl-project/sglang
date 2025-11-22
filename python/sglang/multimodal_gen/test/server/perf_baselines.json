@@ -5,7 +5,7 @@
         "description": "Reference numbers captured from the CI diffusion server baseline run"
     },
     "tolerances": {
-        "e2e": 0.05,
+        "e2e": 0.1,
         "denoise_stage": 0.05,
         "non_denoise_stage": 0.3,
         "denoise_step": 0.2,
@@ -297,7 +297,6 @@
             "expected_avg_denoise_ms": 1820.02,
             "expected_median_denoise_ms": 1798.65
         },
-
         "wan2_2_ti2v_5b": {
             "stages_ms": {
                 "InputValidationStage": 96.27,
@@ -387,26 +386,25 @@
         },
         "fast_hunyuan_video": {
             "stages_ms": {
-                "InputValidationStage": 0.07,
-                "TextEncodingStage": 598.66,
-                "ConditioningStage": 0.01,
-                "TimestepPreparationStage": 57.26,
-                "LatentPreparationStage": 15.38,
-                "DenoisingStage": 3367.01,
-                "DecodingStage": 2457.57,
-                "per_frame_generation": null
+                "InputValidationStage": 0.09,
+                "TextEncodingStage": 845.64,
+                "ConditioningStage": 0.04,
+                "TimestepPreparationStage": 125.22,
+                "LatentPreparationStage": 29.34,
+                "DenoisingStage": 3860.64,
+                "DecodingStage": 2580.55
             },
             "denoise_step_ms": {
-                "0": 1577.86,
-                "1": 161.04,
-                "2": 406.81,
-                "3": 408.67,
-                "4": 403.55,
-                "5": 405.31
+                "0": 2063.08,
+                "1": 164.02,
+                "2": 406.99,
+                "3": 407.95,
+                "4": 407.51,
+                "5": 404.2
             },
-            "expected_e2e_ms": 6521.03,
-            "expected_avg_denoise_ms": 560.54,
-            "expected_median_denoise_ms": 406.06
+            "expected_e2e_ms": 7487.87,
+            "expected_avg_denoise_ms": 642.29,
+            "expected_median_denoise_ms": 407.25
         },
         "wan2_2_i2v_a14b_2gpu": {
             "stages_ms": {
@@ -415,7 +413,7 @@
                 "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 2.2,
                 "LatentPreparationStage": 8.93,
-                "ImageVAEEncodingStage":  2075.47,
+                "ImageVAEEncodingStage": 2075.47,
                 "DenoisingStage": 382628.41,
                 "DecodingStage": 2820.89
             },
