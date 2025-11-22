@@ -460,9 +460,14 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(
+        match_result = self.match_prefix(
             RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key)
         )
+        (new_indices, new_last_node) = (
+            match_result.device_indices,
+            match_result.last_device_node,
+        )
+
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
             new_indices[old_prefix_len:],
