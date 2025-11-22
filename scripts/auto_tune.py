@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from itertools import product
 from pathlib import Path
 from typing import List
 
@@ -29,7 +30,7 @@ PER_CHANNEL_QUANT: List[bool] = [True, False]
 BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
 SEEDS: List[int] = [0]
 DISABLE_SHARED_EXPERTS_FUSION: List[bool] = [True, False]
-NUM_ITERS: List[int] = [10]
+NUM_ITERS: int = 10
 
 
 def build_cmd(
@@ -39,7 +40,7 @@ def build_cmd(
     ep: int,
     dtype: str,
     per_channel_quant: bool,
-    batch_size: int | None,
+    batch_sizes: List[int],
     seed: int,
     disable_shared_experts_fusion: bool,
     num_iters: int,
@@ -52,8 +53,7 @@ def build_cmd(
     cmd += ["--dtype", str(dtype)]
     if per_channel_quant:
         cmd.append("--per-channel-quant")
-    if batch_size is not None:
-        cmd += ["--batch-size", str(batch_size)]
+    cmd += ["--batch-sizes", *[str(batch_size) for batch_size in batch_sizes]]
     if seed is not None:
         cmd += ["--seed", str(seed)]
     if disable_shared_experts_fusion:
@@ -66,37 +66,26 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     auto_tune_py = repo_root / "python" / "sglang" / "auto_tune.py"
 
-    lengths = {len(MODELS), len(TP_SIZES), len(EP_SIZES), len(DTYPES), len(PER_CHANNEL_QUANT), len(BATCH_SIZES), len(SEEDS), len(DISABLE_SHARED_EXPERTS_FUSION), len(NUM_ITERS)}
-    if len(lengths) != 1:
-        raise SystemExit("All config lists must have the same length.")
-
-    for idx, (model, tp, ep, dtype, pcq, batch, seed, disable_fusion, num_iters) in enumerate(
-        zip(
-            MODELS,
-            TP_SIZES,
-            EP_SIZES,
-            DTYPES,
-            PER_CHANNEL_QUANT,
-            BATCH_SIZES,
-            SEEDS,
-            DISABLE_SHARED_EXPERTS_FUSION,
-            NUM_ITERS,
-        )
+    idx = 0
+    for model, tp, ep, dtype, pcq, seed, disable_fusion in product(
+        MODELS,
+        TP_SIZES,
+        EP_SIZES,
+        DTYPES,
+        PER_CHANNEL_QUANT,
+        SEEDS,
+        DISABLE_SHARED_EXPERTS_FUSION,
     ):
-        if not model or str(model).startswith("FILL_ME_MODEL"):
-            print(f"[skip] Config {idx} has placeholder model; edit MODELS first.")
-            continue
-
         cmd = build_cmd(
             model=model,
             tp=tp,
             ep=ep,
             dtype=dtype,
             per_channel_quant=pcq,
-            batch_size=batch,
+            batch_sizes=BATCH_SIZES,
             seed=seed,
             disable_shared_experts_fusion=disable_fusion,
-            num_iters=num_iters,
+            num_iters=NUM_ITERS,
             auto_tune_py=auto_tune_py,
         )
 
@@ -105,8 +94,10 @@ def main() -> None:
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as exc:
             print(f"[fail] Config {idx} exited with {exc.returncode}")
+            idx += 1
             continue
         print(f"[done] Config {idx} completed\n")
+        idx += 1
 
 
 if __name__ == "__main__":

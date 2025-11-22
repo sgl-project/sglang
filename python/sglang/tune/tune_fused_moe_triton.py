@@ -254,7 +254,7 @@ def tune_fused_moe_triton(
     ep_size: int,
     dtype: str,
     per_channel_quant: bool,
-    batch_size: Optional[int],
+    batch_sizes: Optional[List[int]],
     seed: int,
     disable_shared_experts_fusion: bool,
     num_iters: int,
@@ -280,7 +280,7 @@ def tune_fused_moe_triton(
     use_int8_w8a8 = dtype == "int8_w8a8"
     use_int8_w8a16 = dtype == "int8_w8a16"
 
-    batch_sizes = [batch_size] if batch_size is not None else get_default_batch_sizes()
+    batch_sizes = batch_sizes if batch_sizes else get_default_batch_sizes()
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])

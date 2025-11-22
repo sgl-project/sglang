@@ -7,7 +7,7 @@ Usage:
 
 import argparse
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 from python.sglang.tune.tune_fused_moe_triton import tune_fused_moe_triton
 from python.sglang.tune.utils import (
@@ -38,7 +38,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, required=False)
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="*",
+        required=False,
+        help="List of batch sizes to tune; defaults to internal list if omitted",
+    )
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument(
         "--num-iters",
@@ -65,7 +71,7 @@ def run_auto_tune(args: argparse.Namespace) -> None:
         ep_size=args.ep_size,
         dtype=args.dtype,
         per_channel_quant=args.per_channel_quant,
-        batch_size=args.batch_size,
+        batch_sizes=args.batch_sizes,
         seed=args.seed,
         disable_shared_experts_fusion=args.disable_shared_experts_fusion,
         num_iters=args.num_iters,

@@ -1,10 +1,26 @@
-name: Auto tune
-
-on:
-  workflow_dispatch:
+name: Auto Tune Kernels 
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  2-gpu-runner-auto-tune:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run auto tune
+        run: |
+          pip install "triton==3.1.0"
+          python3 scripts/auto_tune.py
+          pip install "triton==3.2.0"
+          python3 scripts/auto_tune.py
+          pip install "triton==3.3.0"
+          python3 scripts/auto_tune.py
+          pip install "triton==3.4.0"
+          python3 scripts/auto_tune.py
