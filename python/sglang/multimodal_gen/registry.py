@@ -30,6 +30,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
+    StableDiffusion3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
@@ -43,6 +46,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
+from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
+    StableDiffusion3SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
@@ -405,6 +411,11 @@ def _register_configs():
         model_name="qwen-image-edit",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
+    )
+    register_configs(
+        model_name="stable-diffusion-3-medium",
+        sampling_param_cls=StableDiffusion3SamplingParams,
+        pipeline_config_cls=StableDiffusion3PipelineConfig,
     )
 
 
