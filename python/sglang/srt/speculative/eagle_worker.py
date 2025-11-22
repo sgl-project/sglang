@@ -19,6 +19,7 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -365,6 +366,12 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
+        if isinstance(batch.tree_cache, SWAChunkCache):
+            for req in batch.reqs:
+                batch.tree_cache.evict_swa(
+                    req, req.seqlen - 1, batch.model_config.attention_chunk_size
+                )
+
         # Parse args
         num_seqs = batch.batch_size()
         spec_info = batch.spec_info
