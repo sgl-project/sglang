@@ -264,7 +264,8 @@ class DiffGenerator:
             else DataType.VIDEO
         )
         pretrained_sampling_params.data_type = data_type
-        pretrained_sampling_params.set_output_file_name()
+        pretrained_sampling_params._set_output_file_name()
+        pretrained_sampling_params.adjust(self.server_args)
 
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
@@ -272,7 +273,6 @@ class DiffGenerator:
             current_sampling_params.prompt = p
             requests.append(
                 prepare_request(
-                    p,
                     server_args=self.server_args,
                     sampling_params=current_sampling_params,
                 )
@@ -310,21 +310,11 @@ class DiffGenerator:
                     continue
                 for output_idx, sample in enumerate(output_batch.output):
                     num_outputs = len(output_batch.output)
-                    output_file_name = req.output_file_name
-                    if num_outputs > 1 and output_file_name:
-                        base, ext = os.path.splitext(output_file_name)
-                        output_file_name = f"{base}_{output_idx}{ext}"
-
-                    save_path = (
-                        os.path.join(req.output_path, output_file_name)
-                        if output_file_name
-                        else None
-                    )
                     frames = self.post_process_sample(
                         sample,
                         fps=req.fps,
                         save_output=req.save_output,
-                        save_file_path=save_path,
+                        save_file_path=req.output_file_path(num_outputs, output_idx),
                         data_type=req.data_type,
                     )
 
