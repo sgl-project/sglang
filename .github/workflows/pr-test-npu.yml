@@ -88,7 +88,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1]
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
     steps:
@@ -122,7 +122,7 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
+          python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   per-commit-4-npu-a2:
     needs: [check-changes]
@@ -167,10 +167,6 @@ jobs:
     needs: [check-changes]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
-    strategy:
-      fail-fast: true
-      matrix:
-        part: [0, 1]
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-a3-ubuntu22.04-py3.11
     steps:
@@ -204,4 +200,5 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600
+
