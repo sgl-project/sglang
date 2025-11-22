@@ -192,8 +192,9 @@ def benchmark_config(
 class BenchmarkWorker:
     def __init__(self, seed: int) -> None:
         torch.set_default_device("cuda")
-        torch.cuda.manual_seed_all(0)
         self.seed = seed
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
         self.device_id = int(ray.get_gpu_ids()[0])

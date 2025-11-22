@@ -9,8 +9,8 @@ import argparse
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from python.sglang.tune.tune_fused_moe_triton import tune_fused_moe_triton
-from python.sglang.tune.utils import (
+from sglang.tune.tune_fused_moe_triton import tune_fused_moe_triton
+from sglang.tune.utils import (
     get_config_filename,
     save_configs,
 )
@@ -81,7 +81,7 @@ def run_auto_tune(args: argparse.Namespace) -> None:
         output_path = Path(args.output)
     else:
         # Recompute filename here so tune_fused_moe_triton stays pure
-        from python.sglang.tune.utils import get_model_config
+        from sglang.tune.utils import get_model_config
         import triton
 
         model_config = get_model_config(
