@@ -487,7 +487,7 @@ python3 -m sglang_router.launch_router \
   --worker-urls https://api.openai.com \
   --history-backend oracle
 
-# Postgresql backend
+# PostgreSQL backend
 python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
