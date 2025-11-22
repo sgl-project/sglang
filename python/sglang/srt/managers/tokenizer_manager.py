@@ -1824,17 +1824,22 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         meta_info["spec_accept_length"] = 0
         meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+        # Determine the number of draft tokens per step (for Eagle vs NGRAM)
+        num_draft_tokens = (
+            self.server_args.speculative_num_steps
+            if self.server_args.speculative_num_steps is not None
+            else self.server_args.speculative_num_draft_tokens
+        )
+
         if (
             recv_obj.spec_verify_ct[i] > 0
-            and self.server_args.speculative_num_steps is not None
+            and num_draft_tokens is not None
             and not isinstance(recv_obj, BatchEmbeddingOutput)
             and hasattr(recv_obj, "spec_accepted_tokens")
             # Checks that `spec_accepted_tokens[i]` will exist.
             and len(recv_obj.spec_accepted_tokens) > i
         ):
-            total_draft_tokens = (
-                recv_obj.spec_verify_ct[i] * self.server_args.speculative_num_steps
-            )
+            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_draft_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
