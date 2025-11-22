@@ -562,7 +562,7 @@ class Req:
         self.host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
-        # The prefix length of the last prefix matching
+        # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
