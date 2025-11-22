@@ -417,7 +417,7 @@
                 "LatentPreparationStage": 8.93,
                 "ImageVAEEncodingStage":  2075.47,
                 "DenoisingStage": 382628.41,
-                "DecodingStage": 2820.89,
+                "DecodingStage": 2820.89
             },
             "denoise_step_ms": {
                 "0": 31228.27,
@@ -611,7 +611,7 @@
                 "TimestepPreparationStage": 2.29,
                 "LatentPreparationStage": 3.08,
                 "DenoisingStage": 79913.08,
-                "DecodingStage": 1339.58,
+                "DecodingStage": 1339.58
             },
             "denoise_step_ms": {
                 "0": 19269.37,
