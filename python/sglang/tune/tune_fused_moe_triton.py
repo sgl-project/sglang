@@ -13,11 +13,9 @@ import torch
 import triton
 from utils import (
     BenchmarkConfig,
-    get_config_filename,
     get_configs_compute_bound,
     get_default_batch_sizes,
     get_model_config,
-    save_configs,
     sort_config,
 )
 from ray.experimental.tqdm_ray import tqdm
@@ -260,14 +258,11 @@ def tune_fused_moe_triton(
     seed: int,
     disable_shared_experts_fusion: bool,
     num_iters: int,
-) -> Tuple[str, Dict[int, BenchmarkConfig]]:
+) -> Dict[int, BenchmarkConfig]:
     """Run fused MoE Triton tuning programmatically.
 
     Returns:
-        A tuple of (config_path, best_configs), where config_path is the full
-        path of the saved config JSON under the fused_moe_triton configs
-        directory for the current Triton version, and best_configs maps batch
-        size to the tuned kernel config.
+        A mapping of batch size to the tuned kernel config.
     """
 
     model_config = get_model_config(
@@ -311,33 +306,8 @@ def tune_fused_moe_triton(
             if block_k % config["BLOCK_SIZE_K"] == 0
         ]
 
-    filename = get_config_filename(
-        E,
-        shard_intermediate_size,
-        hidden_size,
-        topk,
-        dtype_torch,
-        use_fp8_w8a8,
-        use_int8_w8a8,
-        use_int8_w8a16,
-        per_channel_quant,
-        block_shape,
-    )
-    triton_version_dir = f"triton_{triton.__version__.replace('.', '_')}"
-    config_root = (
-        Path(__file__).resolve().parent.parent
-        / "srt"
-        / "layers"
-        / "moe"
-        / "fused_moe_triton"
-        / "configs"
-        / triton_version_dir
-    )
-    config_root.mkdir(parents=True, exist_ok=True)
-    config_path = config_root / filename
-
     print(
-        f"Start tuning over {len(search_space)} configurations to create {config_path}..."
+        f"Start tuning over {len(search_space)} configurations..."
     )
 
     start = time.perf_counter()
@@ -364,10 +334,6 @@ def tune_fused_moe_triton(
     best_configs = {
         M: sort_config(config) for M, config in zip(batch_sizes, configs)
     }
-    save_configs(
-        best_configs,
-        str(config_path),
-    )
     end = time.perf_counter()
     print(f"Tuning took {end - start:.2f} seconds")
-    return str(config_path), best_configs
+    return best_configs
