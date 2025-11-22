@@ -454,6 +454,7 @@ class RadixCache(BasePrefixCache):
             )
         else:
             req.prefix_indices = new_indices
+
         req.last_node = new_last_node
 
     def pretty_print(self):
@@ -497,8 +498,8 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.value)
-                self.protected_size_ += len(node.value)
+                self.evictable_size_ -= len(node.key)
+                self.protected_size_ += len(node.key)
                 delta -= len(node.key)
             node.lock_ref += 1
             node = node.parent
@@ -511,8 +512,8 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                self.evictable_size_ += len(node.value)
-                self.protected_size_ -= len(node.value)
+                self.evictable_size_ += len(node.key)
+                self.protected_size_ -= len(node.key)
                 delta += len(node.key)
             node.lock_ref -= 1
             if node.parent is None:
@@ -626,7 +627,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
+            self.evictable_size_ += len(key)
             self._record_store_event(new_node)
         return total_prefix_length
 
@@ -653,7 +654,7 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.evictable_size_ -= len(node.value)
+        self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self):
         total_size = 0
