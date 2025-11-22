@@ -36,7 +36,7 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
 fi
 
-RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y && apt install software-properties-common -y \
+RUN apt update && apt install wget -y && apt install software-properties-common -y \
  && add-apt-repository ppa:deadsnakes/ppa -y \
  && apt install python3.12-full python3.12-dev python3.10-venv -y \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
@@ -49,7 +49,7 @@ RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y &
  && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
 # Set timezone and install all packages
-RUN --mount=type=cache,target=/var/cache/apt echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
+RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
  && apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
@@ -108,7 +108,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
  && rm -rf /tmp/local_src
-RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+RUN  python3 -m pip install --upgrade pip setuptools wheel html5lib six \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
@@ -189,7 +189,7 @@ RUN cd /sgl-workspace/nvshmem && \
 
 # Install DeepEP
 # CTK13 requires the cccl include
-RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
+RUN cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
       12.6.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
@@ -208,12 +208,12 @@ RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0" --extra-index-url https://pypi.org/simple/
+RUN python3 -m pip install --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0" --extra-index-url https://pypi.org/simple/
 
 # For cuda 13, we install triton from source to fix some sm103 issues
 # This can be reverted after >3.4.5 is released
 # See the conversation in: https://github.com/triton-lang/triton/pull/8536
-RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+RUN if [ "$CUDA_VERSION" = "13.0.1" ]; then \
     wget -q https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/${TRITON_LANG_COMMIT}.zip && \
     unzip -q ${TRITON_LANG_COMMIT}.zip && rm ${TRITON_LANG_COMMIT}.zip && mv triton-${TRITON_LANG_COMMIT} triton && \
     cd triton && pip install --break-system-packages -r python/requirements.txt && \
@@ -221,7 +221,7 @@ RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]
 fi
 
 # Python tools
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
+RUN python3 -m pip install \
     datamodel_code_generator \
     mooncake-transfer-engine==0.3.7.post2 \
     pre-commit \
@@ -236,7 +236,7 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     py-spy
 
 # Install development tools and utilities
-RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y \
     gdb \
     ninja-build \
     vim \
@@ -262,7 +262,7 @@ RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-RUN --mount=type=cache,target=/var/cache/apt apt update -y \
+RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
     && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
     && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
@@ -276,7 +276,7 @@ ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
 # Install minimal Python packages
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --break-system-packages \
+RUN python3 -m pip install --break-system-packages \
     pytest \
     black \
     isort \
@@ -314,7 +314,7 @@ RUN CMAKE_VERSION=3.31.1 \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Build and install sgl-router (Rust toolchain removed after build to save space)
-RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && rustc --version && cargo --version \
     && python3 -m pip install maturin \
