@@ -79,7 +79,7 @@ def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
     if target starts with 're:' to any target in list.
     """
     for target in targets:
-        if _is_equal_or_regex_match(layer_name, target):
+        if _is_equal_or_regex_match(layer_name, target, check_contains=True):
             return True
     return False
 
