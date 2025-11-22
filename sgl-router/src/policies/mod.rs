@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use tracing::{debug};
+use tracing::debug;
 
 use crate::core::Worker;
 

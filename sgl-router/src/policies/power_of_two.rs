@@ -8,7 +8,7 @@ use std::{
 use rand::Rng;
 use tracing::info;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, DPLoadManager};
+use super::{get_healthy_worker_indices, DPLoadManager, LoadBalancingPolicy};
 use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Power-of-two choices policy
