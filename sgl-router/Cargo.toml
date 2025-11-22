@@ -19,6 +19,14 @@ crate-type = ["rlib"]
 name = "sglang-router"
 path = "src/main.rs"
 
+[[bin]]
+name = "smg"
+path = "src/main.rs"
+
+[[bin]]
+name = "amg"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
