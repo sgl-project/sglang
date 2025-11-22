@@ -94,6 +94,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.mm_utils import (
     external_mm_preprocess_routine,
+    resolve_external_mm_data_embedding_funcs,
     should_use_external_mm_preprocess,
 )
 from sglang.srt.mem_cache.allocator import (
@@ -216,7 +217,7 @@ _is_xpu_xmx_available = xpu_has_xmx_support()
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 
 # Detect stragger ranks in model loading
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 # the ratio of mamba cache pool size to max_running_requests, it will be safe when it is larger than 2 (yizhang2077)
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
@@ -2145,9 +2146,11 @@ class ModelRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
 
         if self.is_multimodal and should_use_external_mm_preprocess(self.model):
+            data_embedding_funcs = resolve_external_mm_data_embedding_funcs(self.model)
             forward_batch = external_mm_preprocess_routine(
                 forward_batch=forward_batch,
                 multimodal_model=self.model,
+                data_embedding_funcs=data_embedding_funcs,
             )
 
         kwargs = {}
