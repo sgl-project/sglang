@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import pytest
 
-# Import the base class to reuse logic
 from sglang.multimodal_gen.test.server.test_server_performance import (
     DiffusionPerformanceBase,
+    diffusion_server,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     TWO_GPU_CASES,
