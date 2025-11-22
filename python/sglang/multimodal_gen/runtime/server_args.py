@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
-"""The arguments of sgl-diffusion Inference."""
+"""The arguments of sglang-diffusion Inference."""
 import argparse
 import dataclasses
 import inspect
@@ -393,7 +393,7 @@ class ServerArgs:
             type=str,
             choices=ExecutionMode.choices(),
             default=ServerArgs.mode.value,
-            help="The mode to run sgl-diffusion",
+            help="The mode to run SGLang-diffusion",
         )
 
         # Workload type

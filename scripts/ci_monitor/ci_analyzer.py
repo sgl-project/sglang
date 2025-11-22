@@ -1174,12 +1174,12 @@ def main():
             analyzer.generate_nightly_github_summary(stats)
             regressions = analyzer.detect_nightly_regressions(stats)
 
-            # Exit with error code if regressions detected
+            # Report regressions but don't stop the monitor
             if regressions:
-                sys.exit(1)
+                print("\n⚠️  Regressions detected - see report above")
             else:
                 print("\n✓ No significant regressions detected")
-                sys.exit(0)
+            sys.exit(0)
 
         else:
             # Regular CI analysis mode
