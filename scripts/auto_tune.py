@@ -20,8 +20,12 @@ from typing import List
 
 
 MODELS: List[str] = [
+    "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "Qwen/Qwen3-Next-80B-A3B-Instruct",
     "deepseek-ai/DeepSeek-V3",
-    "deepseek-ai/DeepSeek-R1",  
+    "inclusionAI/Ling-mini-2.0",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "zai-org/GLM-4.5-Air",
 ]
 TP_SIZES: List[int] = [1, 2, 4, 8]
 EP_SIZES: List[int] = [1, 2, 4, 8]
