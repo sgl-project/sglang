@@ -693,6 +693,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
+        # DeepEP Normal may return 3D tensor [num_experts, num_tokens_per_expert, hidden_size]
+        # Need to reshape to 2D [total_tokens, hidden_size] for fused_marlin_moe
+        original_shape = hidden_states.shape
+        if hidden_states.ndim == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+
         # Create a dummy router_logits tensor for compatibility
         # In DeepEP mode, routing has already been done
         router_logits = torch.zeros(
@@ -721,6 +727,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
+
+        # Reshape output back to original shape if needed
+        if len(original_shape) == 3:
+            output = output.reshape(original_shape[0], original_shape[1], -1)
+
         return output
 
     def apply_deepep_ll(
@@ -764,6 +775,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
+        # DeepEP LL returns 3D tensor [num_experts, num_tokens_per_expert, hidden_size]
+        # Need to reshape to 2D [total_tokens, hidden_size] for fused_marlin_moe
+        original_shape = hidden_states.shape
+        if hidden_states.ndim == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+
         # Create a dummy router_logits tensor for compatibility
         router_logits = torch.zeros(
             hidden_states.shape[0],
@@ -791,4 +808,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
+
+        # Reshape output back to original shape if needed
+        if len(original_shape) == 3:
+            output = output.reshape(original_shape[0], original_shape[1], -1)
+
         return output
