@@ -2,9 +2,9 @@
 <img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
 </div>
 
-**sgl-diffusion is an inference framework for accelerated image/video generation.**
+**SGLang diffusion is an inference framework for accelerated image/video generation.**
 
-SGLang-Diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
+SGLang diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
 
 ## Key Features
 
@@ -65,7 +65,7 @@ For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md
 
 ## Contributing
 
-All contributions are welcome.
+All contributions are welcome. The contribution guide is available [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/contributing.md).
 
 ## Acknowledgement
 

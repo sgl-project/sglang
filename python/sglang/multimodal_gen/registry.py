@@ -15,7 +15,7 @@ import re
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
-from sglang.multimodal_gen.configs.pipelines import (
+from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
     HunyuanConfig,
@@ -25,12 +25,12 @@ from sglang.multimodal_gen.configs.pipelines import (
     WanT2V480PConfig,
     WanT2V720PConfig,
 )
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipelines.wan import (
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
     Wan2_2_I2V_A14B_Config,
@@ -55,7 +55,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
-from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -74,49 +74,37 @@ _PIPELINE_REGISTRY: Dict[str, Type[ComposedPipelineBase]] = {}
 def _discover_and_register_pipelines():
     """
     Automatically discover and register all ComposedPipelineBase subclasses.
-    This function scans the 'sglang.multimodal_gen.runtime.architectures' package,
+    This function scans the 'sglang.multimodal_gen.runtime.pipelines' package,
     finds modules with an 'EntryClass' attribute, and maps the class's 'pipeline_name'
     to the class itself in a global registry.
     """
-    if _PIPELINE_REGISTRY:  # E-run only once
+    if _PIPELINE_REGISTRY:  # run only once
         return
 
-    package_name = "sglang.multimodal_gen.runtime.architectures"
+    package_name = "sglang.multimodal_gen.runtime.pipelines"
     package = importlib.import_module(package_name)
 
-    for _, pipeline_type_str, ispkg in pkgutil.iter_modules(package.__path__):
+    for _, module_name, ispkg in pkgutil.walk_packages(
+        package.__path__, package.__name__ + "."
+    ):
         if not ispkg:
-            continue
-        pipeline_type_package_name = f"{package_name}.{pipeline_type_str}"
-        pipeline_type_package = importlib.import_module(pipeline_type_package_name)
-        for _, arch, ispkg_arch in pkgutil.iter_modules(pipeline_type_package.__path__):
-            if not ispkg_arch:
-                continue
-            arch_package_name = f"{pipeline_type_package_name}.{arch}"
-            arch_package = importlib.import_module(arch_package_name)
-            for _, module_name, ispkg_module in pkgutil.walk_packages(
-                arch_package.__path__, arch_package.__name__ + "."
-            ):
-                if not ispkg_module:
-                    pipeline_module = importlib.import_module(module_name)
-                    if hasattr(pipeline_module, "EntryClass"):
-                        entry_cls = pipeline_module.EntryClass
-                        if not isinstance(entry_cls, list):
-                            entry_cls_list = [entry_cls]
-                        else:
-                            entry_cls_list = entry_cls
+            pipeline_module = importlib.import_module(module_name)
+            if hasattr(pipeline_module, "EntryClass"):
+                entry_cls = pipeline_module.EntryClass
+                entry_cls_list = (
+                    [entry_cls] if not isinstance(entry_cls, list) else entry_cls
+                )
 
-                        for cls in entry_cls_list:
-                            if hasattr(cls, "pipeline_name"):
-                                if cls.pipeline_name in _PIPELINE_REGISTRY:
-                                    logger.warning(
-                                        f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
-                                    )
-                                _PIPELINE_REGISTRY[cls.pipeline_name] = cls
-                            # else:
-                            #     logger.warning(
-                            #         f"Pipeline class {cls.__name__} does not have a 'pipeline_name' attribute."
-                            #     )
+                for cls in entry_cls_list:
+                    if hasattr(cls, "pipeline_name"):
+                        if cls.pipeline_name in _PIPELINE_REGISTRY:
+                            logger.warning(
+                                f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
+                            )
+                        _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+    logger.debug(
+        f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
+    )
 
 
 # --- Part 2: Config Registration ---
