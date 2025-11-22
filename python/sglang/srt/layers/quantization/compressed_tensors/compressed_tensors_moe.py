@@ -697,7 +697,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         # Need to reshape to 2D [total_tokens, hidden_size] for fused_marlin_moe
         original_shape = hidden_states.shape
         if hidden_states.ndim == 3:
-            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous()
+
+        # Also reshape topk_ids and topk_weights if they are 3D
+        if topk_ids.ndim == 3:
+            topk_ids = topk_ids.reshape(-1, topk_ids.shape[-1]).contiguous()
+        if topk_weights.ndim == 3:
+            topk_weights = topk_weights.reshape(-1, topk_weights.shape[-1]).contiguous()
 
         # Create a dummy router_logits tensor for compatibility
         # In DeepEP mode, routing has already been done
@@ -749,7 +755,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             Output tensor after MoE computation
         """
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
+            fused_marlin_moe_deepep_ll,
         )
 
         assert (
@@ -775,42 +781,29 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        # DeepEP LL returns 3D tensor [num_experts, num_tokens_per_expert, hidden_size]
-        # Need to reshape to 2D [total_tokens, hidden_size] for fused_marlin_moe
-        original_shape = hidden_states.shape
-        if hidden_states.ndim == 3:
-            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-
-        # Create a dummy router_logits tensor for compatibility
-        router_logits = torch.zeros(
-            hidden_states.shape[0],
-            self.moe_runner_config.num_local_experts,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+        print(
+            f"[DeepEP LL Marlin] hidden_states.shape={hidden_states.shape}, "
+            f"masked_m={masked_m.tolist() if masked_m.numel() <= 10 else masked_m.shape}, "
+            f"expected_m={expected_m}"
         )
 
-        output = fused_marlin_moe(
+        # Call the specialized DeepEP LL Marlin MoE kernel
+        output = fused_marlin_moe_deepep_ll(
             hidden_states,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
             layer.w13_weight_scale,
             layer.w2_weight_scale,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            global_num_experts=self.moe_runner_config.num_experts,
-            expert_map=None,  # DeepEP handles expert mapping
+            masked_m,
             g_idx1=layer.w13_weight_g_idx,
             g_idx2=layer.w2_weight_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
+            w1_zeros=None,
+            w2_zeros=None,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
-
-        # Reshape output back to original shape if needed
-        if len(original_shape) == 3:
-            output = output.reshape(original_shape[0], original_shape[1], -1)
 
         return output
