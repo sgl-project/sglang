@@ -241,7 +241,7 @@ class LoRAManager:
 
         return required_slots <= mem_pool_vacancy
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def prepare_lora_batch(self, forward_batch: ForwardBatch, prefetch=False):
         # Load active loras into lora memory pool
         cur_uids = set(forward_batch.lora_ids)
 

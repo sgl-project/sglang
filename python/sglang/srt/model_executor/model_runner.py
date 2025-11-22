@@ -1343,6 +1343,23 @@ class ModelRunner:
             server_args=self.server_args,
         )
 
+    def prefetch_lora_batch(self, prefetch_batch: ForwardBatch):
+        """Prefetch LoRA adapters for the given batch"""
+
+        logger.info(
+            f"LoRA adapter prefetch starts for batch size: {prefetch_batch.batch_size}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.lora_manager.prepare_lora_batch(prefetch_batch, prefetch=True)
+
+        logger.info(
+            f"LoRA adapter prefetch completes for batch size: {prefetch_batch.batch_size}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result
+
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
 
