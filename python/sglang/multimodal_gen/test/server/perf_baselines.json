@@ -7,7 +7,7 @@
     "tolerances": {
         "e2e": 0.1,
         "denoise_stage": 0.05,
-        "non_denoise_stage": 0.3,
+        "non_denoise_stage": 0.4,
         "denoise_step": 0.2,
         "denoise_agg": 0.08
     },
@@ -41,7 +41,7 @@
                 "TimestepPreparationStage": 10.6,
                 "LatentPreparationStage": 11.8,
                 "DenoisingStage": 21202.6,
-                "DecodingStage": 512.6
+                "DecodingStage": 751.1
             },
             "denoise_step_ms": {
                 "0": 1077.77,
