@@ -133,7 +133,7 @@ class Scheduler:
 
             # 2: execute, make sure a reply is always sent
             try:
-                output_batch = self.worker.execute_forward(reqs, self.server_args)
+                output_batch = self.worker.execute_forward(reqs)
             except Exception as e:
                 logger.error(
                     f"Error executing forward in scheduler event loop: {e}",

@@ -14,7 +14,6 @@ ARG SGL_KERNEL_VERSION=0.3.17.post2
 ARG SGL_VERSION=0.5.5.post3
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
-ARG NVSHMEM_VERSION=3.4.5
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -24,7 +23,6 @@ ARG FLASHINFER_VERSION=0.5.2
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
     FLASHINFER_VERSION=${FLASHINFER_VERSION}
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -148,12 +146,8 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
 # Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 RUN set -eux; \
-    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      wget -q https://${GITHUB_ARTIFACTORY}/NVIDIA/nvshmem/releases/download/v${NVSHMEM_VERSION}-0/nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz; \
-      NVSHMEM_TARBALL="nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz"; \
-    else \
-      wget -q https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VERSION}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz; \
-      NVSHMEM_TARBALL="nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+    if [ "${CUDA_VERSION%%.*}" != "13" ]; then \
+      pip install nvidia-nvshmem-cu12==3.4.5 ; \
     fi && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
@@ -166,24 +160,7 @@ RUN set -eux; \
       unzip ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
       cd .. ; \
-    fi && \
-    tar -xf "${NVSHMEM_TARBALL}" && \
-    mv nvshmem_src nvshmem && \
-    rm -f "/sgl-workspace/${NVSHMEM_TARBALL}"
-
-# Build and install NVSHMEM
-RUN cd /sgl-workspace/nvshmem && \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then CUDA_ARCH="90;100;103;120"; else CUDA_ARCH="90"; fi && \
-    NVSHMEM_SHMEM_SUPPORT=0 \
-    NVSHMEM_UCX_SUPPORT=0 \
-    NVSHMEM_USE_NCCL=0 \
-    NVSHMEM_MPI_SUPPORT=0 \
-    NVSHMEM_IBGDA_SUPPORT=1 \
-    NVSHMEM_PMIX_SUPPORT=0 \
-    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
-    NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
-    cmake --build build --target install -j${BUILD_AND_DOWNLOAD_PARALLEL}
+    fi
 
 # Install DeepEP
 # CTK13 requires the cccl include
@@ -202,7 +179,7 @@ RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
+    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this

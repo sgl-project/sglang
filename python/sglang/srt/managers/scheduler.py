@@ -1004,6 +1004,9 @@ class Scheduler(
 
             self.last_batch = batch
 
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1050,8 +1053,8 @@ class Scheduler(
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
-            if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
-                self._check_runtime_mem_leak()
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
 
     def recv_requests(
         self,

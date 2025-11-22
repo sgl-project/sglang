@@ -52,11 +52,6 @@ if _use_aiter:
 logger = logging.getLogger(__name__)
 
 
-def _mask_topk_ids_cpu_experts(topk_ids: torch.Tensor, num_gpu_experts: int):
-    """Mask topk_ids >= num_gpu_experts by setting them to -1."""
-    topk_ids[topk_ids >= num_gpu_experts] = -1
-
-
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
