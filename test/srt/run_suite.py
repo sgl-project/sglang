@@ -116,6 +116,7 @@ suites = {
         TestFile("test_swa_unittest.py", 1),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 210),
+        TestFile("test_triton_fused_moe.py", 80),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_torchao.py", 70),
         TestFile("test_triton_attention_kernels.py", 4),
@@ -180,7 +181,7 @@ suites = {
     "per-commit-8-gpu-b200": [],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
-        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 590),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
