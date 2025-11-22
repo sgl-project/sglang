@@ -405,8 +405,8 @@ def initialize_model_parallel(
     assert _SP is None, "sequence parallel group is already initialized"
 
     try:
-        from yunchang import set_seq_parallel_pg as _set_seq_parallel_pg
-        from yunchang.globals import PROCESS_GROUP as _YC_PROCESS_GROUP
+        from .yunchang import PROCESS_GROUP as _YC_PROCESS_GROUP
+        from .yunchang import set_seq_parallel_pg as _set_seq_parallel_pg
     except ImportError:
         _set_seq_parallel_pg = None
 
