@@ -548,9 +548,12 @@ class FusedMoE(torch.nn.Module):
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:
+            require_global_experts = getattr(
+                param, "_sglang_require_global_experts", False
+            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
-                    self.layer_id, expert_id
+                    self.layer_id, expert_id, require_global_experts
                 )
             )
 
