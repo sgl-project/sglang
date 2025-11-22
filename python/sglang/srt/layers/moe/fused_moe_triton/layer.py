@@ -1115,9 +1115,6 @@ class FlashInferFP4MoE(FusedMoE):
             routing_method_type is not None
         ), "flashinfer trtllm moe nvfp4 backend has not been adapted for the current moe layer, you can set routing_method_type (See definition of RoutingMethodType please) for the moe layer explicitly for a quick adaptation."
 
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
-
         correction_bias = (
             None
             if topk_config.correction_bias is None
