@@ -16,7 +16,7 @@ limitations under the License.
 import logging
 import threading
 import time
-from queue import Empty, Full, Queue
+from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
@@ -259,6 +259,7 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        enable_backup_priority: bool = False,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -337,9 +338,11 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
-        self.write_queue: List[CacheOperation] = []
+        if enable_backup_priority:
+            self.write_queue = PriorityQueue[CacheOperation]()
+        else:
+            self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
@@ -446,7 +449,6 @@ class HiCacheController:
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return
-
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()

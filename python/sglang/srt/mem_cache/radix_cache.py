@@ -196,6 +196,7 @@ class RadixCache(BasePrefixCache):
         enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
+        enable_backup_priority: bool = False,
         is_eagle: bool = False,
         disable_finished_insert: bool = False,
     ):
@@ -205,6 +206,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.enable_backup_priority = enable_backup_priority
         self.is_eagle = is_eagle
         self.disable_finished_insert = disable_finished_insert
 
