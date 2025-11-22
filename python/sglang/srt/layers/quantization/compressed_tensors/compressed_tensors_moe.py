@@ -684,9 +684,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         ) = dispatch_output
 
         # Marlin uses fp16/bf16 activations, no need for FP8 scale
-        assert (
-            hidden_states_scale is None
-        ), "Marlin MoE does not support FP8 activations"
+        if hidden_states_scale is not None:
+            raise RuntimeError(
+                "Marlin MoE does not support FP8 activations in DeepEP dispatch. "
+                "Please set environment variable: SGLANG_DEEPEP_BF16_DISPATCH=1"
+            )
 
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -753,9 +755,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         ) = dispatch_output
 
         # Marlin uses fp16/bf16 activations, no need for FP8 scale
-        assert (
-            hidden_states_scale is None
-        ), "Marlin MoE does not support FP8 activations"
+        if hidden_states_scale is not None:
+            raise RuntimeError(
+                "Marlin MoE does not support FP8 activations in DeepEP dispatch. "
+                "Please set environment variable: SGLANG_DEEPEP_BF16_DISPATCH=1"
+            )
 
         if hidden_states.shape[0] == 0:
             return hidden_states
