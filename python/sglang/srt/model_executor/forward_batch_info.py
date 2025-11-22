@@ -637,6 +637,8 @@ class ForwardBatch:
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
         # batch_size * [3 * seq_len]
+        from .forkedpdb import ForkedPdb
+        # ForkedPdb().set_trace()
         batch_size = self.seq_lens.shape[0]
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
@@ -655,7 +657,7 @@ class ForwardBatch:
                         mm_input, self.seq_lens[batch_idx], model_runner.device
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
-            elif self.forward_mode.is_extend():
+            elif self.forward_mode.is_extend(include_draft_extend_v2=True):
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
@@ -684,7 +686,8 @@ class ForwardBatch:
                             mm_input, self.seq_lens[batch_idx], model_runner.device
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
-
+        # from .forkedpdb import ForkedPdb
+        # ForkedPdb().set_trace()
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
             dim=1,

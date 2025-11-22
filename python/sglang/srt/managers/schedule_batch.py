@@ -923,10 +923,11 @@ class Req:
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None:
-            if self.grammar.is_terminated():
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-                return
+        # This judgment logic should not be placed here, otherwise it will cause the current result of the Nth round of generation to be eos, but the non-eos tokens are being processed but are judged to have ended.
+        # if self.grammar is not None:
+        #     if self.grammar.is_terminated():
+        #         self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+        #         return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 

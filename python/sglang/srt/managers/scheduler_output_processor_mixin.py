@@ -156,16 +156,16 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                        try:
-                            req.grammar.accept_token(next_token_id)
-                        except ValueError as e:
-                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                            # This can happen if the grammar is not set correctly or the token is invalid.
-                            logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                            )
-                            self.abort_request(AbortReq(rid=req.rid))
+                    #     # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    #     try:
+                    #         req.grammar.accept_token(next_token_id)
+                    #     except ValueError as e:
+                    #         # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    #         # This can happen if the grammar is not set correctly or the token is invalid.
+                    #         logger.error(
+                    #             f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    #         )
+                    #         self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
                     trace_slice(
@@ -367,16 +367,16 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    req.grammar.accept_token(next_token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
-                    self.abort_request(AbortReq(rid=req.rid))
+            #     # FIXME: this try-except block is for handling unexpected xgrammar issue.
+            #     try:
+            #         req.grammar.accept_token(next_token_id)
+            #     except ValueError as e:
+            #         # Grammar accept_token can raise ValueError if the token is not in the grammar.
+            #         # This can happen if the grammar is not set correctly or the token is invalid.
+            #         logger.error(
+            #             f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+            #         )
+            #         self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)

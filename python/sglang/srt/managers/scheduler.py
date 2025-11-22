@@ -1004,6 +1004,121 @@ class Scheduler(
 
             self.last_batch = batch
 
+
+
+    def _peek_spec_token_ids(
+        self, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> List[List[int]]:
+        """
+        Extract speculative token IDs for the Eagle algorithm.
+        Assumes inputs are already transferred to CPU to minimize overhead.
+        """
+        next_token_ids = result.next_token_ids
+        accept_lens = result.accept_lens
+        
+        # Ensure data is in list format for faster python slicing
+        if hasattr(next_token_ids, 'tolist'):
+            next_token_ids = next_token_ids.tolist()
+        if hasattr(accept_lens, 'tolist'):
+            accept_lens = accept_lens.tolist()
+
+        stride = self.draft_worker.speculative_num_draft_tokens
+        predict_tokens = []
+        
+        # Slice the tokens for each request based on its acceptance length
+        for i in range(len(batch.reqs)):
+            start = i * stride
+            end = start + accept_lens[i]
+            predict_tokens.append(next_token_ids[start:end])
+            
+        return predict_tokens
+
+    def _update_grammar_fast_path(self, batch, batch_result):
+        """
+        [Optimized] Fast update of Grammar state after batch execution.
+        
+        Note: This forces a synchronization of GPU data to CPU because the 
+        grammar FSM resides in CPU memory and requires the actual token IDs.
+        """
+        # 1. Trigger non-blocking data transfer to CPU
+        needs_sync = False
+        
+        def move_to_cpu(tensor):
+            if tensor is not None and hasattr(tensor, 'device') and tensor.device.type != 'cpu':
+                return tensor.to("cpu", non_blocking=True)
+            return tensor
+
+        if batch.forward_mode.is_decode():
+            batch_result.next_token_ids = move_to_cpu(batch_result.next_token_ids)
+            # Eagle mode requires additional length info
+            if batch.is_v2_eagle:
+                batch_result.accept_lens = move_to_cpu(batch_result.accept_lens)
+                batch_result.allocate_lens = move_to_cpu(batch_result.allocate_lens)
+            needs_sync = True
+            
+        elif batch.forward_mode.is_extend():
+            # Extend mode usually only needs next_token_ids
+            if hasattr(batch_result.next_token_ids, 'flatten'):
+                 batch_result.next_token_ids = move_to_cpu(batch_result.next_token_ids)
+                 needs_sync = True
+        else:
+            return
+
+        # 2. Synchronize the current stream to ensure data is ready on CPU
+        if needs_sync:
+            torch.cuda.current_stream().synchronize()
+
+        # 3. Prepare token data (Handle Standard vs Eagle/Speculative)
+        next_token_ids = None
+        is_multi_token = False
+
+        if batch.forward_mode.is_decode():
+            if batch.is_v2_eagle:
+                # Eagle: Multiple tokens per request
+                next_token_ids = self._peek_spec_token_ids(batch_result, batch)
+                is_multi_token = True
+            elif batch.spec_algorithm.is_none():
+                # Standard Decode: Single token per request
+                if hasattr(batch_result.next_token_ids, 'flatten'):
+                    next_token_ids = batch_result.next_token_ids.flatten().tolist()
+                else:
+                    next_token_ids = batch_result.next_token_ids
+        elif batch.forward_mode.is_extend():
+             if hasattr(batch_result.next_token_ids, 'flatten'):
+                next_token_ids = batch_result.next_token_ids.flatten().tolist()
+             else:
+                next_token_ids = batch_result.next_token_ids
+
+        if next_token_ids is None:
+            return
+
+        # 4. Update Grammar State
+        # Loop unswitching: Split loops to avoid repeated type checks (list vs int) inside the hot loop.
+        reqs = batch.reqs
+        
+        if is_multi_token:
+            # Path A: Multi-token update (e.g., Eagle)
+            for i, tokens in enumerate(next_token_ids):
+                req = reqs[i]
+                if req.grammar is None:
+                    continue
+                try:
+                    for t in tokens:
+                        req.grammar.accept_token(t)
+                except ValueError as e:
+                    logger.error(f"Fast-path grammar update failed for req {req.rid}: {e}")
+        else:
+            # Path B: Single-token update (Standard)
+            for i, token in enumerate(next_token_ids):
+                req = reqs[i]
+                if req.grammar is None:
+                    continue
+                try:
+                    req.grammar.accept_token(int(token))
+                except ValueError as e:
+                    logger.error(f"Fast-path grammar update failed for req {req.rid}: {e}")
+
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1020,7 +1135,8 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-
+            # from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -2114,6 +2230,8 @@ class Scheduler(
                 extend_logprob_start_len_per_req
             )
             ret = batch_result
+            if batch.has_grammar:
+                self._update_grammar_fast_path(batch, batch_result)
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
@@ -2148,6 +2266,8 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
+            # from .forkedpdb import ForkedPdb
+            # ForkedPdb().set_trace()
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
