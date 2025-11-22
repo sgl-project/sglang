@@ -90,6 +90,27 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+    def __str__(self):
+        if self == ForwardMode.EXTEND:
+            return "EXTEND"
+        elif self == ForwardMode.DECODE:
+            return "DECODE"
+        elif self == ForwardMode.MIXED:
+            return "MIXED"
+        elif self == ForwardMode.IDLE:
+            return "IDLE"
+        elif self == ForwardMode.TARGET_VERIFY:
+            return "TARGET_VERIFY"
+        elif self == ForwardMode.DRAFT_EXTEND:
+            return "DRAFT_EXTEND"
+        elif self == ForwardMode.DRAFT_EXTEND_V2:
+            return "DRAFT_EXTEND_V2"
+        elif self == ForwardMode.PREBUILT:
+            return "PREBUILT"
+        elif self == ForwardMode.SPLIT_PREFILL:
+            return "SPLIT_PREFILL"
+        return "UNKNOWN"
+
     def is_prefill(self):
         return self.is_extend()
 

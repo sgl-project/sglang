@@ -93,6 +93,11 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.token_dispatcher.base import (
+    BaseDispatcher,
+    CombineInput,
+    DispatchOutput,
+)
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -131,7 +136,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.single_batch_overlap import SboFlags
+from sglang.srt.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
@@ -168,10 +173,14 @@ _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
+
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    from aiter.ops.triton.fused_fp8_quant import (
+        fused_flatten_fp8_group_quant,
+        fused_rms_fp8_group_quant,
+    )
 
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
@@ -241,17 +250,6 @@ def add_forward_absorb_core_attention_backend(backend_name):
     if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
         FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
-
-
-def is_nsa_indexer_wk_and_weights_proj_fused(config, quant_config):
-    """
-    NSA Indexer wk and weights_proj can be fused in FP4 model because they are both in BF16
-    """
-    return (
-        is_deepseek_nsa(config)
-        and quant_config is not None
-        and quant_config.get_name() == "modelopt_fp4"
-    )
 
 
 class AttnForwardMethod(IntEnum):
@@ -858,7 +856,9 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         if hidden_states.shape[0] > 0:
-            if not self._fuse_shared_experts_inside_sbo:
+            if (
+                not self._fuse_shared_experts_inside_sbo
+            ):  # TODO: check if it supports mtp
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
@@ -872,23 +872,36 @@ class DeepseekV2MoE(nn.Module):
         if self._fuse_shared_experts_inside_sbo:
             shared_output = None
 
-            def _forward_shared_experts_and_put_results():
+            def _pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator
-                )
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, gemm_output_zero_allocator
+                    )
+
+                pre_combine_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                nonlocal shared_output
+                torch.cuda.current_stream().wait_stream(self.alt_stream)
+                post_combine_hook_handle.remove()
+
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
 
         final_hidden_states = self.experts(
             hidden_states,
             topk_output,
-            **(
-                dict(
-                    forward_shared_experts=_forward_shared_experts_and_put_results,
-                    alt_stream=self.alt_stream,
-                )
-                if self._fuse_shared_experts_inside_sbo
-                else {}
-            ),
         )
         if (
             not _is_cuda
@@ -972,10 +985,11 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
+        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not self._fuse_shared_experts_inside_sbo:
+            if not sbo_enabled_flag:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -988,26 +1002,67 @@ class DeepseekV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        if self._fuse_shared_experts_inside_sbo:
+        # SBO is not yet implemented for NextN
+        if sbo_enabled_flag:
             shared_output = None
 
-            def _forward_shared_experts_and_put_results():
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+
+                post_dispatch_hook_handle.remove()
+
+            def _pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+
+                if (
+                    e := dispatcher.meta_overlap_args.get("record_event_after_down")
+                ) is not None:
+                    e.record()
+
+                # TODO reduce sm for non-deepgemm
+                with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                    dispatcher.meta_overlap_args["compute_num_sms"]
+                ):
+                    shared_output = self._forward_shared_experts(hidden_states)
+
+                pre_combine_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
-            **(
-                dict(
-                    forward_shared_experts=_forward_shared_experts_and_put_results,
-                    alt_stream=self.alt_stream,
-                    # SBO is not yet implemented for NextN
-                    disable_sbo=self.is_nextn,
-                )
-                if self._fuse_shared_experts_inside_sbo
-                else {}
-            ),
         )
 
         if shared_output is not None:
@@ -1235,9 +1290,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
-                fuse_wk_and_weights_proj=is_nsa_indexer_wk_and_weights_proj_fused(
-                    config, quant_config
-                ),
             )
 
         self.kv_b_proj = ColumnParallelLinear(
@@ -2015,6 +2067,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
+            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                attn_bmm_output = attn_bmm_output.transpose(0, 1)
+                attn_bmm_output = fused_flatten_fp8_group_quant(
+                    attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
+                )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
@@ -3849,12 +3906,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
-        # Fuse wk and weights_proj when NSA Indexer is enabled and quant_config is FP4. For nextn, fp4 is disabled so we cannot fuse.
-        fuse_wk_and_weights_proj = (
-            is_nsa_indexer_wk_and_weights_proj_fused(self.config, self.quant_config)
-            and not is_nextn
-        )
-        cached_wk_and_weights_proj = {} if fuse_wk_and_weights_proj else None
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -4040,57 +4091,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
-                        elif fuse_wk_and_weights_proj and (
-                            "wk" in name or "weights_proj" in name
-                        ):
-                            cached_wk_and_weights_proj[name] = loaded_weight
-                            wk_name = (
-                                name
-                                if "wk" in name
-                                else name.replace("weights_proj", "wk")
-                            )
-                            weights_proj_name = (
-                                name
-                                if "weights_proj" in name
-                                else name.replace("wk", "weights_proj")
-                            )
-
-                            # When both wk and weights_proj has been cached, load the fused weight to parameter
-                            if (
-                                wk_name in cached_wk_and_weights_proj
-                                and weights_proj_name in cached_wk_and_weights_proj
-                            ):
-                                wk_weight = cached_wk_and_weights_proj[wk_name]
-                                weights_proj_weight = cached_wk_and_weights_proj[
-                                    weights_proj_name
-                                ]
-                                # todo dequantize wk for fp8
-                                assert wk_weight.dtype == weights_proj_weight.dtype
-                                fused_weight = torch.cat(
-                                    [wk_weight, weights_proj_weight], dim=0
-                                )
-                                param_name = (
-                                    name.replace("wk", "fused_wk_and_weights_proj")
-                                    if "wk" in name
-                                    else name.replace(
-                                        "weights_proj",
-                                        "fused_wk_and_weights_proj",
-                                    )
-                                )
-                                param = params_dict[param_name]
-
-                                weight_loader = getattr(
-                                    param, "weight_loader", default_weight_loader
-                                )
-                                maybe_executor_submit(
-                                    executor=executor,
-                                    futures=futures,
-                                    use_async=use_async_loading,
-                                    func=weight_loader,
-                                    func_args=(param, fused_weight),
-                                )
-                                cached_wk_and_weights_proj.pop(wk_name)
-                                cached_wk_and_weights_proj.pop(weights_proj_name)
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
