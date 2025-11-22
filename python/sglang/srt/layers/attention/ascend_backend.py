@@ -626,8 +626,8 @@ class AscendAttnBackend(AttentionBackend):
 
         if not self.use_mla:
             num_tokens = q.shape[0]
-            """PA will support bs=1 in the later version of CANN"""
-            if num_tokens == 1:
+            """PA will support bs<=tp in the later version of CANN"""
+            if num_tokens <= get_attention_tp_size():
                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
                 ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)

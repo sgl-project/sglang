@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.utils import is_npu
 
@@ -77,12 +78,12 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self, model_runner):
-        if self.bs == 1:
+        if self.bs <= get_attention_tp_size():
             return self.attr_name[AttentionArch.MLA]
         return self.attr_name[model_runner.model_config.attention_arch]
 
     def _get_update_attr_type(self, model_runner):
-        if self.bs == 1:
+        if self.bs <= get_attention_tp_size():
             return self.attr_type[AttentionArch.MLA]
         return self.attr_type[model_runner.model_config.attention_arch]
 
