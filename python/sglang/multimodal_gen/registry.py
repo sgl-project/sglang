@@ -12,9 +12,10 @@ import importlib
 import os
 import pkgutil
 import re
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
-from sglang.multimodal_gen.configs.pipelines import (
+from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
     HunyuanConfig,
@@ -24,12 +25,12 @@ from sglang.multimodal_gen.configs.pipelines import (
     WanT2V480PConfig,
     WanT2V720PConfig,
 )
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipelines.wan import (
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
     Wan2_2_I2V_A14B_Config,
@@ -54,7 +55,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
-from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -73,49 +74,37 @@ _PIPELINE_REGISTRY: Dict[str, Type[ComposedPipelineBase]] = {}
 def _discover_and_register_pipelines():
     """
     Automatically discover and register all ComposedPipelineBase subclasses.
-    This function scans the 'sglang.multimodal_gen.runtime.architectures' package,
+    This function scans the 'sglang.multimodal_gen.runtime.pipelines' package,
     finds modules with an 'EntryClass' attribute, and maps the class's 'pipeline_name'
     to the class itself in a global registry.
     """
-    if _PIPELINE_REGISTRY:  # E-run only once
+    if _PIPELINE_REGISTRY:  # run only once
         return
 
-    package_name = "sglang.multimodal_gen.runtime.architectures"
+    package_name = "sglang.multimodal_gen.runtime.pipelines"
     package = importlib.import_module(package_name)
 
-    for _, pipeline_type_str, ispkg in pkgutil.iter_modules(package.__path__):
+    for _, module_name, ispkg in pkgutil.walk_packages(
+        package.__path__, package.__name__ + "."
+    ):
         if not ispkg:
-            continue
-        pipeline_type_package_name = f"{package_name}.{pipeline_type_str}"
-        pipeline_type_package = importlib.import_module(pipeline_type_package_name)
-        for _, arch, ispkg_arch in pkgutil.iter_modules(pipeline_type_package.__path__):
-            if not ispkg_arch:
-                continue
-            arch_package_name = f"{pipeline_type_package_name}.{arch}"
-            arch_package = importlib.import_module(arch_package_name)
-            for _, module_name, ispkg_module in pkgutil.walk_packages(
-                arch_package.__path__, arch_package.__name__ + "."
-            ):
-                if not ispkg_module:
-                    pipeline_module = importlib.import_module(module_name)
-                    if hasattr(pipeline_module, "EntryClass"):
-                        entry_cls = pipeline_module.EntryClass
-                        if not isinstance(entry_cls, list):
-                            entry_cls_list = [entry_cls]
-                        else:
-                            entry_cls_list = entry_cls
+            pipeline_module = importlib.import_module(module_name)
+            if hasattr(pipeline_module, "EntryClass"):
+                entry_cls = pipeline_module.EntryClass
+                entry_cls_list = (
+                    [entry_cls] if not isinstance(entry_cls, list) else entry_cls
+                )
 
-                        for cls in entry_cls_list:
-                            if hasattr(cls, "pipeline_name"):
-                                if cls.pipeline_name in _PIPELINE_REGISTRY:
-                                    logger.warning(
-                                        f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
-                                    )
-                                _PIPELINE_REGISTRY[cls.pipeline_name] = cls
-                            # else:
-                            #     logger.warning(
-                            #         f"Pipeline class {cls.__name__} does not have a 'pipeline_name' attribute."
-                            #     )
+                for cls in entry_cls_list:
+                    if hasattr(cls, "pipeline_name"):
+                        if cls.pipeline_name in _PIPELINE_REGISTRY:
+                            logger.warning(
+                                f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
+                            )
+                        _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+    logger.debug(
+        f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
+    )
 
 
 # --- Part 2: Config Registration ---
@@ -177,30 +166,16 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     # 1. Exact match
     if model_path in _MODEL_PATH_TO_NAME:
         model_name = _MODEL_PATH_TO_NAME[model_path]
+        logger.debug(f"Resolved model name '{model_name}' from exact path match.")
         return _CONFIG_REGISTRY.get(model_name)
 
-    # 2. Partial match: find the best (longest) match to avoid conflicts
-    #    like "Qwen-Image" and "Qwen-Image-Edit".
+    # 2. Partial match: find the best (longest) match against all registered model names.
     cleaned_model_path = re.sub(r"--", "/", model_path.lower())
-
-    best_match_name = None
-    best_match_len = -1
-
-    # Check mappings, prioritizing longer keys to resolve ambiguity
-    sorted_mappings = sorted(
-        _MODEL_PATH_TO_NAME.items(), key=lambda item: len(item[0]), reverse=True
-    )
-
-    for registered_id, model_name in sorted_mappings:
-        normalized_registered_id = registered_id.lower()
-        if normalized_registered_id in cleaned_model_path:
-            # Find the best match based on the longest key
-            if len(normalized_registered_id) > best_match_len:
-                best_match_len = len(normalized_registered_id)
-                best_match_name = model_name
-
-    if best_match_name:
-        return _CONFIG_REGISTRY.get(best_match_name)
+    all_model_names = sorted(_CONFIG_REGISTRY.keys(), key=len, reverse=True)
+    for model_name in all_model_names:
+        if model_name in cleaned_model_path:
+            logger.debug(f"Resolved model name '{model_name}' from partial path match.")
+            return _CONFIG_REGISTRY.get(model_name)
 
     # 3. Use detectors
     if os.path.exists(model_path):
@@ -212,6 +187,9 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
 
     for model_name, detector in _MODEL_NAME_DETECTORS:
         if detector(model_path.lower()) or detector(pipeline_name):
+            logger.debug(
+                f"Resolved model name '{model_name}' using a registered detector."
+            )
             return _CONFIG_REGISTRY.get(model_name)
 
     return None
@@ -232,6 +210,7 @@ class ModelInfo:
     pipeline_config_cls: Type[PipelineConfig]
 
 
+@lru_cache(maxsize=1)
 def get_model_info(model_path: str) -> Optional[ModelInfo]:
     """
     Resolves all necessary classes (pipeline, sampling, config) for a given model path.
@@ -271,16 +250,12 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
     # 3. Get configuration classes (sampling, pipeline config)
     config_info = _get_config_info(model_path)
     if not config_info:
-        logger.warning(
-            f"No specific configuration registered for '{model_path}'. "
-            f"Falling back to default SamplingParams and PipelineConfig."
+        logger.error(
+            f"Could not resolve configuration for model '{model_path}'. "
+            "It is not a registered model path or detected by any registered model family detectors. "
+            f"Known model paths: {list(_MODEL_PATH_TO_NAME.keys())}"
         )
-        # Fallback to defaults if no specific config is found
-        from sglang.multimodal_gen.configs.sample.base import SamplingParams
-
-        config_info = ConfigInfo(
-            sampling_param_cls=SamplingParams, pipeline_config_cls=PipelineConfig
-        )
+        return None
 
     # 4. Combine and return the complete model info
     return ModelInfo(
@@ -425,18 +400,11 @@ def _register_configs():
         model_name="qwen-image",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
-        model_paths=[
-            "Qwen/Qwen-Image",
-        ],
-        model_detectors=[lambda id: "qwen-image" in id.lower()],
     )
     register_configs(
         model_name="qwen-image-edit",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
-        model_paths=[
-            "Qwen/Qwen-Image-Edit",
-        ],
     )
 
 

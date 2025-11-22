@@ -316,6 +316,11 @@ class _DeepEPDispatcherImplBase:
 
         self.handle = None
 
+        self.quant_config: Optional[dict] = None
+
+        self.overlap_args: Optional[CombineOverlapArgs] = None
+        self.meta_overlap_args: Optional[dict] = None
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -331,7 +336,6 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         raise NotImplementedError
 
@@ -340,6 +344,19 @@ class _DeepEPDispatcherImplBase:
 
     def _get_buffer(self):
         raise NotImplementedError
+
+    def set_quant_config(self, quant_config: dict) -> None:
+        self.quant_config = quant_config
+
+    def set_overlap_args(
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+    ) -> None:
+        self.overlap_args = combine_overlap_args
+        self.meta_overlap_args = meta_overlap_args
+
+    def clear_overlap_args(self) -> None:
+        self.overlap_args = None
+        self.meta_overlap_args = None
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
@@ -461,7 +478,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
 
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
@@ -502,9 +518,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
-
-    def set_quant_config(self, quant_config: dict):
-        self.quant_config = quant_config
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
@@ -617,17 +630,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
             topk_weights,
-            overlap_args=overlap_args,
         )
-        return hidden_states, event, hook, overlap_args
+        return hidden_states, event, hook
 
-    def combine_b(self, hidden_states, event, hook, overlap_args):
+    def combine_b(self, hidden_states, event, hook):
+        overlap_args = self.overlap_args
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
@@ -643,9 +655,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         buffer = self._get_buffer()
+        overlap_args = self.overlap_args
 
         ctx = nullcontext()
         if overlap_args is not None:
@@ -685,9 +697,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_experts,
         )
 
-    def set_quant_config(self, quant_config: dict):
-        self.quant_config = quant_config
-
 
 @dataclass
 class _Stage(Enum):
@@ -711,6 +720,8 @@ class DeepEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        super().__init__()
+
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(
@@ -737,8 +748,12 @@ class DeepEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
 
-    def dispatch(self, *args, **kwargs) -> DispatchOutput:
-        self.dispatch_a(*args, **kwargs)
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> DispatchOutput:
+        self.dispatch_a(hidden_states, topk_output)
         ret = self.dispatch_b()
         return ret
 
@@ -763,16 +778,14 @@ class DeepEPDispatcher(BaseDispatcher):
     def combine(
         self,
         combine_input: CombineInput,
-        overlap_args: Optional[CombineOverlapArgs] = None,
-    ) -> Tuple:
-        self.combine_a(combine_input, overlap_args)
+    ) -> torch.Tensor:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
         combine_input: CombineInput,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
@@ -780,7 +793,6 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            overlap_args=overlap_args,
         )
         self._combine_intermediate_state = inner_state
 
@@ -805,7 +817,28 @@ class DeepEPDispatcher(BaseDispatcher):
         self._stage = new_stage
 
     def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
+
+    def set_overlap_args(
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+    ):
+        super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+
+    def clear_overlap_args(self):
+        super().clear_overlap_args()
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.clear_overlap_args()
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.clear_overlap_args()

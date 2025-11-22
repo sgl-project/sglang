@@ -157,7 +157,7 @@ class SelfAttention(nn.Module):
         with_qk_norm: bool = True,
         attn_type: str = "torch",
         supported_attention_backends=(
-            AttentionBackendEnum.FA3,
+            AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
         ),
     ):
@@ -269,7 +269,7 @@ class CrossAttention(nn.Module):
         bias=False,
         with_qk_norm=True,
         supported_attention_backends=(
-            AttentionBackendEnum.FA3,
+            AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
         ),
     ) -> None:
