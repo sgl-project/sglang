@@ -41,7 +41,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
-    deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -357,16 +356,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 if should_deepgemm_weight_requant_ue8m0(
                     weight_block_size=getattr(
                         self.quant_config, "weight_block_size", None
-                    )
-                ) and (
-                    self.w8a8_block_fp8_linear
-                    is deepgemm_w8a8_block_fp8_linear_with_fallback
+                    ),
+                    layer=layer,
                 ):
                     requant_weight_ue8m0_inplace(
                         layer.weight,
                         layer.weight_scale_inv,
                         self.quant_config.weight_block_size,
                     )
+                    layer._executed_weight_requant_ue8m0 = True
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
             layer.weight.data = weight.data

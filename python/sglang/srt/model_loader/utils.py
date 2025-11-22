@@ -122,13 +122,36 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
             model.post_load_weights()
 
 
-def should_deepgemm_weight_requant_ue8m0(weight_block_size):
+def should_deepgemm_weight_requant_ue8m0(weight_block_size, layer=None):
     """Should we requant fp8 weights into UE8M0 format when loading the model"""
-    return (
+    should_requant = (
         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         and weight_block_size is not None
     )
+
+    # For backward compatibility
+    if layer is None:
+        return should_requant
+
+    if should_requant:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+
+        if isinstance(layer, LinearBase):
+            # Check if the applied FP8 Gemm kernel is DeepGEMM
+            # TODO: Refactor this after we have a better way to check the applied FP8 Gemm kernel
+            from sglang.srt.layers.quantization.fp8_utils import (
+                CUTLASS_BLOCK_FP8_SUPPORTED,
+                ENABLE_FLASHINFER_FP8_GEMM,
+            )
+
+            if not ENABLE_FLASHINFER_FP8_GEMM and not CUTLASS_BLOCK_FP8_SUPPORTED:
+                return True
+        elif isinstance(layer, DeepEPMoE):
+            # TODO: Add logic for checking MoE kernel
+            return True
+    return False
 
 
 def should_async_load(weight: torch.Tensor) -> bool:
