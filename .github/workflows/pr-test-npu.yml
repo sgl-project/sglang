@@ -201,4 +201,3 @@ jobs:
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600
-
