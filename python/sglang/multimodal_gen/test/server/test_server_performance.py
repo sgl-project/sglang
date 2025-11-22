@@ -145,7 +145,7 @@ Consider updating perf_baselines.json with the snippets below:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
         prev_len = len(read_perf_logs(log_path))
-        log_wait_timeout = 1200
+        log_wait_timeout = 30
 
         rid = generate_fn()
 

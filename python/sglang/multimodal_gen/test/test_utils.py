@@ -171,8 +171,11 @@ def wait_for_req_perf_record(
     """
     logger.info(f"Waiting for req perf record with request id: {request_id}")
     deadline = time.time() + timeout
+    print(f"{prev_len=}")
     while time.time() < deadline:
         records = read_perf_logs(log_path)
+        print(f"{records=}")
+        print(f"{len(records)=}")
         if len(records) == prev_len + 1:
             # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
             # potential error when there are multiple servers

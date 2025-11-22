@@ -315,6 +315,7 @@ TWO_GPU_CASES = [
         image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
         custom_validator="video",
         num_gpus=2,
+        num_frames=1
     ),
     DiffusionTestCase(
         id="wan2_2_t2v_a14b",
