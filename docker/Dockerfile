@@ -135,7 +135,6 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
       python3 -m pip uninstall -y torch torchaudio torchvision ; \
       python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
     else \
@@ -146,8 +145,12 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
 # Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 RUN set -eux; \
-    if [ "${CUDA_VERSION%%.*}" != "13" ]; then \
+    if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       pip install nvidia-nvshmem-cu12==3.4.5 ; \
+    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      pip install nvidia-nvshmem-cu13==3.4.5 ; \
+    else \
+      echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ; \
     fi && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
@@ -209,6 +212,12 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     scikit-build-core \
     nixl \
     py-spy
+
+# Reinstall nccl and cublas for cuda 13
+RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
+  python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+  python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
+fi
 
 # Install development tools and utilities
 RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
