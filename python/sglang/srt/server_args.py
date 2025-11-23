@@ -504,6 +504,7 @@ class ServerArgs:
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     enable_piecewise_cuda_graph: bool = False
+    enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: int = 4096
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
@@ -3444,6 +3445,11 @@ class ServerArgs:
             "--enable-torch-air-compile",
             action="store_true",
             help="Optimize the model with Torch Ascend Intermediate Representation compilation. Experimental feature.",
+        )
+        parser.add_argument(
+            "--enable-torch-compile-debug-mode",
+            action="store_true",
+            help="Enable debug mode for torch compile",
         )
         parser.add_argument(
             "--enable-piecewise-cuda-graph",
