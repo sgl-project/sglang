@@ -1,5 +1,6 @@
 import math
 from collections.abc import Iterable
+from typing import List, Optional
 
 import einops
 import torch
@@ -138,6 +139,21 @@ class JetVLMForConditionalGeneration(nn.Module):
     ) -> list[int]:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def get_embed_and_head(self):
+        return self.llm.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.llm.set_embed_and_head(embed, head)
+
+    def get_embed(self):
+        return self.llm.get_embed()
+
+    def set_embed(self, embed):
+        self.llm.set_embed(embed)
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.llm.set_eagle3_layers_to_capture(layer_ids)
 
 
 EntryClass = [JetVLMForConditionalGeneration]

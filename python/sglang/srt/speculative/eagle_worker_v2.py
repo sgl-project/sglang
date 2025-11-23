@@ -37,6 +37,7 @@ from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
     load_token_map,
+    update_hybrid_gdn_state_after_verify,
 )
 from sglang.srt.utils.common import (
     empty_context,
@@ -699,6 +700,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+
+        if self.target_worker.model_runner.hybrid_gdn_config is not None:
+            update_hybrid_gdn_state_after_verify(
+                verify_input.topk,
+                accept_index,
+                accept_length,
+                self.target_worker.model_runner,
+            )
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(

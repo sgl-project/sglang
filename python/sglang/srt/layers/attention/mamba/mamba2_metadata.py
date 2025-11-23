@@ -33,6 +33,11 @@ class ForwardMetadata:
 
 
 @dataclass(kw_only=True)
+class JetNemotronMetadata(ForwardMetadata):
+    seq_idx: torch.Tensor
+
+
+@dataclass(kw_only=True)
 class Mamba2Metadata(ForwardMetadata):
     """stable metadata across all mamba2 layers in the forward pass"""
 
