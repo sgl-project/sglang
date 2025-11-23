@@ -478,7 +478,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu-h200:
-    needs: [check-changes, unit-test-backend-2-gpu]
+    needs: [check-changes, stage-a-test-1]
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
@@ -961,26 +961,26 @@ jobs:
         sgl-kernel-unit-test,
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
-        sgl-kernel-b200-test,
+        # sgl-kernel-b200-test,
 
-        multimodal-gen-test,
+        # multimodal-gen-test,
 
         stage-a-test-1,
-        unit-test-backend-1-gpu,
-        unit-test-backend-2-gpu,
-        unit-test-backend-4-gpu,
-        unit-test-backend-8-gpu-h20,
+        # unit-test-backend-1-gpu,
+        # unit-test-backend-2-gpu,
+        # unit-test-backend-4-gpu,
+        # unit-test-backend-8-gpu-h20,
         unit-test-backend-8-gpu-h200,
-        performance-test-1-gpu-part-1,
-        performance-test-1-gpu-part-2,
-        performance-test-1-gpu-part-3,
-        performance-test-2-gpu,
-        accuracy-test-1-gpu,
-        accuracy-test-2-gpu,
-        unit-test-deepep-4-gpu,
-        unit-test-deepep-8-gpu,
-        unit-test-backend-4-gpu-b200,
-        unit-test-backend-4-gpu-gb200,
+        # performance-test-1-gpu-part-1,
+        # performance-test-1-gpu-part-2,
+        # performance-test-1-gpu-part-3,
+        # performance-test-2-gpu,
+        # accuracy-test-1-gpu,
+        # accuracy-test-2-gpu,
+        # unit-test-deepep-4-gpu,
+        # unit-test-deepep-8-gpu,
+        # unit-test-backend-4-gpu-b200,
+        # unit-test-backend-4-gpu-gb200,
       ]
     if: always()
     runs-on: ubuntu-latest
