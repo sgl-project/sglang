@@ -22,7 +22,12 @@ def upload_file_to_slack(
         run_id = os.getenv("GITHUB_RUN_ID", "local")
 
         token = os.environ.get("SGLANG_DIFFUSION_SLACK_TOKEN")
-        if not token or not file_path or not os.path.exists(file_path):
+        if not token:
+            logger.info(f"Slack upload failed: no token")
+            return False
+
+        if not file_path or not os.path.exists(file_path):
+            logger.info(f"Slack upload failed: no file path")
             return False
 
         if origin_file_path and origin_file_path.startswith(("http", "https")):
@@ -54,7 +59,7 @@ def upload_file_to_slack(
         return True
 
     except Exception as e:
-        logger.error(f"Slack upload failed: {e}")
+        logger.info(f"Slack upload failed: {e}")
         return False
     finally:
         if temp_path and os.path.exists(temp_path):
