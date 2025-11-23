@@ -26,11 +26,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 
-from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -61,8 +57,14 @@ from sglang.srt.utils.common import (
     wait_port_available,
     xpu_has_xmx_support,
 )
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
-from sglang.utils import is_in_ci
+from sglang.utils import LazyImport, is_in_ci
+
+ConnectorType = LazyImport("sglang.srt.connector", "ConnectorType")
+FunctionCallParser = LazyImport(
+    "sglang.srt.function_call.function_call_parser", "FunctionCallParser"
+)
+ReasoningParser = LazyImport("sglang.srt.parser.reasoning_parser", "ReasoningParser")
+LoRARef = LazyImport("sglang.srt.lora.lora_registry", "LoRARef")
 
 logger = logging.getLogger(__name__)
 
@@ -1739,6 +1741,8 @@ class ServerArgs:
                 )
 
     def _handle_load_format(self):
+        from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
         if (
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
@@ -1862,6 +1866,7 @@ class ServerArgs:
             )
 
     def _handle_deterministic_inference(self):
+
         if self.rl_on_policy_target is not None:
             logger.warning(
                 "Enable deterministic inference because of rl_on_policy_target."
@@ -1956,7 +1961,6 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -3819,6 +3823,8 @@ class ServerArgs:
             return f"http://{self.host}:{self.port}"
 
     def get_hf_config(self):
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
         kwargs = {}
         hf_config = get_config(
             self.model_path,

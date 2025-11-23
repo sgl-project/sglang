@@ -42,12 +42,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    Req,
-    RequestStage,
-    ScheduleBatch,
-)
+from sglang.srt.managers.request_types import FINISH_LENGTH, RequestStage
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -60,6 +55,7 @@ from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
 

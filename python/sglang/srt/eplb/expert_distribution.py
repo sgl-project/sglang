@@ -29,7 +29,6 @@ import torch.distributed
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.collector import ExpertDispatchCollector
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_int_env_var, is_npu
 
@@ -37,6 +36,7 @@ _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 

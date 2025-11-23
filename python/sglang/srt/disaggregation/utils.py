@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import is_npu
+from sglang.srt.managers.request_types import FINISH_ABORT
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -89,6 +89,8 @@ class MetadataBuffers:
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
+        from sglang.srt.utils import is_npu
+
         self.custom_mem_pool = custom_mem_pool
         device = "cpu"
         if is_npu():
@@ -346,8 +348,6 @@ def is_mla_backend(target_kv_pool) -> bool:
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 

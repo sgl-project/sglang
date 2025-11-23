@@ -12,30 +12,26 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
+
 import json
 import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import Any, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Union
 
 import torch
-from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
-from sglang.srt.utils.hf_transformers_utils import (
-    get_config,
-    get_context_length,
-    get_generation_config,
-    get_hf_text_config,
-    get_sparse_attention_config,
-)
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+    from sglang.srt.server_args import ServerArgs
 
 
 class AttentionArch(IntEnum):
@@ -117,6 +113,13 @@ class ModelConfig:
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
+
+        from sglang.srt.utils.hf_transformers_utils import (
+            get_config,
+            get_generation_config,
+            get_hf_text_config,
+        )
+
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -284,6 +287,8 @@ class ModelConfig:
             self.hf_config.num_nextn_predict_layers = 1
 
     def _derive_context_length(self, context_length: int):
+        from sglang.srt.utils.hf_transformers_utils import get_context_length
+
         is_draft_model = self.is_draft_model
         derived_context_len = get_context_length(self.hf_text_config)
 
@@ -507,6 +512,8 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
+        from sglang.srt.utils import retry
+
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
@@ -632,6 +639,9 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+        from sglang.srt.utils import is_hip
+
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
@@ -730,6 +740,8 @@ class ModelConfig:
                 )
 
     def _verify_dual_chunk_attention_config(self) -> None:
+        from sglang.srt.utils.hf_transformers_utils import get_sparse_attention_config
+
         if hasattr(self.hf_config, "dual_chunk_attention_config"):
             # Try loading the sparse attention config
             sparse_attn_config = get_sparse_attention_config(self.model_path)

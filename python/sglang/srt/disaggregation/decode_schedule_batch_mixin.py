@@ -8,8 +8,13 @@ import torch
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.utils import LazyImport
+
+ForwardMode = LazyImport("sglang.srt.model_executor.forward_batch_info", "ForwardMode")
+CaptureHiddenMode = LazyImport(
+    "sglang.srt.model_executor.forward_batch_info", "CaptureHiddenMode"
+)
 
 logger = logging.getLogger(__name__)
 

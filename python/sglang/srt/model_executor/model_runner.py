@@ -1442,14 +1442,14 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig):
+        if isinstance(config, (Qwen3NextConfig, JetNemotronConfig, JetVLMConfig)):
             return config
         return None
 
     @property
     def mamba2_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, FalconH1Config | NemotronHConfig):
+        if isinstance(config, (FalconH1Config, NemotronHConfig)):
             return config
         return None
 

@@ -17,10 +17,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.utils import LazyImport
+
+TorchMemorySaverAdapter = LazyImport(
+    "sglang.srt.utils.torch_memory_saver_adapter", "TorchMemorySaverAdapter"
+)
 
 """
 Memory pool.
@@ -42,7 +44,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -52,6 +53,8 @@ from sglang.srt.mem_cache.utils import (
 from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 
@@ -1510,6 +1513,8 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        from sgalng.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
+
         layer_id = layer.layer_id
 
         if self.use_nsa and self.nsa_kv_cache_store_fp8:

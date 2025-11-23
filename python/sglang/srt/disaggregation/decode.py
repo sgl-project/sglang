@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, List, Optional, Type, Union
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -46,12 +45,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
-from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.managers.request_types import FINISH_ABORT, RequestStage
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -63,12 +57,19 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.utils import LazyImport
+
+ScheduleBatch = LazyImport("sglang.srt.managers.schedule_batch", "ScheduleBatch")
+GenerationBatchResult = LazyImport("sglang.srt.managers.utils", "GenerationBatchResult")
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.mamba_utils import Mamba2CacheParams
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
 
@@ -225,6 +226,8 @@ class DecodePreallocQueue:
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -723,6 +726,8 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
     def pop_transferred(self) -> List[Req]:
+        from sglang.srt.mem_cache.common import release_kv_cache
+
         if not self.queue:
             return []
         polls = poll_and_all_reduce(
