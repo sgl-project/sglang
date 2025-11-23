@@ -3593,8 +3593,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                         weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if getattr(
-                        self_attn.kv_b_proj, "_executed_weight_requant_ue8m0", False
+                    if (
+                        should_deepgemm_weight_requant_ue8m0(
+                            weight_block_size=getattr(
+                                self.quant_config, "weight_block_size", None
+                            )
+                        )
+                        and self_attn.kv_b_proj.executed_weight_requant_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
@@ -3740,12 +3745,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             if layer_id in moe_layers or is_nextn:
                 experts = layer.mlp.experts
                 # TODO: move this logic to Fp8MoEMethod.process_weights_after_loading
-                if should_deepgemm_weight_requant_ue8m0(
-                    weight_block_size=getattr(
-                        self.quant_config, "weight_block_size", None
-                    ),
-                    layer=experts,
-                ):
+                if isinstance(experts, DeepEPMoE):
                     for w in [
                         (experts.w13_weight, experts.w13_weight_scale_inv),
                         (experts.w2_weight, experts.w2_weight_scale_inv),
