@@ -370,6 +370,10 @@ jobs:
           pip install slack_sdk
 
       - name: Run diffusion server tests
+        env:
+          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+
         timeout-minutes: 60
         run: |
           cd python
@@ -398,6 +402,10 @@ jobs:
           pip install slack_sdk
 
       - name: Run diffusion server tests
+        env:
+          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+
         timeout-minutes: 60
         run: |
           cd python
