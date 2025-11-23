@@ -333,7 +333,10 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        if (
+            not batch.spec_algorithm.is_none()
+            and result.num_accepted_tokens is not None
+        ):
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
