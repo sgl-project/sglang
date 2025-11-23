@@ -206,6 +206,12 @@ def fuse_scale_shift_kernel(
             sh_sb, sh_sl, sh_sc = shift_exp.stride()
         else:
             sh_sb = sh_sl = sh_sc = 0
+        
+        # If both scalars and both zero, copy fast-path
+        if need_scale_scalar and need_shift_scalar:
+            if (scale_blc.abs().max() == 0) and (shift_blc.abs().max() == 0):
+                output.copy_(x)
+                return output
 
         grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
         fuse_scale_shift_kernel_blc_opt[grid](
