@@ -451,11 +451,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
-        async with self.is_pause_cond:
-            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+        # Fast path: check pause state without lock (common case: not paused)
+        if self.is_pause:
+            # Only acquire lock if potentially paused
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
-        async with self.model_update_lock.reader_lock:
-            if self.server_args.enable_lora and obj.lora_path:
+        # Only acquire model_update_lock for LoRA operations (not for tokenization)
+        if self.server_args.enable_lora and obj.lora_path:
+            async with self.model_update_lock.reader_lock:
                 if isinstance(obj.lora_path, str):
                     unique_lora_paths = set([obj.lora_path])
                 else:
@@ -504,16 +508,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
-            if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
-                state = self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj, state, request):
-                    yield response
-            else:
-                async for response in self._handle_batch_request(
-                    obj, request, created_time
-                ):
-                    yield response
+        # Tokenize outside of model_update_lock to reduce lock contention
+        if obj.is_single:
+            tokenized_obj = await self._tokenize_one_request(obj)
+            state = self._send_one_request(obj, tokenized_obj, created_time)
+            async for response in self._wait_one_response(obj, state, request):
+                yield response
+        else:
+            async for response in self._handle_batch_request(
+                obj, request, created_time
+            ):
+                yield response
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool

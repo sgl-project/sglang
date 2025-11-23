@@ -534,9 +534,11 @@ class ServerArgs:
     enable_nsa_prefill_context_parallel: bool = False
 
     # Dynamic batch tokenizer
-    enable_dynamic_batch_tokenizer: bool = False
-    dynamic_batch_tokenizer_batch_size: int = 32
-    dynamic_batch_tokenizer_batch_timeout: float = 0.002
+    # Optimized defaults for better high-concurrency performance
+    # Set SGLANG_DISABLE_OPTIMIZED_TOKENIZATION=1 to revert to old behavior
+    enable_dynamic_batch_tokenizer: bool = True
+    dynamic_batch_tokenizer_batch_size: int = 128
+    dynamic_batch_tokenizer_batch_timeout: float = 0.02
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1788,6 +1790,15 @@ class ServerArgs:
             logger.warning("Cuda graph is disabled for prefill server")
 
     def _handle_tokenizer_batching(self):
+        # Check environment variable to revert to old tokenization behavior
+        if os.environ.get("SGLANG_DISABLE_OPTIMIZED_TOKENIZATION", "0") == "1":
+            self.enable_dynamic_batch_tokenizer = False
+            self.dynamic_batch_tokenizer_batch_size = 32
+            self.dynamic_batch_tokenizer_batch_timeout = 0.002
+            logger.info(
+                "SGLANG_DISABLE_OPTIMIZED_TOKENIZATION=1: Reverting to old tokenization behavior"
+            )
+
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
             raise ValueError(
                 "Cannot enable both --enable-tokenizer-batch-encode and --enable-dynamic-batch-tokenizer. "

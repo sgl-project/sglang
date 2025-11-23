@@ -40,8 +40,8 @@ class AsyncDynamicbatchTokenizer:
         self._queue: Optional[asyncio.Queue] = None
         self._batcher_task: Optional[asyncio.Task] = None
 
-        # Single-thread executor for blocking tokenizer calls
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Multi-thread executor for parallel tokenization (reduces GIL bottleneck)
+        self._executor = ThreadPoolExecutor(max_workers=4)
         self._initialized = False
 
     def _ensure_initialized(self):

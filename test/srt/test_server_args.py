@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +24,33 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+    def test_optimized_tokenization_defaults(self):
+        """Test that optimized tokenization is enabled by default."""
+        server_args = ServerArgs(model_path="dummy")
+        # New optimized defaults
+        self.assertTrue(server_args.enable_dynamic_batch_tokenizer)
+        self.assertEqual(server_args.dynamic_batch_tokenizer_batch_size, 128)
+        self.assertEqual(server_args.dynamic_batch_tokenizer_batch_timeout, 0.02)
+
+    def test_disable_optimized_tokenization_env_var(self):
+        """Test that SGLANG_DISABLE_OPTIMIZED_TOKENIZATION=1 reverts to old behavior."""
+        with patch.dict(os.environ, {"SGLANG_DISABLE_OPTIMIZED_TOKENIZATION": "1"}):
+            server_args = ServerArgs(model_path="dummy")
+            # Should revert to old values after __post_init__
+            self.assertFalse(server_args.enable_dynamic_batch_tokenizer)
+            self.assertEqual(server_args.dynamic_batch_tokenizer_batch_size, 32)
+            self.assertEqual(server_args.dynamic_batch_tokenizer_batch_timeout, 0.002)
+
+    def test_optimized_tokenization_without_env_var(self):
+        """Test that without env var, optimized tokenization remains enabled."""
+        # Ensure env var is not set
+        with patch.dict(os.environ, {}, clear=True):
+            server_args = ServerArgs(model_path="dummy")
+            # Should keep optimized defaults
+            self.assertTrue(server_args.enable_dynamic_batch_tokenizer)
+            self.assertEqual(server_args.dynamic_batch_tokenizer_batch_size, 128)
+            self.assertEqual(server_args.dynamic_batch_tokenizer_batch_timeout, 0.02)
 
 
 class TestPortArgs(unittest.TestCase):
