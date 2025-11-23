@@ -1477,7 +1477,7 @@ def sample_image_requests(
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
             int(input_lens[i]),
-            special_tokens = special_tokens
+            special_tokens=special_tokens
         )
 
         # Generate image list
