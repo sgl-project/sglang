@@ -50,6 +50,8 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+from sglang.srt.managers.io_struct import ModelWorkerTask
+
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
 
@@ -97,6 +99,10 @@ class BaseTpWorker(ABC):
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
         )
+
+    def execute_task_in_model_worker(self, task_spec: ModelWorkerTask):
+        """Execute a task on every model worker subprocess"""
+        return self.model_runner.execute_task_in_model_worker(task_spec)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
