@@ -34,9 +34,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    FlashAttentionBackend,
-)
+
+try:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+        FlashAttentionBackend,
+    )
+except ImportError:
+    FlashAttentionBackend = None
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
@@ -136,6 +140,7 @@ class DenoisingStage(PipelineStage):
             dtype=torch.float16,  # TODO(will): hack
             supported_attention_backends={
                 AttentionBackendEnum.SLIDING_TILE_ATTN,
+                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.VIDEO_SPARSE_ATTN,
                 AttentionBackendEnum.VMOBA_ATTN,
                 AttentionBackendEnum.FA,
@@ -619,8 +624,14 @@ class DenoisingStage(PipelineStage):
                 log_dir = f"./logs"
                 os.makedirs(log_dir, exist_ok=True)
 
+                rank_suffix = ""
+                try:
+                    rank_suffix = f"-rank{get_world_group().rank}"
+                except Exception:
+                    pass
+
                 trace_path = os.path.abspath(
-                    os.path.join(log_dir, f"{request_id}.trace.json.gz")
+                    os.path.join(log_dir, f"{request_id}{rank_suffix}.trace.json.gz")
                 )
                 logger.info(f"Saving profiler traces to: {trace_path}")
                 self.profiler.export_chrome_trace(trace_path)
@@ -995,7 +1006,11 @@ class DenoisingStage(PipelineStage):
             The attention metadata, or None if not applicable.
         """
         attn_metadata = None
-        self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        self.attn_metadata_builder = None
+        try:
+            self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        except NotImplementedError:
+            self.attn_metadata_builder_cls = None
         if self.attn_metadata_builder_cls:
             self.attn_metadata_builder = self.attn_metadata_builder_cls()
         if (st_attn_available and self.attn_backend == SlidingTileAttentionBackend) or (
