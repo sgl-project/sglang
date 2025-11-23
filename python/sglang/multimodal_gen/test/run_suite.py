@@ -4,8 +4,8 @@ Helper script to discover and run multimodal generation tests
 This script scans the `multimodal_gen/test/server/` directory for test files matching a pattern and executes a subset of them based on the partition ID
 
 How to add a new test:
-1. Create a new test file in `python/sglang/multimodal_gen/test/server/`.
-2. Name it matching the pattern `test_server_*.py` (e.g., `test_server_c.py`).
+1. Create a new test file in `python/sglang/multimodal_gen/test/server/`
+2. Name it matching the pattern it belongs to
 3. The CI will automatically pick it up and distribute it to one of the runners.
 """
 
@@ -47,7 +47,7 @@ def parse_args():
 
 
 def get_test_files(base_dir, sub_dir, pattern):
-    """Find all test files matching the pattern."""
+    """find all test files matching the pattern"""
     search_path = os.path.join(base_dir, sub_dir, pattern)
     files = sorted(glob.glob(search_path))
     return files
@@ -56,12 +56,10 @@ def get_test_files(base_dir, sub_dir, pattern):
 def main():
     args = parse_args()
 
-    # Determine the absolute path of the test directory
-    # Assuming this script is located at python/sglang/multimodal_gen/test/run_suite.py
     current_file_path = Path(__file__).resolve()
     test_root_dir = current_file_path.parent
 
-    # 1. Discover Test Files
+    # 1. get all test files
     all_files = get_test_files(str(test_root_dir), args.target_dir, args.pattern)
 
     if not all_files:
@@ -70,10 +68,7 @@ def main():
         )
         sys.exit(0)  # Exit gracefully if no files found
 
-    print(f"Found {len(all_files)} test files total.")
-
-    # 2. Partitioning (Distribute files across runners)
-    # Using simple interleaving: file 0 -> runner 0, file 1 -> runner 1, file 2 -> runner 0...
+    # 2. partitioning the test files
     my_files = [
         f
         for i, f in enumerate(all_files)
@@ -86,14 +81,10 @@ def main():
         )
         sys.exit(0)
 
-    print(f"Running {len(my_files)} files on this partition:")
     for f in my_files:
         print(f"  - {os.path.basename(f)}")
 
-    # 3. Execute Pytest
-    # Construct the pytest command
-    # -s: show stdout
-    # -v: verbose
+    # 3. execute the tests, one file at a time
     cmd = [
         sys.executable,
         "-m",
@@ -103,7 +94,7 @@ def main():
         "--log-cli-level=INFO",
     ] + my_files
 
-    print(f"Executing command: {' '.join(cmd)}")
+    print(f"Running command: {' '.join(cmd)}")
 
     result = subprocess.run(cmd)
     sys.exit(result.returncode)

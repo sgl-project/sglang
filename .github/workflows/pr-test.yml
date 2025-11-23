@@ -402,7 +402,7 @@ jobs:
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 1 \
+            --total-partitions 2 \
             --target-dir server \
             --pattern "test_server_2_gpu*.py"
 
