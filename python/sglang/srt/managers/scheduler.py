@@ -419,8 +419,8 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
-        # Init memory pool and cache
-        self.init_memory_pool_and_cache()
+        # Init cache using the existing memory pool
+        self.init_cache_with_memory_pool()
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -693,7 +693,7 @@ class Scheduler(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
-    def init_memory_pool_and_cache(self):
+    def init_cache_with_memory_pool(self):
         server_args = self.server_args
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
