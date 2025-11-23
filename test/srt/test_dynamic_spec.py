@@ -20,10 +20,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Use local models to avoid downloading
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "/gpfs/models/huggingface.co/Qwen/Qwen3-8B"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "/gpfs/users/chenqiaoling/CQLVERL/SpecForge/outputs/Qwen3-8B-eagle3-pretrain-by-sharegpt/epoch_2"
-
 
 class TestDynamicSpec(CustomTestCase):
     """Test dynamic speculative decoding with automatic mode switching."""
