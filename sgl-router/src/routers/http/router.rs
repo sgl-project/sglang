@@ -220,8 +220,10 @@ impl Router {
                         load_incremented,
                     )
                     .await;
-
-                worker.record_outcome(response.status().is_success());
+                
+                let _status = response.status();
+                let not_error = _status.is_success() || _status.is_client_error();
+                worker.record_outcome(not_error);
 
                 // For retryable failures, we need to decrement load since send_typed_request
                 // won't have done it (it only decrements on success or non-retryable failures)
