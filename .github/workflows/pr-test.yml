@@ -357,7 +357,6 @@ jobs:
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
-      max-parallel: 5
       matrix:
         part: [0, 1]
     steps:
