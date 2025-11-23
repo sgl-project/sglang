@@ -119,6 +119,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disaggregation_mode",
     "enable_deterministic_inference",
     "multi_item_scoring_delimiter",
+    "mm_enable_dp_encoder",
 ]
 
 # Put some global args for easy access

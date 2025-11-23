@@ -523,6 +523,22 @@ class ServerArgs:
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
 
+    # For encoder dp
+    mm_enable_dp_encoder: bool = False
+
+    def get_attention_backends(server_args):
+        prefill_attention_backend_str = (
+            server_args.prefill_attention_backend
+            if server_args.prefill_attention_backend
+            else server_args.attention_backend
+        )
+        decode_attention_backend_str = (
+            server_args.decode_attention_backend
+            if server_args.decode_attention_backend
+            else server_args.attention_backend
+        )
+        return prefill_attention_backend_str, decode_attention_backend_str
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3460,6 +3476,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
+        )
+
+        parser.add_argument(
+            "--mm-enable-dp-encoder",
+            action="store_true",
+            default=ServerArgs.mm_enable_dp_encoder,
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         )
 
         # Configuration file support

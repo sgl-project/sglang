@@ -286,7 +286,7 @@ class FusedMoE(torch.nn.Module):
         expert_map = torch.full(
             (global_num_experts,), -1, dtype=torch.int32, device="cpu"
         )
-
+        
         if ep_rank < (ep_size - 1):
             expert_map[
                 ep_rank * local_routed_experts : (ep_rank + 1) * local_routed_experts
