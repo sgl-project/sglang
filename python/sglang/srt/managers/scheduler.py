@@ -149,7 +149,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import CacheInitParams, release_kv_cache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -700,19 +700,24 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
+        CacheClass = None
+
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            if self.is_hybrid:
-                ChunkCacheClass = SWAChunkCache
+            if not self.is_hybrid:
+                CacheClass = ChunkCache
             else:
-                ChunkCacheClass = ChunkCache
-            self.tree_cache = ChunkCacheClass(
+                CacheClass = SWAChunkCache
+
+            params = CacheInitParams(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
             )
+
+            self.tree_cache = CacheClass(params)
         else:
             tp_cache_group = (
                 self.attn_tp_cpu_group
