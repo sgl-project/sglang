@@ -705,6 +705,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         if topk_weights.ndim == 3:
             topk_weights = topk_weights.reshape(-1, topk_weights.shape[-1]).contiguous()
 
+        print(
+            f"[DeepEP Normal] After reshape: hidden_states.shape={hidden_states.shape}, "
+            f"hidden_states.is_contiguous()={hidden_states.is_contiguous()}, "
+            f"topk_ids.shape={topk_ids.shape}, topk_ids.is_contiguous()={topk_ids.is_contiguous()}, "
+            f"topk_weights.shape={topk_weights.shape}, topk_weights.is_contiguous()={topk_weights.is_contiguous()}"
+        )
+
         # Create a dummy router_logits tensor for compatibility
         # In DeepEP mode, routing has already been done
         router_logits = torch.zeros(
@@ -755,7 +762,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             Output tensor after MoE computation
         """
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe_deepep_ll,
+            batched_fused_marlin_moe,
+            get_scalar_type,
         )
 
         assert (
@@ -781,26 +789,38 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
+        # Extract expert_num_tokens from masked_m
+        # masked_m contains the number of valid tokens per expert
+        expert_num_tokens = masked_m.to(torch.int32)
+
         print(
             f"[DeepEP LL Marlin] hidden_states.shape={hidden_states.shape}, "
-            f"masked_m={masked_m.tolist() if masked_m.numel() <= 10 else masked_m.shape}, "
+            f"expert_num_tokens.shape={expert_num_tokens.shape}, "
+            f"expert_num_tokens={expert_num_tokens.tolist() if expert_num_tokens.numel() <= 10 else expert_num_tokens[:10].tolist()}, "
             f"expected_m={expected_m}"
         )
 
-        # Call the specialized DeepEP LL Marlin MoE kernel
-        output = fused_marlin_moe_deepep_ll(
-            hidden_states,
-            layer.w13_weight_packed,
-            layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
-            masked_m,
+        # Call batched_fused_marlin_moe
+        scalar_type = get_scalar_type(self.num_bits, has_zp=False)
+        
+        output = batched_fused_marlin_moe(
+            hidden_states=hidden_states,
+            expert_num_tokens=expert_num_tokens,
+            w1=layer.w13_weight_packed,
+            w2=layer.w2_weight_packed,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            gating_output=None,  # Not used in batched mode
+            quant_type_id=scalar_type.id,
+            global_num_experts=self.moe_runner_config.num_experts,
+            expert_map=None,  # DeepEP handles expert mapping
             g_idx1=layer.w13_weight_g_idx,
             g_idx2=layer.w2_weight_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
             w1_zeros=None,
             w2_zeros=None,
+            workspace=None,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,

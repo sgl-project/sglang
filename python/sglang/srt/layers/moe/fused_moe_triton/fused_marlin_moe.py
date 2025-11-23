@@ -239,177 +239,205 @@ def fused_marlin_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-def fused_marlin_moe_deepep_ll(
+def batched_fused_marlin_moe(
     hidden_states: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    masked_m: torch.Tensor,
+    gating_output: Optional[torch.Tensor],
+    quant_type_id: int,
+    global_num_experts: int = -1,
+    expert_map: Optional[torch.Tensor] = None,
     g_idx1: Optional[torch.Tensor] = None,
     g_idx2: Optional[torch.Tensor] = None,
     sort_indices1: Optional[torch.Tensor] = None,
     sort_indices2: Optional[torch.Tensor] = None,
     w1_zeros: Optional[torch.Tensor] = None,
     w2_zeros: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
-    routed_scaling_factor: float = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Marlin MoE kernel for DeepEP low latency mode with masked operations.
+    Batched version of fused_marlin_moe for DeepEP LL mode.
     
-    Args:
-        hidden_states: Input tensor [num_experts, max_tokens_per_expert, hidden_size]
-        w1: First weight tensor [num_experts, ...]
-        w2: Second weight tensor [num_experts, ...]
-        w1_scale: Scale for w1
-        w2_scale: Scale for w2
-        masked_m: Number of valid tokens per expert [num_experts]
-        g_idx1, g_idx2: Group indices for act_order
-        sort_indices1, sort_indices2: Sorting indices for act_order
-        w1_zeros, w2_zeros: Zero points
-        num_bits: Number of quantization bits
-        is_k_full: Whether K dimension is full
-        routed_scaling_factor: Optional scaling factor
-        
+    This function massages the inputs so the batched hidden_states can be
+    presented as a 2D contiguous tensor that could be used with fused_marlin_moe.
+    
+    In the batched version, the tokens are already grouped/batched by experts
+    they subscribe to. Due to this, we can represent the batched hidden_states
+    tensor of shape [B, MAX_TOKENS_PER_BATCH, K] as a 2D tensor of shape,
+    [B * MAX_TOKENS_PER_BATCH, K]. We may treat this a 2D contiguous tensor
+    with topk=1 as each token (row in the tensor) subscribes to exactly one
+    expert_id (which is the batch_id). With the expert_num_tokens tensor, that
+    indicates how many tokens are actually valid in each batch, the
+    batched_moe_align_block_size function constructs the sorted_ids and
+    expert_ids tensors, so only relevant/valid rows of A (hidden_states)
+    are accessed and are processed with the correct expert_ids.
+    
+    Parameters:
+    - hidden_states: [num_experts, max_tokens_per_expert, hidden_size]
+    - expert_num_tokens: [num_experts] number of valid tokens per expert
+    - w1, w2: Expert weights
+    - w1_scale, w2_scale: Quantization scales
+    - gating_output: Not used in batched mode (routing already done)
+    - Other parameters: Same as fused_marlin_moe
+    
     Returns:
-        Output tensor [num_experts, max_tokens_per_expert, hidden_size]
+    - output: [num_experts, max_tokens_per_expert, hidden_size]
     """
-    assert hidden_states.ndim == 3, "hidden_states must be 3D for DeepEP LL mode"
+    from sglang.srt.layers.moe.fused_moe_triton import (
+        moe_align_block_size,
+        try_get_optimal_moe_config,
+    )
+    from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+        batched_moe_align_block_size,
+    )
+    from sglang.srt.layers.quantization.utils.marlin_utils import (
+        marlin_make_workspace_new,
+        marlin_moe_intermediate_size,
+        maybe_warn_marlin_atomic_add,
+    )
+
+    assert hidden_states.ndim == 3, (
+        f"hidden states must be batched. e.g. [B, MAX_TOKENS, K]. "
+        f"But got {hidden_states.size()}"
+    )
+
+    B, BATCH_TOKENS_MAX, K = hidden_states.size()
+    M = hidden_states.view(-1, K).size(0)
+    E = w1.size(0)
+    N = marlin_moe_intermediate_size(w1, w2)
+
+    # Check constraints
+    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+    assert expert_num_tokens.size(0) == E
+    assert B == E, (
+        "Batch must be as big as number of experts as the tokens "
+        "are sorted into the batch/expert they belong to"
+    )
+    assert w1.size(1) * 16 == K, "Hidden size mismatch w1"
+    assert w2.size(2) // (num_bits // 2) == K, "Hidden size mismatch w2"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert num_bits in [4, 8]
-    
-    num_experts, max_tokens, hidden_size = hidden_states.shape
-    device = hidden_states.device
-    dtype = hidden_states.dtype
-    
-    # Verify dimensions
-    assert hidden_size == w1.shape[1] * 16, f"Hidden size mismatch: {hidden_size} != {w1.shape[1] * 16}"
-    assert hidden_size == w2.shape[2] // (num_bits // 2), "Hidden size mismatch w2"
-    assert w1.shape[0] == num_experts, "Number of experts mismatch"
-    assert w2.shape[0] == num_experts, "Number of experts mismatch"
-    assert masked_m.shape[0] == num_experts, "masked_m must have num_experts elements"
-    
-    N = w2.shape[1] * 16  # Intermediate dimension
-    
-    # Allocate output tensor
-    output = torch.zeros_like(hidden_states)
-    
-    # Get scalar types
-    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
-    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
-    
-    # Process each expert separately, only on valid tokens
-    for expert_id in range(num_experts):
-        valid_tokens = int(masked_m[expert_id].item())
-        
-        if valid_tokens == 0:
-            continue
-            
-        # Extract valid tokens for this expert
-        expert_input = hidden_states[expert_id, :valid_tokens, :].contiguous()  # [valid_tokens, hidden_size]
-        
-        # Prepare workspace
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
-        workspace = torch.zeros(sms * 4, dtype=torch.int, device=device, requires_grad=False)
-        
-        # First GEMM: expert_input @ w1[expert_id] -> intermediate (gate_up projection)
-        intermediate1 = torch.empty(
-            (valid_tokens, 2 * N),
-            device=device,
-            dtype=dtype,
-        )
-        
-        # Call Marlin GEMM for expert expert_id, treating it as a single-expert MoE
-        # We need to create dummy topk_ids that map all tokens to expert 0 (since we're processing one expert at a time)
-        dummy_topk_ids = torch.zeros((valid_tokens, 1), dtype=torch.int32, device=device)
-        dummy_topk_weights = torch.ones((valid_tokens, 1), dtype=torch.float32, device=device)
-        dummy_expert_ids = torch.zeros(valid_tokens, dtype=torch.int32, device=device)
-        
-        # Extract this expert's weights (treat as single expert)
-        w1_expert = w1[expert_id:expert_id+1]  # [1, ...]
-        w2_expert = w2[expert_id:expert_id+1]  # [1, ...]
-        w1_scale_expert = w1_scale[expert_id:expert_id+1]
-        w2_scale_expert = w2_scale[expert_id:expert_id+1]
-        
-        g_idx1_expert = g_idx1[expert_id:expert_id+1] if g_idx1 is not None else None
-        g_idx2_expert = g_idx2[expert_id:expert_id+1] if g_idx2 is not None else None
-        sort_indices1_expert = sort_indices1[expert_id:expert_id+1] if sort_indices1 is not None else None
-        sort_indices2_expert = sort_indices2[expert_id:expert_id+1] if sort_indices2 is not None else None
-        w1_zeros_expert = w1_zeros[expert_id:expert_id+1] if w1_zeros is not None else None
-        w2_zeros_expert = w2_zeros[expert_id:expert_id+1] if w2_zeros is not None else None
-        
-        use_atomic_add = (dtype == torch.half or torch.cuda.get_device_capability(device)[0] >= 9)
-        
-        # First GEMM
-        intermediate1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
-            expert_input,
-            intermediate1,
-            w1_expert,
-            w1_scale_expert,
-            w1_zeros_expert,
-            g_idx1_expert,
-            sort_indices1_expert,
-            workspace,
-            dummy_topk_ids[:, 0],  # sorted_token_ids
-            dummy_expert_ids,
-            valid_tokens,
-            dummy_topk_weights,
-            moe_block_size=64,  # Use a reasonable block size
-            top_k=1,
-            mul_topk_weights=False,
-            is_ep=False,
-            b_q_type_id=scalar_type1.id,
-            size_m=valid_tokens,
-            size_n=2 * N,
-            size_k=hidden_size,
-            is_k_full=is_k_full,
-            use_atomic_add=use_atomic_add,
-            use_fp32_reduce=True,
-            is_zp_float=False,
-        )
-        
-        # Apply SiLU and mul
-        intermediate2 = torch.empty((valid_tokens, N), device=device, dtype=dtype)
-        silu_and_mul(intermediate1, intermediate2)
-        
-        # Second GEMM: intermediate2 @ w2[expert_id] -> output
-        intermediate3 = torch.empty((valid_tokens, 1, hidden_size), device=device, dtype=dtype)
-        
-        intermediate3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
-            intermediate2,
-            intermediate3.view(valid_tokens, hidden_size),
-            w2_expert,
-            w2_scale_expert,
-            w2_zeros_expert,
-            g_idx2_expert,
-            sort_indices2_expert,
-            workspace,
-            dummy_topk_ids[:, 0],
-            dummy_expert_ids,
-            valid_tokens,
-            dummy_topk_weights,
-            moe_block_size=64,
-            top_k=1,
-            mul_topk_weights=True,
-            is_ep=False,
-            b_q_type_id=scalar_type2.id,
-            size_m=valid_tokens,
-            size_n=hidden_size,
-            size_k=N,
-            is_k_full=is_k_full,
-            use_atomic_add=use_atomic_add,
-            use_fp32_reduce=True,
-            is_zp_float=False,
-        ).view(valid_tokens, 1, hidden_size)
-        
-        # Sum over topk dimension (which is 1 here) and store in output
-        output[expert_id, :valid_tokens, :] = intermediate3.squeeze(1)
-    
+
+    # Tokens are already separated by their expert ids
+    # Hidden-States can just be squeezed to have just 2 dimensions,
+    # [B * MAX_TOKENS, K] and top_k can be interpreted as just 1.
+    topk = 1
+
+    # M block size selection logic
+    block_size_m = 64
+
+    # Use batched version of moe_align_block_size
+    sorted_token_ids, expert_ids, num_tokens_post_padded = batched_moe_align_block_size(
+        max_tokens_per_batch=BATCH_TOKENS_MAX,
+        block_size=block_size_m,
+        expert_num_tokens=expert_num_tokens,
+    )
+
+    if workspace is None:
+        workspace = marlin_make_workspace_new(hidden_states.device, 4)
+
+    intermediate_cache13 = torch.empty(
+        (M * topk * max(2 * N, K),),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
+    intermediate_cache2 = torch.empty(
+        (M * topk, N),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
+    intermediate_cache1 = intermediate_cache13[: M * topk * 2 * N].view(M * topk, 2 * N)
+    intermediate_cache3 = intermediate_cache13[: M * topk * K].view(M * topk, K)
+
+    maybe_warn_marlin_atomic_add(hidden_states.device, hidden_states.dtype)
+    use_atomic_add = (
+        hidden_states.dtype == torch.half
+        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+    )
+
+    scalar_type = get_scalar_type(num_bits, has_zp=(w1_zeros is not None))
+
+    # Create dummy topk_weights (all ones for batched mode)
+    topk_weights = torch.ones(
+        (M, topk), device=hidden_states.device, dtype=torch.float32
+    )
+
+    # First GEMM: hidden_states @ w1 -> intermediate_cache1
+    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+        hidden_states.view(-1, K),
+        intermediate_cache1,
+        w1,
+        w1_scale,
+        w1_zeros,
+        g_idx1,
+        sort_indices1,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=topk,
+        mul_topk_weights=False,  # Don't multiply by topk_weights in first GEMM
+        is_ep=expert_map is not None,
+        b_q_type_id=scalar_type.id,
+        size_m=M,
+        size_n=2 * N,
+        size_k=K,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+
+    # Activation function
+    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+
+    if expert_map is not None:
+        intermediate_cache3.zero_()
+
+    # Second GEMM: intermediate_cache2 @ w2 -> output
+    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+        intermediate_cache2,
+        intermediate_cache3,
+        w2,
+        w2_scale,
+        w2_zeros,
+        g_idx2,
+        sort_indices2,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=1,
+        mul_topk_weights=False,  # Batched mode doesn't need routing weights
+        is_ep=expert_map is not None,
+        b_q_type_id=scalar_type.id,
+        size_m=M * topk,
+        size_n=K,
+        size_k=N,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+
+    # Reshape output back to 3D
+    output = intermediate_cache3.view(B, BATCH_TOKENS_MAX, K)
+
     if routed_scaling_factor is not None:
         output *= routed_scaling_factor
-        
+
     return output
