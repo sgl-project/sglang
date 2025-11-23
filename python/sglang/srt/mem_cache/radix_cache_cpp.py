@@ -24,21 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 class RadixCacheCpp(BasePrefixCache):
-    def _merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
-        """
-        Merge a list of tensors into a single tensor.
-        Args:
-            l (List[torch.Tensor]): List of tensors to merge.
-        Returns:
-            torch.Tensor: Merged tensor.
-        """
-        if len(l) == 0:
-            return torch.empty(0, dtype=torch.int64, device=self.device)
-        elif len(l) == 1:
-            return l[0]
-        else:
-            return torch.cat(l)
-
     def __init__(
         self,
         disable: bool,
@@ -89,6 +74,21 @@ class RadixCacheCpp(BasePrefixCache):
             return  # early return if hicache is not used
 
         raise NotImplementedError("Host cache is not supported yet")
+
+    def _merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Merge a list of tensors into a single tensor.
+        Args:
+            l (List[torch.Tensor]): List of tensors to merge.
+        Returns:
+            torch.Tensor: Merged tensor.
+        """
+        if len(l) == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        elif len(l) == 1:
+            return l[0]
+        else:
+            return torch.cat(l)
 
     def reset(self):
         if self.cache_controller is not None:
