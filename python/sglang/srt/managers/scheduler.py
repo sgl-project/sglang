@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import pickle
 import signal
 import sys
 import threading
@@ -48,6 +49,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -117,6 +119,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -201,6 +204,91 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+
+
+def _determine_tensor_transport_mode(server_args: ServerArgs):
+    is_cross_node = server_args.dist_init_addr
+
+    if is_cross_node:
+        # Fallback to default CPU transport for multi-node
+        return "default"
+    else:
+        return "cuda_ipc"
+
+
+class WaitingImageRequest:
+    def __init__(self, rid: str, recv_req, req, embedding_port, mm_processor):
+        self.rid = rid
+        self.recv_req = recv_req
+        self.req = req
+        self.embedding_port = embedding_port
+        self.embedding_ready = False
+        self.mm_inputs = None
+        self.error = None
+        self.thread = None
+        self.ready = False
+        self.mm_processor = mm_processor
+
+    def start_waiting(self):
+        self.thread = threading.Thread(target=self._recv_mm_data_thread, daemon=True)
+        self.thread.start()
+
+    def _recv_mm_data_thread(self):
+        try:
+            mm_processor = self.mm_processor
+            prompt = self.recv_req.input_text
+
+            self.recv_req.mm_inputs = self._recv_mm_data_sync(
+                self.rid, self.embedding_port, mm_processor, prompt
+            )
+
+            self.embedding_ready = True
+
+        except Exception as e:
+            logger.error(f"Error receiving embedding for {self.rid}: {e}")
+            self.error = str(e)
+
+    def _recv_mm_data_sync(self, req_id, embedding_port, mm_processor, prompt):
+        if req_id is None:
+            return None
+        context = zmq.Context()
+        recv_socket = context.socket(zmq.PULL)
+        recv_socket.bind(f"tcp://*:{embedding_port}")
+        logger.info(f"Waiting for input {embedding_port = }")
+        try:
+            recv_embedding_data = None
+            while recv_embedding_data is None or not recv_embedding_data.ready:
+                try:
+                    parts = recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
+                except zmq.Again:
+                    # No data available yet, wait a bit and retry
+                    continue
+
+                recv_obj: EmbeddingData = pickle.loads(parts[0])
+                buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
+                recv_obj.embedding = torch.frombuffer(
+                    buffer, dtype=recv_obj.dtype
+                ).reshape(recv_obj.shape)
+                recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
+                print(
+                    f"transport cost  {(time.time() - recv_obj.send_time) * 1000:.2f}"
+                )
+                if recv_embedding_data is None:
+                    recv_embedding_data = recv_obj
+                else:
+                    recv_embedding_data.add(recv_obj)
+            recv_embedding = recv_embedding_data.get_embedding()
+            img_grid_thw = recv_embedding_data.get_img_grid()
+
+            mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
+            if mm_inputs and "input_ids" in mm_inputs:
+                self.req.origin_input_ids = mm_inputs["input_ids"]
+            self.ready = True
+            return mm_inputs
+
+        finally:
+            recv_socket.close()
+            context.term()
 
 
 @dataclass
@@ -540,6 +628,38 @@ class Scheduler(
 
         # Init mlp sync flag
         self.require_mlp_sync = require_mlp_sync(server_args)
+
+        self.waiting_for_image: List[WaitingImageRequest] = []
+        transport_mode = _determine_tensor_transport_mode(self.server_args)
+        if self.model_config.is_multimodal:
+            import_processors("sglang.srt.multimodal.processors")
+            try:
+                _processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
+                )
+            except ValueError as e:
+                error_message = str(e)
+                if "does not have a slow version" in error_message:
+                    logger.info(
+                        f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
+                    )
+                    _processor = get_processor(
+                        server_args.tokenizer_path,
+                        tokenizer_mode=server_args.tokenizer_mode,
+                        trust_remote_code=server_args.trust_remote_code,
+                        revision=server_args.revision,
+                        use_fast=True,
+                    )
+                else:
+                    raise e
+        self.mm_processor = get_mm_processor(
+            self.model_config.hf_config, server_args, _processor, transport_mode
+        )
+        print(f"{self.mm_processor = }")
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -970,6 +1090,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            self.process_waiting_requests()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
@@ -1005,6 +1126,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            self.process_waiting_requests()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
@@ -1272,6 +1394,128 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+    def _complete_multimodal_request(self, waiting_req: WaitingImageRequest):
+        recv_req = waiting_req.recv_req
+        req: Req = waiting_req.req
+        image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+
+        # The following steps are already fast, execute locally on each rank.
+        # Expand a single image token into multiple dummy tokens for receiving image embeddings
+        req.origin_input_ids = self.pad_input_ids_func(
+            req.origin_input_ids, image_inputs
+        )
+        req.extend_image_inputs(image_inputs)
+
+        if len(req.origin_input_ids) >= self.max_req_input_len:
+            req.set_finish_with_abort(
+                error_msg=(
+                    "Multimodal prompt is too long after expanding multimodal tokens. "
+                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                )
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        # initialize before returning
+        self.init_req_max_new_tokens(req)
+
+        # Validate prompt length
+        error_msg = validate_input_length(
+            req,
+            self.max_req_input_len,
+            self.server_args.allow_auto_truncate,
+        )
+        if error_msg:
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        # Copy more attributes
+        if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
+            # By default, only return the logprobs for output tokens
+            # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
+            # to skip input logprob computation entirely
+            if req.is_prefill_only:
+                req.logprob_start_len = len(req.origin_input_ids)
+            else:
+                # TODO: For text generation, evaluate setting logprob_start_len to len(req.origin_input_ids) as well
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+        else:
+            req.logprob_start_len = recv_req.logprob_start_len
+
+        if not req.is_prefill_only and req.logprob_start_len >= len(
+            req.origin_input_ids
+        ):
+            error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
+            req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        # Init grammar cache for this request
+        add_to_grammar_queue = False
+        if (
+            req.sampling_params.json_schema is not None
+            or req.sampling_params.regex is not None
+            or req.sampling_params.ebnf is not None
+            or req.sampling_params.structural_tag is not None
+        ):
+            if self.grammar_backend is None:
+                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                req.set_finish_with_abort(error_msg)
+            else:
+                if req.sampling_params.json_schema is not None:
+                    key = ("json", req.sampling_params.json_schema)
+                elif req.sampling_params.regex is not None:
+                    key = ("regex", req.sampling_params.regex)
+                elif req.sampling_params.ebnf is not None:
+                    key = ("ebnf", req.sampling_params.ebnf)
+                elif req.sampling_params.structural_tag:
+                    key = ("structural_tag", req.sampling_params.structural_tag)
+
+                value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+                req.grammar = value
+
+                if not cache_hit:
+                    req.grammar_key = key
+                    add_to_grammar_queue = True
+                else:
+                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                        error_msg = f"Invalid grammar request with cache hit: {key=}"
+                        req.set_finish_with_abort(error_msg)
+
+        if add_to_grammar_queue:
+            self.grammar_queue.append(req)
+        else:
+            self._add_request_to_queue(req)
+
+    def process_waiting_requests(
+        self,
+    ) -> None:
+        if not self.waiting_for_image or len(self.waiting_for_image) == 0:
+            return
+        local_statuses = []
+        request_rids = []
+
+        for waiting_req in self.waiting_for_image:
+            local_statuses.append(1 if waiting_req.embedding_ready else 0)
+            request_rids.append(waiting_req.rid)
+
+        local_tensor = torch.tensor(local_statuses, dtype=torch.int32)
+
+        if torch.cuda.is_available():
+            local_tensor = local_tensor.cuda()
+
+        torch.distributed.all_reduce(local_tensor, op=torch.distributed.ReduceOp.MIN)
+        new_waiting = []
+        for i, waiting_req in enumerate(self.waiting_for_image):
+            if local_tensor[i].item() == 1:
+                self._complete_multimodal_request(waiting_req)
+            else:
+                new_waiting.append(waiting_req)
+        self.waiting_for_image = new_waiting
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1351,6 +1595,21 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        # TODO: add this
+        if recv_req.need_wait_for_image is True:
+            assert recv_req.embedding_ports is not None
+            waiting_req = WaitingImageRequest(
+                rid=recv_req.rid,
+                recv_req=recv_req,
+                req=req,
+                embedding_port=recv_req.embedding_ports[self.tp_rank],
+                mm_processor=self.mm_processor,
+            )
+            self.waiting_for_image.append(waiting_req)
+            waiting_req.start_waiting()
+
+            return
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
