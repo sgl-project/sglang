@@ -151,9 +151,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -772,6 +770,8 @@ class Scheduler(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
             elif self.is_hybrid:
+                from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+
                 self.tree_cache = SWARadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -782,13 +782,9 @@ class Scheduler(
                     enable_metrics=self.enable_metrics,
                 )
             elif self.is_hybrid_gdn:
-                self.tree_cache = MambaRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    enable_metrics=self.enable_metrics,
-                )
+                from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+                self.tree_cache = MambaRadixCache(params)
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,
@@ -1630,6 +1626,8 @@ class Scheduler(
         return num_used, token_usage, available_size, evictable_size
 
     def _get_mamba_token_info(self):
+        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
         is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
         full_available_size = self.token_to_kv_pool_allocator.available_size()
         full_evictable_size = (
