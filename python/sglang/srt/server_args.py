@@ -102,6 +102,7 @@ QUANTIZATION_CHOICES = [
     "w4afp8",
     "mxfp4",
     "auto-round",
+    "modelslim",
     "compressed-tensors",  # for Ktransformers
 ]
 

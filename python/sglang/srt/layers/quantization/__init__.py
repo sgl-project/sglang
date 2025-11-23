@@ -16,6 +16,9 @@ class DummyConfig:
 
 CompressedTensorsConfig = DummyConfig
 
+from sglang.srt.hardware_backend.ascend_npu.quantization.modelslim import (
+    ModelSlimConfig,
+)
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -38,7 +41,7 @@ from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
+from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
 
 _is_mxfp_supported = mxfp_supported()
 
@@ -66,6 +69,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "auto-round": AutoRoundConfig,
+    "modelslim": ModelSlimConfig,
 }
 
 

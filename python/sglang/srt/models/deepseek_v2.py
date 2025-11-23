@@ -47,10 +47,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
-    NPUFusedMLAPreprocess,
-    is_mla_preprocess_enabled,
-)
+from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
@@ -193,6 +190,12 @@ elif _is_npu:
     from sglang.srt.hardware_backend.ascend_npu.models.deepseek_v2 import (
         forward_dsa_prepare as forward_dsa_prepare_ascend,
     )
+    from sglang.srt.hardware_backend.ascend_npu.models.deepseek_v2 import (
+        forward_mla_core as forward_mla_core_npu,
+    )
+    from sglang.srt.hardware_backend.ascend_npu.models.deepseek_v2 import (
+        forward_mla_prepare as forward_mla_prepare_npu,
+    )
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_decomposition as awq_dequantize,
     )
@@ -247,6 +250,8 @@ class AttnForwardMethod(IntEnum):
     MLA = auto()
 
     # Use Deepseek V3.2 sparse multi-latent attention
+    NPU_MHA = auto()
+    NPU_MLA = auto()
     NPU_MLA_SPARSE = auto()
 
     # Use multi-head attention, but with KV cache chunked.
@@ -304,7 +309,7 @@ def handle_attention_ascend(attn, forward_batch):
         if hasattr(attn, "indexer"):
             return AttnForwardMethod.NPU_MLA_SPARSE
         else:
-            return AttnForwardMethod.MLA
+            return AttnForwardMethod.NPU_MLA
 
 
 def _get_sum_extend_prefix_lens(forward_batch):
@@ -1431,29 +1436,13 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
-            if not self.is_mla_preprocess_enabled:
-                inner_state = self.forward_absorb_prepare(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
-            else:
-                # TODO(iforgetmyname): to be separated as a standalone func
-                if self.mla_preprocess is None:
-                    self.mla_preprocess = NPUFusedMLAPreprocess(
-                        self.fused_qkv_a_proj_with_mqa,
-                        self.q_a_layernorm,
-                        self.kv_a_layernorm,
-                        self.q_b_proj,
-                        self.w_kc,
-                        self.rotary_emb,
-                        self.layer_id,
-                        self.num_local_heads,
-                        self.qk_nope_head_dim,
-                        self.qk_rope_head_dim,
-                    )
-                inner_state = self.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
-                inner_state = (*inner_state, None)  # add a position for topk_indices
+            inner_state = self.forward_absorb_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        elif attn_forward_method == AttnForwardMethod.NPU_MLA:
+            inner_state = forward_mla_prepare_npu(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
             inner_state = forward_dsa_prepare_ascend(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1485,6 +1474,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.NPU_MLA:
+            return forward_mla_core_npu(*inner_state)
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
             return forward_dsa_core_ascend(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
@@ -3696,12 +3687,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        if not _is_npu:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        else:
-            torch.npu.empty_cache()
-            torch.npu.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

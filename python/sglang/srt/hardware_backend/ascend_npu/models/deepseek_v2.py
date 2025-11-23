@@ -136,3 +136,74 @@ def forward_dsa_core(
 
     output, _ = self.o_proj(attn_bmm_output)
     return output
+
+
+def forward_mla_prepare(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    zero_allocator: BumpAllocator,
+):
+    if not self.is_mla_preprocess_enabled:
+        inner_state = self.forward_absorb_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+    else:
+        # TODO(iforgetmyname): to be separated as a standalone func
+        if self.mla_preprocess is None:
+            self.mla_preprocess = NPUFusedMLAPreprocess(
+                self.fused_qkv_a_proj_with_mqa,
+                self.q_a_layernorm,
+                self.kv_a_layernorm,
+                self.q_b_proj,
+                self.w_kc,
+                self.rotary_emb,
+                self.layer_id,
+                self.num_local_heads,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            )
+        inner_state = self.mla_preprocess.forward(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+        inner_state = (*inner_state, None)  # add a position for topk_indices
+
+
+def forward_mla_core(
+    self,
+    q_pe,
+    k_pe,
+    q_nope_out,
+    k_nope,
+    forward_batch,
+    zero_allocator,
+    positions,
+    topk_indices,
+):
+    attn_output = self.attn_mqa(
+        q_nope_out,
+        k_nope,
+        k_nope,
+        forward_batch,
+        q_rope=q_pe,
+        k_rope=k_pe,
+        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+    )
+    attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+
+    attn_bmm_output = torch.empty(
+        (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+        dtype=attn_output.dtype,
+        device=attn_output.device,
+    )
+    torch.bmm(
+        attn_output.transpose(0, 1),
+        self.w_vc,
+        out=attn_bmm_output.view(-1, self.num_local_heads, self.v_head_dim).transpose(
+            0, 1
+        ),
+    )
+    output, _ = self.o_proj(attn_bmm_output)
+
+    return output
