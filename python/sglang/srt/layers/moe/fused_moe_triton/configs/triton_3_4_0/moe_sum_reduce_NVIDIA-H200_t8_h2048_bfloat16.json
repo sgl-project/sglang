@@ -1,0 +1,109 @@
+{
+  "8-2048-bfloat16": {
+    "1": {
+      "BLOCK_M": 1,
+      "BLOCK_DIM": 256,
+      "NUM_STAGE": 1,
+      "num_warps": 2,
+      "evict_policy": "evict_last"
+    },
+    "2": {
+      "BLOCK_M": 1,
+      "BLOCK_DIM": 512,
+      "NUM_STAGE": 1,
+      "num_warps": 4,
+      "evict_policy": "evict_last"
+    },
+    "4": {
+      "BLOCK_M": 1,
+      "BLOCK_DIM": 512,
+      "NUM_STAGE": 1,
+      "num_warps": 4,
+      "evict_policy": "evict_last"
+    },
+    "8": {
+      "BLOCK_M": 1,
+      "BLOCK_DIM": 256,
+      "NUM_STAGE": 1,
+      "num_warps": 4,
+      "evict_policy": "evict_last"
+    },
+    "16": {
+      "BLOCK_M": 1,
+      "BLOCK_DIM": 256,
+      "NUM_STAGE": 1,
+      "num_warps": 4,
+      "evict_policy": "evict_last"
+    },
+    "32": {
+      "BLOCK_M": 1,
+      "BLOCK_DIM": 256,
+      "NUM_STAGE": 1,
+      "num_warps": 4,
+      "evict_policy": "evict_last"
+    },
+    "64": {
+      "BLOCK_M": 2,
+      "BLOCK_DIM": 512,
+      "NUM_STAGE": 1,
+      "num_warps": 8,
+      "evict_policy": "evict_last"
+    },
+    "128": {
+      "BLOCK_M": 2,
+      "BLOCK_DIM": 512,
+      "NUM_STAGE": 1,
+      "num_warps": 8,
+      "evict_policy": "evict_last"
+    },
+    "256": {
+      "BLOCK_M": 2,
+      "BLOCK_DIM": 1024,
+      "NUM_STAGE": 1,
+      "num_warps": 16,
+      "evict_policy": "evict_last"
+    },
+    "512": {
+      "BLOCK_M": 2,
+      "BLOCK_DIM": 512,
+      "NUM_STAGE": 1,
+      "num_warps": 8,
+      "evict_policy": "evict_last"
+    },
+    "1024": {
+      "BLOCK_M": 4,
+      "BLOCK_DIM": 512,
+      "NUM_STAGE": 1,
+      "num_warps": 4,
+      "evict_policy": "evict_first"
+    },
+    "2048": {
+      "BLOCK_M": 2,
+      "BLOCK_DIM": 1024,
+      "NUM_STAGE": 1,
+      "num_warps": 4,
+      "evict_policy": "evict_first"
+    },
+    "4096": {
+      "BLOCK_M": 1,
+      "BLOCK_DIM": 2048,
+      "NUM_STAGE": 1,
+      "num_warps": 4,
+      "evict_policy": "evict_first"
+    },
+    "8192": {
+      "BLOCK_M": 2,
+      "BLOCK_DIM": 2048,
+      "NUM_STAGE": 1,
+      "num_warps": 16,
+      "evict_policy": "evict_last"
+    },
+    "16384": {
+      "BLOCK_M": 1,
+      "BLOCK_DIM": 2048,
+      "NUM_STAGE": 1,
+      "num_warps": 16,
+      "evict_policy": "evict_last"
+    }
+  }
+}
