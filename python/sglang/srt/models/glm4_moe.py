@@ -15,6 +15,7 @@
 """Inference-only GLM-4.5, GLM-4.6 model compatible with HuggingFace weights"""
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -96,7 +97,42 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
+# Dual-stream policy for GLM-4 MoE (non-DeepEP):
+#   auto (default): enable when CUDA graph capture is on; otherwise use token threshold
+#   capture: enable only when CUDA graph capture is on
+#   always: always enable if alt_stream is available
+#   never: never enable dual stream
+_DUAL_STREAM_POLICY = os.getenv("SGLANG_GLM4_MOE_DUAL_STREAM", "auto").lower()
+try:
+    _DUAL_STREAM_TOKEN_THRESHOLD = int(
+        os.getenv("SGLANG_GLM4_MOE_DUAL_STREAM_THRESHOLD", "1024")
+    )
+except ValueError:
+    _DUAL_STREAM_TOKEN_THRESHOLD = 1024
+
 logger = logging.getLogger(__name__)
+
+
+def _should_use_glm4_moe_dual_stream(
+    hidden_states: torch.Tensor, alt_stream: Optional[torch.cuda.Stream]
+) -> bool:
+    if alt_stream is None:
+        return False
+    if _DUAL_STREAM_POLICY == "never":
+        return False
+
+    capture_mode = get_is_capture_mode()
+    if _DUAL_STREAM_POLICY == "capture":
+        return capture_mode
+    if _DUAL_STREAM_POLICY == "always":
+        return True
+
+    # default auto: prefer dual stream during CUDA graph capture; otherwise use threshold
+    if capture_mode:
+        return True
+    if hidden_states.shape[0] == 0:
+        return False
+    return hidden_states.shape[0] <= _DUAL_STREAM_TOKEN_THRESHOLD
 
 
 class Glm4MoeMLP(nn.Module):
@@ -446,13 +482,57 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            if _should_use_glm4_moe_dual_stream(hidden_states, self.alt_stream):
+                return self.forward_normal_dual_stream(
+                    hidden_states,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                )
+            else:
+                return self.forward_normal(
+                    hidden_states,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(hidden_states)
+
+        with torch.cuda.stream(self.alt_stream):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            if not _is_cuda and not _use_aiter:
+                final_hidden_states *= self.routed_scaling_factor
+
+        current_stream.wait_stream(self.alt_stream)
+        with use_symmetric_memory(
+            parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            final_hidden_states_out = torch.empty_like(final_hidden_states)
+
+        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+        final_hidden_states = final_hidden_states_out
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states
 
     def forward_normal(
         self,
