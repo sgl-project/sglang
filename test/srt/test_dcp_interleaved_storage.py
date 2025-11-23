@@ -11,8 +11,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.allocator import (
-    TokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
 )
 
 
@@ -45,7 +45,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
-    def test_token_allocator_dcp_interleaved_page_size_1(self, mock_rank, mock_world_size):
+    def test_token_allocator_dcp_interleaved_page_size_1(
+        self, mock_rank, mock_world_size
+    ):
         """Test TokenToKVPoolAllocator with DCP interleaved storage (page_size=1)."""
         # Setup: 2 DCP ranks, current rank is 0
         mock_world_size.return_value = 2
@@ -62,7 +64,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         # Test: allocate 5 tokens with positions [0, 1, 2, 3, 4]
         # Rank 0 should store: 0, 2, 4 (token_idx % 2 == 0)
         # Rank 1 should store: 1, 3 (token_idx % 2 == 1)
-        token_positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=self.device)
+        token_positions = torch.tensor(
+            [0, 1, 2, 3, 4], dtype=torch.int64, device=self.device
+        )
         need_size = 5
 
         initial_available = allocator.available_size()
@@ -100,7 +104,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         )
 
         # Test: allocate 5 tokens with positions [0, 1, 2, 3, 4]
-        token_positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=self.device)
+        token_positions = torch.tensor(
+            [0, 1, 2, 3, 4], dtype=torch.int64, device=self.device
+        )
         need_size = 5
 
         initial_available = allocator.available_size()
@@ -135,7 +141,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
             need_sort=False,
         )
 
-        token_positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=self.device)
+        token_positions = torch.tensor(
+            [0, 1, 2, 3, 4], dtype=torch.int64, device=self.device
+        )
         need_size = 5
 
         initial_available = allocator.available_size()
@@ -177,7 +185,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         seq_lens_cpu = torch.tensor([15], dtype=torch.int64)
         last_loc = torch.tensor([9], dtype=torch.int64, device=self.device)
         extend_num_tokens = 5
-        token_positions = torch.tensor([10, 11, 12, 13, 14], dtype=torch.int64, device=self.device)
+        token_positions = torch.tensor(
+            [10, 11, 12, 13, 14], dtype=torch.int64, device=self.device
+        )
 
         initial_available = allocator.available_size()
         indices = allocator.alloc_extend(
@@ -241,7 +251,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
-    def test_paged_allocator_extend_no_token_positions(self, mock_rank, mock_world_size):
+    def test_paged_allocator_extend_no_token_positions(
+        self, mock_rank, mock_world_size
+    ):
         """Test PagedTokenToKVPoolAllocator.alloc_extend without token_positions (backward compatibility)."""
         mock_world_size.return_value = 2
         mock_rank.return_value = 0
@@ -299,7 +311,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         # Rank 0 should store: 0, 3 (token_idx % 3 == 0)
         # Rank 1 should store: 1, 4 (token_idx % 3 == 1)
         # Rank 2 should store: 2, 5 (token_idx % 3 == 2)
-        token_positions = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64, device=self.device)
+        token_positions = torch.tensor(
+            [0, 1, 2, 3, 4, 5], dtype=torch.int64, device=self.device
+        )
         need_size = 6
 
         indices = allocator.alloc(need_size, token_positions=token_positions)
@@ -331,7 +345,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         )
 
         # First allocation
-        token_positions_1 = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=self.device)
+        token_positions_1 = torch.tensor(
+            [0, 1, 2, 3, 4], dtype=torch.int64, device=self.device
+        )
         indices_1 = allocator.alloc(5, token_positions=token_positions_1)
         available_after_alloc1 = allocator.available_size()
 
@@ -344,7 +360,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         self.assertGreater(available_after_free1, available_after_alloc1)
 
         # Second allocation should be able to reuse freed indices
-        token_positions_2 = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int64, device=self.device)
+        token_positions_2 = torch.tensor(
+            [5, 6, 7, 8, 9], dtype=torch.int64, device=self.device
+        )
         indices_2 = allocator.alloc(5, token_positions=token_positions_2)
         self.assertIsNotNone(indices_2)
 
@@ -374,7 +392,9 @@ class TestDCPInterleavedStorage(unittest.TestCase):
 
             # Large sequence: 100 tokens with positions [0, 1, 2, ..., 99]
             seq_len = 100
-            token_positions = torch.arange(seq_len, dtype=torch.int64, device=self.device)
+            token_positions = torch.arange(
+                seq_len, dtype=torch.int64, device=self.device
+            )
 
             initial_available = allocator.available_size()
             indices = allocator.alloc(seq_len, token_positions=token_positions)
@@ -387,24 +407,36 @@ class TestDCPInterleavedStorage(unittest.TestCase):
             for pos in range(seq_len):
                 if pos % 4 == rank:
                     # This token belongs to current rank
-                    self.assertNotEqual(indices[pos].item(), -1,
-                                      f"Rank {rank}, position {pos} should be allocated")
+                    self.assertNotEqual(
+                        indices[pos].item(),
+                        -1,
+                        f"Rank {rank}, position {pos} should be allocated",
+                    )
                     expected_count += 1
                 else:
                     # This token belongs to another rank
-                    self.assertEqual(indices[pos].item(), -1,
-                                   f"Rank {rank}, position {pos} should be placeholder")
+                    self.assertEqual(
+                        indices[pos].item(),
+                        -1,
+                        f"Rank {rank}, position {pos} should be placeholder",
+                    )
 
             # Verify: available_size decreased by expected_count
             final_available = allocator.available_size()
-            self.assertEqual(initial_available - final_available, expected_count,
-                           f"Rank {rank} should allocate {expected_count} tokens")
+            self.assertEqual(
+                initial_available - final_available,
+                expected_count,
+                f"Rank {rank} should allocate {expected_count} tokens",
+            )
 
             # Verify: All allocated indices are unique
             allocated_indices = indices[indices >= 0]
             self.assertEqual(len(allocated_indices), expected_count)
-            self.assertEqual(len(torch.unique(allocated_indices)), expected_count,
-                           f"Rank {rank} allocated indices should be unique")
+            self.assertEqual(
+                len(torch.unique(allocated_indices)),
+                expected_count,
+                f"Rank {rank} allocated indices should be unique",
+            )
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
@@ -433,14 +465,20 @@ class TestDCPInterleavedStorage(unittest.TestCase):
             seq_len = 120
             extend_len = seq_len - prefix_len
 
-            prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=self.device)
+            prefix_lens = torch.tensor(
+                [prefix_len], dtype=torch.int64, device=self.device
+            )
             prefix_lens_cpu = torch.tensor([prefix_len], dtype=torch.int64)
             seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=self.device)
             seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int64)
-            last_loc = torch.tensor([prefix_len - 1], dtype=torch.int64, device=self.device)
+            last_loc = torch.tensor(
+                [prefix_len - 1], dtype=torch.int64, device=self.device
+            )
 
             # Token positions for extend tokens: [20, 21, 22, ..., 119]
-            token_positions = torch.arange(prefix_len, seq_len, dtype=torch.int64, device=self.device)
+            token_positions = torch.arange(
+                prefix_len, seq_len, dtype=torch.int64, device=self.device
+            )
 
             initial_available = allocator.available_size()
             indices = allocator.alloc_extend(
@@ -461,19 +499,28 @@ class TestDCPInterleavedStorage(unittest.TestCase):
             for i, pos in enumerate(range(prefix_len, seq_len)):
                 if pos % 4 == rank:
                     # This token belongs to current rank
-                    self.assertNotEqual(indices[i].item(), -1,
-                                      f"Rank {rank}, position {pos} should be allocated")
+                    self.assertNotEqual(
+                        indices[i].item(),
+                        -1,
+                        f"Rank {rank}, position {pos} should be allocated",
+                    )
                     expected_count += 1
                 else:
                     # This token belongs to another rank
-                    self.assertEqual(indices[i].item(), -1,
-                                   f"Rank {rank}, position {pos} should be placeholder")
+                    self.assertEqual(
+                        indices[i].item(),
+                        -1,
+                        f"Rank {rank}, position {pos} should be placeholder",
+                    )
 
             # Verify: All allocated indices are unique
             allocated_indices = indices[indices >= 0]
             self.assertEqual(len(allocated_indices), expected_count)
-            self.assertEqual(len(torch.unique(allocated_indices)), expected_count,
-                           f"Rank {rank} allocated indices should be unique")
+            self.assertEqual(
+                len(torch.unique(allocated_indices)),
+                expected_count,
+                f"Rank {rank} allocated indices should be unique",
+            )
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
@@ -498,10 +545,16 @@ class TestDCPInterleavedStorage(unittest.TestCase):
 
             # Large decode batch: 50 requests with varying sequence lengths
             batch_size = 50
-            seq_lens_list = [100 + i for i in range(batch_size)]  # seq_lens: [100, 101, ..., 149]
-            seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=self.device)
+            seq_lens_list = [
+                100 + i for i in range(batch_size)
+            ]  # seq_lens: [100, 101, ..., 149]
+            seq_lens = torch.tensor(
+                seq_lens_list, dtype=torch.int64, device=self.device
+            )
             seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int64)
-            last_loc = torch.tensor([s - 2 for s in seq_lens_list], dtype=torch.int64, device=self.device)
+            last_loc = torch.tensor(
+                [s - 2 for s in seq_lens_list], dtype=torch.int64, device=self.device
+            )
 
             # Token positions: seq_len - 1 for each request
             token_positions = (seq_lens - 1).to(torch.int64)
@@ -523,20 +576,29 @@ class TestDCPInterleavedStorage(unittest.TestCase):
                 token_pos = seq_len_val - 1  # Decode token position
                 if token_pos % 4 == rank:
                     # This token belongs to current rank
-                    self.assertNotEqual(indices[i].item(), -1,
-                                      f"Rank {rank}, request {i}, position {token_pos} should be allocated")
+                    self.assertNotEqual(
+                        indices[i].item(),
+                        -1,
+                        f"Rank {rank}, request {i}, position {token_pos} should be allocated",
+                    )
                     expected_count += 1
                 else:
                     # This token belongs to another rank
-                    self.assertEqual(indices[i].item(), -1,
-                                   f"Rank {rank}, request {i}, position {token_pos} should be placeholder")
+                    self.assertEqual(
+                        indices[i].item(),
+                        -1,
+                        f"Rank {rank}, request {i}, position {token_pos} should be placeholder",
+                    )
 
             # Verify: All allocated indices are unique
             allocated_indices = indices[indices >= 0]
             self.assertEqual(len(allocated_indices), expected_count)
             if expected_count > 0:
-                self.assertEqual(len(torch.unique(allocated_indices)), expected_count,
-                               f"Rank {rank} allocated indices should be unique")
+                self.assertEqual(
+                    len(torch.unique(allocated_indices)),
+                    expected_count,
+                    f"Rank {rank} allocated indices should be unique",
+                )
 
     @patch("sglang.srt.mem_cache.allocator.get_dcp_world_size")
     @patch("sglang.srt.mem_cache.allocator.get_dcp_rank")
@@ -568,8 +630,12 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         prefix_lens_cpu = torch.tensor([prefix_len], dtype=torch.int64)
         seq_lens_extend = torch.tensor([seq_len], dtype=torch.int64, device=self.device)
         seq_lens_cpu_extend = torch.tensor([seq_len], dtype=torch.int64)
-        last_loc_extend = torch.tensor([prefix_len - 1], dtype=torch.int64, device=self.device)
-        token_positions_extend = torch.arange(prefix_len, seq_len, dtype=torch.int64, device=self.device)
+        last_loc_extend = torch.tensor(
+            [prefix_len - 1], dtype=torch.int64, device=self.device
+        )
+        token_positions_extend = torch.arange(
+            prefix_len, seq_len, dtype=torch.int64, device=self.device
+        )
 
         indices_extend = allocator.alloc_extend(
             prefix_lens=prefix_lens,
@@ -585,17 +651,23 @@ class TestDCPInterleavedStorage(unittest.TestCase):
         self.assertEqual(len(indices_extend), extend_len)
 
         # Count tokens allocated for rank 0 in extend
-        extend_rank_0_count = sum(1 for pos in range(prefix_len, seq_len) if pos % 4 == 0)
+        extend_rank_0_count = sum(
+            1 for pos in range(prefix_len, seq_len) if pos % 4 == 0
+        )
         extend_allocated = indices_extend[indices_extend >= 0]
         self.assertEqual(len(extend_allocated), extend_rank_0_count)
 
         # Second: decode with batch
         batch_size = 30
-        seq_lens_decode = torch.tensor([seq_len + i for i in range(batch_size)],
-                                     dtype=torch.int64, device=self.device)
+        seq_lens_decode = torch.tensor(
+            [seq_len + i for i in range(batch_size)],
+            dtype=torch.int64,
+            device=self.device,
+        )
         seq_lens_cpu_decode = seq_lens_decode.cpu()
-        last_loc_decode = torch.tensor([s - 2 for s in seq_lens_decode],
-                                      dtype=torch.int64, device=self.device)
+        last_loc_decode = torch.tensor(
+            [s - 2 for s in seq_lens_decode], dtype=torch.int64, device=self.device
+        )
         token_positions_decode = (seq_lens_decode - 1).to(torch.int64)
 
         indices_decode = allocator.alloc_decode(
@@ -615,8 +687,11 @@ class TestDCPInterleavedStorage(unittest.TestCase):
 
         # Verify: All indices are unique across extend and decode
         all_allocated = torch.cat([extend_allocated, decode_allocated])
-        self.assertEqual(len(torch.unique(all_allocated)), len(all_allocated),
-                        "All allocated indices should be unique")
+        self.assertEqual(
+            len(torch.unique(all_allocated)),
+            len(all_allocated),
+            "All allocated indices should be unique",
+        )
 
 
 if __name__ == "__main__":

@@ -11,12 +11,11 @@ import torch
 import triton
 from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-
-from sglang.srt.distributed.parallel_state import get_dcp_world_size, get_dcp_rank
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -85,7 +84,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.dcp_world_size = get_dcp_world_size()
             self.dcp_rank = get_dcp_rank()
         except Exception as e:
-            print(f"dcp disabled or not initialized, dcp world size and rank will be set to 1 and 0")
+            print(
+                f"dcp disabled or not initialized, dcp world size and rank will be set to 1 and 0"
+            )
             self.dcp_world_size = 1
             self.dcp_rank = 0
 
@@ -365,7 +366,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn:
-            assert self.dcp_world_size == 1, "FlashMLA does not support DCP for FP8 kv cache"
+            assert (
+                self.dcp_world_size == 1
+            ), "FlashMLA does not support DCP for FP8 kv cache"
             reshape_q_fp8 = reshape_q.to(torch.float8_e4m3fn)
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q_fp8,

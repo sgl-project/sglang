@@ -608,15 +608,16 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
-    def reduce_scatter_along_dim(self,
-                       input_: torch.Tensor,
-                       dim: int = -1) -> torch.Tensor:
+    def reduce_scatter_along_dim(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}")
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -628,16 +629,16 @@ class GroupCoordinator:
 
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
-        output_shape = (chunk_size, ) + input_tensor.shape[1:]
+        output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        output_tensor = torch.empty(output_shape,
-                                    dtype=input_tensor.dtype,
-                                    device=input_tensor.device)
+        output_tensor = torch.empty(
+            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+        )
 
         # Perform reduce-scatter operation
-        torch.distributed.reduce_scatter_tensor(output_tensor,
-                                                input_tensor,
-                                                group=self.device_group)
+        torch.distributed.reduce_scatter_tensor(
+            output_tensor, input_tensor, group=self.device_group
+        )
 
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
@@ -1321,12 +1322,15 @@ _TP: Optional[GroupCoordinator] = None
 
 _DCP: Optional[GroupCoordinator] = None
 
-decode_context_parallel_size:Optional[int] = None
+decode_context_parallel_size: Optional[int] = None
+
+
 def get_dcp_size_from_env():
     global decode_context_parallel_size
     if decode_context_parallel_size is None:
         decode_context_parallel_size = int(os.getenv("SGLANG_DCP", 1))
     return decode_context_parallel_size
+
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -1348,9 +1352,11 @@ def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
+
 def get_dcp_group() -> GroupCoordinator:
     assert _DCP is not None, "decode context parallel group is not initialized"
     return _DCP
+
 
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
@@ -1563,18 +1569,29 @@ def initialize_model_parallel(
     decode_context_model_parallel_size = get_dcp_size_from_env()
     if decode_context_model_parallel_size > 1:
         if get_tensor_model_parallel_rank() == 0:
-            logger.info(f"DCP enabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}")
+            logger.info(
+                f"DCP enabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
     else:
         if get_tensor_model_parallel_rank() == 0:
-            logger.info(f"DCP disabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}")
-    assert tensor_model_parallel_size % decode_context_model_parallel_size == 0, f"{tensor_model_parallel_size} must be divisible by decode_context_model_parallel_size"
-    num_decode_context_model_parallel_groups: int = world_size // decode_context_model_parallel_size
+            logger.info(
+                f"DCP disabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
+    assert (
+        tensor_model_parallel_size % decode_context_model_parallel_size == 0
+    ), f"{tensor_model_parallel_size} must be divisible by decode_context_model_parallel_size"
+    num_decode_context_model_parallel_groups: int = (
+        world_size // decode_context_model_parallel_size
+    )
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
     group_ranks = []
     for i in range(num_decode_context_model_parallel_groups):
         ranks = list(
-            range(i * decode_context_model_parallel_size, (i + 1) * decode_context_model_parallel_size)
+            range(
+                i * decode_context_model_parallel_size,
+                (i + 1) * decode_context_model_parallel_size,
+            )
         )
         group_ranks.append(ranks)
 
@@ -1685,7 +1702,9 @@ def ensure_model_parallel_initialized(
     )
 
     dcp_world_size = get_dcp_group().world_size
-    assert dcp_world_size == get_dcp_size_from_env(), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size_from_env()=}"
+    assert (
+        dcp_world_size == get_dcp_size_from_env()
+    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size_from_env()=}"
 
 
 def model_parallel_is_initialized():

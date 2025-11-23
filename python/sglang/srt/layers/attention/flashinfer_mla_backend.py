@@ -23,6 +23,7 @@ if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
+from sglang.srt.distributed import get_dcp_group, get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
@@ -36,13 +37,6 @@ from sglang.srt.utils import (
     is_sm100_supported,
     next_power_of_2,
 )
-
-from sglang.srt.distributed import (
-    get_dcp_world_size,
-    get_dcp_group,
-    get_dcp_rank,
-)
-
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -454,6 +448,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs]
+            if get_dcp_world_size() > 1:
+                dcp_world_size = get_dcp_world_size()
+                dcp_rank = get_dcp_rank()
+                # Compute local lengths following the same formula as filter_seq_indices.
+                kv_len_arr_cpu = ((kv_len_arr_cpu - dcp_rank - 1) // dcp_world_size) + 1
+
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
@@ -651,7 +651,9 @@ class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size() * get_dcp_world_size()
+            model_runner.model_config.num_attention_heads
+            // get_attention_tp_size()
+            * get_dcp_world_size()
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -723,21 +725,47 @@ class FlashInferMLAIndicesUpdaterDecode:
             )
 
             # TODO(augusto.yjh) 更新kv_indices
-            def filter_seq_indices(paged_kernel_lens, paged_kernel_lens_cumsum, dcp_rank:int, dpc_world_size:int):
-                paged_kernel_lens_split = ((paged_kernel_lens - dcp_rank - 1) // dpc_world_size) + 1
+            def filter_seq_indices(
+                paged_kernel_lens,
+                paged_kernel_lens_cumsum,
+                dcp_rank: int,
+                dpc_world_size: int,
+            ):
+                paged_kernel_lens_split = (
+                    (paged_kernel_lens - dcp_rank - 1) // dpc_world_size
+                ) + 1
                 all_filered_indice = []
                 for i in range(len(paged_kernel_lens_split)):
-                    indice = torch.arange(paged_kernel_lens_split[i], device=paged_kernel_lens.device) * dpc_world_size + dcp_rank + paged_kernel_lens_cumsum[i]
+                    indice = (
+                        torch.arange(
+                            paged_kernel_lens_split[i], device=paged_kernel_lens.device
+                        )
+                        * dpc_world_size
+                        + dcp_rank
+                        + paged_kernel_lens_cumsum[i]
+                    )
                     all_filered_indice.append(indice)
-                filterd_kv_indices = torch.cat(all_filered_indice, dim=0).to(device="cuda")
+                filterd_kv_indices = torch.cat(all_filered_indice, dim=0).to(
+                    device="cuda"
+                )
                 return paged_kernel_lens_split, filterd_kv_indices
 
             if get_dcp_world_size() > 1:
-                filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size())
-                kv_indices = kv_indices[filterd_kv_indices]
+                filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(
+                    paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size()
+                )
+                if init_metadata_replay:
+                    # For cuda graph replay, we must pack the DCP-filtered indices
+                    # back into the shared kv_indices buffer so that the FlashInfer
+                    # kernel reads a contiguous prefix of valid entries.
+                    local_kv_indices = kv_indices[filterd_kv_indices]
+                    kv_indices[: local_kv_indices.numel()] = local_kv_indices
+                else:
+                    # Non-replay path can keep using a shrunk tensor.
+                    kv_indices = kv_indices[filterd_kv_indices]
                 kv_lens = filtered_paged_kernel_lens.to(torch.int32)
-                kv_indptr[1:bs+1] = torch.cumsum(filtered_paged_kernel_lens, dim=0)
-                kv_indptr = kv_indptr[:bs+1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(filtered_paged_kernel_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 

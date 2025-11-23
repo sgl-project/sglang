@@ -1,9 +1,9 @@
+import torch
 import triton
 import triton.language as tl
-import torch
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator
-)
+
+from sglang.srt.distributed.parallel_state import GroupCoordinator
+
 # Keep this in sync with the Triton kernel inside `create_flashmla_kv_indices_triton`.
 # Number of pages that the kernel writes per iteration.
 # Exposed here so other Python modules can import it instead of hard-coding 64.
@@ -269,7 +269,7 @@ def cp_lse_ag_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
-    ctx: CPTritonContext = None
+    ctx: CPTritonContext = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -282,7 +282,7 @@ def cp_lse_ag_out_rs(
         ctx = CPTritonContext()
 
     lses = torch.empty(
-        (cp_group.world_size, ) + cp_attn_lse.shape,
+        (cp_group.world_size,) + cp_attn_lse.shape,
         dtype=cp_attn_lse.dtype,
         device=cp_attn_lse.device,
     )
