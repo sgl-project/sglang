@@ -25,6 +25,35 @@ def moe_align_block_size(
     )
 
 
+def batched_moe_align_block_size(
+    max_tokens_per_batch,
+    block_size,
+    batch_num_tokens,
+    sorted_ids,
+    batch_ids,
+    num_tokens_post_pad,
+):
+    """
+    Batched version of moe_align_block_size for DeepEP LL mode.
+    
+    Args:
+        max_tokens_per_batch: Maximum tokens per batch (expert)
+        block_size: Block size for alignment
+        batch_num_tokens: Number of valid tokens per batch [num_batches]
+        sorted_ids: Output sorted token IDs
+        batch_ids: Output batch (expert) IDs
+        num_tokens_post_pad: Output total tokens after padding
+    """
+    torch.ops.sgl_kernel.batched_moe_align_block_size.default(
+        max_tokens_per_batch,
+        block_size,
+        batch_num_tokens,
+        sorted_ids,
+        batch_ids,
+        num_tokens_post_pad,
+    )
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

@@ -83,6 +83,7 @@ from sgl_kernel.marlin import (
 from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
+    batched_moe_align_block_size,
     cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
     kimi_k2_moe_fused_gate,
