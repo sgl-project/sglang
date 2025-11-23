@@ -40,6 +40,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -188,6 +189,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
 
         # Read model args
         self.model_path = server_args.model_path
@@ -306,6 +310,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+
+        # E Disaggregation
+        if self.model_config.is_multimodal and self.server_args.language_only:
+            self.mm_receiver = MMReceiver(
+                server_args.host,
+                server_args.encode_urls,
+                server_args.mm_transfer_backend,
+                server_args.disaggregation_ib_device,
+                self.model_config.dtype,
+            )
 
         # Request states
         self._chosen_loop = None
@@ -693,13 +707,24 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            mm_inputs: Dict = await self.mm_data_processor.process(
-                image_data=obj.image_data,
-                audio_data=obj.audio_data,
-                input_text_or_ids=(input_text or input_ids),
-                request_obj=obj,
-                max_req_input_len=self.max_req_input_len,
-            )
+
+            mm_inputs = None
+            if self.server_args.language_only:
+                mm_inputs: Dict = await self.mm_receiver.recv_mm_data(
+                    obj.image_data,
+                    self.mm_processor,
+                    input_text or input_ids,
+                )
+
+            if mm_inputs is None:
+                mm_inputs: Dict = await self.mm_data_processor.process(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text_or_ids=(input_text or input_ids),
+                    request_obj=obj,
+                    max_req_input_len=self.max_req_input_len,
+                )
+
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
         else:

@@ -596,22 +596,27 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
+            if hasattr(config, "mm_only"):
+                self.config.mm_only = config.mm_only
+            if hasattr(config, "language_only"):
+                self.config.language_only = config.language_only
 
-        self.model = language_model_cls(
-            config=self.config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
+        if not hasattr(config, "mm_only") or not config.mm_only:
+            self.model = language_model_cls(
+                config=self.config,
                 quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
+                prefix=add_prefix("model", prefix),
             )
+
+            if self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(self.config)
@@ -620,7 +625,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
@@ -744,6 +749,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.mm_only or self.config.language_only
+                ) and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -757,6 +767,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 try:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip loading visual/language model weights
+                    if (
+                        self.config.mm_only or self.config.language_only
+                    ) and name not in params_dict:
                         continue
                     param = params_dict[name]
                 except KeyError:
