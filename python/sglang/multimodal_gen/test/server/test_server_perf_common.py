@@ -301,7 +301,6 @@ Consider updating perf_baselines.json with the snippets below:
                     response_format="b64_json",
                 )
             rid = response.headers.get("x-request-id", "")
-            print(f"{response=}")
 
             result = response.parse()
             validate_image(result.data[0].b64_json)

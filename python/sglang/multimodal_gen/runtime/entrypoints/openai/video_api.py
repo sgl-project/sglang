@@ -42,6 +42,8 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 
+# NOTE(mick): the sampling params needs to be further adjusted
+# FIXME: duplicated with the one in `image_api.py`
 def _build_sampling_params_from_request(
     request_id: str, request: VideoGenerationsRequest
 ) -> SamplingParams:
@@ -56,9 +58,8 @@ def _build_sampling_params_from_request(
         request.num_frames if request.num_frames is not None else derived_num_frames
     )
     server_args = get_global_server_args()
-    # TODO: should we cache this sampling_params?
-    sampling_params = SamplingParams.from_pretrained(server_args.model_path)
-    user_params = SamplingParams(
+    sampling_params = SamplingParams.from_user_sampling_params_args(
+        model_path=server_args.model_path,
         request_id=request_id,
         prompt=request.prompt,
         num_frames=num_frames,
@@ -67,10 +68,10 @@ def _build_sampling_params_from_request(
         height=height,
         image_path=request.input_reference,
         save_output=True,
+        server_args=server_args,
+        output_file_name=request_id,
     )
-    sampling_params = sampling_params.from_user_sampling_params(user_params)
-    sampling_params.set_output_file_name()
-    sampling_params.log(server_args)
+
     return sampling_params
 
 
@@ -195,7 +196,6 @@ async def create_video(
 
     # Build Req for scheduler
     batch = prepare_request(
-        prompt=req.prompt,
         server_args=get_global_server_args(),
         sampling_params=sampling_params,
     )
