@@ -2911,7 +2911,6 @@ class ServerArgs:
             choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
-
         )
         # Ngram speculative decoding
         parser.add_argument(
