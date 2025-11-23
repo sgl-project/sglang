@@ -740,8 +740,6 @@ class Scheduler(
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     tp_cache_group=params.tp_cache_group,
                     page_size=self.page_size,
-                    hicache_ratio=server_args.hicache_ratio,
-                    hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                     enable_metrics=self.enable_metrics,
                     enable_kv_cache_events=self.enable_kv_cache_events,

@@ -47,12 +47,9 @@ class RadixCacheCpp(BasePrefixCache):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
-        hicache_ratio: float,
-        hicache_size: int,
         hicache_write_policy: str,
         enable_metrics: bool = False,
         enable_kv_cache_events: bool = False,
-        hicache_oracle: bool = False,
         enable_write_cancel: bool = False,
     ):
         self.disable = disable
