@@ -21,6 +21,8 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 
+    pub model: Option<String>,
+
     /// Input IDs for tokenized input
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_ids: Option<InputIds>,
@@ -201,8 +203,12 @@ impl GenerationRequest for GenerateRequest {
     }
 
     fn get_model(&self) -> Option<&str> {
-        // Generate requests typically don't have a model field
-        None
+        // Generate requests have an optional model field
+        if let Some(s) = &self.model {
+            Some(s.as_str())
+        } else {
+            None
+        }
     }
 
     fn extract_text_for_routing(&self) -> String {

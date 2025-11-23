@@ -4,14 +4,14 @@ if [ "$1" = "rocm" ]; then
     echo "Running in ROCm mode"
 
     # Clean SGLang processes
-    pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt' | xargs -r kill -9
+    pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::' | xargs -r kill -9
 
 else
     # Show current GPU status
     nvidia-smi
 
     # Clean SGLang processes
-    pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt' | xargs -r kill -9
+    pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::' | xargs -r kill -9
 
     # Clean all GPU processes if any argument is provided
     if [ $# -gt 0 ]; then

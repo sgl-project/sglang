@@ -51,6 +51,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, Sched
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -618,37 +619,21 @@ class DecodePreallocQueue:
 
         req.req_pool_idx = req_pool_indices[0]
 
+        # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
+        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        req.kv_allocated_len = fill_len
+        req.kv_committed_len = fill_len
         if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-            )
+            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
-            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [0],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                prefix_lens_cpu=torch.tensor(
-                    [0],
-                    dtype=torch.int64,
-                ),
-                seq_lens=torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                seq_lens_cpu=torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int64,
-                ),
-                last_loc=torch.tensor(
-                    [-1],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                extend_num_tokens=num_tokens,
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
             )
 
         assert (
@@ -693,6 +678,50 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+        idx = decode_req.metadata_buffer_index
+        (
+            output_id,
+            cached_tokens,
+            output_token_logprobs_val,
+            output_token_logprobs_idx,
+            output_top_logprobs_val,
+            output_top_logprobs_idx,
+            output_topk_p,
+            output_topk_index,
+            output_hidden_states,
+        ) = self.metadata_buffers.get_buf(idx)
+
+        decode_req.req.output_ids.append(output_id[0].item())
+        decode_req.req.cached_tokens = cached_tokens[0].item()
+        if not self.spec_algorithm.is_none():
+            decode_req.req.output_topk_p = output_topk_p
+            decode_req.req.output_topk_index = output_topk_index
+            decode_req.req.hidden_states_tensor = output_hidden_states
+
+        if decode_req.req.return_logprob:
+            decode_req.req.output_token_logprobs_val.append(
+                output_token_logprobs_val[0].item()
+            )
+            decode_req.req.output_token_logprobs_idx.append(
+                output_token_logprobs_idx[0].item()
+            )
+            decode_req.req.output_top_logprobs_val.append(
+                output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
+            )
+            decode_req.req.output_top_logprobs_idx.append(
+                output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
+            )
+
+        decode_req.kv_receiver.clear()
+        decode_req.kv_receiver = None
+        trace_slice_end(
+            RequestStage.DECODE_TRANSFERRED,
+            decode_req.req.rid,
+            auto_next_anon=True,
+        )
+        decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+
     def pop_transferred(self) -> List[Req]:
         if not self.queue:
             return []
@@ -719,64 +748,15 @@ class DecodeTransferQueue:
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                self.tree_cache.cache_finished_req(decode_req.req, is_insert=False)
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-
-                idx = decode_req.metadata_buffer_index
-                (
-                    output_id,
-                    cached_tokens,
-                    output_token_logprobs_val,
-                    output_token_logprobs_idx,
-                    output_top_logprobs_val,
-                    output_top_logprobs_idx,
-                    output_topk_p,
-                    output_topk_index,
-                    output_hidden_states,
-                ) = self.metadata_buffers.get_buf(idx)
-
-                decode_req.req.output_ids.append(output_id[0].item())
-                decode_req.req.cached_tokens = cached_tokens[0].item()
-                if not self.spec_algorithm.is_none():
-                    decode_req.req.output_topk_p = output_topk_p
-                    decode_req.req.output_topk_index = output_topk_index
-                    decode_req.req.hidden_states_tensor = output_hidden_states
-
-                if decode_req.req.return_logprob:
-                    decode_req.req.output_token_logprobs_val.append(
-                        output_token_logprobs_val[0].item()
-                    )
-                    decode_req.req.output_token_logprobs_idx.append(
-                        output_token_logprobs_idx[0].item()
-                    )
-                    decode_req.req.output_top_logprobs_val.append(
-                        output_top_logprobs_val[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-                    decode_req.req.output_top_logprobs_idx.append(
-                        output_top_logprobs_idx[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-
-                if hasattr(decode_req.kv_receiver, "clear"):
-                    decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
-
+                self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
-                decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
                 transferred_reqs.append(decode_req.req)
-                trace_slice_end(
-                    RequestStage.DECODE_TRANSFERRED,
-                    decode_req.req.rid,
-                    auto_next_anon=True,
-                )
-
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -899,8 +879,7 @@ class SchedulerDisaggregationDecodeMixin:
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
-            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
-            trace_event_batch("schedule", ret.reqs, attrs=attrs)
+            trace_event_batch("schedule", ret.reqs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -951,7 +930,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        new_batch.process_prebuilt(self.server_args, self.model_config)
+        new_batch.process_prebuilt(self.server_args, self.future_map)
 
         return new_batch
 
