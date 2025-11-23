@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
+import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -16,7 +18,7 @@ class CacheInitParams:
     page_size: int
 
     is_eagle: bool = False
-    tp_cache_group: int = 0
+    tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
     disable_finished_insert: bool = False
 
