@@ -610,9 +610,7 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}postgres-pool-max",
             type=int,
-            default=int(
-                os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)
-            ),
+            default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
         )
         # mTLS configuration
