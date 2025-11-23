@@ -56,43 +56,44 @@ def main(args):
     backend = select_sglang_backend(args)
     sgl.set_default_backend(backend)
 
-    
     all_rets = []
     all_questions = []
-    
+
     # Calculate batch sizes based on total number of questions
-    first_batch_size = int(args.num_questions * 0.8)  
+    first_batch_size = int(args.num_questions * 0.8)
     remaining = args.num_questions - first_batch_size
     small_batch_size = max(1, remaining // 4)  # Divide remaining into 4 batches
-    
+
     batch_configs = [
-        (first_batch_size, 0),      
-        (small_batch_size, 0),    
-        (small_batch_size, 0),     
-        (small_batch_size, 0),      
-        (small_batch_size, 0),     
+        (first_batch_size, 0),
+        (small_batch_size, 0),
+        (small_batch_size, 0),
+        (small_batch_size, 0),
+        (small_batch_size, 0),
     ]
-    
+
     start_idx = 0
     overall_start = time.perf_counter()
-    
+
     for batch_num, (batch_size, wait_time) in enumerate(batch_configs, 1):
         # Wait before sending (except for first batch)
         if wait_time > 0:
             print(f"\nWaiting {wait_time}s before batch {batch_num}...")
             time.sleep(wait_time)
-        
+
         # Get batch arguments
         end_idx = min(start_idx + batch_size, len(arguments))
         if start_idx >= len(arguments):
             break
-            
+
         batch_arguments = arguments[start_idx:end_idx]
         batch_questions = questions[start_idx:end_idx]
         actual_batch_size = len(batch_arguments)
-        
-        print(f"\nSending batch {batch_num}: {actual_batch_size} questions (indices {start_idx}-{end_idx-1})")
-        
+
+        print(
+            f"\nSending batch {batch_num}: {actual_batch_size} questions (indices {start_idx}-{end_idx-1})"
+        )
+
         # Run batch
         batch_start = time.perf_counter()
         batch_rets = answer_mt_bench.run_batch(
@@ -103,21 +104,21 @@ def main(args):
             progress_bar=True,
         )
         batch_latency = time.perf_counter() - batch_start
-        
+
         print(f"Batch {batch_num} completed in {batch_latency:.3f}s")
-        
+
         all_rets.extend(batch_rets)
         all_questions.extend(batch_questions)
         start_idx = end_idx
-    
+
     total_latency = time.perf_counter() - overall_start
-    
+
     # Process results
     answers = [[s["answer_1"], s["answer_2"]] for s in all_rets]
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("Final Results:")
-    print("="*50)
+    print("=" * 50)
     print(f"#questions: {len(all_questions)}, Total Latency: {total_latency:.2f}s")
 
     # Write results

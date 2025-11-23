@@ -613,7 +613,6 @@ class Scheduler(
             )
 
         elif self.spec_algorithm.is_standalone():
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
@@ -627,7 +626,6 @@ class Scheduler(
                 )
 
         elif self.spec_algorithm.is_standalone():
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
             self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
 
@@ -654,7 +652,6 @@ class Scheduler(
         # This tracks whether we're currently in spec mode (for dynamic spec switching)
         # Use None to indicate we haven't decided yet (warmup phase)
         self.last_step_in_spec_mode = None
-
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2035,29 +2032,36 @@ class Scheduler(
 
     def cleanup_speculative_state(self, batch: ScheduleBatch):
         """Clean up speculative decoding related state when switching to non-spec mode.
-        
+
         Simply use the last generated token from each request as input_ids for non-spec decode.
         """
-        
+
         # Use the last generated token from each request for non-spec decode
         # This is simpler and more reliable than trying to extract from draft_token
 
-        batch.input_ids = torch.tensor([
-            req.output_ids[-1] if len(req.output_ids) > 0 else req.origin_input_ids[-1]
-            for req in batch.reqs
-        ], dtype=torch.int64, device=batch.device)
+        batch.input_ids = torch.tensor(
+            [
+                (
+                    req.output_ids[-1]
+                    if len(req.output_ids) > 0
+                    else req.origin_input_ids[-1]
+                )
+                for req in batch.reqs
+            ],
+            dtype=torch.int64,
+            device=batch.device,
+        )
 
         # Clear spec_info state
         batch.spec_info = None
         batch.spec_algorithm = SpeculativeAlgorithm.NONE
         batch.out_cache_loc = None
-        
+
         # Must reallocate cache for non-spec mode (1 slot per request)
         # Spec mode uses multiple slots per request, non-spec uses 1 slot
         from sglang.srt.mem_cache.common import alloc_for_decode
-        batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
-        
 
+        batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
 
     def initialize_speculative_state(self, batch: ScheduleBatch):
         """Initialize speculative state when switching from non-spec to spec mode.
@@ -2073,20 +2077,22 @@ class Scheduler(
         # while preserving the existing paged KV cache
         bs = batch.batch_size()
 
-        batch.prefix_lens = [l - 1 for l in batch.seq_lens.cpu().tolist()]  # All previous tokens are prefix
+        batch.prefix_lens = [
+            l - 1 for l in batch.seq_lens.cpu().tolist()
+        ]  # All previous tokens are prefix
         batch.extend_lens = [1] * bs
         batch.extend_num_tokens = bs
-        batch.extend_logprob_start_lens = [max(0, seq_len - 2) for seq_len in batch.seq_lens.cpu().tolist()]
+        batch.extend_logprob_start_lens = [
+            max(0, seq_len - 2) for seq_len in batch.seq_lens.cpu().tolist()
+        ]
         batch.attn_attend_prefix_cache = True
 
         return orig_forward_mode
 
-    def _run_batch_with_dynamic_spec(
-        self, batch: ScheduleBatch
-    ) -> tuple:
+    def _run_batch_with_dynamic_spec(self, batch: ScheduleBatch) -> tuple:
         """
         Run batch with dynamic speculative decoding based on batch size.
-        
+
         Returns:
             tuple: (batch_result, future_indices_or_next_token_ids, use_spec_decoding)
         """
@@ -2097,7 +2103,9 @@ class Scheduler(
                 # System is in non-spec mode, prefill also uses non-spec
                 batch.spec_algorithm = SpeculativeAlgorithm.NONE
                 batch_or_worker_batch = batch.get_model_worker_batch()
-                batch_result = self.tp_worker.forward_batch_generation(batch_or_worker_batch)
+                batch_result = self.tp_worker.forward_batch_generation(
+                    batch_or_worker_batch
+                )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
                 use_spec_decoding = False
@@ -2107,47 +2115,53 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 use_spec_decoding = True
-                
+
         # DECODE mode participates in dynamic spec decisions
         else:
             use_spec_decoding = self.should_use_speculative_decoding(batch)
             if not use_spec_decoding:  # non-spec mode
                 batch.spec_algorithm = SpeculativeAlgorithm.NONE
-                
+
                 # If switching from spec to non-spec mode, clean up speculative state
                 if self.last_step_in_spec_mode:
                     self.cleanup_speculative_state(batch)
-                
+
                 self.last_step_in_spec_mode = False
-                
+
                 # Use tp_worker to run the batch
                 batch_or_worker_batch = batch.get_model_worker_batch()
-                batch_result = self.tp_worker.forward_batch_generation(batch_or_worker_batch)
+                batch_result = self.tp_worker.forward_batch_generation(
+                    batch_or_worker_batch
+                )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
-                
+
             else:  # spec mode
                 # If switching from non-spec to spec mode, initialize speculative state
                 batch.spec_init_orig_forward_mode = None
                 if self.last_step_in_spec_mode == False:
-                    batch.spec_init_orig_forward_mode = self.initialize_speculative_state(batch)
+                    batch.spec_init_orig_forward_mode = (
+                        self.initialize_speculative_state(batch)
+                    )
                 else:
                     batch.spec_algorithm = self.spec_algorithm
-                
+
                 self.last_step_in_spec_mode = True
-                
+
                 # Use model_worker (eagle_worker) to run the batch
                 batch_result = self.model_worker.forward_batch_generation(batch)
-                
+
                 # Update spec decoding metrics if available
                 if batch_result.num_accepted_tokens is not None:
                     bs = batch.batch_size()
-                    self.spec_num_total_accepted_tokens += batch_result.num_accepted_tokens + bs
+                    self.spec_num_total_accepted_tokens += (
+                        batch_result.num_accepted_tokens + bs
+                    )
                     self.spec_num_total_forward_ct += bs
                     self.num_generated_tokens += batch_result.num_accepted_tokens
-                
+
                 future_indices_or_next_token_ids = batch_result.next_token_ids
-        
+
         return batch_result, future_indices_or_next_token_ids, use_spec_decoding
 
     def run_batch(
@@ -2178,10 +2192,14 @@ class Scheduler(
             batch_or_worker_batch = batch
 
             # Check if we should use dynamic spec logic
-            if self.server_args.enable_dynamic_spec and not self.spec_algorithm.is_none():
+            if (
+                self.server_args.enable_dynamic_spec
+                and not self.spec_algorithm.is_none()
+            ):
                 # Use dynamic spec logic
                 batch_result, future_indices_or_next_token_ids, use_spec_decoding = (
-                    self._run_batch_with_dynamic_spec(batch))
+                    self._run_batch_with_dynamic_spec(batch)
+                )
 
             if self.enable_overlap or self.spec_algorithm.is_none():
                 # FIXME(lsyin): remove this if and finally unify the abstraction
@@ -2238,11 +2256,11 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
-                
+
             else:
                 # Original sglang behavior - no dynamic switching
                 batch_or_worker_batch = batch
-                
+
                 if self.enable_overlap or self.spec_algorithm.is_none():
                     batch_or_worker_batch = batch.get_model_worker_batch()
 
@@ -2285,7 +2303,7 @@ class Scheduler(
                     )
                     future_indices_or_next_token_ids = batch_result.next_token_ids
                     self.update_cache_from_scheduler(batch, batch_result)
-                
+
                 use_spec_decoding = not self.spec_algorithm.is_none()
 
             # Common post-processing for all generation paths
@@ -2294,7 +2312,9 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or (self.spec_algorithm.is_eagle() and use_spec_decoding):
+            if batch.return_logprob or (
+                self.spec_algorithm.is_eagle() and use_spec_decoding
+            ):
                 extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
             else:
                 extend_input_len_per_req = None
@@ -2358,7 +2378,10 @@ class Scheduler(
 
         # Restore forward_mode if this was a spec initialization with EXTEND
         # Do NOT clean up prefix_lens/extend_lens - they will be managed by eagle_worker
-        if hasattr(batch, 'spec_init_orig_forward_mode') and batch.spec_init_orig_forward_mode is not None:
+        if (
+            hasattr(batch, "spec_init_orig_forward_mode")
+            and batch.spec_init_orig_forward_mode is not None
+        ):
             batch.forward_mode = batch.spec_init_orig_forward_mode
             batch.spec_init_orig_forward_mode = None
 

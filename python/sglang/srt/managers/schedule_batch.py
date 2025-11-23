@@ -1762,7 +1762,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
         # 1) current batch is always prefill, whose seq_lens is not a future
         # 2) other batch is always decode, which is finished in previous step
-        
+
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -1805,6 +1805,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.spec_info.merge_batch(other.spec_info)
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
                 other.out_cache_loc = None
                 self.spec_info = None
                 self.spec_algorithm = SpeculativeAlgorithm.NONE

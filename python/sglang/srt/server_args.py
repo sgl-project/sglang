@@ -392,8 +392,8 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     # Dynamic speculative decoding
-    enable_dynamic_spec: bool = False  
-    speculative_batch_size_threshold: int = 8  
+    enable_dynamic_spec: bool = False
+    speculative_batch_size_threshold: int = 8
     speculative_moe_runner_backend: Optional[str] = None
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
@@ -2895,7 +2895,6 @@ class ServerArgs:
             default=ServerArgs.speculative_attention_mode,
         )
         parser.add_argument(
-
             "--enable-dynamic-spec",
             action="store_true",
             help="Enable dynamic speculative decoding based on batch size. When enabled, speculative decoding will be automatically disabled when decode batch size exceeds the threshold.",
