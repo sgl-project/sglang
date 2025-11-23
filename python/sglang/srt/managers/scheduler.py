@@ -795,16 +795,11 @@ class Scheduler(
                 )
 
                 self.tree_cache = LMCRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    enable_metrics=self.enable_metrics,
+                    params=params,
                     model_config=self.model_config,
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
-                    eviction_policy=server_args.radix_eviction_policy,
                 )
             else:
                 self.tree_cache = RadixCache(params)
