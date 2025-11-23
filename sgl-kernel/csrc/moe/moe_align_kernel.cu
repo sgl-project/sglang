@@ -367,7 +367,7 @@ void moe_align_block_size(
 // Batched MoE align block size kernel for DeepEP LL mode
 // Based on vLLM's implementation: 
 // https://github.com/vllm-project/vllm/blob/main/csrc/moe/moe_align_sum_kernels.cu
-namespace batched_moe_align_block_size {
+namespace batched_moe_align_impl {
 
 // Note num_threads needs to be 1024 for BlockScan Reduction in the kernel.
 static constexpr int32_t num_threads = 1024;
@@ -466,7 +466,7 @@ __global__ void batched_moe_align_block_size_kernel(
   }
 }
 
-}  // namespace batched_moe_align_block_size
+}  // namespace batched_moe_align_impl
 
 void batched_moe_align_block_size(
     int64_t max_tokens_per_batch,
@@ -476,7 +476,7 @@ void batched_moe_align_block_size(
     torch::Tensor batch_ids,
     torch::Tensor num_tokens_post_pad) {
   
-  namespace batched_kernel = batched_moe_align_block_size;
+  namespace batched_kernel = batched_moe_align_impl;
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   int32_t const B = batch_num_tokens.size(0);

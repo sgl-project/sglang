@@ -309,6 +309,14 @@ void moe_align_block_size(
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids);
 
+void batched_moe_align_block_size(
+    int64_t max_tokens_per_batch,
+    int64_t block_size,
+    torch::Tensor const& batch_num_tokens,
+    torch::Tensor sorted_ids,
+    torch::Tensor batch_ids,
+    torch::Tensor num_tokens_post_pad);
+
 void topk_softmax(
     torch::Tensor& topk_weights,
     torch::Tensor& topk_indices,
