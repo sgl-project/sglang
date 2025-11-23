@@ -1627,66 +1627,6 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
-    def _get_token_info(self):
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
-        return num_used, token_usage, available_size, evictable_size
-
-    def _get_mamba_token_info(self):
-        is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
-        full_available_size = self.token_to_kv_pool_allocator.available_size()
-        full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_radix_tree else 0
-        )
-        mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
-        mamba_evictable_size = (
-            self.tree_cache.mamba_evictable_size() if is_radix_tree else 0
-        )
-        full_num_used = self.token_to_kv_pool_allocator.size - (
-            full_available_size + full_evictable_size
-        )
-        mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
-            mamba_available_size + mamba_evictable_size
-        )
-        full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
-        mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
-        return (
-            full_num_used,
-            mamba_num_used,
-            full_token_usage,
-            mamba_usage,
-            full_available_size,
-            full_evictable_size,
-            mamba_available_size,
-            mamba_evictable_size,
-        )
-
-    def _get_swa_token_info(self):
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-        full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-        swa_evictable_size = self.tree_cache.swa_evictable_size()
-        full_num_used = self.full_tokens_per_layer - (
-            full_available_size + full_evictable_size
-        )
-        swa_num_used = self.swa_tokens_per_layer - (
-            swa_available_size + swa_evictable_size
-        )
-        full_token_usage = full_num_used / self.full_tokens_per_layer
-        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
-        return (
-            full_num_used,
-            swa_num_used,
-            full_token_usage,
-            swa_token_usage,
-            full_available_size,
-            full_evictable_size,
-            swa_available_size,
-            swa_evictable_size,
-        )
-
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
