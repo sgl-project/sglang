@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,8 @@ if is_cuda():
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
+import logging
+logger = logging.getLogger(__name__)
 
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
@@ -186,6 +189,69 @@ class EagleDraftInputV2Mixin:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
+    def prepare_for_v2_vanilla_draft(
+        self: EagleDraftInput,
+        req_to_token_pool: ReqToTokenPool,
+        batch: ModelWorkerBatch,
+        cuda_graph_runner: EAGLEDraftCudaGraphRunner,
+        draft_model_runner: ModelRunner,
+        topk: int,
+        num_steps: int,
+    ):
+        # Get a forward batch
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        return forward_batch, can_cuda_graph
+
+    def prepare_for_extend_to_fill_vanilla_draft_kvcache(
+        self,
+        batch: ModelWorkerBatch,
+        predict: torch.Tensor,
+        num_draft_tokens: int,
+        req_to_token_pool: ReqToTokenPool,
+        draft_model_runner: Any,
+    ):
+        seq_lens_cpu_ = batch.seq_lens_cpu
+        bs = len(batch.seq_lens)
+        extend_num_tokens = bs * num_draft_tokens
+        batch.out_cache_loc = torch.empty(
+            (extend_num_tokens,),
+            dtype=torch.int64,
+            device=batch.input_ids.device,
+        )
+
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + num_draft_tokens,
+            batch.out_cache_loc,
+            req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+
+        if os.getenv('DEBUG_MODE', 'false').lower() == 'true':
+            logger.warning(f"(gaoji:extend_for_decode:kvcache)\n "
+                       f"extend_num_tokens: {bs * num_draft_tokens}\n"
+                       f"batch.seq_lens: {batch.seq_lens}\n"
+                       f"batch.out_cache_loc: {batch.out_cache_loc}\n")
+
+        batch.spec_info = self
+        batch.input_ids = predict
+        batch.seq_lens = batch.seq_lens + num_draft_tokens
+        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
+        batch.seq_lens_sum += extend_num_tokens
+        batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
+        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+        batch.extend_num_tokens = extend_num_tokens
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        return forward_batch
+
 
 @dataclass
 class EagleVerifyInputV2Mixin:
@@ -215,22 +281,31 @@ class EagleVerifyInputV2Mixin:
             next_power_of_2(bs),
         )
 
+        if os.getenv('DEBUG_MODE', 'false').lower() == 'true':
+            logger.warning(f"(gaoji:prepare_for_v2_verify)\n"
+                       f"batch.seq_lens: {batch.seq_lens}\n"
+                       f"batch.out_cache_loc: {batch.out_cache_loc}\n"
+                       f"batch.req_pool_indices: {batch.req_pool_indices}\n")
+
+
+
         # Get a forward batch
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
+        can_run_cuda_graph = False
         # Run attention backend plan and cuda graph preparation
-        can_run_cuda_graph = bool(
-            target_worker.model_runner.graph_runner
-            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+        # can_run_cuda_graph = bool(
+        #     target_worker.model_runner.graph_runner
+        #     and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+        # )
+        # if can_run_cuda_graph:
+        #     target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+        # else:
+        target_worker.model_runner.attn_backend.init_forward_metadata(
+            verify_forward_batch
         )
-        if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
-        else:
-            target_worker.model_runner.attn_backend.init_forward_metadata(
-                verify_forward_batch
-            )
 
         return verify_forward_batch, can_run_cuda_graph
 
@@ -256,11 +331,20 @@ class EagleVerifyInputV2Mixin:
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
-
         # Sample tokens
         if sampling_info.is_all_greedy:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
+
+            if os.getenv('DEBUG_MODE', 'false').lower() == 'true':
+                logger.warning(f"(gaoji:sample)\n"
+                           f"sampling_info.is_all_greedy: {sampling_info.is_all_greedy}\n"
+                           f"spec_steps: {self.spec_steps}\n"
+                           f"candidates: {candidates}\n"
+                           f"retrive_index: {self.retrive_index}\n"
+                           f"retrive_next_token: {self.retrive_next_token}\n"
+                           f"retrive_next_sibling: {self.retrive_next_sibling}\n"
+                           f"target_predict: {target_predict}\n")
 
             verify_tree_greedy(
                 predicts=predict,  # mutable
@@ -339,6 +423,42 @@ class EagleVerifyInputV2Mixin:
 
 
 @torch.compile(dynamic=True)
+def select_top_k_tokens_tmp_vanilla(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+):
+    # TODO(gaoji): support top k > 1
+    # The first step after extend
+    input_ids = topk_index.flatten()
+    hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+    scores = topk_p  # shape: (b, topk)
+
+    if i == 0:
+        # First step: parent is -1 for root, then 0, 1, 2, ...
+        parent_indices = torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
+    else:
+        # Subsequent steps (i=1,2,3): parent indices should account for previous tokens
+        # Each token at step i has topk children, so parent offset is based on cumulative token count
+        # At step i, we have already generated topk^i tokens
+        # Parent indices should be: topk + (topk^2 * (i-1)), topk + (topk^2 * (i-1)) + 1, ..., topk + (topk^2 * i) - 1
+        offset = topk + topk ** 2 * (i - 1)
+        parent_indices = torch.arange(offset, offset + topk, dtype=torch.long, device=hidden_states.device)
+
+    tree_info = (
+        topk_p.unsqueeze(1),  # shape: (b, 1, topk)
+        topk_index,  # shape: (b, topk)
+        parent_indices.unsqueeze(0).repeat(topk_p.shape[0], 1),  # shape: (b, topk)
+    )
+
+    return input_ids, hidden_states, scores, tree_info
+
+
+
+@torch.compile(dynamic=True)
 def select_top_k_tokens_tmp(
     i: int,
     topk_p: torch.Tensor,
@@ -348,18 +468,27 @@ def select_top_k_tokens_tmp(
     topk: int,
 ):
     # FIXME(lsyin): remove this duplicate code
-    if i == 0:
+    if i <= 3:
         # The first step after extend
         input_ids = topk_index.flatten()
         hidden_states = hidden_states.repeat_interleave(topk, dim=0)
         scores = topk_p  # shape: (b, topk)
 
+        if i == 0:
+            # First step: parent is -1 for root, then 0, 1, 2, ...
+            parent_indices = torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
+        else:
+            # Subsequent steps (i=1,2,3): parent indices should account for previous tokens
+            # Each token at step i has topk children, so parent offset is based on cumulative token count
+            # At step i, we have already generated topk^i tokens
+            # Parent indices should be: topk + (topk^2 * (i-1)), topk + (topk^2 * (i-1)) + 1, ..., topk + (topk^2 * i) - 1
+            offset = topk + topk ** 2 * (i - 1)
+            parent_indices = torch.arange(offset, offset + topk, dtype=torch.long, device=hidden_states.device)
+
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
+            parent_indices.unsqueeze(0).repeat(topk_p.shape[0], 1),  # shape: (b, topk)
         )
     else:
         # The later decode steps

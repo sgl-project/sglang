@@ -12,12 +12,13 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    VANILLA = auto()
 
     def is_none(self):
         return self == SpeculativeAlgorithm.NONE
 
     def is_eagle(self):
-        return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3
+        return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3 or self == SpeculativeAlgorithm.VANILLA
 
     def is_eagle3(self):
         return self == SpeculativeAlgorithm.EAGLE3
@@ -28,6 +29,9 @@ class SpeculativeAlgorithm(IntEnum):
     def is_ngram(self):
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_vanilla(self):
+        return self == SpeculativeAlgorithm.VANILLA
+
     @lru_cache(maxsize=None)
     @staticmethod
     def from_string(name: str):
@@ -36,6 +40,7 @@ class SpeculativeAlgorithm(IntEnum):
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
             "NGRAM": SpeculativeAlgorithm.NGRAM,
+            "VANILLA": SpeculativeAlgorithm.VANILLA,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:

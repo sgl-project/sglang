@@ -154,6 +154,7 @@ from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.vanilla_worker import VANILLAWorkerV2
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_set_proc_propagate_context,
@@ -557,11 +558,17 @@ class Scheduler(
                 f"Using draft model load_format: '{server_args.speculative_draft_load_format}'"
             )
 
-        if self.spec_algorithm.is_eagle():
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_vanilla():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            from sglang.srt.speculative.vanilla_worker import VANILLAWorkerV2
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-            WorkerClass = EAGLEWorkerV2 if self.enable_overlap else EAGLEWorker
+            if self.spec_algorithm.is_vanilla():
+                WorkerClass = VANILLAWorkerV2
+            elif self.enable_overlap:
+                WorkerClass = EAGLEWorkerV2
+            else:
+                WorkerClass = EAGLEWorker
 
             self.draft_worker = WorkerClass(
                 gpu_id=gpu_id,

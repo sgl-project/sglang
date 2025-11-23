@@ -453,6 +453,9 @@ class ModelRunner:
 
             enable_batch_invariant_mode()
 
+        if os.getenv('DEBUG_MODE', 'false').lower() == 'true':
+            logger.warning(f"(gaoji:max_running_requests) = {server_args.max_running_requests}\n"
+                         f"(max_total_tokens) = {server_args.max_total_tokens}\n")
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -1998,6 +2001,9 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+        # 如果 forward_batch 中有 layer_idx，则传递给 model.forward
+        if forward_batch.layer_idx is not None:
+            kwargs["layer_idx"] = forward_batch.layer_idx
 
         if self.piecewise_cuda_graph_runner is not None:
             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
@@ -2090,17 +2096,22 @@ class ModelRunner:
             and self.graph_runner.can_run(forward_batch)
         )
 
-        if can_run_graph:
-            ret = self.graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-            return ret, can_run_graph
+        # if can_run_graph:
+        #     ret = self.graph_runner.replay(
+        #         forward_batch,
+        #         skip_attn_backend_init=skip_attn_backend_init,
+        #         pp_proxy_tensors=pp_proxy_tensors,
+        #     )
+        #     return ret, can_run_graph
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
+
+        if os.getenv('DEBUG_MODE', 'false').lower() == 'true':
+            logger.warning(f"(gaoji:model_runner:begin)\n"
+                       f"forward_batch.input_ids: {forward_batch.input_ids}\n"
+                       f"forward_batch.positions: {forward_batch.positions}\n")
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

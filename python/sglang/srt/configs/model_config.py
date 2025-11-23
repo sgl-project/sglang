@@ -241,6 +241,9 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
+        if is_draft_model and self.hf_config.architectures[0] == "MiniMaxM2ForCausalLM":
+            self.hf_config.architectures[0] = "MiniMaxM2ForCausalLMNextN"
+
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "LongcatFlashForCausalLM"

@@ -122,7 +122,7 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         # Normalize and apply local weight shard
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = x.to(orig_dtype) * self.weight
+        x = (x * self.weight).to(orig_dtype)
 
         return x
 
@@ -143,7 +143,7 @@ class MiniMaxM2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-        )
+            )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -191,7 +191,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
-            + get_global_server_args().ep_num_redundant_experts,
+                        + get_global_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -435,7 +435,7 @@ class MiniMaxM2Attention(nn.Module):
             reduce_results=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-        )
+            )
 
         # Setup RoPE with partial rotary dimension
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -809,6 +809,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
 
@@ -833,13 +836,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
+            # Skip loading weights that belong to MTP layers
+            if "rotary_emb.inv_freq" in name or "mtp_layers" in name:
                 continue
-
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None:
-                continue  # skip spec decode layers for main model
-
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -905,17 +904,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
             num_logical_experts=config.num_local_experts,
             num_groups=None,
         )
-
-
-def get_spec_layer_idx_from_weight_name(
-    config: PretrainedConfig, weight_name: str
-) -> Optional[int]:
-    if hasattr(config, "num_mtp_modules") and (config.num_mtp_modules > 0):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_mtp_modules):
-            if weight_name.startswith(f"model.layers.{layer_idx + i}."):
-                return layer_idx + i
-    return None
 
 
 # Entry class for model registration

@@ -314,6 +314,9 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    # For MTP (Multi-Token Prediction) layer index
+    layer_idx: Optional[int] = None
+
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
