@@ -58,6 +58,7 @@ fn default_generate_request() -> GenerateRequest {
         bootstrap_room: None,
         bootstrap_pair_key: None,
         data_parallel_rank: None,
+        decode_dp_rank: None,
         background: false,
         conversation_id: None,
         priority: None,
