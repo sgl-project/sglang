@@ -76,7 +76,6 @@ class GetK:
         :param page_indices: (num_pages,), int32/int64
         :return: (seq_len, index_head_dim), uint8
         """
-        # print(f"Using Triton GetK")
         return _get_k_triton(
             buf=buf,
             page_indices=page_indices,
@@ -146,7 +145,6 @@ class GetS:
         :param page_indices: (num_pages,), int32/int64
         :return: (seq_len, 4), uint8
         """
-        # print(f"Using Triton GetS")
         return _get_s_triton(
             buf=buf,
             page_indices=page_indices,
