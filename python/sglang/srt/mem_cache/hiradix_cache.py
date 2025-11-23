@@ -685,7 +685,7 @@ class HiRadixCache(RadixCache):
 
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key.token_ids = self.key_convert_fn(key.token_ids)
+        key, _ = self.maybe_bigram_convert(key)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -786,7 +786,7 @@ class HiRadixCache(RadixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode()
+            new_node = TreeNode(priority=node.priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = None
@@ -823,7 +823,7 @@ class HiRadixCache(RadixCache):
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
-        new_node = TreeNode()
+        new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -848,8 +848,16 @@ class HiRadixCache(RadixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def insert(self, key: RadixKey, value=None, chunked=False):
-        key.token_ids = self.key_convert_fn(key.token_ids)
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        chunked: bool = False,
+        priority: int | None = None,
+    ):
+        if priority is None:
+            priority = 0
+        key, value = self.maybe_bigram_convert(key, value)
 
         if len(key) == 0:
             return 0
@@ -865,6 +873,7 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
+            node.priority = max(node.priority, priority)
             prefix_len = self.key_match_fn(node.key, key)
 
             if prefix_len == len(node.key):
@@ -879,6 +888,8 @@ class HiRadixCache(RadixCache):
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
+                # shared-prefix node should also reflect max priority
+                new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len]
                     self.evictable_size_ += len(new_node.value)
@@ -894,7 +905,7 @@ class HiRadixCache(RadixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode()
+            new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = value

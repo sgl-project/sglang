@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils.common import (
+    ceil_align,
     disable_request_logging,
     pyspy_dump_schedulers,
     raise_error_or_warn,
@@ -77,7 +78,23 @@ class SchedulerRuntimeCheckerMixin:
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         return memory_leak, token_msg
 
-    def _check_runtime_mem_leak(self: Scheduler):
+    def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
+        ret = 0
+        for req in batch.reqs:
+            assert req.kv_committed_freed == req.kv_overallocated_freed
+            uncached_len = 0
+            if not req.kv_committed_freed:
+                allocated_len = req.kv_allocated_len
+                if self.page_size > 1:
+                    allocated_len = ceil_align(allocated_len, self.page_size)
+                    assert req.cache_protected_len % self.page_size == 0
+                uncached_len = allocated_len - req.cache_protected_len
+
+            ret += uncached_len
+
+        return ret
+
+    def self_check_during_busy(self: Scheduler):
         current_batch: ScheduleBatch = self.last_batch
 
         if current_batch is None:
@@ -86,45 +103,20 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
 
-        extend_size = 0
-        for i, req in enumerate(current_batch.reqs):
-            seq_len = len(req.origin_input_ids) + len(req.output_ids)
-            fill_len = len(req.fill_ids) if req.fill_ids is not None else 0
-            prefix_len = (
-                len(req.prefix_indices) if req.prefix_indices is not None else 0
-            )
-
-            if current_batch.forward_mode.is_decode():
-                if req.finished():
-                    unreleased_len = 1
-                else:
-                    unreleased_len = seq_len - prefix_len
-            else:
-                unreleased_len = fill_len - prefix_len
-
-            extend_size += unreleased_len
+        uncached_size = self._get_batch_uncached_size(current_batch)
 
         if (
             current_batch.forward_mode.is_extend()
             and self.running_batch is not None
             and not self.running_batch.is_empty()
-            and self.running_batch.forward_mode.is_decode()
         ):
-            for i, req in enumerate(self.running_batch.reqs):
-                seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                prefix_len = (
-                    len(req.prefix_indices) if req.prefix_indices is not None else 0
-                )
+            uncached_size += self._get_batch_uncached_size(self.running_batch)
 
-                if req.finished():
-                    unreleased_len = 0
-                else:
-                    unreleased_len = seq_len - prefix_len - 1
+        if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
+            log_msg = f"[Mem Check (BUSY)] {available_size=}, {evictable_size=}, {protected_size=}, {uncached_size=}"
+            logger.info(log_msg)
 
-                extend_size += unreleased_len
-
-        total_tokens = available_size + evictable_size + protected_size + extend_size
-
+        total_tokens = available_size + evictable_size + protected_size + uncached_size
         assert (
             total_tokens == self.max_total_num_tokens
         ), f"Mem Leak Detected! {total_tokens=} vs {self.max_total_num_tokens=}"

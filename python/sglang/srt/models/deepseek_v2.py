@@ -787,12 +787,13 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
-                and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+                and get_is_capture_mode()
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -3979,6 +3980,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
+                    if _is_npu:
+                        name = name.replace("weight_packed", "weight")
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
                     # we need to skip here BEFORE we update the name, otherwise
@@ -4006,7 +4009,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
+                        if _is_npu:
+                            name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(

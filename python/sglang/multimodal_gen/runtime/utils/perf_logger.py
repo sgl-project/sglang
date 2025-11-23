@@ -6,7 +6,6 @@ import os
 import subprocess
 import sys
 import time
-import traceback
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -16,6 +15,10 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    _SGLDiffusionLogger,
+    get_is_main_process,
+)
 
 
 @dataclasses.dataclass
@@ -123,7 +126,7 @@ class StageProfiler:
     def __init__(
         self,
         stage_name: str,
-        logger: logging.Logger,
+        logger: _SGLDiffusionLogger,
         timings: Optional["RequestTimings"],
         simple_log: bool = False,
     ):
@@ -131,7 +134,6 @@ class StageProfiler:
         self.timings = timings
         self.logger = logger
         self.simple_log = simple_log
-        self.logger = logging.getLogger(__name__)
         self.start_time = 0.0
 
         # Check env var at runtime to ensure we pick up changes (e.g. from CLI args)
@@ -158,13 +160,8 @@ class StageProfiler:
                 self.stage_name,
                 execution_time_s * 1000,
                 exc_val,
+                exc_info=True,
             )
-            if self.metrics_enabled:
-                self.logger.error(
-                    "[%s] Traceback: %s",
-                    self.stage_name,
-                    "".join(traceback.format_tb(exc_tb)),
-                )
             return False
 
         if self.simple_log:
@@ -252,14 +249,15 @@ class PerformanceLogger:
         )
 
         try:
-            log_dir = get_diffusion_perf_log_dir()
-            if not os.path.exists(log_dir):
-                os.makedirs(log_dir, exist_ok=True)
+            if get_is_main_process():
+                log_dir = get_diffusion_perf_log_dir()
+                if not os.path.exists(log_dir):
+                    os.makedirs(log_dir, exist_ok=True)
 
-            log_file = os.path.join(log_dir, "performance.log")
+                log_file = os.path.join(log_dir, "performance.log")
 
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(dataclasses.asdict(record)) + "\n")
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(dataclasses.asdict(record)) + "\n")
 
         except (OSError, PermissionError) as e:
             print(f"WARNING: Failed to log performance record: {e}", file=sys.stderr)
