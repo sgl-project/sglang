@@ -1422,6 +1422,10 @@ TX
                         "bool_param": {"type": "boolean"},
                         "str_param": {"type": "string"},
                         "obj_param": {"type": "object"},
+                        "str_param_int_content": {"type": "string"},
+                        "str_param_float_content": {"type": "string"},
+                        "str_param_bool_content": {"type": "string"},
+                        "str_param_obj_content": {"type": "string"},
                     },
                 },
             ),
@@ -1444,6 +1448,18 @@ hello world
 <parameter=obj_param>
 {"key": "value"}
 </parameter>
+<parameter=str_param_int_content>
+42
+</parameter>
+<parameter=str_param_float_content>
+3.14
+</parameter>
+<parameter=str_param_bool_content>
+true
+</parameter>
+<parameter=str_param_obj_content>
+{"key": "value"}
+</parameter>
 </function>
 </tool_call>"""
 
@@ -1456,6 +1472,10 @@ hello world
         self.assertEqual(params["bool_param"], True)
         self.assertEqual(params["str_param"], "hello world")
         self.assertEqual(params["obj_param"], {"key": "value"})
+        self.assertEqual(params["str_param_int_content"], "42")
+        self.assertEqual(params["str_param_float_content"], "3.14")
+        self.assertEqual(params["str_param_bool_content"], "true")
+        self.assertEqual(params["str_param_obj_content"], '{"key": "value"}')
 
     def test_parse_streaming_incremental(self):
         """Test that streaming is truly incremental with very small chunks."""

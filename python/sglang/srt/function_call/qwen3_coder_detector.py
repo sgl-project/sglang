@@ -17,15 +17,118 @@ from sglang.srt.function_call.core_types import (
 logger = logging.getLogger(__name__)
 
 
-def _safe_val(raw: str) -> Any:
-    raw = html.unescape(raw.strip())
-    try:
-        return json.loads(raw)
-    except Exception:
+def _convert_param_value(
+    param_value: str, param_name: str, param_config: dict, func_name: str
+) -> Any:
+    """
+    Convert parameter value based on its type in the schema.
+
+    Adapted from vllm-project/vllm (vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py)
+    """
+    param_value = html.unescape(param_value.strip())
+
+    # Handle null value for any type
+    if param_value.lower() == "null":
+        return None
+
+    if param_name not in param_config:
+        if param_config != {}:
+            logger.warning(
+                "Parsed parameter '%s' is not defined in the tool "
+                "parameters for tool '%s', directly returning the "
+                "string value.",
+                param_name,
+                func_name,
+            )
+        return param_value
+
+    if (
+        isinstance(param_config[param_name], dict)
+        and "type" in param_config[param_name]
+    ):
+        param_type = str(param_config[param_name]["type"]).strip().lower()
+    else:
+        param_type = "string"
+    if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+        return param_value
+    elif (
+        param_type.startswith("int")
+        or param_type.startswith("integer")
+        or param_type.startswith("uint")
+        or param_type.startswith("long")
+        or param_type.startswith("short")
+        or param_type.startswith("unsigned")
+    ):
         try:
-            return ast.literal_eval(raw)
-        except Exception:
-            return raw
+            return int(param_value)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Parsed value '%s' of parameter '%s' is not an "
+                "integer in tool '%s', degenerating to string.",
+                param_value,
+                param_name,
+                func_name,
+            )
+            return param_value
+    elif param_type.startswith("num") or param_type.startswith("float"):
+        try:
+            float_param_value = float(param_value)
+            return (
+                float_param_value
+                if float_param_value - int(float_param_value) != 0
+                else int(float_param_value)
+            )
+        except (ValueError, TypeError):
+            logger.warning(
+                "Parsed value '%s' of parameter '%s' is not a float "
+                "in tool '%s', degenerating to string.",
+                param_value,
+                param_name,
+                func_name,
+            )
+            return param_value
+    elif param_type in ["boolean", "bool", "binary"]:
+        param_value = param_value.lower()
+        if param_value not in ["true", "false"]:
+            logger.warning(
+                "Parsed value '%s' of parameter '%s' is not a boolean "
+                "(`true` or `false`) in tool '%s', degenerating to "
+                "false.",
+                param_value,
+                param_name,
+                func_name,
+            )
+        return param_value == "true"
+    else:
+        if (
+            param_type in ["object", "array", "arr"]
+            or param_type.startswith("dict")
+            or param_type.startswith("list")
+        ):
+            try:
+                param_value = json.loads(param_value)
+                return param_value
+            except (json.JSONDecodeError, TypeError, ValueError):
+                logger.warning(
+                    "Parsed value '%s' of parameter '%s' cannot be "
+                    "parsed with json.loads in tool '%s', will try "
+                    "other methods to parse it.",
+                    param_value,
+                    param_name,
+                    func_name,
+                )
+        try:
+            param_value = ast.literal_eval(param_value)  # safer
+        except (ValueError, SyntaxError, TypeError):
+            logger.warning(
+                "Parsed value '%s' of parameter '%s' cannot be "
+                "converted via Python `ast.literal_eval()` in tool "
+                "'%s', degenerating to string.",
+                param_value,
+                param_name,
+                func_name,
+            )
+        return param_value
 
 
 class Qwen3CoderDetector(BaseFormatDetector):
@@ -83,6 +186,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Build tool indices for validation
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
+
+        # Build tool parameter configs for type conversion
+        if not hasattr(self, "_tool_parameter_configs"):
+            self._tool_parameter_configs = {
+                tool.function.name: tool.function.parameters.get("properties", {})
+                for tool in tools
+                if tool.function.name
+            }
 
         while True:
             # If we're not in a tool call and don't see a start token, return normal text
@@ -235,7 +346,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
         for match in param_matches:
             param_name = match.group(1).strip()
             param_value = match.group(2)
-            new_params[param_name] = _safe_val(param_value)
+            new_params[param_name] = _convert_param_value(
+                param_value,
+                param_name,
+                self._tool_parameter_configs.get(self._current_function_name, {}),
+                self._current_function_name,
+            )
 
         # Calculate parameter diff to stream with proper incremental JSON building
         if new_params != self._current_parameters:
@@ -321,6 +437,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def _parse_block(self, block: str, tools: List[Tool]) -> List[ToolCallItem]:
         res: List[ToolCallItem] = []
+        _tool_parameter_configs = {
+            tool.function.name: tool.function.parameters.get("properties", {})
+            for tool in tools
+        }
         for m in self.tool_call_function_regex.findall(block):
             txt = m[0] if m[0] else m[1]
             if ">" not in txt:
@@ -336,7 +456,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 pidx = ptxt.index(">")
                 pname = ptxt[:pidx].strip()
                 pval = ptxt[pidx + 1 :].lstrip("\n").rstrip("\n")
-                params[pname] = _safe_val(pval)
+                params[pname] = _convert_param_value(
+                    pval,
+                    pname,
+                    _tool_parameter_configs.get(fname, {}),
+                    fname,
+                )
             raw = {"name": fname, "arguments": params}
             try:
                 # TODO: fix idx in function call, the index for a function
