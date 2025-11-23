@@ -2708,7 +2708,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip-special-tokens",
         action="store_true",
-        help="Skip special tokens when generating random prompt.  " 
+        help="Skip special tokens when generating random prompt. "
         "Useful in multimodal preprocessing to avoid generating tokens like image_token_id, audio_token_id"
         "which could trigger special handling during preprocessing.",
     )
