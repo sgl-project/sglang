@@ -770,7 +770,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=True,
+                    causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
