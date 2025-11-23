@@ -17,7 +17,6 @@ suites = {
         TestFile("lora/test_lora_eviction.py", 240),
         TestFile("lora/test_lora_update.py", 600),
         TestFile("lora/test_lora_backend.py", 99),
-        TestFile("lora/test_lora_spec_decoding.py", 150),
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
@@ -166,7 +165,6 @@ suites = {
         TestFile("test_deepseek_v32_mtp.py", 275),
     ],
     "per-commit-8-gpu-h20": [
-        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
         TestFile("test_disaggregation_dp_attention.py", 155),
@@ -190,6 +188,7 @@ suites = {
     ],
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
+        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
