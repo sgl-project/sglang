@@ -369,6 +369,25 @@ TWO_GPU_CASES = [
         custom_validator="video",
         num_gpus=2,
     ),
+    DiffusionTestCase(
+        id="qwen_image_t2i_2_gpus",
+        model_path="Qwen/Qwen-Image",
+        modality="image",
+        prompt="A futuristic cityscape at sunset with flying cars",
+        output_size="1024x1024",
+        warmup_text=1,
+        warmup_edit=0,
+        num_gpus=2,
+    ),
+    DiffusionTestCase(
+        id="flux_image_t2i_2_gpus",
+        model_path="black-forest-labs/FLUX.1-dev",
+        modality="image",
+        prompt="A futuristic cityscape at sunset with flying cars",
+        output_size="1024x1024",
+        warmup_text=1,
+        warmup_edit=0,
+    ),
 ]
 
 # Load global configuration

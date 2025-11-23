@@ -170,7 +170,7 @@ class UlyssesAttention_VSA(UlyssesAttention):
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
         gate_compress: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         """Forward pass for distributed attention.
 
         Args:
@@ -212,16 +212,14 @@ class UlyssesAttention_VSA(UlyssesAttention):
             q, k, v, gate_compress=gate_compress, attn_metadata=ctx_attn_metadata
         )  # type: ignore[call-arg]
 
-        # Redistribute back if using sequence parallelism
-        replicated_output = None
-
         # Apply backend-specific postprocess_output
         output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
 
         output = sequence_model_parallel_all_to_all_4D(
             output, scatter_dim=1, gather_dim=2
         )
-        return output, replicated_output
+
+        return output
 
 
 class LocalAttention(nn.Module):
@@ -309,7 +307,7 @@ class USPAttention(nn.Module):
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
-        dropout_p: float = 0.0,
+        dropout_rate: float = 0.0,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -341,7 +339,7 @@ class USPAttention(nn.Module):
         self.backend = backend_name_to_enum(attn_backend.get_name())
         self.dtype = dtype
         self.causal = causal
-        self.dropout_p = dropout_p
+        self.dropout_p = dropout_rate
 
     def forward(
         self,
@@ -351,7 +349,7 @@ class USPAttention(nn.Module):
         replicated_q: torch.Tensor | None = None,
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
 
@@ -367,7 +365,7 @@ class USPAttention(nn.Module):
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
-            return out, None
+            return out
 
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
@@ -395,4 +393,4 @@ class USPAttention(nn.Module):
             # -> [B, S_local, H, D]
             out = _usp_output_all_to_all(out, head_dim=2)
 
-        return out, None
+        return out

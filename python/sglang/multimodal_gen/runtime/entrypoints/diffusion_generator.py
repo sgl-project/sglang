@@ -284,7 +284,7 @@ class DiffGenerator:
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
             logger.info(
-                "Processing prompt %d/%d: %s...",
+                "Processing prompt: %d/%d: %s",
                 request_idx + 1,
                 len(requests),
                 req.prompt[:100],

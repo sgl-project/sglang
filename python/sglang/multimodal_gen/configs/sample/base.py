@@ -507,6 +507,7 @@ class SamplingParams:
         if user_params is None:
             return
 
+        # user is not allowed to modify any param defined in the SamplingParams subclass
         subclass_defined_fields = set(type(self).__annotations__.keys())
 
         # Compare against current instance to avoid constructing a default instance

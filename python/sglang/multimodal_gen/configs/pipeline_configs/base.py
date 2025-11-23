@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
+from einops import rearrange
 
 from sglang.multimodal_gen.configs.models import (
     DiTConfig,
@@ -18,6 +19,11 @@ from sglang.multimodal_gen.configs.models import (
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.utils import update_config_from_args
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
@@ -59,10 +65,45 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     raise NotImplementedError
 
 
+def shard_rotary_emb_for_sp(emb):
+    """
+    Shard rotary embeddings [S, D] along sequence for SP.
+    If S is not divisible by SP degree, pad by repeating the last row.
+    """
+    # Sequence Parallelism: slice image RoPE to local shard if enabled
+    try:
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_sp_parallel_rank,
+            get_sp_world_size,
+        )
+
+        sp_world_size = get_sp_world_size()
+    except Exception:
+        sp_world_size = 1
+    seq_len = emb.shape[0]
+    if seq_len % sp_world_size != 0:
+        pad_len = sp_world_size - (seq_len % sp_world_size)
+        pad = emb[-1:].repeat(pad_len, 1)
+        emb = torch.cat([emb, pad], dim=0)
+    if sp_world_size > 1:
+        try:
+            rank = get_sp_parallel_rank()
+        except Exception:
+            rank = 0
+        seq_len = emb.shape[0]
+        local_len = seq_len // sp_world_size
+        start = rank * local_len
+        end = start + local_len
+        emb = emb[start:end]
+        return emb
+    else:
+        return emb
+
+
 # config for a single pipeline
 @dataclass
 class PipelineConfig:
-    """Base configuration for all pipeline architectures."""
+    """The base configuration class for a generation pipeline."""
 
     task_type: ModelTaskType
 
@@ -163,8 +204,27 @@ class PipelineConfig:
         return shape
 
     # called after latents are prepared
-    def pack_latents(self, latents, batch_size, batch):
+    def maybe_pack_latents(self, latents, batch_size, batch):
         return latents
+
+    def gather_latents_for_sp(self, latents):
+        # For video latents [B, C, T_local, H, W], gather along time dim=2
+        latents = sequence_model_parallel_all_gather(latents, dim=2)
+        return latents
+
+    def shard_latents_for_sp(self, batch, latents):
+        # general logic for video models
+        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if latents.dim() != 5:
+            return latents, False
+        time_dim = latents.shape[2]
+        if time_dim > 0 and time_dim % sp_world_size == 0:
+            sharded_tensor = rearrange(
+                latents, "b c (n t) h w -> b c n t h w", n=sp_world_size
+            ).contiguous()
+            sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
+            return sharded_tensor, True
+        return latents, False
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
@@ -457,6 +517,55 @@ class PipelineConfig:
 
         if hasattr(self, "__post_init__"):
             self.__post_init__()
+
+
+@dataclass
+class ImagePipelineConfig(PipelineConfig):
+    """Base config for image generation pipelines with token-like latents [B, S, D]."""
+
+    def shard_latents_for_sp(self, batch, latents):
+        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        seq_len = latents.shape[1]
+
+        # Pad to next multiple of SP degree if needed
+        if seq_len % sp_world_size != 0:
+            pad_len = sp_world_size - (seq_len % sp_world_size)
+            pad = torch.zeros(
+                (latents.shape[0], pad_len, latents.shape[2]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=1)
+            # Record padding length for later unpad
+            batch.sp_seq_pad = int(getattr(batch, "sp_seq_pad", 0)) + pad_len
+
+        sharded_tensor = rearrange(
+            latents, "b (n s) d -> b n s d", n=sp_world_size
+        ).contiguous()
+        sharded_tensor = sharded_tensor[:, rank_in_sp_group, :, :]
+        return sharded_tensor, True
+
+    def gather_latents_for_sp(self, latents):
+        # For image latents [B, S_local, D], gather along sequence dim=1
+        latents = sequence_model_parallel_all_gather(latents, dim=1)
+        return latents
+
+    def _unpad_and_unpack_latents(self, latents, batch):
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        channels = self.dit_config.arch_config.in_channels
+        batch_size = latents.shape[0]
+
+        height = 2 * (int(batch.height) // (vae_scale_factor * 2))
+        width = 2 * (int(batch.width) // (vae_scale_factor * 2))
+
+        # If SP padding was applied, remove extra tokens before reshaping
+        target_tokens = (height // 2) * (width // 2)
+        if latents.shape[1] > target_tokens:
+            latents = latents[:, :target_tokens, :]
+
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+        return latents, batch_size, channels, height, width
 
 
 @dataclass
