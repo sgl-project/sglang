@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import shallow_asdict
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
@@ -76,19 +77,7 @@ def _build_sampling_params_from_request(
 
 def _build_req_from_sampling(s: SamplingParams) -> Req:
     return Req(
-        request_id=s.request_id,
-        data_type=s.data_type,
-        prompt=s.prompt,
-        image_path=s.image_path,
-        height=s.height,
-        width=s.width,
-        fps=1,
-        num_frames=s.num_frames,
-        seed=s.seed,
-        output_path=s.output_path,
-        output_file_name=s.output_file_name,
-        num_outputs_per_prompt=s.num_outputs_per_prompt,
-        save_output=s.save_output,
+        **shallow_asdict(s),
     )
 
 
