@@ -3,14 +3,14 @@ Configuration and data structures for diffusion performance tests.
 
 Usage:
 
-pytest python/sglang/multimodal_gen/test/server/test_server_performance.py
+pytest python/sglang/multimodal_gen/test/server/test_server_a.py
 # for a single testcase, look for the name of the testcases in DIFFUSION_CASES
-pytest python/sglang/multimodal_gen/test/server/test_server_performance.py -k qwen_image_t2i
+pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t2i
 
 
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
-2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_performance.py -k my_new_test_case_id`
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_a.py -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
 
@@ -122,13 +122,16 @@ class DiffusionTestCase:
     image_path: Path | str | None = None  # input image/video for editing (Path or URL)
 
     # duration
-    seconds: int = 4  # for video: duration in seconds
+    seconds: int = 1  # for video: duration in seconds
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
 
     warmup_text: int = 1  # number of text-to-image/video warmups
     warmup_edit: int = 0  # number of image/video-edit warmups
     custom_validator: str | None = None  # optional custom validator name
+
+    # resources
+    num_gpus: int = 1
 
     def is_image_url(self) -> bool:
         """Check if image_edit_path is a URL."""
@@ -206,26 +209,9 @@ class PerformanceSummary:
         )
 
 
-# Common paths
-IMAGE_INPUT_FILE = Path(__file__).resolve().parents[1] / "test_files" / "girl.jpg"
-
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
-DIFFUSION_CASES: list[DiffusionTestCase] = [
-    # === Image to Video (I2V) ===
-    DiffusionTestCase(
-        id="wan2_2_i2v_a14b",
-        model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        modality="video",
-        prompt="generate",  # passing in something since failing if no prompt is passed
-        warmup_text=0,  # warmups only for image gen models
-        warmup_edit=0,
-        output_size="832x1104",
-        edit_prompt="generate",
-        image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
-        custom_validator="video",
-        seconds=1,
-    ),
+ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         id="qwen_image_t2i",
@@ -257,46 +243,43 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         edit_prompt="Convert 2D style to 3D style",
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
     ),
+]
+
+
+ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
-    # TODO: FastWan2.1, FastWan2.2
     DiffusionTestCase(
         id="wan2_1_t2v_1.3b",
         model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         modality="video",
         prompt="A curious raccoon",
         output_size="848x480",
-        seconds=4,
-        warmup_text=0,  # warmups only for image gen models
+        warmup_text=0,
+        warmup_edit=0,
+        custom_validator="video",
+    ),
+    # NOTE(mick): flaky
+    # DiffusionTestCase(
+    #     id="hunyuan_video",
+    #     model_path="hunyuanvideo-community/HunyuanVideo",
+    #     modality="video",
+    #     prompt="A curious raccoon",
+    #     output_size="720x480",
+    #     warmup_text=0,
+    #     warmup_edit=0,
+    #     custom_validator="video",
+    # ),
+    DiffusionTestCase(
+        id="fast_hunyuan_video",
+        model_path="FastVideo/FastHunyuan-diffusers",
+        modality="video",
+        prompt="A curious raccoon",
+        output_size="720x480",
+        warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
     ),
     # === Text and Image to Video (TI2V) ===
-    DiffusionTestCase(
-        id="wan2_1_i2v_14b_480P",
-        model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-        output_size="832x1104",
-        modality="video",
-        prompt="Animate this image",
-        edit_prompt="Add dynamic motion to the scene",
-        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        warmup_text=0,  # warmups only for image gen models
-        warmup_edit=0,
-        custom_validator="video",
-        seconds=1,
-    ),
-    DiffusionTestCase(
-        id="wan2_1_i2v_14b_720P",
-        model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
-        modality="video",
-        prompt="Animate this image",
-        edit_prompt="Add dynamic motion to the scene",
-        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        output_size="832x1104",
-        warmup_text=0,  # warmups only for image gen models
-        warmup_edit=0,
-        custom_validator="video",
-        seconds=1,
-    ),
     DiffusionTestCase(
         id="wan2_2_ti2v_5b",
         model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
@@ -305,10 +288,108 @@ DIFFUSION_CASES: list[DiffusionTestCase] = [
         prompt="Animate this image",
         edit_prompt="Add dynamic motion to the scene",
         image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        warmup_text=0,  # warmups only for image gen models
+        warmup_text=0,
         warmup_edit=0,
         custom_validator="video",
-        seconds=1,
+    ),
+    DiffusionTestCase(
+        id="fastwan2_2_ti2v_5b",
+        model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+        modality="video",
+        output_size="832x1104",
+        prompt="Animate this image",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        warmup_text=0,
+        warmup_edit=0,
+        custom_validator="video",
+    ),
+]
+
+TWO_GPU_CASES_A = [
+    DiffusionTestCase(
+        id="wan2_2_i2v_a14b_2gpu",
+        model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        modality="video",
+        prompt="generate",
+        warmup_text=0,
+        warmup_edit=0,
+        output_size="832x1104",
+        edit_prompt="generate",
+        image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
+        custom_validator="video",
+        num_gpus=2,
+        num_frames=1,
+    ),
+    DiffusionTestCase(
+        id="wan2_2_t2v_a14b_2gpu",
+        model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        modality="video",
+        prompt="A curious raccoon",
+        output_size="720x480",
+        warmup_text=0,
+        warmup_edit=0,
+        custom_validator="video",
+        num_gpus=2,
+    ),
+    DiffusionTestCase(
+        id="wan2_1_t2v_14b_2gpu",
+        model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        modality="video",
+        prompt="A curious raccoon",
+        output_size="720x480",
+        warmup_text=0,
+        warmup_edit=0,
+        custom_validator="video",
+        num_gpus=2,
+    ),
+]
+
+TWO_GPU_CASES_B = [
+    DiffusionTestCase(
+        id="wan2_1_i2v_14b_480P_2gpu",
+        model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        output_size="832x1104",
+        modality="video",
+        prompt="Animate this image",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        warmup_text=0,
+        warmup_edit=0,
+        custom_validator="video",
+        num_gpus=2,
+    ),
+    DiffusionTestCase(
+        id="wan2_1_i2v_14b_720P_2gpu",
+        model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        modality="video",
+        prompt="Animate this image",
+        edit_prompt="Add dynamic motion to the scene",
+        image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        output_size="832x1104",
+        warmup_text=0,
+        warmup_edit=0,
+        custom_validator="video",
+        num_gpus=2,
+    ),
+    DiffusionTestCase(
+        id="qwen_image_t2i_2_gpus",
+        model_path="Qwen/Qwen-Image",
+        modality="image",
+        prompt="A futuristic cityscape at sunset with flying cars",
+        output_size="1024x1024",
+        warmup_text=1,
+        warmup_edit=0,
+        num_gpus=2,
+    ),
+    DiffusionTestCase(
+        id="flux_image_t2i_2_gpus",
+        model_path="black-forest-labs/FLUX.1-dev",
+        modality="image",
+        prompt="A futuristic cityscape at sunset with flying cars",
+        output_size="1024x1024",
+        warmup_text=1,
+        warmup_edit=0,
     ),
 ]
 
