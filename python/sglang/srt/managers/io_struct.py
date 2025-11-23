@@ -227,6 +227,9 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    embedding_ports: Optional[List] = None
+    need_wait_for_image: Optional[bool] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -695,6 +698,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: bool = False
+    embedding_ports: list[str] = None
 
 
 @dataclass

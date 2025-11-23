@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import multiprocessing as mp
+import pickle
+import time
 import traceback
 from typing import List, Optional
 
@@ -35,6 +37,35 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
 
 logger = logging.getLogger(__name__)
+import ctypes
+import sys
+
+
+class TensorWrapper:
+    """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
+
+    def __init__(self, tensor):
+        # Ensure tensor is on CPU and contiguous
+        if tensor.is_cuda:
+            tensor = tensor.cpu()
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+
+        # Keep tensor reference
+        self.tensor = tensor
+        self.shape = list(tensor.shape)
+        self.dtype = tensor.dtype
+
+        # Create buffer view based on Python version
+        if sys.version_info >= (3, 12):
+            data_ptr = tensor.data_ptr()
+            total_bytes = tensor.numel() * tensor.element_size()
+            self._buffer = memoryview(
+                (ctypes.c_char * total_bytes).from_address(data_ptr)
+            )
+        else:
+            # For Python 3.10, just use numpy - it already supports buffer protocol
+            self._buffer = np.asarray(tensor)
 
 
 def _convert(data):
@@ -53,6 +84,14 @@ def _convert(data):
 _image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
 
 
+class ReceivePortsManager:
+    def __init__(
+        self,
+    ):
+        self.rid_2_ports = dict()
+        self.rid_2_tp_size = dict()
+
+
 def _get_image_grid_dim(images_input):
     for attr in _image_grid_attrs:
         if attr in images_input:
@@ -60,6 +99,16 @@ def _get_image_grid_dim(images_input):
     raise ValueError(
         f"Image grid dim ({_image_grid_attrs}) not found in {images_input}"
     )
+
+
+def get_ports_for_rank(embedding_ports, rank, tp_size):
+    total_ports = len(embedding_ports)
+    ports_per_rank = (total_ports + tp_size - 1) // tp_size
+
+    start_idx = rank * ports_per_rank
+    end_idx = min(start_idx + ports_per_rank, total_ports)
+
+    return embedding_ports[start_idx:end_idx]
 
 
 class MMEncoder:
@@ -160,7 +209,16 @@ class MMEncoder:
                 continue
             mm_item.set(k, _convert(v))
         with torch.inference_mode():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            start_time1 = time.perf_counter()
             mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            logger.info(
+                f"Vit time : {(end_time - start_time1)*1000:.2f} ms {mm_embedding.shape = }"
+            )
         if len(mm_embedding.shape) != 2:
             mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
         return _get_image_grid_dim(images_input), mm_embedding.cpu()
@@ -183,7 +241,7 @@ class MMEncoder:
 
             mm_data.embedding = None
             mm_data.embedding_list[mm_data.part_idx] = None
-
+        logger.info(f" [{self.rank}] Sending to {prefill_host}:{embedding_port}")
         # Send ack/data
         socket = get_zmq_socket(
             self.context,
@@ -191,10 +249,17 @@ class MMEncoder:
             f"tcp://{prefill_host}:{embedding_port}",
             False,
         )
-        socket.send_pyobj(mm_data)
+
+        new_mm_data = mm_data.copy_without_embedding()
+        embedding_tensor = TensorWrapper(mm_data.embedding)
+        new_mm_data.send_time = time.time()
+        socket.send_multipart([pickle.dumps(new_mm_data), embedding_tensor._buffer])
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
+        start_time = time.time()
         image_grid_dim, mm_embedding = await self._encode(mm_items)
+        end_time = time.time()
+        print(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
         if self.rank == 0:
             mm_data = EmbeddingData(
                 req_id,
@@ -207,18 +272,47 @@ class MMEncoder:
         return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
     async def send(
-        self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
+        self,
+        req_id,
+        prefill_host,
+        embedding_ports,
+        session_id=None,
+        buffer_address=None,
     ):
         mm_data: EmbeddingData = self.embedding_to_send[req_id]
-        await self._send(
-            prefill_host,
-            embedding_port,
-            mm_data.embedding,
-            mm_data,
-            session_id,
-            buffer_address,
-        )
-        del self.embedding_to_send[req_id]
+
+        if not mm_data:
+            logger.error(f"No embedding data found for req_id: {req_id}")
+            return
+        logger.info(f"{self.rank=} {embedding_ports = }")
+        # send_tasks = []
+        # ports_to_send = get_ports_for_rank(embedding_ports, self.rank, self.server_args.tp_size)
+        try:
+            send_tasks = [
+                self._send(
+                    prefill_host,
+                    port,
+                    mm_data.embedding,
+                    mm_data,
+                    session_id,
+                    buffer_address,
+                )
+                for port in embedding_ports
+            ]
+            results = await asyncio.gather(*send_tasks, return_exceptions=True)
+
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(
+                        f"Failed to send to port {embedding_ports[i]}: {result}"
+                    )
+                else:
+                    logger.debug(f"Successfully sent to port {embedding_ports[i]}")
+
+            del self.embedding_to_send[req_id]
+        except Exception as e:
+            logger.error(f"Error sending embeddings for req_id {req_id}: {e}")
+            raise
 
     async def get_embedding_port(self, prefill_url):
         async with aiohttp.ClientSession(
@@ -287,6 +381,7 @@ def launch_server(server_args: ServerArgs):
 @app.post("/encode")
 async def handle_encode_request(request: dict):
     # broadcast request
+    request.update({"enter_time": time.time()})
     for socket in send_sockets:
         socket.send_pyobj(request)
 
@@ -296,6 +391,8 @@ async def handle_encode_request(request: dict):
         num_parts=request["num_parts"],
         part_idx=request["part_idx"],
     )
+    time3 = time.time()
+    # print(f"🕛 send_time = {(time2 - time1) * 1000:.2f}ms, encode_time = {(time3 - time2) * 1000:.2f}ms")
     if encoder.server_args.mm_transfer_backend == "mooncake":
         del request["mm_items"]
         request.update(
@@ -310,7 +407,7 @@ async def handle_encode_request(request: dict):
         await encoder.send(
             req_id=request["req_id"],
             prefill_host=request["prefill_host"],
-            embedding_port=request["embedding_port"],
+            embedding_ports=request["embedding_ports"],
         )
         return ORJSONResponse(content=None)
 

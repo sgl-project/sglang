@@ -20,7 +20,9 @@ class EmbeddingData:
         self.part_idx = part_idx
         self.image_grid_dim = image_grid_dim
         self.embedding = embedding
-
+        self.send_time = None
+        self.dtype = embedding.dtype if embedding is not None else None
+        self.shape = list(embedding.shape) if embedding is not None else None
         # aggregated data
         self.ready_list = [i == self.part_idx for i in range(self.num_parts)]
         self.embedding_list = [
@@ -52,6 +54,18 @@ class EmbeddingData:
 
     def __repr__(self):
         return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx})"
+
+    def copy_without_embedding(self):
+        new_data = EmbeddingData(
+            req_id=self.req_id,
+            num_parts=self.num_parts,
+            part_idx=self.part_idx,
+            image_grid_dim=self.image_grid_dim,
+        )
+        new_data.send_time = self.send_time
+        new_data.dtype = self.dtype
+        new_data.shape = self.shape
+        return new_data
 
 
 def _generate_id():
