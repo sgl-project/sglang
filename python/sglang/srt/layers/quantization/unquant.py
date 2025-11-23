@@ -135,10 +135,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
-    def __init__(self, use_triton_kernels: bool = False):
+    def __init__(
+        self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
+    ):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
+        self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
+        self._cache_permute_indices = dict({})
 
     def create_weights(
         self,
@@ -214,6 +218,68 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
+        # Reorder rows of W1 for fused gated activation
+        if self.use_flashinfer_trtllm_moe:
+            from flashinfer.fused_moe.core import (
+                _maybe_get_cached_w3_w1_permute_indices,
+                convert_to_block_layout,
+                get_w2_permute_indices_with_cache,
+            )
+
+            # w1 and w3 have been swapped, so we don't need do that here
+            epilogue_tile_m = 128
+            block_k = 128
+            w13_weights_bf16_shuffled = []
+            w2_weights_bf16_shuffled = []
+            for i in range(layer.num_local_experts):
+                permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices,
+                    layer.w13_weight.data[i].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                tmp_weights1 = (
+                    layer.w13_weight.data[i]
+                    .clone()
+                    .view(torch.uint8)[permute_indices.to(layer.w13_weight.data.device)]
+                    .contiguous()
+                )
+
+                permute_indices = get_w2_permute_indices_with_cache(
+                    self._cache_permute_indices,
+                    layer.w2_weight.data[i].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                tmp_weights2 = (
+                    layer.w2_weight.data[i]
+                    .clone()
+                    .view(torch.uint8)[permute_indices.to(layer.w2_weight.data.device)]
+                    .contiguous()
+                )
+
+                tmp_weights1 = convert_to_block_layout(
+                    tmp_weights1.view(torch.uint8), block_k
+                )
+                tmp_weights2 = convert_to_block_layout(
+                    tmp_weights2.view(torch.uint8), block_k
+                )
+
+                w13_weights_bf16_shuffled.append(tmp_weights1.view(torch.bfloat16))
+                w2_weights_bf16_shuffled.append(tmp_weights2.view(torch.bfloat16))
+
+            # Stack weights for all experts
+            w13_weights_bf16_shuffled = (
+                torch.stack(w13_weights_bf16_shuffled).view(torch.bfloat16).contiguous()
+            )
+            w2_weights_bf16_shuffled = (
+                torch.stack(w2_weights_bf16_shuffled).view(torch.bfloat16).contiguous()
+            )
+            layer.w13_weight = torch.nn.Parameter(
+                w13_weights_bf16_shuffled, requires_grad=False
+            )
+            layer.w2_weight = torch.nn.Parameter(
+                w2_weights_bf16_shuffled, requires_grad=False
+            )
 
         return
 
