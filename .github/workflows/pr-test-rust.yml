@@ -9,7 +9,6 @@ on:
     branches: [ main ]
     paths:
       - "sgl-router/**"
-    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -57,16 +56,17 @@ jobs:
       - name: Test maturin build
         uses: PyO3/maturin-action@v1
         with:
+          working-directory: bindings/python
           args: --release --out dist --features vendored-openssl
           rust-toolchain: stable
           sccache: true
 
       - name: List built wheel
-        run: ls -lh dist/
+        run: ls -lh bindings/python/dist/
 
       - name: Test wheel install
         run: |
-          pip install dist/*.whl
+          pip install bindings/python/dist/*.whl
           python -c "import sglang_router; print('Python package: OK')"
           python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
@@ -157,16 +157,6 @@ jobs:
           cache-all-crates: true
           cache-on-failure: true
 
-      - name: Cache router build
-        uses: actions/cache@v4
-        with:
-          path: |
-            sgl-router/target
-            sgl-router/.venv
-          key: ${{ runner.os }}-router-${{ hashFiles('sgl-router/Cargo.lock', 'sgl-router/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-router-
-
       - name: Install SGLang dependencies
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
@@ -175,18 +165,18 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
-          cd sgl-router
-          python3 -m venv .venv
+          cd sgl-router/bindings/python
           python3 -m pip install --upgrade pip maturin
-          maturin develop --release --profile ci --features vendored-openssl
-
+          pip uninstall -y sglang-router
+          maturin build --profile ci --features vendored-openssl --out dist
+          pip install dist/*.whl
 
       - name: Run Python unit tests
         run: |
           cd sgl-router
           source "$HOME/.cargo/env"
           python3 -m pip install pytest pytest-cov pytest-xdist
-          pytest -q py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
+          pytest -q py_test/unit --cov=sglang_router --cov-config=bindings/python/.coveragerc --cov-report=term-missing --cov-fail-under=80
 
       - name: Run Python integration tests
         run: |
@@ -236,16 +226,6 @@ jobs:
           cache-all-crates: true
           cache-on-failure: true
 
-      - name: Cache router build
-        uses: actions/cache@v4
-        with:
-          path: |
-            sgl-router/target
-            sgl-router/.venv
-          key: ${{ runner.os }}-router-${{ hashFiles('sgl-router/Cargo.lock', 'sgl-router/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-router-
-
       - name: Install SGLang dependencies
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
@@ -279,14 +259,26 @@ jobs:
           echo "ATP_PASSWORD=oracle" >> $GITHUB_ENV
           echo "ATP_DSN=localhost:1521/XEPDB1" >> $GITHUB_ENV
 
+      - name: Start Brave MCP Server
+        run: |
+          docker run -d --rm \
+            -p 8001:8080 \
+            -e BRAVE_API_KEY \
+            --name brave-search-server \
+            shoofio/brave-search-mcp-sse:1.0.10
+          echo "Starting Brave MCP Server..."
+          sleep 2
+          curl -f --max-time 1 http://localhost:8001/sse > /dev/null 2>&1 && echo "Brave MCP Server is healthy!" || echo "Brave MCP Server responded"
+
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
-          cd sgl-router
-          python3 -m venv .venv
+          cd sgl-router/bindings/python
           python3 -m pip install --upgrade pip maturin
-          maturin develop --release --profile ci --features vendored-openssl
+          pip uninstall -y sglang-router
+          maturin build --profile ci --features vendored-openssl --out dist
+          pip install dist/*.whl
 
       - name: Run Python E2E response API tests
         run: |
@@ -301,6 +293,12 @@ jobs:
           cd sgl-router
           source "$HOME/.cargo/env"
           SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Cleanup Brave MCP Server
+        if: always()
+        run: |
+          docker stop brave-search-server || true
+          docker rm brave-search-server || true
 
       - name: Cleanup Oracle Database
         if: always()

@@ -1,11 +1,11 @@
-# sgl-diffusion CLI Inference
+# SGLang diffusion CLI Inference
 
-The sgl-diffusion CLI provides a quick way to access the sgl-diffusion inference pipeline for image and video generation.
+The SGLang-diffusion CLI provides a quick way to access the inference pipeline for image and video generation.
 
 ## Prerequisites
 
-- A working sgl-diffusion installation and the `sgl-diffusion` CLI available in `$PATH`.
-- Python 3.10+ if you plan to use the OpenAI Python SDK.
+- A working SGLang diffusion installation and the `sglang` CLI available in `$PATH`.
+- Python 3.11+ if you plan to use the OpenAI Python SDK.
 
 
 ## Supported Arguments
@@ -127,7 +127,7 @@ sglang generate --help
 
 ## Serve
 
-Launch the sgl-diffusion HTTP server and interact with it using the OpenAI SDK and curl. The server implements an OpenAI-compatible subset for Videos under the `/v1/videos` namespace.
+Launch the SGLang diffusion HTTP server and interact with it using the OpenAI SDK and curl. The server implements an OpenAI-compatible subset for Videos under the `/v1/videos` namespace.
 
 ### Start the server
 
@@ -143,7 +143,7 @@ SERVER_ARGS=(
   --ring-degree=2
 )
 
-sglang serve $SERVER_ARGS
+sglang serve "${SERVER_ARGS[@]}"
 ```
 
 - **--model-path**: Which model to load. The example uses `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
@@ -265,7 +265,7 @@ SAMPLING_ARGS=(
   --output-file-name "A curious raccoon.mp4"
 )
 
-sglang generate $SERVER_ARGS $SAMPLING_ARGS
+sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 ```
 
 Once the generation task has finished, the server will shut down automatically.

@@ -13,6 +13,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import openai
+
 # Add e2e_response_api directory for imports
 _TEST_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_TEST_DIR))
@@ -22,6 +24,7 @@ from mixins.basic_crud import ConversationCRUDBaseTest, ResponseCRUDBaseTest
 from mixins.function_call import FunctionCallingBaseTest
 from mixins.mcp import MCPTests
 from mixins.state_management import StateManagementTests
+from mixins.structured_output import StructuredOutputBaseTest
 from router_fixtures import popen_launch_openai_xai_router
 from util import kill_process_tree
 
@@ -32,10 +35,12 @@ class TestOpenaiBackend(
     StateManagementTests,
     MCPTests,
     FunctionCallingBaseTest,
+    StructuredOutputBaseTest,
 ):
     """End to end tests for OpenAI backend."""
 
     api_key = os.environ.get("OPENAI_API_KEY")
+    mcp_validation_mode = "strict"  # Enable strict validation for HTTP backend
 
     @classmethod
     def setUpClass(cls):
@@ -49,10 +54,29 @@ class TestOpenaiBackend(
         )
 
         cls.base_url = cls.cluster["base_url"]
+        cls.client = openai.Client(api_key=cls.api_key, base_url=cls.base_url + "/v1")
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.cluster["router"].pid)
+
+    # Inherited from MCPTests:
+    # - test_mcp_basic_tool_call (with strict validation)
+    # - test_mcp_basic_tool_call_streaming (with strict validation)
+    # - test_mixed_mcp_and_function_tools (requires external MCP server)
+    # - test_mixed_mcp_and_function_tools_streaming (requires external MCP server)
+
+    @unittest.skip(
+        "Requires external MCP server (deepwiki) - may not be accessible in CI"
+    )
+    def test_mixed_mcp_and_function_tools(self):
+        super().test_mixed_mcp_and_function_tools()
+
+    @unittest.skip(
+        "Requires external MCP server (deepwiki) - may not be accessible in CI"
+    )
+    def test_mixed_mcp_and_function_tools_streaming(self):
+        super().test_mixed_mcp_and_function_tools_streaming()
 
 
 class TestXaiBackend(StateManagementTests):
@@ -72,6 +96,7 @@ class TestXaiBackend(StateManagementTests):
         )
 
         cls.base_url = cls.cluster["base_url"]
+        cls.client = openai.Client(api_key=cls.api_key, base_url=cls.base_url + "/v1")
 
     @classmethod
     def tearDownClass(cls):

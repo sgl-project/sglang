@@ -90,7 +90,7 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        if get_global_server_args().rl_on_policy_target == "fsdp":
+        if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
@@ -281,7 +281,7 @@ class Qwen2Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_global_server_args().rl_on_policy_target == "fsdp"
+                    if get_global_server_args().rl_on_policy_target is not None
                     else None
                 ),
             )
@@ -311,7 +311,7 @@ class Qwen2Model(nn.Module):
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_global_server_args().rl_on_policy_target == "fsdp"
+                if get_global_server_args().rl_on_policy_target is not None
                 else {}
             )
             self.norm = RMSNorm(

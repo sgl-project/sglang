@@ -5,9 +5,8 @@
 
 use axum::response::Response;
 
-use crate::{
-    grpc_client::proto,
-    routers::grpc::{context::ExecutionResult, error, utils},
+use crate::routers::grpc::{
+    context::ExecutionResult, error, proto_wrapper::ProtoGenerateComplete, utils,
 };
 
 /// Collect and merge responses from execution result
@@ -24,7 +23,7 @@ use crate::{
 pub async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
-) -> Result<Vec<proto::GenerateComplete>, Response> {
+) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let all_responses = match execution_result {
         ExecutionResult::Single { mut stream } => {
             let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
@@ -68,16 +67,19 @@ pub async fn collect_responses(
 ///
 /// Takes input_logprobs from the first prefill response and copies them
 /// into all decode responses. This is used in PD mode when logprobs are requested.
+/// Only works with SGLang (vLLM doesn't support PD mode).
 fn merge_prefill_logprobs(
-    prefill_responses: &[proto::GenerateComplete],
-    decode_responses: &mut [proto::GenerateComplete],
+    prefill_responses: &[ProtoGenerateComplete],
+    decode_responses: &mut [ProtoGenerateComplete],
 ) {
-    if let Some(prefill_input_logprobs) = prefill_responses
-        .first()
-        .and_then(|r| r.input_logprobs.clone())
-    {
-        for response in decode_responses.iter_mut() {
-            response.input_logprobs = Some(prefill_input_logprobs.clone());
+    // Only SGLang supports PD mode and has input_logprobs
+    if let Some(ProtoGenerateComplete::Sglang(prefill_first)) = prefill_responses.first() {
+        if let Some(prefill_input_logprobs) = prefill_first.input_logprobs.clone() {
+            for response in decode_responses.iter_mut() {
+                if let ProtoGenerateComplete::Sglang(decode_resp) = response {
+                    decode_resp.input_logprobs = Some(prefill_input_logprobs.clone());
+                }
+            }
         }
     }
 }

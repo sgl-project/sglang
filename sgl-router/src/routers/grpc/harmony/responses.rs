@@ -20,9 +20,9 @@
 //!
 //!     match result {
 //!         ToolCallsFound { tool_calls, .. } => {
-//!             // Execute MCP tools
-//!             // Build next request with tool results
-//!             // Continue loop
+//!             // Separate MCP tools from function tools
+//!             // Execute MCP tools, return if function tools found
+//!             // Continue loop with MCP results if only MCP tools
 //!         }
 //!         Completed { response, .. } => {
 //!             return Ok(response);
@@ -30,12 +30,6 @@
 //!     }
 //! }
 //! ```
-//!
-//! ## Design Reference
-//!
-//! See `/Users/simolin/workspace/sglang/.claude/docs/harmony_pipeline/tool_loop_design.md`
-//! for complete architecture, rationale, and implementation details.
-
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -45,7 +39,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde_json::{from_str, from_value, json, to_string, to_value, Value};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -54,10 +48,10 @@ use crate::{
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
-            McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-            ResponseOutputItem, ResponseReasoningContent, ResponseStatus, ResponseTool,
-            ResponseToolType, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
-            StringOrContentParts,
+            McpToolInfo, OutputTokensDetails, ResponseContentPart, ResponseInput,
+            ResponseInputOutputItem, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+            ResponseTool, ResponseToolType, ResponseUsage, ResponsesRequest, ResponsesResponse,
+            ResponsesUsage, StringOrContentParts,
         },
     },
     routers::grpc::{
@@ -210,6 +204,18 @@ impl HarmonyResponsesContext {
     }
 }
 
+/// Build a HashSet of MCP tool names for O(1) lookup
+///
+/// Creates a HashSet containing the names of all MCP tools in the request,
+/// allowing for efficient O(1) lookups when partitioning tool calls.
+fn build_mcp_tool_names_set(request_tools: &[ResponseTool]) -> std::collections::HashSet<&str> {
+    request_tools
+        .iter()
+        .filter(|t| t.r#type == ResponseToolType::Mcp)
+        .filter_map(|t| t.function.as_ref().map(|f| f.name.as_str()))
+        .collect()
+}
+
 /// Execute Harmony Responses API request with multi-turn MCP tool support
 ///
 /// This function orchestrates the multi-turn conversation flow:
@@ -318,6 +324,12 @@ async fn execute_with_mcp_loop(
 
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
+            error!(
+                function = "execute_with_mcp_loop",
+                iteration_count = iteration_count,
+                max_iterations = MAX_TOOL_ITERATIONS,
+                "Maximum tool iterations exceeded"
+            );
             return Err(error::internal_error(format!(
                 "Maximum tool iterations ({}) exceeded",
                 MAX_TOOL_ITERATIONS
@@ -354,7 +366,20 @@ async fn execute_with_mcp_loop(
                     tool_call_count = tool_calls.len(),
                     has_analysis = analysis.is_some(),
                     partial_text_len = partial_text.len(),
-                    "Tool calls found - checking limits before executing MCP tools"
+                    "Tool calls found - separating MCP and function tools"
+                );
+
+                // Separate MCP and function tool calls based on tool type
+                let request_tools = current_request.tools.as_deref().unwrap_or(&[]);
+                let mcp_tool_names = build_mcp_tool_names_set(request_tools);
+                let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                    .into_iter()
+                    .partition(|tc| mcp_tool_names.contains(tc.function.name.as_str()));
+
+                debug!(
+                    mcp_calls = mcp_tool_calls.len(),
+                    function_calls = function_tool_calls.len(),
+                    "Tool calls separated by type"
                 );
 
                 // Check combined limit (user's max_tool_calls vs safety limit)
@@ -363,21 +388,29 @@ async fn execute_with_mcp_loop(
                     None => MAX_TOOL_ITERATIONS,
                 };
 
-                // Check if we would exceed the limit with these new tool calls
-                let total_calls_after = mcp_tracking.total_calls() + tool_calls.len();
+                // Check if we would exceed the limit with these new MCP tool calls
+                let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
                 if total_calls_after > effective_limit {
                     warn!(
                         current_calls = mcp_tracking.total_calls(),
-                        new_calls = tool_calls.len(),
+                        new_calls = mcp_tool_calls.len() + function_tool_calls.len(),
                         total_after = total_calls_after,
                         effective_limit = effective_limit,
                         user_max = ?max_tool_calls,
                         "Reached tool call limit - returning incomplete response"
                     );
 
-                    // Build response with incomplete status
-                    let mut response = build_function_tool_response(
-                        tool_calls,
+                    // Combine back for response
+                    let all_tool_calls: Vec<_> = mcp_tool_calls
+                        .into_iter()
+                        .chain(function_tool_calls)
+                        .collect();
+
+                    // Build response with incomplete status - no tools executed due to limit
+                    let mut response = build_tool_response(
+                        vec![],         // No MCP tools executed
+                        vec![],         // No MCP results
+                        all_tool_calls, // All tools returned as function calls (not executed)
                         analysis,
                         partial_text,
                         usage,
@@ -397,15 +430,50 @@ async fn execute_with_mcp_loop(
                     return Ok(response);
                 }
 
-                // Execute MCP tools
-                let tool_results =
-                    execute_mcp_tools(&ctx.mcp_manager, &tool_calls, &mut mcp_tracking).await?;
+                // Execute MCP tools (if any)
+                let mcp_results = if !mcp_tool_calls.is_empty() {
+                    execute_mcp_tools(&ctx.mcp_manager, &mcp_tool_calls, &mut mcp_tracking).await?
+                } else {
+                    Vec::new()
+                };
+
+                // If there are function tools, exit MCP loop and return response
+                if !function_tool_calls.is_empty() {
+                    debug!(
+                        "Function tool calls present - exiting MCP loop and returning to caller"
+                    );
+
+                    // Build response that includes:
+                    // 1. Reasoning/message from this iteration
+                    // 2. MCP tools as completed (with output) - these were executed
+                    // 3. Function tools as completed (without output) - need caller execution
+                    let mut response = build_tool_response(
+                        mcp_tool_calls,
+                        mcp_results,
+                        function_tool_calls,
+                        analysis,
+                        partial_text,
+                        usage,
+                        request_id,
+                        Arc::new(current_request),
+                    );
+
+                    // Inject MCP metadata for all executed calls
+                    if mcp_tracking.total_calls() > 0 {
+                        inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                    }
+
+                    return Ok(response);
+                }
+
+                // Only MCP tools - continue loop with their results
+                debug!("Only MCP tools - continuing loop with results");
 
                 // Build next request with appended history
                 current_request = build_next_request_with_tools(
                     current_request,
-                    tool_calls,
-                    tool_results,
+                    mcp_tool_calls,
+                    mcp_results,
                     analysis,
                     partial_text,
                 )
@@ -469,7 +537,9 @@ async fn execute_without_mcp_loop(
                 "Function tool calls found - returning to caller"
             );
 
-            Ok(build_function_tool_response(
+            Ok(build_tool_response(
+                vec![],
+                vec![],
                 tool_calls,
                 analysis,
                 partial_text,
@@ -602,6 +672,20 @@ async fn execute_mcp_tool_loop_streaming(
         );
     }
 
+    // Build HashSet of MCP tool names for O(1) lookup during streaming
+    // Clone tool names to owned strings to avoid borrowing current_request
+    let mcp_tool_names: std::collections::HashSet<String> = current_request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|t| t.r#type == ResponseToolType::Mcp)
+                .filter_map(|t| t.function.as_ref().map(|f| f.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Emit mcp_list_tools on first iteration
     let (output_index, item_id) = emitter.allocate_output_index(OutputItemType::McpListTools);
 
@@ -705,21 +789,21 @@ async fn execute_mcp_tool_loop_streaming(
             }
         };
 
-        // Process stream with token-level streaming (MCP path - emits mcp_call.* events)
-        let iteration_result =
-            match HarmonyStreamingProcessor::process_responses_iteration_stream_mcp(
-                execution_result,
-                emitter,
-                tx,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(err_msg) => {
-                    emitter.emit_error(&err_msg, Some("processing_error"), tx);
-                    return;
-                }
-            };
+        // Process stream with token-level streaming (mixed tools - emits correct events per tool type)
+        let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
+            execution_result,
+            emitter,
+            tx,
+            &mcp_tool_names,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err_msg) => {
+                emitter.emit_error(&err_msg, Some("processing_error"), tx);
+                return;
+            }
+        };
 
         // Handle iteration result (tool calls or completion)
         match iteration_result {
@@ -734,7 +818,20 @@ async fn execute_mcp_tool_loop_streaming(
                     tool_call_count = tool_calls.len(),
                     has_analysis = analysis.is_some(),
                     partial_text_len = partial_text.len(),
-                    "MCP tool calls found in commentary channel - checking limits"
+                    "Tool calls found - separating MCP and function tools"
+                );
+
+                // Separate MCP and function tool calls based on tool type
+                let request_tools = current_request.tools.as_deref().unwrap_or(&[]);
+                let mcp_tool_names = build_mcp_tool_names_set(request_tools);
+                let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                    .into_iter()
+                    .partition(|tc| mcp_tool_names.contains(tc.function.name.as_str()));
+
+                debug!(
+                    mcp_calls = mcp_tool_calls.len(),
+                    function_calls = function_tool_calls.len(),
+                    "Tool calls separated by type in streaming"
                 );
 
                 // Check combined limit (user's max_tool_calls vs safety limit)
@@ -743,12 +840,12 @@ async fn execute_mcp_tool_loop_streaming(
                     None => MAX_TOOL_ITERATIONS,
                 };
 
-                // Check if we would exceed the limit with these new tool calls
-                let total_calls_after = mcp_tracking.total_calls() + tool_calls.len();
+                // Check if we would exceed the limit with these new MCP tool calls
+                let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
                 if total_calls_after > effective_limit {
                     warn!(
                         current_calls = mcp_tracking.total_calls(),
-                        new_calls = tool_calls.len(),
+                        new_calls = mcp_tool_calls.len() + function_tool_calls.len(),
                         total_after = total_calls_after,
                         effective_limit = effective_limit,
                         user_max = ?max_tool_calls,
@@ -768,9 +865,10 @@ async fn execute_mcp_tool_loop_streaming(
                     return;
                 }
 
-                // Execute MCP tools and continue loop
-                let tool_results =
-                    match execute_mcp_tools(&ctx.mcp_manager, &tool_calls, &mut mcp_tracking).await
+                // Execute MCP tools (if any)
+                let mcp_results = if !mcp_tool_calls.is_empty() {
+                    match execute_mcp_tools(&ctx.mcp_manager, &mcp_tool_calls, &mut mcp_tracking)
+                        .await
                     {
                         Ok(results) => results,
                         Err(err_response) => {
@@ -781,16 +879,42 @@ async fn execute_mcp_tool_loop_streaming(
                             );
                             return;
                         }
-                    };
+                    }
+                } else {
+                    Vec::new()
+                };
 
-                // Update mcp_call output items with execution results
-                emitter.update_mcp_call_outputs(&tool_results);
+                // Update mcp_call output items with execution results (if any MCP tools were executed)
+                if !mcp_results.is_empty() {
+                    emitter.update_mcp_call_outputs(&mcp_results);
+                }
+
+                // If there are function tools, exit MCP loop and emit completion
+                if !function_tool_calls.is_empty() {
+                    debug!(
+                        "Function tool calls present - exiting MCP loop and emitting completion"
+                    );
+
+                    // Function tool calls were already emitted during streaming processing
+                    // Just emit response.completed with usage
+                    let usage_json = json!({
+                        "input_tokens": usage.prompt_tokens,
+                        "output_tokens": usage.completion_tokens,
+                        "total_tokens": usage.total_tokens,
+                    });
+                    let event = emitter.emit_completed(Some(&usage_json));
+                    emitter.send_event_best_effort(&event, tx);
+                    return;
+                }
+
+                // Only MCP tools - continue loop with their results
+                debug!("Only MCP tools - continuing loop with results");
 
                 // Build next request with appended history
                 current_request = match build_next_request_with_tools(
                     current_request,
-                    tool_calls,
-                    tool_results,
+                    mcp_tool_calls,
+                    mcp_results,
                     analysis,
                     partial_text,
                 ) {
@@ -873,20 +997,22 @@ async fn execute_without_mcp_streaming(
     };
 
     // Process stream (emits all output items during streaming - function tool path emits function_call_arguments.* events)
-    let iteration_result =
-        match HarmonyStreamingProcessor::process_responses_iteration_stream_function(
-            execution_result,
-            emitter,
-            tx,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(err_msg) => {
-                emitter.emit_error(&err_msg, Some("processing_error"), tx);
-                return;
-            }
-        };
+    // Pass empty HashSet so all tools are treated as function tools (per-tool detection)
+    let empty_mcp_tools = std::collections::HashSet::new();
+    let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
+        execution_result,
+        emitter,
+        tx,
+        &empty_mcp_tools,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err_msg) => {
+            emitter.emit_error(&err_msg, Some("processing_error"), tx);
+            return;
+        }
+    };
 
     // Extract usage from iteration result
     let usage = match iteration_result {
@@ -917,17 +1043,16 @@ async fn execute_without_mcp_streaming(
     emitter.send_event_best_effort(&event, tx);
 }
 
-/// Build ResponsesResponse with function tool calls for caller to execute
+/// Build ResponsesResponse with tool calls (MCP and/or function tools)
 ///
-/// When tool calls are found but no MCP client is available (function tools only),
-/// this builds a response with status=Completed and tool calls without output field.
-/// The absence of output signals the caller should execute tools and resume.
-///
-/// TODO: Refactor to use builder pattern
-fn build_function_tool_response(
-    tool_calls: Vec<ToolCall>,
-    analysis: Option<String>,
-    partial_text: String,
+/// ResponsesResponse with tool calls
+#[allow(clippy::too_many_arguments)]
+fn build_tool_response(
+    mcp_tool_calls: Vec<ToolCall>,
+    mcp_results: Vec<ToolResult>,
+    function_tool_calls: Vec<ToolCall>,
+    analysis: Option<String>, // Analysis channel content (reasoning)
+    partial_text: String,     // Final channel content (message)
     usage: Usage,
     request_id: String,
     responses_request: Arc<ResponsesRequest>,
@@ -960,61 +1085,62 @@ fn build_function_tool_response(
         });
     }
 
-    // Add function tool calls as completed output items (no output field = needs execution)
-    for tool_call in tool_calls {
+    // Add MCP tool calls WITH output (these were executed)
+    for (tool_call, result) in mcp_tool_calls.iter().zip(mcp_results.iter()) {
+        let output_str = to_string(&result.output).unwrap_or_else(|e| {
+            format!("{{\"error\": \"Failed to serialize tool output: {}\"}}", e)
+        });
+
         output.push(ResponseOutputItem::FunctionToolCall {
             id: tool_call.id.clone(),
             call_id: tool_call.id.clone(),
             name: tool_call.function.name.clone(),
             arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-            output: None, // No output = tool needs execution by caller
+            output: Some(output_str),
+            status: if result.is_error {
+                "failed"
+            } else {
+                "completed"
+            }
+            .to_string(),
+        });
+    }
+
+    // Add function tool calls WITHOUT output (need caller execution)
+    for tool_call in function_tool_calls {
+        output.push(ResponseOutputItem::FunctionToolCall {
+            id: tool_call.id.clone(),
+            call_id: tool_call.id.clone(),
+            name: tool_call.function.name.clone(),
+            arguments: tool_call.function.arguments.clone().unwrap_or_default(),
+            output: None, // No output = needs execution
             status: "completed".to_string(),
         });
     }
 
     // Build ResponsesResponse with Completed status
-    // The presence of FunctionToolCall items without output signals tool execution needed
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
 
-    ResponsesResponse {
-        id: request_id,
-        object: "response".to_string(),
-        created_at,
-        status: ResponseStatus::Completed,
-        error: None,
-        incomplete_details: None,
-        instructions: responses_request.instructions.clone(),
-        max_output_tokens: responses_request.max_output_tokens,
-        model: responses_request.model.clone(),
-        output,
-        parallel_tool_calls: responses_request.parallel_tool_calls.unwrap_or(true),
-        previous_response_id: responses_request.previous_response_id.clone(),
-        reasoning: None,
-        store: responses_request.store.unwrap_or(true),
-        temperature: responses_request.temperature,
-        text: None,
-        tool_choice: responses_request
-            .tool_choice
-            .as_ref()
-            .map(|tc| to_string(tc).unwrap_or_else(|_| "auto".to_string()))
-            .unwrap_or_else(|| "auto".to_string()),
-        tools: responses_request.tools.clone().unwrap_or_default(),
-        top_p: responses_request.top_p,
-        truncation: None,
-        usage: Some(ResponsesUsage::Modern(ResponseUsage {
+    ResponsesResponse::builder(&request_id, &responses_request.model)
+        .copy_from_request(&responses_request)
+        .created_at(created_at)
+        .status(ResponseStatus::Completed)
+        .output(output)
+        .usage(ResponsesUsage::Modern(ResponseUsage {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
             input_tokens_details: None,
-            output_tokens_details: None,
-        })),
-        user: None,
-        safety_identifier: responses_request.user.clone(),
-        metadata: responses_request.metadata.clone().unwrap_or_default(),
-    }
+            output_tokens_details: usage.completion_tokens_details.as_ref().and_then(|d| {
+                d.reasoning_tokens.map(|tokens| OutputTokensDetails {
+                    reasoning_tokens: tokens,
+                })
+            }),
+        }))
+        .build()
 }
 
 /// Execute MCP tools and collect results
@@ -1022,13 +1148,6 @@ fn build_function_tool_response(
 /// Executes each tool call sequentially via the MCP manager.
 /// Tool execution errors are returned as error results to the model
 /// (allows model to handle gracefully).
-///
-/// # Arguments
-///
-/// * `mcp_manager` - MCP manager for tool execution
-/// * `tool_calls` - Tool calls from commentary channel
-///
-/// # Returns
 ///
 /// Vector of tool results (one per tool call)
 async fn execute_mcp_tools(
@@ -1048,6 +1167,13 @@ async fn execute_mcp_tools(
         // Parse tool arguments from JSON string
         let args_str = tool_call.function.arguments.as_deref().unwrap_or("{}");
         let args: Value = from_str(args_str).map_err(|e| {
+            error!(
+                function = "execute_mcp_tools",
+                tool_name = %tool_call.function.name,
+                call_id = %tool_call.id,
+                error = %e,
+                "Failed to parse tool arguments JSON"
+            );
             error::internal_error(format!(
                 "Invalid tool arguments JSON for tool '{}': {}",
                 tool_call.function.name, e
@@ -1151,24 +1277,12 @@ async fn execute_mcp_tools(
 /// 1. Original input items (preserved)
 /// 2. Assistant message with analysis (reasoning) + partial_text + tool_calls
 /// 3. Tool result messages for each tool execution
-///
-/// # Arguments
-///
-/// * `request` - Current request (contains original input)
-/// * `tool_calls` - Tool calls from commentary channel
-/// * `tool_results` - Results from MCP tool execution
-/// * `analysis` - Analysis channel content (becomes reasoning content)
-/// * `partial_text` - Final channel content (becomes message content)
-///
-/// # Returns
-///
-/// New ResponsesRequest with appended history
 fn build_next_request_with_tools(
     mut request: ResponsesRequest,
     tool_calls: Vec<ToolCall>,
     tool_results: Vec<ToolResult>,
-    analysis: Option<String>,
-    partial_text: String,
+    analysis: Option<String>, // Analysis channel content (becomes reasoning content)
+    partial_text: String,     // Final channel content (becomes message content)
 ) -> Result<ResponsesRequest, Box<Response>> {
     // Get current input items (or empty vec if Text variant)
     let mut items = match request.input {
@@ -1243,7 +1357,7 @@ fn build_next_request_with_tools(
             ..
         }) = items
             .iter_mut()
-            .find(|item| matches!(item, ResponseInputOutputItem::FunctionToolCall { id, .. } if id == &tool_result.call_id))
+            .find(|item| matches!(item, ResponseInputOutputItem::FunctionToolCall { call_id, .. } if call_id == &tool_result.call_id))
         {
             *output = Some(output_str);
             *status = if tool_result.is_error {
@@ -1422,6 +1536,12 @@ async fn load_previous_messages(
         .get_response_chain(&prev_id, None)
         .await
         .map_err(|e| {
+            error!(
+                function = "load_previous_messages",
+                prev_id = %prev_id_str,
+                error = %e,
+                "Failed to load previous response chain from storage"
+            );
             error::internal_error(format!(
                 "Failed to load previous response chain for {}: {}",
                 prev_id_str, e

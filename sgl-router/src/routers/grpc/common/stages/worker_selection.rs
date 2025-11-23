@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
@@ -47,11 +47,13 @@ impl WorkerSelectionStage {
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let prep = ctx
-            .state
-            .preparation
-            .as_ref()
-            .ok_or_else(|| error::internal_error("Preparation stage not completed"))?;
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            error!(
+                function = "WorkerSelectionStage::execute",
+                "Preparation stage not completed"
+            );
+            error::internal_error("Preparation stage not completed")
+        })?;
 
         // For Harmony, use selection_text produced during Harmony encoding
         // Otherwise, use original_text from regular preparation
@@ -66,6 +68,12 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_single_worker(ctx.input.model_id.as_deref(), text) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
+                        error!(
+                            function = "WorkerSelectionStage::execute",
+                            mode = "Regular",
+                            model_id = ?ctx.input.model_id,
+                            "No available workers for model"
+                        );
                         return Err(error::service_unavailable(format!(
                             "No available workers for model: {:?}",
                             ctx.input.model_id
@@ -77,6 +85,12 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_pd_pair(ctx.input.model_id.as_deref(), text) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
+                        error!(
+                            function = "WorkerSelectionStage::execute",
+                            mode = "PrefillDecode",
+                            model_id = ?ctx.input.model_id,
+                            "No available PD worker pairs for model"
+                        );
                         return Err(error::service_unavailable(format!(
                             "No available PD worker pairs for model: {:?}",
                             ctx.input.model_id

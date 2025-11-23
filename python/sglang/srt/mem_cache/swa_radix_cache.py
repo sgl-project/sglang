@@ -20,6 +20,7 @@ The radix tree data structure for managing the hybrid (full and SWA) KV cache.
 """
 
 import heapq
+import time
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -32,11 +33,11 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
-    _convert_to_bigram_key,
     _key_match_page_size1,
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -336,6 +337,7 @@ class SWARadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         is_eagle: bool = False,
+        enable_metrics: bool = False,
     ):
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
@@ -357,9 +359,12 @@ class SWARadixCache(BasePrefixCache):
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
 
         if is_eagle:
-            self.key_convert_fn = _convert_to_bigram_key
+            self.key_convert_fn = convert_to_bigram_key
         else:
             self.key_convert_fn = lambda key: key
+
+        if enable_metrics:
+            self.init_metrics_collector()
 
         self.sliding_window_size = sliding_window_size
         self.reset()
@@ -436,21 +441,21 @@ class SWARadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
-        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :all_token_len
+                req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
-        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
+        actual_kv_len = kv_committed_len - 1 if self.is_eagle else kv_committed_len
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :all_token_len
+            req.req_pool_idx, :kv_committed_len
         ]
 
         if self.page_size != 1:
@@ -469,7 +474,7 @@ class SWARadixCache(BasePrefixCache):
         )
 
         old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+        if self.is_eagle and old_prefix_len > req.cache_protected_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
@@ -531,7 +536,7 @@ class SWARadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
         old_prefix_len = len(req.prefix_indices)
-        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+        if self.is_eagle and old_prefix_len > req.cache_protected_len:
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
@@ -557,7 +562,7 @@ class SWARadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        req.last_matched_prefix_len = len(new_indices)
+        req.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
         swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
@@ -589,7 +594,7 @@ class SWARadixCache(BasePrefixCache):
     def evict(self, full_num_tokens: int, swa_num_tokens: int = 0) -> None:
         if self.disable:
             return
-
+        start_time = time.perf_counter()
         full_num_evicted = 0
         swa_num_evicted = 0
         if full_num_tokens > 0:
@@ -668,6 +673,8 @@ class SWARadixCache(BasePrefixCache):
                     self._iteratively_delete_tombstone_leaf(x)
 
                 x = x_next
+
+        self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
 
     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
