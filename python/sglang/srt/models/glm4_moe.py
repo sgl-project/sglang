@@ -102,7 +102,16 @@ _device_sm = get_device_sm()
 #   capture: enable only when CUDA graph capture is on
 #   always: always enable if alt_stream is available
 #   never: never enable dual stream
+_VALID_DUAL_STREAM_POLICIES = {"auto", "capture", "always", "never"}
 _DUAL_STREAM_POLICY = os.getenv("SGLANG_GLM4_MOE_DUAL_STREAM", "auto").lower()
+if _DUAL_STREAM_POLICY not in _VALID_DUAL_STREAM_POLICIES:
+    logger.warning(
+        "Invalid SGLANG_GLM4_MOE_DUAL_STREAM value: '%s'. "
+        "Falling back to 'auto'. Valid options are: %s",
+        _DUAL_STREAM_POLICY,
+        _VALID_DUAL_STREAM_POLICIES,
+    )
+    _DUAL_STREAM_POLICY = "auto"
 try:
     _DUAL_STREAM_TOKEN_THRESHOLD = int(
         os.getenv("SGLANG_GLM4_MOE_DUAL_STREAM_THRESHOLD", "1024")
