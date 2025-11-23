@@ -1650,8 +1650,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 CutlassMoEType.BlockscaledFP4,
                 device,
                 num_experts=layer.num_experts,  # global num experts
-                intermediate_size_per_partition=layer.w2_weight.shape[2] * num_shards,  # n
-                hidden_size=layer.w13_weight.shape[2] * num_shards,
+                intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
+                hidden_size=layer.w13_weight.shape[2] * 2,
             )  # k
 
     @property
