@@ -983,12 +983,47 @@ def should_use_external_mm_preprocess(multimodal_model: nn.Module) -> bool:
 
     cls_name = multimodal_model.__class__.__name__
 
-    qwen_vl_classes = {
+    external_mm_preprocess_classes = {
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
+        "InternVLChatModel",
     }
 
-    return cls_name in qwen_vl_classes
+    return cls_name in external_mm_preprocess_classes
+
+
+def resolve_external_mm_data_embedding_funcs(
+    multimodal_model: nn.Module,
+) -> Optional[Dict[Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]]]:
+    """
+    Resolve the data_embedding_funcs mapping for external_mm_preprocess_routine
+    based on the given multimodal model. If this function returns None, the
+    external_mm_preprocess_routine will use its internal default behavior
+    (for example, for Qwen2_5_VL).
+
+    Resolution order:
+        1. If the model exposes external_mm_data_embedding_funcs explicitly,
+           adopt it.
+        2. TODO: Handle special classes with customized mm_data_embedding_funcs
+           (e.g. Qwen3_VL).
+        3. If not mapping, return None.
+    """
+
+    cls_name = multimodal_model.__class__.__name__
+
+    # High priority: model provides an explicit mapping attribute.
+    #    Example in InternVLChatModel.__init__:
+    #      self.external_mm_data_embedding_funcs = {
+    #          Modality.IMAGE: self.get_image_feature,
+    #      }
+    if hasattr(multimodal_model, "external_mm_data_embedding_funcs"):
+        funcs = getattr(multimodal_model, "external_mm_data_embedding_funcs")
+        # Allow an empty dict to mean "no data_embedding_funcs are needed".
+        return funcs or None
+
+    # If no mapping is found, return None so that external_mm_preprocess_routine
+    # can fall back to its default logic.
+    return None
 
 
 def external_mm_preprocess_routine(
