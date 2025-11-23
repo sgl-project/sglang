@@ -692,6 +692,8 @@ class PrefillAdder:
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(
                     running_req
                 )
+            if min_tokens_to_remove <= 0:
+                break
 
         # Check max token count limit can be met
         if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:
@@ -704,7 +706,7 @@ class PrefillAdder:
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
                 self.rem_total_token_offset -= (
-                    self._get_running_request_total_token_offset(req)
+                    self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1
                 self.running_batch.release_req(
