@@ -44,3 +44,13 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
     ...
     ```
 4. **Paste**: paste the table into the PR description
+
+## 3. Safeguard your changes with CI
+
+Consider adding tests to pr-test or nightly-test, to safeguard your changes, especially when your PR either:
+
+1. supports a new model
+2. supports/fixes important features
+3. significantly improves the performance
+
+See [test](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/test) for examples
