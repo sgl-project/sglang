@@ -20,7 +20,10 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import (
+    release_kv_cache,
+    truncate_kv_cache_after_prefill,
+)
 from sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
@@ -118,6 +121,11 @@ class SchedulerOutputProcessorMixin:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+
+                        # Truncate KV cache after prefill completes
+                        truncate_kv_cache_after_prefill(
+                            req, batch.req_to_token_pool, self.tree_cache
+                        )
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None

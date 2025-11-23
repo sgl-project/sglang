@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
@@ -22,6 +23,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     compute_nsa_seqlens,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.mem_cache.common import HIERARCHICAL_NSA_DECODE_MAX_TOKENS
 from sglang.srt.mem_cache.memory_pool import NSAReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
@@ -191,6 +193,8 @@ _NSA_IMPL_T: TypeAlias = Literal["flashmla_sparse", "flashmla_kv", "fa3", "tilel
 
 NSA_PREFILL_IMPL: _NSA_IMPL_T
 NSA_DECODE_IMPL: _NSA_IMPL_T
+
+logger = logging.getLogger(__name__)
 
 
 class NativeSparseAttnBackend(AttentionBackend):
@@ -1071,6 +1075,12 @@ class NativeSparseAttnBackend(AttentionBackend):
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        # TODO: Only Truncate those requests that have prompt length >= 2048
+        if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
+            page_table_1 = metadata.page_table_1[
+                :, : HIERARCHICAL_NSA_DECODE_MAX_TOKENS - 1
+            ]
 
         if NSA_DECODE_IMPL == "flashmla_sparse":
             if q_rope is not None:

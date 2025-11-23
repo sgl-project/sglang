@@ -267,22 +267,18 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         index_k_last_loc: torch.Tensor = None,
     ):
         """Decode allocation: both KV and nsa indexer_k"""
-        kv_indices = self.kv_allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        if kv_indices is None:
-            return None
+        return self.kv_allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
-        # Use separate last_loc for indexer_k
-        if index_k_last_loc is None:
-            index_k_last_loc = last_loc
-
-        index_k_indices = self.index_k_allocator.alloc_decode(
+    def alloc_index_k_only_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        index_k_last_loc: torch.Tensor,
+    ):
+        """Decode allocation: only allocate index_k, not KV cache"""
+        return self.index_k_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, index_k_last_loc
         )
-        if index_k_indices is None:
-            self.kv_allocator.free(kv_indices)
-            return None
-
-        return (kv_indices, index_k_indices)
 
     def free(self, free_index: torch.Tensor):
         """Free both KV and indexer_k (expects tuple or KV indices only for compatibility)"""

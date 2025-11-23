@@ -256,6 +256,40 @@ def is_enabled_hierarchical_nsa(allocator):
     return isinstance(allocator, NSAHybridTokenToKVPoolAllocator)
 
 
+HIERARCHICAL_NSA_DECODE_MAX_TOKENS = 2049
+
+
+def truncate_kv_cache_after_prefill(req: "Req", req_to_token_pool, tree_cache):
+    """Truncate KV cache to HIERARCHICAL_NSA_DECODE_MAX_TOKENS after prefill completes."""
+    if not is_enabled_hierarchical_nsa(tree_cache.token_to_kv_pool_allocator):
+        return
+
+    if req.is_chunked > 0:
+        return
+
+    current_len = req.kv_committed_len
+    if current_len > HIERARCHICAL_NSA_DECODE_MAX_TOKENS:
+        old_prefix_len = len(req.prefix_indices)
+
+        page_size = tree_cache.page_size
+        kv_keep_len = ceil_align(HIERARCHICAL_NSA_DECODE_MAX_TOKENS, page_size)
+
+        free_indices = req_to_token_pool.req_to_token[
+            req.req_pool_idx, kv_keep_len:current_len
+        ]
+        tree_cache.token_to_kv_pool_allocator.kv_allocator.free(free_indices)
+        req.kv_committed_len = kv_keep_len
+        req.kv_allocated_len = kv_keep_len
+        req.prefix_indices = req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_keep_len
+        ].to(dtype=torch.int64, copy=True)
+
+        logger.info(
+            f"Truncate request {req.rid} KV cache from {current_len} to {kv_keep_len} (page-aligned) after prefill completes."
+        )
+        tree_cache.protected_size_ -= old_prefix_len - kv_keep_len
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -461,19 +495,14 @@ def alloc_paged_token_slots_decode(
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     token_per_req: int = 1,
-    index_k_last_loc: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
+    # Over estimate the number of tokens: assume each request needs a new page.
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    if is_enabled_hierarchical_nsa(allocator):
-        out_cache_loc = allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc, index_k_last_loc
-        )
-    else:
-        out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
     if out_cache_loc is None:
         error_msg = (
@@ -489,8 +518,13 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> tuple:
-    """Allocate KV cache for decode batch and write to req_to_token_pool."""
+def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    """
+    Allocate KV cache for decode batch and write to req_to_token_pool.
+
+    Returns:
+        out_cache_loc: allocated cache locations
+    """
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req in batch.reqs:
             batch.tree_cache.evict_swa(
@@ -498,39 +532,115 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> tuple:
             )
 
     bs = batch.seq_lens.shape[0]
-    hierarchical_nsa_enabled = is_enabled_hierarchical_nsa(
-        batch.tree_cache.token_to_kv_pool_allocator
-    )
 
     if batch.tree_cache.page_size == 1:
-        alloc_result = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        # Non-paged allocation
+        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
-        kv_last_loc = batch.req_to_token_pool.req_to_token[
+        # Paged allocation
+        last_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, batch.seq_lens - 1
         ]
-
-        # Get index_k_last_loc for NSA hybrid allocator
-        index_k_last_loc = None
-        if hierarchical_nsa_enabled:
-            index_k_last_loc = batch.req_to_token_pool.req_to_nsa_index_k[
-                batch.req_pool_indices, batch.seq_lens - 1
-            ]
-
         seq_lens_next = batch.seq_lens + token_per_req
-        alloc_result = alloc_paged_token_slots_decode(
+        out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
-            last_loc=kv_last_loc,
+            last_loc=last_loc,
             token_per_req=token_per_req,
-            index_k_last_loc=index_k_last_loc,
         )
 
-    if hierarchical_nsa_enabled:
-        out_cache_loc, out_index_cache_loc = alloc_result
+    # Write to req_to_token_pool
+    if batch.model_config.is_encoder_decoder:
+        locs = batch.encoder_lens + batch.seq_lens
     else:
-        out_cache_loc = alloc_result
-        out_index_cache_loc = None
+        locs = batch.seq_lens.clone()
+
+    batch.req_to_token_pool.write(
+        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    )
+
+    return out_cache_loc
+
+
+def alloc_for_nsa_decode(batch: ScheduleBatch, token_per_req: int) -> tuple:
+    """
+    Allocate KV cache and index_k for NSA hierarchical decode batch.
+
+    Returns:
+        out_cache_loc: allocated KV cache locations
+        out_index_cache_loc: allocated index_k cache locations
+    """
+    if isinstance(batch.tree_cache, SWAChunkCache):
+        for req in batch.reqs:
+            batch.tree_cache.evict_swa(
+                req, req.seqlen - 1, batch.model_config.attention_chunk_size
+            )
+
+    bs = batch.seq_lens.shape[0]
+    seq_lens_next = batch.seq_lens + token_per_req
+
+    # Find truncated and non-truncated requests
+    kv_prompt_lens = torch.tensor(
+        [len(req.origin_input_ids) for req in batch.reqs],
+        dtype=torch.int32,
+        device=batch.device,
+    )
+    truncated_mask = kv_prompt_lens >= HIERARCHICAL_NSA_DECODE_MAX_TOKENS
+    out_cache_loc = torch.empty(bs, dtype=torch.int32, device=batch.device)
+
+    # Handle truncated requests: use fixed position
+    if truncated_mask.any():
+        truncated_indices = truncated_mask.nonzero(as_tuple=True)[0]
+        out_cache_loc[truncated_indices] = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices[truncated_indices],
+            HIERARCHICAL_NSA_DECODE_MAX_TOKENS - 1,
+        ]
+
+    # Handle non-truncated requests: allocate normally
+    if (~truncated_mask).any():
+        non_truncated_indices = (~truncated_mask).nonzero(as_tuple=True)[0]
+        non_truncated_indices_cpu = non_truncated_indices.cpu()
+        non_truncated_pool_indices = batch.req_pool_indices[non_truncated_indices]
+        non_truncated_seq_lens = batch.seq_lens[non_truncated_indices]
+        non_truncated_seq_lens_cpu = batch.seq_lens_cpu[non_truncated_indices_cpu]
+        non_truncated_seq_lens_next = seq_lens_next[non_truncated_indices]
+
+        if batch.tree_cache.page_size == 1:
+            non_truncated_out = alloc_token_slots(
+                batch.tree_cache, len(non_truncated_indices) * token_per_req
+            )
+        else:
+            non_truncated_last_loc = batch.req_to_token_pool.req_to_token[
+                non_truncated_pool_indices, non_truncated_seq_lens - 1
+            ]
+            non_truncated_out = alloc_paged_token_slots_decode(
+                tree_cache=batch.tree_cache,
+                seq_lens=non_truncated_seq_lens_next,
+                seq_lens_cpu=non_truncated_seq_lens_cpu + token_per_req,
+                last_loc=non_truncated_last_loc,
+                token_per_req=token_per_req,
+            )
+        out_cache_loc[non_truncated_indices] = non_truncated_out.to(torch.int32)
+
+    # Allocate index_k for all requests
+    index_k_last_loc = batch.req_to_token_pool.req_to_nsa_index_k[
+        batch.req_pool_indices, batch.seq_lens - 1
+    ]
+    out_index_cache_loc = (
+        batch.tree_cache.token_to_kv_pool_allocator.alloc_index_k_only_decode(
+            seq_lens_next, batch.seq_lens_cpu + token_per_req, index_k_last_loc
+        )
+    )
+
+    if out_index_cache_loc is None:
+        error_msg = (
+            f"Decode out of memory for index_k. Try to lower your batch size.\n"
+            f"Try to allocate {len(seq_lens_next) * token_per_req} tokens.\n"
+            f"{available_and_evictable_str(batch.tree_cache)}"
+        )
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
     # Write KV indices
     if batch.model_config.is_encoder_decoder:
@@ -543,10 +653,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> tuple:
     )
 
     # Write index_k indices
-    if hierarchical_nsa_enabled:
-        batch.req_to_token_pool.write_index_token(
-            (batch.req_pool_indices, locs), out_index_cache_loc.to(torch.int32)
-        )
+    batch.req_to_token_pool.write_index_token(
+        (batch.req_pool_indices, locs), out_index_cache_loc.to(torch.int32)
+    )
 
     return out_cache_loc, out_index_cache_loc
 

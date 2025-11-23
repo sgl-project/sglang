@@ -65,11 +65,12 @@ from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
+    alloc_for_nsa_decode,
     evict_from_tree_cache,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import NSAReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
@@ -1662,9 +1663,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.prepare_encoder_info_decode()
 
         # Allocate memory
-        self.out_cache_loc, self.out_index_cache_loc = alloc_for_decode(
-            self, token_per_req=1
-        )
+        if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
+            self.out_cache_loc, self.out_index_cache_loc = alloc_for_nsa_decode(
+                self, token_per_req=1
+            )
+        else:
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+            self.out_index_cache_loc = None
 
         # Update req-level memory management fields
         for req in self.reqs:

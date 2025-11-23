@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -16,6 +17,8 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+logger = logging.getLogger(__name__)
 
 
 class ChunkCache(BasePrefixCache):
@@ -54,20 +57,36 @@ class ChunkCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_committed_len = req.pop_committed_kv_cache()
-        # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
-        self.req_to_token_pool.free(req.req_pool_idx)
-        self.protected_size_ -= len(req.prefix_indices)
 
         if isinstance(self.token_to_kv_pool_allocator, NSAHybridTokenToKVPoolAllocator):
+            kv_free_len = kv_committed_len
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_free_len
+            ]
+            index_k_len = req.seqlen
             index_k_indices = self.req_to_token_pool.req_to_nsa_index_k[
+                req.req_pool_idx, :index_k_len
+            ]
+
+            self.req_to_token_pool.free(req.req_pool_idx)
+            self.protected_size_ -= len(req.prefix_indices)
+
+            self.token_to_kv_pool_allocator.free((kv_indices, index_k_indices))
+            logger.info(
+                f"Free KV and index_k cache for request {req.rid} with shape {kv_indices.shape} and {index_k_indices.shape}"
+            )
+        else:
+            kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            self.token_to_kv_pool_allocator.free((kv_indices, index_k_indices))
-        else:
+
+            self.req_to_token_pool.free(req.req_pool_idx)
+            self.protected_size_ -= len(req.prefix_indices)
+
             self.token_to_kv_pool_allocator.free(kv_indices)
+            logger.info(
+                f"Only Free KV cache for request {req.rid} with shape {kv_indices.shape}"
+            )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
