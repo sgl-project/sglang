@@ -774,7 +774,7 @@ class WanTransformer3DModel(CachableDiT):
 
         encoder_hidden_states = (
             encoder_hidden_states.to(orig_dtype)
-            if current_platform.is_mps()
+            if current_platform.is_mps() or current_platform.is_npu()
             else encoder_hidden_states
         )  # cast to orig_dtype for MPS
 
