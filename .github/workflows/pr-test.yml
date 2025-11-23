@@ -387,7 +387,7 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        part: [0, 1]
+        part: [0]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -396,15 +396,14 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
-      - name: Run diffusion server tests (2 GPU)
+      - name: Run diffusion server tests
         timeout-minutes: 60
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
-            --target-dir server \
-            --pattern "test_server_2_gpu*.py"
+            --total-partitions 1
 
   unit-test-backend-1-gpu:
     needs: [check-changes, stage-a-test-1]
