@@ -739,7 +739,7 @@
                 "TimestepPreparationStage": 2.48,
                 "LatentPreparationStage": 3.0,
                 "DenoisingStage": 87876.99,
-                "DecodingStage": 1765.45,
+                "DecodingStage": 1765.45
             },
             "denoise_step_ms": {
                 "0": 21306.9,
