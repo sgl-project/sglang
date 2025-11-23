@@ -748,24 +748,7 @@ class Scheduler(
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
             elif self.enable_hierarchical_cache:
-                self.tree_cache = HiRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=params.tp_cache_group,
-                    page_size=self.page_size,
-                    eviction_policy=server_args.radix_eviction_policy,
-                    hicache_ratio=server_args.hicache_ratio,
-                    hicache_size=server_args.hicache_size,
-                    hicache_write_policy=server_args.hicache_write_policy,
-                    hicache_io_backend=server_args.hicache_io_backend,
-                    hicache_mem_layout=server_args.hicache_mem_layout,
-                    enable_metrics=self.enable_metrics,
-                    hicache_storage_backend=server_args.hicache_storage_backend,
-                    hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
-                    model_name=server_args.served_model_name,
-                    storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
-                    is_eagle=self.spec_algorithm.is_eagle(),
-                )
+                self.tree_cache = HiRadixCache(params=params, server_args=server_args)
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
