@@ -27,7 +27,7 @@ dependencies = [
   "einops",
   "fastapi",
   "flashinfer_python==0.5.3", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.5.3",
+  # "flashinfer_cubin==0.5.3", # TODO: Add it back when the cubin is ready: https://github.com/flashinfer-ai/flashinfer/issues/2133
   "gguf",
   "hf_transfer",
   "huggingface_hub",
