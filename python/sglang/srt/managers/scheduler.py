@@ -148,7 +148,6 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
-from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.common import CacheInitParams, release_kv_cache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
@@ -704,6 +703,11 @@ class Scheduler(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
+            tp_cache_group=(
+                self.attn_tp_cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_cpu_group
+            ),
         )
 
         if (
@@ -711,15 +715,15 @@ class Scheduler(
             and server_args.disable_radix_cache
         ):
             if not self.is_hybrid:
+                from sglang.srt.mem_cache.chunk_cache import ChunkCache
+
                 self.tree_cache = ChunkCache(params)
             else:
+
+                from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+
                 self.tree_cache = SWAChunkCache(params)
         else:
-            tp_cache_group = (
-                self.attn_tp_cpu_group
-                if self.server_args.enable_dp_attention
-                else self.tp_cpu_group
-            )
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
@@ -731,7 +735,7 @@ class Scheduler(
                     use_hicache=self.enable_hierarchical_cache,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=tp_cache_group,
+                    tp_cache_group=params.tp_cache_group,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
@@ -743,7 +747,7 @@ class Scheduler(
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=tp_cache_group,
+                    tp_cache_group=params.tp_cache_group,
                     page_size=self.page_size,
                     eviction_policy=server_args.radix_eviction_policy,
                     hicache_ratio=server_args.hicache_ratio,
@@ -815,11 +819,7 @@ class Scheduler(
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=(
-                    self.attn_tp_cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_cpu_group
-                ),
+                tp_group=params.tp_cache_group,
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
             )
