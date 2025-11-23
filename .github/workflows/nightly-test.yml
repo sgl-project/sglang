@@ -122,6 +122,49 @@ jobs:
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_vlms
 
+  nightly-test-multimodal-server-1-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        test_file: ["test_server_perf_a.py", "test_server_perf_b.py"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion server tests (1-GPU)
+        timeout-minutes: 60
+        run: |
+          cd python
+          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/${{ matrix.test_file }}
+
+  nightly-test-multimodal-server-2-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion server tests (2-GPU)
+        timeout-minutes: 60
+        run: |
+          cd python
+          pytest -s -v --log-cli-level=INFO sglang/multimodal_gen/test/server/test_server_perf_2_gpu.py
+
   nightly-test-1-gpu:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 1-gpu-runner
@@ -235,6 +278,8 @@ jobs:
       - nightly-test-perf-text-models
       - nightly-test-eval-vlms
       - nightly-test-perf-vlms
+      - nightly-test-multimodal-server-1-gpu
+      - nightly-test-multimodal-server-2-gpu
       - nightly-test-1-gpu
       - nightly-test-4-gpu
       - nightly-test-8-gpu-h200
