@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -8,10 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
@@ -509,12 +505,3 @@ def available_and_evictable_str(tree_cache) -> str:
         available_size = token_to_kv_pool_allocator.available_size()
         evictable_size = tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
-
-
-@dataclasses.dataclass
-class CacheInitParams:
-    req_to_token_pool: ReqToTokenPool
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
-    page_size: int
-
-    tp_cache_group: int

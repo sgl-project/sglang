@@ -148,7 +148,8 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
-from sglang.srt.mem_cache.common import CacheInitParams, release_kv_cache
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -700,14 +701,19 @@ class Scheduler(
         )
 
         params = CacheInitParams(
+            disable=server_args.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
+            is_eagle=self.spec_algorithm.is_eagle(),
             tp_cache_group=(
                 self.attn_tp_cpu_group
                 if self.server_args.enable_dp_attention
                 else self.tp_cpu_group
             ),
+            eviction_policy=server_args.radix_eviction_policy,
+            enable_metrics=self.enable_metrics,
+            enable_kv_cache_events=self.enable_kv_cache_events,
         )
 
         if (
@@ -801,16 +807,7 @@ class Scheduler(
                     eviction_policy=server_args.radix_eviction_policy,
                 )
             else:
-                self.tree_cache = RadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    enable_metrics=self.enable_metrics,
-                    enable_kv_cache_events=self.enable_kv_cache_events,
-                    eviction_policy=server_args.radix_eviction_policy,
-                    is_eagle=self.spec_algorithm.is_eagle(),
-                )
+                self.tree_cache = RadixCache(params)
 
         if (
             server_args.disaggregation_mode == "decode"

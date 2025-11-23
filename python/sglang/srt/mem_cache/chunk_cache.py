@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.common import CacheInitParams
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 
 class ChunkCache(BasePrefixCache):
