@@ -139,6 +139,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh diffusion
+          pip install slack_sdk
 
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 60
@@ -158,6 +159,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh diffusion
+          pip install slack_sdk
 
       - name: Run diffusion server tests (2-GPU)
         timeout-minutes: 60
