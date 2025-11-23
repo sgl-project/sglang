@@ -773,13 +773,7 @@ class Scheduler(
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
                 self.tree_cache = SWARadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    sliding_window_size=self.sliding_window_size,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    is_eagle=self.spec_algorithm.is_eagle(),
-                    enable_metrics=self.enable_metrics,
+                    params=params, sliding_window_size=self.sliding_window_size
                 )
             elif self.is_hybrid_gdn:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
