@@ -699,11 +699,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             f"but got shape {hidden_states.shape}"
         )
 
-        print(
-            f"[DeepEP Normal Marlin] hidden_states.shape={hidden_states.shape}, "
-            f"topk_ids.shape={topk_ids.shape}, topk_weights.shape={topk_weights.shape}"
-        )
-
         # Create a dummy router_logits tensor for compatibility
         # In DeepEP mode, routing has already been done
         router_logits = torch.zeros(
@@ -784,13 +779,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         # Extract expert_num_tokens from masked_m
         # masked_m contains the number of valid tokens per expert
         expert_num_tokens = masked_m.to(torch.int32)
-
-        print(
-            f"[DeepEP LL Marlin] hidden_states.shape={hidden_states.shape}, "
-            f"expert_num_tokens.shape={expert_num_tokens.shape}, "
-            f"expert_num_tokens={expert_num_tokens.tolist() if expert_num_tokens.numel() <= 10 else expert_num_tokens[:10].tolist()}, "
-            f"expected_m={expected_m}"
-        )
 
         # Call batched_fused_marlin_moe
         scalar_type = get_scalar_type(self.num_bits, has_zp=False)
