@@ -189,7 +189,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
                 avg_score,
                 0.90,
                 f"Average ROUGE-L score too low: {avg_score:.4f}. "
-                f"Individual scores: {rouge_scores}"
+                f"Individual scores: {rouge_scores}",
             )
 
     def test_chunked_prefill(self):
