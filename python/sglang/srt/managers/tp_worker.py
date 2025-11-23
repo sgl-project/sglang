@@ -340,6 +340,12 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.token_to_kv_pool.size,
         )
 
+    def get_remote_instance_transfer_engine_info(self):
+        return (
+            self.model_runner.remote_instance_transfer_engine_session_id,
+            self.model_runner.remote_instance_transfer_engine_weight_info,
+        )
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
