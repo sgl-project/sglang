@@ -1466,7 +1466,11 @@ def sample_image_requests(
         for i in range(num_requests):
             text_prompt = gen_mm_prompt(
                 processor.tokenizer,
-                processor.image_token_id if hasattr(processor, "image_token_id") else None,
+                (
+                    processor.image_token_id
+                    if hasattr(processor, "image_token_id")
+                    else None
+                ),
                 int(input_lens[i]),
             )
             dataset.append(
@@ -2019,12 +2023,12 @@ async def benchmark(
 
             # Recompute prompt_len / text_prompt_len / vision_prompt_len with images
             data_row = create_mm_data_row(
-                request.prompt, 
+                request.prompt,
                 list(images),
                 list(images_base64),
-                request.output_len, 
-                processor, 
-                backend
+                request.output_len,
+                processor,
+                backend,
             )
 
             # Update DatasetRow so that later metrics use accurate token counts
