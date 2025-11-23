@@ -33,8 +33,7 @@ class ToleranceConfig:
     """Tolerance ratios for performance validation."""
 
     e2e: float
-    denoise_stage: float
-    non_denoise_stage: float
+    stage: float
     denoise_step: float
     denoise_agg: float
 
@@ -69,15 +68,7 @@ class BaselineConfig:
         tol_data = data["tolerances"]
         tolerances = ToleranceConfig(
             e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", tol_data["e2e"])),
-            denoise_stage=float(
-                os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["denoise_stage"])
-            ),
-            non_denoise_stage=float(
-                os.getenv(
-                    "SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE",
-                    tol_data["non_denoise_stage"],
-                )
-            ),
+            stage=float(os.getenv("SGLANG_STAGE_TIME_TOLERANCE", tol_data["stage"])),
             denoise_step=float(
                 os.getenv("SGLANG_DENOISE_STEP_TOLERANCE", tol_data["denoise_step"])
             ),
@@ -257,9 +248,17 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         warmup_edit=0,
         custom_validator="video",
     ),
-]
-
-TWO_GPU_CASES_A = [
+    # NOTE(mick): flaky
+    # DiffusionTestCase(
+    #     id="hunyuan_video",
+    #     model_path="hunyuanvideo-community/HunyuanVideo",
+    #     modality="video",
+    #     prompt="A curious raccoon",
+    #     output_size="720x480",
+    #     warmup_text=0,
+    #     warmup_edit=0,
+    #     custom_validator="video",
+    # ),
     DiffusionTestCase(
         id="fast_hunyuan_video",
         model_path="FastVideo/FastHunyuan-diffusers",
@@ -270,9 +269,7 @@ TWO_GPU_CASES_A = [
         warmup_edit=0,
         custom_validator="video",
     ),
-]
-
-TWO_GPU_CASES_B = [
+    # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
         id="wan2_2_ti2v_5b",
         model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
@@ -299,7 +296,7 @@ TWO_GPU_CASES_B = [
     ),
 ]
 
-TWO_GPU_CASES = [
+TWO_GPU_CASES_A = [
     DiffusionTestCase(
         id="wan2_2_i2v_a14b_2gpu",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
@@ -336,6 +333,9 @@ TWO_GPU_CASES = [
         custom_validator="video",
         num_gpus=2,
     ),
+]
+
+TWO_GPU_CASES_B = [
     DiffusionTestCase(
         id="wan2_1_i2v_14b_480P_2gpu",
         model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
