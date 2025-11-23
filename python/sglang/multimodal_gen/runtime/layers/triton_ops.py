@@ -206,7 +206,7 @@ def fuse_scale_shift_kernel(
             sh_sb, sh_sl, sh_sc = shift_exp.stride()
         else:
             sh_sb = sh_sl = sh_sc = 0
-        
+
         # If both scalars and both zero, copy fast-path
         if need_scale_scalar and need_shift_scalar:
             if (scale_blc.abs().max() == 0) and (shift_blc.abs().max() == 0):
