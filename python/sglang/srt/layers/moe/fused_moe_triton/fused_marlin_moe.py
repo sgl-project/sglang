@@ -296,8 +296,8 @@ def batched_fused_marlin_moe(
     from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
         batched_moe_align_block_size,
     )
-    from sglang.srt.layers.quantization.utils.marlin_utils import (
-        marlin_make_workspace_new,
+    from sglang.srt.layers.quantization.marlin_utils import (
+        marlin_make_workspace,
         marlin_moe_intermediate_size,
         maybe_warn_marlin_atomic_add,
     )
@@ -342,7 +342,7 @@ def batched_fused_marlin_moe(
     )
 
     if workspace is None:
-        workspace = marlin_make_workspace_new(hidden_states.device, 4)
+        workspace = marlin_make_workspace(hidden_states.device, 4)
 
     intermediate_cache13 = torch.empty(
         (M * topk * max(2 * N, K),),

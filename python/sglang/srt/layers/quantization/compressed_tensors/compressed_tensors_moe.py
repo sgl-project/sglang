@@ -693,23 +693,15 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        # DeepEP Normal may return 3D tensor [num_experts, num_tokens_per_expert, hidden_size]
-        # Need to reshape to 2D [total_tokens, hidden_size] for fused_marlin_moe
-        original_shape = hidden_states.shape
-        if hidden_states.ndim == 3:
-            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous()
-
-        # Also reshape topk_ids and topk_weights if they are 3D
-        if topk_ids.ndim == 3:
-            topk_ids = topk_ids.reshape(-1, topk_ids.shape[-1]).contiguous()
-        if topk_weights.ndim == 3:
-            topk_weights = topk_weights.reshape(-1, topk_weights.shape[-1]).contiguous()
+        # DeepEP Normal mode always returns 2D tensor [total_tokens, hidden_size]
+        assert hidden_states.ndim == 2, (
+            f"DeepEP Normal mode should return 2D hidden_states, "
+            f"but got shape {hidden_states.shape}"
+        )
 
         print(
-            f"[DeepEP Normal] After reshape: hidden_states.shape={hidden_states.shape}, "
-            f"hidden_states.is_contiguous()={hidden_states.is_contiguous()}, "
-            f"topk_ids.shape={topk_ids.shape}, topk_ids.is_contiguous()={topk_ids.is_contiguous()}, "
-            f"topk_weights.shape={topk_weights.shape}, topk_weights.is_contiguous()={topk_weights.is_contiguous()}"
+            f"[DeepEP Normal Marlin] hidden_states.shape={hidden_states.shape}, "
+            f"topk_ids.shape={topk_ids.shape}, topk_weights.shape={topk_weights.shape}"
         )
 
         # Create a dummy router_logits tensor for compatibility
