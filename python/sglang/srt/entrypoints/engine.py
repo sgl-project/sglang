@@ -533,8 +533,7 @@ class Engine(EngineBase):
             zmq_handles=zmq_handles,
             flush_cache=flush_cache,
         )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_ipc(obj, None)
         )
 
