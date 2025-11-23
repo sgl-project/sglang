@@ -61,7 +61,12 @@ from sglang.srt.model_loader.weight_utils import (
     replace_substrings,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, make_layers_non_pp
+from sglang.srt.utils import (
+    add_prefix,
+    get_current_device_stream_fast,
+    is_cuda,
+    make_layers_non_pp,
+)
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
@@ -209,7 +214,7 @@ class NemotronHMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         alt_stream = _get_or_create_alt_stream(self.device_module)
 
-        alt_stream.wait_stream(self.device_module.current_stream())
+        alt_stream.wait_stream(get_current_device_stream_fast())
 
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
@@ -221,7 +226,7 @@ class NemotronHMoE(nn.Module):
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-        self.device_module.current_stream().wait_stream(alt_stream)
+        get_current_device_stream_fast().wait_stream(alt_stream)
 
         return final_hidden_states, shared_output
 

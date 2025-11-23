@@ -20,7 +20,7 @@ class DiTArchConfig(ArchConfig):
         default_factory=lambda: {
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
-            AttentionBackendEnum.FA3,
+            AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
@@ -43,7 +43,7 @@ class DiTArchConfig(ArchConfig):
 class DiTConfig(ModelConfig):
     arch_config: DiTArchConfig = field(default_factory=DiTArchConfig)
 
-    # sgl-diffusionDiT-specific parameters
+    # sglang-diffusion DiT-specific parameters
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
 

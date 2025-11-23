@@ -117,7 +117,7 @@ class HiRadixCache(RadixCache):
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,
             }
-            self.metrics_collector = StorageMetricsCollector(labels=labels)
+            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -139,6 +139,7 @@ class HiRadixCache(RadixCache):
             disable=False,
             eviction_policy=eviction_policy,
             is_eagle=is_eagle,
+            enable_metrics=enable_metrics,
         )
 
     def _parse_storage_backend_extra_config(
@@ -334,6 +335,7 @@ class HiRadixCache(RadixCache):
         return self.evictable_size_
 
     def evict(self, num_tokens: int):
+        start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -373,6 +375,8 @@ class HiRadixCache(RadixCache):
             for node in write_back_nodes:
                 assert node.backuped
                 self._evict_backuped(node)
+
+        self.update_eviction_metrics(num_evicted, start_time)
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -425,6 +429,7 @@ class HiRadixCache(RadixCache):
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
 
+        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -469,6 +474,12 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_load_back_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+
         return device_indices
 
     def init_load_back(
@@ -507,7 +518,7 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
-            self.metrics_collector.log_storage_metrics(
+            self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
 
@@ -551,7 +562,9 @@ class HiRadixCache(RadixCache):
             if entry is not None:
                 entry.release_host()
             if self.enable_storage_metrics:
-                self.metrics_collector.log_backuped_tokens(operation.completed_tokens)
+                self.storage_metrics_collector.log_backuped_tokens(
+                    operation.completed_tokens
+                )
 
         # release host memory
         host_indices_list = []
@@ -664,7 +677,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
         if self.enable_storage_metrics:
-            self.metrics_collector.log_prefetched_tokens(
+            self.storage_metrics_collector.log_prefetched_tokens(
                 min_completed_tokens - matched_length
             )
 
@@ -672,7 +685,7 @@ class HiRadixCache(RadixCache):
 
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key.token_ids = self.key_convert_fn(key.token_ids)
+        key, _ = self.maybe_bigram_convert(key)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -773,7 +786,7 @@ class HiRadixCache(RadixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode()
+            new_node = TreeNode(priority=node.priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = None
@@ -810,7 +823,7 @@ class HiRadixCache(RadixCache):
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
-        new_node = TreeNode()
+        new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -835,8 +848,16 @@ class HiRadixCache(RadixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def insert(self, key: RadixKey, value=None, chunked=False):
-        key.token_ids = self.key_convert_fn(key.token_ids)
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        chunked: bool = False,
+        priority: int | None = None,
+    ):
+        if priority is None:
+            priority = 0
+        key, value = self.maybe_bigram_convert(key, value)
 
         if len(key) == 0:
             return 0
@@ -852,6 +873,7 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
+            node.priority = max(node.priority, priority)
             prefix_len = self.key_match_fn(node.key, key)
 
             if prefix_len == len(node.key):
@@ -866,6 +888,8 @@ class HiRadixCache(RadixCache):
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
+                # shared-prefix node should also reflect max priority
+                new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len]
                     self.evictable_size_ += len(new_node.value)
@@ -881,7 +905,7 @@ class HiRadixCache(RadixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode()
+            new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = value

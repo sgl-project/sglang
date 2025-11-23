@@ -290,6 +290,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                         if moe_runner_config.activation == "silu"
                         else ActivationType.Gelu
                     ),
+                    expert_mask=layer.expert_mask_gpu,
                 )
                 return StandardCombineInput(hidden_states=output)
             else:

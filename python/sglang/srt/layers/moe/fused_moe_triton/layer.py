@@ -25,6 +25,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.kt_ep_wrapper import (
+    KTEPWrapperMethod,
+    create_kt_config_from_server_args,
+)
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -32,19 +36,17 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
-)
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    CompressedTensorsWNA16AMXEPMoEMethod,
-    CompressedTensorsWNA16AMXMoEMethod,
-    CompressedTensorsWNA16MoEMethod,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -56,7 +58,7 @@ from sglang.srt.utils import (
 )
 
 if is_flashinfer_available():
-    from flashinfer import RoutingMethodType, fp4_quantize
+    from flashinfer import fp4_quantize
 
 # Try to import FP4 TRTLLM function if flashinfer is available
 trtllm_fp4_block_scale_moe = None
@@ -69,6 +71,7 @@ if get_moe_runner_backend().is_flashinfer_trtllm():
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +147,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_clamp_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
+        routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
     ):
         super().__init__()
@@ -167,8 +171,12 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
-        assert num_experts % self.moe_ep_size == 0
-        self.num_local_experts = num_experts // self.moe_ep_size
+        assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
+        self.num_local_experts = (
+            num_experts - num_fused_shared_experts
+        ) // self.moe_ep_size + num_fused_shared_experts
+
+        self.expert_mask_gpu = None
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -208,10 +216,19 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
-        if quant_config is not None:
-            self.quant_method = quant_config.get_quant_method(self, prefix)
-        if self.quant_method is None:
-            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+        server_args = get_global_server_args()
+        kt_config = create_kt_config_from_server_args(server_args, layer_id)
+        if kt_config is not None:
+            if quant_config is not None:
+                gpu_method = quant_config.get_quant_method(self, prefix)
+            else:
+                gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+            self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
+        else:
+            if quant_config is not None:
+                self.quant_method = quant_config.get_quant_method(self, prefix)
+            if self.quant_method is None:
+                self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
 
         self.quant_method.create_weights(
             layer=self,
@@ -224,8 +241,6 @@ class FusedMoE(torch.nn.Module):
                 if not use_weight_loader_fused
                 else self.weight_loader_fused
             ),
-            intermediate_size_full=intermediate_size,
-            top_k=top_k,
             with_bias=with_bias,
         )
 
@@ -238,6 +253,12 @@ class FusedMoE(torch.nn.Module):
             isinstance(self.quant_method, Fp8MoEMethod)
             and get_moe_runner_backend().is_cutlass()
         )
+
+        self.routing_method_type = routing_method_type
+
+        # overlap args
+        self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
+        self.meta_overlap_args: Optional[dict] = None
 
     def _load_per_tensor_weight_scale(
         self,
@@ -467,10 +488,18 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        start_idx = self.moe_ep_rank * self.num_local_experts
-        end_idx = (self.moe_ep_rank + 1) * self.num_local_experts
+        num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
+        num_local_routed_experts = (
+            self.num_local_experts - self.num_fused_shared_experts
+        )
+        start_idx = self.moe_ep_rank * num_local_routed_experts
+        end_idx = (self.moe_ep_rank + 1) * num_local_routed_experts
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
+        elif (
+            self.num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts
+        ):
+            return expert_id - num_global_routed_experts + num_local_routed_experts
         else:
             return -1
 
@@ -501,6 +530,11 @@ class FusedMoE(torch.nn.Module):
 
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
+            if not getattr(param, "_sglang_require_global_experts", False):
+                expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+                if expert_id == -1:
+                    return
+
             self._weight_loader_impl(
                 param=param,
                 loaded_weight=loaded_weight,
@@ -514,9 +548,12 @@ class FusedMoE(torch.nn.Module):
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:
+            require_global_experts = getattr(
+                param, "_sglang_require_global_experts", False
+            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
-                    self.layer_id, expert_id
+                    self.layer_id, expert_id, require_global_experts
                 )
             )
 
@@ -540,16 +577,12 @@ class FusedMoE(torch.nn.Module):
         # WARN: This makes the `expert_id` mean "local" and "global" in different cases
         if not getattr(param, "_sglang_require_global_experts", False):
             expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-            if expert_id == -1:
+            if expert_id < 0 or expert_id >= self.num_local_experts:
                 return
 
         if isinstance(
             self.quant_method,
-            (
-                CompressedTensorsWNA16MoEMethod,
-                CompressedTensorsWNA16AMXMoEMethod,
-                CompressedTensorsWNA16AMXEPMoEMethod,
-            ),
+            KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
                 if expert_id >= self.quant_method.num_gpu_experts:
@@ -576,15 +609,17 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
+        method = self.quant_method
+        if method.__class__.__name__ == "KTEPWrapperMethod":
+            method = method.gpu_method
+
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
-                self.quant_method.__class__.__name__
+                method.__class__.__name__
                 in [
                     "CompressedTensorsWNA16MarlinMoEMethod",
                     "CompressedTensorsWNA16MoEMethod",
-                    "CompressedTensorsWNA16AMXMoEMethod",
-                    "CompressedTensorsWNA16AMXEPMoEMethod",
                 ]
             )
             else loaded_weight
@@ -830,17 +865,25 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        if _use_aiter and self.dispatcher.local_expert_mapping is not None:
+            self.expert_mask_gpu = (
+                (
+                    (self.dispatcher.local_expert_mapping >= 0)
+                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
+                )
+                .to(torch.int32)
+                .to(device="cuda")
+            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
-            **kwargs,
         )
 
         with use_symmetric_memory(
@@ -858,12 +901,11 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def run_moe_core(self, dispatch_output: DispatchOutput, **kwargs) -> CombineInput:
+    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
-            **kwargs,
         )
 
     @classmethod
@@ -957,6 +999,16 @@ class FusedMoE(torch.nn.Module):
             for shard_id in ["w1", "w2", "w3"]
         ]
 
+    def set_overlap_args(
+        self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
+    ):
+        self.down_gemm_overlap_args = down_gemm_overlap_args
+        self.meta_overlap_args = meta_overlap_args
+
+    def clear_overlap_args(self) -> None:
+        self.down_gemm_overlap_args = None
+        self.meta_overlap_args = None
+
 
 class FlashInferFusedMoE(FusedMoE):
     def __init__(self, *args, **kwargs):
@@ -983,7 +1035,9 @@ class FlashInferFusedMoE(FusedMoE):
         final_hidden_states = self.quant_method.apply_with_router_logits(
             layer=self,
             dispatch_output=StandardDispatchOutput(
-                hidden_states=hidden_states, topk_output=topk_output
+                hidden_states=hidden_states,
+                hidden_states_scale=None,
+                topk_output=topk_output,
             ),
         )
 
