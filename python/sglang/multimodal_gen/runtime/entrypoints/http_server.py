@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI
@@ -65,7 +66,7 @@ def create_app(server_args: ServerArgs):
 if __name__ == "__main__":
     import uvicorn
 
-    server_args = prepare_server_args([])
+    server_args = prepare_server_args(sys.argv[1:])
     configure_logger(server_args)
     app = create_app(server_args)
     uvicorn.run(
