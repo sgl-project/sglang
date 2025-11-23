@@ -132,7 +132,7 @@ class ServerManager:
         env["SGLANG_PERF_LOG_DIR"] = log_dir.as_posix()
 
         # TODO: unify with run_command
-        print(f"Running command: {shlex.join(command)}")
+        logger.info(f"Running command: {shlex.join(command)}")
 
         process = subprocess.Popen(
             command,

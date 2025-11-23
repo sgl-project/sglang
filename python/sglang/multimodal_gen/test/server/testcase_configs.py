@@ -3,14 +3,14 @@ Configuration and data structures for diffusion performance tests.
 
 Usage:
 
-pytest python/sglang/multimodal_gen/test/server/test_server_performance.py
+pytest python/sglang/multimodal_gen/test/server/test_server_a.py
 # for a single testcase, look for the name of the testcases in DIFFUSION_CASES
-pytest python/sglang/multimodal_gen/test/server/test_server_performance.py -k qwen_image_t2i
+pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t2i
 
 
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
-2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_performance.py -k my_new_test_case_id`
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_a.py -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
 
@@ -306,7 +306,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
 ]
 
-TWO_GPU_CASES = [
+TWO_GPU_CASES_A = [
     DiffusionTestCase(
         id="wan2_2_i2v_a14b_2gpu",
         model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
@@ -343,6 +343,9 @@ TWO_GPU_CASES = [
         custom_validator="video",
         num_gpus=2,
     ),
+]
+
+TWO_GPU_CASES_B = [
     DiffusionTestCase(
         id="wan2_1_i2v_14b_480P_2gpu",
         model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
@@ -368,6 +371,25 @@ TWO_GPU_CASES = [
         warmup_edit=0,
         custom_validator="video",
         num_gpus=2,
+    ),
+    DiffusionTestCase(
+        id="qwen_image_t2i_2_gpus",
+        model_path="Qwen/Qwen-Image",
+        modality="image",
+        prompt="A futuristic cityscape at sunset with flying cars",
+        output_size="1024x1024",
+        warmup_text=1,
+        warmup_edit=0,
+        num_gpus=2,
+    ),
+    DiffusionTestCase(
+        id="flux_image_t2i_2_gpus",
+        model_path="black-forest-labs/FLUX.1-dev",
+        modality="image",
+        prompt="A futuristic cityscape at sunset with flying cars",
+        output_size="1024x1024",
+        warmup_text=1,
+        warmup_edit=0,
     ),
 ]
 
