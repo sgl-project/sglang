@@ -738,6 +738,7 @@ def get_processor(
 
 def get_dataset(args, tokenizer, model_id=None):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
+    skip_special_tokens = getattr(args, "skip_special_tokens", False)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
         input_requests = sample_sharegpt_requests(
@@ -773,6 +774,7 @@ def get_dataset(args, tokenizer, model_id=None):
             image_format=args.image_format,
             image_resolution=args.image_resolution,
             backend=args.backend,
+            skip_special_tokens = skip_special_tokens,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -1416,6 +1418,7 @@ def sample_image_requests(
     image_format: str,
     image_resolution: str,
     backend: str,
+    skip_special_tokens: bool
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -1465,12 +1468,16 @@ def sample_image_requests(
 
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
+
+    special_tokens = None
+    if skip_special_tokens and hasattr(processor.tokenizer, "all_special_ids") and processor.tokenizer.all_special_ids is not None:
+        special_tokens = set(processor.tokenizer.all_special_ids)
     for i in range(num_requests):
         # Generate text prompt
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
-            processor.image_token_id if hasattr(processor, "image_token_id") else None,
             int(input_lens[i]),
+            special_tokens = special_tokens
         )
 
         # Generate image list
@@ -1511,11 +1518,14 @@ def gen_prompt(tokenizer, token_num):
     return tokenizer.decode(selected_tokens)
 
 
-def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+def gen_mm_prompt(tokenizer, token_num, special_tokens):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    if image_pad_id:
-        all_available_tokens.remove(image_pad_id)
+    if special_tokens is not None: 
+        all_available_tokens = [
+            t for t in tokenizer.get_vocab().values() if t not in special_tokens
+        ]
+    else:
+        all_available_tokens = list(tokenizer.get_vocab().values())
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -2213,6 +2223,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
 
+    if not hasattr(args, "skip_special_tokens"):
+        args.skip_special_tokens = False
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -2691,6 +2704,13 @@ if __name__ == "__main__":
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
+    )
+    parser.add_argument(
+        "--skip-special-tokens",
+        action="store_true",
+        help="Skip special tokens when generating random prompt.  " 
+        "Useful in multimodal preprocessing to avoid generating tokens like image_token_id, audio_token_id"
+        "which could trigger special handling during preprocessing.",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
