@@ -3,14 +3,14 @@ Configuration and data structures for diffusion performance tests.
 
 Usage:
 
-pytest python/sglang/multimodal_gen/test/server/test_server_performance.py
+pytest python/sglang/multimodal_gen/test/server/test_server_a.py
 # for a single testcase, look for the name of the testcases in DIFFUSION_CASES
-pytest python/sglang/multimodal_gen/test/server/test_server_performance.py -k qwen_image_t2i
+pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t2i
 
 
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
-2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_performance.py -k my_new_test_case_id`
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_a.py -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
 
@@ -245,7 +245,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
 ]
 
-
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -258,17 +257,9 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         warmup_edit=0,
         custom_validator="video",
     ),
-    # NOTE(mick): flaky
-    # DiffusionTestCase(
-    #     id="hunyuan_video",
-    #     model_path="hunyuanvideo-community/HunyuanVideo",
-    #     modality="video",
-    #     prompt="A curious raccoon",
-    #     output_size="720x480",
-    #     warmup_text=0,
-    #     warmup_edit=0,
-    #     custom_validator="video",
-    # ),
+]
+
+TWO_GPU_CASES_A = [
     DiffusionTestCase(
         id="fast_hunyuan_video",
         model_path="FastVideo/FastHunyuan-diffusers",
@@ -279,7 +270,9 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         warmup_edit=0,
         custom_validator="video",
     ),
-    # === Text and Image to Video (TI2V) ===
+]
+
+TWO_GPU_CASES_B = [
     DiffusionTestCase(
         id="wan2_2_ti2v_5b",
         model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
