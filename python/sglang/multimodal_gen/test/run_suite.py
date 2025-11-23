@@ -14,6 +14,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
 SUITES = {
     "1-gpu": [
         "test_server_a.py",
@@ -65,7 +69,7 @@ def run_pytest(files):
 
     cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"] + files
 
-    print(f"Executing command: {' '.join(cmd)}")
+    logger.info(f"Running command: {' '.join(cmd)}")
     result = subprocess.run(cmd)
     return result.returncode
 
