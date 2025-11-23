@@ -367,13 +367,8 @@ jobs:
       - name: Install dependencies
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
-          pip install slack_sdk
 
       - name: Run diffusion server tests
-        env:
-          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-
         timeout-minutes: 60
         run: |
           cd python
@@ -399,13 +394,8 @@ jobs:
       - name: Install dependencies
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
-          pip install slack_sdk
 
       - name: Run diffusion server tests
-        env:
-          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-
         timeout-minutes: 60
         run: |
           cd python
