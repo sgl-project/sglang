@@ -390,6 +390,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
+
         self._delete_leaf(node)
         return num_evicted
 
@@ -414,7 +415,6 @@ class HiRadixCache(RadixCache):
                 continue
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
-
             for k, v in x.parent.children.items():
                 if v == x:
                     break
