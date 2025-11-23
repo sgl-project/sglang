@@ -150,7 +150,6 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -748,6 +747,8 @@ class Scheduler(
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
             elif self.enable_hierarchical_cache:
+                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
                 self.tree_cache = HiRadixCache(params=params, server_args=server_args)
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
