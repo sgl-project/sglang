@@ -620,6 +620,7 @@ class ServerArgs:
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
+        self._handle_fp8_gemm_backend()
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
@@ -1429,6 +1430,38 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+
+    def _handle_fp8_gemm_backend(self):
+        """
+        Auto-enable FlashInfer FP8 GEMM kernel for Blackwell GPUs.
+
+        The default DeepGEMM kernel has numerical stability issues (produces NaN)
+        when performing FP8 matrix multiplications on sm_100 architecture.
+        FlashInfer's TRT-LLM backend provides a compatible implementation.
+
+        This is automatically enabled when:
+        - Hardware: Blackwell GPU (B200/GB200) is detected
+        - Quantization: FP8 format is specified
+        - Not manually overridden: User hasn't set SGLANG_ENABLE_FLASHINFER_FP8_GEMM
+        """
+        from sglang.srt.environ import envs
+
+        # Check if already manually set by user
+        if get_bool_env_var("SGLANG_ENABLE_FLASHINFER_FP8_GEMM"):
+            return
+
+        # Auto-enable for Blackwell + FP8
+        if (
+            is_blackwell_supported()
+            and self.quantization
+            and "fp8" in str(self.quantization).lower()
+        ):
+            envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.set(True)
+            logger.info(
+                "Auto-enabled FlashInfer FP8 GEMM kernel for Blackwell GPU. "
+                "This resolves numerical stability issues with FP8 quantization on sm_100. "
+                "To disable, set SGLANG_ENABLE_FLASHINFER_FP8_GEMM=0."
+            )
 
     def _handle_page_size(self):
         if self.page_size is None:
