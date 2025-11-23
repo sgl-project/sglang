@@ -391,3 +391,50 @@ def concat_mla_absorb_q(
     )
     torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
     return out
+
+
+def mla_rope_quantize_fp8_fused(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    is_neox: bool,
+    q_out: torch.Tensor,
+    k_nope_out: Optional[torch.Tensor],
+    k_rope_out: Optional[torch.Tensor],
+    kv_buffer: Optional[torch.Tensor],
+    kv_cache_loc: Optional[torch.Tensor],
+):
+    """
+    Fused MLA RoPE + FP8 quantization + KV cache write kernel.
+
+    Args:
+        q_nope: Query nope part
+        q_rope: Query rope part
+        k_nope: Key nope part
+        k_rope: Key rope part
+        cos_sin_cache: Precomputed cos/sin cache
+        pos_ids: Position IDs
+        is_neox: Whether to use NeoX-style RoPE
+        q_out: Output buffer for quantized Q
+        k_nope_out: Optional output buffer for quantized K nope
+        k_rope_out: Optional output buffer for quantized K rope
+        kv_buffer: Optional KV cache buffer for direct write
+        kv_cache_loc: Optional cache locations for KV buffer write
+    """
+    torch.ops.sgl_kernel.mla_rope_quantize_fp8_fused.default(
+        q_nope,
+        q_rope,
+        k_nope,
+        k_rope,
+        cos_sin_cache,
+        pos_ids,
+        is_neox,
+        q_out,
+        k_nope_out,
+        k_rope_out,
+        kv_buffer,
+        kv_cache_loc,
+    )
