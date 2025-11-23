@@ -24,8 +24,8 @@ use crate::{
         utils,
     },
     tokenizer::{
+        registry::TokenizerRegistry,
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
-        traits::Tokenizer,
     },
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -33,7 +33,7 @@ use crate::{
 /// Unified response processor for both routers
 #[derive(Clone)]
 pub struct ResponseProcessor {
-    pub tokenizer: Arc<dyn Tokenizer>,
+    pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
     pub configured_tool_parser: Option<String>,
@@ -42,14 +42,14 @@ pub struct ResponseProcessor {
 
 impl ResponseProcessor {
     pub fn new(
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer_registry: Arc<TokenizerRegistry>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         Self {
-            tokenizer,
+            tokenizer_registry,
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
@@ -174,10 +174,22 @@ impl ResponseProcessor {
 
         // Step 4: Convert output logprobs if present
         let logprobs = if let Some(proto_logprobs) = complete.output_logprobs() {
-            match utils::convert_proto_to_openai_logprobs(proto_logprobs, &self.tokenizer) {
-                Ok(logprobs) => Some(logprobs),
-                Err(e) => {
-                    error!("Failed to convert logprobs: {}", e);
+            // Resolve tokenizer from registry
+            match self.tokenizer_registry.get(&original_request.model) {
+                Some(tokenizer) => {
+                    match utils::convert_proto_to_openai_logprobs(proto_logprobs, &tokenizer) {
+                        Ok(logprobs) => Some(logprobs),
+                        Err(e) => {
+                            error!("Failed to convert logprobs: {}", e);
+                            None
+                        }
+                    }
+                }
+                None => {
+                    error!(
+                        "Tokenizer not found for model '{}', skipping logprobs conversion",
+                        original_request.model
+                    );
                     None
                 }
             }
