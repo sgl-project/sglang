@@ -1,3 +1,15 @@
+"""
+Test bench_serving_video functionality.
+
+Usage:
+python3 -m unittest test_bench_serving_video.TestBenchServingVideo
+or
+python3 test_bench_serving_video.py
+
+To run a single test, use:
+python3 -m unittest test_bench_serving_video.TestBenchServingVideo.test_video_throughput
+"""
+
 import unittest
 
 from sglang.test.test_utils import (
@@ -17,7 +29,7 @@ class TestBenchServingVideo(CustomTestCase):
             other_server_args=[],
             num_prompts=20,
             video_seconds=5,
-            unique_video=False,
+            unique_video=True,
         )
 
         if is_in_ci():
@@ -25,7 +37,7 @@ class TestBenchServingVideo(CustomTestCase):
                 f"### test_video_throughput\n"
                 f"Video throughput: {res['throughput_vid_sec']:.2f} vid_sec/s\n"
             )
-        self.assertLess(res["throughput_vid_sec"], 90)
+        self.assertGreater(res["throughput_vid_sec"], 45)
         print("Test video throughput:", res["throughput_vid_sec"])
 
     def test_video_throughput_cache_hit(self):
@@ -34,7 +46,7 @@ class TestBenchServingVideo(CustomTestCase):
             other_server_args=[],
             num_prompts=20,
             video_seconds=5,
-            unique_video=True,
+            unique_video=False,
         )
 
         if is_in_ci():
@@ -42,7 +54,7 @@ class TestBenchServingVideo(CustomTestCase):
                 f"### test_video_throughput_cache_hit\n"
                 f"Video throughput: {res['throughput_vid_sec']:.2f} vid_sec/s\n"
             )
-        self.assertLess(res["throughput_vid_sec"], 80)
+        self.assertGreater(res["throughput_vid_sec"], 50)
         print("Test video throughput cache hit:", res["throughput_vid_sec"])
 
     # Token Throughput Tests
@@ -52,7 +64,7 @@ class TestBenchServingVideo(CustomTestCase):
             other_server_args=[],
             num_prompts=20,
             video_seconds=5,
-            unique_video=False,
+            unique_video=True,
         )
 
         if is_in_ci():
@@ -60,7 +72,7 @@ class TestBenchServingVideo(CustomTestCase):
                 f"### test_token_throughput\n"
                 f"Token throughput: {res['output_throughput']:.2f} tok/s\n"
             )
-        self.assertLess(res["output_throughput"], 300)
+        self.assertGreater(res["output_throughput"], 150)
         print("Test token throughput:", res["output_throughput"])
 
     def test_token_throughput_cache_hit(self):
@@ -69,7 +81,7 @@ class TestBenchServingVideo(CustomTestCase):
             other_server_args=[],
             num_prompts=20,
             video_seconds=5,
-            unique_video=True,
+            unique_video=False,
             request_rate=float("inf"),
         )
 
@@ -78,7 +90,7 @@ class TestBenchServingVideo(CustomTestCase):
                 f"### test_token_throughput_cache_hit\n"
                 f"Token throughput: {res['output_throughput']:.2f} tok/s\n"
             )
-        self.assertLess(res["output_throughput"], 275)
+        self.assertGreater(res["output_throughput"], 200)
         print("Test token throughput cache hit:", res["output_throughput"])
 
     # Latency Tests
@@ -88,7 +100,7 @@ class TestBenchServingVideo(CustomTestCase):
             other_server_args=[],
             num_prompts=20,
             video_seconds=5,
-            unique_video=False,
+            unique_video=True,
             request_rate=1,
         )
 
@@ -107,7 +119,7 @@ class TestBenchServingVideo(CustomTestCase):
             other_server_args=[],
             num_prompts=20,
             video_seconds=5,
-            unique_video=True,
+            unique_video=False,
             request_rate=1,
         )
 
