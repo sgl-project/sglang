@@ -9,7 +9,6 @@ adjusted to match the structure and interface of `cuda.py`.
 
 import torch
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -68,10 +67,6 @@ class RocmPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        logger.info(
-            "Trying SGLANG_DIFFUSION_ATTENTION_BACKEND=%s",
-            envs.SGLANG_DIFFUSION_ATTENTION_BACKEND,
-        )
 
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
@@ -92,10 +87,10 @@ class RocmPlatform(Platform):
                 f"Invalid attention backend for {cls.device_name}: {selected_backend}"
             )
 
-        target_backend = AttentionBackendEnum.FA
+        target_backend = AttentionBackendEnum.AITER
         if dtype not in (torch.float16, torch.bfloat16):
             logger.info(
-                "Cannot use FlashAttention backend for dtype other than "
+                "Cannot use AITER backend for dtype other than "
                 "torch.float16 or torch.bfloat16."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
@@ -129,9 +124,11 @@ class RocmPlatform(Platform):
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        logger.info("Using Flash Attention backend.")
+        logger.info("Using AITER backend.")
 
-        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+        )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

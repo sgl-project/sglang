@@ -64,6 +64,9 @@ class RMSNorm(CustomOp):
             x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
         )
 
+    def forward_hip(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
+        return self.forward_native(x, residual)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -192,6 +195,14 @@ class LayerNorm(CustomOp):
         ).view(x.shape)
 
     def forward_cuda(
+        self,
+        x: torch.Tensor,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        shape = x.shape
+        x = x.view(-1, self.hidden_size)
+        return self.forward_triton(x).view(shape)
+
+    def forward_hip(
         self,
         x: torch.Tensor,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
