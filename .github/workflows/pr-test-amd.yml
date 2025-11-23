@@ -363,7 +363,7 @@ jobs:
       - name: Benchmark dummy grok (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
+          docker exec -w /sglang-checkout/test/manual/models ci_sglang python3 test_dummy_grok_models.py
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 25
