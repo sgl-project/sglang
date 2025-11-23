@@ -28,6 +28,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlusPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
@@ -405,6 +406,11 @@ def _register_configs():
         model_name="qwen-image-edit",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
+    )
+    register_configs(
+        model_name="qwen-image-edit-2509",
+        sampling_param_cls=QwenImageSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
     )
 
 

@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlusPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -120,7 +121,10 @@ class InputValidationStage(PipelineStage):
             batch.pil_image = image
 
         # NOTE: resizing needs to be bring in advance
-        if isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
+        if isinstance(
+            server_args.pipeline_config,
+            (QwenImageEditPipelineConfig, QwenImageEditPlusPipelineConfig),
+        ):
             height = None if batch.height_not_provided else batch.height
             width = None if batch.width_not_provided else batch.width
             width, height = server_args.pipeline_config.adjust_size(
