@@ -148,7 +148,7 @@ jobs:
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite -gpu \
+            --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2
 
