@@ -1,5 +1,5 @@
 """
-2 GPU Performance tests (A14B models) with --num-gpus 2 --ulysses-degree 2.
+2 GPU tests
 """
 
 from __future__ import annotations
