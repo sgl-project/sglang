@@ -774,7 +774,7 @@ def get_dataset(args, tokenizer, model_id=None):
             image_format=args.image_format,
             image_resolution=args.image_resolution,
             backend=args.backend,
-            skip_special_tokens = skip_special_tokens,
+            skip_special_tokens=skip_special_tokens,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
