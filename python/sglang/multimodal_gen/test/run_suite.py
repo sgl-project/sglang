@@ -16,12 +16,13 @@ from pathlib import Path
 
 SUITES = {
     "1-gpu": [
-        "test_server_perf_a.py",
-        "test_server_perf_b.py",
+        "test_server_a.py",
+        "test_server_b.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
-        "test_server_perf_2_gpu.py",
+        "test_server_2_gpu_a.py",
+        "test_server_2_gpu_b.py",
         # add new 2-gpu test files here
     ],
 }
