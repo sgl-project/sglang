@@ -700,24 +700,20 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        CacheClass = None
+        params = CacheInitParams(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            page_size=self.page_size,
+        )
 
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
             if not self.is_hybrid:
-                CacheClass = ChunkCache
+                self.tree_cache = ChunkCache(params)
             else:
-                CacheClass = SWAChunkCache
-
-            params = CacheInitParams(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
-
-            self.tree_cache = CacheClass(params)
+                self.tree_cache = SWAChunkCache(params)
         else:
             tp_cache_group = (
                 self.attn_tp_cpu_group
