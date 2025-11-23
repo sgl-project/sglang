@@ -733,17 +733,7 @@ class Scheduler(
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
                 logger.info("Using experimental C++ radix tree implementation.")
-                self.tree_cache = RadixCacheCpp(
-                    disable=False,
-                    use_hicache=self.enable_hierarchical_cache,
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=params.tp_cache_group,
-                    page_size=self.page_size,
-                    hicache_write_policy=server_args.hicache_write_policy,
-                    enable_metrics=self.enable_metrics,
-                    enable_kv_cache_events=self.enable_kv_cache_events,
-                )
+                self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
