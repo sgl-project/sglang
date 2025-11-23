@@ -534,7 +534,7 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
-                 + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+            + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
 
         parser.add_argument(
@@ -566,7 +566,7 @@ class ServerArgs:
             "--pin-cpu-memory",
             action=StoreBoolean,
             help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-                 "Should be enabled in almost all cases",
+            "Should be enabled in almost all cases",
         )
         parser.add_argument(
             "--disable-autocast",
