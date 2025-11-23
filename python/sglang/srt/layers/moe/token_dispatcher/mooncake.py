@@ -6,7 +6,6 @@ from typing import NamedTuple, Optional, Tuple
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -14,7 +13,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.utils import get_int_env_var
 
@@ -30,15 +28,16 @@ from enum import Enum, auto
 import torch
 import torch.distributed as dist
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 logger = logging.getLogger(__name__)
 
 
 class MooncakeDispatchOutput(NamedTuple):
     """Mooncake EP dispatch output."""
 
-    hidden_states: torch.Tensor
-    hidden_states_scale: Optional[torch.Tensor]
-    topk_ids: torch.Tensor
+    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
+    topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
     expected_m: int
@@ -153,23 +152,23 @@ class _MooncakeEPDispatcherImpl:
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
-        topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
         buffer = self._get_buffer()
-        topk_ids = topk_ids.to(torch.int64)
+        topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
-            topk_ids,
+            topk_idx,
             use_fp8=True,
         )
         return (
             hidden_states,
-            topk_ids,
+            topk_idx,
             topk_weights,
             masked_m,
             expected_m,
@@ -180,7 +179,7 @@ class _MooncakeEPDispatcherImpl:
     def dispatch_b(
         self,
         hidden_states,
-        topk_ids,
+        topk_idx,
         topk_weights,
         masked_m,
         expected_m,
@@ -200,8 +199,7 @@ class _MooncakeEPDispatcherImpl:
 
         return MooncakeDispatchOutput(
             hidden_states,
-            hidden_states_scale,
-            topk_ids,
+            topk_idx,
             topk_weights,
             masked_m,
             expected_m,
@@ -210,14 +208,14 @@ class _MooncakeEPDispatcherImpl:
     def _dispatch_core(
         self,
         hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+        topk_idx: torch.Tensor,
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
-                topk_ids,
+                topk_idx,
                 self.active_ranks,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
@@ -232,12 +230,12 @@ class _MooncakeEPDispatcherImpl:
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+        topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
-            topk_ids,
+            topk_idx,
             topk_weights,
         )
         return hidden_states, event, hook
@@ -249,13 +247,13 @@ class _MooncakeEPDispatcherImpl:
     def _combine_core(
         self,
         hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+        topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
-            topk_ids,
+            topk_idx,
             topk_weights,
             self.active_ranks,
             -1 if self.first_execution else self.timeout_us,
@@ -327,20 +325,24 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
+        input_global_scale: Optional[torch.Tensor],
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl().dispatch_a(
+        inner_state = self._get_impl(forward_batch).dispatch_a(
             hidden_states=hidden_states,
-            topk_output=topk_output,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
         )
-        self._dispatch_intermediate_state = inner_state
+        self._dispatch_intermediate_state = forward_batch, inner_state
 
     def dispatch_b(self):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
-        inner_state = self._dispatch_intermediate_state
+        forward_batch, inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl().dispatch_b(*inner_state)
+        return self._get_impl(forward_batch).dispatch_b(*inner_state)
 
     def combine(self, *args, **kwargs) -> Tuple:
         self.combine_a(*args, **kwargs)
@@ -350,27 +352,29 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+        topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
         overlap_args: Optional = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl().combine_a(
+        inner_state = self._get_impl(forward_batch).combine_a(
             hidden_states=hidden_states,
-            topk_ids=topk_ids,
+            topk_idx=topk_idx,
             topk_weights=topk_weights,
         )
-        self._combine_intermediate_state = inner_state
+        self._combine_intermediate_state = forward_batch, inner_state
 
     def combine_b(self):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-        inner_state = self._combine_intermediate_state
+        forward_batch, inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl().combine_b(*inner_state)
+        return self._get_impl(forward_batch).combine_b(*inner_state)
 
-    def _get_impl(self) -> _MooncakeEPDispatcherImpl:
-        is_extend_in_batch = get_is_extend_in_batch()
-        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
+    def _get_impl(self, forward_batch: ForwardBatch) -> _MooncakeEPDispatcherImpl:
+        resolved_deepep_mode = self.deepep_mode.resolve(
+            forward_batch.is_extend_in_batch
+        )
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             raise NotImplementedError
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
@@ -381,6 +385,3 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
-
-    def set_quant_config(self, quant_config: dict):
-        pass

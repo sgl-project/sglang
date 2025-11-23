@@ -118,8 +118,6 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_custom_logit_processor",
     "disaggregation_mode",
     "enable_deterministic_inference",
-    "nsa_prefill",
-    "nsa_decode",
     "multi_item_scoring_delimiter",
 ]
 

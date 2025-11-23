@@ -14,15 +14,18 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.moe.token_dispatcher.deepep import (
-    DeepEPLLCombineInput,
-    DeepEPNormalCombineInput,
-)
-from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    sglang_per_token_group_quant_fp8,
+)
+from sglang.srt.layers.quantization.modelopt_quant import (
+    CUTEDSL_MOE_NVFP4_DISPATCH,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
@@ -113,6 +116,23 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
+        # TODO: move to the beginning of the file
+        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
+
+        self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=self.top_k,
+            permute_fusion=True,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=params_dtype,
+            deepep_mode=self.deepep_mode,
+            async_finish=True,  # TODO
+            return_recv_hook=True,
+        )
+
         if self.deepep_mode.enable_low_latency() and not _is_npu:
             # NPU supports low_latency deepep without deepgemm
             assert (
@@ -152,24 +172,19 @@ class DeepEPMoE(FusedMoE):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
         forward_shared_experts=None,
         alt_stream=None,
         disable_sbo=False,
     ):
-
-        if self.deprecate_flag:
-            assert forward_shared_experts is None
-            assert alt_stream is None
-            return super().forward(
-                hidden_states,
-                topk_output,
-            )
-
         # We have to call SBO inside MoE to be compatible with hooks used in offloading
         return single_batch_overlap.execute_sbo(
             hidden_states=hidden_states,
-            topk_output=topk_output,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
             # SBO args
             experts=self,
             forward_shared_experts=forward_shared_experts,
@@ -180,14 +195,25 @@ class DeepEPMoE(FusedMoE):
     def dispatch(
         self,
         hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
     ):
-        return self.dispatcher.dispatch(
+        return self.deepep_dispatcher.dispatch(
             hidden_states=hidden_states,
-            topk_output=topk_output,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+            input_global_scale=(
+                self.w13_input_scale_quant
+                if isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+                and self.quant_method.enable_flashinfer_cutedsl_moe
+                and CUTEDSL_MOE_NVFP4_DISPATCH
+                else None
+            ),
         )
 
-    def run_moe_core(
+    def moe_impl(
         self,
         dispatch_output: DispatchOutput,
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
@@ -241,14 +267,16 @@ class DeepEPMoE(FusedMoE):
     def combine(
         self,
         hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+        topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
         overlap_args: Optional[Dict[str, Any]] = None,
     ):
-        return self.dispatcher.combine(
+        return self.deepep_dispatcher.combine(
             hidden_states=hidden_states,
-            topk_ids=topk_ids,
+            topk_idx=topk_idx,
             topk_weights=topk_weights,
+            forward_batch=forward_batch,
             overlap_args=overlap_args,
         )
 
@@ -256,9 +284,9 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput],
     ):
-        hidden_states, topk_ids, topk_weights = (
+        hidden_states, topk_idx, topk_weights = (
             dispatch_output.hidden_states,
-            dispatch_output.topk_ids,
+            dispatch_output.topk_idx,
             dispatch_output.topk_weights,
         )
         if hidden_states.shape[0] == 0:
@@ -266,15 +294,15 @@ class DeepEPMoE(FusedMoE):
         # in original deepep, idx == -1 meaning invalid and will not be processed.
         # aiter does not accept -1, we use a expert mask to make these idx invalid
         # (idx == num_local_experts) meaning not used in aiter fused_moe
-        topk_ids_copy = topk_ids.to(torch.int32)
-        topk_ids_copy[topk_ids_copy == -1] = self.num_local_experts
+        topk_idx_copy = topk_idx.to(torch.int32)
+        topk_idx_copy[topk_idx_copy == -1] = self.num_local_experts
 
         return fused_moe(
             hidden_states,
             self.w13_weight,
             self.w2_weight,
             topk_weights,
-            topk_ids_copy,
+            topk_idx_copy,
             w1_scale=self.w13_weight_scale_inv,
             w2_scale=self.w2_weight_scale_inv,
             quant_type=QuantType.per_128x128,
@@ -286,18 +314,164 @@ class DeepEPMoE(FusedMoE):
             expert_mask=self.expert_mask,
         )
 
+    def forward_deepgemm_contiguous(
+        self,
+        dispatch_output: DeepEPNormalOutput,
+    ):
+        hidden_states_fp8, topk_idx, topk_weights, num_recv_tokens_per_expert = (
+            dispatch_output
+        )
+        hidden_states_fp8, hidden_states_scale = hidden_states_fp8
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+        if num_recv_tokens_per_expert is None:
+            return hidden_states_fp8.bfloat16()
+        all_tokens = sum(num_recv_tokens_per_expert)
+        if all_tokens <= 0:
+            return hidden_states_fp8.bfloat16()
+        M, K = hidden_states_fp8.size()
+        N = self.w13_weight.size(1)
+        scale_block_size = 128
+
+        w13_weight_fp8 = (
+            self.w13_weight,
+            (
+                self.w13_weight_scale_inv
+                if self.use_block_quant
+                else self.w13_weight_scale
+            ),
+        )
+        w2_weight_fp8 = (
+            self.w2_weight,
+            (
+                self.w2_weight_scale_inv
+                if self.use_block_quant
+                else self.w2_weight_scale
+            ),
+        )
+
+        hidden_states_fp8_shape = hidden_states_fp8.shape
+        hidden_states_fp8_device = hidden_states_fp8.device
+        hidden_states_fp8_dtype = hidden_states_fp8.dtype
+
+        input_tensor = [
+            torch.empty(
+                (all_tokens, K),
+                device=hidden_states_fp8.device,
+                dtype=hidden_states_fp8.dtype,
+            ),
+            (
+                # TODO check whether need `zeros`
+                torch.zeros(
+                    (ceil_div(K // 128, 4), all_tokens),
+                    device=hidden_states_fp8.device,
+                    dtype=torch.int,
+                ).transpose(0, 1)
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else torch.empty(
+                    (all_tokens, K // 128),
+                    device=hidden_states_fp8.device,
+                    dtype=torch.float32,
+                )
+            ),
+        ]
+        m_indices = torch.empty(
+            all_tokens, device=hidden_states_fp8.device, dtype=torch.int32
+        )
+        output_index = torch.empty_like(topk_idx)
+
+        if get_offloader().forbid_copy_engine_usage:
+            num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
+                num_recv_tokens_per_expert
+            )
+        else:
+            num_recv_tokens_per_expert_gpu = torch.tensor(
+                num_recv_tokens_per_expert,
+                dtype=torch.int32,
+                pin_memory=True,
+                device="cpu",
+            ).cuda(non_blocking=True)
+        expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+
+        ep_scatter(
+            hidden_states_fp8,
+            hidden_states_scale,
+            topk_idx,
+            num_recv_tokens_per_expert_gpu,
+            expert_start_loc,
+            input_tensor[0],
+            input_tensor[1],
+            m_indices,
+            output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+        dispose_tensor(hidden_states_fp8)
+
+        gateup_output = torch.empty(
+            (all_tokens, N),
+            device=hidden_states_fp8_device,
+            dtype=torch.bfloat16,
+        )
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            input_tensor[1] = tma_align_input_scale(input_tensor[1])
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+            input_tensor, w13_weight_fp8, gateup_output, m_indices
+        )
+        del input_tensor
+        down_input = torch.empty(
+            (
+                all_tokens,
+                N // 2,
+            ),
+            device=gateup_output.device,
+            dtype=torch.bfloat16,
+        )
+        silu_and_mul(gateup_output.view(-1, N), down_input)
+        del gateup_output
+        down_output = torch.empty(
+            (all_tokens, K),
+            device=hidden_states_fp8_device,
+            dtype=torch.bfloat16,
+        )
+        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+            down_input,
+            scale_block_size,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+        del down_input
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            down_input_scale = tma_align_input_scale(down_input_scale)
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+            (down_input_fp8, down_input_scale),
+            w2_weight_fp8,
+            down_output,
+            m_indices,
+        )
+        del down_input_fp8, down_input_scale
+
+        gather_out = torch.empty(
+            hidden_states_fp8_shape,
+            device=hidden_states_fp8_device,
+            dtype=torch.bfloat16,
+        )
+        ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
+
+        return gather_out
+
     def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLDispatchOutput,
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
     ):
-        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+        hidden_states, _, _, masked_m, _ = dispatch_output
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
 
         output = self.quant_method.apply_without_routing_weights(
             layer=self,
-            x=(hidden_states, hidden_states_scale),
+            x=hidden_states,
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
             down_gemm_overlap_args=down_gemm_overlap_args,
@@ -319,15 +493,78 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPLLDispatchOutput,
     ):
+        hidden_states_fp8, _, _, masked_m, expected_m = dispatch_output
+        assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
-        assert isinstance(self.quant_method, W4AFp8MoEMethod)
-        assert get_bool_env_var(
-            "SGLANG_DEEPEP_BF16_DISPATCH"
-        ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
-        return self.quant_method.apply_deepep_ll(
-            layer=self,
-            dispatch_output=dispatch_output,
+
+        # GroupGemm-0
+        num_groups, m, k = hidden_states_fp8[0].size()
+        n = self.w13_weight.size(1)
+        expected_m = min(expected_m, m)
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            hidden_states_fp8,
+            self.w13_weight_fp8,
+            gateup_output,
+            masked_m,
+            expected_m,
+        )
+        dispose_tensor(hidden_states_fp8[0])
+
+        # Act
+        down_input = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2,
+            ),
+            device=gateup_output.device,
+            dtype=self.fp8_dtype,
+        )
+        scale_block_size = 128
+        down_input_scale = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2 // scale_block_size,
+            ),
+            device=gateup_output.device,
+            dtype=torch.float32,
+        )
+        silu_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            scale_block_size,
+            masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+        del gateup_output
+
+        # GroupGemm-1
+        n = self.w2_weight.size(1)
+        down_input_fp8 = (
+            down_input,
+            (
+                down_input_scale
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(down_input_scale)
+            ),
+        )
+        down_output = torch.empty(
+            (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            down_input_fp8,
+            self.w2_weight_fp8,
+            down_output,
+            masked_m,
+            expected_m,
+        )
+
+        return down_output
 
     def forward_npu(
         self,
@@ -346,10 +583,12 @@ class DeepEPMoE(FusedMoE):
 
         def _forward_normal(dispatch_output: DeepEPNormalDispatchOutput):
             if TYPE_CHECKING:
-                assert isinstance(dispatch_output, DeepEPNormalDispatchOutput)
-            hidden_states, hidden_states_scale, _, _, num_recv_tokens_per_expert = (
-                dispatch_output
-            )
+                assert isinstance(dispatch_output, DeepEPNormalOutput)
+            hidden_states, _, _, num_recv_tokens_per_expert = dispatch_output
+
+            if isinstance(hidden_states, tuple):
+                per_token_scale = hidden_states[1]
+                hidden_states = hidden_states[0]
 
             group_list = torch.tensor(num_recv_tokens_per_expert, dtype=torch.int64).to(
                 hidden_states.device
@@ -359,7 +598,7 @@ class DeepEPMoE(FusedMoE):
                 hidden_states = torch_npu.npu_grouped_matmul(
                     x=[hidden_states],
                     weight=[self.w13_weight.permute(0, 2, 1)],
-                    # per_token_scale=[hidden_states_scale],
+                    # per_token_scale=[per_token_scale],
                     split_item=2,
                     group_list_type=group_list_type,
                     group_type=0,
@@ -379,7 +618,7 @@ class DeepEPMoE(FusedMoE):
                 )[0]
             else:
                 if not get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT"):
-                    hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
+                    hidden_states, per_token_scale = torch_npu.npu_dynamic_quant(
                         hidden_states
                     )
                 # gmm1: gate_up_proj
@@ -387,7 +626,7 @@ class DeepEPMoE(FusedMoE):
                     x=[hidden_states],
                     weight=[self.w13_weight],
                     scale=[self.w13_weight_scale.to(output_dtype)],
-                    per_token_scale=[hidden_states_scale],
+                    per_token_scale=[per_token_scale],
                     split_item=2,
                     group_list_type=group_list_type,
                     group_type=0,
@@ -418,15 +657,12 @@ class DeepEPMoE(FusedMoE):
 
         def _forward_ll(dispatch_output: DeepEPLLDispatchOutput):
             if TYPE_CHECKING:
-                assert isinstance(dispatch_output, DeepEPLLDispatchOutput)
-            (
-                hidden_states,
-                hidden_states_scale,
-                topk_ids,
-                topk_weights,
-                group_list,
-                _,
-            ) = dispatch_output
+                assert isinstance(dispatch_output, DeepEPLLOutput)
+            hidden_states, topk_idx, topk_weights, group_list, _ = dispatch_output
+
+            if isinstance(hidden_states, tuple):
+                per_token_scale = hidden_states[1]
+                hidden_states = hidden_states[0]
 
             group_list = group_list.to(torch.int64)
 
@@ -435,7 +671,7 @@ class DeepEPMoE(FusedMoE):
                 hidden_states = torch_npu.npu_grouped_matmul(
                     x=[hidden_states],
                     weight=[self.w13_weight.permute(0, 2, 1)],
-                    # per_token_scale=[hidden_states_scale],
+                    # per_token_scale=[per_token_scale],
                     split_item=2,
                     group_list_type=group_list_type,
                     group_type=0,
@@ -469,7 +705,7 @@ class DeepEPMoE(FusedMoE):
                 hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
                     x=hidden_states,
                     weight_scale=self.w13_weight_scale.to(torch.float32),
-                    activation_scale=hidden_states_scale,
+                    activation_scale=per_token_scale,
                     bias=None,
                     quant_scale=None,
                     quant_offset=None,

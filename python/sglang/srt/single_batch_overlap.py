@@ -1,19 +1,3 @@
-# Copyright 2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -21,12 +5,12 @@ import torch
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import is_sbo_enabled
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
 
 class SboFlags:
@@ -70,22 +54,23 @@ class DownGemmOverlapArgs:
 
 def execute_sbo(
     forward_shared_experts: Callable[[], Any],
-    experts: FusedMoE,
+    experts: "DeepEPMoE",
     hidden_states: torch.Tensor,
-    topk_output: TopKOutput,
-    alt_stream: Optional[torch.cuda.Stream] = None,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    forward_batch: ForwardBatch,
+    alt_stream: Optional = None,
     disable_sbo: bool = False,
 ):
-
-    dispatch_output = experts.dispatcher.dispatch(
-        hidden_states=hidden_states, topk_output=topk_output
+    dispatch_output = experts.dispatch(
+        hidden_states, topk_idx, topk_weights, forward_batch
     )
 
     combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
         _compute_overlap_args(dispatch_output, alt_stream, disable_sbo=disable_sbo)
     )
 
-    combine_input = experts.run_moe_core(
+    hidden_states = experts.moe_impl(
         dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
     )
     if (e := meta_overlap_args.get("record_event_after_down")) is not None:
@@ -98,7 +83,13 @@ def execute_sbo(
         ):
             forward_shared_experts()
 
-    hidden_states = experts.dispatcher.combine(combine_input=combine_input)
+    hidden_states = experts.combine(
+        hidden_states,
+        dispatch_output.topk_idx,
+        dispatch_output.topk_weights,
+        forward_batch,
+        overlap_args=combine_overlap_args,
+    )
 
     return hidden_states
 
@@ -110,7 +101,9 @@ def _compute_overlap_args(dispatch_output, alt_stream, disable_sbo):
     ):
         return None, None, {}
 
-    hidden_states = dispatch_output.hidden_states
+    hidden_states = dispatch_output.hidden_states_fp8
+    if isinstance(hidden_states, tuple):
+        hidden_states = hidden_states[0]
 
     num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
 

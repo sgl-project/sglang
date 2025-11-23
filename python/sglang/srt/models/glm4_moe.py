@@ -54,10 +54,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
-)
+from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -74,7 +71,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -421,6 +418,19 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 self.gate.e_score_correction_bias.data
                 if self.gate.e_score_correction_bias is not None
                 else None
+            )
+
+            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
+                group=parallel_state.get_tp_group().device_group,
+                router_topk=self.top_k,
+                permute_fusion=True,
+                num_experts=self.num_experts,
+                num_local_experts=config.n_routed_experts // self.tp_size,
+                hidden_size=config.hidden_size,
+                params_dtype=config.torch_dtype,
+                deepep_mode=get_deepep_mode(),
+                async_finish=True,
+                return_recv_hook=True,
             )
 
         self._enable_a2a_moe = (
