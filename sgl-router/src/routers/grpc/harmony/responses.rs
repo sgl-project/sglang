@@ -54,15 +54,18 @@ use crate::{
             ResponsesUsage, StringOrContentParts,
         },
     },
-    routers::grpc::{
-        common::responses::{
-            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
-            streaming::{OutputItemType, ResponseStreamEventEmitter},
+    routers::{
+        common::strip_server_label,
+        grpc::{
+            common::responses::{
+                build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+                streaming::{OutputItemType, ResponseStreamEventEmitter},
+            },
+            context::SharedComponents,
+            error,
+            harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
+            pipeline::RequestPipeline,
         },
-        context::SharedComponents,
-        error,
-        harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
-        pipeline::RequestPipeline,
     },
 };
 
@@ -692,9 +695,9 @@ async fn execute_mcp_tool_loop_streaming(
     // Build tools list for item structure
     let tool_items: Vec<_> = mcp_tools
         .iter()
-        .map(|t| {
+        .map(|(qualified_name, _server_name, t)| {
             json!({
-                "name": t.name,
+                "name": qualified_name,
                 "description": t.description,
                 "input_schema": Value::Object((*t.input_schema).clone())
             })
@@ -1401,13 +1404,16 @@ pub(crate) struct ToolResult {
 ///
 /// Converts MCP Tool entries (from rmcp SDK) to ResponseTool format so the model
 /// knows about available MCP tools when making tool calls.
-pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
+/// Tools from MCP manager's list_tools() have qualified names (server_label__tool_name).
+pub fn convert_mcp_tools_to_response_tools(
+    mcp_tools: &[(String, String, mcp::Tool)],
+) -> Vec<ResponseTool> {
     mcp_tools
         .iter()
-        .map(|tool_info| ResponseTool {
+        .map(|(qualified_name, _server_name, tool_info)| ResponseTool {
             r#type: ResponseToolType::Mcp,
             function: Some(Function {
-                name: tool_info.name.to_string(),
+                name: qualified_name.clone(),
                 description: tool_info.description.as_ref().map(|d| d.to_string()),
                 parameters: Value::Object((*tool_info.input_schema).clone()),
                 strict: None,
@@ -1443,7 +1449,7 @@ fn inject_mcp_metadata(
     let tools = mcp_manager.list_tools();
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
-        .map(|t| McpToolInfo {
+        .map(|(_qualified_name, _server_name, t)| McpToolInfo {
             name: t.name.to_string(),
             description: t.description.as_ref().map(|d| d.to_string()),
             input_schema: Value::Object((*t.input_schema).clone()),
@@ -1474,7 +1480,7 @@ fn inject_mcp_metadata(
             approval_request_id: None,
             arguments: record.arguments.clone(),
             error: record.error.clone(),
-            name: record.tool_name.clone(),
+            name: strip_server_label(&record.tool_name).to_string(),
             output: record.output.clone(),
             server_label: tracking.server_label.clone(),
         })

@@ -21,6 +21,7 @@ use crate::protocols::{
     responses::{ResponsesGetParams, ResponsesRequest},
 };
 
+pub mod common;
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;

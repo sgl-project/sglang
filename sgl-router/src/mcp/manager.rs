@@ -3,16 +3,12 @@
 //! Manages both static MCP servers (from config) and dynamic MCP servers (from requests).
 //! Static clients are never evicted; dynamic clients use LRU eviction via connection pool.
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
 use rmcp::{
-    model::{
-        CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult,
-        ReadResourceRequestParam, ReadResourceResult, SubscribeRequestParam,
-        UnsubscribeRequestParam,
-    },
+    model::{CallToolRequestParam, CallToolResult},
     service::RunningService,
     transport::{
         sse_client::SseClientConfig, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -20,11 +16,10 @@ use rmcp::{
     },
     RoleClient, ServiceExt,
 };
-use serde_json::Map;
 use tracing::{debug, error, info, warn};
 
 use crate::mcp::{
-    config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Prompt, RawResource, Tool},
+    config::{McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Tool},
     connection_pool::McpConnectionPool,
     error::{McpError, McpResult},
     inventory::ToolInventory,
@@ -51,12 +46,12 @@ impl McpManager {
             McpConnectionPool::with_full_config(pool_max_connections, config.proxy.clone());
 
         let inventory_clone = Arc::clone(&inventory);
-        connection_pool.set_eviction_callback(move |server_key: &str| {
+        connection_pool.set_eviction_callback(move |server_label: &str| {
             debug!(
                 "LRU evicted dynamic server '{}' - clearing tools from inventory",
-                server_key
+                server_label
             );
-            inventory_clone.clear_server_tools(server_key);
+            inventory_clone.clear_server_tools(server_label);
         });
 
         let connection_pool = Arc::new(connection_pool);
@@ -73,7 +68,7 @@ impl McpManager {
                 Ok(client) => {
                     let client_arc = Arc::new(client);
                     // Load inventory for this server
-                    Self::load_server_inventory(&inventory, &server_config.name, &client_arc).await;
+                    Self::load_server_inventory(&inventory, server_config, &client_arc).await;
                     static_clients.insert(server_config.name.clone(), client_arc);
                     info!("Connected to static server '{}'", server_config.name);
                 }
@@ -102,11 +97,11 @@ impl McpManager {
         Self::new(config, Self::MAX_DYNAMIC_CLIENTS).await
     }
 
-    pub async fn get_client(&self, server_name: &str) -> Option<Arc<McpClient>> {
+    pub async fn get_client(&self, server_name: &str, server_url: &str) -> Option<Arc<McpClient>> {
         if let Some(client) = self.static_clients.get(server_name) {
             return Some(Arc::clone(client.value()));
         }
-        self.connection_pool.get(server_name)
+        self.connection_pool.get(server_url)
     }
 
     pub async fn get_or_create_client(
@@ -124,15 +119,15 @@ impl McpManager {
             .connection_pool
             .get_or_create(
                 &server_key,
-                server_config,
+                server_config.clone(),
                 |config, global_proxy| async move {
                     Self::connect_server(&config, global_proxy.as_ref()).await
                 },
             )
             .await?;
 
-        self.inventory.clear_server_tools(&server_key);
-        Self::load_server_inventory(&self.inventory, &server_key, &client).await;
+        self.inventory.clear_server_tools(&server_name);
+        Self::load_server_inventory(&self.inventory, &server_config, &client).await;
         Ok(client)
     }
 
@@ -153,28 +148,27 @@ impl McpManager {
     }
 
     /// List all available tools from all servers
-    pub fn list_tools(&self) -> Vec<Tool> {
-        self.inventory
-            .list_tools()
-            .into_iter()
-            .map(|(_tool_name, _server_name, tool_info)| tool_info)
-            .collect()
+    ///
+    /// Returns Vec of (qualified_tool_name, server_label, Tool) where qualified_tool_name is server_label__tool_name
+    pub fn list_tools(&self) -> Vec<(String, String, Tool)> {
+        self.inventory.list_tools()
     }
 
-    /// Call a tool by name with automatic type coercion
+    /// Call a tool by qualified name with automatic type coercion
     ///
+    /// Accepts qualified tool name in the format `server_label__tool_name`.
     /// Accepts either JSON string or parsed Map as arguments.
     /// Automatically converts string numbers to actual numbers based on tool schema.
     pub async fn call_tool(
         &self,
-        tool_name: &str,
+        qualified_tool_name: &str,
         args: impl Into<ToolArgs>,
     ) -> McpResult<CallToolResult> {
-        // Get tool info for schema and server
-        let (server_name, tool_info) = self
+        // Get tool info for schema and server using qualified name
+        let (server_label, server_url, tool_info) = self
             .inventory
-            .get_tool(tool_name)
-            .ok_or_else(|| McpError::ToolNotFound(tool_name.to_string()))?;
+            .get_tool(qualified_tool_name)
+            .ok_or_else(|| McpError::ToolNotFound(qualified_tool_name.to_string()))?;
 
         // Convert args with type coercion based on schema
         let tool_schema = Some(serde_json::Value::Object((*tool_info.input_schema).clone()));
@@ -185,13 +179,14 @@ impl McpManager {
 
         // Get client for that server
         let client = self
-            .get_client(&server_name)
+            .get_client(&server_label, &server_url)
             .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
+            .ok_or_else(|| McpError::ServerNotFound(server_label.clone()))?;
 
-        // Call the tool
+        // Call the tool using the original tool name from the Tool struct
+        // (not the qualified name, since the MCP server expects the original name)
         let request = CallToolRequestParam {
-            name: Cow::Owned(tool_name.to_string()),
+            name: tool_info.name.clone(),
             arguments: args_map,
         };
 
@@ -205,86 +200,17 @@ impl McpManager {
     pub fn get_tool(&self, tool_name: &str) -> Option<Tool> {
         self.inventory
             .get_tool(tool_name)
-            .map(|(_server_name, tool_info)| tool_info)
-    }
-
-    /// Get a prompt by name
-    pub async fn get_prompt(
-        &self,
-        prompt_name: &str,
-        args: Option<Map<String, serde_json::Value>>,
-    ) -> McpResult<GetPromptResult> {
-        // Get server that owns this prompt
-        let (server_name, _prompt_info) = self
-            .inventory
-            .get_prompt(prompt_name)
-            .ok_or_else(|| McpError::PromptNotFound(prompt_name.to_string()))?;
-
-        // Get client for that server
-        let client = self
-            .get_client(&server_name)
-            .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
-
-        // Get the prompt
-        let request = GetPromptRequestParam {
-            name: prompt_name.to_string(),
-            arguments: args,
-        };
-
-        client
-            .get_prompt(request)
-            .await
-            .map_err(|e| McpError::Transport(format!("Failed to get prompt: {}", e)))
-    }
-
-    /// List all available prompts
-    pub fn list_prompts(&self) -> Vec<Prompt> {
-        self.inventory
-            .list_prompts()
-            .into_iter()
-            .map(|(_prompt_name, _server_name, prompt_info)| prompt_info)
-            .collect()
-    }
-
-    /// Read a resource by URI
-    pub async fn read_resource(&self, uri: &str) -> McpResult<ReadResourceResult> {
-        // Get server that owns this resource
-        let (server_name, _resource_info) = self
-            .inventory
-            .get_resource(uri)
-            .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
-
-        // Get client for that server
-        let client = self
-            .get_client(&server_name)
-            .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
-
-        // Read the resource
-        let request = ReadResourceRequestParam {
-            uri: uri.to_string(),
-        };
-
-        client
-            .read_resource(request)
-            .await
-            .map_err(|e| McpError::Transport(format!("Failed to read resource: {}", e)))
-    }
-
-    /// List all available resources
-    pub fn list_resources(&self) -> Vec<RawResource> {
-        self.inventory
-            .list_resources()
-            .into_iter()
-            .map(|(_resource_uri, _server_name, resource_info)| resource_info)
-            .collect()
+            .map(|(_server_label, _server_url, tool_info)| tool_info)
     }
 
     /// Refresh inventory for a specific server
-    pub async fn refresh_server_inventory(&self, server_name: &str) -> McpResult<()> {
+    pub async fn refresh_server_inventory(
+        &self,
+        server_name: &str,
+        server_url: &str,
+    ) -> McpResult<()> {
         let client = self
-            .get_client(server_name)
+            .get_client(server_name, server_url)
             .await
             .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
 
@@ -310,21 +236,25 @@ impl McpManager {
                 // Get all static server keys
                 // Note: Dynamic clients in the connection pool are refreshed on-demand
                 // when they are accessed via get_or_create_client()
-                let server_keys: Vec<String> = self
+                let server_names: Vec<String> = self
                     .static_clients
                     .iter()
                     .map(|e| e.key().clone())
                     .collect();
 
-                if !server_keys.is_empty() {
+                if !server_names.is_empty() {
                     debug!(
                         "Background refresh: Refreshing {} static server(s)",
-                        server_keys.len()
+                        server_names.len()
                     );
 
-                    for server_key in server_keys {
-                        if let Err(e) = self.refresh_server_inventory(&server_key).await {
-                            warn!("Background refresh failed for '{}': {}", server_key, e);
+                    for server_name in server_names {
+                        // For static servers, use server_name as both name and URL
+                        if let Err(e) = self
+                            .refresh_server_inventory(&server_name, &server_name)
+                            .await
+                        {
+                            warn!("Background refresh failed for '{}': {}", server_name, e);
                         }
                     }
 
@@ -337,62 +267,6 @@ impl McpManager {
     /// Check if a tool exists
     pub fn has_tool(&self, name: &str) -> bool {
         self.inventory.has_tool(name)
-    }
-
-    /// Get prompt info by name
-    pub fn get_prompt_info(&self, name: &str) -> Option<Prompt> {
-        self.inventory.get_prompt(name).map(|(_server, info)| info)
-    }
-
-    /// Get resource info by URI
-    pub fn get_resource_info(&self, uri: &str) -> Option<RawResource> {
-        self.inventory.get_resource(uri).map(|(_server, info)| info)
-    }
-
-    /// Subscribe to resource changes
-    pub async fn subscribe_resource(&self, uri: &str) -> McpResult<()> {
-        let (server_name, _resource_info) = self
-            .inventory
-            .get_resource(uri)
-            .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
-
-        let client = self
-            .get_client(&server_name)
-            .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
-
-        debug!("Subscribing to '{}' on '{}'", uri, server_name);
-
-        client
-            .peer()
-            .subscribe(SubscribeRequestParam {
-                uri: uri.to_string(),
-            })
-            .await
-            .map_err(|e| McpError::ToolExecution(format!("Failed to subscribe: {}", e)))
-    }
-
-    /// Unsubscribe from resource changes
-    pub async fn unsubscribe_resource(&self, uri: &str) -> McpResult<()> {
-        let (server_name, _resource_info) = self
-            .inventory
-            .get_resource(uri)
-            .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))?;
-
-        let client = self
-            .get_client(&server_name)
-            .await
-            .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
-
-        debug!("Unsubscribing from '{}' on '{}'", uri, server_name);
-
-        client
-            .peer()
-            .unsubscribe(UnsubscribeRequestParam {
-                uri: uri.to_string(),
-            })
-            .await
-            .map_err(|e| McpError::ToolExecution(format!("Failed to unsubscribe: {}", e)))
     }
 
     /// List all connected servers (static + dynamic)
@@ -442,13 +316,10 @@ impl McpManager {
 
     /// Get statistics about the manager
     pub fn stats(&self) -> McpManagerStats {
-        let (tools, prompts, resources) = self.inventory.counts();
         McpManagerStats {
             static_server_count: self.static_clients.len(),
             pool_stats: self.connection_pool.stats(),
-            tool_count: tools,
-            prompt_count: prompts,
-            resource_count: resources,
+            tool_count: self.inventory.count(),
         }
     }
 
@@ -470,82 +341,48 @@ impl McpManager {
     /// Discover and cache tools/prompts/resources for a connected server
     ///
     /// This method is public to allow workflow-based inventory loading.
-    /// It discovers all tools, prompts, and resources from the client and caches them in the inventory.
     pub async fn load_server_inventory(
         inventory: &Arc<ToolInventory>,
-        server_key: &str,
+        server_config: &McpServerConfig,
         client: &Arc<McpClient>,
     ) {
-        // Tools
-        match client.peer().list_all_tools().await {
-            Ok(ts) => {
-                info!("Discovered {} tools from '{}'", ts.len(), server_key);
-                for t in ts {
-                    inventory.insert_tool(t.name.to_string(), server_key.to_string(), t);
-                }
-            }
-            Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
-        }
+        let server_name = &server_config.name;
+        let server_url = Self::server_key(server_config);
 
-        // Prompts
-        match client.peer().list_all_prompts().await {
-            Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_key);
-                for p in ps {
-                    inventory.insert_prompt(p.name.clone(), server_key.to_string(), p);
-                }
-            }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_key, e),
-        }
-
-        // Resources
-        match client.peer().list_all_resources().await {
-            Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_key);
-                for r in rs {
-                    inventory.insert_resource(r.uri.clone(), server_key.to_string(), r.raw);
-                }
-            }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_key, e),
-        }
-    }
-
-    /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
-    async fn load_server_inventory_internal(&self, server_name: &str, client: &McpClient) {
         // Tools
         match client.peer().list_all_tools().await {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_name);
                 for t in ts {
-                    self.inventory
-                        .insert_tool(t.name.to_string(), server_name.to_string(), t);
+                    inventory.insert_tool(
+                        t.name.to_string(),
+                        server_name.to_string(),
+                        server_url.clone(),
+                        t,
+                    );
                 }
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
         }
+    }
 
-        // Prompts
-        match client.peer().list_all_prompts().await {
-            Ok(ps) => {
-                info!("Discovered {} prompts from '{}'", ps.len(), server_name);
-                for p in ps {
-                    self.inventory
-                        .insert_prompt(p.name.clone(), server_name.to_string(), p);
+    /// Discover and cache tools/prompts/resources for a connected server (internal wrapper)
+    async fn load_server_inventory_internal(&self, server_name: &str, client: &Arc<McpClient>) {
+        // For refresh operations
+        match client.peer().list_all_tools().await {
+            Ok(ts) => {
+                info!("Discovered {} tools from '{}'", ts.len(), server_name);
+                for t in ts {
+                    self.inventory.insert_tool(
+                        t.name.to_string(),
+                        server_name.to_string(),
+                        // Note: server_url is the same as server_name for static servers
+                        server_name.to_string(),
+                        t,
+                    );
                 }
             }
-            Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
-        }
-
-        // Resources
-        match client.peer().list_all_resources().await {
-            Ok(rs) => {
-                info!("Discovered {} resources from '{}'", rs.len(), server_name);
-                for r in rs {
-                    self.inventory
-                        .insert_resource(r.uri.clone(), server_name.to_string(), r.raw);
-                }
-            }
-            Err(e) => debug!("No resources or failed to list on '{}': {}", server_name, e),
+            Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
         }
     }
 
@@ -756,10 +593,6 @@ pub struct McpManagerStats {
     pub pool_stats: crate::mcp::connection_pool::PoolStats,
     /// Number of cached tools
     pub tool_count: usize,
-    /// Number of cached prompts
-    pub prompt_count: usize,
-    /// Number of cached resources
-    pub resource_count: usize,
 }
 
 #[cfg(test)]
