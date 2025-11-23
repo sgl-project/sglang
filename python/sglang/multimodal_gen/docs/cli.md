@@ -147,9 +147,9 @@ sglang serve "${SERVER_ARGS[@]}"
 ```
 
 - **--model-path**: Which model to load. The example uses `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
-- **--port**: HTTP port to listen on (the default here is `30010`).
+- **--port**: HTTP port to listen on (the default here is `3000`).
 
-Wait until the port is listening. In CI, the tests probe `127.0.0.1:30010` before sending requests.
+Wait until the port is listening. In CI, the tests probe `127.0.0.1:3000` before sending requests.
 
 ### OpenAI Python SDK usage
 
@@ -158,7 +158,7 @@ Initialize the client with a dummy API key and point `base_url` to your local se
 ```python
 from openai import OpenAI
 
-client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1")
+client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:3000/v1")
 ```
 
 - **Create a video**
@@ -206,7 +206,7 @@ with open("output.mp4", "wb") as f:
 - **Create a video**
 
 ```bash
-curl -sS -X POST "http://localhost:30010/v1/videos" \
+curl -sS -X POST "http://localhost:3000/v1/videos" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-proj-1234567890" \
   -d '{
@@ -218,14 +218,14 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
 - **List videos**
 
 ```bash
-curl -sS -X GET "http://localhost:30010/v1/videos" \
+curl -sS -X GET "http://localhost:3000/v1/videos" \
   -H "Authorization: Bearer sk-proj-1234567890"
 ```
 
 - **Download video content**
 
 ```bash
-curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
+curl -sS -L "http://localhost:3000/v1/videos/<VIDEO_ID>/content" \
   -H "Authorization: Bearer sk-proj-1234567890" \
   -o output.mp4
 ```
