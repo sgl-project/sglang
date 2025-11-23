@@ -32,16 +32,18 @@ the optimized kernels and infrastructure and expose an explicit
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from transformers import PretrainedConfig
-
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
-class PanguEmbeddedModel(LlamaModel):
-    """Thin wrapper that reuses the optimized LLaMA block composition."""
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+
+# Thin alias; we reuse the optimized LLaMA block composition directly.
+PanguEmbeddedModel = LlamaModel
 
 
 class PanguEmbeddedForCausalLM(LlamaForCausalLM):
@@ -49,17 +51,17 @@ class PanguEmbeddedForCausalLM(LlamaForCausalLM):
 
     We override `_init_model` to construct `PanguEmbeddedModel`, but otherwise
     inherit the high-performance runtime from the LLaMA implementation.  The
-    weight mapping logic in class `LlamaForCausalLM` is compatible with the
+    weight mapping logic in :class:`LlamaForCausalLM` is compatible with the
     official checkpoint structure (q/k/v projections + SwiGLU MLP), so no
     additional remapping is required.
     """
 
     def _init_model(
         self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        config: "PretrainedConfig",
+        quant_config: Optional["QuantizationConfig"] = None,
         prefix: str = "",
-    ) -> PanguEmbeddedModel:
+    ):
         return PanguEmbeddedModel(config, quant_config=quant_config, prefix=prefix)
 
 
