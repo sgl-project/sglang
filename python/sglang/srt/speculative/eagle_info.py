@@ -137,6 +137,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 last_loc,
                 len(batch.input_ids),
             )
+            for req in batch.reqs:
+                req.kv_allocated_len += self.draft_token_num
             self.last_loc = last_loc
 
         bs = batch.batch_size()
@@ -478,6 +480,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
                 )
+                for i, req in enumerate(batch.reqs):
+                    req.kv_committed_len += accept_length_list[i] + 1
+                    req.kv_allocated_len = req.kv_committed_len
 
         # Construct EagleVerifyOutput
         if not has_finished:

@@ -449,6 +449,8 @@ class EAGLEWorker(TpModelWorker):
                     backup_state=True,
                 )
             )
+            for req in batch.reqs:
+                req.kv_allocated_len += self.speculative_num_steps * self.topk
 
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
