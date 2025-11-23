@@ -15,7 +15,10 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.utils.logging_utils import _SGLDiffusionLogger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    _SGLDiffusionLogger,
+    get_is_main_process,
+)
 
 
 @dataclasses.dataclass
@@ -246,14 +249,15 @@ class PerformanceLogger:
         )
 
         try:
-            log_dir = get_diffusion_perf_log_dir()
-            if not os.path.exists(log_dir):
-                os.makedirs(log_dir, exist_ok=True)
+            if get_is_main_process():
+                log_dir = get_diffusion_perf_log_dir()
+                if not os.path.exists(log_dir):
+                    os.makedirs(log_dir, exist_ok=True)
 
-            log_file = os.path.join(log_dir, "performance.log")
+                log_file = os.path.join(log_dir, "performance.log")
 
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(dataclasses.asdict(record)) + "\n")
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(dataclasses.asdict(record)) + "\n")
 
         except (OSError, PermissionError) as e:
             print(f"WARNING: Failed to log performance record: {e}", file=sys.stderr)
