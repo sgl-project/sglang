@@ -664,7 +664,10 @@ class Qwen3MoeModel(Qwen2MoeModel):
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
-
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "experts": ["gate_proj", "down_proj", "up_proj"],
+    }
     def __init__(
         self,
         config: Qwen3MoeConfig,
@@ -806,6 +809,11 @@ class Qwen3MoeForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
         )
+
+        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
+                num_experts=self.config.num_experts,
+            )
 
         # Cache params_dict to avoid repeated expensive traversal of model parameters
         if not hasattr(self, "_cached_params_dict"):

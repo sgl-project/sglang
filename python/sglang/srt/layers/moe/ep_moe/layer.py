@@ -18,6 +18,12 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsWInt4AFp8MoEMethod,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
@@ -89,6 +95,13 @@ class DeepEPMoE(FusedMoE):
             quant_config, Fp8Config
         ):
             self.deprecate_flag = True
+        elif (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and isinstance(quant_config, CompressedTensorsConfig)
+            and quant_config._is_wfp8afp8_moe
+            and getattr(self.quant_method, "block_quant", False)
+        ):
+            self.deprecate_flag = True
         else:
             self.deprecate_flag = False
 
@@ -104,6 +117,16 @@ class DeepEPMoE(FusedMoE):
             self.use_w4afp8 = True
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
+        elif isinstance(quant_config, CompressedTensorsConfig):
+            if quant_config._is_wint4afp8_moe:
+                self.use_w4afp8 = True
+                self.use_fp8_w8a8 = False
+                self.use_block_quant = False
+            elif quant_config._is_wfp8afp8_moe:
+                self.use_block_quant = getattr(self.quant_method, "block_quant", False)
+                self.use_fp8_w8a8 = True
+                self.fp8_dtype = torch.float8_e4m3fn
+                self.use_w4afp8 = False
         else:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
@@ -287,7 +310,9 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DeepEPNormalDispatchOutput,
     ):
         assert self.moe_runner_config.activation == "silu"
-        assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        assert isinstance(self.quant_method, W4AFp8MoEMethod) or isinstance(
+            self.quant_method, CompressedTensorsWInt4AFp8MoEMethod
+        )
         return self.quant_method.apply_deepep_normal(
             layer=self,
             dispatch_output=dispatch_output,
@@ -298,7 +323,9 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DeepEPLLDispatchOutput,
     ):
         assert self.moe_runner_config.activation == "silu"
-        assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        assert isinstance(self.quant_method, W4AFp8MoEMethod) or isinstance(
+            self.quant_method, CompressedTensorsWInt4AFp8MoEMethod
+        )
         assert get_bool_env_var(
             "SGLANG_DEEPEP_BF16_DISPATCH"
         ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
