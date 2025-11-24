@@ -1279,7 +1279,8 @@ class CheckWeightsReqInput(BaseReq):
 
 @dataclass
 class CheckWeightsReqOutput(BaseReq):
-    pass
+    success: bool
+    message: str
 
 
 @dataclass

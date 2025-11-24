@@ -669,9 +669,10 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
         request: Optional[fastapi.Request] = None,
-    ):
+    ) -> CheckWeightsReqOutput:
         self.auto_create_handle_loop()
-        await self.check_weights_communicator(obj)
+        results = await self.check_weights_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def slow_down(
         self: TokenizerManager,
