@@ -174,7 +174,7 @@ class SchedulerUpdateWeightsMixin:
             return CheckWeightsReqOutput(success=True, message="Success.")
         except Exception as e:
             logger.warning(f"check_weights see error: {e}")
-            traceback.print_stack()
+            traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
     def save_remote_model(self: Scheduler, params):
