@@ -426,7 +426,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
                 )
 
                 return FlashInferFP4MoE
-            except:
+            except ImportError:
                 pass
         elif (quant_config is None) or (
             quant_config is not None and quant_config.get_name() == "fp8"
