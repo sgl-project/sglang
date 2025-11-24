@@ -13,8 +13,8 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEnableTokenizerMode(CustomTestCase):
-    def test_tokenzier_mode(self):
+class TestServedModelName(CustomTestCase):
+    def test_served_model_name(self):
         served_model_name = "Llama3.2"
         other_args = (
             [
