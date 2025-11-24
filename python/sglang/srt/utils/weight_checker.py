@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
+        self._snapshot_tensors = None
 
     def handle(self, action: str):
         logger.info(f"[WeightChecker] handle action={action}")
@@ -20,7 +21,10 @@ class WeightChecker:
             raise Exception(f"Unsupported {action=}")
 
     def _snapshot(self):
-        TODO
+        self._snapshot_tensors = [
+            (name, param.data.detach().cpu())
+            for name, param in self._model_state()
+        ]
 
     def _reset_param(self):
         for name, param in self._model_state():
