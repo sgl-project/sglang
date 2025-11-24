@@ -65,7 +65,10 @@ class SchedulerPPMixin:
 
         if self.attn_tp_size != 1:
             data = broadcast_pyobj(
-                data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
+                data,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
             )
 
         return data
