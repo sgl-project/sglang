@@ -3,7 +3,6 @@ from typing import Dict
 
 import torch
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -24,9 +23,13 @@ class WeightChecker:
             raise Exception(f"Unsupported {action=}")
 
     def _snapshot(self):
-        named_tensors = [(name, param.data.detach().cpu()) for name, param in self._model_state()]
+        named_tensors = [
+            (name, param.data.detach().cpu()) for name, param in self._model_state()
+        ]
         self._snapshot_tensors = dict(named_tensors)
-        assert len(self._snapshot_tensors) == len(named_tensors), f"should not have duplicated tensor name"
+        assert len(self._snapshot_tensors) == len(
+            named_tensors
+        ), f"should not have duplicated tensor name"
 
     def _reset_param(self):
         for name, param in self._model_state():
@@ -45,7 +48,9 @@ class WeightChecker:
         yield from self._model_runner.model.named_parameters()
 
 
-def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict[str, torch.Tensor]):
+def _check_tensors(
+    expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict[str, torch.Tensor]
+):
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
     assert len(expect_tensors) == len(actual_tensors)
