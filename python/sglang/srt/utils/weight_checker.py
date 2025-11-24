@@ -65,10 +65,11 @@ def _check_tensors(
         if torch.all(expect == actual):
             good_names.append(name)
         else:
+            abs_diff = (actual.float() - expect.float()).abs()
             error_messages.append(
                 f"name={name} "
-                f"max_abs_err={(actual - expect).abs().max()} "
-                f"mean_abs_err={(actual - expect).abs().mean()} "
+                f"max_abs_err={abs_diff.max()} "
+                f"mean_abs_err={abs_diff.mean()} "
                 f"{get_tensor_info(expect)=} "
                 f"{get_tensor_info(actual)=} "
             )
