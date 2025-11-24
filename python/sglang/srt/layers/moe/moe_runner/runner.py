@@ -77,6 +77,10 @@ class MoeRunner:
         if self.down_gemm_overlap_args is not None:
             running_state["down_gemm_overlap_args"] = self.down_gemm_overlap_args
         if self.meta_overlap_args is not None:
+            print(
+                "setting meta_overlap_args in moe_runner with keys are:",
+                list(self.meta_overlap_args.keys()),
+            )
             running_state["meta_overlap_args"] = self.meta_overlap_args
 
         runner_input = self.pre_permute_func(
