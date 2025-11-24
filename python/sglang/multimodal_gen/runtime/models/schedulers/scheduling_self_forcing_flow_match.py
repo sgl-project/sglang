@@ -26,7 +26,6 @@ class SelfForcingFlowMatchSchedulerOutput(BaseOutput):
 
 
 class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
-
     config_name = "scheduler_config.json"
     order = 1
 
@@ -41,7 +40,10 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         inverse_timesteps=False,
         extra_one_step=False,
         reverse_sigmas=False,
+        *args,
+        **kwargs,
     ):
+        super().__init__(*args, **kwargs)
         self.num_train_timesteps = num_train_timesteps
         self.shift = shift
         self.sigma_max = sigma_max
