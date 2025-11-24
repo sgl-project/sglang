@@ -1108,7 +1108,7 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
     # Optional format specification for loading
-    flattened_bucket_meta: Optional[dict] = None
+    load_format: Optional[str] = None
 
 
 @dataclass

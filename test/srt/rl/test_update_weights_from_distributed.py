@@ -27,6 +27,7 @@ from transformers import AutoModelForCausalLM
 
 import sglang as sgl
 from sglang.srt.utils import init_custom_process_group
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -68,6 +69,7 @@ def init_process(
     backend,
     checking_parameters,
     tie_word_embeddings,
+    load_format,
 ):
     torch.cuda.set_device(rank)
 
@@ -81,6 +83,7 @@ def init_process(
             checking_parameters,
             tie_word_embeddings,
             state_dict_key_to_shape,
+            load_format,
         )
     elif rank in [1, 2]:
         init_process_sgl(
@@ -94,6 +97,7 @@ def init_process(
             state_dict_key_to_shape,
             backend,
             tp_size,
+            load_format,
         )
 
 
@@ -106,6 +110,7 @@ def init_process_hf(
     checking_parameters,
     tie_word_embeddings,
     state_dict_key_to_shape,
+    load_format,
 ):
     # These two environment variables are very important
     # to avoid unexpected behaviors of CUDA and NCCL.
@@ -171,14 +176,20 @@ def init_process_hf(
     if tie_word_embeddings:
         broadcast_parameters.remove("lm_head.weight")
 
-    # Broadcast all the weights from the training
-    # engine to other ranks (inference engine).
-    for parameter_name in broadcast_parameters:
-        torch.distributed.broadcast(
-            hf_base_model.get_parameter(parameter_name),
-            src=0,
-            group=group,
-        )
+    if load_format == "flattened_bucket":
+        named_tensors = [(parameter_name, hf_base_model.get_parameter(parameter_name)) for parameter_name in broadcast_parameters]
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = bucket.get_flattened_tensor()
+        torch.distributed.broadcast(flattened_tensor, src=0, group=group)
+    else:
+        # Broadcast all the weights from the training
+        # engine to other ranks (inference engine).
+        for parameter_name in broadcast_parameters:
+            torch.distributed.broadcast(
+                hf_base_model.get_parameter(parameter_name),
+                src=0,
+                group=group,
+            )
     torch.cuda.synchronize()
     time_end_broadcast = time.perf_counter()
 
@@ -208,6 +219,7 @@ def init_process_sgl(
     state_dict_key_to_shape,
     backend,
     tp_size,
+    load_format,
 ):
     torch.cuda.set_device(rank)
     torch.cuda.synchronize()
@@ -306,6 +318,7 @@ def init_process_sgl(
             dtypes=dtypes,
             shapes=shapes,
             group_name="test_parameter_update_group",
+            load_format=load_format,
         )
     else:
         requests.post(
@@ -315,6 +328,7 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
+                "load_format": load_format,
             },
         )
     torch.cuda.synchronize()
@@ -383,6 +397,7 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
+    load_format=None,
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -406,6 +421,7 @@ def test_update_weights_from_distributed(
             backend,
             checking_parameters,
             tie_word_embeddings,
+            load_format,
         ),
         nprocs=1 + dp_size,
         join=False,
@@ -626,6 +642,17 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 checking_parameters,
             )
 
+            # FlattenedTensor
+            test_update_weights_from_distributed(
+                tp_size,
+                dp_size,
+                model_name,
+                backend,
+                model_state_dict_shapes[model_name],
+                truncate_size,
+                checking_parameters,
+                load_format="flattened_bucket",
+            )
 
 if __name__ == "__main__":
     unittest.main()
