@@ -22,8 +22,6 @@ Currently, DeepEP and Mooncake only support cases where `ep_size = tp_size`. For
 
 ### Backends for MoE Computation
 
-### Backends for MoE Computation
-
 | Backend                  | Description                                                                 | Use Cases                          |
 |--------------------------|-----------------------------------------------------------------------------|------------------------------------|
 | **`auto` (default)**     | Automatically selects the optimal backend based on model architecture, hardware (e.g., NVIDIA architecture like Ampere, Hopper, Blackwell), quantization scheme (e.g., FP8, FP4), and runtime conditions. | General-purpose deployments; ensures compatibility and performance without user intervention. |
