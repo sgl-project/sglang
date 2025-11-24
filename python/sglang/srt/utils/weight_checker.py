@@ -85,17 +85,13 @@ def _random_like(t: torch.Tensor):
 
     if dtype.is_floating_point:
         gen_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
-        tmp = torch.rand(shape, device=device, dtype=gen_dtype)
-        return tmp.to(dtype)
+        return torch.rand(shape, device=device, dtype=gen_dtype).to(dtype)
 
     if dtype == torch.bool:
         return torch.rand(shape, device=device) > 0.5
 
-    # Integer types
     if dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
         info = torch.iinfo(dtype)
-        low = int(info.min)
-        high = int(info.max)
-        return torch.randint(low=low, high=high, size=shape, device=device, dtype=dtype)
+        return torch.randint(low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype)
 
     raise TypeError(f"unsupported dtype: {dtype}")
