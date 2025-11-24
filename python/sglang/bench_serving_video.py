@@ -49,7 +49,6 @@ try:
 except ImportError:
     print("Error: 'numpy' is required for video generation.")
     print("Please install it via: pip install numpy")
-    sys.exit(1)
 
 
 @dataclass
