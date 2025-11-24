@@ -151,9 +151,14 @@ class BaseTpWorker(ABC):
     def update_weights_from_distributed(
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
-        success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
-        )
+        if recv_req.flattened_bucket_meta is not None:
+            success, message = self.model_runner.update_bucketed_weights_from_distributed(
+                recv_req.flattened_bucket_meta, recv_req.group_name,
+            )
+        else:
+            success, message = self.model_runner.update_weights_from_distributed(
+                recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name,
+            )
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

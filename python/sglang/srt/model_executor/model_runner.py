@@ -1175,6 +1175,40 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
+    def update_bucketed_weights_from_distributed(self, flattened_bucket_meta, group_name):
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+        try:
+            metadata = MultiprocessingSerializer.deserialize(flattened_bucket_meta['metadata'])
+            flattened_bucket = torch.empty(
+                flattened_bucket_meta['flattened_bucket_shape'],
+                dtype=metadata[0].dtype,
+                device=self.device,
+            )
+            torch.distributed.broadcast(
+                flattened_bucket,
+                src=0,
+                group=self._model_update_group[group_name],
+            )
+            # Create bucket and reconstruct tensors
+            bucket = FlattenedTensorBucket(
+                flattened_tensor=flattened_bucket, metadata=metadata
+            )
+            reconstructed_tensors = bucket.reconstruct_tensors()
+            self.model.load_weights(reconstructed_tensors)
+            self.server_args.weight_version = weight_version
+            return True, f"Succeeded to update parameter online."
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
