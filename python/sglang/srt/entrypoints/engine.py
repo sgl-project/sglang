@@ -136,9 +136,12 @@ class Engine(EngineBase):
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
-        self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-        )
+        if self.server_args.node_rank == 0:
+            self.send_to_rpc = get_zmq_socket(
+                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
+            )
+        else:
+            self.send_to_rpc = None
 
         # Enable tracing
         if server_args.enable_trace:
@@ -735,7 +738,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.17.post1",
+            "0.3.17.post2",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

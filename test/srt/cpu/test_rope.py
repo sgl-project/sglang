@@ -146,6 +146,12 @@ class TestROPE(CustomTestCase):
             (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 512, 32, 8),
             (128, 128, 2048, 10000, False, torch.bfloat16, "cpu", 2, 512, 16, 4),
             (512, 128, 311, 10000, False, torch.bfloat16, "cpu", 3, 39, 4, 2),
+            (64, 64, 32, 8000, True, torch.float32, "cpu", 32, 32, 1, 1),
+            (256, 128, 4096, 10000, True, torch.float32, "cpu", 2, 512, 32, 8),
+            (512, 128, 311, 10000, True, torch.float32, "cpu", 3, 39, 4, 2),
+            (128, 128, 2048, 10000, False, torch.float32, "cpu", 2, 512, 32, 8),
+            (128, 128, 2048, 10000, False, torch.float32, "cpu", 2, 512, 16, 4),
+            (512, 128, 311, 10000, False, torch.float32, "cpu", 3, 39, 4, 2),
         ]
 
         for (
