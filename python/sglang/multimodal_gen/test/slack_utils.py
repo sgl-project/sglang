@@ -12,7 +12,6 @@ from urllib.request import urlopen
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 import inspect
 
 try:
@@ -53,7 +52,8 @@ def _get_status_message(run_id, current_case_id, thread_messages=None):
     if not ALL_CASES:
         return base_header
 
-    status_map = {c.id: "❓" for c in ALL_CASES}
+    default_emoji_for_case_in_progress = "⏳"
+    status_map = {c.id: default_emoji_for_case_in_progress for c in ALL_CASES}
 
     if thread_messages:
         for msg in thread_messages:
@@ -78,7 +78,7 @@ def _get_status_message(run_id, current_case_id, thread_messages=None):
     table_lines.append(f"| {'-' * max_len} | :----: |")
 
     for c in ALL_CASES:
-        mark = status_map.get(c.id, "⏳")
+        mark = status_map.get(c.id, default_emoji_for_case_in_progress)
         table_lines.append(f"| {c.id.ljust(max_len)} |   {mark}   |")
 
     table_lines.append("```")
