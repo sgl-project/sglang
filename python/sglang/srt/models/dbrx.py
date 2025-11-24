@@ -103,7 +103,7 @@ class DbrxExperts(nn.Module):
         self.top_k = config.ffn_config.moe_top_k
         self.d_model = config.d_model
         self.intermediate_size = config.ffn_config.ffn_hidden_size // self.tp_size
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
                 self.use_triton_kernels

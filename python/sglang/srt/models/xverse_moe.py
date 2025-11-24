@@ -33,10 +33,12 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -99,6 +101,8 @@ class XverseMoE(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.num_experts = config.num_experts
+        self.hidden_size = config.hidden_size
         self.rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.n_routed_experts = config.num_experts
@@ -124,6 +128,14 @@ class XverseMoE(nn.Module):
         )
         self.pack_params()
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
+
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        if quant_config is None:
+            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+            self.quant_method.create_moe_runner(self, self.moe_runner_config)
+        else:
+            self.quant_method = quant_config.get_quant_method(self, prefix)
+        assert self.quant_method is not None
 
         self.router = ReplicatedLinear(
             config.hidden_size,
@@ -154,18 +166,18 @@ class XverseMoE(nn.Module):
         for expert in self.experts:
             w1.append(expert.gate_up_proj.weight)
             w2.append(expert.down_proj.weight)
-        self.w1 = torch._utils._flatten_dense_tensors(w1)
-        w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
+        self.w13_weight = torch._utils._flatten_dense_tensors(w1)
+        w1s = torch._utils._unflatten_dense_tensors(self.w13_weight, w1)
         for data, param in zip(w1s, w1):
             param.data = data
-        self.w1 = self.w1.view(len(w1), *w1s[0].shape)
+        self.w13_weight = self.w13_weight.view(len(w1), *w1s[0].shape)
 
-        self.w2 = torch._utils._flatten_dense_tensors(w2)
-        w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
+        self.w2_weight = torch._utils._flatten_dense_tensors(w2)
+        w2s = torch._utils._unflatten_dense_tensors(self.w2_weight, w2)
         for data, param in zip(w2s, w2):
             param.data = data
 
-        self.w2 = self.w2.view(len(w2), *w2s[0].shape)
+        self.w2_weight = self.w2_weight.view(len(w2), *w2s[0].shape)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -175,13 +187,17 @@ class XverseMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe(
-            hidden_states,
-            self.w1,
-            self.w2,
-            topk_output,
-            self.moe_runner_config,
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=hidden_states, topk_output=topk_output
         )
+        final_hidden_states = self.quant_method.apply(
+            layer=self, dispatch_output=dispatch_output
+        )
+
+        if isinstance(
+            final_hidden_states, CombineInput
+        ):  # quant_method use `UnquantizedFusedMoEMethod`
+            final_hidden_states = final_hidden_states.hidden_states
 
         if self.config.num_shared_experts is not None:
             final_hidden_states = final_hidden_states + shared_output
