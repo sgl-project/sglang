@@ -254,7 +254,7 @@ class DiffGenerator:
         data_type = (
             DataType.IMAGE
             if self.server_args.pipeline_config.task_type.is_image_gen()
-               or pretrained_sampling_params.num_frames == 1
+            or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )
         pretrained_sampling_params.data_type = data_type
@@ -376,7 +376,11 @@ class DiffGenerator:
         if isinstance(response, dict) and response.get("status") == "ok":
             logger.info(f"Successfully set LoRA adapter: {lora_nickname}")
         else:
-            error_msg = response.get("message", "Unknown error") if isinstance(response, dict) else "Unknown response format"
+            error_msg = (
+                response.get("message", "Unknown error")
+                if isinstance(response, dict)
+                else "Unknown response format"
+            )
             raise RuntimeError(f"Failed to set LoRA adapter: {error_msg}")
 
     def unmerge_lora_weights(self) -> None:

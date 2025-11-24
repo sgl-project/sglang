@@ -356,7 +356,7 @@ def get_lora_layer(
     lora_alpha: int | None = None,
 ) -> BaseLayerWithLoRA | None:
     """
-        transform the given layer to its corresponding LoRA layer
+    transform the given layer to its corresponding LoRA layer
     """
     supported_layer_types: dict[type[LinearBase], type[BaseLayerWithLoRA]] = {
         # the order matters
