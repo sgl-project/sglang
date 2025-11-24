@@ -14,10 +14,7 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
-    general_mm_embed_routine,
-)
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternTokenPairs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -471,6 +468,12 @@ class InternVLChatModel(nn.Module):
             nn.Linear(llm_hidden_size, llm_hidden_size),
         )
 
+        self.external_mm_data_embedding_funcs = {
+            Modality.IMAGE: self.get_image_feature,
+        }
+
+        self.model = self.language_model.model
+
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
         # N, W, H, C --> N, W, H * scale, C // scale
@@ -531,17 +534,25 @@ class InternVLChatModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        hs = general_mm_embed_routine(
+        input_embeds = forward_batch.input_embeds
+        # It may seem strange to assign input_embeds again even after passing it as an argument.
+        # This is for compatibility considerations.
+        # In the 'extend' scenario, this forward function is called from two places:
+        # 1. model_runner calls forward directly,
+        # 2. piece_wise_cuda_graph_runner calls forward and replay.
+
+        # Currently,
+        # In 'extend', input_embeds is passed in.
+        # In 'decode', input_ids is passed in.
+
+        hidden_states = self.language_model(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.language_model,
-            data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
-            },
+            input_embeds=input_embeds,
             positions=positions,
         )
 
-        return hs
+        return hidden_states
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
