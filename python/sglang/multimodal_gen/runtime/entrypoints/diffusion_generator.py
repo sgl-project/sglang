@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 """
-DiffGenerator module for sgl-diffusion.
+DiffGenerator module for sglang-diffusion.
 
 This module provides a consolidated interface for generating videos using
 diffusion models.
@@ -21,8 +21,8 @@ import torch
 import torchvision
 from einops import rearrange
 
-from sglang.multimodal_gen.runtime.pipelines import Req
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 # Suppress verbose logging from imageio, which is triggered when saving images.
 logging.getLogger("imageio").setLevel(logging.WARNING)
@@ -259,12 +259,13 @@ class DiffGenerator:
         # TODO: simplify
         data_type = (
             DataType.IMAGE
-            if self.server_args.pipeline_config.task_type.is_image_task()
+            if self.server_args.pipeline_config.task_type.is_image_gen()
             or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )
         pretrained_sampling_params.data_type = data_type
-        pretrained_sampling_params.set_output_file_name()
+        pretrained_sampling_params._set_output_file_name()
+        pretrained_sampling_params.adjust(self.server_args)
 
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
@@ -272,7 +273,6 @@ class DiffGenerator:
             current_sampling_params.prompt = p
             requests.append(
                 prepare_request(
-                    p,
                     server_args=self.server_args,
                     sampling_params=current_sampling_params,
                 )
@@ -284,7 +284,7 @@ class DiffGenerator:
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
             logger.info(
-                "Processing prompt %d/%d: %s...",
+                "Processing prompt: %d/%d: %s",
                 request_idx + 1,
                 len(requests),
                 req.prompt[:100],
@@ -310,21 +310,11 @@ class DiffGenerator:
                     continue
                 for output_idx, sample in enumerate(output_batch.output):
                     num_outputs = len(output_batch.output)
-                    output_file_name = req.output_file_name
-                    if num_outputs > 1 and output_file_name:
-                        base, ext = os.path.splitext(output_file_name)
-                        output_file_name = f"{base}_{output_idx}{ext}"
-
-                    save_path = (
-                        os.path.join(req.output_path, output_file_name)
-                        if output_file_name
-                        else None
-                    )
                     frames = self.post_process_sample(
                         sample,
                         fps=req.fps,
                         save_output=req.save_output,
-                        save_file_path=save_path,
+                        save_file_path=req.output_file_path(num_outputs, output_idx),
                         data_type=req.data_type,
                     )
 
@@ -334,7 +324,11 @@ class DiffGenerator:
                         "prompts": req.prompt,
                         "size": (req.height, req.width, req.num_frames),
                         "generation_time": gen_time,
-                        "logging_info": output_batch.logging_info,
+                        "timings": (
+                            output_batch.timings.to_dict()
+                            if output_batch.timings
+                            else {}
+                        ),
                         "trajectory": output_batch.trajectory_latents,
                         "trajectory_timesteps": output_batch.trajectory_timesteps,
                         "trajectory_decoded": output_batch.trajectory_decoded,
@@ -343,7 +337,10 @@ class DiffGenerator:
                     results.append(result_item)
             except Exception as e:
                 logger.error(
-                    "Failed to generate output for prompt %d: %s", request_idx + 1, e
+                    "Failed to generate output for prompt %d: %s",
+                    request_idx + 1,
+                    e,
+                    exc_info=True,
                 )
                 continue
 

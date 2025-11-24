@@ -10,35 +10,12 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
-
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
-    )
-
-    MARLIN_FP8_AVAILABLE = True
-except ImportError:
-    MARLIN_FP8_AVAILABLE = False
-
-    def dummy_func(*args, **kwargs):
-        raise ImportError(
-            "marlin FP8 requires some operators from vllm. Please install vllm."
-        )
-
-    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
-
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -67,8 +44,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -228,7 +210,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
-        if _is_cuda and MARLIN_FP8_AVAILABLE:
+        if _is_cuda:
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
@@ -280,6 +262,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
+        layer.executed_weight_requant_ue8m0 = False
 
         # WEIGHT
         weight_dtype = (
@@ -366,7 +349,34 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 return
             else:
+                # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    deepgemm_w8a8_block_fp8_linear_with_fallback,
+                )
+                from sglang.srt.model_loader.utils import (
+                    should_deepgemm_weight_requant_ue8m0,
+                )
+
+                if (
+                    should_deepgemm_weight_requant_ue8m0(
+                        weight_block_size=getattr(
+                            self.quant_config, "weight_block_size", None
+                        ),
+                    )
+                    and (
+                        self.w8a8_block_fp8_linear
+                        is deepgemm_w8a8_block_fp8_linear_with_fallback
+                    )
+                    and (not layer.executed_weight_requant_ue8m0)
+                ):
+                    requant_weight_ue8m0_inplace(
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        self.quant_config.weight_block_size,
+                    )
+                    layer.executed_weight_requant_ue8m0 = True
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
         else:
@@ -1210,9 +1220,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else topk_config.correction_bias.to(x.dtype)
         )
 
-        routing_method_type = getattr(
-            layer, "routing_method_type", RoutingMethodType.DeepSeekV3
-        )
+        routing_method_type = getattr(layer, "routing_method_type")
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
