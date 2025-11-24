@@ -97,8 +97,24 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
     sgl_hip::activation::act_and_mul_kernel<c_type, silu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    flashinfer::activation::act_and_mul_kernel<c_type, silu>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, silu>;
+
+    cudaLaunchKernelEx(
+        &config, kernel, static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 #endif
     return true;
   });
