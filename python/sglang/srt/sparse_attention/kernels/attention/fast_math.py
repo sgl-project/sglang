@@ -5,8 +5,8 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Uint32
-from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @cute.jit
@@ -47,7 +47,13 @@ def umulhi(a: Int32, b: Int32, *, loc=None, ip=None) -> Uint32:
 
 class FastDivmod:
     def __init__(
-        self, divisor: Int32, multipler: Uint32, shift_right: Uint32, *, loc=None, ip=None
+        self,
+        divisor: Int32,
+        multipler: Uint32,
+        shift_right: Uint32,
+        *,
+        loc=None,
+        ip=None
     ):
         self.divisor = divisor
         self.multiplier = multipler

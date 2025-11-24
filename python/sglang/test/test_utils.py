@@ -8,11 +8,11 @@ import logging
 import os
 import random
 import re
+import string
 import subprocess
 import threading
 import time
 import unittest
-import string
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial

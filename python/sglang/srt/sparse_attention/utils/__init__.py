@@ -8,4 +8,3 @@ sglang.srt.sparse_attention library.
 from .factory import Factory
 
 __all__ = ["Factory"]
-

@@ -5,7 +5,6 @@ import math
 from typing import Type
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
@@ -39,7 +38,9 @@ class FlashAttentionBackwardPostprocess:
         self.m_block_size = m_block_size
         # padding head_dim to a multiple of 32 as k_block_size
         hdim_multiple_of = 32
-        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+        self.head_dim_padded = int(
+            math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of
+        )
         self.check_hdim_oob = head_dim != self.head_dim_padded
         # self.tiled_mma = tiled_mma
         self.num_threads = num_threads
@@ -126,7 +127,9 @@ class FlashAttentionBackwardPostprocess:
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: dQaccum / dQ
         # ///////////////////////////////////////////////////////////////////////////////
-        self.sdQaccum_layout = cute.make_layout(self.m_block_size * self.head_dim_padded)
+        self.sdQaccum_layout = cute.make_layout(
+            self.m_block_size * self.head_dim_padded
+        )
         # We can't just use kHeadDim here. E.g. if MMA shape is 64 x 96 but split across 2 WGs,
         # then setting kBlockKSmem to 32 will cause "Static shape_div failure".
         # We want to treat it as 64 x 48, so kBlockKSmem should be 16.
@@ -145,7 +148,9 @@ class FlashAttentionBackwardPostprocess:
         stream: cuda.CUstream,
     ):
         # Get the data type and check if it is fp16 or bf16
-        if cutlass.const_expr(not mdQ.element_type in [cutlass.Float16, cutlass.BFloat16]):
+        if cutlass.const_expr(
+            not mdQ.element_type in [cutlass.Float16, cutlass.BFloat16]
+        ):
             raise TypeError("Only Float16 or BFloat16 is supported")
         if cutlass.const_expr(mdQaccum is not None):
             if cutlass.const_expr(not mdQaccum.element_type in [cutlass.Float32]):
@@ -221,14 +226,20 @@ class FlashAttentionBackwardPostprocess:
             mdQaccum[batch_size, num_head, None], blkdQaccum_shape, (m_block,)
         )
         blkdQ_shape = (self.m_block_size, self.head_dim_padded)
-        gdQ = cute.local_tile(mdQ[batch_size, None, num_head, None], blkdQ_shape, (m_block, 0))
+        gdQ = cute.local_tile(
+            mdQ[batch_size, None, num_head, None], blkdQ_shape, (m_block, 0)
+        )
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
         smem = cutlass.utils.SmemAllocator()
-        sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
-        sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
+        sdQaccum = smem.allocate_tensor(
+            cutlass.Float32, sdQaccum_layout, byte_alignment=1024
+        )
+        sdQ = cute.make_tensor(
+            cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout
+        )
 
         seqlen_q = mdQ.shape[1]
         seqlen_q_rounded = cute.round_up(seqlen_q, self.m_block_size)
@@ -274,9 +285,13 @@ class FlashAttentionBackwardPostprocess:
         # Step 3: Copy dQ from register to smem
         cute.arch.barrier()  # make sure all threads have finished loading dQaccum
         smem_copy_atom_dQ = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=cutlass.Float32.width
+            cute.nvgpu.CopyUniversalOp(),
+            self.dtype,
+            num_bits_per_copy=cutlass.Float32.width,
         )
-        smem_thr_copy_dQ = cute.make_tiled_copy_C(smem_copy_atom_dQ, tiled_mma).get_slice(tidx)
+        smem_thr_copy_dQ = cute.make_tiled_copy_C(
+            smem_copy_atom_dQ, tiled_mma
+        ).get_slice(tidx)
         taccdQrdQ = smem_thr_copy_dQ.retile(rdQ)
         taccdQsdQ = smem_thr_copy_dQ.partition_D(sdQ)
         cute.copy(smem_copy_atom_dQ, taccdQrdQ, taccdQsdQ)

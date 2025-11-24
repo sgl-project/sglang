@@ -7,10 +7,9 @@ import torch
 
 from sglang.srt.sparse_attention.cache_manager.cache_manager import (
     CacheManager,
-    RetriveResult,
     RetriveQuery,
+    RetriveResult,
 )
-
 from sglang.srt.sparse_attention.kernels.combine_indices_paged import combine_indices
 from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_quest import (
     compute_quest_score as compute_score,
@@ -170,17 +169,25 @@ class NaiveDecodeSparseRetriver:
         compute_score(
             q=query.query[:bs],
             k=query.proxy_k_tensor,
-            out=query.score[:bs, :, :query.max_num_pages],
+            out=query.score[:bs, :, : query.max_num_pages],
             req_to_token=req_to_token,
             req_pool_indices=query.req_pool_indices[:bs],
             kv_pages_num_per_seq=kv_pages_num_per_seq[:bs],
             num_sink_pages=self.stream_budget[0] // self.cache_manager.config.page_size,
             num_local_pages=self.stream_budget[1]
             // self.cache_manager.config.page_size,
-            page_size=self.cache_manager.config.page_size
+            page_size=self.cache_manager.config.page_size,
         )
-        _, topk_indices = torch.topk(query.score[:bs, :, :query.max_num_pages], k=top_k, dim=2, sorted=False)
-        score_copy(topk_indices, req_to_token, query.req_pool_indices[:bs], bs, self.cache_manager.config.page_size)
+        _, topk_indices = torch.topk(
+            query.score[:bs, :, : query.max_num_pages], k=top_k, dim=2, sorted=False
+        )
+        score_copy(
+            topk_indices,
+            req_to_token,
+            query.req_pool_indices[:bs],
+            bs,
+            self.cache_manager.config.page_size,
+        )
         query.selected_page_indices[:bs, :, :] = topk_indices
 
     def _call_after_update_query(
@@ -261,8 +268,10 @@ class NaiveDecodeSparseRetriver:
         if self.cache_manager.config.async_retrive:
             retrive_result = self.cache_manager.get_result(layer.layer_id)
         else:
-            self.cache_manager._retrive_one_layer(self.cache_manager.retrived_query[layer.layer_id], 
-                                                  self.cache_manager.retrived_result[layer.layer_id])
+            self.cache_manager._retrive_one_layer(
+                self.cache_manager.retrived_query[layer.layer_id],
+                self.cache_manager.retrived_result[layer.layer_id],
+            )
             retrive_result = self.cache_manager.get_result(layer.layer_id)
 
         new_seq_lens = self._combine_indices_async(

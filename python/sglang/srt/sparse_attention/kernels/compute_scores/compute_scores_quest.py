@@ -8,7 +8,7 @@ def _compute_quest_score_kernel(
     Q,
     K,
     Out,
-    #kv_pages_per_seq,
+    # kv_pages_per_seq,
     req_to_token,
     req_pool_indices,
     kv_pages_num_per_seq,
@@ -56,7 +56,7 @@ def _compute_quest_score_kernel(
         q_ptrs, mask=q_load_mask, other=0.0
     )  # [PADDED_GROUP_SIZE, HEAD_DIM]
 
-    #page_ptr = kv_pages_per_seq + bid * kv_pages_per_seq_stride_b
+    # page_ptr = kv_pages_per_seq + bid * kv_pages_per_seq_stride_b
     b_offset = tl.load(req_pool_indices + bid)
     if b_offset < 0:
         return
@@ -94,7 +94,7 @@ def compute_quest_score(
     q: torch.Tensor,
     k: torch.Tensor,
     out: torch.Tensor,
-    #kv_pages_per_seq: torch.Tensor = None,
+    # kv_pages_per_seq: torch.Tensor = None,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     kv_pages_num_per_seq: torch.Tensor,
@@ -123,12 +123,12 @@ def compute_quest_score(
         q,
         k,
         out,
-        #kv_pages_per_seq,
+        # kv_pages_per_seq,
         req_to_token,
         req_pool_indices,
         kv_pages_num_per_seq,
         # Strides
-        #kv_pages_per_seq.stride(0),
+        # kv_pages_per_seq.stride(0),
         req_to_token.stride(0),
         q.stride(0),
         q.stride(1),

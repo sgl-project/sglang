@@ -3,10 +3,9 @@
 # from Cutlass C++ to Cute-DSL.
 import math
 import operator
-from typing import Type, Optional
+from typing import Optional, Type
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 
@@ -36,7 +35,9 @@ class FlashAttentionBackwardPreprocess:
         self.m_block_size = m_block_size
         # padding head_dim to a multiple of 32 as k_block_size
         hdim_multiple_of = 32
-        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+        self.head_dim_padded = int(
+            math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of
+        )
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.num_threads = num_threads
 
@@ -135,7 +136,9 @@ class FlashAttentionBackwardPreprocess:
         # Get the data type and check if it is fp16 or bf16
         if cutlass.const_expr(not (mO.element_type == mdO.element_type)):
             raise TypeError("All tensors must have the same data type")
-        if cutlass.const_expr(not mO.element_type in [cutlass.Float16, cutlass.BFloat16]):
+        if cutlass.const_expr(
+            not mO.element_type in [cutlass.Float16, cutlass.BFloat16]
+        ):
             raise TypeError("Only Float16 or BFloat16 is supported")
         if cutlass.const_expr(not mdPsum.element_type in [cutlass.Float32]):
             raise TypeError("dPsum tensor must be Float32")
@@ -143,7 +146,9 @@ class FlashAttentionBackwardPreprocess:
             if cutlass.const_expr(not mdQaccum.element_type in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
         if cutlass.const_expr(mLSE is not None):
-            assert mLSElog2 is not None, "If mLSE is provided, mLSElog2 must also be provided"
+            assert (
+                mLSElog2 is not None
+            ), "If mLSE is provided, mLSElog2 must also be provided"
             if cutlass.const_expr(not mLSE.element_type in [cutlass.Float32]):
                 raise TypeError("LSE tensor must be Float32")
             if cutlass.const_expr(not mLSElog2.element_type in [cutlass.Float32]):
@@ -195,8 +200,12 @@ class FlashAttentionBackwardPreprocess:
         # ///////////////////////////////////////////////////////////////////////////////
         blkOdO_shape = (self.m_block_size, self.head_dim_padded)
         # (m_block_size, head_dim)
-        gO = cute.local_tile(mO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0))
-        gdO = cute.local_tile(mdO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0))
+        gO = cute.local_tile(
+            mO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0)
+        )
+        gdO = cute.local_tile(
+            mdO[batch_size, None, num_head, None], blkOdO_shape, (m_block, 0)
+        )
 
         gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
         gmem_thr_copy_dO = gmem_tiled_copy_dO.get_slice(tidx)
@@ -241,18 +250,26 @@ class FlashAttentionBackwardPreprocess:
                     gmem_thr_copy_O,
                     tOgO[None, m, None],
                     tOrO[None, m, None],
-                    pred=tOpO[None, m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
+                    pred=(
+                        tOpO[None, m, None]
+                        if cutlass.const_expr(self.check_hdim_oob)
+                        else None
+                    ),
                 )
                 cute.copy(
                     gmem_thr_copy_dO,
                     tOgdO[None, m, None],
                     tOrdO[None, m, None],
-                    pred=tOpdO[None, m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
+                    pred=(
+                        tOpdO[None, m, None]
+                        if cutlass.const_expr(self.check_hdim_oob)
+                        else None
+                    ),
                 )
         # Sum across the "k" dimension
-        dpsum = (tOrO.load().to(cutlass.Float32) * tOrdO.load().to(cutlass.Float32)).reduce(
-            cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
-        )
+        dpsum = (
+            tOrO.load().to(cutlass.Float32) * tOrdO.load().to(cutlass.Float32)
+        ).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1))
         dpsum = utils.warp_reduce(dpsum, operator.add, width=self.gmem_threads_per_row)
         dP_sum = cute.make_fragment(cute.size(tOrO, mode=[1]), cutlass.Float32)
         dP_sum.store(dpsum)
@@ -265,7 +282,11 @@ class FlashAttentionBackwardPreprocess:
         if tOcO[0, 0, 0][1] == 0:
             for m in cutlass.range(cute.size(dP_sum), unroll_full=True):
                 row = tOcO[0, m, 0][0]
-                gdPsum[row] = dP_sum[m] if row < mO.shape[1] - m_block * self.m_block_size else 0.0
+                gdPsum[row] = (
+                    dP_sum[m]
+                    if row < mO.shape[1] - m_block * self.m_block_size
+                    else 0.0
+                )
 
         # Clear dQaccum
         if cutlass.const_expr(mdQaccum is not None):

@@ -9,6 +9,7 @@ the gmem reads once at the beginning of each tile, rather than having to repeat 
 to compute various things like n_block_min, n_block_max, etc.
 """
 
+
 class SeqlenInfo:
     def __init__(
         self,
@@ -17,7 +18,9 @@ class SeqlenInfo:
         cu_seqlens: Optional[cute.Tensor] = None,
         seqused: Optional[cute.Tensor] = None,
     ):
-        self.offset = 0 if cutlass.const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
+        self.offset = (
+            0 if cutlass.const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
+        )
         if cutlass.const_expr(seqused is not None):
             self.seqlen = seqused[batch_idx]
         elif cutlass.const_expr(cu_seqlens is not None):
@@ -37,8 +40,12 @@ class SeqlenInfoQK:
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
     ):
-        self.offset_q = 0 if cutlass.const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
-        self.offset_k = 0 if cutlass.const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        self.offset_q = (
+            0 if cutlass.const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
+        )
+        self.offset_k = (
+            0 if cutlass.const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        )
         if cutlass.const_expr(mSeqUsedQ is not None):
             self.seqlen_q = mSeqUsedQ[batch_idx]
         else:

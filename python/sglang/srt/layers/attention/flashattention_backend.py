@@ -19,9 +19,15 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from sglang.srt.sparse_attention.updater.flashattention.cache_updater import LServerUpdaterFlashAttentionBackend
+
 from sglang.srt.sparse_attention.cache_manager.cache_manager import ManagerConfig
-from sglang.srt.sparse_attention.kernels.attention.interface import flash_attn_with_kvcache as cute_flash_attn_with_kvcache
+from sglang.srt.sparse_attention.kernels.attention.interface import (
+    flash_attn_with_kvcache as cute_flash_attn_with_kvcache,
+)
+from sglang.srt.sparse_attention.updater.flashattention.cache_updater import (
+    LServerUpdaterFlashAttentionBackend,
+)
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -355,8 +361,10 @@ class FlashAttentionBackend(AttentionBackend):
                 moving_average_factor=model_runner.server_args.sparse_moving_average_factor,
                 skip_first_n_layers=model_runner.server_args.sparse_skip_first_n_layers,
             )
-        
-            self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
+
+            self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(
+                manager_config
+            )
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -588,7 +596,7 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             if self.sparse_attn:
                 self.sparse_cache_updater.update_extend(forward_batch, metadata)
-                
+
                 self.strided_indices = torch.arange(
                     0, metadata.page_table.shape[1], self.page_size, device=self.device
                 )
@@ -690,7 +698,9 @@ class FlashAttentionBackend(AttentionBackend):
                         k_rope,
                     )
         if self.sparse_attn:
-            self.sparse_cache_updater.update_extend_proxy_k_tensor(forward_batch, layer.layer_id)
+            self.sparse_cache_updater.update_extend_proxy_k_tensor(
+                forward_batch, layer.layer_id
+            )
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -971,7 +981,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
-        
+
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
             self.attention_chunk_size is not None
@@ -1014,7 +1024,9 @@ class FlashAttentionBackend(AttentionBackend):
         if not self.use_mla:
             # Do multi-head attention
             if self.sparse_attn:
-                self.sparse_cache_updater.call_begin_forward_attn_decode(q, forward_batch, metadata, layer)
+                self.sparse_cache_updater.call_begin_forward_attn_decode(
+                    q, forward_batch, metadata, layer
+                )
 
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -1076,14 +1088,14 @@ class FlashAttentionBackend(AttentionBackend):
                 # # Default: single-token self-attention
                 if self.sparse_attn:
                     result = cute_flash_attn_with_kvcache(
-                        q_reshaped, 
-                        key_cache, 
-                        value_cache, 
-                        cache_seqlens=cache_seqlens, 
-                        cu_seqlens_q=metadata.cu_seqlens_q, 
-                        max_seqlen_q=1, 
-                        page_table=page_table, 
-                        causal=True, 
+                        q_reshaped,
+                        key_cache,
+                        value_cache,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=1,
+                        page_table=page_table,
+                        causal=True,
                         groupwise=True,
                         softmax_scale=layer.scaling,
                         softcap=layer.logit_cap,
@@ -1447,7 +1459,9 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         }
         if self.sparse_attn:
-            self.sparse_cache_updater.cache_manager.config.decode_cuda_graph_metadata = self.decode_cuda_graph_metadata
+            self.sparse_cache_updater.cache_manager.config.decode_cuda_graph_metadata = (
+                self.decode_cuda_graph_metadata
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1550,7 +1564,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.cu_seqlens_q = torch.arange(
                         0, batch_size + 1, dtype=torch.int32, device=device
                     )
-                
+
                 self.decode_cuda_graph_metadata[bs] = metadata
 
                 if self.attention_chunk_size is not None:

@@ -1,8 +1,9 @@
-from typing import Optional
-import torch
 import math
+from typing import Optional
 
-from einops import repeat, rearrange
+import torch
+from einops import rearrange, repeat
+
 
 def construct_streaming_mask(
     seqlen_q: int,
@@ -12,7 +13,7 @@ def construct_streaming_mask(
     is_causal: bool,
     query_padding_mask: Optional[torch.Tensor] = None,
     key_padding_mask: Optional[torch.Tensor] = None,
-    device: torch.device = torch.device('cpu'),
+    device: torch.device = torch.device("cpu"),
 ):
     """
     Construct attention mask for Streaming Attention.
@@ -58,11 +59,7 @@ def construct_streaming_mask(
             # sk is the actual length of the key sequence. If no mask is provided, use seqlen_k.
             # Otherwise, get actual length by summing the mask (assuming real tokens are 1, padding is 0).
             # Note: padding_mask is now a mask for a single sequence with shape (seqlen,), not batch-level
-            sk = (
-                seqlen_k
-                if key_padding_mask is None 
-                else key_padding_mask.sum().item()
-            )
+            sk = seqlen_k if key_padding_mask is None else key_padding_mask.sum().item()
             # sq is the actual length of the query sequence, same logic as above.
             sq = (
                 seqlen_q
@@ -77,10 +74,11 @@ def construct_streaming_mask(
         if query_padding_mask is not None or key_padding_mask is not None:
             # For cases with padding, need to adjust causal relationship and window boundaries
             # because actual sequence may be shorter than padded length
-            beyond_causal = col_idx > torch.minimum(row_idx + sk - sq, torch.tensor(sk, device=device))
+            beyond_causal = col_idx > torch.minimum(
+                row_idx + sk - sq, torch.tensor(sk, device=device)
+            )
             outside_window = torch.logical_and(
-                col_idx < row_idx + sk - sq - (local_size - 1),
-                col_idx >= sink_size
+                col_idx < row_idx + sk - sq - (local_size - 1), col_idx >= sink_size
             )
         else:
             # Simplified logic without padding
@@ -90,7 +88,7 @@ def construct_streaming_mask(
             # beyond_causal has shape (seqlen_q, seqlen_k)
             # because row_idx has shape (seqlen_q, 1), col_idx has shape (seqlen_k,)
             # Through broadcasting, the comparison produces a boolean tensor of shape (seqlen_q, seqlen_k)
-            beyond_causal = col_idx > row_idx 
+            beyond_causal = col_idx > row_idx
 
             # Condition 2: Outside window mask
             # `row_idx - (local_size - 1)` is the left boundary of the sliding window.
@@ -98,8 +96,7 @@ def construct_streaming_mask(
             # Any token with col_idx < 5 is outside the window.
             # `col_idx >= sink_size` exempts tokens in the sink region.
             outside_window = torch.logical_and(
-                col_idx < row_idx - (local_size - 1),
-                col_idx >= sink_size
+                col_idx < row_idx - (local_size - 1), col_idx >= sink_size
             )
         mask = torch.logical_or(beyond_causal, outside_window)
 
@@ -109,7 +106,6 @@ def construct_streaming_mask(
         mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.bool, device=device)
 
     return mask
-
 
 
 def block_streaming_attention_ref(
@@ -155,7 +151,7 @@ def block_streaming_attention_ref(
     device = q.device
     total_q, num_heads, head_dim = q.shape
     _, num_heads_k, _ = k.shape
-    
+
     # batch_size can be inferred from the length of cu_seqlens
     batch_size = cu_seqlens_q.shape[0] - 1
 
@@ -170,23 +166,32 @@ def block_streaming_attention_ref(
         # Ensure the number of query heads is an integer multiple of key/value heads
         assert num_heads % num_heads_k == 0
         # Use einops.repeat to replicate K and V heads to match Q heads for subsequent computation
-        k = repeat(k, "t h d -> t (h g) d", g = num_heads // num_heads_k)
-        v = repeat(v, "t h d -> t (h g) d", g = num_heads // num_heads_k)
+        k = repeat(k, "t h d -> t (h g) d", g=num_heads // num_heads_k)
+        v = repeat(v, "t h d -> t (h g) d", g=num_heads // num_heads_k)
 
     output = torch.zeros(total_q, num_heads, head_dim, device=device, dtype=q.dtype)
 
     # --- 3. Main loop: process each sequence in the batch ---
     for batch_idx in range(batch_size):
         # Use cumulative lengths to determine start and end positions of current sequence in concatenated tensor
-        q_start, q_end = cu_seqlens_q[batch_idx].item(), cu_seqlens_q[batch_idx + 1].item()
-        k_start, k_end = cu_seqlens_k[batch_idx].item(), cu_seqlens_k[batch_idx + 1].item()
+        q_start, q_end = (
+            cu_seqlens_q[batch_idx].item(),
+            cu_seqlens_q[batch_idx + 1].item(),
+        )
+        k_start, k_end = (
+            cu_seqlens_k[batch_idx].item(),
+            cu_seqlens_k[batch_idx + 1].item(),
+        )
 
         # Slice current sequence's q, k, v from large tensor
-        q_batch = q[q_start:q_end] #(seqlen_q, num_heads, head_dim)
+        q_batch = q[q_start:q_end]  # (seqlen_q, num_heads, head_dim)
         k_batch = k[k_start:k_end]
         v_batch = v[k_start:k_end]
 
-        seqlen_q, seqlen_k = q_batch.shape[0], k_batch.shape[0] # query sequence length, key sequence length
+        seqlen_q, seqlen_k = (
+            q_batch.shape[0],
+            k_batch.shape[0],
+        )  # query sequence length, key sequence length
 
         # --- 4. Compute attention scores ---
         # Use einsum to efficiently compute dot product of Q and K, obtaining raw attention scores
@@ -194,22 +199,29 @@ def block_streaming_attention_ref(
         # qhd: (seqlen_q, num_heads, head_dim)
         # khd: (seqlen_k, num_heads, head_dim)
         # hqk: output (num_heads, seqlen_q, seqlen_k)
-        scores = torch.einsum("qhd,khd->hqk", q_batch * softmax_scale, k_batch) # (seqlen_q, seqlen_k)
+        scores = torch.einsum(
+            "qhd,khd->hqk", q_batch * softmax_scale, k_batch
+        )  # (seqlen_q, seqlen_k)
 
         # If there's a key padding mask, set scores at padding positions to negative infinity
         # This way, after softmax, probabilities at these positions become 0
         if key_padding_mask is not None:
             key_mask = key_padding_mask[batch_idx, :seqlen_k].to(device)
-            scores = scores.masked_fill(~key_mask[None, None, :], float('-inf'))
+            scores = scores.masked_fill(~key_mask[None, None, :], float("-inf"))
 
         for head_idx in range(num_heads):
             mask_type = head_mask_type[head_idx].item()
 
-            if mask_type == 0: 
+            if mask_type == 0:
                 # Dense Attention
                 if is_causal:
-                    causal_mask = torch.triu(torch.ones((seqlen_q, seqlen_k), dtype=torch.bool, device=device), diagonal=1)
-                    scores[head_idx].masked_fill_(causal_mask, float('-inf'))
+                    causal_mask = torch.triu(
+                        torch.ones(
+                            (seqlen_q, seqlen_k), dtype=torch.bool, device=device
+                        ),
+                        diagonal=1,
+                    )
+                    scores[head_idx].masked_fill_(causal_mask, float("-inf"))
 
             elif mask_type < 0:
                 # Extract padding masks for current batch (if they exist)
@@ -228,14 +240,14 @@ def block_streaming_attention_ref(
                     is_causal=is_causal,
                     query_padding_mask=query_mask_batch,
                     key_padding_mask=key_mask_batch,
-                    device=device
+                    device=device,
                 )
 
-                scores[head_idx].masked_fill_(streaming_mask, float('-inf'))
+                scores[head_idx].masked_fill_(streaming_mask, float("-inf"))
 
             elif mask_type > 0:
-                    # This indicates Block Sparse Attention, not considered for now
-                    pass
+                # This indicates Block Sparse Attention, not considered for now
+                pass
 
         attn = torch.softmax(scores, dim=-1).to(v_batch.dtype)
 

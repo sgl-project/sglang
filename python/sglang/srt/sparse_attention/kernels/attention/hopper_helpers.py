@@ -16,7 +16,15 @@ def gemm(
     swap_AB: cutlass.Constexpr[bool] = False,
 ) -> None:
     if cutlass.const_expr(swap_AB):
-        gemm(tiled_mma, acc, tCrB, tCrA, zero_init=zero_init, wg_wait=wg_wait, swap_AB=False)
+        gemm(
+            tiled_mma,
+            acc,
+            tCrB,
+            tCrA,
+            zero_init=zero_init,
+            wg_wait=wg_wait,
+            swap_AB=False,
+        )
     else:
         warpgroup.fence()
         # We make a new mma_atom since we'll be modifying its attribute (accumulate).

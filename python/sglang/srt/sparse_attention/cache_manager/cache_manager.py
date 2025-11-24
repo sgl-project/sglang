@@ -8,6 +8,7 @@ import torch
 from sglang.srt.model_executor.graph_runner import get_global_graph_memory_pool
 from sglang.srt.sparse_attention.kernels.moving_average import moving_average_update
 
+
 class ManagerConfig:
     def __init__(
         self,
@@ -243,9 +244,13 @@ class CacheManager:
         bs = req_pool_indices.shape[0]
         pre_bs = self.retrived_query[layer_id].bs
         if self.config.async_retrive:
-            moving_average_update(self.retrived_query[layer_id].query[:bs], query[:bs], 
-                                req_pool_indices[:bs], self.retrived_query[layer_id].req_pool_indices[:pre_bs], 
-                                self.config.moving_average_factor)
+            moving_average_update(
+                self.retrived_query[layer_id].query[:bs],
+                query[:bs],
+                req_pool_indices[:bs],
+                self.retrived_query[layer_id].req_pool_indices[:pre_bs],
+                self.config.moving_average_factor,
+            )
         else:
             self.retrived_query[layer_id].query[:bs] = query
         self.retrived_query[layer_id].req_pool_indices[:bs] = req_pool_indices
@@ -306,8 +311,13 @@ class CacheManager:
     def _retrive_loop(self):
         while True:
             max_seq_len_k = self.retrived_query[0].seq_lens.max().item()
-            max_num_pages = max(self.config.top_k, (max_seq_len_k + self.config.page_size - 1) // self.config.page_size)
-            for layer_id in range(self.config.skip_first_n_layers, self.config.num_layers):
+            max_num_pages = max(
+                self.config.top_k,
+                (max_seq_len_k + self.config.page_size - 1) // self.config.page_size,
+            )
+            for layer_id in range(
+                self.config.skip_first_n_layers, self.config.num_layers
+            ):
                 self.retrived_query[layer_id].max_num_pages = max_num_pages
                 if self.graph_runner:
                     self.graph_runner.replay(layer_id)

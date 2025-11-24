@@ -159,10 +159,12 @@ def proxy_k_tensor_extend_kernel(
 
     if extend_len <= 0:
         return
-    
-    for page_start in range(prefix_len+block_inner_idx*PAGE_SIZE, seq_len, BLOCK_NUM*PAGE_SIZE):
+
+    for page_start in range(
+        prefix_len + block_inner_idx * PAGE_SIZE, seq_len, BLOCK_NUM * PAGE_SIZE
+    ):
         page_offset = page_start + tl.arange(0, PAGE_SIZE)
-        
+
         page_index_ptr = req_to_token_ptr + req_pool_idx * max_seq_len + page_offset
         block_mask = page_offset < seq_len
 
@@ -189,11 +191,7 @@ def proxy_k_tensor_extend_kernel(
         # proxy_k_tensor shape: [num_pages, 2, num_head, num_dim]
         # 0: min, 1: max
         first_token_in_page = (
-            tl.load(
-                req_to_token_ptr
-                + req_pool_idx * max_seq_len
-                + page_start
-            )
+            tl.load(req_to_token_ptr + req_pool_idx * max_seq_len + page_start)
             // PAGE_SIZE
         )
 
