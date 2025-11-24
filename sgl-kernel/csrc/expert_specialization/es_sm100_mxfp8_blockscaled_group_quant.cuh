@@ -31,6 +31,8 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
   return b;
 }
 
+// Some code references TRT-LLM:
+// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/quantization.cuh
 template <typename FragmentS, typename FragmentD>
 __inline__ __device__ uint8_t cvt_warp_fp16_to_mxfp8(FragmentS& fragment_s, FragmentD& fragment_d) {
   using FragmentSLayout = typename FragmentS::layout_type;
