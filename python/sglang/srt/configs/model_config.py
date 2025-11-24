@@ -548,6 +548,15 @@ class ModelConfig:
         # parallel size so each GPU has at least one KV head.
         return max(1, total_num_kv_heads // tensor_parallel_size)
 
+    def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
+        """Similar to get_num_kv_heads(), but for SWA."""
+        if not self.is_hybrid_swa_compress:
+            return 0
+
+        # For HybridSWACompressedForCausalLM models
+        total_num_kv_heads = self.hf_text_config.compression_softmax_num_kv_heads
+        return max(1, total_num_kv_heads // tensor_parallel_size)
+
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
