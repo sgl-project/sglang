@@ -260,6 +260,9 @@ class FusedMoE(torch.nn.Module):
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
+        if self.quant_method is not None and hasattr(self.quant_method, "runner"):
+            self.runner = self.quant_method.runner
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
