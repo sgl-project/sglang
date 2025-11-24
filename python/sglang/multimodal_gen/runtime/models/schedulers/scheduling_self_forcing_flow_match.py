@@ -129,9 +129,6 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample.type_as(noise)
 
-
-        return weights
-
     def scale_model_input(
         self, sample: torch.Tensor, timestep: int | None = None
     ) -> torch.Tensor:

@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Code adapted from SGLang https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/layers.py
 
-import math
 
 import torch
 from torch import nn
@@ -56,7 +55,6 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_path: str | None = None
-
 
         self.lora_A = None
         self.lora_B = None
