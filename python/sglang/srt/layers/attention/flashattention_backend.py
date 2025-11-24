@@ -22,6 +22,11 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+from sglang.srt.utils import get_bool_env_var
+
+_use_update_local_attn_cuda = get_bool_env_var("SGLANG_USE_UPDATE_LOCAL_ATTN_METADATA_CUDA")
+if _use_update_local_attn_cuda:
+    import local_attention_cuda
 
 @dataclass
 class FlashAttentionMetadata:
@@ -2142,7 +2147,7 @@ class FlashAttentionBackend(AttentionBackend):
         #
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
-        max_seq_len = int(seqlens.max().item())
+        max_seq_len = int(torch.max(seqlens))
         if self.is_hybrid:
             sliced_page_table = self.full_to_swa_index_mapping[
                 metadata.page_table[:bs, :max_seq_len]
@@ -2150,44 +2155,68 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
-        cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
-        seqlens_np = seqlens.cpu().numpy()
-        (
-            seqlens_q_local_np,
-            cu_seqlens_q_local_np,
-            seqlens_k_local_np,
-            block_table_local,
-        ) = make_local_attention_virtual_batches(
-            self.attention_chunk_size,
-            cu_seqlens_q_np,
-            seqlens_np,
-            sliced_page_table,
-            self.page_size,
-        )
+        if _use_update_local_attn_cuda:
+            results = local_attention_cuda.make_local_attention_virtual_batches_fully_fused(
+                self.attention_chunk_size,
+                cu_seqlens_q,
+                seqlens,
+                sliced_page_table,
+                self.page_size,
+                local_q_buf,
+                local_k_buf,
+                local_block_buf
+            )
+            q_len = results[4][0]
+            k_len = results[4][1]
+            b0 = results[4][2]
+            b1 = results[4][3]
+            max_query_len = results[4][4]
+            max_seq_len = results[4][5]
+            
+            # 更新元数据对象
+            if metadata.local_attn_metadata is not None:
+                lam = metadata.local_attn_metadata
+                lam.local_max_query_len = max_query_len
+                lam.local_max_seq_len = max_seq_len
+        else:
+            cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
+            seqlens_np = seqlens.cpu().numpy()
+            (
+                seqlens_q_local_np,
+                cu_seqlens_q_local_np,
+                seqlens_k_local_np,
+                block_table_local,
+            ) = make_local_attention_virtual_batches(
+                self.attention_chunk_size,
+                cu_seqlens_q_np,
+                seqlens_np,
+                sliced_page_table,
+                self.page_size,
+            )
 
-        # Convert back to tensors
-        device = local_q_buf.device
-        cu_seqlens_q_local = torch.from_numpy(cu_seqlens_q_local_np).to(device)
-        seqlens_k_local = torch.from_numpy(seqlens_k_local_np).to(device)
-        block_table_local = block_table_local.to(device)
-        # Get sizes
-        q_len = cu_seqlens_q_local.shape[0]
-        k_len = seqlens_k_local.shape[0]
-        b0, b1 = block_table_local.shape
+            # Convert back to tensors
+            device = local_q_buf.device
+            cu_seqlens_q_local = torch.from_numpy(cu_seqlens_q_local_np).to(device)
+            seqlens_k_local = torch.from_numpy(seqlens_k_local_np).to(device)
+            block_table_local = block_table_local.to(device)
+            # Get sizes
+            q_len = cu_seqlens_q_local.shape[0]
+            k_len = seqlens_k_local.shape[0]
+            b0, b1 = block_table_local.shape
 
-        # In-place updates into preallocated tensors and zero out the unused space
-        local_q_buf[:q_len].copy_(cu_seqlens_q_local)
-        local_q_buf[q_len:].fill_(0)
-        local_k_buf[:k_len].copy_(seqlens_k_local)
-        local_k_buf[k_len:].fill_(0)
-        local_block_buf[:b0, :b1].copy_(block_table_local)
-        local_block_buf[b0:, :].fill_(0)
-        local_block_buf[:b0, b1:].fill_(0)
+            # In-place updates into preallocated tensors and zero out the unused space
+            local_q_buf[:q_len].copy_(cu_seqlens_q_local)
+            local_q_buf[q_len:].fill_(0)
+            local_k_buf[:k_len].copy_(seqlens_k_local)
+            local_k_buf[k_len:].fill_(0)
+            local_block_buf[:b0, :b1].copy_(block_table_local)
+            local_block_buf[b0:, :].fill_(0)
+            local_block_buf[:b0, b1:].fill_(0)
 
-        if metadata.local_attn_metadata is not None:
-            lam = metadata.local_attn_metadata
-            lam.local_max_query_len = int(seqlens_q_local_np.max())
-            lam.local_max_seq_len = int(seqlens_k_local_np.max())
+            if metadata.local_attn_metadata is not None:
+                lam = metadata.local_attn_metadata
+                lam.local_max_query_len = int(seqlens_q_local_np.max())
+                lam.local_max_seq_len = int(seqlens_k_local_np.max())
 
     def _init_sliding_window_attn_spec_metadata(
         self,
