@@ -15,38 +15,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ### Building images from innersource
+  # Building images
   build-arm-image:
     if: github.repository == 'sgl-project/sglang'
     uses: .github/workflows/release-docker-npu-nightly.yml
     secrets: inherit
 
-  daily-innersource-1-ascend-a3:
-    needs: [ build-innersource-image ]
-    if: ${{ needs.build-innersource-image.result == 'success' && (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') }}
+  nightly-test-npu-1-a3:
+    needs: [ build-arm-image ]
+    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-2
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
     container:
-      image: ${{ vars.REGISTRY_HK }}/base_image/ascend-ci/sglang:main
+      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
     steps:
-      - name: Pre-config git access token
-        run: |
-          # as we use a proxy but checkout@v4 only set basic auth header for github.com
-          # so we set the extraheader manually
-          TOKEN=`echo -n "x-access-token:${{ secrets.ADMIN_PAT }}"|base64`
-          git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
-
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: 'upstream/251031'
-          sparse-checkout: |
-            .github
-            scripts
-            test
 
       - name: Copy dataset
         run: |
@@ -70,30 +57,22 @@ jobs:
         run: |
           pip install sentence_transformers accelerate
           cd test/srt
-          python3 run_suite.py --suite daily-test-1-ascend-npu --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite daily-test-1-ascend-npu --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  daily-innersource-2-ascend-a3:
-    needs: [ build-innersource-image ]
-    if: ${{ needs.build-innersource-image.result == 'success' && (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') }}
+  nightly-test-npu-2-a3:
+    needs: [ build-arm-image ]
+    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-2
     strategy:
       fail-fast: false
       matrix:
         part: [0]
     container:
-      image: ${{ vars.REGISTRY_HK }}/base_image/ascend-ci/sglang:main
+      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
     steps:
-      - name: Pre-config git access token
-        run: |
-          # as we use a proxy but checkout@v4 only set basic auth header for github.com
-          # so we set the extraheader manually
-          TOKEN=`echo -n "x-access-token:${{ secrets.ADMIN_PAT }}"|base64`
-          git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: 'upstream/251031'
           sparse-checkout: |
             .github
             scripts
@@ -123,24 +102,17 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite daily-test-2-ascend-npu --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-  daily-innersource-4-ascend-a3:
-    needs: [ build-innersource-image ]
-    if: ${{ needs.build-innersource-image.result == 'success' && (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') }}
+ nightly-test-npu-4-a3:
+    needs: [ build-arm-image ]
+    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-4
     strategy:
       fail-fast: false
       matrix:
         part: [0]
     container:
-      image: ${{ vars.REGISTRY_HK }}/base_image/ascend-ci/sglang:main
+      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
     steps:
-      - name: Pre-config git access token
-        run: |
-          # as we use a proxy but checkout@v4 only set basic auth header for github.com
-          # so we set the extraheader manually
-          TOKEN=`echo -n "x-access-token:${{ secrets.ADMIN_PAT }}"|base64`
-          git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -184,24 +156,17 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite daily-test-4-ascend-npu --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-  daily-innersource-8-ascend-a3:
-    needs: [ build-innersource-image ]
-    if: ${{ needs.build-innersource-image.result == 'success' && (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') }}
+  nightly-test-npu-8-a3:
+    needs: [ build-arm-image ]
+    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-8
     strategy:
       fail-fast: false
       matrix:
         part: [0]
     container:
-      image: ${{ vars.REGISTRY_HK }}/base_image/ascend-ci/sglang:main
+      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
     steps:
-      - name: Pre-config git access token
-        run: |
-          # as we use a proxy but checkout@v4 only set basic auth header for github.com
-          # so we set the extraheader manually
-          TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
-          git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -240,28 +205,19 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite daily-test-8-ascend-npu --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-  daily-innersource-16-ascend-a3:
-    needs: [ build-innersource-image ]
-    if: ${{ needs.build-innersource-image.result == 'success' && (github.repository == 'Ascend/sglang' || github.event_name == 'pull_request') }}
+  nightly-test-npu-16-a3:
+    needs: [ build-arm-image ]
+    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-16
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
     container:
-      image: ${{ vars.REGISTRY_HK }}/base_image/ascend-ci/sglang:main
+      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
     steps:
-      - name: Pre-config git access token
-        run: |
-          # as we use a proxy but checkout@v4 only set basic auth header for github.com
-          # so we set the extraheader manually
-          TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
-          git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
-
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: 'upstream/251031'
 
       - name: Copy dataset
         run: |
@@ -299,11 +255,11 @@ jobs:
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
-      - daily-innersource-1-ascend-a3
-      - daily-innersource-2-ascend-a3
-      - daily-innersource-4-ascend-a3
-      - daily-innersource-8-ascend-a3
-      - daily-innersource-16-ascend-a3
+      - nightly-test-npu-1-a3
+      - nightly-test-npu-2-a3
+      - nightly-test-npu-4-a3
+      - nightly-test-npu-8-a3
+      - nightly-test-npu-16-a3
     runs-on: linux-amd64-cpu-1
     container:
       image: docker.m.daocloud.io/ubuntu:22.04
