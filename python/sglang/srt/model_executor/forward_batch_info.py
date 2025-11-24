@@ -561,63 +561,68 @@ class ForwardBatch:
     ):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens.shape[0]
-        mrope_positions_list = [[]] * batch_size
-        for batch_idx in range(batch_size):
-            mm_input = batch.multimodal_inputs[batch_idx]
-            if self.forward_mode.is_decode():
-                # 3 * N
-                if mm_input is None:
-                    mrope_positions_list[batch_idx] = torch.full(
-                        (3, 1),
-                        self.seq_lens[batch_idx] - 1,
-                        dtype=torch.int64,
-                        device=model_runner.device,
-                    )
-                else:
-                    if mm_input.mrope_position_delta.device.type != model_runner.device:
-                        # transfer mrope_position_delta to device when the first running,
-                        # avoiding successvie host-to-device data transfer
-                        mm_input.mrope_position_delta = (
-                            mm_input.mrope_position_delta.to(
-                                model_runner.device, non_blocking=True
-                            )
-                        )
-                    mrope_position_deltas = mm_input.mrope_position_delta.flatten()
-                    mrope_positions_list[batch_idx] = (
-                        (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
-                        .unsqueeze(0)
-                        .repeat(3, 1)
-                    )
-            elif self.forward_mode.is_extend():
-                extend_seq_len, extend_prefix_len = (
-                    batch.extend_seq_lens[batch_idx],
-                    batch.extend_prefix_lens[batch_idx],
+        device = model_runner.device
+        if self.forward_mode.is_decode():
+            has_mm_input = [batch.multimodal_inputs[i] is not None for i in range(batch_size)]
+
+            if not any(has_mm_input):
+                mrope_positions_list = torch.full(
+                    (3, batch_size),
+                    0,
+                    dtype=torch.int64,
+                    device = device,
                 )
+                mrope_positions_list += (self.seq_lens - 1).unsqueeze(0)
+                self.mrope_positions = mrope_positions_list
+                return
+            deltas_cpu = torch.zeros((batch_size, 1, 1), dtype=torch.int64)
+            for i in range(batch_size):
+                if has_mm_input[i]:
+                    assert batch.multimodal_inputs[i].mrope_position_delta.shape == (1, 1)
+                    deltas_cpu[i] = batch.multimodal_inputs[i].mrope_position_delta
+            deltas_cpu_flat = deltas_cpu.view(batch_size)
+            deltas_gpu = deltas_cpu_flat.to(device, non_blocking=True)
+
+            self.mrope_positions = torch.empty((3, batch_size), dtype=torch.int64, device=device)
+            compute_mrope_positions_kernel[(batch_size,)](
+                self.seq_lens,
+                deltas_gpu,
+                self.mrope_positions,
+                batch_size,
+            )
+
+        elif self.forward_mode.is_extend():
+            extend_seq_lens = batch.extend_seq_lens
+            extend_prefix_lens = batch.extend_prefix_lens
+
+            mrope_positions_cpu_list = []
+
+            for batch_idx in range(batch_size):
+                extend_seq_len = extend_seq_lens[batch_idx]
+                extend_prefix_len = extend_prefix_lens[batch_idx]
+                mm_input = batch.multimodal_inputs[batch_idx]
+
                 if mm_input is None:
-                    # text only
-                    mrope_positions = torch.tensor(
-                        [
-                            [
-                                pos
-                                for pos in range(
-                                    extend_prefix_len,
-                                    extend_prefix_len + extend_seq_len,
-                                )
-                            ]
-                        ]
-                        * 3
-                    )
+                    positions = torch.arange(
+                        extend_prefix_len,
+                        extend_prefix_len + extend_seq_len,
+                        dtype=torch.int64
+                    ).unsqueeze(0).expand(3, -1)
                 else:
-                    mrope_positions = mm_input.mrope_positions[
+                    positions = mm_input.mrope_positions[
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
-                mrope_positions_list[batch_idx] = mrope_positions
+                
+                mrope_positions_cpu_list.append(positions)
+            
+            mrope_positions_cpu = torch.cat(mrope_positions_cpu_list, dim=1)
+            self.mrope_positions = mrope_positions_cpu.to(
+                dtype=torch.int64, 
+                device=device,
+                non_blocking=True
+            )
 
-        self.mrope_positions = torch.cat(
-            [pos.to(device=model_runner.device) for pos in mrope_positions_list],
-            dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device)
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
@@ -1123,3 +1128,20 @@ def create_chunked_prefix_cache_kv_indices(
         tl.store(
             chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask
         )
+        
+
+@triton.jit
+def compute_mrope_positions_kernel(
+    seq_lens_ptr,  # (batch_size,)
+    deltas_ptr,    # (batch_size,)
+    mrope_positions_ptr,  # (3, batch_size)
+    batch_size,
+):
+    pid = tl.program_id(0)
+    if pid >= batch_size:
+        return
+    base = tl.load(seq_lens_ptr + pid) - 1
+    delta = tl.load(deltas_ptr + pid)
+    for j in range(3):
+        tl.store(mrope_positions_ptr + j * batch_size + pid, base + delta)
+
