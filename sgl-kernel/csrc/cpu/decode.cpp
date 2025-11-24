@@ -223,6 +223,14 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
 }
 
 template <typename scalar_t>
+inline void
+copy_stub(at::Float8_e4m3fn* __restrict__ out, const scalar_t* __restrict__ src, int64_t size, float scale) {
+  for (int64_t d = 0; d < size; ++d) {
+    out[d] = static_cast<at::Float8_e4m3fn>(src[d] * scale);
+  }
+}
+
+template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   constexpr int kVecSize = bVec::size();
@@ -1039,21 +1047,16 @@ void decode_set_kv_buffer(
   });
 }
 
-template<typename scalar_t>
-float find_max_abs(
-  const scalar_t* __restrict__ data,
-  int64_t size,
-  float max_val) {
-    using Vec = at::vec::Vectorized<scalar_t>;
+template <typename scalar_t>
+float find_max_abs(const scalar_t* __restrict__ data, int64_t size, float max_val) {
+  using Vec = at::vec::Vectorized<scalar_t>;
   auto vec_size = Vec::size();
   int64_t i = 0;
   for (; i <= size - vec_size; i += vec_size) {
     Vec vec_data = Vec::loadu(data + i);
     Vec vec_abs = vec_data.abs();
-    scalar_t vec_max = at::vec::vec_reduce_all<scalar_t>(
-      [](Vec& x, Vec& y) {return at::vec::maximum(x, y);},
-      vec_abs
-    );
+    scalar_t vec_max =
+        at::vec::vec_reduce_all<scalar_t>([](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, vec_abs);
     if (vec_max > max_val) {
       max_val = vec_max;
     }
@@ -1091,23 +1094,28 @@ void decode_set_kv_buffer(
     bool is_mla) {
   constexpr float FP8_MAX = 448.0f;
   constexpr float eps = 1e-12;
-  for (int64_t bi = 0; bi < batches; bi++) {
-    int64_t loc_val = loc[bi];
-    float max_abs = 0;
-    for (int64_t hi = 0; hi < num_heads_kv; hi++) {
-        const scalar_t* key_ptr = key + bi * nk_strideN + hi * nk_strideH;
-        max_abs = find_max_abs<scalar_t>(key_ptr, head_size, max_abs);
-    }
-    k_scale[loc_val] = std::max(max_abs / FP8_MAX, eps);
-    if (!is_mla) {
-      max_abs = 0;
+  at::parallel_for(0, batches, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0};
+    data_index_init(begin, bs, batches);
+    for (int64_t i = begin; i < end; i++) {
+      int64_t loc_val = loc[bs];
+      float max_abs = 0;
       for (int64_t hi = 0; hi < num_heads_kv; hi++) {
-          const scalar_t* value_ptr = value + bi * nv_strideN + hi * nv_strideH;
-          max_abs = find_max_abs<scalar_t>(value_ptr, head_size_v, max_abs);
+        const scalar_t* key_ptr = key + bs * nk_strideN + hi * nk_strideH;
+        max_abs = find_max_abs<scalar_t>(key_ptr, head_size, max_abs);
       }
-      v_scale[loc_val] = std::max(max_abs / FP8_MAX, eps);
+      k_scale[loc_val] = std::max(max_abs / FP8_MAX, eps);
+      if (!is_mla) {
+        max_abs = 0;
+        for (int64_t hi = 0; hi < num_heads_kv; hi++) {
+          const scalar_t* value_ptr = value + bs * nv_strideN + hi * nv_strideH;
+          max_abs = find_max_abs<scalar_t>(value_ptr, head_size_v, max_abs);
+        }
+        v_scale[loc_val] = std::max(max_abs / FP8_MAX, eps);
+      }
+      data_index_step(bs, batches);
     }
-  }
+  });
   at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
     int64_t bs{0}, head_kv_id{0};
     data_index_init(begin, bs, batches, head_kv_id, num_heads_kv);
@@ -1116,17 +1124,11 @@ void decode_set_kv_buffer(
       int64_t loc_val = loc[bs];
       at::Float8_e4m3fn* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
       const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
-      // copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
-      for (int64_t di = 0; di < head_size; di++) {
-        k_buffer_ptr[di] = static_cast<at::Float8_e4m3fn>(new_key_ptr[di] / k_scale[loc_val]);
-      }
+      copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size, 1 / k_scale[loc_val]);
       if (!is_mla) {
         at::Float8_e4m3fn* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
         const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
-        // copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
-        for (int64_t di = 0; di < head_size_v; di++) {
-          v_buffer_ptr[di] = static_cast<at::Float8_e4m3fn>(new_value_ptr[di] / v_scale[loc_val]);
-        }
+        copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v, 1 / v_scale[loc_val]);
       }
 
       // move to the next index
