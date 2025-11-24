@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestPrefrredSample(CustomTestCase):
+class TestPreferredSample(CustomTestCase):
     def test_prefrred_sample(self):
         preferred_sampling_params = '{"temperature":0.7, "top_p":0.9, "top_k":40}'
         other_args = (
