@@ -6,11 +6,7 @@ from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 
 logger = logging.getLogger(__name__)
 
@@ -403,5 +399,10 @@ class Step3Detector(BaseFormatDetector):
         """Return True if this detector supports structural tag format."""
         return False
 
-    def structure_info(self) -> _GetInfoFunc:
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
         raise NotImplementedError()

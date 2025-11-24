@@ -1,16 +1,12 @@
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.parser.harmony_parser import HarmonyParser
 
 logger = logging.getLogger(__name__)
@@ -237,5 +233,75 @@ class GptOssDetector(BaseFormatDetector):
             parameters=json.dumps(arguments, ensure_ascii=False),
         )
 
-    def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError("structure_info not used with HarmonyParser")
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build structural tag for GPT-OSS format."""
+        tags = []
+        triggers = set()
+
+        for tool in tools:
+            name = tool.function.name
+            if not name:
+                continue
+
+            # Always include schema
+            schema = tool.function.parameters or {}
+
+            # Pattern 1: For reasoning-enabled mode (with analysis channel before commentary)
+            # Begin includes the full trigger pattern
+            begin1 = (
+                "<|start|>assistant<|channel|>commentary to=functions."
+                + name
+                + "<|constrain|>json<|message|>"
+            )
+            # End is empty because <|call|> comes naturally from Harmony stop tokens
+            end1 = ""
+
+            tags.append(
+                {
+                    "format": "tag",
+                    "begin": begin1,
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": end1,
+                }
+            )
+            triggers.add("<|start|>assistant<|channel|>commentary")
+
+            # Pattern 2: For reasoning-disabled mode (goes directly to commentary channel)
+            begin2 = (
+                "<|channel|>commentary to=functions."
+                + name
+                + "<|constrain|>json<|message|>"
+            )
+            # End is empty because <|call|> comes naturally from Harmony stop tokens
+            end2 = ""
+
+            tags.append(
+                {
+                    "format": "tag",
+                    "begin": begin2,
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": end2,
+                }
+            )
+            triggers.add("<|channel|>commentary")
+
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": list(triggers),
+                "tags": tags,
+                "at_least_one": at_least_one,
+                "stop_after_first": stop_after_first,
+            }
+        }

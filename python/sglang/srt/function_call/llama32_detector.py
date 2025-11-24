@@ -2,15 +2,11 @@ import ast
 import json
 import logging
 import re
-from typing import List
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    StructureInfo,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +132,48 @@ class Llama32Detector(BaseFormatDetector):
             self._buffer = original_buffer
             return super().parse_streaming_increment(new_text, tools)
 
-    def structure_info(self) -> _GetInfoFunc:
-        return lambda name: StructureInfo(
-            begin='<|python_tag|>{"name":"' + name + '", "arguments":',
-            end="}",
-            trigger="<|python_tag|>",
-        )
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build structural tag for Llama 3.2 format."""
+        tags = []
+        triggers = set()
+
+        for tool in tools:
+            name = tool.function.name
+            if not name:
+                continue
+
+            # Extract from structure_info() implementation
+            begin = '<|python_tag|>{"name":"' + name + '", "arguments":'
+            end = "}"
+            trigger = "<|python_tag|>"
+
+            # Always include schema
+            schema = tool.function.parameters or {}
+
+            tags.append(
+                {
+                    "format": "tag",
+                    "begin": begin,
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": end,
+                }
+            )
+            triggers.add(trigger)
+
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": list(triggers),
+                "tags": tags,
+                "at_least_one": at_least_one,
+                "stop_after_first": stop_after_first,
+            }
+        }

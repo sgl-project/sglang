@@ -520,6 +520,4 @@ class MinimaxM2Detector(BaseFormatDetector):
         at_least_one: bool = False,
         stop_after_first: bool = False,
     ) -> Dict[str, Any]:
-        raise NotImplementedError(
-            "Minimax M2 detector does not support structural tags"
-        )
+        raise NotImplementedError()

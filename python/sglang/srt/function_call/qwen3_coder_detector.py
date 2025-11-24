@@ -8,11 +8,7 @@ from typing import Any, Dict, List, Tuple
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +343,49 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return res
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
-    def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+
+        tags = []
+        triggers = set()
+
+        for tool in tools:
+            name = tool.function.name
+            if not name:
+                continue
+
+            begin = f"<tool_call>\n<function={name}>\n"
+            end = "\n</function>\n</tool_call>"
+            trigger = "<tool_call>"
+
+            # Always include schema for parameter validation
+            schema = tool.function.parameters or {}
+
+            tags.append(
+                {
+                    "format": "tag",
+                    "begin": begin,
+                    "content": {
+                        "type": "qwen_xml_parameter",
+                        "json_schema": schema,
+                    },
+                    "end": end,
+                }
+            )
+            triggers.add(trigger)
+
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": list(triggers),
+                "tags": tags,
+                "at_least_one": at_least_one,
+                "stop_after_first": stop_after_first,
+            }
+        }
