@@ -185,7 +185,8 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
-        TestFile("ep/test_mooncake_ep_small.py", 450),
+        # TODO: Add it back after mooncake supports torch 2.9
+        # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
