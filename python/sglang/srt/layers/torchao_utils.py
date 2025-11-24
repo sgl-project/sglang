@@ -36,6 +36,7 @@ def proj_filter(
     return "proj" in fqn
 
 
+# TODO: implement a more general filter function
 def proj_filter_conv3d(
     module: torch.nn.Module,
     fqn: str,
