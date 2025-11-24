@@ -159,122 +159,12 @@ def load_fused_expert_weights(
 class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
         self,
-        *,
         config: Qwen3VLMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        language_model_cls=Qwen3MoeLLMModel,
     ):
-        super(Qwen3VLForConditionalGeneration, self).__init__()
-        self.config = config
-        self.use_data_parallel = global_server_args_dict["mm_enable_dp_encoder"]
-
-        self.visual = Qwen3_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
-
-        self.model = Qwen3MoeLLMModel(
-            config=config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
-
-        self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-
-        # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-
-    @property
-    def use_deepstack(self) -> bool:
-        return hasattr(self, "deepstack_visual_indexes")
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        get_embedding: bool = False,
-    ):
-        """Run forward pass for Qwen3-VL.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
-                opensource models), the shape will be `(3, seq_len)`,
-                otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
-        """
-        if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
-
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
-
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-        )
-
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return self.pooler(hidden_states, forward_batch)
-
-    def load_fused_expert_weights(
-        self,
-        name: str,
-        params_dict: dict,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        num_experts: int,
-    ):
-        param = params_dict[name]
-        # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-        weight_loader = param.weight_loader
-        # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
-            weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                expert_id,
-            )
+        super().__init__(config, quant_config, prefix, language_model_cls)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
