@@ -4,9 +4,13 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
-if is_cuda() or is_hip():
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
+
+if _is_cuda or _is_hip:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -114,20 +118,36 @@ def build_tree_kernel_efficient(
             (bs * num_verify_tokens,), device=device, dtype=torch.long
         )
 
-    sgl_build_tree_kernel_efficient(
-        parent_list,
-        top_scores_index,
-        seq_lens,
-        tree_mask,
-        positions,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
-        topk,
-        spec_steps,
-        num_verify_tokens,
-        tree_mask_mode,
-    )
+    if _is_npu:
+        torch.ops.npu.build_tree_kernel_efficient(
+            parent_list.to(dtype=torch.int64),
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+    else:
+        sgl_build_tree_kernel_efficient(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
     return (
         tree_mask,
         positions,
@@ -136,3 +156,44 @@ def build_tree_kernel_efficient(
         retrive_next_sibling,
         draft_tokens,
     )
+
+
+def verify_tree_greedy_func(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+    topk: int = -1,
+):
+    if _is_cuda or _is_hip:
+        from sgl_kernel import verify_tree_greedy
+
+        verify_tree_greedy(
+            predicts=predicts,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_token_num,  # mutable
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            target_predict=target_predict,
+        )
+
+    elif _is_npu:
+        from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
+
+        verify_tree_greedy(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            target_predict=target_predict,
+        )
+    return predicts, accept_index, accept_token_num

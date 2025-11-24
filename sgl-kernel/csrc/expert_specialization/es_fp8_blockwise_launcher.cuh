@@ -232,7 +232,7 @@ void es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype(
         workspace,
         stream);
   } else {
-    launch_sm90_fp8_blockwise_scaled_group_mm<HighMGemmHx00Traits>(
+    launch_sm90_fp8_blockwise_scaled_group_mm<MiddleMGemmH20Traits>(
         out_ptrs,
         a_ptrs,
         b_ptrs,

@@ -17,7 +17,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
-        # GLM-4.1V and GLM-4.5V specific tokens
+        # GLM-V specific tokens
         self.IMAGE_TOKEN = "<|image|>"
         self.VIDEO_TOKEN = "<|video|>"
         self.IMAGE_START_TOKEN = "<|begin_of_image|>"

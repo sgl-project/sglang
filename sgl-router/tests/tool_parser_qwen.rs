@@ -6,7 +6,7 @@ use serde_json::json;
 use sglang_router_rs::tool_parser::{QwenParser, ToolParser};
 
 mod common;
-use common::create_test_tools;
+use common::{create_test_tools, streaming_helpers::*};
 
 #[tokio::test]
 async fn test_qwen_single_tool() {
@@ -249,4 +249,59 @@ async fn test_buffer_efficiency_with_multiple_tools() {
             assert!(["tool1", "tool2", "tool3"].contains(&name.as_str()));
         }
     }
+}
+
+// =============================================================================
+// REALISTIC STREAMING TESTS
+// =============================================================================
+
+#[tokio::test]
+async fn test_qwen_realistic_chunks_with_xml_tags() {
+    let tools = create_test_tools();
+    let mut parser = QwenParser::new();
+
+    let input = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>";
+    let chunks = create_realistic_chunks(input);
+
+    assert!(chunks.len() > 20, "Should have many small chunks");
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(&chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "get_weather");
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed tool name");
+}
+
+#[tokio::test]
+async fn test_qwen_xml_tag_arrives_in_parts() {
+    let tools = create_test_tools();
+    let mut parser = QwenParser::new();
+
+    let chunks = vec![
+        "<to", "ol_", "cal", "l>\n", "{", r#"""#, "na", "me", r#"""#, ": ", r#"""#, "tra", "nsl",
+        "ate", r#"""#, ", ", r#"""#, "arg", "ume", "nts", r#"""#, ": {", r#"""#, "tex", "t",
+        r#"""#, ": ", r#"""#, "hel", "lo", r#"""#, "}}\n", "</t", "ool", "_ca", "ll>",
+    ];
+
+    let mut got_tool_name = false;
+
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "translate");
+                got_tool_name = true;
+            }
+        }
+    }
+
+    assert!(got_tool_name, "Should have parsed tool name");
 }

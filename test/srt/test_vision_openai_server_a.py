@@ -6,7 +6,16 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_
 
 import unittest
 
+import openai
 from test_vision_openai_server_common import *
+from test_vision_openai_server_common import (  # DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,; DEFAULT_URL_FOR_TEST,; IMAGE_MAN_IRONING_URL,; popen_launch_server,
+    AudioOpenAITestMixin,
+    CustomTestCase,
+    ImageOpenAITestMixin,
+    OmniOpenAITestMixin,
+    TestOpenAIMLLMServerBase,
+    VideoOpenAITestMixin,
+)
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -136,6 +145,9 @@ class TestKimiVLServer(ImageOpenAITestMixin):
         pass
 
 
+@unittest.skip(
+    "Disabling this test to speed up CI. Prefer to test it within nightly test."
+)
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"
     extra_args = [
@@ -145,6 +157,62 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 
 class TestQwen2AudioServer(AudioOpenAITestMixin):
     model = "Qwen/Qwen2-Audio-7B-Instruct"
+
+
+class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
+    model = "deepseek-ai/DeepSeek-OCR"
+    trust_remote_code = False
+
+    def verify_single_image_response_for_ocr(self, response):
+        """Verify DeepSeek-OCR grounding output with coordinates"""
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+
+        # DeepSeek-OCR uses grounding format, outputs coordinates
+        assert "text" in text.lower(), f"OCR text: {text}, should contain 'text'"
+
+        # Verify coordinate format [[x1, y1, x2, y2]]
+        import re
+
+        coord_pattern = r"\[\[[\d\s,]+\]\]"
+        assert re.search(
+            coord_pattern, text
+        ), f"OCR text: {text}, should contain coordinate format [[x1, y1, x2, y2]]"
+
+        # Verify basic response fields
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+
+    def test_single_image_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        image_url = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/ocr-text.png"
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        },
+                        {
+                            "type": "text",
+                            "text": "<|grounding|>Convert the document to markdown.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+            **(self.get_vision_request_kwargs()),
+        )
+
+        self.verify_single_image_response_for_ocr(response)
 
 
 if __name__ == "__main__":

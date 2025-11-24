@@ -1,8 +1,8 @@
 import json
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from sglang.srt.server_args import PortArgs, prepare_server_args
+from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -32,7 +32,7 @@ class TestPortArgs(unittest.TestCase):
         mock_is_port_available.return_value = True
         mock_temp_file.return_value.name = "temp_file"
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
         server_args.enable_dp_attention = False
@@ -48,7 +48,7 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_single_node_dp_attention(self, mock_is_port_available):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
         server_args.enable_dp_attention = True
@@ -68,7 +68,7 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_dp_rank(self, mock_is_port_available):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
         server_args.enable_dp_attention = True
@@ -88,7 +88,7 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_ipv4_address(self, mock_is_port_available):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
 
         server_args.nccl_port = None
@@ -110,7 +110,7 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_malformed_ipv4_address(self, mock_is_port_available):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
 
@@ -131,7 +131,7 @@ class TestPortArgs(unittest.TestCase):
     ):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
 
@@ -149,7 +149,7 @@ class TestPortArgs(unittest.TestCase):
     ):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
 
@@ -175,7 +175,7 @@ class TestPortArgs(unittest.TestCase):
     ):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
 
@@ -194,7 +194,7 @@ class TestPortArgs(unittest.TestCase):
     ):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
 
@@ -214,7 +214,7 @@ class TestPortArgs(unittest.TestCase):
     ):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
 
@@ -236,7 +236,7 @@ class TestPortArgs(unittest.TestCase):
     ):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
 
@@ -256,7 +256,7 @@ class TestPortArgs(unittest.TestCase):
     ):
         mock_is_port_available.return_value = True
 
-        server_args = MagicMock()
+        server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
 

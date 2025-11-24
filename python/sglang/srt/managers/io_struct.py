@@ -39,6 +39,7 @@ else:
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -52,11 +53,61 @@ class BaseReq(ABC):
 @dataclass
 class BaseBatchReq(ABC):
     rids: Optional[List[str]] = field(default=None, kw_only=True)
+    http_worker_ipcs: Optional[List[str]] = field(default=None, kw_only=True)
 
     def regenerate_rids(self):
         """Generate new request IDs and return them."""
         self.rids = [uuid.uuid4().hex for _ in range(len(self.rids))]
         return self.rids
+
+
+@dataclass
+class RequestTimingMetricsMixin:
+    """
+    Mixin class containing common request-level timing metrics.
+
+    This class consolidates the timing metrics that are shared across all batch output types
+    to avoid code duplication and ensure consistency.
+    """
+
+    # Queue duration: time spent waiting in queue before request is scheduled.
+    queue_time: Optional[List[Optional[float]]]
+
+    # Forward entry time: timestamp when the request enters the forward pass stage.
+    # This corresponds to `forward_entry_time` in TimeStats.
+    # In different modes:
+    #   - Unified/PD-colocate: timestamp when forward computation begins (covers prefill + decode)
+    #   - Prefill instance (P): timestamp when prefill forward pass begins
+    #   - Decode instance (D): timestamp when decode forward pass begins
+    # Note: This is NOT the same as prefill_start_time. There may be a delay between
+    # forward_entry_time and prefill_start_time (see prefill_launch_delay).
+    forward_entry_time: Optional[List[Optional[float]]]
+
+    # Prefill launch delay: time spent waiting between forward entry and prefill start.
+    # Calculated as: prefill_start_time - forward_entry_time
+    # This represents the delay between when the request enters the forward stage
+    # and when prefill computation actually begins.
+    prefill_launch_delay: Optional[List[Optional[float]]]
+
+    # Prefill launch latency: time spent during prefill kernel launch.
+    # Calculated as: prefill_end_time_host - prefill_start_time_host
+    prefill_launch_latency: Optional[List[Optional[float]]]
+
+
+@dataclass
+class SpeculativeDecodingMetricsMixin:
+    """
+    Mixin class containing speculative decoding metrics.
+
+    This class consolidates speculative decoding metrics that are shared across
+    batch output types that support speculative decoding to avoid code duplication.
+    """
+
+    # Verify count: number of verification forward passes
+    spec_verify_ct: List[int]
+
+    # Accepted tokens: Number of accepted tokens during speculative decoding
+    spec_accepted_tokens: List[int]
 
 
 # Parameters for a session
@@ -145,6 +196,9 @@ class GenerateReqInput(BaseReq):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
+
+    # Validation step duration
+    validation_time: Optional[float] = None
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -562,6 +616,7 @@ class GenerateReqInput(BaseReq):
                 if self.bootstrap_pair_key is not None
                 else None
             ),
+            validation_time=self.validation_time,
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
@@ -572,6 +627,7 @@ class GenerateReqInput(BaseReq):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            http_worker_ipc=self.http_worker_ipc,
         )
 
 
@@ -681,6 +737,8 @@ class EmbeddingReqInput(BaseReq):
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # Validation step duration
+    validation_time: Optional[float] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
     # Priority for the request
@@ -691,6 +749,9 @@ class EmbeddingReqInput(BaseReq):
 
     # tracing context
     trace_context: Optional[Dict] = None
+
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -757,6 +818,7 @@ class EmbeddingReqInput(BaseReq):
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 is_cross_encoder_request=True,
+                http_worker_ipc=self.http_worker_ipc,
             )
 
         return EmbeddingReqInput(
@@ -767,6 +829,9 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            validation_time=self.validation_time,
+            dimensions=self.dimensions,
+            http_worker_ipc=self.http_worker_ipc,
         )
 
 
@@ -786,6 +851,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     data_parallel_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
 
 
 @dataclass
@@ -804,7 +871,9 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 
 @dataclass
-class BatchTokenIDOutput(BaseBatchReq):
+class BatchTokenIDOutput(
+    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
+):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -822,8 +891,6 @@ class BatchTokenIDOutput(BaseBatchReq):
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
-    spec_verify_ct: List[int]
-    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -848,6 +915,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -886,7 +956,9 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
 
 
 @dataclass
-class BatchStrOutput(BaseBatchReq):
+class BatchStrOutput(
+    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
+):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -898,8 +970,6 @@ class BatchStrOutput(BaseBatchReq):
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
-    spec_verify_ct: List[int]
-    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -924,6 +994,9 @@ class BatchStrOutput(BaseBatchReq):
     # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -955,17 +1028,20 @@ class BatchMultimodalOutput(BaseBatchReq):
 
 
 @dataclass
-class BatchEmbeddingOutput(BaseBatchReq):
+class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
-    embeddings: List[List[float]]
+    embeddings: Union[List[List[float]], List[Dict[int, float]]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
 
 @dataclass
@@ -1004,6 +1080,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
+    # Whether to recapture cuda graph after weight udpdate
+    recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
 
@@ -1076,6 +1154,24 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     group_name: str = "weight_send_group"
     # The backend
     backend: str = "nccl"
+
+
+# Now UpdateWeightsFromIPCReqInput and UpdateWeightsFromIPCReqOutput
+# are only used by Checkpoint Engine (https://github.com/MoonshotAI/checkpoint-engine)
+@dataclass
+class UpdateWeightsFromIPCReqInput(BaseReq):
+    # ZMQ socket paths for each device UUID
+    zmq_handles: Dict[str, str]
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromIPCReqOutput(BaseReq):
+    success: bool
+    message: str
 
 
 @dataclass
@@ -1192,7 +1288,7 @@ class AbortReq(BaseReq):
     abort_all: bool = False
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
-    abort_reason: Optional[str] = None
+    abort_message: Optional[str] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
@@ -1236,6 +1332,7 @@ class ProfileReqInput(BaseReq):
     record_shapes: Optional[bool] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    profile_prefix: Optional[str] = None
 
 
 class ProfileReqType(Enum):
@@ -1256,6 +1353,7 @@ class ProfileReq(BaseReq):
     profile_id: Optional[str] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    profile_prefix: Optional[str] = None
 
 
 @dataclass
@@ -1306,6 +1404,7 @@ class ExpertDistributionReqType(Enum):
     DUMP_RECORD = 3
 
 
+@dataclass
 class ExpertDistributionReq(BaseReq):
     action: ExpertDistributionReqType
 
@@ -1407,18 +1506,6 @@ class LoRAUpdateOutput(BaseReq):
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
 
 
-@dataclass
-class MultiTokenizerRegisterReq(BaseBatchReq):
-    ipc_name: Optional[str] = None
-
-
-@dataclass
-class MultiTokenizerWrapper:
-    # FIXME(lsyin): remove this
-    worker_id: int
-    obj: Optional[Any] = None
-
-
 class BlockReqType(Enum):
     BLOCK = 1
     UNBLOCK = 2
@@ -1445,6 +1532,16 @@ class GetLoadReqOutput(BaseReq):
 @dataclass
 class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
+
+
+@dataclass
+class SetInjectDumpMetadataReqInput(BaseReq):
+    dump_metadata: Dict[str, Any]
+
+
+@dataclass
+class SetInjectDumpMetadataReqOutput(BaseReq):
+    success: bool
 
 
 @dataclass
