@@ -10,8 +10,8 @@ from __future__ import annotations
 import pytest
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.test_server_perf_common import (  # noqa: F401
-    DiffusionPerformanceBase,
+from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
+    DiffusionServerBase,
     diffusion_server,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -22,7 +22,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 logger = init_logger(__name__)
 
 
-class TestDiffusionPerformanceOneGpu(DiffusionPerformanceBase):
+class TestDiffusionServerOneGpu(DiffusionServerBase):
     """Performance tests for 1-GPU diffusion cases."""
 
     @pytest.fixture(params=ONE_GPU_CASES_B, ids=lambda c: c.id)
