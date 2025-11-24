@@ -1043,11 +1043,13 @@ class FlashInferFusedMoE(FusedMoE):
 
         if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
             # lazy import
-            trtllm_bf16_moe = None
             try:
                 from flashinfer.fused_moe import trtllm_bf16_moe
-            except ImportError:
-                trtllm_bf16_moe = None
+            except ImportError as e:
+                raise ImportError(
+                    "Can't import trtllm_bf16_moe from flashinfer. "
+                    "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
+                ) from e
 
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
