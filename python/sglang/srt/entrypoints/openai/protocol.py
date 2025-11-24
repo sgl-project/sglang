@@ -658,9 +658,6 @@ class ChatCompletionRequest(BaseModel):
             )
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
-        elif self.response_format and self.response_format.type == "structural_tag":
-            # Structural tag format is now handled via tool_call_constraint
-            pass
 
         # Check if there are already existing output constraints
         has_existing_constraints = (
