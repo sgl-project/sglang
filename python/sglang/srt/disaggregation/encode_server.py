@@ -39,6 +39,11 @@ from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
 logger = logging.getLogger(__name__)
 import ctypes
 import sys
+from typing import Dict, Set, Tuple
+
+rid_2_receive_endpoint: Dict[str, List[str]] = dict()
+rid_2_receive_count: Dict[str, int] = dict()
+rid_2_ready_event: Dict[str, asyncio.Event] = dict()
 
 
 class TensorWrapper:
@@ -225,8 +230,7 @@ class MMEncoder:
 
     async def _send(
         self,
-        prefill_host: int,
-        embedding_port: int,
+        url,
         embedding: torch.Tensor,
         mm_data: EmbeddingData,
         session_id=None,
@@ -241,12 +245,12 @@ class MMEncoder:
 
             mm_data.embedding = None
             mm_data.embedding_list[mm_data.part_idx] = None
-        logger.info(f" [{self.rank}] Sending to {prefill_host}:{embedding_port}")
+        logger.info(f" [{self.rank}] Sending to {url}")
         # Send ack/data
         socket = get_zmq_socket(
             self.context,
             zmq.PUSH,
-            f"tcp://{prefill_host}:{embedding_port}",
+            f"tcp://{url}",
             False,
         )
 
@@ -274,45 +278,76 @@ class MMEncoder:
     async def send(
         self,
         req_id,
-        prefill_host,
-        embedding_ports,
         session_id=None,
         buffer_address=None,
     ):
-        mm_data: EmbeddingData = self.embedding_to_send[req_id]
-
+        mm_data = self.embedding_to_send.get(req_id)
         if not mm_data:
-            logger.error(f"No embedding data found for req_id: {req_id}")
             return
-        logger.info(f"{self.rank=} {embedding_ports = }")
-        # send_tasks = []
-        # ports_to_send = get_ports_for_rank(embedding_ports, self.rank, self.server_args.tp_size)
+        sent_urls: Set[str] = set()
+        all_tasks: List[Tuple[asyncio.Task, str]] = []
+        start_time = asyncio.get_running_loop().time()
+        timeout = 60.0
+
         try:
-            send_tasks = [
-                self._send(
-                    prefill_host,
-                    port,
-                    mm_data.embedding,
-                    mm_data,
-                    session_id,
-                    buffer_address,
-                )
-                for port in embedding_ports
-            ]
-            results = await asyncio.gather(*send_tasks, return_exceptions=True)
+            while True:
+                current_targets = rid_2_receive_endpoint.get(req_id, set()).copy()
+                expected_count = rid_2_receive_count.get(req_id)
 
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.error(
-                        f"Failed to send to port {embedding_ports[i]}: {result}"
+                new_targets = current_targets - sent_urls
+
+                if new_targets:
+                    logger.info(
+                        f"Found {len(new_targets)} new endpoints for {req_id}. Starting tasks..."
                     )
-                else:
-                    logger.debug(f"Successfully sent to port {embedding_ports[i]}")
+                    for url in new_targets:
+                        task = asyncio.create_task(
+                            self._send(
+                                url,
+                                mm_data.embedding,
+                                mm_data,
+                                session_id,
+                                buffer_address,
+                            )
+                        )
+                        all_tasks.append((task, url))
+                        sent_urls.add(url)  # Mark as handled immediately
+                if expected_count is not None and len(sent_urls) >= expected_count:
+                    logger.info(
+                        f"All {expected_count} endpoints initiated for {req_id}. Breaking loop."
+                    )
+                    break
 
-            del self.embedding_to_send[req_id]
-        except Exception as e:
-            logger.error(f"Error sending embeddings for req_id {req_id}: {e}")
-            raise
+                if asyncio.get_running_loop().time() - start_time > timeout:
+                    logger.error(
+                        f"Timeout waiting for all endpoints for {req_id}. Initiated {len(sent_urls)}/{expected_count}"
+                    )
+                    break
+
+                await asyncio.sleep(0.001)
+
+            if all_tasks:
+                logger.info(
+                    f"Loop finished. Awaiting completion of {len(all_tasks)} sending tasks..."
+                )
+                tasks_only = [t[0] for t in all_tasks]
+                results = await asyncio.gather(*tasks_only, return_exceptions=True)
+
+                # Process results and log errors
+                for i, result in enumerate(results):
+                    url = all_tasks[i][1]  # Retrieve URL associated with the task
+                    if isinstance(result, Exception):
+                        logger.error(f"Failed to send to {url}: {result}")
+                    else:
+                        logger.debug(f"Successfully sent to {url}")
+
+            logger.info(f"All tasks completed for req_id: {req_id}")
+
+        finally:
+            logger.info(f"Cleaning up resources for req_id {req_id}")
+            rid_2_receive_endpoint.pop(req_id, None)
+            rid_2_receive_count.pop(req_id, None)
+            self.embedding_to_send.pop(req_id, None)
 
     async def get_embedding_port(self, prefill_url):
         async with aiohttp.ClientSession(
@@ -406,8 +441,6 @@ async def handle_encode_request(request: dict):
     elif encoder.server_args.mm_transfer_backend == "zmq":
         await encoder.send(
             req_id=request["req_id"],
-            prefill_host=request["prefill_host"],
-            embedding_ports=request["embedding_ports"],
         )
         return ORJSONResponse(content=None)
 
@@ -423,3 +456,14 @@ async def handle_send_request(request: dict):
         buffer_address=request["buffer_address"],
     )
     return ORJSONResponse(content=None)
+
+
+@app.post("/scheduler_receive_url")
+async def handle_scheduler_receive_url_request(request: dict):
+    rid = request["req_id"]
+    global rid_2_receive_endpoint
+    if rid not in rid_2_receive_endpoint:
+        rid_2_receive_endpoint[rid] = set()
+        rid_2_receive_count[rid] = request["receive_count"]
+    assert rid_2_receive_count[rid] == request["receive_count"]
+    rid_2_receive_endpoint[rid].add(request["receive_url"])

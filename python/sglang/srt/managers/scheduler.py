@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import asyncio
 import faulthandler
 import logging
 import os
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+import aiohttp
 import psutil
 import setproctitle
 import torch
@@ -179,7 +181,9 @@ from sglang.srt.utils import (
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_free_port,
     get_int_env_var,
+    get_local_ip_by_remote,
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
@@ -217,17 +221,30 @@ def _determine_tensor_transport_mode(server_args: ServerArgs):
 
 
 class WaitingImageRequest:
-    def __init__(self, rid: str, recv_req, req, embedding_port, mm_processor):
+    def __init__(
+        self,
+        rid: str,
+        recv_req: TokenizedGenerateReqInput,
+        req,
+        mm_processor,
+        image_urls,
+        host_name,
+        receive_count,
+    ):
         self.rid = rid
         self.recv_req = recv_req
         self.req = req
-        self.embedding_port = embedding_port
         self.embedding_ready = False
         self.mm_inputs = None
         self.error = None
         self.thread = None
         self.ready = False
         self.mm_processor = mm_processor
+        self.image_urls = image_urls
+        self.host_name = host_name
+        self.receive_count = receive_count
+        self.num_items_assigned = recv_req.num_items_assigned
+        self.encode_idx = recv_req.encode_idx
 
     def start_waiting(self):
         self.thread = threading.Thread(target=self._recv_mm_data_thread, daemon=True)
@@ -237,9 +254,8 @@ class WaitingImageRequest:
         try:
             mm_processor = self.mm_processor
             prompt = self.recv_req.input_text
-
             self.recv_req.mm_inputs = self._recv_mm_data_sync(
-                self.rid, self.embedding_port, mm_processor, prompt
+                self.rid, mm_processor, prompt
             )
 
             self.embedding_ready = True
@@ -248,14 +264,67 @@ class WaitingImageRequest:
             logger.error(f"Error receiving embedding for {self.rid}: {e}")
             self.error = str(e)
 
-    def _recv_mm_data_sync(self, req_id, embedding_port, mm_processor, prompt):
+    def _recv_mm_data_sync(self, req_id, mm_processor, prompt):
         if req_id is None:
             return None
+        embedding_port = get_free_port()
         context = zmq.Context()
         recv_socket = context.socket(zmq.PULL)
         recv_socket.bind(f"tcp://*:{embedding_port}")
         logger.info(f"Waiting for input {embedding_port = }")
+
+        async def _send_single_request(session, url, payload):
+            try:
+                async with session.post(url, json=payload) as response:
+                    response.raise_for_status()
+                    return await response.text()
+            except Exception as e:
+                logger.error(f"Failed to send request to {url}: {e}")
+                raise
+
+        async def send_embedding_port(req_id, receive_count, host_name, embedding_port):
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=1800)
+            ) as session:
+                tasks = []
+                logger.info(f"{self.num_items_assigned = } ")
+                for idx, assigned_num in enumerate(self.num_items_assigned):
+                    if assigned_num == 0:
+                        continue
+                    image_url = self.image_urls[self.encode_idx[idx]]
+                    target_url = f"{image_url}/scheduler_receive_url"
+                    payload = {
+                        "req_id": req_id,
+                        "receive_count": receive_count,
+                        "receive_url": f"{host_name}:{embedding_port}",
+                    }
+
+                    logger.info(f"Preparing to send  to {target_url}")
+
+                    task = _send_single_request(session, target_url, payload)
+                    tasks.append(task)
+
+                if not tasks:
+                    logger.info("No tasks to send.")
+                    return
+                logger.info(f"Concurrently sending {len(tasks)} requests...")
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logger.error(f"Request {i} failed: {result}")
+                    else:
+                        logger.debug(f"Request {i} succeeded.")
+
         try:
+            asyncio.run(
+                send_embedding_port(
+                    self.recv_req.rid,
+                    self.receive_count,
+                    self.host_name,
+                    embedding_port,
+                )
+            )
             recv_embedding_data = None
             while recv_embedding_data is None or not recv_embedding_data.ready:
                 try:
@@ -322,6 +391,7 @@ class Scheduler(
     ):
         # Parse args
         self.server_args = server_args
+        self.host_name = get_local_ip_by_remote()
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
@@ -1598,13 +1668,15 @@ class Scheduler(
 
         # TODO: add this
         if recv_req.need_wait_for_image is True:
-            assert recv_req.embedding_ports is not None
             waiting_req = WaitingImageRequest(
                 rid=recv_req.rid,
                 recv_req=recv_req,
                 req=req,
-                embedding_port=recv_req.embedding_ports[self.tp_rank],
                 mm_processor=self.mm_processor,
+                image_urls=self.server_args.encode_urls,
+                host_name=self.host_name,
+                ##TODO fixme:
+                receive_count=self.server_args.tp_size,
             )
             self.waiting_for_image.append(waiting_req)
             waiting_req.start_waiting()

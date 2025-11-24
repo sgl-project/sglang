@@ -106,7 +106,6 @@ from sglang.srt.utils import (
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
-    get_local_ip_auto,
     get_multi_free_port,
     get_zmq_socket,
     kill_process_tree,
@@ -460,14 +459,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 image.url = ""
         return image_urls
 
-    def _run_encode_in_thread(self, req_id, img_data, embedding_ports, endpoint_encode):
+    def _run_encode_in_thread(
+        self, req_id, img_data, endpoint_encode, num_items_assigned, encode_idx
+    ):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         try:
             loop.run_until_complete(
                 self._encode_in_background(
-                    req_id, img_data, embedding_ports, endpoint_encode
+                    req_id, img_data, endpoint_encode, num_items_assigned, encode_idx
                 )
             )
             # logger.info(f"Encode completed for request {req_id}")
@@ -479,18 +480,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             loop.close()
 
     async def _encode_in_background(
-        self, req_id, img_data, embedding_ports, endpoint_encode
+        self, req_id, img_data, endpoint_encode, num_items_assigned, encode_idx
     ):
         if len(img_data) == 0:
             return
 
         # Split mm_items
         encode_requests = []
-        random.shuffle(self.encode_idx)
-        num_items_assigned = [
-            (idx + len(img_data)) // len(self.server_args.encode_urls)
-            for idx in self.encode_idx
-        ]
+
         num_parts = sum(1 for x in num_items_assigned if x != 0)
         cum_num_items = 0
         cum_idx = 0
@@ -499,13 +496,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 continue
             encode_requests.append(
                 {
-                    "encoder_idx": idx,
+                    "encoder_idx": encode_idx[idx],
                     "mm_items": img_data[cum_num_items : cum_num_items + assigned_num],
                     "num_parts": num_parts,
                     "part_idx": cum_idx,
                     "req_id": req_id,
-                    "prefill_host": get_local_ip_auto(),
-                    "embedding_ports": embedding_ports,
                 }
             )
             cum_idx += 1
@@ -554,9 +549,22 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self.riq_2_images[obj.rid] = image_urls
                 obj.embedding_ports = get_multi_free_port(self.server_args.tp_size)
                 obj.need_wait_for_image = True
+
+                random.shuffle(self.encode_idx)
+                obj.encode_idx = self.encode_idx
+                obj.num_items_assigned = [
+                    (idx + len(image_urls)) // len(self.server_args.encode_urls)
+                    for idx in self.encode_idx
+                ]
                 encode_thread = threading.Thread(
                     target=self._run_encode_in_thread,
-                    args=(obj.rid, image_urls, obj.embedding_ports, "encode"),
+                    args=(
+                        obj.rid,
+                        image_urls,
+                        "encode",
+                        obj.num_items_assigned,
+                        obj.encode_idx,
+                    ),
                     daemon=True,
                 )
                 encode_thread.start()
@@ -1025,7 +1033,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 need_wait_for_image=obj.need_wait_for_image,
-                embedding_ports=obj.embedding_ports,
+                num_items_assigned=obj.num_items_assigned,
+                encode_idx=obj.encode_idx,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
