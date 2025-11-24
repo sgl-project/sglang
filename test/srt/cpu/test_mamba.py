@@ -1,6 +1,5 @@
 import unittest
 
-import sgl_kernel
 import torch
 import torch.nn.functional as F
 from utils import precision
