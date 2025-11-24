@@ -38,7 +38,7 @@ class WeightChecker:
 
         for name in curr_tensors:
             curr_tensor = curr_tensors[name]
-            snapshot_tensor = self._snapshot_tensors[name]
+            snapshot_tensor = self._snapshot_tensors[name].cuda()
             TODO
 
     def _model_state(self):
