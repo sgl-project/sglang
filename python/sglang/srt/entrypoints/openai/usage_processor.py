@@ -27,6 +27,9 @@ class UsageProcessor:
             for i in range(0, len(responses), n_choices)
         )
 
+        # Get reasoning tokens from meta_info
+        reasoning_tokens = sum(r["meta_info"].get("reasoning_tokens", 0) for r in responses)
+
         cached_details = None
         if enable_cache_report:
             cached_total = sum(
@@ -34,10 +37,11 @@ class UsageProcessor:
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
-        return UsageProcessor.calculate_token_usage(
+        # Create usage info with reasoning_tokens
+        return UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            cached_tokens=cached_details,
+            reasoning_tokens=reasoning_tokens,
         )
 
     @staticmethod
