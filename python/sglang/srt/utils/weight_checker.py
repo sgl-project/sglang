@@ -22,9 +22,9 @@ class WeightChecker:
             raise Exception(f"Unsupported {action=}")
 
     def _snapshot(self):
-        self._snapshot_tensors = [
-            (name, param.data.detach().cpu()) for name, param in self._model_state()
-        ]
+        named_tensors = [(name, param.data.detach().cpu()) for name, param in self._model_state()]
+        self._snapshot_tensors = dict(named_tensors)
+        assert len(self._snapshot_tensors) == len(named_tensors), f"should not have duplicated tensor name"
 
     def _reset_param(self):
         for name, param in self._model_state():
