@@ -46,6 +46,7 @@ suites = {
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
+        TestFile("ops/test_repeat_interleave.py", 60),
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fp8_kernel.py", 8),
         TestFile("quant/test_int8_kernel.py", 8),
@@ -95,7 +96,7 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
-        TestFile("test_piecewise_cuda_graph.py", 750),
+        TestFile("test_piecewise_cuda_graph.py", 850),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -116,6 +117,7 @@ suites = {
         TestFile("test_swa_unittest.py", 1),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 210),
+        TestFile("test_triton_fused_moe.py", 80),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_torchao.py", 70),
         TestFile("test_triton_attention_kernels.py", 4),
@@ -180,9 +182,7 @@ suites = {
     "per-commit-8-gpu-b200": [],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
-        # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12533
-        # TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 590),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -198,37 +198,7 @@ suites = {
         TestFile("test_quantization.py", 185),
         TestFile("test_gguf.py", 96),
     ],
-    # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
-    "nightly-1-gpu": [
-        TestFile("layers/attention/nsa/test_nsa_indexer.py", 2),
-        TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("lora/test_lora_radix_cache.py", 200),
-        TestFile("lora/test_lora_eviction_policy.py", 200),
-        TestFile("lora/test_lora_openai_api.py", 30),
-        TestFile("openai_server/features/test_lora_openai_compatible.py", 150),
-        TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
-        TestFile("test_cpp_radix_cache.py", 60),
-        TestFile("test_deepseek_v3_deterministic.py", 240),
-    ],
-    "nightly-4-gpu-b200": [
-        TestFile("nightly/test_flashinfer_trtllm_gen_moe_backend.py", 300),
-        TestFile("nightly/test_gpt_oss_4gpu_perf.py", 600),
-        TestFile("nightly/test_flashinfer_trtllm_gen_attn_backend.py", 300),
-        TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
-        TestFile("test_fp4_moe.py", 300),
-    ],
-    "nightly-8-gpu-b200": [
-        TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
-    ],
-    "nightly-4-gpu": [
-        TestFile("nightly/test_encoder_dp.py", 500),
-        TestFile("test_qwen3_next_deterministic.py", 200),
-    ],
-    "nightly-8-gpu": [],
-    "nightly-8-gpu-h200": [
-        TestFile("test_deepseek_v32_nsabackend.py", 600),
-    ],
-    "nightly-8-gpu-h20": [],
+    # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
