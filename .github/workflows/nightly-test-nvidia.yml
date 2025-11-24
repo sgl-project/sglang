@@ -193,6 +193,68 @@ jobs:
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_vlms
 
+  # diffusion performance tests
+  nightly-test-multimodal-server-1-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        part: [0, 1]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh diffusion
+          pip install slack_sdk
+
+      - name: Run diffusion server tests
+        env:
+          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+
+        timeout-minutes: 60
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 1-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2
+
+
+  nightly-test-multimodal-server-2-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        part: [0, 1]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh diffusion
+          pip install slack_sdk
+
+      - name: Run diffusion server tests
+        env:
+          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+
+        timeout-minutes: 60
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 2-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2
+
   # B200 Performance tests - 4 GPU
   nightly-test-perf-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang'
@@ -275,6 +337,8 @@ jobs:
       - nightly-test-text-perf-2-gpu-runner
       - nightly-test-vlm-accuracy-2-gpu-runner
       - nightly-test-vlm-perf-2-gpu-runner
+      - nightly-test-multimodal-server-1-gpu
+      - nightly-test-multimodal-server-2-gpu
       - nightly-test-perf-4-gpu-b200
       - nightly-test-perf-8-gpu-b200
     runs-on: ubuntu-latest
