@@ -3,7 +3,7 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,12 +16,20 @@ from sglang.test.test_utils import (
 class TestOpenAIEmbedding(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+        cls.model = (
+            "/root/.cache/modelscope/hub/models/iic/gte_Qwen2-1.5B-instruct"
+            if is_npu()
+            else DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
         # Configure embedding-specific args
-        other_args = ["--is-embedding", "--enable-metrics"]
+        other_args = (
+            ["--is-embedding", "--enable-metrics", "--attention-backend", "ascend"]
+            if is_npu()
+            else ["--is-embedding", "--enable-metrics"]
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
