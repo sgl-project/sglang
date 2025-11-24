@@ -18,7 +18,6 @@ class TestVLMModels(CustomTestCase):
     models = []
     tp_size = 4
     mem_fraction_static = 0.35
-    parsed_args = None  # Class variable to store args
 
     @classmethod
     def setUpClass(cls):
@@ -164,7 +163,7 @@ class TestVLMModels(CustomTestCase):
                     "32",
                     "--enable-multimodal",
                     "--mem-fraction-static",
-                    str(self.parsed_args.mem_fraction_static),  # Use class variable
+                    self..mem_fraction_static,
                     "--log-level",
                     log_level,
                 ]
