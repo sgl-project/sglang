@@ -10,7 +10,7 @@ import requests
 from transformers import AutoProcessor, AutoTokenizer
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -26,13 +26,28 @@ from sglang.test.test_utils import (
 class TestSkipTokenizerInit(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        if is_npu():
+            cls.model = (
+                "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"
+            )
+        else:
+            cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--skip-tokenizer-init", "--stream-output"],
+            other_args=(
+                [
+                    "--skip-tokenizer-init",
+                    "--stream-output",
+                    "--attention-backend",
+                    "ascend",
+                    "--disable-cuda-graph",
+                ]
+                if is_npu()
+                else ["--skip-tokenizer-init", "--stream-output"]
+            ),
         )
         cls.eos_token_id = [119690]
         cls.tokenizer = AutoTokenizer.from_pretrained(
@@ -202,9 +217,12 @@ class TestSkipTokenizerInit(CustomTestCase):
 class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     @classmethod
     def setUpClass(cls):
-        cls.image_url = DEFAULT_IMAGE_URL
+        cls.image_url = ("https://gh.llkk.cc/" + image_path) if is_npu() else DEFAULT_IMAGE_URL
         cls.image = download_image_with_retry(cls.image_url)
-        cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        if is_npu():
+            cls.model = "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-VL-3B-Instruct"
+        else:
+            cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
         cls.processor = AutoProcessor.from_pretrained(cls.model, trust_remote_code=True)
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -212,7 +230,16 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--skip-tokenizer-init"],
+                        other_args=(
+                [
+                    "--skip-tokenizer-init",
+                    "--attention-backend",
+                    "ascend",
+                    "--disable-cuda-graph",
+                ]
+                if is_npu()
+                else ["--skip-tokenizer-init"]
+            ),
         )
         cls.eos_token_id = [cls.tokenizer.eos_token_id]
 
