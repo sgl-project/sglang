@@ -5,6 +5,7 @@ Server management and performance validation for diffusion tests.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -130,7 +131,9 @@ class ServerManager:
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
         env["SGLANG_PERF_LOG_DIR"] = log_dir.as_posix()
 
-        stdout_fh = stdout_path.open("w", encoding="utf-8", buffering=1)
+        # TODO: unify with run_command
+        logger.info(f"Running command: {shlex.join(command)}")
+
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -141,6 +144,7 @@ class ServerManager:
         )
 
         log_thread = None
+        stdout_fh = stdout_path.open("w", encoding="utf-8", buffering=1)
         if process.stdout:
 
             def _log_pipe(pipe: Any, file: Any) -> None:

@@ -100,6 +100,8 @@ if TYPE_CHECKING:
     # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
     from decord import VideoReader
 
+    from sglang.srt.server_args import ServerArgs
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
@@ -2778,7 +2780,7 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather(server_args):
+def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
@@ -2801,7 +2803,7 @@ def require_mlp_tp_gather(server_args):
         return False
 
 
-def require_attn_tp_gather(server_args):
+def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
@@ -2815,11 +2817,11 @@ def require_attn_tp_gather(server_args):
         return False
 
 
-def require_gathered_buffer(server_args):
+def require_gathered_buffer(server_args: ServerArgs):
     return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
 
 
-def require_mlp_sync(server_args):
+def require_mlp_sync(server_args: ServerArgs):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
