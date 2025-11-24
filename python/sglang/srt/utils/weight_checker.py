@@ -31,6 +31,7 @@ class WeightChecker:
             param.copy_(_random_like(param))
 
     def _compare(self):
+        assert self._snapshot_tensors is not None
         TODO
 
     def _model_state(self):
