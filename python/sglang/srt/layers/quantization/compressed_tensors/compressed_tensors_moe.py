@@ -5,34 +5,61 @@ from __future__ import annotations
 import enum
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.environ import envs
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import find_matched_target
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
-from sglang.srt.layers.quantization.utils import (
+from sglang.srt.layers.quantization.utils.utils import (
     all_close_1d,
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    find_matched_target,
+    is_activation_quantization_format,
+    should_ignore_layer,
+)
+
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    get_compiler_backend,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_sm90_supported,
+    is_sm100_supported,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLDispatchOutput,
+        DeepEPNormalDispatchOutput,
     )
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
@@ -61,6 +88,8 @@ __all__ = [
     "CompressedTensorsMoEMethod",
     "CompressedTensorsW8A8Fp8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
+    "CompressedTensorsWNA16AMXEPMoEMethod",  # for Ktransformers
+    "CompressedTensorsWInt4AFp8MoEMethod",
 ]
 
 
@@ -79,14 +108,43 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
 
-        weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
-        input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
+        if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
+            match = re.search(r"(\d+)\.mlp", prefix)
+            if not match:
+                raise ValueError(
+                    f"Unable to extract layer number from prefix '{prefix}'. "
+                    f"Expected format: '<layer_number>.mlp'"
+                )
+            layer_number = int(match.group(1))
+            return CompressedTensorsWNA16AMXEPMoEMethod(quant_config, layer_number)
+
+        if quant_config.target_scheme_map:
+
+            # Use 'Linear' as the default target for fused MoE layers in llm-compressor
+            if "Linear" in quant_config.target_scheme_map.keys():
+                prefix = "Linear"
+
+            matched_target = find_matched_target(
+                layer_name=prefix,
+                module=layer,
+                targets=quant_config.target_scheme_map.keys(),
+                fused_mapping=quant_config.packed_modules_mapping,
+            )
+
+            scheme_dict = quant_config.target_scheme_map[matched_target]
+            weight_quant = scheme_dict.get("weights")
+            input_quant = scheme_dict.get("input_activations")
+
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
 
             logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
+            quant_config._is_wfp8afp8_moe = True
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
+        elif quant_config._is_int4_afp8(weight_quant, input_quant):
+            quant_config._is_wint4afp8_moe = True
+            return CompressedTensorsWInt4AFp8MoEMethod(scheme_dict)
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -94,7 +152,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
 
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
-
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
         self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
@@ -103,6 +160,25 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         )
 
         self.static_input_scales = not self.input_quant.dynamic
+
+        from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+
+        self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.use_cutlass_fused_experts_fp8 = (
+            get_bool_env_var("SGLANG_CUTLASS_MOE")
+            and self.cutlass_fp8_supported
+            and self.weight_quant.strategy == QuantizationStrategy.BLOCK
+            and (is_sm100_supported() or is_sm90_supported())
+        )
+
+        self.block_quant = False
+        if self.weight_quant.strategy == QuantizationStrategy.BLOCK:
+            if self.weight_quant.block_structure is None:
+                raise RuntimeError(
+                    f"For BLOCK quantization strategy, block_structure(weight_block_size) must be set in the QuantConfig."
+                )
+            self.block_quant = True
+            self.weight_block_size = self.weight_quant.block_structure
 
     def create_weights(
         self,
@@ -116,6 +192,30 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.float8_e4m3fn
+
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if self.block_quant:
+            block_n, block_k = (
+                self.weight_block_size[0],
+                self.weight_block_size[1],
+            )
+            # Required by column parallel or enabling merged weights
+            if intermediate_size_per_partition % block_n != 0:
+                raise ValueError(
+                    f"The output_size of gate's and up's weight = "
+                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )
+            if tp_size > 1:
+                # Required by row parallel
+                if intermediate_size_per_partition % block_k != 0:
+                    raise ValueError(
+                        f"The input_size of down's weight = "
+                        f"{intermediate_size_per_partition} is not divisible by "
+                        f"weight quantization block_k = {block_k}."
+                    )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -169,6 +269,81 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
             weight_quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+        elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    (hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    (hidden_size + block_n - 1) // block_n,
+                    (intermediate_size_per_partition + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            assert not self.static_input_scales
+            if self.use_cutlass_fused_experts_fp8:
+                self.ab_strides1 = torch.full(
+                    (num_experts,),
+                    hidden_size,
+                    device=w13_weight.device,
+                    dtype=torch.int64,
+                )
+                self.c_strides1 = torch.full(
+                    (num_experts,),
+                    2 * intermediate_size_per_partition,
+                    device=w13_weight.device,
+                    dtype=torch.int64,
+                )
+                self.ab_strides2 = torch.full(
+                    (num_experts,),
+                    intermediate_size_per_partition,
+                    device=w2_weight.device,
+                    dtype=torch.int64,
+                )
+                self.c_strides2 = torch.full(
+                    (num_experts,),
+                    hidden_size,
+                    device=w2_weight.device,
+                    dtype=torch.int64,
+                )
+                self.workspace = torch.empty(
+                    90000, device=w13_weight.device, dtype=torch.uint8
+                )
+                self.a_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.b_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.out_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.a_scales_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.b_scales_ptr = torch.empty(
+                    num_experts, device=w13_weight.device, dtype=torch.int64
+                )
+                self.expert_offsets = torch.empty(
+                    num_experts + 1, device=w13_weight.device, dtype=torch.int32
+                )
+                self.problem_sizes1 = torch.empty(
+                    num_experts, 3, device=w13_weight.device, dtype=torch.int32
+                )
+                self.problem_sizes2 = torch.empty(
+                    num_experts, 3, device=w13_weight.device, dtype=torch.int32
+                )
+            weight_quant_method = FusedMoeWeightScaleSupported.CHANNEL.BLOCK.value
         else:
             raise ValueError(
                 f"Unsupported weight quantization strategy: {self.weight_quant.strategy}"
@@ -205,6 +380,51 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
+        # Block quant doesn't need to process weights after loading
+
+        if self.block_quant:
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if is_fp8_fnuz():
+                # activation_scheme: dynamic
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale,
+                    input_scale=None,
+                )
+                # Reset the parameter
+                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w13_input_scale = None
+                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale = torch.nn.Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                layer.w2_input_scale = None
+
+            if _use_aiter:
+                # Pre-shuffle weights
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
+                )
+
+            if is_cpu():
+                assert (
+                    cpu_has_amx_support()
+                ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
+            return
+
         if self.static_input_scales:
             if layer.w13_input_scale is None or layer.w2_input_scale is None:
                 raise ValueError(
@@ -294,8 +514,28 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+
+        if moe_runner_backend.is_auto():
+            if (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and get_moe_a2a_backend().is_deepep()
+            ):
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            else:
+                moe_runner_backend = MoeRunnerBackend.TRITON
+        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO(cwan): refactor other backends
+            pass
 
     def apply(
         self,
@@ -306,44 +546,96 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
         moe_runner_config = self.moe_runner_config
 
-        if _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
-            assert not moe_runner_config.no_combine, "unsupported"
-            topk_weights, topk_ids, _ = topk_output
-            if moe_runner_config.apply_router_weight_on_input:
-                assert (
-                    topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-                _, topk = topk_weights.shape
-                assert (
-                    topk == 1
-                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(
-                    topk_weights, dtype=torch.float32
-                )  # topk_weights must be FP32 (float32)
-            output = fused_moe(
+        if self.use_cutlass_fused_experts_fp8:
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            output = cutlass_fused_experts_fp8(
                 x,
-                layer.w13_weight,
-                layer.w2_weight,
+                layer.w13_weight.transpose(1, 2),
+                layer.w2_weight.transpose(1, 2),
+                layer.w13_weight_scale.transpose(1, 2),
+                layer.w2_weight_scale.transpose(1, 2),
                 topk_weights,
                 topk_ids,
-                activation=(
-                    ActivationType.Silu
-                    if moe_runner_config.activation == "silu"
-                    else ActivationType.Gelu
-                ),
-                quant_type=QuantType.per_Token,
+                self.ab_strides1,
+                self.c_strides1,
+                self.ab_strides2,
+                self.c_strides2,
+                self.workspace,
+                self.a_ptr,
+                self.b_ptr,
+                self.out_ptr,
+                self.a_scales_ptr,
+                self.b_scales_ptr,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                use_fp8_blockscale=True,
+            )
+            return StandardCombineInput(hidden_states=output)
+        elif (
+            _use_aiter
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and moe_runner_config.apply_router_weight_on_input
+        ):
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            output = rocm_fused_experts_tkw1(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=moe_runner_config.activation,
+                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
             return StandardCombineInput(hidden_states=output)
-        else:
+        elif self.runner.runner_backend.is_deep_gemm():
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
+            if self.block_quant:
+                block_shape = self.weight_block_size
+                w13_scale = layer.w13_weight_scale
+                w2_scale = layer.w2_weight_scale
+            else:
+                # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
+                scale_block_size = 128
+                block_shape = [scale_block_size, scale_block_size]
+                w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+                w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+                w13_scale = (
+                    layer.w13_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w13_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w13_scale_k, dim=2)
+                )
+                w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+                w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+                w2_scale = (
+                    layer.w2_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w2_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w2_scale_k, dim=2)
+                )
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=True,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                block_shape=block_shape,
+            )
+        elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -354,8 +646,14 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                block_shape=self.weight_block_size if self.block_quant else None,
             )
-            return self.runner.run(dispatch_output, quant_info)
+
+        else:
+            raise NotImplementedError(
+                "Unsupported runner backend: %s" % self.runner.runner_backend
+            )
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
@@ -652,3 +950,666 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
+    """AMX MoE method using AMXMoEWrapper for CPU inference."""
+
+    def __init__(
+        self,
+        quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
+        layer_idx,
+        num_gpu_experts,
+        cpuinfer,
+        threadpool_count,
+        amx_weight_path,
+        chunked_prefill_size,
+    ):
+
+        if not KTRANSFORMERS_AVAILABLE:
+            raise ImportError(
+                "kt_kernel is not installed, to use CompressedTensorsWNA16AMXEPMoEMethod, please install kt_kernel."
+            )
+
+        if not FUSED_MARLIN_MOE_AVAILABLE:
+            raise ImportError("fused_marlin_moe is not available")
+
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.layer_idx = layer_idx
+        self.num_gpu_experts = num_gpu_experts
+        self.amx_weight_path = amx_weight_path
+        self.chunked_prefill_size = chunked_prefill_size
+        self.cpuinfer = cpuinfer
+        self.threadpool_count = threadpool_count
+        self.amx_wrapper = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        self.experts_num = num_experts
+        self.num_experts_per_tok = extra_weight_attrs.pop("top_k")
+        self.hidden_size = hidden_size
+        self.moe_intermediate_size = extra_weight_attrs.pop("intermediate_size_full")
+
+        if self.tp_rank != 0:
+            return
+        self.amx_wrapper = AMXMoEWrapper(
+            layer_idx=self.layer_idx,
+            num_experts=num_experts,
+            num_experts_per_tok=self.num_experts_per_tok,
+            hidden_size=hidden_size,
+            moe_intermediate_size=self.moe_intermediate_size,
+            num_gpu_experts=self.num_gpu_experts,
+            cpuinfer_threads=self.cpuinfer,
+            threadpool_count=self.threadpool_count,
+            amx_weight_path=self.amx_weight_path,
+            chunked_prefill_size=self.chunked_prefill_size,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.tp_rank != 0:
+            return
+
+        if self.amx_wrapper is None:
+            raise RuntimeError(
+                "AMXMoEWrapper not initialized. Call create_weights first."
+            )
+
+        torch.cuda.synchronize()
+        # Load weights using wrapper
+        from sglang.srt.eplb.expert_location_dispatch import (
+            get_global_expert_location_metadata,
+        )
+
+        physical_to_logical_map_cpu = (
+            get_global_expert_location_metadata()
+            .physical_to_logical_map_cpu[self.layer_idx]
+            .contiguous()
+        )
+        self.amx_wrapper.load_weights(physical_to_logical_map_cpu)
+
+    def submit(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> None:
+        """Submit AMX inference task asynchronously."""
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        if self.tp_rank != 0 or self.amx_wrapper is None:
+            return None
+
+        # Submit forward task using wrapper
+        self.amx_wrapper.submit_forward(
+            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+        )
+        return None
+
+    def sync(self, x):
+        """Synchronize and retrieve AMX inference results."""
+        if self.tp_rank != 0 or self.amx_wrapper is None:
+            return torch.zeros_like(x)
+
+        # Sync forward task using wrapper
+        return self.amx_wrapper.sync_forward(
+            x, torch.cuda.current_stream(x.device).cuda_stream
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        """Execute AMX MoE forward pass synchronously."""
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        if self.tp_rank != 0 or self.amx_wrapper is None:
+            return StandardCombineInput(hidden_states=torch.zeros_like(x))
+
+        # Execute forward using wrapper (submit + sync)
+        output = self.amx_wrapper.forward(
+            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+        )
+        return StandardCombineInput(hidden_states=output)
+
+
+def override_config(
+    cls,
+    num_gpu_experts,
+    cpuinfer,
+    threadpool_count,
+    amx_weight_path,
+    amx_method,
+    chunked_prefill_size,
+):
+    """Override MOE configuration via environment variables."""
+    # Set environment variables using envs utility class
+    if num_gpu_experts is not None:
+        envs.SGLANG_KT_MOE_NUM_GPU_EXPERTS.set(num_gpu_experts)
+    if cpuinfer is not None:
+        envs.SGLANG_KT_MOE_CPUINFER.set(cpuinfer)
+    if threadpool_count is not None:
+        envs.SGLANG_KT_THREADPOOL_COUNT.set(threadpool_count)
+    if amx_weight_path is not None:
+        envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.set(amx_weight_path)
+    if amx_method is not None:
+        envs.SGLANG_KT_AMX_METHOD.set(amx_method)
+    if chunked_prefill_size is not None:
+        envs.SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE.set(chunked_prefill_size)
+
+
+class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
+
+    def __init__(
+        self,
+        quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
+        layer_idx,
+    ):
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+        if (
+            not envs.SGLANG_KT_MOE_NUM_GPU_EXPERTS.is_set()
+            or not envs.SGLANG_KT_MOE_CPUINFER.is_set()
+            or not envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set()
+        ):
+            raise RuntimeError(
+                "the following arguments are required: --kt-amx-weight-path, --kt-cpuinfer, --kt-num-gpu-experts"
+            )
+        self.num_gpu_experts = envs.SGLANG_KT_MOE_NUM_GPU_EXPERTS.value
+        cpuinfer = envs.SGLANG_KT_MOE_CPUINFER.value
+        threadpool_count = envs.SGLANG_KT_THREADPOOL_COUNT.value
+        amx_weight_path = envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.value
+        chunked_prefill_size = envs.SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE.value
+
+        self.AMX_method = CompressedTensorsWNA16AMXMoEMethod(
+            quant_config,
+            layer_idx,
+            self.num_gpu_experts,
+            cpuinfer,
+            threadpool_count,
+            amx_weight_path,
+            chunked_prefill_size,
+        )
+        self.marlin_method = CompressedTensorsWNA16MoEMethod(
+            quant_config, self.num_gpu_experts
+        )
+        self.layer_id = layer_idx
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        self.global_num_experts = num_experts
+        self.AMX_method.create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        self.marlin_method.create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.AMX_method.process_weights_after_loading(layer)
+        self.marlin_method.process_weights_after_loading(layer)
+
+    def submit(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        """Submit hybrid GPU+CPU MoE task (AMX submission + GPU execution)."""
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, router_logits = topk_output
+
+        # Submit AMX task if on rank 0
+        if self.tp_rank == 0:
+            self.AMX_method.submit(layer, dispatch_output)
+
+        # Mask CPU expert IDs (>= num_gpu_experts) as -1 so they won't be computed on GPU
+        topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+
+        # Execute GPU (Marlin) experts
+        output = fused_marlin_moe(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            g_idx1=layer.w13_weight_g_idx,
+            g_idx2=layer.w2_weight_g_idx,
+            sort_indices1=layer.w13_g_idx_sort_indices,
+            sort_indices2=layer.w2_g_idx_sort_indices,
+            num_bits=self.marlin_method.num_bits,
+            is_k_full=self.marlin_method.is_k_full,
+            global_num_experts=self.global_num_experts,
+            expert_map=torch.empty(1, device=x.device),
+        )
+        return StandardCombineInput(hidden_states=output)
+
+    def sync(self, x):
+        """Synchronize and retrieve AMX results."""
+        if self.tp_rank != 0:
+            return torch.zeros_like(x)
+        return self.AMX_method.sync(x)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        """Execute hybrid GPU+CPU MoE forward pass with parallelism."""
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, router_logits = topk_output
+
+        # Step 1: Submit AMX task (non-blocking) if on rank 0
+        # This starts CPU computation in parallel
+        if self.tp_rank == 0:
+            self.AMX_method.submit(layer, dispatch_output)
+
+        # Step 2: Execute GPU (Marlin) experts in parallel with CPU
+
+        # Mask CPU expert IDs (>= num_gpu_experts) as -1 so they won't be computed on GPU
+        topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+
+        # While GPU computes, CPU is also computing
+        output = fused_marlin_moe(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            g_idx1=layer.w13_weight_g_idx,
+            g_idx2=layer.w2_weight_g_idx,
+            sort_indices1=layer.w13_g_idx_sort_indices,
+            sort_indices2=layer.w2_g_idx_sort_indices,
+            num_bits=self.marlin_method.num_bits,
+            is_k_full=self.marlin_method.is_k_full,
+            global_num_experts=self.global_num_experts,
+            expert_map=torch.empty(1, device=x.device),
+        )
+
+        # Step 3: Sync AMX results and combine with GPU results
+        if self.tp_rank == 0:
+            amx_output = self.AMX_method.sync(x)
+            output += amx_output
+
+        return StandardCombineInput(hidden_states=output)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.AMX_method.create_moe_runner(layer, moe_runner_config)
+
+
+class CompressedTensorsWInt4AFp8MoEMethod(CompressedTensorsMoEMethod):
+    def __init__(self, scheme_dict: Dict[str, Any]):
+        self.input_quant = scheme_dict.get("input_activations")
+        self.weight_quant = scheme_dict.get("weights")
+        self.static_input_scales = not self.input_quant.dynamic
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        assert "weight_loader" in extra_weight_attrs
+
+        # Fused gate_up_proj (column parallel)
+        w13_weight_packed = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition * 2,
+                hidden_size // 2,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_packed", w13_weight_packed)
+        set_weight_attrs(w13_weight_packed, extra_weight_attrs)
+
+        # down_proj (row parallel)
+        w2_weight_packed = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_packed", w2_weight_packed)
+        set_weight_attrs(w2_weight_packed, extra_weight_attrs)
+
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
+        )
+        w13_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.weight_quant.group_size,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        w2_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.weight_quant.group_size,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # Input scales
+        if self.static_input_scales:
+            # w13_input_scale = torch.nn.Parameter(
+            #     torch.ones((num_experts, 2), dtype=torch.bfloat16),
+            #     requires_grad=False,
+            # )
+            # layer.register_parameter("w13_input_scale", w13_input_scale)
+            # set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+            # w2_input_scale = torch.nn.Parameter(
+            #     torch.ones(num_experts, dtype=torch.bfloat16),
+            #     requires_grad=False,
+            # )
+            # layer.register_parameter("w2_input_scale", w2_input_scale)
+            # set_weight_attrs(w2_input_scale, extra_weight_attrs)
+            logger.error(
+                "Static input scales for WInt4AFp8MoEMethod are not yet supported for llm-compressor."
+            )
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
+        # Pre-populate the strides
+        device = layer.w13_weight_packed.device
+
+        self.a_strides1 = torch.full(
+            (num_experts, 3),
+            hidden_size,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.c_strides1 = torch.full(
+            (num_experts, 3),
+            2 * intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.a_strides2 = torch.full(
+            (num_experts, 3),
+            intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.c_strides2 = torch.full(
+            (num_experts, 3),
+            hidden_size,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.b_strides1 = self.a_strides1
+        self.s_strides13 = self.c_strides1
+        self.b_strides2 = self.a_strides2
+        self.s_strides2 = self.c_strides2
+
+        self.expert_offsets = torch.empty(
+            (num_experts + 1), dtype=torch.int32, device=device
+        )
+        self.problem_sizes1 = torch.empty(
+            (num_experts, 3), dtype=torch.int32, device=device
+        )
+        self.problem_sizes2 = torch.empty(
+            (num_experts, 3), dtype=torch.int32, device=device
+        )
+        return
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.quantization.w4afp8 import interleave_scales
+
+        dtype = torch.bfloat16
+        device = layer.w2_weight_packed.device
+
+        # Interleave w13_weight_scale (gate_up_proj)
+        w13_weight_scale = layer.w13_weight_scale.to(dtype)
+        w13_weight_scale = interleave_scales(w13_weight_scale)
+        layer.w13_weight_scale = torch.nn.Parameter(
+            w13_weight_scale, requires_grad=False
+        )
+
+        # Interleave w2_weight_scale (down_proj)
+        w2_weight_scale = layer.w2_weight_scale.to(dtype)
+        w2_weight_scale = interleave_scales(w2_weight_scale)
+        layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
+
+        if self.static_input_scales:
+            # Process input scales
+            # w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
+            # new_w13_input_scale = torch.tensor(
+            #     [1],
+            #     dtype=dtype,
+            #     device=device,
+            # )
+            # layer.w13_input_scale = torch.nn.Parameter(new_w13_input_scale, requires_grad=False)
+
+            # w2_input_scale_max = layer.w2_input_scale.max().to(dtype).item()
+            # new_w2_input_scale = torch.tensor(
+            #     [1], dtype=dtype, device=device
+            # )
+            # layer.w2_input_scale = torch.nn.Parameter(new_w2_input_scale, requires_grad=False)
+
+            logger.error(
+                "Static input scales for WInt4AFp8MoEMethod are not yet supported for llm-compressor."
+            )
+
+        # Use scale = 1.0 (cast to bfloat16), is faster
+        new_w13_input_scale = torch.tensor(
+            [1],
+            dtype=dtype,
+            device=device,
+        )
+        layer.w13_input_scale = torch.nn.Parameter(
+            new_w13_input_scale, requires_grad=False
+        )
+        new_w2_input_scale = torch.tensor([1], dtype=dtype, device=device)
+        layer.w2_input_scale = torch.nn.Parameter(
+            new_w2_input_scale, requires_grad=False
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, _ = topk_output
+
+        output = cutlass_w4a8_moe(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+            self.a_strides1,
+            self.b_strides1,
+            self.c_strides1,
+            self.a_strides2,
+            self.b_strides2,
+            self.c_strides2,
+            self.s_strides13,
+            self.s_strides2,
+            self.expert_offsets,
+            self.problem_sizes1,
+            self.problem_sizes2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
+        )
+        if self.moe_runner_config.routed_scaling_factor is not None:
+            output *= self.moe_runner_config.routed_scaling_factor
+        return StandardCombineInput(hidden_states=output)
+
+    def apply_deepep_ll(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ) -> torch.Tensor:
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
+
+        hidden_states, _, topk_ids, _, masked_m, _ = dispatch_output
+
+        output = cutlass_w4a8_moe_deepep_ll(
+            hidden_states,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            topk_ids,
+            masked_m,
+            layer.quant_method.a_strides1,
+            layer.quant_method.b_strides1,
+            layer.quant_method.c_strides1,
+            layer.quant_method.a_strides2,
+            layer.quant_method.b_strides2,
+            layer.quant_method.c_strides2,
+            layer.quant_method.s_strides13,
+            layer.quant_method.s_strides2,
+            layer.quant_method.expert_offsets,
+            layer.quant_method.problem_sizes1,
+            layer.quant_method.problem_sizes2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
+        )
+        return output
+
+    def apply_deepep_normal(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPNormalDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+            cutlass_w4a8_moe_deepep_normal,
+        )
+
+        hidden_states, topk_idx, topk_weights = (
+            dispatch_output.hidden_states,
+            dispatch_output.topk_ids,
+            dispatch_output.topk_weights,
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > 0:
+            return cutlass_w4a8_moe_deepep_normal(
+                hidden_states,
+                layer.w13_weight_packed,
+                layer.w2_weight_packed,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                topk_weights,
+                topk_idx,
+                self.a_strides1,
+                self.b_strides1,
+                self.c_strides1,
+                self.a_strides2,
+                self.b_strides2,
+                self.c_strides2,
+                self.s_strides13,
+                self.s_strides2,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+            )
+        else:
+            return hidden_states
