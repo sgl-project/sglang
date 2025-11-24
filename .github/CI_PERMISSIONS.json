@@ -305,6 +305,12 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "guapisolo": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
     "guoyuhong": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,

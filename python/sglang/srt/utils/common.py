@@ -56,6 +56,7 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -93,6 +94,9 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -2774,7 +2778,7 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather(server_args):
+def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
@@ -2797,7 +2801,7 @@ def require_mlp_tp_gather(server_args):
         return False
 
 
-def require_attn_tp_gather(server_args):
+def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
@@ -2811,11 +2815,11 @@ def require_attn_tp_gather(server_args):
         return False
 
 
-def require_gathered_buffer(server_args):
+def require_gathered_buffer(server_args: ServerArgs):
     return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
 
 
-def require_mlp_sync(server_args):
+def require_mlp_sync(server_args: ServerArgs):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
@@ -3638,12 +3642,6 @@ def cached_triton_kernel(key_fn=None):
     """
 
     def decorator(fn):
-        # Auto-enable the custom kernel cache for CUDA, where it is
-        # known to be compatible.
-        if is_cuda() and not envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.is_set():
-            logger.debug("Detected platform CUDA, using custom triton kernel cache.")
-            return CachedKernel(fn, key_fn)
-
         if envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
             logger.debug(
                 f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = True. Using custom triton kernel cache."
