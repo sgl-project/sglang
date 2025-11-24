@@ -70,6 +70,56 @@ async def set_lora_adapter(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/merge_lora_weights")
+async def merge_lora_weights():
+    """
+    Merge LoRA weights into the base model.
+    """
+    try:
+        payload = {"method": "merge_lora_weights"}
+        response = await scheduler_client.forward(payload)
+
+        if isinstance(response, dict) and response.get("status") == "ok":
+            return {"status": "ok", "message": "Successfully merged LoRA weights"}
+        else:
+            error_msg = (
+                response.get("message", "Unknown error")
+                if isinstance(response, dict)
+                else "Unknown response format"
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Failed to merge LoRA weights: {error_msg}"
+            )
+    except Exception as e:
+        logger.error(f"Error merging LoRA weights: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/unmerge_lora_weights")
+async def unmerge_lora_weights():
+    """
+    Unmerge LoRA weights from the base model.
+    """
+    try:
+        payload = {"method": "unmerge_lora_weights"}
+        response = await scheduler_client.forward(payload)
+
+        if isinstance(response, dict) and response.get("status") == "ok":
+            return {"status": "ok", "message": "Successfully unmerged LoRA weights"}
+        else:
+            error_msg = (
+                response.get("message", "Unknown error")
+                if isinstance(response, dict)
+                else "Unknown response format"
+            )
+            raise HTTPException(
+                status_code=500, detail=f"Failed to unmerge LoRA weights: {error_msg}"
+            )
+    except Exception as e:
+        logger.error(f"Error unmerging LoRA weights: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def _choose_ext(output_format: Optional[str], background: Optional[str]) -> str:
     # Normalize and choose extension
     fmt = (output_format or "").lower()

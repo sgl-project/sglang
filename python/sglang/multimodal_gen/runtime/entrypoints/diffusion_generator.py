@@ -110,7 +110,6 @@ class DiffGenerator:
         Returns:
             The created DiffGenerator
         """
-        # executor_class = SchedulerBase.get_class(server_args)
         instance = cls(
             server_args=server_args,
         )
@@ -388,12 +387,33 @@ class DiffGenerator:
         Use unmerged weights for inference to produce outputs that align with
         validation outputs generated during training.
         """
-        # self.scheduler.unmerge_lora_weights()
-        pass  # Removed as per edit hint
+        payload = {"method": "unmerge_lora_weights"}
+        response = sync_scheduler_client.forward(payload)
+        if isinstance(response, dict) and response.get("status") == "ok":
+            logger.info("Successfully unmerged LoRA weights")
+        else:
+            error_msg = (
+                response.get("message", "Unknown error")
+                if isinstance(response, dict)
+                else "Unknown response format"
+            )
+            raise RuntimeError(f"Failed to unmerge LoRA weights: {error_msg}")
 
     def merge_lora_weights(self) -> None:
-        # self.scheduler.merge_lora_weights()
-        pass  # Removed as per edit hint
+        """
+        Merge LoRA weights.
+        """
+        payload = {"method": "merge_lora_weights"}
+        response = sync_scheduler_client.forward(payload)
+        if isinstance(response, dict) and response.get("status") == "ok":
+            logger.info("Successfully merged LoRA weights")
+        else:
+            error_msg = (
+                response.get("message", "Unknown error")
+                if isinstance(response, dict)
+                else "Unknown response format"
+            )
+            raise RuntimeError(f"Failed to merge LoRA weights: {error_msg}")
 
     def shutdown(self):
         """

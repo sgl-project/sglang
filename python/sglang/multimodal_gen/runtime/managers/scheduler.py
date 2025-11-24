@@ -142,6 +142,12 @@ class Scheduler:
                             reqs["lora_path"],
                         )
                         output_batch = {"status": "ok"}
+                    elif method == "unmerge_lora_weights":
+                        self.worker.unmerge_lora_weights()
+                        output_batch = {"status": "ok"}
+                    elif method == "merge_lora_weights":
+                        self.worker.merge_lora_weights()
+                        output_batch = {"status": "ok"}
                     else:
                         error_msg = f"Unknown method: {method}"
                         logger.error(error_msg)
