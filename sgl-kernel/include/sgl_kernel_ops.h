@@ -174,17 +174,48 @@ void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
-void fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
+void fast_topk_interface(const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths);
 void fast_topk_transform_interface(
-    at::Tensor score,
-    at::Tensor lengths,
-    at::Tensor dst_page_table,
-    at::Tensor src_page_table,
-    at::Tensor cu_seqlens_q);
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q);
+void fast_topk_transform_ragged_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
+
+/*
+ * From gguf quantization
+ */
+torch::Tensor
+ggml_dequantize(torch::Tensor W, int64_t type, int64_t m, int64_t n, std::optional<at::ScalarType> const& dtype);
+
+torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W, torch::Tensor X, int64_t type, int64_t row);
+
+torch::Tensor ggml_mul_mat_a8(torch::Tensor W, torch::Tensor X, int64_t type, int64_t row);
+
+torch::Tensor ggml_moe_a8(
+    torch::Tensor X,
+    torch::Tensor W,
+    torch::Tensor sorted_token_ids,
+    torch::Tensor expert_ids,
+    torch::Tensor num_tokens_post_padded,
+    int64_t type,
+    int64_t row,
+    int64_t top_k,
+    int64_t tokens);
+
+torch::Tensor ggml_moe_a8_vec(
+    torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids, int64_t top_k, int64_t type, int64_t row, int64_t tokens);
+
+int64_t ggml_moe_get_block_size(int64_t type);
 
 /*
  * From csrc/gemm
@@ -219,7 +250,7 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Dtype& out_dtype);
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
-void sgl_per_token_group_quant_fp8(
+void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
     at::Tensor output_s,
@@ -228,14 +259,17 @@ void sgl_per_token_group_quant_fp8(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0);
-void sgl_per_token_group_quant_int8(
+void sgl_per_token_group_quant_8bit_v2(
     at::Tensor input,
     at::Tensor output_q,
     at::Tensor output_s,
     int64_t group_size,
     double eps,
-    double int8_min,
-    double int8_max);
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
@@ -302,6 +336,8 @@ void topk_softmax(
     torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
+
+void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -526,6 +562,21 @@ void transfer_kv_per_layer_pf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+void transfer_kv_per_layer_ph_lf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
 void transfer_kv_all_layer(
     const at::Tensor src_k_layers,
     const at::Tensor dst_k_layers,
@@ -548,6 +599,21 @@ void transfer_kv_all_layer_lf_pf(
     int64_t item_size,
     int64_t dst_layout_dim,
     int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_lf_ph(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
     int64_t block_quota,
     int64_t num_warps_per_block);
 
@@ -790,3 +856,72 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
+
+/*
+ * From csrc/expert_specialization
+ */
+void es_fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_d,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+
+/*
+ * From fast-hadamard-transform
+ */
+torch::Tensor fast_hadamard_transform(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_12N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_20N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
+
+/*
+ * From csrc/fastertransformer
+ */
+std::vector<at::Tensor> get_mla_decoding_metadata(
+    at::Tensor& seqlens_k,
+    const int64_t num_q_tokens_per_head_k,
+    const int64_t h_k,
+    const std::optional<int64_t> h_q,
+    const bool is_fp8_kvcache,
+    const std::optional<int64_t> topk);
+
+std::vector<at::Tensor> fwd_kvcache_mla(
+    at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size
+    const at::Tensor& kcache,  // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or
+                               // num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
+    const int64_t head_size_v,
+    const at::Tensor& seqlens_k,    // batch_size
+    const at::Tensor& block_table,  // batch_size x max_num_blocks_per_seq
+    const double softmax_scale,
+    bool is_causal,
+    const at::Tensor& tile_scheduler_metadata,  // num_sm_parts x TileSchedulerMetaDataSize
+    const at::Tensor& num_splits,               // batch_size + 1
+    const bool& is_fp8,
+    const std::optional<at::Tensor>& indices  // None, or batch_size x seqlen_q x topk
+);
+
+void FMHACutlassSM100FwdRun(
+    at::Tensor workspace_buffer,
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor cumulative_seqlen_q,
+    at::Tensor cumulative_seqlen_kv,
+    at::Tensor o,
+    at::Tensor lse,
+    int64_t mask_mode_code,
+    double softmax_scale,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_kv,
+    bool is_varlen);
+
+std::vector<at::Tensor>
+sparse_prefill_fwd(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices, double sm_scale, int64_t d_v);

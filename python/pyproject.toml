@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.3"
+version = "0.5.4.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
 ]
+
 dependencies = [
   "IPython",
   "aiohttp",
@@ -21,10 +22,12 @@ dependencies = [
   "build",
   "compressed-tensors",
   "cuda-python",
+  "decord2",
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.4.0rc3",
+  "flashinfer_python==0.4.1",
+  "gguf",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
@@ -46,33 +49,35 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
-  "pynvml",
+  "nvidia-ml-py",
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.15",
+  "sgl-kernel==0.3.16.post4",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
   "torch==2.8.0",
-  "torch_memory_saver==0.0.9rc2",
+  "torch_memory_saver==0.0.9",
   "torchao==0.9.0",
   "torchaudio==2.8.0",
   "torchvision",
   "tqdm",
-  "transformers==4.57.0",
+  "transformers==4.57.1",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.25",
   "grpcio==1.75.1", # keep it align with compile_proto.py
-  "grpcio-tools==1.75.1" # keep it align with compile_proto.py
+  "grpcio-tools==1.75.1", # keep it align with compile_proto.py
+  "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+  "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
 ]
 
 [project.optional-dependencies]
-decord = ["decord"]
+modelopt = ["nvidia-modelopt"]
 test = [
   "accelerate",
   "expecttest",
@@ -84,21 +89,31 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
-tracing = [
-    "opentelemetry-api",
-    "opentelemetry-exporter-otlp",
-    "opentelemetry-exporter-otlp-proto-grpc",
-    "opentelemetry-sdk",
+checkpoint-engine = ["checkpoint-engine==0.1.2"]
+all = []
+dev = ["sglang[test]"]
+
+# Temporary tags
+cu130 = [
+  "torch==2.9.0",
+  "torchaudio==2.9.0",
+  "torchvision==0.24.0",
 ]
-all = ["sglang[test]", "sglang[decord]"]
-all_aarch64 = ["sglang[test]"]
-dev = ["sglang[test]", "sglang[decord]"]
+cu130_all = [
+  "sglang[test]",
+  "sglang[decord]",
+  "sglang[cu130]"
+]
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
+]
 
-
-# The following will be deprecated in 2 weeks
-blackwell = ["sglang[test]", "sglang[decord]"]
-blackwell_aarch64 = ["sglang[test]"]
-
+# To be deprecated in 2 weeks
+blackwell = ["sglang[dev]"]
+blackwell_aarch64 = ["sglang[dev]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

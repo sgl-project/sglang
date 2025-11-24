@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 from __future__ import annotations
 
 import argparse
@@ -43,6 +42,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import uuid
 import warnings
 from collections import OrderedDict, defaultdict
@@ -63,6 +63,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Sequence,
     Set,
     Tuple,
     TypeVar,
@@ -70,6 +71,7 @@ from typing import (
 )
 
 import numpy as np
+import orjson
 import psutil
 import pybase64
 import requests
@@ -88,6 +90,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
@@ -131,6 +134,7 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
@@ -162,6 +166,20 @@ def _check(cc_major):
     ) >= (12, 3)
 
 
+@contextmanager
+def device_context(device: torch.device):
+    if device.type == "cpu" and is_cpu():
+        with torch.device("cpu"):
+            yield
+    else:
+        module = torch.get_device_module(device)
+        if module is not None:
+            with module.device(device.index):
+                yield
+        else:
+            raise ValueError(f"Unknown device module: {device}")
+
+
 is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
 
@@ -171,6 +189,15 @@ def is_blackwell():
     if not is_cuda():
         return False
     return torch.cuda.get_device_capability()[0] == 10
+
+
+@lru_cache(maxsize=1)
+def is_sm120_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
+    return (torch.cuda.get_device_capability(device)[0] == 12) and (
+        torch.version.cuda >= "12.8"
+    )
 
 
 @lru_cache(maxsize=1)
@@ -228,7 +255,7 @@ def support_triton(backend: str) -> bool:
 
 
 try:
-    import sgl_kernel
+    import sgl_kernel  # noqa: F401
 
     is_intel_amx_backend_available = hasattr(
         torch.ops.sgl_kernel, "convert_weight_packed"
@@ -253,6 +280,14 @@ def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 
 
+def xpu_has_xmx_support():
+    # TODO: update with XPU capalibity query
+    if is_xpu():
+        # currently only PVC/LNL/BMG supports F64, so we only support these now
+        return torch.xpu.get_device_properties().has_fp64
+    return False
+
+
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -261,6 +296,17 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+
+
+def is_nvidia_cublas_cu12_version_ge_12_9():
+    """
+    temporary fix for issue #11272
+    """
+    try:
+        installed_version = version("nvidia-cublas-cu12")
+    except PackageNotFoundError:
+        return False
+    return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
 
 
 def random_uuid() -> str:
@@ -409,7 +455,15 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        SHARED_SYSMEM_DEVICE_MEM_SMS = (87, 110, 121)  # Orin, Thor, Spark
+        if get_device_sm() in SHARED_SYSMEM_DEVICE_MEM_SMS:
+            # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
+            # only reports "free" memory, which can be lower than what is actually
+            # available due to not including cache memory. So we use the system available
+            # memory metric instead.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
@@ -453,6 +507,8 @@ def get_available_gpu_memory(
                 f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
                 "which may cause useless memory allocation for torch NPU context.",
             )
+        if empty_cache:
+            torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
@@ -481,13 +537,13 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
-    offloader_kwargs: Dict[str, Any] = {},
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
-    from sglang.srt.offloader import get_offloader
+    from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -506,7 +562,7 @@ def make_layers(
                 layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
                 for idx in range(start_layer, end_layer)
             ),
-            **offloader_kwargs,
+            **(offloader_kwargs or {}),
         )
         + [
             PPMissingLayer(return_tuple=return_tuple)
@@ -523,7 +579,7 @@ def make_layers_non_pp(
     layer_fn: LayerFn,
     prefix: str = "",
 ) -> torch.nn.ModuleList:
-    from sglang.srt.offloader import get_offloader
+    from sglang.srt.utils.offloader import get_offloader
 
     layers = torch.nn.ModuleList(
         get_offloader().wrap_modules(
@@ -829,9 +885,9 @@ def get_image_bytes(image_file: Union[str, bytes]):
             return f.read()
     elif image_file.startswith("data:"):
         image_file = image_file.split(",")[1]
-        return pybase64.b64decode(image_file)
+        return pybase64.b64decode(image_file, validate=True)
     elif isinstance(image_file, str):
-        return pybase64.b64decode(image_file)
+        return pybase64.b64decode(image_file, validate=True)
     else:
         raise NotImplementedError(f"Invalid image: {image_file}")
 
@@ -868,7 +924,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 vr = VideoReader(tmp_file.name, ctx=ctx)
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
-                video_bytes = pybase64.b64decode(encoded)
+                video_bytes = pybase64.b64decode(encoded, validate=True)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
@@ -876,7 +932,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             elif os.path.isfile(video_file):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
-                video_bytes = pybase64.b64decode(video_file)
+                video_bytes = pybase64.b64decode(video_file, validate=True)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
@@ -1010,32 +1066,6 @@ def monkey_patch_p2p_access_check():
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
-def monkey_patch_vllm_gguf_config():
-    try:
-        from vllm.model_executor.layers.quantization.gguf import (
-            GGUFConfig,
-            GGUFEmbeddingMethod,
-            GGUFLinearMethod,
-        )
-    except ImportError:
-        return
-
-    from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
-    def get_quant_method_with_embedding_replaced(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
-        if isinstance(layer, LinearBase):
-            return GGUFLinearMethod(self)
-        elif isinstance(layer, VocabParallelEmbedding):
-            # patch to own VocabParallelEmbedding
-            return GGUFEmbeddingMethod(self)
-        return None
-
-    setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
-
-
 def set_ulimit(target_soft_limit=65535):
     # number of open files
     resource_type = resource.RLIMIT_NOFILE
@@ -1072,9 +1102,9 @@ def add_api_key_middleware(app, api_key: str):
     async def authentication(request, call_next):
         if request.method == "OPTIONS":
             return await call_next(request)
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-        if request.url.path.startswith("/metrics"):
+        if request.url.path.startswith("/health") or request.url.path.startswith(
+            "/metrics"
+        ):
             return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
@@ -1101,7 +1131,7 @@ def configure_logger(server_args, prefix: str = ""):
                 f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
             )
         with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
-            custom_config = json.loads(file.read())
+            custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
@@ -1280,8 +1310,46 @@ def pytorch_profile(name, func, *args, data_size=-1):
 
 
 def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-) -> zmq.Socket:
+    context: zmq.Context,
+    socket_type: zmq.SocketType,
+    endpoint: Optional[str] = None,
+    bind: bool = True,
+) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
+    """Create and configure a ZeroMQ socket.
+
+    Args:
+        context: ZeroMQ context to create the socket from.
+        socket_type: Type of ZeroMQ socket to create.
+        endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
+        bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
+
+    Returns:
+        If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
+        If endpoint is provided: The configured ZeroMQ socket.
+    """
+    socket = context.socket(socket_type)
+
+    if endpoint is None:
+        # Bind to random TCP port
+        config_socket(socket, socket_type)
+        port = socket.bind_to_random_port("tcp://*")
+        return port, socket
+    else:
+        # Handle IPv6 if endpoint contains brackets
+        if endpoint.find("[") != -1:
+            socket.setsockopt(zmq.IPV6, 1)
+
+        config_socket(socket, socket_type)
+
+        if bind:
+            socket.bind(endpoint)
+        else:
+            socket.connect(endpoint)
+
+        return socket
+
+
+def config_socket(socket, socket_type: zmq.SocketType):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -1289,10 +1357,6 @@ def get_zmq_socket(
         buf_size = int(0.5 * 1024**3)
     else:
         buf_size = -1
-
-    socket = context.socket(socket_type)
-    if endpoint.find("[") != -1:
-        socket.setsockopt(zmq.IPV6, 1)
 
     def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
@@ -1306,18 +1370,11 @@ def get_zmq_socket(
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type == zmq.DEALER:
+    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
         set_send_opt()
         set_recv_opt()
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
-
-    if bind:
-        socket.bind(endpoint)
-    else:
-        socket.connect(endpoint)
-
-    return socket
 
 
 def dump_to_file(dirpath, name, value):
@@ -1518,7 +1575,7 @@ def get_hpu_memory_capacity():
 
 def get_npu_memory_capacity():
     try:
-        import torch_npu
+        import torch_npu  # noqa: F401
 
         return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
     except ImportError as e:
@@ -1539,13 +1596,18 @@ def get_cpu_memory_capacity():
         for numa_id in range(n_numa_node):
             file_meminfo = f"node{numa_id}/meminfo"
             with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # 1st line contains 'MemTotal'
-                line = f.read().split("\n")[0]
-                numa_mem_list.append(int(line.split()[3]))
+                # MemTotal info is at the 1st line
+                line = f.readline()
+                # Expected format: "Node 0 MemTotal:       100000000 kB"
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "MemTotal:":
+                    numa_mem_list.append(int(parts[3]))
+                else:
+                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
         # Retrieved value in KB, need MB
         numa_mem = float(min(numa_mem_list) // 1024)
         return numa_mem
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError, IndexError):
         numa_mem = psutil.virtual_memory().total / n_numa_node
         # Retrieved value in Byte, need MB
         return float(numa_mem // (1 << 20))
@@ -1705,7 +1767,7 @@ def get_device(device_id: Optional[int] = None) -> str:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 if device_id == None:
@@ -1735,7 +1797,7 @@ def get_device_count() -> int:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 return torch.hpu.device_count()
@@ -1878,7 +1940,9 @@ def direct_register_custom_op(
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
-        if "Tried to register an operator" in str(e) and "multiple times" in str(e):
+        if "Tried to register an operator" in str(error) and "multiple times" in str(
+            error
+        ):
             # Silently ignore duplicate registration errors
             # This can happen in multi-engine scenarios
             pass
@@ -1891,6 +1955,7 @@ def direct_register_custom_op(
 
 
 def set_gpu_proc_affinity(
+    pp_size: int,
     tp_size: int,
     nnodes: int,
     gpu_id: int,
@@ -1899,7 +1964,8 @@ def set_gpu_proc_affinity(
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    tp_size_per_node = tp_size // nnodes
+    nnodes_per_tp_group = max(nnodes // pp_size, 1)
+    tp_size_per_node = tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -2030,7 +2096,78 @@ class MultiprocessingSerializer:
             # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
 
-        return ForkingPickler.loads(data)
+        return SafeUnpickler(io.BytesIO(data)).load()
+
+
+class SafeUnpickler(pickle.Unpickler):
+    ALLOWED_MODULE_PREFIXES = {
+        # --- Python types ---
+        "builtins.",
+        "collections.",
+        "copyreg.",
+        "functools.",
+        "itertools.",
+        "operator.",
+        "types.",
+        "weakref.",
+        # --- PyTorch types ---
+        "torch.",
+        "torch._tensor.",
+        "torch.storage.",
+        "torch.nn.parameter.",
+        "torch.autograd.function.",
+        # --- torch distributed ---
+        "torch.distributed.",
+        "torch.distributed._shard.",
+        "torch.distributed._composable.",
+        "torch._C._distributed_c10d.",
+        "torch._C._distributed_fsdp.",
+        "torch.distributed.optim.",
+        # --- multiprocessing ---
+        "multiprocessing.resource_sharer.",
+        "multiprocessing.reduction.",
+        "pickletools.",
+        # --- PEFT / LoRA ---
+        "peft.",
+        "transformers.",
+        "huggingface_hub.",
+        # --- SGLang & Unitest ---
+        "sglang.srt.weight_sync.tensor_bucket.",
+        "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.layers.",
+        "sglang.srt.utils.",
+    }
+
+    DENY_CLASSES = {
+        ("builtins", "eval"),
+        ("builtins", "exec"),
+        ("builtins", "compile"),
+        ("os", "system"),
+        ("subprocess", "Popen"),
+        ("subprocess", "run"),
+        ("codecs", "decode"),
+        ("types", "CodeType"),
+        ("types", "FunctionType"),
+    }
+
+    def find_class(self, module, name):
+        # Block deterministic attacks
+        if (module, name) in self.DENY_CLASSES:
+            raise RuntimeError(
+                f"Blocked unsafe class loading ({module}.{name}), "
+                f"to prevent exploitation of CVE-2025-10164"
+            )
+        # Allowlist of safe-to-load modules.
+        if any(
+            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
+        ):
+            return super().find_class(module, name)
+
+        # Block everything else. (Potential attack surface)
+        raise RuntimeError(
+            f"Blocked unsafe class loading ({module}.{name}), "
+            f"to prevent exploitation of CVE-2025-10164"
+        )
 
 
 def debug_timing(func):
@@ -2182,6 +2319,11 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     app = FastAPI()
 
+    @app.get("/ping")
+    async def ping():
+        """Could be used by the checkpoint-engine update script to confirm the server is up."""
+        return Response(status_code=200)
+
     @app.get("/health")
     async def health():
         """Check the health of the http server."""
@@ -2304,6 +2446,8 @@ def retry(
         try:
             return fn()
         except Exception as e:
+            traceback.print_exc()
+
             if try_index >= max_retry:
                 raise Exception(f"retry() exceed maximum number of retries.")
 
@@ -2317,9 +2461,28 @@ def retry(
             logger.warning(
                 f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
             )
-            traceback.print_exc()
 
             time.sleep(delay)
+
+
+def has_hf_quant_config(model_path: str) -> bool:
+    """Check if the model path contains hf_quant_config.json file.
+
+    Args:
+        model_path: Path to the model, can be local path or remote URL.
+
+    Returns:
+        True if hf_quant_config.json exists, False otherwise.
+    """
+    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
+        return True
+    try:
+        from huggingface_hub import HfApi
+
+        hf_api = HfApi()
+        return hf_api.file_exists(model_path, "hf_quant_config.json")
+    except Exception:
+        return False
 
 
 def flatten_nested_list(nested_list):
@@ -2457,17 +2620,12 @@ def get_local_ip_auto(fallback: str = None) -> str:
     raise ValueError("Can not get local ip")
 
 
-def is_page_size_one(server_args):
-    return server_args.page_size == 1
-
-
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk == 1
-        and is_page_size_one(server_args)
+        server_args.speculative_eagle_topk == 1
+        and (server_args.page_size == 1 or server_args.page_size is None)
     )
 
 
@@ -2479,6 +2637,7 @@ def is_fa3_default_architecture(hf_config):
         "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
+        "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "Qwen3ForCausalLM",
@@ -2512,9 +2671,9 @@ def log_info_on_rank0(logger, msg):
 
 def load_json_config(data: str):
     try:
-        return json.loads(data)
+        return orjson.loads(data)
     except JSONDecodeError:
-        return json.loads(Path(data).read_text())
+        return orjson.loads(Path(data).read_text())
 
 
 def dispose_tensor(x: torch.Tensor):
@@ -2881,7 +3040,7 @@ def get_cpu_ids_by_node():
 def is_shm_available(dtype, world_size, local_size):
     return (
         cpu_has_amx_support()
-        and dtype in [torch.bfloat16, torch.float]
+        and dtype in [torch.bfloat16, torch.float16, torch.float]
         and world_size >= 1
         and world_size == local_size
     )
@@ -2930,10 +3089,6 @@ def lru_cache_frozenset(maxsize=128):
         return wrapper
 
     return decorator
-
-
-def get_origin_rid(rid):
-    return rid.split("_", 1)[1] if "_" in rid else rid
 
 
 def apply_module_patch(target_module, target_function, wrappers):
@@ -3223,7 +3378,7 @@ def numa_bind_to_node(node: int):
 
 def json_list_type(value):
     try:
-        return json.loads(value)
+        return orjson.loads(value)
     except json.JSONDecodeError:
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."
@@ -3231,7 +3386,12 @@ def json_list_type(value):
 
 
 @contextmanager
-def temp_set_cuda_visible_devices(gpu_id: int):
+def maybe_reindex_device_id(gpu_id: int):
+
+    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
+        yield gpu_id
+        return
+
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if original_cuda_visible_devices:
         cuda_visible_devices = original_cuda_visible_devices.split(",")
@@ -3240,7 +3400,11 @@ def temp_set_cuda_visible_devices(gpu_id: int):
 
     str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-    yield
+
+    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+
+    yield 0
+
     if original_cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
     else:
@@ -3401,3 +3565,11 @@ def cached_triton_kernel(key_fn=None):
         return CachedKernel(fn, key_fn)
 
     return decorator
+
+
+# Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim

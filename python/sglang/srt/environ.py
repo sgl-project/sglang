@@ -111,30 +111,46 @@ class Envs:
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
 
+    # Logging Options
+    SGLANG_LOG_GC = EnvBool(False)
+    SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
+    SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
+
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
-    SGLANG_AMD_CI = EnvBool(False)
-    SGLANG_TEST_RETRACT = EnvBool(False)
+    SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
-    SGLANG_GC_LOG = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
-    SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
 
+    # Scheduler: memory leak test
+    SGLANG_TEST_RETRACT = EnvBool(False)
+    SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
+    SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
+
+    # Scheduler: new token ratio hyperparameters
+    SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
+    SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
+    SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
+    SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+
+    # Scheduler: others:
+    SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
 
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
@@ -150,6 +166,7 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -160,6 +177,7 @@ class Envs:
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
@@ -172,6 +190,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
+    SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -188,12 +207,12 @@ class Envs:
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
-    # vLLM dependencies
+    # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
     USE_VLLM_CUSTOM_ALLREDUCE = EnvBool(False)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
-    RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)
@@ -212,13 +231,42 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
+    # Overlap Spec V2
+    SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
+    SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+
+    # VLM
+    SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    SGLANG_RESIZE_RESAMPLE = EnvStr("")
+
+    # Ktransformers
+    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
+    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
+    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
+    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
+    SGLANG_KT_AMX_METHOD = EnvStr(None)
+    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
+
+    # Sparse Embeddings
+    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+
     # fmt: on
 
 
 envs = Envs()
 
 
+def _print_deprecated_env(new_name: str, old_name: str):
+    if old_name in os.environ:
+        warnings.warn(
+            f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
+        )
+        os.environ[new_name] = os.environ[old_name]
+
+
 def _convert_SGL_to_SGLANG():
+    _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
+
     for key, value in os.environ.items():
         if key.startswith("SGL_"):
             new_key = key.replace("SGL_", "SGLANG_", 1)

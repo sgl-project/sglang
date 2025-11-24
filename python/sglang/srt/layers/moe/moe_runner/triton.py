@@ -51,7 +51,9 @@ elif _is_hip:
 
 
 if _is_cuda or _is_hip:
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+    from sgl_kernel import (  # noqa: F401
+        moe_align_block_size as sgl_moe_align_block_size,
+    )
 
 
 @dataclass

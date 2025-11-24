@@ -1,10 +1,11 @@
 //! Random load balancing policy
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::core::Worker;
-use crate::metrics::RouterMetrics;
-use rand::Rng;
 use std::sync::Arc;
+
+use rand::Rng;
+
+use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Random selection policy
 ///
@@ -50,9 +51,10 @@ impl LoadBalancingPolicy for RandomPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
-    use std::collections::HashMap;
 
     #[test]
     fn test_random_selection() {

@@ -5,7 +5,6 @@ These tests focus on testing the router configuration logic in isolation,
 including validation of configuration parameters and their interactions.
 """
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest

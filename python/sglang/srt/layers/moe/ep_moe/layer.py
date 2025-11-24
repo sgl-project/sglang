@@ -1,24 +1,19 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 
+from sglang.srt import single_batch_overlap
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    ep_gather,
-    ep_scatter,
-    silu_and_mul_masked_post_quant_fwd,
-    tma_align_input_scale,
-)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -29,15 +24,15 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     CUTEDSL_MOE_NVFP4_DISPATCH,
     ModelOptNvFp4FusedMoEMethod,
 )
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.offloader import get_offloader
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
-        DeepEPLLOutput,
-        DeepEPNormalOutput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalDispatchOutput,
         DispatchOutput,
     )
 
@@ -47,7 +42,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if not (_is_npu or _is_hip):
-    from sgl_kernel import silu_and_mul
+    pass
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
@@ -59,6 +54,7 @@ logger = logging.getLogger(__name__)
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
+    Mooncake EP shares the same class, as they expose the same interface.
     """
 
     _has_printed = False
@@ -91,13 +87,32 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
 
+        if _use_aiter or _is_npu:
+            self.deprecate_flag = False
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
+            quant_config, Fp8Config
+        ):
+            self.deprecate_flag = True
+        else:
+            self.deprecate_flag = False
+
+        if self.deprecate_flag:
+            return
+
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
-        else:
+            self.use_w4afp8 = False
+        elif isinstance(quant_config, W4AFp8Config):
+            self.use_w4afp8 = True
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
+        else:
+            self.use_w4afp8 = False
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+            self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
 
@@ -141,7 +156,7 @@ class DeepEPMoE(FusedMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w13_weight_scale
                 ),
             )
@@ -149,7 +164,7 @@ class DeepEPMoE(FusedMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w2_weight_scale
                 ),
             )
@@ -160,18 +175,22 @@ class DeepEPMoE(FusedMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        forward_shared_experts=None,
+        alt_stream=None,
+        disable_sbo=False,
     ):
-        dispatch_output = self.dispatch(
-            hidden_states, topk_idx, topk_weights, forward_batch
+        # We have to call SBO inside MoE to be compatible with hooks used in offloading
+        return single_batch_overlap.execute_sbo(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+            # SBO args
+            experts=self,
+            forward_shared_experts=forward_shared_experts,
+            alt_stream=alt_stream,
+            disable_sbo=disable_sbo,
         )
-        hidden_states = self.moe_impl(dispatch_output)
-        hidden_states = self.combine(
-            hidden_states,
-            dispatch_output.topk_idx,
-            dispatch_output.topk_weights,
-            forward_batch,
-        )
-        return hidden_states
 
     def dispatch(
         self,
@@ -199,29 +218,51 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DispatchOutput,
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
     ):
+
+        if self.deprecate_flag:
+            assert down_gemm_overlap_args is None
+            return super().run_moe_core(
+                dispatch_output,
+            )
+
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if _use_aiter:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
-            return self.forward_aiter(dispatch_output)
-        if _is_npu:
+            output = self.forward_aiter(dispatch_output)
+        elif _is_npu:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
-            return self.forward_npu(dispatch_output)
-        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            return self.forward_deepgemm_contiguous(dispatch_output)
+            output = self.forward_npu(dispatch_output)
+        elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            if self.use_w4afp8:
+                output = self.forward_cutlass_w4afp8(dispatch_output)
+            else:
+                assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            if get_moe_runner_backend().is_flashinfer_cutedsl():
-                return self.forward_flashinfer_cutedsl(
+            if (
+                get_moe_runner_backend().is_flashinfer_cutedsl()
+                and self.quant_config.get_name() == "modelopt_fp4"
+            ):
+                output = self.forward_flashinfer_cutedsl(
                     dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
                 )
-            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            return self.forward_deepgemm_masked(dispatch_output)
-        else:
-            raise ValueError(
-                f"Dispatch output format {dispatch_output.format} is not supported"
-            )
+            elif self.use_w4afp8:
+                output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+            else:
+                assert False, "forward_deepgemm_masked is deprecated"
+
+        combine_input_wrapper = (
+            DeepEPNormalCombineInput
+            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
+            else DeepEPLLCombineInput
+        )
+        return combine_input_wrapper(
+            hidden_states=output,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+            overlap_args=down_gemm_overlap_args,
+        )
 
     def combine(
         self,
@@ -241,7 +282,7 @@ class DeepEPMoE(FusedMoE):
 
     def forward_aiter(
         self,
-        dispatch_output: Union[DeepEPNormalOutput, DeepEPLLOutput],
+        dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput],
     ):
         hidden_states, topk_idx, topk_weights = (
             dispatch_output.hidden_states,
@@ -421,7 +462,7 @@ class DeepEPMoE(FusedMoE):
 
     def forward_flashinfer_cutedsl(
         self,
-        dispatch_output: DeepEPLLOutput,
+        dispatch_output: DeepEPLLDispatchOutput,
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
     ):
         hidden_states, _, _, masked_m, _ = dispatch_output
@@ -437,9 +478,20 @@ class DeepEPMoE(FusedMoE):
         )
         return output
 
-    def forward_deepgemm_masked(
+    def forward_cutlass_w4afp8(
         self,
-        dispatch_output: DeepEPLLOutput,
+        dispatch_output: DeepEPNormalDispatchOutput,
+    ):
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        return self.quant_method.apply_deepep_normal(
+            layer=self,
+            dispatch_output=dispatch_output,
+        )
+
+    def forward_cutlass_w4afp8_masked(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
     ):
         hidden_states_fp8, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
@@ -516,7 +568,7 @@ class DeepEPMoE(FusedMoE):
 
     def forward_npu(
         self,
-        dispatch_output: Union[DeepEPNormalOutput, DeepEPLLOutput],
+        dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput],
     ):
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
@@ -529,7 +581,7 @@ class DeepEPMoE(FusedMoE):
         output_dtype = torch.bfloat16
         group_list_type = 1
 
-        def _forward_normal(dispatch_output: DeepEPNormalOutput):
+        def _forward_normal(dispatch_output: DeepEPNormalDispatchOutput):
             if TYPE_CHECKING:
                 assert isinstance(dispatch_output, DeepEPNormalOutput)
             hidden_states, _, _, num_recv_tokens_per_expert = dispatch_output
@@ -603,7 +655,7 @@ class DeepEPMoE(FusedMoE):
 
             return hidden_states
 
-        def _forward_ll(dispatch_output: DeepEPLLOutput):
+        def _forward_ll(dispatch_output: DeepEPLLDispatchOutput):
             if TYPE_CHECKING:
                 assert isinstance(dispatch_output, DeepEPLLOutput)
             hidden_states, topk_idx, topk_weights, group_list, _ = dispatch_output
@@ -686,7 +738,7 @@ class DeepEPMoE(FusedMoE):
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
-    if get_moe_a2a_backend().is_deepep():
+    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
@@ -713,12 +765,3 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE
     return FusedMoE
-
-
-def copy_list_to_gpu_no_ce(arr: List[int]):
-    from sgl_kernel.elementwise import copy_to_gpu_no_ce
-
-    tensor_cpu = torch.tensor(arr, dtype=torch.int32, device="cpu")
-    tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
-    copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
-    return tensor_gpu

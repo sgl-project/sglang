@@ -3,7 +3,7 @@ import subprocess
 import time
 import unittest
 
-from sglang.bench_one_batch_server import BenchmarkResult
+from sglang.bench_one_batch_server import BenchmarkResult, generate_markdown_report
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -41,7 +41,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
 
     def test_bench_one_batch(self):
         all_benchmark_results = []
-
+        all_model_succeed = True
         for model_setup in self.models:
             benchmark_results = []
             with self.subTest(model=model_setup.model_path):
@@ -113,18 +113,20 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         # Clean up JSON file
                         os.remove(json_output_file)
                     else:
+                        all_model_succeed = False
                         print(f"Warning: JSON output file {json_output_file} not found")
 
                 finally:
                     kill_process_tree(process.pid)
 
-                report_part = BenchmarkResult.generate_markdown_report(
-                    PROFILE_DIR, benchmark_results
-                )
+                report_part = generate_markdown_report(PROFILE_DIR, benchmark_results)
                 self.full_report += report_part + "\n"
 
         if is_in_ci():
             write_github_step_summary(self.full_report)
+
+        if not all_model_succeed:
+            raise AssertionError("Some models failed the perf tests.")
 
 
 if __name__ == "__main__":

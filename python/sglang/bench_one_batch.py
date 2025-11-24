@@ -51,6 +51,7 @@ import logging
 import multiprocessing
 import os
 import time
+from types import SimpleNamespace
 from typing import Tuple
 
 import numpy as np
@@ -71,13 +72,25 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
+    is_cuda_alike,
+    is_xpu,
     kill_process_tree,
+    maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
+    profiler_activity
+    for available, profiler_activity in [
+        (is_cuda_alike(), torch.profiler.ProfilerActivity.CUDA),
+        (is_xpu(), torch.profiler.ProfilerActivity.XPU),
+    ]
+    if available
+]
 
 
 @dataclasses.dataclass
@@ -147,7 +160,7 @@ class BenchArgs:
         )
 
 
-def load_model(server_args, port_args, tp_rank):
+def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
@@ -156,7 +169,7 @@ def load_model(server_args, port_args, tp_rank):
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
-        gpu_id=tp_rank,
+        gpu_id=gpu_id,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
         moe_ep_rank=moe_ep_rank,
@@ -257,11 +270,18 @@ def prepare_synthetic_inputs_for_latency_test(
 
 @torch.no_grad
 def extend(reqs, model_runner):
+    # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
+    dummy_tree_cache = SimpleNamespace(
+        page_size=model_runner.server_args.page_size,
+        device=model_runner.device,
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+    )
+
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-        tree_cache=None,
+        tree_cache=dummy_tree_cache,
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -300,6 +320,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             speculative_num_draft_tokens=None,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
+            offload_tags=set(),
         )
 
 
@@ -331,6 +352,7 @@ def correctness_test(
     server_args,
     port_args,
     bench_args,
+    gpu_id,
     tp_rank,
 ):
     # Configure the logger
@@ -338,7 +360,7 @@ def correctness_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs
     custom_prompts = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
@@ -416,10 +438,7 @@ def latency_test_run_once(
     profiler = None
     if profile:
         profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=profile_activities,
             with_stack=True,
             record_shapes=profile_record_shapes,
         )
@@ -452,10 +471,7 @@ def latency_test_run_once(
         if profile and i == output_len / 2:
             profiler = None
             profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
+                activities=profile_activities,
                 with_stack=True,
                 record_shapes=profile_record_shapes,
             )
@@ -504,20 +520,23 @@ def latency_test(
     server_args,
     port_args,
     bench_args,
+    gpu_id,
     tp_rank,
 ):
     initialize_moe_config(server_args)
 
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
+        set_gpu_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, tp_rank
+        )
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -619,21 +638,23 @@ def main(server_args, bench_args):
     port_args = PortArgs.init_new(server_args)
 
     if server_args.tp_size == 1:
-        work_func(server_args, port_args, bench_args, 0)
+        work_func(server_args, port_args, bench_args, 0, 0)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
-            proc = multiprocessing.Process(
-                target=work_func,
-                args=(
-                    server_args,
-                    port_args,
-                    bench_args,
-                    tp_rank,
-                ),
-            )
-            proc.start()
-            workers.append(proc)
+            with maybe_reindex_device_id(tp_rank) as gpu_id:
+                proc = multiprocessing.Process(
+                    target=work_func,
+                    args=(
+                        server_args,
+                        port_args,
+                        bench_args,
+                        gpu_id,
+                        tp_rank,
+                    ),
+                )
+                proc.start()
+                workers.append(proc)
 
         for proc in workers:
             proc.join()

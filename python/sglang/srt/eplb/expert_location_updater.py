@@ -24,7 +24,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,7 @@ def _update_expert_weights_with_canary(
         canary_tensor = (
             _get_canary_value(old_expert_location_metadata, layer_id)
             .clone()
-            .to(device=global_server_args_dict["device"], non_blocking=True)
+            .to(device=get_global_server_args().device, non_blocking=True)
         )
         routed_experts_weights_of_layer[layer_id].append(canary_tensor)
 

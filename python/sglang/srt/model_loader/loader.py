@@ -4,7 +4,6 @@ from __future__ import annotations
 
 # ruff: noqa: SIM117
 import collections
-import concurrent
 import dataclasses
 import fnmatch
 import glob
@@ -12,13 +11,11 @@ import json
 import logging
 import math
 import os
-import re
 import socket
 import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -30,13 +27,12 @@ from typing import (
     Tuple,
     cast,
 )
-from urllib.parse import urlparse
 
 import huggingface_hub
 import numpy as np
-import requests
-import safetensors.torch
 import torch
+
+from sglang.srt.server_args import get_global_server_args
 
 # Try to import accelerate (optional dependency)
 try:
@@ -52,7 +48,7 @@ except ImportError:
 
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -81,9 +77,8 @@ from sglang.srt.model_loader.utils import (
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
-    _BAR_FORMAT,
-    default_weight_loader,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -104,6 +99,7 @@ from sglang.srt.utils import (
     get_device_capability,
     is_npu,
     is_pin_memory_available,
+    rank0_log,
     set_weight_attrs,
 )
 
@@ -184,11 +180,12 @@ def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
+    remap_prefix: Dict[str, str] | None = None,
 ) -> Optional[QuantizationConfig]:
     """Get the quantization config."""
     if model_config.quantization is not None:
         quant_config = get_quant_config(
-            model_config, load_config, packed_modules_mapping
+            model_config, load_config, packed_modules_mapping, remap_prefix
         )
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
@@ -224,6 +221,7 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+    remap_prefix = getattr(model_class, "remap_prefix", None)
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -247,12 +245,21 @@ def _initialize_model(
         )
 
     quant_config = _get_quantization_config(
-        model_config, load_config, packed_modules_mapping
+        model_config, load_config, packed_modules_mapping, remap_prefix
     )
-    return model_class(
-        config=model_config.hf_config,
-        quant_config=quant_config,
-    )
+
+    # Build kwargs conditionally
+    kwargs = {
+        "config": model_config.hf_config,
+        "quant_config": quant_config,
+    }
+
+    # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+    if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
+        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
+        kwargs["model_path"] = model_config.model_path
+
+    return model_class(**kwargs)
 
 
 class BaseModelLoader(ABC):
@@ -445,10 +452,8 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-            weight_loader_disable_mmap = global_server_args_dict.get(
-                "weight_loader_disable_mmap"
+            weight_loader_disable_mmap = (
+                get_global_server_args().weight_loader_disable_mmap
             )
 
             if extra_config.get("enable_multithread_load"):
@@ -545,12 +550,21 @@ class DefaultModelLoader(BaseModelLoader):
             **model_kwargs,
             trust_remote_code=True,
         )
-        logger.info(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
+        # Handle both legacy modelopt_quant and unified quantization flags
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+            # Legacy approach
+            quant_choice_str = model_config.modelopt_quant
+            rank0_log(f"ModelOpt quantization requested (legacy): {quant_choice_str}")
+        else:
+            # Unified approach - extract quantization type
+            quant_choice_str = model_config._get_modelopt_quant_type()
+            rank0_log(
+                f"ModelOpt quantization requested (unified): {model_config.quantization} -> {quant_choice_str}"
+            )
 
-        quant_choice_str = model_config.modelopt_quant
         if not isinstance(quant_choice_str, str):
             raise TypeError(
-                f"modelopt_quant must be a string preset key (e.g., 'fp8'), "
+                f"Quantization type must be a string (e.g., 'fp8'), "
                 f"got {type(quant_choice_str)}"
             )
 
@@ -598,6 +612,8 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+                if _is_npu:
+                    torch.npu.empty_cache()
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -616,9 +632,9 @@ class LayeredModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
+        from sglang.srt.server_args import get_global_server_args
 
-        torchao_config = global_server_args_dict.get("torchao_config")
+        torchao_config = get_global_server_args().torchao_config
         target_device = torch.device(device_config.device)
 
         with set_default_torch_dtype(model_config.dtype):
@@ -1764,6 +1780,167 @@ class ModelOptModelLoader(DefaultModelLoader):
         super().__init__(load_config)
         # Any ModelOpt specific initialization if needed
 
+    def _setup_modelopt_quantization(
+        self,
+        model,
+        tokenizer,
+        quant_cfg,
+        quantized_ckpt_restore_path: str | None = None,
+        quantized_ckpt_save_path: str | None = None,
+        export_path: str | None = None,
+    ) -> None:
+        """
+        Set up ModelOpt quantization for the given model.
+
+        Args:
+            model: The model to quantize
+            tokenizer: The tokenizer associated with the model
+            quant_cfg: The quantization configuration
+            quantized_ckpt_restore_path: Path to restore quantized checkpoint from
+            quantized_ckpt_save_path: Path to save quantized checkpoint to
+            export_path: Path to export the quantized model in HuggingFace format
+
+        Raises:
+            ImportError: If ModelOpt is not available
+            Exception: If quantization setup fails
+        """
+        try:
+            import modelopt.torch.opt as mto
+            import modelopt.torch.quantization as mtq
+            from modelopt.torch.quantization.utils import is_quantized
+        except ImportError as e:
+            raise ImportError(
+                "ModelOpt is not available. Please install modelopt."
+            ) from e
+
+        if is_quantized(model):
+            rank0_log("Model is already quantized, skipping quantization setup.")
+            return
+        # Restore from checkpoint if provided
+        if quantized_ckpt_restore_path:
+            try:
+                mto.restore(model, quantized_ckpt_restore_path)
+                rank0_log(
+                    f"Restored quantized model from {quantized_ckpt_restore_path}"
+                )
+
+                # Export model if path provided (even when restoring from checkpoint)
+                self._maybe_export_modelopt(model, export_path)
+                return
+            except Exception as e:
+                logger.warning(
+                    f"Failed to restore from {quantized_ckpt_restore_path}: {e}"
+                )
+                rank0_log("Proceeding with calibration-based quantization...")
+
+        # Set up calibration-based quantization
+        try:
+            # Left padding tends to work better for batched generation with decoder-only LMs
+            with suppress(Exception):
+                tokenizer.padding_side = "left"
+
+            from modelopt.torch.utils.dataset_utils import (
+                create_forward_loop,
+                get_dataset_dataloader,
+            )
+
+            # Create calibration dataloader
+            calib_dataloader = get_dataset_dataloader(
+                dataset_name="cnn_dailymail",  # TODO: Consider making this configurable
+                tokenizer=tokenizer,
+                batch_size=36,  # TODO: Consider making this configurable
+                num_samples=512,  # TODO: Consider making this configurable
+                device=model.device,
+                include_labels=False,
+            )
+
+            calibrate_loop = create_forward_loop(dataloader=calib_dataloader)
+
+            # Apply quantization
+            mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+
+            if get_tensor_model_parallel_rank() == 0:
+                mtq.print_quant_summary(model)
+
+            # Save checkpoint if path provided
+            if quantized_ckpt_save_path:
+                try:
+                    mto.save(model, quantized_ckpt_save_path)
+                    rank0_log(f"Quantized model saved to {quantized_ckpt_save_path}")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to save quantized checkpoint to {quantized_ckpt_save_path}: {e}"
+                    )
+
+            # Export model if path provided
+            self._maybe_export_modelopt(model, export_path)
+
+        except Exception as e:
+            raise Exception(f"Failed to set up ModelOpt quantization: {e}") from e
+
+    def _maybe_export_modelopt(self, model, export_path: str | None) -> None:
+        """Export model to HuggingFace format if export_path is provided."""
+        if export_path:
+            try:
+                # Get the original model path from the model config
+                original_model_path = getattr(self, "_original_model_path", None)
+                self._export_modelopt_checkpoint(
+                    model, export_path, original_model_path
+                )
+                rank0_log(
+                    f"Quantized model exported to HuggingFace format at {export_path}"
+                )
+            except Exception as e:
+                rank0_log(
+                    f"Warning: Failed to export quantized model to {export_path}: {e}"
+                )
+
+    def _export_modelopt_checkpoint(
+        self,
+        model,
+        export_path: str,
+        model_path: str = None,
+        trust_remote_code: bool = True,
+    ) -> None:
+        """
+        Export the quantized model to HuggingFace format using ModelOpt export API.
+
+        Args:
+            model: The quantized model to export
+            export_path: Directory path to export the model to
+            model_path: Path to the original model (for tokenizer export)
+            trust_remote_code: Whether to trust remote code for tokenizer loading
+
+        Raises:
+            ImportError: If ModelOpt export functionality is not available
+            Exception: If export fails
+        """
+        try:
+            from modelopt.torch.export import export_hf_checkpoint
+            from transformers import AutoTokenizer
+        except ImportError as e:
+            raise ImportError(
+                "ModelOpt export functionality is not available. "
+                "Please ensure you have the latest version of modelopt installed."
+            ) from e
+
+        # Create export directory if it doesn't exist
+        os.makedirs(export_path, exist_ok=True)
+
+        # Export the quantized model
+        export_hf_checkpoint(model, export_dir=export_path)
+
+        # Export the tokenizer if model_path is provided
+        if model_path:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_path, trust_remote_code=trust_remote_code
+                )
+                tokenizer.save_pretrained(export_path)
+                rank0_log(f"Tokenizer exported to {export_path}")
+            except Exception as e:
+                rank0_log(f"Warning: Failed to export tokenizer: {e}")
+
     def load_model(
         self,
         *,
@@ -1773,29 +1950,52 @@ class ModelOptModelLoader(DefaultModelLoader):
 
         logger.info("ModelOptModelLoader: Loading base model...")
 
-        # Use shared method from parent class to load base model
+        # Store the original model path for tokenizer export
+        self._original_model_path = model_config.model_path
+
+        # Check if model is already quantized
+        if model_config._is_already_quantized():
+            logger.info("Model is already quantized, loading directly...")
+            # Use default loading for pre-quantized models
+            return super().load_model(
+                model_config=model_config, device_config=device_config
+            )
+
+        # TODO: Quantize-and-serve mode has been disabled at the ModelConfig level
+        # All quantization now uses the standard workflow (quantize + export/save)
+        logger.info("Standard quantization mode: Will quantize and export/save")
+        return self._standard_quantization_workflow(model_config, device_config)
+
+    def _standard_quantization_workflow(
+        self, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        """Standard quantization workflow: quantize, save checkpoint, export, then return model."""
+        # Use shared method from parent class to load base model for quantization
         model = self._load_modelopt_base_model(model_config)
 
-        # Import ModelOpt modules (already done in _load_modelopt_base_model, but needed here for quantization)
+        # Import ModelOpt modules
         try:
             import modelopt.torch.quantization as mtq
-            from modelopt.torch.utils.dataset_utils import create_forward_loop
         except ImportError:
             logger.error(
                 "NVIDIA Model Optimizer (modelopt) library not found. "
-                "Please install it to use 'modelopt_quant' feature."
+                "Please install it to use ModelOpt quantization."
             )
             raise
 
-        quant_choice_str = model_config.modelopt_quant
+        # Handle both old modelopt_quant and new unified quantization flags
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+            # Legacy modelopt_quant flag
+            quant_choice_str = model_config.modelopt_quant
+        else:
+            # Unified quantization flag - extract the type (fp8/fp4)
+            quant_choice_str = model_config._get_modelopt_quant_type()
 
         quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
         if not quant_cfg_name:
             raise ValueError(
-                f"Invalid modelopt_quant choice: '{quant_choice_str}'. "
-                f"Available choices in QUANT_CFG_CHOICES: {list(QUANT_CFG_CHOICES.keys())}. "
-                "Ensure QUANT_CFG_CHOICES is correctly defined with mappings to "
-                "attribute names of config objects in modelopt.torch.quantization."
+                f"Invalid quantization choice: '{quant_choice_str}'. "
+                f"Available choices: {list(QUANT_CFG_CHOICES.keys())}"
             )
 
         try:
@@ -1803,38 +2003,39 @@ class ModelOptModelLoader(DefaultModelLoader):
             quant_cfg = getattr(mtq, quant_cfg_name)
         except AttributeError:
             raise AttributeError(
-                f"ModelOpt quantization config attribute '{quant_cfg_name}' "
-                f"(from choice '{quant_choice_str}') not found in modelopt.torch.quantization module. "
-                "Please verify QUANT_CFG_CHOICES and the ModelOpt library."
-            )
-
-        # For now, assume no calibration. Calibration setup is a separate, more complex step.
-        use_calibration = False  # This would ideally be a configurable parameter
-        calib_dataloader = None  # This would need to be provided/configured
-
-        calibrate_loop = (
-            create_forward_loop(dataloader=calib_dataloader)
-            if use_calibration
-            else None
-        )
-
-        if use_calibration and calib_dataloader is None:
-            logger.warning(
-                "ModelOpt calibration requested but no calib_dataloader provided. "
-                "Proceeding without calibration. Quantization accuracy may be affected."
+                f"ModelOpt quantization config '{quant_cfg_name}' not found. "
+                "Please verify the ModelOpt library installation."
             )
 
         logger.info(
-            f"Quantizing model with ModelOpt using config attribute: mtq.{quant_cfg_name}"
+            f"Quantizing model with ModelOpt using config: mtq.{quant_cfg_name}"
+        )
+
+        # Get ModelOpt configuration from LoadConfig
+        modelopt_config = self.load_config.modelopt_config
+        quantized_ckpt_restore_path = (
+            modelopt_config.checkpoint_restore_path if modelopt_config else None
+        )
+        quantized_ckpt_save_path = (
+            modelopt_config.checkpoint_save_path if modelopt_config else None
+        )
+        export_path = modelopt_config.export_path if modelopt_config else None
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_config.model_path, use_fast=True
         )
 
         try:
-            model = mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
-            logger.info("Model successfully quantized with ModelOpt.")
+            self._setup_modelopt_quantization(
+                model,
+                tokenizer,
+                quant_cfg,
+                quantized_ckpt_restore_path=quantized_ckpt_restore_path,
+                quantized_ckpt_save_path=quantized_ckpt_save_path,
+                export_path=export_path,
+            )
         except Exception as e:
-            logger.error(f"Error during ModelOpt mtq.quantize call: {e}")
-            raise
-        mtq.print_quant_summary(model)
+            logger.warning(f"ModelOpt quantization failed: {e}")
+            rank0_log("Proceeding without quantization...")
 
         return model.eval()
 
@@ -1844,12 +2045,27 @@ def get_model_loader(
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
+    if model_config and (
+        (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
+        or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
+    ):
+        logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
+        return ModelOptModelLoader(load_config)
+
+    # Use ModelOptModelLoader for unified quantization flags
     if (
         model_config
-        and hasattr(model_config, "modelopt_quant")
-        and model_config.modelopt_quant
+        and hasattr(model_config, "quantization")
+        and model_config.quantization in ["modelopt_fp8", "modelopt_fp4"]
     ):
-        logger.info("Using ModelOptModelLoader due to 'modelopt_quant' config.")
+        if model_config._is_already_quantized():
+            logger.info(
+                f"Using ModelOptModelLoader for pre-quantized model: {model_config.quantization}"
+            )
+        else:
+            logger.info(
+                f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
+            )
         return ModelOptModelLoader(load_config)
 
     if isinstance(load_config.load_format, type):

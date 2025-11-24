@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -14,8 +15,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
+    get_deepep_config,
+    get_moe_runner_backend,
+    is_tbo_enabled,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -53,7 +58,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
-class DeepEPNormalOutput(NamedTuple):
+class DeepEPNormalDispatchOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
     hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
@@ -67,7 +72,7 @@ class DeepEPNormalOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_NORMAL
 
 
-class DeepEPLLOutput(NamedTuple):
+class DeepEPLLDispatchOutput(NamedTuple):
     """DeepEP low latency dispatch output."""
 
     hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
@@ -81,14 +86,17 @@ class DeepEPLLOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
-assert isinstance(DeepEPNormalOutput, DispatchOutput)
-assert isinstance(DeepEPLLOutput, DispatchOutput)
+assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
+assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
     """DeepEP normal combine input."""
 
-    pass
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    overlap_args: Optional[CombineOverlapArgs] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -98,7 +106,10 @@ class DeepEPNormalCombineInput(NamedTuple):
 class DeepEPLLCombineInput(NamedTuple):
     """DeepEP low latency combine input."""
 
-    pass
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    overlap_args: Optional[CombineOverlapArgs] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -230,6 +241,15 @@ class DeepEPBuffer:
             cls.clean_buffer()
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
+    @classmethod
+    def set_dispatch_mode(cls, mode: DeepEPMode):
+        if mode.is_low_latency():
+            cls.set_dispatch_mode_as_low_latency()
+        elif mode.is_normal():
+            cls.set_dispatch_mode_as_normal()
+        else:
+            raise Exception("unsupported mode")
+
 
 class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
@@ -340,7 +360,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and not get_moe_runner_backend().is_cutlass()
+        ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -386,7 +409,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -412,7 +434,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
-
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
@@ -616,6 +637,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return hidden_states, event, hook, overlap_args
 
     def combine_b(self, hidden_states, event, hook, overlap_args):
+        if overlap_args is not None:
+            overlap_args.stream.wait_stream(self.device_module.current_stream())
+
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         if overlap_args is not None:
@@ -747,8 +771,8 @@ class DeepEPDispatcher(BaseDispatcher):
         del self._dispatch_intermediate_state
         return self._get_impl(forward_batch).dispatch_b(*inner_state)
 
-    def combine(self, *args, **kwargs) -> Tuple:
-        self.combine_a(*args, **kwargs)
+    def combine(self, combine_input: CombineInput) -> Tuple:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
@@ -760,6 +784,7 @@ class DeepEPDispatcher(BaseDispatcher):
         forward_batch: ForwardBatch,
         overlap_args: Optional["CombineOverlapArgs"] = None,
     ):
+        hidden_states, topk_ids, topk_weights, overlap_args = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl(forward_batch).combine_a(
             hidden_states=hidden_states,

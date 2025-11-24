@@ -49,6 +49,7 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
 | max_new_tokens  | `int = 128`                                  | The maximum output length measured in tokens.                                                                                                  |
 | stop            | `Optional[Union[str, List[str]]] = None`     | One or multiple [stop words](https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop). Generation will stop if one of these words is sampled. |
 | stop_token_ids  | `Optional[List[int]] = None`                 | Provide stop words in the form of token IDs. Generation will stop if one of these token IDs is sampled.                                        |
+| stop_regex      | `Optional[Union[str, List[str]]] = None`     | Stop when hitting any of the regex patterns in this list |
 | temperature     | `float (model default; fallback 1.0)`        | [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, a higher temperature leads to more diversity. |
 | top_p           | `float (model default; fallback 1.0)`        | [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens. |
 | top_k           | `int (model default; fallback -1)`           | [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens. |
@@ -317,4 +318,28 @@ response = requests.post(
     },
 )
 print(response.json())
+```
+
+Send an OpenAI chat completion request:
+
+```python
+import openai
+from sglang.utils import print_highlight
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    messages=[
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0.0,
+    max_tokens=32,
+    extra_body={
+        "custom_logit_processor": DeterministicLogitProcessor().to_str(),
+        "custom_params": {"token_id": 5},
+    },
+)
+
+print_highlight(f"Response: {response}")
 ```

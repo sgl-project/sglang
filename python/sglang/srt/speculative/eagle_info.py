@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -10,23 +10,30 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    get_last_loc,
-    global_server_args_dict,
-)
+from sglang.srt.managers.overlap_utils import FutureIndices
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.eagle_info_v2 import (
+    EagleDraftInputV2Mixin,
+    EagleVerifyInputV2Mixin,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
-    _generate_simulated_accept_index,
     align_evict_mask_to_page_size,
     assign_req_to_token_pool,
     create_accept_length_filter,
     create_extend_after_decode_spec_info,
     filter_finished_cache_loc_kernel,
+    generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
@@ -46,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class EagleVerifyInput(SpecInput):
+class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -100,7 +107,10 @@ class EagleVerifyInput(SpecInput):
         batch.input_ids = self.draft_token
 
         if page_size == 1:
-            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
+            batch.out_cache_loc = alloc_token_slots(
+                batch.tree_cache,
+                len(batch.input_ids),
+            )
             end_offset = batch.seq_lens + self.draft_token_num
         else:
             prefix_lens = batch.seq_lens
@@ -112,7 +122,8 @@ class EagleVerifyInput(SpecInput):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
+            batch.out_cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
                 prefix_lens,
                 prefix_lens_cpu,
                 end_offset,
@@ -235,7 +246,10 @@ class EagleVerifyInput(SpecInput):
             )
 
         # Apply penalty
-        if sampling_info.penalizer_orchestrator.is_required:
+        if (
+            sampling_info.penalizer_orchestrator.is_required
+            or sampling_info.logit_bias is not None
+        ):
             # This is a relaxed version of penalties for speculative decoding.
             linear_penalty = torch.zeros(
                 (bs, logits_output.next_token_logits.shape[1]),
@@ -322,18 +336,14 @@ class EagleVerifyInput(SpecInput):
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=global_server_args_dict[
-                    "speculative_accept_threshold_single"
-                ],
-                threshold_acc=global_server_args_dict[
-                    "speculative_accept_threshold_acc"
-                ],
+                threshold_single=get_global_server_args().speculative_accept_threshold_single,
+                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
             )
 
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
-            accept_index = _generate_simulated_accept_index(
+            accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
                 accept_length=accept_length,  # mutable
@@ -377,6 +387,9 @@ class EagleVerifyInput(SpecInput):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
@@ -563,7 +576,10 @@ class EagleVerifyInput(SpecInput):
 
 
 @dataclass
-class EagleDraftInput(SpecInput):
+class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+    # Constant: alloc length per decode step
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -592,6 +608,12 @@ class EagleDraftInput(SpecInput):
     seq_lens_for_draft_extend: torch.Tensor = None
     seq_lens_for_draft_extend_cpu: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
+
+    # Inputs for V2 overlap worker
+    future_indices: Optional[FutureIndices] = None
+    allocate_lens: Optional[torch.Tensor] = None
+    new_seq_lens: Optional[torch.Tensor] = None
+    verify_done: Optional[torch.cuda.Event] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -698,6 +720,11 @@ class EagleDraftInput(SpecInput):
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if self.future_indices is not None:
+            self.future_indices.indices = self.future_indices.indices[new_indices]
+            self.allocate_lens = self.allocate_lens[new_indices]
+            return
+
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
@@ -717,6 +744,18 @@ class EagleDraftInput(SpecInput):
             self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        if self.future_indices is not None:
+            assert spec_info.future_indices is not None
+            self.future_indices = FutureIndices(
+                indices=torch.cat(
+                    [self.future_indices.indices, spec_info.future_indices.indices]
+                )
+            )
+            self.allocate_lens = torch.cat(
+                [self.allocate_lens, spec_info.allocate_lens]
+            )
+            return
+
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id

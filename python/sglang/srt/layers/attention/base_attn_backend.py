@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -53,6 +53,25 @@ class AttentionBackend(ABC):
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
+        raise NotImplementedError()
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        """
+        Return buffers of verify attention kernels that needs to be filled after draft.
+
+        Typically, these are tree mask and position buffers.
+        """
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        """
+        Update the buffers returned by get_verify_fill_after_draft_buffers if needed.
+
+        Here, we need to redo the computation of all metadata of the attention backend
+        that depends on tree mask and position buffers.
+        """
         raise NotImplementedError()
 
     def forward(

@@ -224,13 +224,17 @@ def create_grammar_backend(
         eos_list = list(eos_token_ids) if eos_token_ids else None
 
         grammar_backend = XGrammarGrammarBackend(
-            tokenizer, vocab_size=vocab_size, model_eos_token_ids=eos_list
+            tokenizer,
+            vocab_size=vocab_size,
+            model_eos_token_ids=eos_list,
+            any_whitespace=not server_args.constrained_json_disable_any_whitespace,
         )
     elif name == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 
         grammar_backend = GuidanceBackend(
             tokenizer=tokenizer,
+            any_whitespace=not server_args.constrained_json_disable_any_whitespace,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
     elif name == "none":
