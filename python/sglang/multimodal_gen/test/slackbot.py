@@ -49,10 +49,24 @@ def upload_file_to_slack(
             f"*Prompt:* {prompt}"
         )
 
-        WebClient(token=token).files_upload_v2(
-            channel="C0A02NDF7UY",
+        client = WebClient(token=token)
+        channel_id = "C0A02NDF7UY"
+        thread_ts = None
+
+        try:
+            history = client.conversations_history(channel=channel_id, limit=10)
+            for msg in history.get("messages", []):
+                if f"*GitHub Run ID:* {run_id}" in msg.get("text", ""):
+                    thread_ts = msg.get("ts")
+                    break
+        except Exception as e:
+            logger.warning(f"Failed to search slack history: {e}")
+
+        client.files_upload_v2(
+            channel=channel_id,
             file_uploads=uploads,
             initial_comment=message,
+            thread_ts=thread_ts,
         )
 
         logger.info(f"File uploaded successfully: {os.path.basename(file_path)}")
