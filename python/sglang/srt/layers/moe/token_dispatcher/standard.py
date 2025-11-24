@@ -30,7 +30,12 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.utils.common import get_bool_env_var, is_hip, is_sm120_supported
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_sm120_supported,
+)
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -40,7 +45,7 @@ if TYPE_CHECKING:
 
 
 try:
-    if is_sm120_supported():
+    if is_cuda() and is_sm120_supported():
         from flashinfer import fp4_quantize
     else:
         from sgl_kernel import scaled_fp4_quant as fp4_quantize
