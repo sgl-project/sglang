@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -18,13 +18,30 @@ from sglang.test.test_utils import (
 class TestDataParallelism(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = (
+            "/root/.cache/modelscope/hub/models/AI-ModelScope/Llama-3.1-8B-Instruct"
+            if is_npu()
+            else DEFAULT_MODEL_NAME_FOR_TEST
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = (
+            [
+                "--dp",
+                2,
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+                "--mem-fraction-static",
+                0.8,
+            ]
+            if is_npu()
+            else ["--dp", 2]
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dp", 2],
+            other_args=other_args,
         )
 
     @classmethod
