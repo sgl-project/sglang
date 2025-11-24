@@ -73,7 +73,7 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda:
     from sgl_kernel import kimi_k2_moe_fused_gate, moe_fused_gate
 
     @torch.library.register_fake("sgl_kernel::kimi_k2_moe_fused_gate")

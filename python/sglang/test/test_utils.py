@@ -35,7 +35,6 @@ from sglang.srt.utils import (
     get_device,
     is_cuda,
     is_port_available,
-    is_rocm,
     is_xpu,
     kill_process_tree,
     retry,
@@ -1923,24 +1922,18 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
 
 
 def get_gpu_count():
-    if is_xpu():
-        gpu_count = torch.xpu.device_count()
-    elif is_cuda():
-        gpu_count = torch.cuda.device_count()
-    elif is_rocm():
-        gpu_count = torch.rocm.device_count()
-    else:
+    if get_device() == "cpu":
         gpu_count = 0
+    else:
+        gpu_count = torch.accelerator.device_count()
     return gpu_count
 
 
 def empty_gpu_cache():
-    if is_xpu():
-        torch.xpu.empty_cache()
-    elif is_cuda() or is_rocm():
-        torch.cuda.empty_cache()
-    else:
+    if get_device() == "cpu":
         print("There is no suitable GPU")
+    else:
+        torch.accelerator.empty_cache()
 
 
 def get_gpu_memory_gb():
