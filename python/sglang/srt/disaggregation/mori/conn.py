@@ -183,15 +183,15 @@ class MoriKVManager(CommonKVManager):
         if self.kv_args.ib_device:
             os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
 
-        engine_key = (
-            f"mori-{self.disaggregation_mode.value}-"
-            f"dp{self.system_dp_rank}-tp{self.attn_tp_rank}-"
-            f"pp{self.pp_rank}-pid{os.getpid()}"
-        )
-
         port = get_free_port()
         self.local_ip = get_local_ip_auto()
         config = IOEngineConfig(host=self.local_ip, port=port)
+
+        engine_key = (
+            f"io-{self.disaggregation_mode.value}-"
+            f"dp{self.system_dp_rank}-tp{self.attn_tp_rank}-"
+            f"{self.local_ip}:{port}"
+        )
 
         engine = IOEngine(engine_key, config)
         poll_mode = PollCqMode.POLLING
