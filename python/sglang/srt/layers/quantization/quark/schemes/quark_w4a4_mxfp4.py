@@ -6,10 +6,10 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 
-_is_hip = is_hip()
-if _is_hip:
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+if _use_aiter:
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
     from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
