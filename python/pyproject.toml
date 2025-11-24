@@ -26,8 +26,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.5.2", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.5.2",
+  "flashinfer_python==0.5.3", # keep it aligned with jit-cache version in Dockerfile
+  # "flashinfer_cubin==0.5.3", # TODO: Add it back when the cubin is ready: https://github.com/flashinfer-ai/flashinfer/issues/2133
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -69,7 +69,7 @@ dependencies = [
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop==0.21.0",
+  "uvloop",
   "xgrammar==0.1.27",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
@@ -131,6 +131,9 @@ sglang = "sglang.cli.main:main"
   "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
   "srt/speculative/cpp_ngram/*.cpp",
   "srt/speculative/cpp_ngram/*.h",
+  "jit_kernel/include/sgl_kernel/*.h",
+  "jit_kernel/include/sgl_kernel/*.cuh",
+  "jit_kernel/csrc/*.cuh"
 ]
 
 [tool.setuptools.packages.find]
