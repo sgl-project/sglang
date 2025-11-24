@@ -125,6 +125,7 @@ class StandardDispatcher(BaseDispatcher):
             topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                 [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
             )
+            # TODO: fuse into cutlass moe
             x_sf = nvfp4_block_scale_interleave(x_sf)
 
             hidden_states = x
