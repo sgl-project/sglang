@@ -1027,6 +1027,8 @@ class DeepseekV2MoE(nn.Module):
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
+                if meta_overlap_args is None:
+                    print("meta_overlap_args is None in deepep dispatch hook")
                 dispatcher.set_overlap_args(
                     combine_overlap_args=combine_overlap_args,
                     meta_overlap_args=meta_overlap_args,
