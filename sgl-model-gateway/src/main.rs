@@ -5,7 +5,7 @@ use sgl_model_gateway::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
-        RouterConfig, RoutingMode, TokenizerCacheConfig,
+        RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
     metrics::PrometheusConfig,
@@ -348,6 +348,12 @@ struct CliArgs {
 
     #[arg(long, default_value_t = false)]
     enable_wasm: bool,
+
+    #[arg(long, default_value_t = false)]
+    enable_trace: bool,
+
+    #[arg(long, default_value = "localhost:4317")]
+    otlp_traces_endpoint: String,
 }
 
 enum OracleConnectSource {
@@ -539,6 +545,11 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
+        let trace_config = Some(TraceConfig {
+            enable_trace: self.enable_trace,
+            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+        });
+
         let mut all_urls = Vec::new();
         match &mode {
             RoutingMode::Regular { worker_urls } => {
@@ -624,6 +635,7 @@ impl CliArgs {
             .maybe_api_key(self.api_key.as_ref())
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
+            .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
             .maybe_request_id_headers(
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
