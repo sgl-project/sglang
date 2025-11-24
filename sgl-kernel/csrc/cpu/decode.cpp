@@ -20,6 +20,7 @@ inline void pack_vnni_Nx32(
     scalar_t* __restrict__ dst0,
     scalar_t* __restrict__ dst1,
     const scalar_t* __restrict__ src,
+    const float* __restrict__ src_scale,
     const index_t* __restrict__ ind,
     int N,
     int ld_src,
@@ -55,6 +56,58 @@ inline void pack_vnni_Nx32(
     _mm512_mask_storeu_epi32(dst0 + k * ld_dst0 * 2, vmask, vinputs[k]);
   }
 }
+
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_Nx32(
+    scalar_t* __restrict__ dst0,
+    scalar_t* __restrict__ dst1,
+    const at::Float8_e4m3fn* __restrict__ src,
+    const float* __restrict__ src_scale,
+    const index_t* __restrict__ ind,
+    int N,
+    int ld_src,
+    int ld_dst0,
+    int ld_dst1,
+    bool convert_v) {
+  __m512i vinputs[16];
+  int n = 0;
+  for (; n < N; ++n) {
+    index_t index = ind[n];
+    __m512 scale = _mm512_set1_ps(src_scale[index]);
+    __m512i s8 = _mm512_loadu_si512(src + ind[n] * ld_src);
+    __m256i s8_0 = _mm512_extracti32x8_epi32(s8, 0);
+    __m512bh bf16_0 = CVT_FP8_TO_BF16(s8_0);
+    __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
+    __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
+    f_lo = _mm512_mul_ps(f_lo, scale);
+    f_hi = _mm512_mul_ps(f_hi, scale);
+    bf16_0 = _mm512_cvtne2ps_pbh(f_hi, f_lo);
+    vinputs[n] = (__m512i)bf16_0;
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; n < 16; ++n) {
+    vinputs[n] = _mm512_set1_epi32(0);
+  }
+
+  // pack value, skip 64 elems for deepseek
+  // handle 2 vectors at a time from [2, 32] to [32, 2]
+  if (convert_v) {
+    for (int n = 0; n < 16; n += 2) {
+      __m512i d0, d1;
+      std::tie(d0, d1) = transpose_2x32_16bit(vinputs[n], vinputs[n + 1]);
+      _mm512_storeu_si512(dst1 + (n >> 1) * ld_dst1 * 2, d0);
+      _mm512_storeu_si512(dst1 + (n >> 1) * ld_dst1 * 2 + 32, d1);
+    }
+  }
+
+  // pack key
+  transpose_16x16_32bit(vinputs);
+
+  const __mmask16 vmask = (1 << N) - 1;
+  for (int k = 0; k < 16; ++k) {
+    _mm512_mask_storeu_epi32(dst0 + k * ld_dst0 * 2, vmask, vinputs[k]);
+  }
+}
 #endif
 
 // [NOTE]: MLA vnni format conversion
@@ -65,11 +118,12 @@ inline void pack_vnni_Nx32(
 //  * for   key: from [N, K/2, 2] to [K/2, N, 2]
 //  * for value: from [N/2, 2, Kv] to [N/2, Kv, 2]
 //
-template <typename scalar_t, typename index_t>
+template <typename scalar_t, typename kvcache_t, typename index_t>
 void pack_vnni(
     scalar_t* __restrict__ dst0,
     scalar_t* __restrict__ dst1,
-    const scalar_t* __restrict__ src,
+    const kvcache_t* __restrict__ src,
+    const float* __restrict__ src_scale,
     const index_t* __restrict__ ind,
     int N,
     int K,
@@ -90,6 +144,7 @@ void pack_vnni(
           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
           /*     src */ src + kb * 32,
+          /* src_scale */ src_scale,
           /*     ind */ ind + nb * 16,
           /*       N */ nb_size,
           /*  ld_src */ ld_src,
@@ -101,9 +156,10 @@ void pack_vnni(
 #else
   for (int n = 0; n < N; ++n) {
     index_t index = ind[n];
+    float scale = src_scale != nullptr ? src_scale[index] : 1.0f;
     for (int k = 0; k < K / 2; ++k) {
       for (int d = 0; d < 2; ++d) {
-        dst0[k * ld_dst0 * 2 + n * 2 + d] = src[index * ld_src + k * 2 + d];
+        dst0[k * ld_dst0 * 2 + n * 2 + d] = src[index * ld_src + k * 2 + d] * scale;
       }
     }
   }
@@ -111,81 +167,22 @@ void pack_vnni(
   for (int n = 0; n < (N >> 1) * 2; n += 2) {
     index_t index0 = ind[n + 0];
     index_t index1 = ind[n + 1];
+    float scale0 = src_scale != nullptr ? src_scale[index0] : 1.0f;
+    float scale1 = src_scale != nullptr ? src_scale[index1] : 1.0f;
     for (int k = 0; k < Kv; ++k) {
-      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = src[index0 * ld_src + k];
-      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = src[index1 * ld_src + k];
+      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = src[index0 * ld_src + k] * scale0;
+      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = src[index1 * ld_src + k] * scale1;
     }
   }
   if (N % 2 != 0) {
     index_t index = ind[N - 1];
+    float scale = src_scale != nullptr ? src_scale[index] : 1.0f;
     for (int k = 0; k < Kv; ++k) {
-      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = src[index * ld_src + k];
+      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = src[index * ld_src + k] * scale;
       dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
     }
   }
 #endif
-}
-
-template <typename scalar_t, typename index_t>
-void pack_vnni(
-    scalar_t* __restrict__ dst0,
-    scalar_t* __restrict__ dst1,
-    const at::Float8_e4m3fn* __restrict__ src,
-    const float* __restrict__ src_scale,
-    const index_t* __restrict__ ind,
-    int N,
-    int K,
-    int Kv,
-    int ld_src,
-    int ld_dst0,
-    int ld_dst1) {
-  // #if defined(CPU_CAPABILITY_AVX512)
-  //   const int NB = div_up(N, 16);
-  //   const int KB = K / 32;    // no remainder
-  //   const int KBv = Kv / 32;  // no remainder
-
-  //   for (int nb = 0; nb < NB; ++nb) {
-  //     for (int kb = 0; kb < KB; ++kb) {
-  //       // handle 16x512bits each block
-  //       int nb_size = std::min(N - nb * 16, 16);
-  //       pack_vnni_Nx32<scalar_t, index_t>(
-  //           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
-  //           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
-  //           /*     src */ src + kb * 32,
-  //           /*     ind */ ind + nb * 16,
-  //           /*       N */ nb_size,
-  //           /*  ld_src */ ld_src,
-  //           /* ld_dst0 */ ld_dst0,
-  //           /* ld_dst1 */ ld_dst1,
-  //           /*   cvt_v */ kb < KBv);
-  //     }
-  //   }
-  // #else
-  for (int n = 0; n < N; ++n) {
-    index_t index = ind[n];
-    for (int k = 0; k < K / 2; ++k) {
-      for (int d = 0; d < 2; ++d) {
-        dst0[k * ld_dst0 * 2 + n * 2 + d] = static_cast<scalar_t>(src[index * ld_src + k * 2 + d] * src_scale[index]);
-      }
-    }
-  }
-  // from [N/2, 2, K] to [N/2, K, 2]
-  for (int n = 0; n < (N >> 1) * 2; n += 2) {
-    index_t index0 = ind[n + 0];
-    index_t index1 = ind[n + 1];
-    for (int k = 0; k < Kv; ++k) {
-      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = static_cast<scalar_t>(src[index0 * ld_src + k] * src_scale[index0]);
-      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = static_cast<scalar_t>(src[index1 * ld_src + k] * src_scale[index1]);
-    }
-  }
-  if (N % 2 != 0) {
-    index_t index = ind[N - 1];
-    for (int k = 0; k < Kv; ++k) {
-      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = static_cast<scalar_t>(src[index * ld_src + k] * src_scale[index]);
-      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
-    }
-  }
-  // #endif
 }
 
 template <typename scalar_t>
@@ -1330,205 +1327,13 @@ void decode_attention_kernel_impl(
       output, attn_logits, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2);
 }  // MHA
 
-template <typename scalar_t, typename index_t, int64_t BLOCK_N>
+template <typename scalar_t, typename kvcache_t, typename index_t, int64_t BLOCK_N>
 void decode_attention_mla_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
-    const index_t* __restrict__ req_to_token,
-    const int64_t* __restrict__ req_pool_indices,
-    const int64_t* __restrict__ seq_lens,
-    scalar_t* __restrict__ buffer,
-    int64_t batches,
-    int64_t num_heads,
-    int64_t head_size,
-    int64_t head_size_v,
-    int64_t num_kv_splits,
-    int64_t q_strideM,
-    int64_t q_strideH,
-    int64_t k_strideN,
-    int64_t k_strideH,
-    int64_t v_strideN,
-    int64_t v_strideH,
-    float scaling,
-    float logit_cap,
-    int64_t max_num_reqs,
-    int64_t max_context_len,
-    int64_t max_total_num_tokens,
-    int64_t buffer_size_per_thread) {
-  using Vec = at::vec::Vectorized<float>;
-
-  // block length for heads
-  const int64_t BLOCK_H = batches == 1 ? 6 : (batches > 16 ? 22 : 11);
-
-  // strides
-  const int64_t l_stride0 = num_heads * num_kv_splits * (head_size_v + 1);
-  const int64_t l_stride1 = num_kv_splits * (head_size_v + 1);
-  const int64_t l_stride2 = head_size_v + 1;
-
-  TORCH_CHECK(logit_cap == 0.f, "decode MLA: expect no logit_cap.");
-
-  // partition the heads into blocks for parallel
-  const int64_t num_blocks = div_up(num_heads, BLOCK_H);
-
-  // parallel on [batches, num_blocks, num_kv_splits]
-  at::parallel_for(0, batches * num_blocks * num_kv_splits, 0, [&](int64_t begin, int64_t end) {
-    int64_t bs{0}, block_id{0}, kv_id{0};
-    data_index_init(begin, bs, batches, block_id, num_blocks, kv_id, num_kv_splits);
-
-    int tid = at::get_thread_num();
-    scalar_t* __restrict__ Btmp0 = buffer + tid * buffer_size_per_thread;
-    scalar_t* __restrict__ Btmp1 = Btmp0 + BLOCK_N * head_size;
-
-    // init Btmp1 just once for each thread to prevent NaN
-    // Btmp0 is not needed as it computes full K every single time
-    fill_stub(Btmp1, 0.f, BLOCK_N * head_size_v);
-
-    alignas(64) float s_i[BLOCK_H * BLOCK_N];
-    float* __restrict__ s_delta = s_i;
-    alignas(64) scalar_t s_delta2[BLOCK_H * BLOCK_N];
-
-    alignas(64) float s_prime[BLOCK_H];
-    alignas(64) float m_prime[BLOCK_H];
-    alignas(64) float m_delta[BLOCK_H];
-
-    for (int64_t i = begin; i < end; ++i) {
-      const int64_t h_start = block_id * BLOCK_H;
-      const int64_t h_end = std::min(block_id * BLOCK_H + BLOCK_H, num_heads);
-      const int64_t h_size = h_end - h_start;
-
-      // get query
-      const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + h_start * q_strideH;
-
-      int64_t seq_len_kv = seq_lens[bs];
-      int64_t req_pool_id = req_pool_indices[bs];
-      TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
-      TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
-
-      const int64_t SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
-      const int64_t kv_start = kv_id * SPLIT_SIZE;
-      const int64_t kv_end = std::min(kv_start + SPLIT_SIZE, seq_len_kv);
-
-      fill_stub(s_prime, 0.f, BLOCK_H);
-      fill_stub(m_prime, -std::numeric_limits<float>::infinity(), BLOCK_H);
-
-      // get v_prime, and init to zero
-      float* __restrict__ v_prime = attn_logits + bs * l_stride0 + h_start * l_stride1 + kv_id * l_stride2;
-      for (int64_t h = 0; h < h_size; ++h) {
-        fill_stub(v_prime + h * l_stride1, 0.f, head_size_v);
-      }
-
-      // loop over K and V sequence with BLOCK_N
-      for (int64_t n = kv_start; n < kv_end; n += BLOCK_N) {
-        int64_t n_size = std::min(BLOCK_N, kv_end - n);
-        const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
-
-        // get key and pack
-        pack_vnni<scalar_t, index_t>(
-            /*    dst0 */ Btmp0,
-            /*    dst1 */ Btmp1,
-            /*     src */ k_buffer + /* head_kv_id */ 0 * k_strideH,
-            /*     ind */ req_to_token + req_pool_id * max_context_len + n,
-            /*       N */ n_size,
-            /*       K */ head_size,
-            /*      Kv */ head_size_v,
-            /*  ld_src */ k_strideN,
-            /* ld_dst0 */ BLOCK_N,
-            /* ld_dst1 */ head_size_v);
-
-        // calculate s_i <- Q @ K
-        at::native::cpublas::brgemm(
-            /* M     */ h_size,
-            /* N     */ n_size,
-            /* K     */ head_size,
-            /* lda   */ q_strideH,
-            /* ldb   */ BLOCK_N,
-            /* ldc   */ BLOCK_N,
-            /* add_C */ false,
-            /* A     */ q_ptr,
-            /* B     */ Btmp0,
-            /* C     */ s_i);
-
-        const Vec scale_vec = Vec(scaling);
-        for (int64_t h = 0; h < h_size; ++h) {
-          // s_i <- s_i * scale
-          at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + h * BLOCK_N, s_i + h * BLOCK_N, n_size);
-
-          // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + h * BLOCK_N, n_size);
-          m_i = std::max(m_i, m_prime[h]);
-
-          // m_delta <- exp(m' - m_i)
-          m_delta[h] = std::exp(m_prime[h] - m_i);
-
-          // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + h * BLOCK_N, s_i + h * BLOCK_N, n_size);
-
-          // s' <- s' * m_delta + sum(s_delta)
-          s_prime[h] *= m_delta[h];
-          s_prime[h] += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
-
-          m_prime[h] = m_i;
-
-          // v' <- v' * m_delta
-          float scale_m = m_delta[h];
-          at::vec::map<float>(
-              [scale_m](Vec x) { return x * Vec(scale_m); },
-              v_prime + h * l_stride1,
-              v_prime + h * l_stride1,
-              head_size_v);
-
-          // pad s_delta with 0 first and then convert to scalar_t
-          fill_stub(s_delta + h * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
-        }
-
-        // calculate V' <- s_delta @ V + V'
-        at::native::cpublas::brgemm(
-            /* M     */ h_size,
-            /* N     */ head_size_v,
-            /* K     */ padded_n_size,  // n_size
-            /* lda   */ BLOCK_N,
-            /* ldb   */ head_size_v,
-            /* ldc   */ l_stride1,
-            /* add_C */ true,
-            /* A     */ s_delta2,
-            /* B     */ Btmp1,
-            /* C     */ v_prime);
-      }  // loop with KV blocks
-
-      // only update v' when kv_split_size > 0
-      if (kv_end > kv_start) {
-        for (int64_t h = 0; h < h_size; ++h) {
-          float s = 1 / s_prime[h];
-          at::vec::map<float>(
-              [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
-          (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
-        }
-      }
-
-      // move to the next index
-      data_index_step(bs, batches, block_id, num_blocks, kv_id, num_kv_splits);
-    }
-    at::native::cpublas::brgemm_release();
-  });
-
-  decode_accumulate_kv_splits(
-      output, attn_logits, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2);
-}  // MLA
-
-template <typename scalar_t, typename index_t, int64_t BLOCK_N>
-void decode_attention_mla_kernel_impl(
-    scalar_t* __restrict__ output,
-    float* __restrict__ attn_logits,
-    const scalar_t* __restrict__ query,
-    const at::Float8_e4m3fn* __restrict__ k_buffer,
-    const at::Float8_e4m3fn* __restrict__ v_buffer,
+    const kvcache_t* __restrict__ k_buffer,
+    const kvcache_t* __restrict__ v_buffer,
     const float* __restrict__ k_buf_scale,
     const float* __restrict__ v_buf_scale,
     const index_t* __restrict__ req_to_token,
@@ -1618,8 +1423,9 @@ void decode_attention_mla_kernel_impl(
       for (int64_t n = kv_start; n < kv_end; n += BLOCK_N) {
         int64_t n_size = std::min(BLOCK_N, kv_end - n);
         const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
+
         // get key and pack
-        pack_vnni<scalar_t, index_t>(
+        pack_vnni<scalar_t, kvcache_t, index_t>(
             /*    dst0 */ Btmp0,
             /*    dst1 */ Btmp1,
             /*     src */ k_buffer + /* head_kv_id */ 0 * k_strideH,
@@ -2022,7 +1828,7 @@ void decode_attention_cpu(
             nv_strideH,
             is_mla);
         if (is_mla) {
-          decode_attention_mla_kernel_impl<scalar_t, index_t, BLOCK_N>(
+          decode_attention_mla_kernel_impl<scalar_t, at::Float8_e4m3fn, index_t, BLOCK_N>(
               output.data_ptr<scalar_t>(),
               attn_logits.data_ptr<float>(),
               query.data_ptr<scalar_t>(),
@@ -2101,12 +1907,14 @@ void decode_attention_cpu(
               max_total_num_tokens);
         } else if (is_mla) {
           // MLA
-          decode_attention_mla_kernel_impl<scalar_t, index_t, BLOCK_N>(
+          decode_attention_mla_kernel_impl<scalar_t, scalar_t, index_t, BLOCK_N>(
               output.data_ptr<scalar_t>(),
               attn_logits.data_ptr<float>(),
               query.data_ptr<scalar_t>(),
               (const scalar_t*)k_buffer_data,
               (const scalar_t*)v_buffer_data,
+              nullptr,
+              nullptr,
               req_to_token.data_ptr<index_t>(),
               req_pool_indices.data_ptr<int64_t>(),
               seq_lens.data_ptr<int64_t>(),
