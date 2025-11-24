@@ -626,13 +626,13 @@ class ServerArgs:
             "--lora-path",
             type=str,
             default=ServerArgs.lora_path,
-            help="the path to the lora",
+            help="The path to the LoRA adapter weights (can be local file path or HF hub id)",
         )
         parser.add_argument(
             "--lora-nickname",
             type=str,
             default=ServerArgs.lora_nickname,
-            help="the path to the lora",
+            help="The nickname for the LoRA adapter",
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)

@@ -1,8 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
-# SPDX-License-Identifier: Apache-2.0
-# Code adapted from SGLang https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/layers.py
-
+import math
 
 import torch
 from torch import nn
@@ -33,6 +30,10 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 )
 from sglang.multimodal_gen.utils import get_mixed_precision_state
 
+# SPDX-License-Identifier: Apache-2.0
+# Code adapted from SGLang https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/layers.py
+
+
 torch._dynamo.config.recompile_limit = 16
 
 
@@ -43,6 +44,7 @@ class BaseLayerWithLoRA(nn.Module):
         base_layer: nn.Module,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        training_mode: bool = False,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
@@ -54,9 +56,39 @@ class BaseLayerWithLoRA(nn.Module):
         self.disable_lora: bool = False
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.training_mode = training_mode
         self.lora_path: str | None = None
-        self.lora_A = None
-        self.lora_B = None
+
+        if training_mode:
+            assert (
+                self.lora_rank is not None
+            ), "LoRA rank  must be set for training mode"
+            if self.lora_rank is None or self.lora_alpha is None:
+                self.lora_alpha = lora_rank
+            self.base_layer.requires_grad_(False)
+            in_dim = self.base_layer.weight.shape[1]
+            out_dim = self.base_layer.weight.shape[0]
+            self.lora_A = nn.Parameter(
+                torch.zeros(
+                    self.lora_rank,
+                    in_dim,
+                    device=self.base_layer.weight.device,
+                    dtype=self.base_layer.weight.dtype,
+                )
+            )
+            self.lora_B = nn.Parameter(
+                torch.zeros(
+                    out_dim,
+                    self.lora_rank,
+                    device=self.base_layer.weight.device,
+                    dtype=self.base_layer.weight.dtype,
+                )
+            )
+            torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            torch.nn.init.zeros_(self.lora_B)
+        else:
+            self.lora_A = None
+            self.lora_B = None
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -90,6 +122,7 @@ class BaseLayerWithLoRA(nn.Module):
         self,
         A: torch.Tensor,
         B: torch.Tensor,
+        training_mode: bool = False,
         lora_path: str | None = None,
     ) -> None:
         self.lora_A = torch.nn.Parameter(
@@ -97,7 +130,8 @@ class BaseLayerWithLoRA(nn.Module):
         )  # share storage with weights in the pipeline
         self.lora_B = torch.nn.Parameter(B)
         self.disable_lora = False
-        self.merge_lora_weights()
+        if not training_mode:
+            self.merge_lora_weights()
         self.lora_path = lora_path
 
     @torch.no_grad()
@@ -211,8 +245,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         base_layer: ColumnParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        training_mode: bool = False,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         # duplicate the logic in ColumnParallelLinear
@@ -246,8 +281,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         base_layer: MergedColumnParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        training_mode: bool = False,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A.to(self.base_layer.weight)
@@ -268,8 +304,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         base_layer: QKVParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        training_mode: bool = False,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -301,8 +338,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         base_layer: RowParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        training_mode: bool = False,
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, training_mode)
 
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in RowParallelLinear
