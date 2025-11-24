@@ -324,8 +324,6 @@ class ModelRunner:
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
-        self._weight_checker = WeightChecker(model_runner=self)
-
         if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
             slow_rank_detector.execute()
         # Init mindspore running environment when model impl is "mindspore"
