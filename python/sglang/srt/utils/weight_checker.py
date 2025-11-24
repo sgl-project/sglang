@@ -32,7 +32,14 @@ class WeightChecker:
 
     def _compare(self):
         assert self._snapshot_tensors is not None
-        TODO
+
+        curr_tensors = dict(self._model_state())
+        assert len(curr_tensors) == len(self._snapshot_tensors)
+
+        for name in curr_tensors:
+            curr_tensor = curr_tensors[name]
+            snapshot_tensor = self._snapshot_tensors[name]
+            TODO
 
     def _model_state(self):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
