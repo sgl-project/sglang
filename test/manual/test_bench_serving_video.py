@@ -106,12 +106,10 @@ class TestBenchServingVideo(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_latency\n"
-                f"Mean latency: {res['mean_latency_ms']:.2f} ms\n"
+                f"### test_latency\n" f"Mean latency: {res['mean_latency_ms']:.2f} ms\n"
             )
         self.assertLess(res["mean_latency_ms"], 300)
         print("Test latency:", res["mean_latency_ms"])
-
 
     def test_latency_cache_hit(self):
         res = run_bench_serving_video(
