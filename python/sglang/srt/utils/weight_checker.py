@@ -28,7 +28,7 @@ class WeightChecker:
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
         yield from self._model_runner.model.named_parameters()
 
-def _random_fill_tensor(t: torch.Tensor, *, low=None, high=None):
+def _random_like(t: torch.Tensor, *, low=None, high=None):
     device = t.device
     shape = t.shape
     dtype = t.dtype
@@ -36,18 +36,17 @@ def _random_fill_tensor(t: torch.Tensor, *, low=None, high=None):
     if dtype.is_floating_point:
         gen_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
         tmp = torch.rand(shape, device=device, dtype=gen_dtype)
-        t.copy_(tmp.to(dtype))
-        return
+        return tmp.to(dtype)
 
     if dtype == torch.bool:
-        t.copy_(torch.rand(shape, device=device) > 0.5)
-        return
+        return torch.rand(shape, device=device) > 0.5
 
     # Integer types
     if dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
         info = torch.iinfo(dtype)
         # Default integer range: full dtype range
-        if low is None: low = int(info.min)
+        if low is None:
+            low = int(info.min)
         if high is None:
             # torch.randint high is exclusive; make maxv+1 if safe
             maxv = int(info.max)
@@ -61,9 +60,7 @@ def _random_fill_tensor(t: torch.Tensor, *, low=None, high=None):
         if not (low < high):
             raise ValueError(f"invalid integer bounds: low={low}, high={high}")
 
-        rand = torch.randint(low=low, high=high, size=shape, device=device, dtype=torch.int64)
-        t.copy_(rand.to(dtype))
-        return
+        return torch.randint(low=low, high=high, size=shape, device=device, dtype=torch.int64)
 
     raise TypeError(f"unsupported dtype: {dtype}")
 
