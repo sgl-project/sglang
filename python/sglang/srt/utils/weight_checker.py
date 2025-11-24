@@ -59,8 +59,8 @@ def _check_tensors(
     error_messages = []
 
     for name in expect_tensors:
-        expect = expect_tensors[name]
-        actual = actual_tensors[name]
+        expect = expect_tensors[name].cuda()
+        actual = actual_tensors[name].cuda()
 
         if torch.all(expect == actual):
             good_names.append(name)
