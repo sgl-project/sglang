@@ -22,6 +22,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    CheckWeightReqInput,
+    CheckWeightReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -53,8 +55,6 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
-    CheckWeightReqInput,
-    CheckWeightReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
