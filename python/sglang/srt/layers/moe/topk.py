@@ -73,8 +73,31 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import kimi_k2_moe_fused_gate, moe_fused_gate
+
+    @torch.library.register_fake("sgl_kernel::kimi_k2_moe_fused_gate")
+    def _kimi_k2_moe_fused_gate(
+        input_tensor,
+        bias,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    ):
+        num_rows = input_tensor.shape[0]
+        topk_weights = input_tensor.new_empty(
+            num_rows,
+            topk,
+            dtype=torch.float32,
+        )
+        topk_ids = input_tensor.new_empty(
+            num_rows,
+            topk,
+            dtype=torch.int32,
+        )
+        return topk_weights, topk_ids
+
 
 if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
@@ -806,8 +829,8 @@ def biased_grouped_topk_gpu(
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
-            gating_output.to(dtype=torch.float32),
-            correction_bias,
+            gating_output,
+            correction_bias.to(dtype=gating_output.dtype),
             topk_weights,
             topk_ids,
             num_expert_group,
@@ -993,7 +1016,6 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    # TODO: fused ops of shared experts in topk function itself when num_fused_shared_experts > 0.
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
         scale_factor = (
@@ -1002,30 +1024,17 @@ def select_experts(
             else fused_shared_experts_scaling_factor
         )
 
-        topk_ids = torch.cat(
-            [
-                topk_ids,
-                torch.arange(
-                    N,
-                    N + num_fused_shared_experts,
-                    dtype=topk_ids.dtype,
-                    device=topk_ids.device,
-                ).expand(M, -1),
-            ],
-            dim=1,
+        # Lazy import to avoid circular-import issues
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+            fused_append_shared_experts,
         )
 
-        topk_weights = torch.cat(
-            [
-                topk_weights,
-                torch.full(
-                    (topk_weights.size(0), num_fused_shared_experts),
-                    scale_factor,
-                    dtype=topk_weights.dtype,
-                    device=topk_weights.device,
-                ),
-            ],
-            dim=1,
+        topk_ids, topk_weights = fused_append_shared_experts(
+            topk_ids,
+            topk_weights,
+            num_fused_shared_experts,
+            scale_factor,
+            N,  # base id for shared experts
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
