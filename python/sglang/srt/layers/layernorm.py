@@ -217,32 +217,50 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward method with allreduce fusion, prioritizing flashinfer fused operations
+        Forward method with allreduce fusion
         """
         if residual is not None:
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
-            from sglang.srt.layers.flashinfer_comm_fusion import (
-                flashinfer_allreduce_residual_rmsnorm,
-            )
-
-            fused_op = (
-                torch.ops.sglang.flashinfer_allreduce_residual_rmsnorm
-                if supports_custom_op()
-                else flashinfer_allreduce_residual_rmsnorm
-            )
-
-            if get_tensor_model_parallel_world_size() > 1:
-                fused_result = fused_op(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.weight,
-                    eps=self.variance_epsilon,
+            if _use_aiter:
+                from sglang.srt.layers.aiter_comm_fusion import (
+                gpuk_allreduce_residual_rmsnorm_quant,
                 )
-                if fused_result[0] is not None:
-                    return fused_result
+
+                fused_op = torch.ops.sglang.gpuk_allreduce_residual_rmsnorm_quant
+
+                if get_tensor_model_parallel_world_size() > 1:
+                    fused_result = fused_op(
+                        allreduce_in=x,
+                        residual_in=residual,
+                        rms_weight=self.weight,
+                        eps=self.variance_epsilon,
+                        fp8_out=False,
+                    )
+                    residual_out, norm_out, scale_out = fused_result
+                    if norm_out is not None:
+                        return norm_out, residual_out
+            else:
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    flashinfer_allreduce_residual_rmsnorm,
+                )
+
+                fused_op = (
+                    torch.ops.sglang.flashinfer_allreduce_residual_rmsnorm
+                    if supports_custom_op()
+                    else flashinfer_allreduce_residual_rmsnorm
+                )
+
+                if get_tensor_model_parallel_world_size() > 1:
+                    fused_result = fused_op(
+                        input_tensor=x,
+                        residual=residual,
+                        weight=self.weight,
+                        eps=self.variance_epsilon,
+                    )
+                    if fused_result[0] is not None:
+                        return fused_result
 
         return self.forward(x, residual)
-
 
 class GemmaRMSNorm(CustomOp):
     def __init__(

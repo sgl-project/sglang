@@ -359,7 +359,14 @@ class LayerCommunicator:
         if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
             return False
 
-        static_conditions_met = (
+        if _use_aiter:
+            static_conditions_met = (
+            (not self.is_last_layer)
+            and (self._context.tp_size > 1)
+            and global_server_args_dict.get("enable_aiter_allreduce_fusion", False)
+        ) 
+        else: # flashinfer allreduce fusion
+            static_conditions_met = (
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
             and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
@@ -563,6 +570,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
                 and hidden_states.shape[0] <= 4096
             ):
+                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                    hidden_states, residual
+                )
+            elif (
+                _use_aiter
+                and hasattr(layernorm, "forward_with_allreduce_fusion")
+                and global_server_args_dict["enable_aiter_allreduce_fusion"]
+                and hidden_states.shape[0] <= 4096
+            ):
+                # print(f"----------------------------hidden_states.shape: {hidden_states.shape}")
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
