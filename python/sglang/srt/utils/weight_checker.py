@@ -3,6 +3,7 @@ from typing import Dict
 
 import torch
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +46,8 @@ class WeightChecker:
 
 
 def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict[str, torch.Tensor]):
+    from sglang.srt.debug_utils.dumper import get_tensor_info
+
     assert len(expect_tensors) == len(actual_tensors)
 
     error_messages = []
@@ -58,7 +61,10 @@ def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict
 
         error_messages.append(
             f"name={name} "
-            f"{TODO}"
+            f"max_abs_err={(actual - expect).abs().max()} "
+            f"mean_abs_err={(actual - expect).abs().mean()} "
+            f"{get_tensor_info(expect)=} "
+            f"{get_tensor_info(actual)=} "
         )
 
     raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
