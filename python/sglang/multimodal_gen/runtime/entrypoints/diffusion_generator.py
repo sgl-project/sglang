@@ -381,6 +381,7 @@ class DiffGenerator:
                 if isinstance(response, dict)
                 else "Unknown response format"
             )
+            )
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
     def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
