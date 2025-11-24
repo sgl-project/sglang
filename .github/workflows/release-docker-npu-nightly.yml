@@ -7,6 +7,7 @@ on:
       - ".github/workflows/release-docker-npu-nightly.yml"
       - "docker/npu.Dockerfile"
   workflow_dispatch:
+  workflow_call:
   schedule:
     - cron: "0 0 * * *"
 
