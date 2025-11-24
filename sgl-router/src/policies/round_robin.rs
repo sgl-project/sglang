@@ -1,10 +1,12 @@
 //! Round-robin load balancing policy
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::core::Worker;
-use crate::metrics::RouterMetrics;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Round-robin selection policy
 ///

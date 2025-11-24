@@ -28,7 +28,6 @@ from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from transformers import Qwen2VLConfig
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
@@ -407,7 +406,7 @@ class Qwen2VisionTransformer(nn.Module):
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         # transformers
         x = x.unsqueeze(1)
@@ -513,6 +512,10 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        # skip visual tower
+        return not module_name.startswith("visual")
 
     def forward(
         self,

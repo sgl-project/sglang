@@ -32,11 +32,11 @@ SGLang supports various environment variables that can be used to configure its 
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
-| `SGL_ENABLE_JIT_DEEPGEMM` | Enable Just-In-Time compilation of DeepGEMM kernels | `"true"` |
-| `SGL_JIT_DEEPGEMM_PRECOMPILE` | Enable precompilation of DeepGEMM kernels | `"true"` |
-| `SGL_JIT_DEEPGEMM_COMPILE_WORKERS` | Number of workers for parallel DeepGEMM kernel compilation | `4` |
+| `SGLANG_ENABLE_JIT_DEEPGEMM` | Enable Just-In-Time compilation of DeepGEMM kernels | `"true"` |
+| `SGLANG_JIT_DEEPGEMM_PRECOMPILE` | Enable precompilation of DeepGEMM kernels | `"true"` |
+| `SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS` | Number of workers for parallel DeepGEMM kernel compilation | `4` |
 | `SGL_IN_DEEPGEMM_PRECOMPILE_STAGE` | Indicator flag used during the DeepGEMM precompile script | `"false"` |
-| `SGL_DG_CACHE_DIR` | Directory for caching compiled DeepGEMM kernels | `~/.cache/deep_gemm` |
+| `SGLANG_DG_CACHE_DIR` | Directory for caching compiled DeepGEMM kernels | `~/.cache/deep_gemm` |
 | `SGL_DG_USE_NVRTC` | Use NVRTC (instead of Triton) for JIT compilation (Experimental) | `"0"` |
 | `SGL_USE_DEEPGEMM_BMM` | Use DeepGEMM for Batched Matrix Multiplication (BMM) operations | `"false"` |
 
@@ -74,6 +74,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_BLOCK_NONZERO_RANK_CHILDREN` | Control blocking of non-zero rank children processes | `1` |
 | `SGL_IS_FIRST_RANK_ON_NODE` | Indicates if the current process is the first rank on its node | `"true"` |
 | `SGLANG_PP_LAYER_PARTITION` | Pipeline parallel layer partition specification | Not set |
+| `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` | Set one visible device per process for distributed computing | `false` |
 
 ## Testing & Debugging (Internal/CI)
 
@@ -82,7 +83,7 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_IS_IN_CI` | Indicates if running in CI environment | `false` |
-| `SGLANG_AMD_CI` | Indicates running in AMD CI environment | `0` |
+| `SGLANG_IS_IN_CI_AMD` | Indicates running in AMD CI environment | `0` |
 | `SGLANG_TEST_RETRACT` | Enable retract decode testing | `false` |
 | `SGLANG_RECORD_STEP_TIME` | Record step time for profiling | `false` |
 | `SGLANG_TEST_REQUEST_TIME_STATS` | Test request time statistics | `false` |
@@ -100,4 +101,5 @@ SGLang supports various environment variables that can be used to configure its 
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
+| `SGLANG_WAIT_WEIGHTS_READY_TIMEOUT` | Timeout period for waiting on weights | `120` |
 | `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `true` |

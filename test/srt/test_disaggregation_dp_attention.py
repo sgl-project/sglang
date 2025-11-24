@@ -1,15 +1,13 @@
 import os
-import time
 import unittest
 from types import SimpleNamespace
-from urllib.parse import urlparse
 
+from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     popen_launch_pd_server,
 )
 
@@ -19,8 +17,7 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
 

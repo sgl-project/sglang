@@ -38,17 +38,15 @@ from sglang.srt.layers.dp_attention import (
     get_dp_device,
     get_dp_dtype,
     get_dp_hidden_size,
-    get_global_dp_buffer,
     get_local_attention_dp_size,
-    set_dp_buffer_len,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
@@ -67,7 +65,7 @@ class LogitsProcessorOutput:
     hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
-    # he log probs of output tokens, if RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
+    # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
@@ -137,7 +135,10 @@ class LogitsMetadata:
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
-            forward_batch.forward_mode.is_extend()
+            (
+                forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_split_prefill()
+            )
             and forward_batch.return_logprob
             and not forward_batch.forward_mode.is_target_verify()
         ):
@@ -227,8 +228,8 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
-        self.use_fp32_lm_head = global_server_args_dict["enable_fp32_lm_head"]
+        self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
+        self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -251,8 +252,8 @@ class LogitsProcessor(nn.Module):
         ):
             self.final_logit_softcapping = None
 
-        self.debug_tensor_dump_output_folder = global_server_args_dict.get(
-            "debug_tensor_dump_output_folder", None
+        self.debug_tensor_dump_output_folder = (
+            get_global_server_args().debug_tensor_dump_output_folder
         )
 
     def compute_logprobs_for_multi_item_scoring(
@@ -369,9 +370,7 @@ class LogitsProcessor(nn.Module):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
-        multi_item_delimiter = global_server_args_dict.get(
-            "multi_item_scoring_delimiter"
-        )
+        multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
         if multi_item_delimiter is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
                 input_ids, hidden_states, lm_head, logits_metadata, multi_item_delimiter
@@ -381,6 +380,7 @@ class LogitsProcessor(nn.Module):
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
+            or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:
@@ -389,8 +389,8 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices = None
         elif (
             logits_metadata.forward_mode.is_extend()
-            and not logits_metadata.extend_return_logprob
-        ):
+            or logits_metadata.forward_mode.is_split_prefill()
+        ) and not logits_metadata.extend_return_logprob:
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
@@ -592,6 +592,11 @@ class LogitsProcessor(nn.Module):
                     lm_head.weight,
                     None,  # bias
                     True,  # is_vnni
+                )
+            elif get_global_server_args().rl_on_policy_target == "fsdp":
+                # Due to tie-weight, we may not be able to change lm_head's weight dtype
+                logits = torch.matmul(
+                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
                 logits = torch.matmul(

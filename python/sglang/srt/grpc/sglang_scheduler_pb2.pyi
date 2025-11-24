@@ -320,10 +320,8 @@ class EmbedError(_message.Message):
     def __init__(self, message: _Optional[str] = ..., code: _Optional[str] = ..., details: _Optional[str] = ...) -> None: ...
 
 class HealthCheckRequest(_message.Message):
-    __slots__ = ("tokenized",)
-    TOKENIZED_FIELD_NUMBER: _ClassVar[int]
-    tokenized: TokenizedInput
-    def __init__(self, tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ...) -> None: ...
+    __slots__ = ()
+    def __init__(self) -> None: ...
 
 class HealthCheckResponse(_message.Message):
     __slots__ = ("healthy", "message")

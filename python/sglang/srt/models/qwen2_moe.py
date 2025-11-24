@@ -17,6 +17,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -64,10 +65,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
@@ -156,7 +157,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             layer_id=self.layer_id,
             top_k=config.num_experts_per_tok,
             num_experts=config.num_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            + get_global_server_args().ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -192,7 +193,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
-                config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
+                config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
 
@@ -518,6 +519,7 @@ class Qwen2MoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
@@ -593,7 +595,12 @@ class Qwen2MoeModel(nn.Module):
                         if residual is not None
                         else hidden_states
                     )
-                with get_global_expert_distribution_recorder().with_current_layer(i):
+                ctx = (
+                    nullcontext()
+                    if get_global_server_args().enable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
                     layer = self.layers[i]
                     hidden_states, residual = layer(
                         positions, hidden_states, forward_batch, residual
@@ -643,7 +650,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support

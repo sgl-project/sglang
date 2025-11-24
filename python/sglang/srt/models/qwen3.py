@@ -29,6 +29,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     get_cmo_stream,
@@ -88,8 +89,16 @@ class Qwen3Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        norm_kwargs = (
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
+            )
+            if get_global_server_args().rl_on_policy_target == "fsdp"
+            else {}
+        )
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -158,10 +167,18 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if get_global_server_args().rl_on_policy_target == "fsdp":
+            hidden_states = hidden_states.bfloat16()
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
+
+        if get_global_server_args().rl_on_policy_target == "fsdp":
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -204,9 +221,22 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        norm_kwargs = (
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
+                override_orig_dtype=torch.float32,
+                fp32_residual=True,
+            )
+            if get_global_server_args().rl_on_policy_target == "fsdp"
+            else {}
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(

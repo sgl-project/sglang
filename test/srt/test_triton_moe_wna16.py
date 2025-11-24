@@ -6,6 +6,7 @@ import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 NUM_EXPERTS = [8, 64]
 TOP_KS = [2, 6]
@@ -116,6 +117,8 @@ def quantize_weights(
 
 
 def torch_moe(a, w1, w2, score, topk):
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)

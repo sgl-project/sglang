@@ -77,8 +77,8 @@ class CommonKVManager(BaseKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._register_to_bootstrap()
-            self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
-            self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+            self.transfer_infos = {}
+            self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -201,6 +201,7 @@ class CommonKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]] = None,
     ):
         pass
 
@@ -245,6 +246,7 @@ class CommonKVReceiver(BaseKVReceiver):
                     f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.bootstrap_infos = None
                 return
             else:
                 logger.debug(

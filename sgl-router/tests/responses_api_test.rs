@@ -1,21 +1,20 @@
 // Integration test for Responses API
 
-use sglang_router_rs::protocols::spec::{
-    GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
-    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
-    ToolChoiceValue, Truncation, UsageInfo,
+use axum::http::StatusCode;
+use sglang_router_rs::protocols::{
+    common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
+    responses::{
+        ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
+        ResponsesRequest, ServiceTier, Truncation,
+    },
 };
 
 mod common;
-use common::mock_mcp_server::MockMCPServer;
-use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, HealthCheckConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode,
+use common::{
+    mock_mcp_server::MockMCPServer,
+    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sglang_router_rs::routers::RouterFactory;
-use sglang_router_rs::server::AppContext;
-use std::sync::Arc;
+use sglang_router_rs::{config::RouterConfig, routers::RouterFactory};
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -42,69 +41,44 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     let worker_url = worker.start().await.expect("start worker");
 
     // Build router config (HTTP OpenAI mode)
-    let router_cfg = RouterConfig {
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    // Create router and context
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    // Create router and context with MCP config from file
+    let ctx =
+        common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
         max_output_tokens: Some(64),
         max_tool_calls: None,
         metadata: None,
-        model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: sglang_router_rs::protocols::spec::ServiceTier::Auto,
-        store: true,
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
         temperature: Some(0.2),
-        tool_choice: sglang_router_rs::protocols::spec::ToolChoice::default(),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::default()),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             authorization: None,
@@ -112,15 +86,15 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: None,
-        truncation: sglang_router_rs::protocols::spec::Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_test_mcp_e2e".to_string(),
+        request_id: Some("resp_test_mcp_e2e".to_string()),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: -1,
         min_p: 0.0,
@@ -129,10 +103,10 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     };
 
     let resp = router
-        .route_responses(None, &req, req.model.as_deref())
+        .route_responses(None, &req, Some(req.model.as_str()))
         .await;
 
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
@@ -243,53 +217,27 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 #[tokio::test]
 async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
-    let router_cfg = RouterConfig {
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["http://localhost".to_string()],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 1,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 8,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
     let create_resp = router.create_conversation(None, &create_body).await;
-    assert_eq!(create_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -300,7 +248,7 @@ async fn test_conversations_crud_basic() {
 
     // Get
     let get_resp = router.get_conversation(None, conv_id).await;
-    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(get_resp.status(), StatusCode::OK);
     let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -312,7 +260,7 @@ async fn test_conversations_crud_basic() {
     let upd_resp = router
         .update_conversation(None, conv_id, &update_body)
         .await;
-    assert_eq!(upd_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(upd_resp.status(), StatusCode::OK);
     let upd_bytes = axum::body::to_bytes(upd_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -322,7 +270,7 @@ async fn test_conversations_crud_basic() {
 
     // Delete
     let del_resp = router.delete_conversation(None, conv_id).await;
-    assert_eq!(del_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(del_resp.status(), StatusCode::OK);
     let del_bytes = axum::body::to_bytes(del_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -331,43 +279,43 @@ async fn test_conversations_crud_basic() {
 
     // Get again -> 404
     let not_found = router.get_conversation(None, conv_id).await;
-    assert_eq!(not_found.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
 }
 
 #[test]
 fn test_responses_request_creation() {
     let request = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("Hello, world!".to_string()),
         instructions: Some("Be helpful".to_string()),
         max_output_tokens: Some(100),
         max_tool_calls: None,
         metadata: None,
-        model: Some("test-model".to_string()),
-        parallel_tool_calls: true,
+        model: "test-model".to_string(),
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::Medium),
             summary: None,
         }),
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::WebSearchPreview,
             ..Default::default()
-        }],
-        top_logprobs: 5,
+        }]),
+        top_logprobs: Some(5),
         top_p: Some(0.9),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: Some("test-user".to_string()),
-        request_id: "resp_test123".to_string(),
+        request_id: Some("resp_test123".to_string()),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: -1,
         min_p: 0.0,
@@ -382,67 +330,69 @@ fn test_responses_request_creation() {
 }
 
 #[test]
-fn test_sampling_params_conversion() {
+fn test_responses_request_sglang_extensions() {
+    // Test that SGLang-specific sampling parameters are present and serializable
     let request = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("Test".to_string()),
         instructions: None,
         max_output_tokens: Some(50),
         max_tool_calls: None,
         metadata: None,
-        model: Some("test-model".to_string()),
-        parallel_tool_calls: true, // Use default true
+        model: "test-model".to_string(),
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true, // Use default true
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
         temperature: Some(0.8),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![],
-        top_logprobs: 0, // Use default 0
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![]),
+        top_logprobs: Some(0),
         top_p: Some(0.95),
-        truncation: Truncation::Auto,
+        truncation: Some(Truncation::Auto),
         user: None,
-        request_id: "resp_test456".to_string(),
+        request_id: Some("resp_test456".to_string()),
         priority: 0,
-        frequency_penalty: 0.1,
-        presence_penalty: 0.2,
+        frequency_penalty: Some(0.1),
+        presence_penalty: Some(0.2),
         stop: None,
+        // SGLang-specific extensions:
         top_k: 10,
         min_p: 0.05,
         repetition_penalty: 1.1,
         conversation: None,
     };
 
-    let params = request.to_sampling_params(1000, None);
+    // Verify SGLang extensions are present
+    assert_eq!(request.top_k, 10);
+    assert_eq!(request.min_p, 0.05);
+    assert_eq!(request.repetition_penalty, 1.1);
 
-    // Check that parameters are converted correctly
-    assert!(params.contains_key("temperature"));
-    assert!(params.contains_key("top_p"));
-    assert!(params.contains_key("frequency_penalty"));
-    assert!(params.contains_key("max_new_tokens"));
-}
+    // Verify serialization works with SGLang extensions
+    let json = serde_json::to_string(&request).expect("Serialization should work");
+    let parsed: ResponsesRequest =
+        serde_json::from_str(&json).expect("Deserialization should work");
 
-#[test]
-fn test_responses_response_creation() {
-    let response = ResponsesResponse::new(
-        "resp_test789".to_string(),
-        "test-model".to_string(),
-        ResponseStatus::Completed,
-    );
-
-    assert_eq!(response.id, "resp_test789");
-    assert_eq!(response.model, "test-model");
-    assert!(response.is_complete());
-    assert!(!response.is_in_progress());
-    assert!(!response.is_failed());
+    assert_eq!(parsed.top_k, 10);
+    assert_eq!(parsed.min_p, 0.05);
+    assert_eq!(parsed.repetition_penalty, 1.1);
 }
 
 #[test]
 fn test_usage_conversion() {
-    let usage_info = UsageInfo::new_with_cached(15, 25, Some(8), 3);
+    // Construct UsageInfo directly with cached token details
+    let usage_info = UsageInfo {
+        prompt_tokens: 15,
+        completion_tokens: 25,
+        total_tokens: 40,
+        reasoning_tokens: Some(8),
+        prompt_tokens_details: Some(sglang_router_rs::protocols::common::PromptTokenUsageInfo {
+            cached_tokens: 3,
+        }),
+    };
     let response_usage = usage_info.to_response_usage();
 
     assert_eq!(response_usage.input_tokens, 15);
@@ -492,37 +442,37 @@ fn test_reasoning_param_default() {
 #[test]
 fn test_json_serialization() {
     let request = ResponsesRequest {
-        background: true,
+        background: Some(true),
         include: None,
         input: ResponseInput::Text("Test input".to_string()),
         instructions: Some("Test instructions".to_string()),
         max_output_tokens: Some(200),
         max_tool_calls: Some(5),
         metadata: None,
-        model: Some("gpt-4".to_string()),
-        parallel_tool_calls: false,
+        model: "gpt-4".to_string(),
+        parallel_tool_calls: Some(false),
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::High),
             summary: None,
         }),
-        service_tier: ServiceTier::Priority,
-        store: false,
-        stream: true,
+        service_tier: Some(ServiceTier::Priority),
+        store: Some(false),
+        stream: Some(true),
         temperature: Some(0.9),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Required),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::CodeInterpreter,
             ..Default::default()
-        }],
-        top_logprobs: 10,
+        }]),
+        top_logprobs: Some(10),
         top_p: Some(0.8),
-        truncation: Truncation::Auto,
+        truncation: Some(Truncation::Auto),
         user: Some("test_user".to_string()),
-        request_id: "resp_comprehensive_test".to_string(),
+        request_id: Some("resp_comprehensive_test".to_string()),
         priority: 1,
-        frequency_penalty: 0.3,
-        presence_penalty: 0.4,
+        frequency_penalty: Some(0.3),
+        presence_penalty: Some(0.4),
         stop: None,
         top_k: 50,
         min_p: 0.1,
@@ -534,11 +484,14 @@ fn test_json_serialization() {
     let parsed: ResponsesRequest =
         serde_json::from_str(&json).expect("Deserialization should work");
 
-    assert_eq!(parsed.request_id, "resp_comprehensive_test");
-    assert_eq!(parsed.model, Some("gpt-4".to_string()));
-    assert!(parsed.background);
-    assert!(parsed.stream);
-    assert_eq!(parsed.tools.len(), 1);
+    assert_eq!(
+        parsed.request_id,
+        Some("resp_comprehensive_test".to_string())
+    );
+    assert_eq!(parsed.model, "gpt-4");
+    assert_eq!(parsed.background, Some(true));
+    assert_eq!(parsed.stream, Some(true));
+    assert_eq!(parsed.tools.as_ref().map(|t| t.len()), Some(1));
 }
 
 #[tokio::test]
@@ -574,83 +527,57 @@ async fn test_multi_turn_loop_with_mcp() {
     let worker_url = worker.start().await.expect("start worker");
 
     // Build router config
-    let router_cfg = RouterConfig {
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("info".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("info")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("search for SGLang".to_string()),
         instructions: Some("Be helpful".to_string()),
         max_output_tokens: Some(128),
         max_tool_calls: None, // No limit - test unlimited
         metadata: None,
-        model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             server_label: Some("mock".to_string()),
             server_description: Some("Mock MCP server for testing".to_string()),
             require_approval: Some("never".to_string()),
             ..Default::default()
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: Some(1.0),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_multi_turn_test".to_string(),
+        request_id: Some("resp_multi_turn_test".to_string()),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: 50,
         min_p: 0.0,
@@ -662,11 +589,7 @@ async fn test_multi_turn_loop_with_mcp() {
     let response = router.route_responses(None, &req, None).await;
 
     // Check status
-    assert_eq!(
-        response.status(),
-        axum::http::StatusCode::OK,
-        "Request should succeed"
-    );
+    assert_eq!(response.status(), StatusCode::OK, "Request should succeed");
 
     // Read the response body
     use axum::body::to_bytes;
@@ -755,80 +678,54 @@ async fn test_max_tool_calls_limit() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig {
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("info".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("info")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("test max calls".to_string()),
         instructions: None,
         max_output_tokens: Some(128),
         max_tool_calls: Some(1), // Limit to 1 call
         metadata: None,
-        model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: false,
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(false),
+        stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             server_label: Some("mock".to_string()),
             ..Default::default()
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: Some(1.0),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_max_calls_test".to_string(),
+        request_id: Some("resp_max_calls_test".to_string()),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: 50,
         min_p: 0.0,
@@ -837,7 +734,7 @@ async fn test_max_tool_calls_limit() {
     };
 
     let response = router.route_responses(None, &req, None).await;
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
 
     use axum::body::to_bytes;
     let response_body = response.into_body();
@@ -898,48 +795,23 @@ async fn setup_streaming_mcp_test() -> (
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig {
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("info".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("info")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx =
+        common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
 }
@@ -993,38 +865,38 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     // Build streaming request with MCP tools
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("search for something interesting".to_string()),
         instructions: Some("Use tools when needed".to_string()),
         max_output_tokens: Some(256),
         max_tool_calls: Some(3),
         metadata: None,
-        model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: true, // KEY: Enable streaming
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(true), // KEY: Enable streaming
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             server_label: Some("mock".to_string()),
             server_description: Some("Mock MCP for streaming test".to_string()),
             require_approval: Some("never".to_string()),
             ..Default::default()
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: Some(1.0),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_streaming_mcp_test".to_string(),
+        request_id: Some("resp_streaming_mcp_test".to_string()),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: 50,
         min_p: 0.0,
@@ -1037,7 +909,7 @@ async fn test_streaming_with_mcp_tool_calls() {
     // Verify streaming response
     assert_eq!(
         response.status(),
-        axum::http::StatusCode::OK,
+        StatusCode::OK,
         "Streaming request should succeed"
     );
 
@@ -1274,36 +1146,36 @@ async fn test_streaming_multi_turn_with_mcp() {
     let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
 
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("complex query requiring multiple tool calls".to_string()),
         instructions: Some("Be thorough".to_string()),
         max_output_tokens: Some(512),
         max_tool_calls: Some(5), // Allow multiple rounds
         metadata: None,
-        model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: true,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(true),
         temperature: Some(0.8),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             server_label: Some("mock".to_string()),
             ..Default::default()
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: Some(1.0),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_streaming_multiturn_test".to_string(),
+        request_id: Some("resp_streaming_multiturn_test".to_string()),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: 50,
         min_p: 0.0,
@@ -1312,7 +1184,7 @@ async fn test_streaming_multi_turn_with_mcp() {
     };
 
     let response = router.route_responses(None, &req, None).await;
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
 
     use axum::body::to_bytes;
     let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -1335,4 +1207,390 @@ async fn test_streaming_multi_turn_with_mcp() {
 
     worker.stop().await;
     mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_conversation_items_create_and_get() {
+    // Test creating items and getting a specific item
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx = common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = router.create_conversation(None, &create_conv).await;
+    assert_eq!(conv_resp.status(), StatusCode::OK);
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Create items
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi there!"}]
+            }
+        ]
+    });
+
+    let items_resp = router
+        .create_conversation_items(None, conv_id, &create_items)
+        .await;
+    assert_eq!(items_resp.status(), StatusCode::OK);
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_json: serde_json::Value = serde_json::from_slice(&items_bytes).unwrap();
+
+    // Verify response structure
+    assert_eq!(items_json["object"], "list");
+    assert!(items_json["data"].is_array());
+
+    // Get first item
+    let item_id = items_json["data"][0]["id"].as_str().unwrap();
+    let get_resp = router
+        .get_conversation_item(None, conv_id, item_id, None)
+        .await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_bytes).unwrap();
+
+    // Verify item structure
+    assert_eq!(get_json["id"], item_id);
+    assert_eq!(get_json["type"], "message");
+    assert_eq!(get_json["role"], "user");
+}
+
+#[tokio::test]
+async fn test_conversation_items_delete() {
+    // Test deleting an item from a conversation
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx = common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Create item
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Test"}]
+            }
+        ]
+    });
+
+    let items_resp = router
+        .create_conversation_items(None, conv_id, &create_items)
+        .await;
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_json: serde_json::Value = serde_json::from_slice(&items_bytes).unwrap();
+    let item_id = items_json["data"][0]["id"].as_str().unwrap();
+
+    // List items (should have 1)
+    let list_resp = router
+        .list_conversation_items(None, conv_id, None, None, None)
+        .await;
+    let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+    assert_eq!(list_json["data"].as_array().unwrap().len(), 1);
+
+    // Delete item
+    let del_resp = router
+        .delete_conversation_item(None, conv_id, item_id)
+        .await;
+    assert_eq!(del_resp.status(), StatusCode::OK);
+
+    // List items again (should have 0)
+    let list_resp2 = router
+        .list_conversation_items(None, conv_id, None, None, None)
+        .await;
+    let list_bytes2 = axum::body::to_bytes(list_resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json2: serde_json::Value = serde_json::from_slice(&list_bytes2).unwrap();
+    assert_eq!(list_json2["data"].as_array().unwrap().len(), 0);
+
+    // Item should NOT be gettable from this conversation after deletion (link removed)
+    let get_resp = router
+        .get_conversation_item(None, conv_id, item_id, None)
+        .await;
+    assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_conversation_items_max_limit() {
+    // Test that creating > 20 items returns error
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx = common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Try to create 21 items (over limit)
+    let mut items = Vec::new();
+    for i in 0..21 {
+        items.push(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": format!("Message {}", i)}]
+        }));
+    }
+    let create_items = serde_json::json!({ "items": items });
+
+    let items_resp = router
+        .create_conversation_items(None, conv_id, &create_items)
+        .await;
+    assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
+
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_text = String::from_utf8_lossy(&items_bytes);
+    assert!(items_text.contains("Cannot add more than 20 items"));
+}
+
+#[tokio::test]
+async fn test_conversation_items_unsupported_type() {
+    // Test that unsupported item types return error
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx = common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Try to create item with completely unsupported type
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "totally_invalid_type",
+                "content": []
+            }
+        ]
+    });
+
+    let items_resp = router
+        .create_conversation_items(None, conv_id, &create_items)
+        .await;
+    assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
+
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_text = String::from_utf8_lossy(&items_bytes);
+    assert!(items_text.contains("Unsupported item type"));
+}
+
+#[tokio::test]
+async fn test_conversation_items_multi_conversation_sharing() {
+    // Test that items can be shared across conversations via soft delete
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx = common::create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create two conversations
+    let conv_a_resp = router
+        .create_conversation(None, &serde_json::json!({}))
+        .await;
+    let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_a_json: serde_json::Value = serde_json::from_slice(&conv_a_bytes).unwrap();
+    let conv_a_id = conv_a_json["id"].as_str().unwrap();
+
+    let conv_b_resp = router
+        .create_conversation(None, &serde_json::json!({}))
+        .await;
+    let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_b_json: serde_json::Value = serde_json::from_slice(&conv_b_bytes).unwrap();
+    let conv_b_id = conv_b_json["id"].as_str().unwrap();
+
+    // Create item in conversation A
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Shared message"}]
+            }
+        ]
+    });
+
+    let items_a_resp = router
+        .create_conversation_items(None, conv_a_id, &create_items)
+        .await;
+    let items_a_bytes = axum::body::to_bytes(items_a_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_a_json: serde_json::Value = serde_json::from_slice(&items_a_bytes).unwrap();
+    let item_id = items_a_json["data"][0]["id"].as_str().unwrap();
+
+    // Reference the same item in conversation B
+    let reference_items = serde_json::json!({
+        "items": [
+            {
+                "type": "item_reference",
+                "id": item_id
+            }
+        ]
+    });
+
+    let items_b_resp = router
+        .create_conversation_items(None, conv_b_id, &reference_items)
+        .await;
+    assert_eq!(items_b_resp.status(), StatusCode::OK);
+
+    // Verify item appears in both conversations
+    let list_a = router
+        .list_conversation_items(None, conv_a_id, None, None, None)
+        .await;
+    let list_a_bytes = axum::body::to_bytes(list_a.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_a_json: serde_json::Value = serde_json::from_slice(&list_a_bytes).unwrap();
+    assert_eq!(list_a_json["data"].as_array().unwrap().len(), 1);
+
+    let list_b = router
+        .list_conversation_items(None, conv_b_id, None, None, None)
+        .await;
+    let list_b_bytes = axum::body::to_bytes(list_b.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_b_json: serde_json::Value = serde_json::from_slice(&list_b_bytes).unwrap();
+    assert_eq!(list_b_json["data"].as_array().unwrap().len(), 1);
+
+    // Delete from conversation A
+    router
+        .delete_conversation_item(None, conv_a_id, item_id)
+        .await;
+
+    // Should be removed from A
+    let list_a2 = router
+        .list_conversation_items(None, conv_a_id, None, None, None)
+        .await;
+    let list_a2_bytes = axum::body::to_bytes(list_a2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_a2_json: serde_json::Value = serde_json::from_slice(&list_a2_bytes).unwrap();
+    assert_eq!(list_a2_json["data"].as_array().unwrap().len(), 0);
+
+    // Should still exist in B (soft delete)
+    let list_b2 = router
+        .list_conversation_items(None, conv_b_id, None, None, None)
+        .await;
+    let list_b2_bytes = axum::body::to_bytes(list_b2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_b2_json: serde_json::Value = serde_json::from_slice(&list_b2_bytes).unwrap();
+    assert_eq!(list_b2_json["data"].as_array().unwrap().len(), 1);
+
+    // Item should still be directly gettable
+    let get_resp = router
+        .get_conversation_item(None, conv_b_id, item_id, None)
+        .await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
 }

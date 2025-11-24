@@ -290,6 +290,9 @@ def aggregate_results(
     htmls = []
     convos = []
     for single_eval_result in single_eval_results:
+        # Skip None results
+        if single_eval_result is None:
+            continue
         for name, value in single_eval_result.metrics.items():
             name2values[name].append(value)
         if single_eval_result.score is not None:

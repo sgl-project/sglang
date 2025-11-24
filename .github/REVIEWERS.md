@@ -15,6 +15,7 @@ Here are some reviewers for common areas. You can ping them to review your code 
 - flash attention backend @hebiao064
 - flashinfer attention backend @Fridge003
 - moe kernel @BBuf @fzyzcjy @ch-wan @Alcanderian
+- quantization @FlamingoPg @HandH1998
 
 ## Scheduler and memory pool
 - general @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann

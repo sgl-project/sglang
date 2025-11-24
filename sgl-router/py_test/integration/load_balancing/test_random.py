@@ -1,5 +1,4 @@
 import collections
-import math
 
 import pytest
 import requests

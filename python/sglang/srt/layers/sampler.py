@@ -11,8 +11,8 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
 
 if is_cuda():
@@ -27,13 +27,13 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
+SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
+        self.use_nan_detection = get_global_server_args().enable_nan_detection
         self.tp_sync_group = get_tp_group().device_group
 
         if is_dp_attention_enabled():
@@ -91,11 +91,24 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-
         else:
+            can_sample_directly_from_probs = (
+                not sampling_info.need_top_p_sampling
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_min_p_sampling
+            )
+
             # If requested, cache probabilities from original logits before temperature scaling.
-            if return_logprob and RETURN_ORIGINAL_LOGPROB:
+            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
+
+            if get_global_server_args().rl_on_policy_target == "fsdp":
+                logits_div_temperature = (
+                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
+                )
+                logprobs_via_logsoftmax_kernel = torch.log_softmax(
+                    logits_div_temperature, dim=-1
+                )
 
             # Post process logits
             logits.div_(sampling_info.temperatures)
@@ -103,8 +116,15 @@ class Sampler(nn.Module):
             probs = logits
             del logits
 
-            if True:  # Keep this redundant check to simplify some internal code sync
-                if global_server_args_dict["sampling_backend"] == "flashinfer":
+            if can_sample_directly_from_probs:
+                # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
+                batch_next_token_ids = sampling_from_probs_torch(
+                    probs,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
+            else:
+                if get_global_server_args().sampling_backend == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -119,7 +139,7 @@ class Sampler(nn.Module):
                             filter_apply_order="joint",
                             check_nan=self.use_nan_detection,
                         )
-                elif global_server_args_dict["sampling_backend"] == "pytorch":
+                elif get_global_server_args().sampling_backend == "pytorch":
                     # A slower fallback implementation with torch native operations.
                     batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                         probs,
@@ -132,12 +152,15 @@ class Sampler(nn.Module):
                     )
                 else:
                     raise ValueError(
-                        f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
+                        f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
                     )
 
             if return_logprob:
+                if get_global_server_args().rl_on_policy_target == "fsdp":
+                    logprobs = logprobs_via_logsoftmax_kernel
+                    del logprobs_via_logsoftmax_kernel
                 # clamp to avoid -inf
-                if RETURN_ORIGINAL_LOGPROB:
+                elif SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = torch.log(probs_without_temp_scaling).clamp(
                         min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )
@@ -288,21 +311,29 @@ def multinomial_with_seed(
     """
     n, m = inputs.shape
     col_indices = torch.arange(m, device=inputs.device).unsqueeze(0)
-    step_seed = seed * 19349663 ^ positions * 73856093
+    step_seed = (seed * 19349663) ^ (positions * 73856093)
     seed_expanded = step_seed.unsqueeze(-1)
-    hashed = seed_expanded * 8589934591 ^ col_indices * 479001599
+    hashed = (seed_expanded * 8589934591) ^ (col_indices * 479001599)
     uniform_samples = (hashed % (2**24)).float() / (2**24)
-    epsilon = 1e-9
-    gumbel_noise = -torch.log(-torch.log(uniform_samples + epsilon) + epsilon)
+    epsilon = 1e-10
+    uniform_samples = uniform_samples.clamp(epsilon, 1.0 - epsilon)
+    gumbel_noise = -torch.log(-torch.log(uniform_samples))
     log_probs = torch.log(inputs + epsilon)
     perturbed_log_probs = log_probs + gumbel_noise
     return torch.argmax(perturbed_log_probs, dim=1, keepdim=True)
 
 
-def sampling_from_probs_torch(probs: torch.Tensor):
+def sampling_from_probs_torch(
+    probs: torch.Tensor,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+):
     """A sampling implementation with native pytorch operations, without
     top-k, top-p, or min-p filtering."""
-    sampled_index = torch.multinomial(probs, num_samples=1)
+    if sampling_seed is not None:
+        sampled_index = multinomial_with_seed(probs, sampling_seed, positions)
+    else:
+        sampled_index = torch.multinomial(probs, num_samples=1)
     batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
     return batch_next_token_ids
 

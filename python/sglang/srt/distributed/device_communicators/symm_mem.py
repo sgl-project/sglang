@@ -9,7 +9,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
-from sglang.srt.utils import get_device_capability, is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 try:
     import torch.distributed._symmetric_memory as torch_symm_mem

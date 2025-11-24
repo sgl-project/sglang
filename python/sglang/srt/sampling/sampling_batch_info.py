@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -10,6 +9,7 @@ import torch
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -67,15 +67,9 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
 
     @classmethod
-    def _get_global_server_args_dict(cls):
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-        return global_server_args_dict
-
-    @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args_dict = cls._get_global_server_args_dict()
-        enable_deterministic = global_server_args_dict["enable_deterministic_inference"]
+        global_server_args = get_global_server_args()
+        enable_deterministic = global_server_args.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
@@ -112,10 +106,9 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = global_server_args_dict[
-            "enable_custom_logit_processor"
-        ] and any(  # check the flag first.
-            r.custom_logit_processor for r in reqs
+        has_custom_logit_processor = (
+            global_server_args.enable_custom_logit_processor
+            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
 
         if has_custom_logit_processor:

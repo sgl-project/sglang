@@ -5,9 +5,7 @@ These tests focus on testing the argument parsing logic in isolation,
 without starting actual router instances.
 """
 
-import argparse
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 from sglang_router.launch_router import RouterArgs, parse_router_args

@@ -4,6 +4,7 @@ Usage:
     python3 -m pytest test/srt/hicache/test_hicache_storage_e2e.py -v
 """
 
+import json
 import os
 import random
 import tempfile
@@ -70,6 +71,9 @@ class HiCacheStorageBaseMixin:
     @classmethod
     def _get_base_server_args(cls):
         """Get base server arguments - can be extended in subclasses"""
+        extra_config = {
+            "hicache_storage_pass_prefix_keys": True,
+        }
         return {
             "--enable-hierarchical-cache": True,
             "--mem-fraction-static": 0.6,
@@ -78,6 +82,7 @@ class HiCacheStorageBaseMixin:
             "--enable-cache-report": True,
             "--hicache-storage-prefetch-policy": "wait_complete",
             "--hicache-storage-backend": "file",
+            "--hicache-storage-backend-extra-config": json.dumps(extra_config),
         }
 
     @classmethod
