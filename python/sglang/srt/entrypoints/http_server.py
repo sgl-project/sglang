@@ -90,6 +90,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    CheckWeightReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -953,13 +954,10 @@ async def resume_memory_occupation(
     except Exception as e:
         return _create_error_response(e)
 
-@app.api_route("/weight_checker", methods=["POST"])
-async def weight_checker(
-    obj: ResumeMemoryOccupationReqInput, request: Request
-):
-    """Resume GPU memory occupation."""
+@app.api_route("/check_weight", methods=["POST"])
+async def check_weight(obj: CheckWeightReqInput, request: Request):
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        await _global_state.tokenizer_manager.check_weight(obj, request)
     except Exception as e:
         return _create_error_response(e)
 
