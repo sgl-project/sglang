@@ -460,7 +460,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
-ARG GDRCOPY_VERSION
+ARG GDRCOPY_VERSION=2.5.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -538,7 +538,7 @@ COPY --from=framework /sgl-workspace /sgl-workspace
 # Copy GDRCopy runtime libraries (but not the build artifacts)
 COPY --from=framework /usr/lib/libgdrapi.so* /usr/lib/
 COPY --from=framework /usr/bin/gdrcopy_* /usr/bin/
-COPY --from=framework ${GDRCOPY_HOME} ${GDRCOPY_HOME}
+COPY --from=framework /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 
 # Copy essential binaries
 COPY --from=framework /usr/local/bin/diff-so-fancy /usr/local/bin/
