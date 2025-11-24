@@ -202,6 +202,7 @@ if _is_cuda:
         dsv3_router_gemm,
         merge_state_v2,
     )
+    from sgl_kernel.quantization import ggml_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -699,7 +700,11 @@ class DeepseekV2MoE(nn.Module):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
-            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if (quant_config is None or quant_config.get_name() == "gguf")
+                else None
+            ),
         )
 
         self.shared_experts_is_int8 = False
@@ -729,6 +734,7 @@ class DeepseekV2MoE(nn.Module):
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
+                "gguf",
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
@@ -1231,6 +1237,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        self.quant_config = quant_config
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -1400,7 +1407,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+            in {"awq", "awq_marlin", "moe_wna16", "gguf"}
         )
         self.use_min_latency_fused_a_gemm = (
             has_fused_proj
@@ -3163,6 +3170,7 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
             )
         else:
@@ -3538,7 +3546,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         layer_id = int(name.split(".")[2])
                         if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
-
         for layer_id in layer_ids:
             self_attn = (
                 self.model.layers[layer_id].self_attn
@@ -3546,8 +3553,25 @@ class DeepseekV2ForCausalLM(nn.Module):
                 else self.model.decoder.self_attn
             )
             if hasattr(self_attn.kv_b_proj, "qweight"):
+                # GGUF compatible
+                if self.quant_config.get_name() == "gguf":
+                    import gguf
+
+                    block_size, type_size = gguf.GGML_QUANT_SIZES[
+                        self_attn.kv_b_proj.qweight_type.weight_type
+                    ]
+                    shape = (
+                        self_attn.kv_b_proj.qweight.shape[0],
+                        self_attn.kv_b_proj.qweight.shape[1] // type_size * block_size,
+                    )
+                    w = ggml_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.qweight_type.weight_type,
+                        *shape,
+                        self.config.dtype,
+                    )
                 # AWQ compatible
-                if _is_cuda or _is_hip or _is_npu:
+                elif _is_cuda or _is_hip or _is_npu:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
@@ -3663,7 +3687,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-
             if (
                 _use_aiter_gfx95
                 and self.quant_config is not None
@@ -3791,7 +3814,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -3997,15 +4019,22 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
                                 cat_dim = 0
-                                if self.quant_config is not None and (
-                                    self.quant_config.get_name() == "awq"
-                                    or self.quant_config.get_name() == "awq_marlin"
-                                    or self.quant_config.get_name() == "moe_wna16"
+                                if (
+                                    self.quant_config is not None
+                                    and (self.quant_config.get_name() == "gguf")
+                                    and (q_a_proj_name.endswith(".qweight_type"))
                                 ):
-                                    cat_dim = 1
-                                fused_weight = torch.cat(
-                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                )
+                                    fused_weight = q_a_proj_weight
+                                else:
+                                    if self.quant_config is not None and (
+                                        self.quant_config.get_name() == "awq"
+                                        or self.quant_config.get_name() == "awq_marlin"
+                                        or self.quant_config.get_name() == "moe_wna16"
+                                    ):
+                                        cat_dim = 1
+                                    fused_weight = torch.cat(
+                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                                    )
                                 param_name = (
                                     name.replace(
                                         "q_a_proj", "fused_qkv_a_proj_with_mqa"

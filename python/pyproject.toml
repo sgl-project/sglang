@@ -28,7 +28,7 @@ dependencies = [
   "fastapi",
   "flashinfer_python==0.5.2", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.5.2",
-  "gguf",
+  "gguf @ git+https://github.com/ggml-org/llama.cpp.git@2376b7758c58b0ede05de382bf72bb538f11ef9a#subdirectory=gguf-py",
   "hf_transfer",
   "huggingface_hub",
   "interegular",

@@ -412,6 +412,10 @@ def npu_fused_moe_without_routing_weights_bf16(
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+    # GGUF compatible
+    if quant_config is not None and quant_config.get_name() == "gguf":
+        return FusedMoE
+
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
 

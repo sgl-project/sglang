@@ -535,8 +535,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int type, SymInt row, SymInt tokens) -> Tensor");
   m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
 
-  m.def("ggml_moe_get_block_size(int type) -> int");
-  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+  m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
   /*
    * From csrc/mamba

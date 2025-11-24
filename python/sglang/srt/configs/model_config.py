@@ -89,6 +89,7 @@ class ModelConfig:
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
+        hf_config_path: Optional[str] = None,
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
@@ -101,6 +102,7 @@ class ModelConfig:
     ) -> None:
         # Parse args
         self.model_path = model_path
+        self.hf_config_path = hf_config_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
@@ -118,7 +120,7 @@ class ModelConfig:
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
         self.hf_config = get_config(
-            self.model_path,
+            self.hf_config_path or self.model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
@@ -231,6 +233,7 @@ class ModelConfig:
     ):
         return ModelConfig(
             model_path=model_path or server_args.model_path,
+            hf_config_path=server_args.hf_config_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
