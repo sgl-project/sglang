@@ -47,6 +47,10 @@ class WeightChecker:
         yield from self._model_runner.model.named_parameters()
 
 
+def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict[str, torch.Tensor]):
+    TODO
+
+
 def _random_like(t: torch.Tensor):
     device = t.device
     shape = t.shape
