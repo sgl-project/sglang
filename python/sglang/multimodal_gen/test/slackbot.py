@@ -1,6 +1,7 @@
 import logging
 import os
 import tempfile
+from datetime import datetime
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -43,10 +44,7 @@ def upload_file_to_slack(
             uploads.insert(0, {"file": origin_file_path, "title": "Original Image"})
 
         message = (
-            f"*GitHub Run ID:* {run_id}\n"
-            f"*Case ID:* `{case_id}`\n"
-            f"*Model:* `{model}`\n"
-            f"*Prompt:* {prompt}"
+            f"*Case ID:* `{case_id}`\n" f"*Model:* `{model}`\n" f"*Prompt:* {prompt}"
         )
 
         client = WebClient(token=token)
@@ -54,13 +52,26 @@ def upload_file_to_slack(
         thread_ts = None
 
         try:
-            history = client.conversations_history(channel=channel_id, limit=10)
+            history = client.conversations_history(channel=channel_id, limit=100)
             for msg in history.get("messages", []):
                 if f"*GitHub Run ID:* {run_id}" in msg.get("text", ""):
-                    thread_ts = msg.get("ts")
+                    # Use thread_ts if it exists (msg is a reply), otherwise use ts (msg is a parent)
+                    thread_ts = msg.get("thread_ts") or msg.get("ts")
+                    print(f"Found thread_ts: {thread_ts}", flush=True)
                     break
         except Exception as e:
             logger.warning(f"Failed to search slack history: {e}")
+
+        if not thread_ts:
+            try:
+                date_str = datetime.now().strftime("%d/%m")
+                parent_msg = (
+                    f"*For nightly test of {date_str}*\n*GitHub Run ID:* {run_id}"
+                )
+                response = client.chat_postMessage(channel=channel_id, text=parent_msg)
+                thread_ts = response["ts"]
+            except Exception as e:
+                logger.warning(f"Failed to create parent thread: {e}")
 
         client.files_upload_v2(
             channel=channel_id,
