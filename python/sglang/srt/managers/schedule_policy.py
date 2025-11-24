@@ -103,12 +103,7 @@ class SchedulePolicy:
         self.sel_waiting_time_ratio = sel_waiting_time_ratio
 
         # It is used to find the matching prefix for in-batch prefix caching.
-        self.waiting_queue_radix_tree = RadixCache(
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=None,
-            page_size=1,
-            disable=False,
-        )
+        self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(self, waiting_queue: List[Req]) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
@@ -637,7 +632,7 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 prefix_len = len(req.prefix_indices)
-                req.last_matched_prefix_len = prefix_len
+                req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -738,7 +733,7 @@ class PrefillAdder:
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
                 self.rem_total_token_offset -= (
-                    self._get_running_request_total_token_offset(req)
+                    self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1
                 self.running_batch.release_req(
