@@ -94,7 +94,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         ctx.cleanup()
 
 
-class DiffusionPerformanceBase:
+class DiffusionServerBase:
     """Performance tests for all diffusion models/scenarios.
 
     This single test class runs against all cases defined in ONE_GPU_CASES.

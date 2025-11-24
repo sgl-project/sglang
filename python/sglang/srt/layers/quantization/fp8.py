@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
@@ -261,6 +262,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
+        layer.executed_weight_requant_ue8m0 = False
 
         # WEIGHT
         weight_dtype = (
@@ -347,7 +349,34 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 return
             else:
+                # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    deepgemm_w8a8_block_fp8_linear_with_fallback,
+                )
+                from sglang.srt.model_loader.utils import (
+                    should_deepgemm_weight_requant_ue8m0,
+                )
+
+                if (
+                    should_deepgemm_weight_requant_ue8m0(
+                        weight_block_size=getattr(
+                            self.quant_config, "weight_block_size", None
+                        ),
+                    )
+                    and (
+                        self.w8a8_block_fp8_linear
+                        is deepgemm_w8a8_block_fp8_linear_with_fallback
+                    )
+                    and (not layer.executed_weight_requant_ue8m0)
+                ):
+                    requant_weight_ue8m0_inplace(
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        self.quant_config.weight_block_size,
+                    )
+                    layer.executed_weight_requant_ue8m0 = True
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
         else:
