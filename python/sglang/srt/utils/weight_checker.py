@@ -75,8 +75,7 @@ def _check_tensors(
 
     logger.info(f"[check_tensors] passed: {good_names}")
     if len(error_messages) > 0:
-        msg = f"check tensor equality failed:\n" + "\n".join(error_messages)
-        raise Exception(msg)
+        raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
 def _random_like(t: torch.Tensor):

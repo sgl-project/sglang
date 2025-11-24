@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -172,6 +173,8 @@ class SchedulerUpdateWeightsMixin:
             self.tp_worker.model_runner.check_weights(action=recv_req.action)
             return CheckWeightsReqOutput(success=True, message="Success.")
         except Exception as e:
+            logger.warning(f"check_weights see error: {e}")
+            traceback.print_stack()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
     def save_remote_model(self: Scheduler, params):
