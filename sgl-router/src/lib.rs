@@ -7,6 +7,7 @@ pub mod data_connector;
 pub mod grpc_client;
 pub mod mcp;
 pub mod metrics;
+pub mod otel_trace;
 pub mod middleware;
 pub mod policies;
 pub mod protocols;

@@ -194,6 +194,7 @@ impl<B> MakeSpan<B> for RequestSpan {
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
         info_span!(
+            target: "sglang_router_rs::otel-trace",
             "http_request",
             method = %request.method(),
             uri = %request.uri(),

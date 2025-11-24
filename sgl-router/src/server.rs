@@ -31,6 +31,7 @@ use crate::{
     },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
+    otel_trace,
     middleware::{self, AuthConfig, QueuedRequest},
     protocols::{
         chat::ChatCompletionRequest,
@@ -696,6 +697,10 @@ pub fn build_app(
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+    if let Some(trace_config) = &config.router_config.trace_config {
+        otel_trace::otel_tracing_init(trace_config.enable_trace, Some(&trace_config.otlp_traces_endpoint))?;
+    }
+
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
         Some(logging::init_logging(LoggingConfig {
             level: config
@@ -714,7 +719,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             colorize: true,
             log_file_name: "sgl-router".to_string(),
             log_targets: None,
-        }))
+        }, config.router_config.trace_config.clone()))
     } else {
         None
     };

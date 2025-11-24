@@ -1,5 +1,7 @@
 use super::*;
 use crate::core::ConnectionMode;
+use std::net::Ipv4Addr;
+use std::str::FromStr;
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -16,6 +18,10 @@ impl ConfigValidator {
 
         if let Some(metrics) = &config.metrics {
             Self::validate_metrics(metrics)?;
+        }
+
+        if let Some(trace_config) = &config.trace_config {
+            Self::validate_trace(trace_config)?;
         }
 
         Self::validate_compatibility(config)?;
@@ -353,6 +359,52 @@ impl ConfigValidator {
                 reason: "Host cannot be empty".to_string(),
             });
         }
+
+        Ok(())
+    }
+
+    fn validate_trace(trace_config: &TraceConfig) -> ConfigResult<()> {
+        if !trace_config.enable_trace {
+            return Ok(());
+        }
+
+        let endpoint = &trace_config.otlp_traces_endpoint;
+
+        // split endpoint into host and port
+        let parts: Vec<&str> = endpoint.split(':').collect();
+        if parts.len() != 2 {
+            return Err(ConfigError::InvalidValue {
+                field: "trace_config.otlp_traces_endpoint".to_string(),
+                value: endpoint.clone(),
+                reason: "expected format <host>:<port>, e.g., localhost:4317 or 127.0.0.1:4317".to_string(),
+            });
+        }
+
+        let host = parts[0];
+        let port_str = parts[1];
+
+        // check host: must be "localhost" or valid IPv4 address
+        if host != "localhost" {
+            if Ipv4Addr::from_str(host).is_err() {
+                return Err(ConfigError::InvalidValue {
+                    field: "trace_config.otlp_traces_endpoint".to_string(),
+                    value: endpoint.clone(),
+                    reason: "host must be 'localhost' or a valid IPv4 address (e.g., 127.0.0.1)".to_string(),
+                });
+            }
+        }
+
+        // check port: must be 1~65535
+        let _port: u16 = match port_str.parse() {
+            Ok(p) if p > 0 => p,
+            _ => {
+                return Err(ConfigError::InvalidValue {
+                    field: "trace_config.otlp_traces_endpoint".to_string(),
+                    value: endpoint.clone(),
+                    reason: "port must be a number between 1 and 65535".to_string(),
+                });
+            }
+        };
 
         Ok(())
     }

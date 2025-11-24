@@ -14,6 +14,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
+use super::events::{self, Event};
 
 use crate::{
     config::types::RetryConfig,
@@ -33,6 +34,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{header_utils, RouterTrait},
+    otel_trace::inject_trace_context_http,
 };
 
 /// Regular router that uses injected load balancing policies
@@ -210,6 +212,13 @@ impl Router {
                     None
                 };
 
+                events::RequestSentEvent{url: worker.url().to_string()}.emit();
+                let mut headers_with_trace = headers.cloned().unwrap_or_default();
+                let headers = match inject_trace_context_http(&mut headers_with_trace) {
+                    Ok(()) => Some(&headers_with_trace),
+                    Err(_) => headers,
+                };
+
                 let response = self
                     .send_typed_request(
                         headers,
@@ -220,6 +229,8 @@ impl Router {
                         load_incremented,
                     )
                     .await;
+
+                events::RequestReceivedEvent{}.emit();
 
                 worker.record_outcome(response.status().is_success());
 
