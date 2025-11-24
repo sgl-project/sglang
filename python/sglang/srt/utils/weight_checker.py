@@ -4,6 +4,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
@@ -22,8 +23,7 @@ class WeightChecker:
 
     def _snapshot(self):
         self._snapshot_tensors = [
-            (name, param.data.detach().cpu())
-            for name, param in self._model_state()
+            (name, param.data.detach().cpu()) for name, param in self._model_state()
         ]
 
     def _reset_param(self):
@@ -37,6 +37,7 @@ class WeightChecker:
     def _model_state(self):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
         yield from self._model_runner.model.named_parameters()
+
 
 def _random_like(t: torch.Tensor):
     device = t.device
@@ -56,7 +57,8 @@ def _random_like(t: torch.Tensor):
         info = torch.iinfo(dtype)
         low = int(info.min)
         high = int(info.max)
-        return torch.randint(low=low, high=high, size=shape, device=device, dtype=torch.int64)
+        return torch.randint(
+            low=low, high=high, size=shape, device=device, dtype=torch.int64
+        )
 
     raise TypeError(f"unsupported dtype: {dtype}")
-
