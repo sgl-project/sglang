@@ -595,8 +595,8 @@ class ModelRunner:
                 )
             moe_tp_size = self.tp_size // self.moe_ep_size
 
-            moe_intermediate_size = (
-                getattr(self.model_config.hf_text_config, "moe_intermediate_size", None)
+            moe_intermediate_size = getattr(
+                self.model_config.hf_text_config, "moe_intermediate_size", None
             )
             if moe_intermediate_size is None:
                 return
