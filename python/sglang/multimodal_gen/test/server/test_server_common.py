@@ -33,7 +33,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
 )
-from sglang.multimodal_gen.test.slackbot import upload_file_to_slack
+from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     read_perf_logs,
