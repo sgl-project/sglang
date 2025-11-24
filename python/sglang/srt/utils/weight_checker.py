@@ -39,7 +39,8 @@ class WeightChecker:
         for name in curr_tensors:
             curr_tensor = curr_tensors[name]
             snapshot_tensor = self._snapshot_tensors[name].cuda()
-            TODO
+            if not torch.all(curr_tensor == snapshot_tensor):
+                TODO
 
     def _model_state(self):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
