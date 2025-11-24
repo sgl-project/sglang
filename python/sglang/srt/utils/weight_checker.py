@@ -39,18 +39,8 @@ def _random_fill_tensor(t: torch.Tensor, *, low=None, high=None):
         t.copy_(tmp.to(dtype))
         return
 
-    # Complex types
-    if dtype.is_complex:
-        comp_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
-        real = torch.rand(shape, device=device, dtype=comp_dtype)
-        imag = torch.rand(shape, device=device, dtype=comp_dtype)
-        t.copy_(torch.complex(real, imag).to(dtype))
-        return
-
-    # Bool
     if dtype == torch.bool:
-        mask = torch.rand(shape, device=device) > 0.5
-        t.copy_(mask)
+        t.copy_(torch.rand(shape, device=device) > 0.5)
         return
 
     # Integer types
