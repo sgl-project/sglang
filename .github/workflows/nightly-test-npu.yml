@@ -18,7 +18,7 @@ jobs:
   # Building images
   build-arm-image:
     if: github.repository == 'sgl-project/sglang'
-    uses: .github/workflows/release-docker-npu-nightly.yml
+    uses: ./.github/workflows/release-docker-npu.yml
     secrets: inherit
 
   nightly-test-npu-1-a3:
