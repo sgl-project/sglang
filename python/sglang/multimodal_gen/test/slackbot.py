@@ -1,3 +1,7 @@
+"""
+    This file upload the media generated in diffusion-nightly-test to a slack channel of SGLang
+"""
+
 import logging
 import os
 import tempfile
@@ -44,7 +48,7 @@ except Exception as e:
 
 def _get_status_message(run_id, current_case_id, thread_messages=None):
     date_str = datetime.now().strftime("%d/%m")
-    base_header = f"*For nightly test of {date_str}*\n*GitHub Run ID:* {run_id}"
+    base_header = f"*🧵 for nightly test of {date_str}*\n*GitHub Run ID:* {run_id}"
 
     if not ALL_CASES:
         return base_header
