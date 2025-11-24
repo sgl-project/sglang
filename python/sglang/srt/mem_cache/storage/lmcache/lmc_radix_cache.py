@@ -196,7 +196,7 @@ class LMCRadixCache(RadixCache):
 
         if num_retrieved > 0:
             fetched = num_retrieved - prefix_pad
-            new_node = TreeNode()
+            new_node = TreeNode(priority=last_node.priority)
             start = value.numel()
             end = start + fetched
             new_node.key = key[start:end]

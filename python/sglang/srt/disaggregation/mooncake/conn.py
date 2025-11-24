@@ -288,12 +288,11 @@ class MooncakeKVManager(CommonKVManager):
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-            kv_item_len = item_lens[0]
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
                     dst_kv_ptrs[layer_id],
-                    kv_item_len,
+                    item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -301,19 +300,18 @@ class MooncakeKVManager(CommonKVManager):
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-            kv_item_len = item_lens[0]
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    kv_item_len,
+                    item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    kv_item_len,
+                    item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -1189,25 +1187,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
-
-    def _get_bootstrap_info_from_server(
-        self, engine_rank, target_dp_group, target_pp_rank
-    ):
-        """Fetch the bootstrap info from the bootstrap server."""
-        try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                bootstrap_info = response.json()
-                return bootstrap_info
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
-                )
-                return None
-        except Exception as e:
-            logger.error(f"Error fetching prefill info from bootstrap: {e}")
-            return None
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:

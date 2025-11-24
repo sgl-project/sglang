@@ -317,7 +317,6 @@ class TestMTP(CustomTestCase):
 class TestMTPWithTBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        import os
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST

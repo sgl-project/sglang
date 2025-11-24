@@ -72,6 +72,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -419,6 +420,12 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    if (
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
+        and request.url.path == "/health"
+    ):
+        return Response(status_code=200)
+
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"HEALTH_CHECK_{time.time()}"
 
@@ -476,6 +483,16 @@ async def health_generate(request: Request) -> Response:
 
 @app.get("/get_model_info")
 async def get_model_info():
+    """Get the model information (deprecated - use /model_info instead)."""
+    logger.warning(
+        "Endpoint '/get_model_info' is deprecated and will be removed in a future version. "
+        "Please use '/model_info' instead."
+    )
+    return await model_info()
+
+
+@app.get("/model_info")
+async def model_info():
     """Get the model information."""
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
@@ -491,6 +508,16 @@ async def get_model_info():
 
 @app.get("/get_weight_version")
 async def get_weight_version():
+    """Get the current weight version (deprecated - use /weight_version instead)."""
+    logger.warning(
+        "Endpoint '/get_weight_version' is deprecated and will be removed in a future version. "
+        "Please use '/weight_version' instead."
+    )
+    return await weight_version()
+
+
+@app.get("/weight_version")
+async def weight_version():
     """Get the current weight version."""
     return {
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version
@@ -499,7 +526,18 @@ async def get_weight_version():
 
 @app.get("/get_server_info")
 async def get_server_info():
-    # Returns interna states per DP.
+    """Get the server information (deprecated - use /server_info instead)."""
+    logger.warning(
+        "Endpoint '/get_server_info' is deprecated and will be removed in a future version. "
+        "Please use '/server_info' instead."
+    )
+    return await server_info()
+
+
+@app.get("/server_info")
+async def server_info():
+    """Get the server information."""
+    # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
@@ -651,6 +689,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
         merge_profiles=obj.merge_profiles,
+        profile_prefix=obj.profile_prefix,
     )
     return Response(
         content="Start profiling.\n",
@@ -716,11 +755,6 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
     success, message, num_paused_requests = (
         await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     )
-
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
 
     content = {
         "success": success,
@@ -815,11 +849,6 @@ async def update_weights_from_tensor(
         obj, request
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -837,11 +866,6 @@ async def update_weights_from_distributed(
         )
     )
 
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
-
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -855,11 +879,6 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
         obj, request
     )
-
-    # Update weight version if provided and weights update was successful
-    if success and obj.weight_version is not None:
-        _update_weight_version_if_provided(obj.weight_version)
-        message += f" Weight version updated to {obj.weight_version}."
 
     content = {"success": success, "message": message}
     if success:
@@ -1324,12 +1343,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
-def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
-    """Update weight version if provided."""
-    if weight_version is not None:
-        _global_state.tokenizer_manager.server_args.weight_version = weight_version
-
-
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
@@ -1402,6 +1415,7 @@ def launch_server(
                 app,
                 host=server_args.host,
                 port=server_args.port,
+                root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=5,
                 loop="uvloop",
@@ -1420,6 +1434,7 @@ def launch_server(
                 "sglang.srt.entrypoints.http_server:app",
                 host=server_args.host,
                 port=server_args.port,
+                root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=5,
                 loop="uvloop",
@@ -1431,8 +1446,8 @@ def launch_server(
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
-# Minimal 2x2 black PNG (base64, 1x1 image would cause ambiguous in image channel dimension)
-MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEElEQVQImWNgYGD4z8DAAAQYAAH7u8WFAAAAAElFTkSuQmCC"
+# Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
 def _execute_server_warmup(
@@ -1528,14 +1543,16 @@ def _execute_server_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
+        warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
         if server_args.disaggregation_mode == "null":
+            logger.info(f"Start of co-locate warmup ...")
             res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=600,
+                timeout=warmup_timeout if warmup_timeout > 0 else 600,
             )
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
@@ -1559,7 +1576,9 @@ def _execute_server_warmup(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=1800,  # because of deep gemm precache is very long if not precache.
+                timeout=(
+                    warmup_timeout if warmup_timeout > 0 else 1800
+                ),  # because of deep gemm precache is very long if not precache.
             )
             if res.status_code == 200:
                 logger.info(

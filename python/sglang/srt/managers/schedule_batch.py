@@ -562,8 +562,8 @@ class Req:
         self.host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
-        # The prefix length of the last prefix matching
-        self.last_matched_prefix_len: int = 0
+        # The prefix length that is inserted into the tree cache
+        self.cache_protected_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -572,6 +572,8 @@ class Req:
 
         # For retraction
         self.is_retracted = False
+        # Indicates if the req has ever been retracted.
+        self.retracted_stain = False
 
         # Incremental streamining
         self.send_token_offset: int = 0
@@ -773,7 +775,7 @@ class Req:
                     else {}
                 ),
             )
-            self.last_matched_prefix_len = len(self.prefix_indices)
+            self.cache_protected_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -947,6 +949,7 @@ class Req:
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
         self.is_retracted = True
+        self.retracted_stain = True
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
@@ -1313,8 +1316,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             multimodal_inputs.append(req.multimodal_inputs)
 
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
+            # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
+            # flag will always True
+            if not req.retracted_stain:
+                req.cached_tokens += pre_len - req.already_computed
+                req.already_computed = seq_len
             req.is_retracted = False
 
             # Compute the relative logprob_start_len in an extend batch
@@ -1754,7 +1760,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def merge_batch(self, other: "ScheduleBatch"):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
-        # 1) current batch is always prefill, whose seq_lens and allocate_lens are not a future
+        # 1) current batch is always prefill, whose seq_lens is not a future
         # 2) other batch is always decode, which is finished in previous step
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
