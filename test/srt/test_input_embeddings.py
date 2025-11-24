@@ -6,7 +6,7 @@ import unittest
 import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -19,15 +19,32 @@ from sglang.test.test_utils import (
 class TestInputEmbeds(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        if is_npu():
+            cls.model = (
+                "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"
+            )
+        else:
+            cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model)
         cls.ref_model = AutoModelForCausalLM.from_pretrained(cls.model)
+        other_args = (
+            [
+                "--disable-radix",
+                "--cuda-graph-max-bs",
+                4,
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+            ]
+            if is_npu()
+            else ["--disable-radix", "--cuda-graph-max-bs", 4]
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--disable-radix", "--cuda-graph-max-bs", 4],
+            other_args=other_args,
         )
         cls.texts = [
             "The capital of France is",
