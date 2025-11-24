@@ -1,4 +1,5 @@
 import logging
+from typing import Dict
 
 import torch
 
@@ -33,14 +34,10 @@ class WeightChecker:
     def _compare(self):
         assert self._snapshot_tensors is not None
 
-        curr_tensors = dict(self._model_state())
-        assert len(curr_tensors) == len(self._snapshot_tensors)
-
-        for name in curr_tensors:
-            curr_tensor = curr_tensors[name]
-            snapshot_tensor = self._snapshot_tensors[name].cuda()
-            if not torch.all(curr_tensor == snapshot_tensor):
-                TODO
+        _check_tensors(
+            expect_tensors=self._snapshot_tensors,
+            actual_tensors=dict(self._model_state()),
+        )
 
     def _model_state(self):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
@@ -48,7 +45,13 @@ class WeightChecker:
 
 
 def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict[str, torch.Tensor]):
-    TODO
+    assert len(expect_tensors) == len(actual_tensors)
+
+    for name in expect_tensors:
+        expect = expect_tensors[name]
+        actual = actual_tensors[name]
+        if not torch.all(curr_tensor == snapshot_tensor):
+            TODO
 
 
 def _random_like(t: torch.Tensor):
