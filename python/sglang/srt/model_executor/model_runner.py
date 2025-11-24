@@ -92,6 +92,11 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.mm_utils import (
+    external_mm_preprocess_routine,
+    resolve_external_mm_data_embedding_funcs,
+    should_use_external_mm_preprocess,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -106,7 +111,9 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
+    MHATokenToKVPoolFP4,
     MLATokenToKVPool,
+    MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
@@ -212,7 +219,7 @@ _is_xpu_xmx_available = xpu_has_xmx_support()
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 
 # Detect stragger ranks in model loading
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 # the ratio of mamba cache pool size to max_running_requests, it will be safe when it is larger than 2 (yizhang2077)
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
@@ -298,6 +305,7 @@ class ModelRunner:
 
         # Model-specific adjustment
         self.model_specific_adjustment()
+        self.check_quantized_moe_compatibility()
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -570,34 +578,34 @@ class ModelRunner:
         if not server_args.disable_chunked_prefix_cache:
             log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
-        if self.model_config.hf_config.model_type == "qwen3_vl_moe":
-            if (
-                quantization_config := getattr(
-                    self.model_config.hf_config, "quantization_config", None
+    def check_quantized_moe_compatibility(self):
+        if (
+            quantization_config := getattr(
+                self.model_config.hf_config, "quantization_config", None
+            )
+        ) is not None and "weight_block_size" in quantization_config:
+            weight_block_size_n = quantization_config["weight_block_size"][0]
+
+            if self.tp_size % self.moe_ep_size != 0:
+                raise ValueError(
+                    f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
                 )
-            ) is not None and "weight_block_size" in quantization_config:
-                weight_block_size_n = quantization_config["weight_block_size"][0]
+            moe_tp_size = self.tp_size // self.moe_ep_size
 
-                if self.tp_size % self.moe_ep_size != 0:
-                    raise ValueError(
-                        f"tp_size {self.tp_size} must be divisible by moe_ep_size {self.moe_ep_size}"
-                    )
-                moe_tp_size = self.tp_size // self.moe_ep_size
-
-                moe_intermediate_size = (
-                    self.model_config.hf_text_config.moe_intermediate_size
+            moe_intermediate_size = (
+                self.model_config.hf_text_config.moe_intermediate_size
+            )
+            if moe_intermediate_size % moe_tp_size != 0:
+                raise ValueError(
+                    f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
                 )
-                if moe_intermediate_size % moe_tp_size != 0:
-                    raise ValueError(
-                        f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
-                    )
 
-                if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
-                    raise ValueError(
-                        f"For qwen3-vl-fp8 models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
-                        f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size}). "
-                        f"You can fix this by setting arguments `--tp-size` and `--ep-size` correctly."
-                    )
+            if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
+                raise ValueError(
+                    f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
+                    f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
+                    f"You can fix this by setting arguments `--tp` and `--ep` correctly."
+                )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -1796,18 +1804,32 @@ class ModelRunner:
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
-            self.token_to_kv_pool = MLATokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=self.model_config.kv_lora_rank,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                self.token_to_kv_pool = MLATokenToKVPoolFP4(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            else:
+                self.token_to_kv_pool = MLATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
@@ -1864,24 +1886,44 @@ class ModelRunner:
                     **extra_args,
                 )
             else:
-                self.token_to_kv_pool = MHATokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                    enable_alt_stream=not self.server_args.enable_pdmux,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
-                )
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    self.token_to_kv_pool = MHATokenToKVPoolFP4(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
+                else:
+                    self.token_to_kv_pool = MHATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
@@ -2138,6 +2180,15 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+
+        if self.is_multimodal and should_use_external_mm_preprocess(self.model):
+            data_embedding_funcs = resolve_external_mm_data_embedding_funcs(self.model)
+            forward_batch = external_mm_preprocess_routine(
+                forward_batch=forward_batch,
+                multimodal_model=self.model,
+                data_embedding_funcs=data_embedding_funcs,
+            )
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
