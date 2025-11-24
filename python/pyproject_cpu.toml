@@ -62,7 +62,7 @@ dependencies = [
   "transformers==4.57.1",
   "uvicorn",
   "uvloop==0.21.0",
-  "xgrammar==0.1.25",
+  "xgrammar==0.1.27",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
