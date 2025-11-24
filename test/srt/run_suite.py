@@ -427,7 +427,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_schedule_conservativeness.py", 400),
         TestFile("ascend/test_ascend_max_loras_per_batch.py", 400),
         TestFile("ascend/test_ascend_lora_backend.py", 400),
-         TestFile("ascend/test_ascend_enable_mixed_chunk.py", 400),
+        TestFile("ascend/test_ascend_enable_mixed_chunk.py", 400),
     ],
     "nightly-test-npu-2-a3": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
