@@ -76,6 +76,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    CheckWeightReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     DestroyWeightsUpdateGroupReqInput,
@@ -90,7 +91,6 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
-    CheckWeightReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -954,13 +954,13 @@ async def resume_memory_occupation(
     except Exception as e:
         return _create_error_response(e)
 
+
 @app.api_route("/check_weight", methods=["POST"])
 async def check_weight(obj: CheckWeightReqInput, request: Request):
     try:
         await _global_state.tokenizer_manager.check_weight(obj, request)
     except Exception as e:
         return _create_error_response(e)
-
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
