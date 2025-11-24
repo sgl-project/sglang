@@ -958,8 +958,10 @@ async def resume_memory_occupation(
 @app.post("/check_weights")
 async def check_weights(obj: CheckWeightsReqInput, request: Request):
     resp = await _global_state.tokenizer_manager.check_weights(obj, request)
-    return ORJSONResponse({"success": resp.success, "message": resp.message},
-                          status_code=200 if resp.success else HTTPStatus.BAD_REQUEST)
+    return ORJSONResponse(
+        {"success": resp.success, "message": resp.message},
+        status_code=200 if resp.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
