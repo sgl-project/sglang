@@ -199,6 +199,7 @@ class RadixCache(BasePrefixCache):
         is_eagle: bool = False,
         disable_finished_insert: bool = False,
     ):
+        assert(page_size > 0, "Page size must be greater than zero")
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
@@ -315,15 +316,12 @@ class RadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
-        if self.disable or len(key) == 0:
+        if self.disable or len(key) < self.page_size:
             return empty_match_result()
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
-
-        if len(key) == 0:
-            return empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
