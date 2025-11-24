@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import torch
+
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -917,7 +919,7 @@ class BatchTokenIDOutput(
     output_hidden_states: List[List[float]]
 
     # The routed experts for each output token
-    output_routed_experts: List[List[int]]
+    output_routed_experts: List[torch.Tensor]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.

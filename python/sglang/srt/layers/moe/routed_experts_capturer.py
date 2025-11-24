@@ -165,8 +165,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         cache_pool_idx = (
             req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
         )
-
-        return self.get_host_cache().buffer[cache_pool_idx].tolist()
+        return self.get_host_cache().buffer[cache_pool_idx]
 
     def get_host_cache(self):
         return self.host_cache

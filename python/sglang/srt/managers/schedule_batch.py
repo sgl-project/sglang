@@ -631,7 +631,9 @@ class Req:
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts
-        self.routed_experts = []
+        self.routed_experts: Optional[torch.Tensor] = (
+            None  # cpu tensor: shape (seqlen, topk)
+        )
 
         # Embedding (return values)
         self.embedding = None
