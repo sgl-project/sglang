@@ -230,7 +230,7 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                        other_args=(
+            other_args=(
                 [
                     "--skip-tokenizer-init",
                     "--attention-backend",
