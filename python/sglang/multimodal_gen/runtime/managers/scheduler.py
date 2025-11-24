@@ -133,13 +133,32 @@ class Scheduler:
 
             # 2: execute, make sure a reply is always sent
             try:
-                output_batch = self.worker.execute_forward(reqs)
+                # reqs can be a list of Reqs (for forward) or a dict (for control messages)
+                if isinstance(reqs, dict):
+                    method = reqs.get("method")
+                    if method == "set_lora_adapter":
+                        self.worker.set_lora_adapter(
+                            reqs["lora_nickname"],
+                            reqs["lora_path"],
+                        )
+                        output_batch = {"status": "ok"}
+                    else:
+                        error_msg = f"Unknown method: {method}"
+                        logger.error(error_msg)
+                        output_batch = {"status": "error", "message": error_msg}
+                else:
+                    # Assume it's a forward request (list of Reqs)
+                    output_batch = self.worker.execute_forward(reqs)
             except Exception as e:
                 logger.error(
-                    f"Error executing forward in scheduler event loop: {e}",
+                    f"Error executing request in scheduler event loop: {e}",
                     exc_info=True,
                 )
-                output_batch = OutputBatch(error=str(e))
+                # Determine appropriate error response format
+                if isinstance(reqs, dict):
+                    output_batch = {"status": "error", "message": str(e)}
+                else:
+                    output_batch = OutputBatch(error=str(e))
 
             try:
                 self.return_result(output_batch)

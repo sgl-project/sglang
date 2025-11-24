@@ -621,6 +621,19 @@ class ServerArgs:
             default=ServerArgs.override_transformer_cls_name,
             help="Override transformer cls name",
         )
+        # LoRA
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=ServerArgs.lora_path,
+            help="the path to the lora",
+        )
+        parser.add_argument(
+            "--lora-nickname",
+            type=str,
+            default=ServerArgs.lora_nickname,
+            help="the path to the lora",
+        )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
 

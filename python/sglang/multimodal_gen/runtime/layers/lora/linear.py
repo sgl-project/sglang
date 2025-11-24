@@ -55,7 +55,6 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_path: str | None = None
-
         self.lora_A = None
         self.lora_B = None
 
@@ -356,6 +355,9 @@ def get_lora_layer(
     lora_rank: int | None = None,
     lora_alpha: int | None = None,
 ) -> BaseLayerWithLoRA | None:
+    """
+        transform the given layer to its corresponding LoRA layer
+    """
     supported_layer_types: dict[type[LinearBase], type[BaseLayerWithLoRA]] = {
         # the order matters
         # VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,

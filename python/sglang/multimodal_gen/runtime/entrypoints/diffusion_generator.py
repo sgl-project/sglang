@@ -23,7 +23,6 @@ from einops import rearrange
 from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.launch_server import launch_server
-from sglang.multimodal_gen.runtime.managers.schedulerbase import SchedulerBase
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
@@ -111,7 +110,7 @@ class DiffGenerator:
         Returns:
             The created DiffGenerator
         """
-        executor_class = SchedulerBase.get_class(server_args)
+        # executor_class = SchedulerBase.get_class(server_args)
         instance = cls(
             server_args=server_args,
         )
@@ -255,7 +254,7 @@ class DiffGenerator:
         data_type = (
             DataType.IMAGE
             if self.server_args.pipeline_config.task_type.is_image_gen()
-            or pretrained_sampling_params.num_frames == 1
+               or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )
         pretrained_sampling_params.data_type = data_type
@@ -364,8 +363,21 @@ class DiffGenerator:
     def set_lora_adapter(
         self, lora_nickname: str, lora_path: str | None = None
     ) -> None:
-        # self.scheduler.set_lora_adapter(lora_nickname, lora_path)
-        pass  # Removed as per edit hint
+        """
+        Set the LoRA adapter.
+        """
+        payload = {
+            "method": "set_lora_adapter",
+            "lora_nickname": lora_nickname,
+            "lora_path": lora_path,
+        }
+        # We use the sync client's forward method which sends any object via send_pyobj
+        response = sync_scheduler_client.forward(payload)
+        if isinstance(response, dict) and response.get("status") == "ok":
+            logger.info(f"Successfully set LoRA adapter: {lora_nickname}")
+        else:
+            error_msg = response.get("message", "Unknown error") if isinstance(response, dict) else "Unknown response format"
+            raise RuntimeError(f"Failed to set LoRA adapter: {error_msg}")
 
     def unmerge_lora_weights(self) -> None:
         """

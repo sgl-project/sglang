@@ -82,11 +82,7 @@ class LoRAPipeline(ComposedPipelineBase):
             if not self.is_target_layer(name):
                 continue
 
-            excluded = False
-            for exclude_layer in self.exclude_lora_layers:
-                if exclude_layer in name:
-                    excluded = True
-                    break
+            excluded = any(exclude_layer in name for exclude_layer in self.exclude_lora_layers)
             if excluded:
                 continue
 

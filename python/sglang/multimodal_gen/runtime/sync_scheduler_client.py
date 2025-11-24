@@ -1,4 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+from typing import Any
 
 import zmq
 
@@ -45,8 +46,8 @@ class SyncSchedulerClient:
             f"SyncSchedulerClient connected to backend scheduler at {scheduler_endpoint}"
         )
 
-    def forward(self, batch: Req) -> Req:
-        """Sends a batch to the scheduler and waits for the response."""
+    def forward(self, batch: Any) -> Any:
+        """Sends a batch or request to the scheduler and waits for the response."""
         try:
             self.scheduler_socket.send_pyobj(batch)
             output_batch = self.scheduler_socket.recv_pyobj()
