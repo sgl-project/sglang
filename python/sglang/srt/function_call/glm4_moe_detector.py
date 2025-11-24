@@ -2,11 +2,11 @@ import ast
 import json
 import logging
 import re
-from typing import List
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.core_types import StreamingParseResult
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,12 @@ class Glm4MoeDetector(BaseFormatDetector):
         return StreamingParseResult(normal_text=normal_text)
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
-    def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError()
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()        
