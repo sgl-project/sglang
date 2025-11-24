@@ -78,7 +78,7 @@ def _get_status_message(run_id, current_case_id, thread_messages=None):
     table_lines.append(f"| {'-' * max_len} | :----: |")
 
     for c in ALL_CASES:
-        mark = status_map.get(c.id, "❓")
+        mark = status_map.get(c.id, "⏳")
         table_lines.append(f"| {c.id.ljust(max_len)} |   {mark}   |")
 
     table_lines.append("```")
