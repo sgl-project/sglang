@@ -55,6 +55,7 @@ def _check_tensors(
 
     assert len(expect_tensors) == len(actual_tensors)
 
+    good_names = []
     error_messages = []
 
     for name in expect_tensors:
@@ -62,17 +63,20 @@ def _check_tensors(
         actual = actual_tensors[name]
 
         if torch.all(expect == actual):
-            continue
+            good_names.append(name)
+        else:
+            error_messages.append(
+                f"name={name} "
+                f"max_abs_err={(actual - expect).abs().max()} "
+                f"mean_abs_err={(actual - expect).abs().mean()} "
+                f"{get_tensor_info(expect)=} "
+                f"{get_tensor_info(actual)=} "
+            )
 
-        error_messages.append(
-            f"name={name} "
-            f"max_abs_err={(actual - expect).abs().max()} "
-            f"mean_abs_err={(actual - expect).abs().mean()} "
-            f"{get_tensor_info(expect)=} "
-            f"{get_tensor_info(actual)=} "
-        )
-
-    raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
+    logger.info(f"[check_tensors] passed: {good_names}")
+    if len(error_messages) > 0:
+        msg = f"check tensor equality failed:\n" + "\n".join(error_messages)
+        raise Exception(msg)
 
 
 def _random_like(t: torch.Tensor):
