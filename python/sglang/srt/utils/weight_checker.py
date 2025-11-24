@@ -1,10 +1,15 @@
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
 
     def handle(self, action: str):
+        logger.info(f"[WeightChecker] handle action={action}")
         if action == "snapshot":
             self._snapshot()
         elif action == "reset_param":
