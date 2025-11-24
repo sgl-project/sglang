@@ -92,4 +92,6 @@ def _random_like(t: torch.Tensor):
         return torch.rand(shape, device=device) > 0.5
 
     info = torch.iinfo(dtype)
-    return torch.randint(low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype)
+    return torch.randint(
+        low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
+    )
