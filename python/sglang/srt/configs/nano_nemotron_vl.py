@@ -13,14 +13,21 @@
 # ==============================================================================
 # Adapted from https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16/blob/cb5a65ff10232128389d882d805fa609427544f1/configuration.py
 
+from typing import Any
+
 from transformers.configuration_utils import PretrainedConfig
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
-from transformers.utils import logging
 
 from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.configs.radio import RadioConfig
 from sglang.srt.multimodal.internvl_utils import IMAGENET_MEAN, IMAGENET_STD
 
-logger = logging.get_logger(__name__)
+
+def float_triplet(seq: Any):
+    a, b, c = tuple(seq)
+    assert (
+        isinstance(a, float) and isinstance(b, float) and isinstance(c, float)
+    ), "expected three floats"
+    return a, b, c
 
 
 class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
@@ -39,7 +46,6 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         image_tag_type="internvl",
         projector_hidden_size=4096,
         vit_hidden_size=1280,
-        attn_implementation="flash_attention_2",
         video_pruning_rate: float = 0.0,
         video_context_token: str = "<video>",
         img_context_token: str = "<image>",
@@ -48,27 +54,23 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         norm_mean: tuple[float, float, float] | list[float] = IMAGENET_MEAN,
         norm_std: tuple[float, float, float] | list[float] = IMAGENET_STD,
         use_thumbnail: bool = True,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
-        if vision_config is not None:
-            vision_auto_config = get_class_from_dynamic_module(
-                *vision_config["auto_map"]["AutoConfig"].split("--")[::-1]
-            )
-            self.vision_config = vision_auto_config(**vision_config)
-        else:
-            self.vision_config = PretrainedConfig()
-
-        # Handle both cases: when loading from JSON (llm_config is dict) and when called internally by transformers (llm_config is None)
+        # Handle both cases: when loading from JSON (llm_config is dict) and when called internally by transformers (llm_config; vision_config are None)
         if llm_config is not None:
             self.llm_config = NemotronHConfig(**llm_config)
+            assert isinstance(vision_config, dict), "vision_config must be a dictionary"
+            self.raw_vision_config = vision_config
         else:
+            assert vision_config is None
             self.llm_config = NemotronHConfig()
+            self.raw_vision_config = {}
 
         # Assign configuration values
-        vision_image_size = getattr(self.vision_config, "image_size", force_image_size)
-        vision_patch_size = getattr(self.vision_config, "patch_size", patch_size)
+        vision_image_size = self.raw_vision_config.get("image_size", force_image_size)
+        vision_patch_size = self.raw_vision_config.get("patch_size", patch_size)
         self.image_size = int(
             vision_image_size[0]
             if isinstance(vision_image_size, list)
@@ -90,17 +92,23 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         self.vit_hidden_size = vit_hidden_size
         self.video_pruning_rate = video_pruning_rate
 
-        self._attn_implementation = attn_implementation
-        self.vision_config.use_flash_attn = (
-            self._attn_implementation is not None
-            and "flash_attention" in self._attn_implementation
-        )
-        self.norm_mean = tuple(norm_mean)
-        assert len(self.norm_mean) == 3, "norm_mean must be a tuple of 3 elements"
-        self.norm_std = tuple(norm_std)
-        assert len(self.norm_std) == 3, "norm_std must be a tuple of 3 elements"
+        self.norm_mean = float_triplet(norm_mean)
+        self.norm_std = float_triplet(norm_std)
         self.use_thumbnail = use_thumbnail
-        self.llm_config._attn_implementation = self._attn_implementation
-
         self.img_start_token = img_start_token
         self.img_end_token = img_end_token
+
+    def create_radio_config(self):
+        config = self.raw_vision_config
+        model_name = config["args"]["model"]
+        reg_tokens = config["args"].get("register_multiple")
+        image_size = config.get("preferred_resolution", [224])[0]
+        radio_config = RadioConfig(
+            patch_size=self.patch_size,
+            norm_mean=self.norm_mean,
+            norm_std=self.norm_std,
+            model_name=model_name,
+            reg_tokens=reg_tokens,
+            image_size=image_size,
+        )
+        return radio_config

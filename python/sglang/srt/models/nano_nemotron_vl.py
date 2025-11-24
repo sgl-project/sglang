@@ -14,13 +14,12 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/nano_nemotron_vl.py
 
 import logging
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import Iterable
 
 import torch
 import torch.nn as nn
 
 from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
-from sglang.srt.configs.radio import RadioConfig
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -39,9 +38,6 @@ from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.utils import add_prefix
 
-if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +45,7 @@ class NemotronH_Nano_VL_V2(nn.Module):
     def __init__(
         self,
         config: NemotronH_Nano_VL_V2_Config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -60,7 +56,7 @@ class NemotronH_Nano_VL_V2(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        self.vision_model = self.get_vit_model_from_radio_config(config).to(
+        self.vision_model = RadioModel(config=config.create_radio_config()).to(
             self.language_model.config.dtype
         )
 
@@ -84,7 +80,7 @@ class NemotronH_Nano_VL_V2(nn.Module):
         ).to(self.language_model.config.torch_dtype)
         self.config = config
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
@@ -143,7 +139,7 @@ class NemotronH_Nano_VL_V2(nn.Module):
         vit_embeds = torch.cat(vit_embeds_list, dim=0)
         return vit_embeds
 
-    def get_image_feature(self, items: List[MultimodalDataItem]):
+    def get_image_feature(self, items: list[MultimodalDataItem]):
         """
         Projects the last hidden state from the vision model into language model space.
 
@@ -154,7 +150,7 @@ class NemotronH_Nano_VL_V2(nn.Module):
         image_features = self.extract_feature(pixel_values)
         return image_features
 
-    def get_video_feature(self, items: List[MultimodalDataItem]):
+    def get_video_feature(self, items: list[MultimodalDataItem]):
         """
         Projects the last hidden state from the video model into language model space.
 
@@ -218,34 +214,6 @@ class NemotronH_Nano_VL_V2(nn.Module):
                 vision_weights.append((hf_key, w))
         self.language_model.load_weights(llm_weights)
         self.vision_model.load_weights(vision_weights)
-
-    def get_vit_model_from_radio_config(
-        self, hf_config: "PretrainedConfig"
-    ) -> RadioModel:
-        hf_config_vision = hf_config.vision_config
-        model_name = hf_config_vision.args.get("model")
-        if model_name is None:
-            raise ValueError(f"Unsupported vit model type: {model_name}")
-
-        preferred_resolution = getattr(hf_config_vision, "preferred_resolution", None)
-        image_size = preferred_resolution[0] if preferred_resolution else 224
-        patch_size = getattr(hf_config_vision, "patch_size", 16)
-
-        radio_config = RadioConfig(
-            model_name=model_name,
-            image_size=image_size,
-            patch_size=patch_size,
-            norm_mean=hf_config.norm_mean,
-            norm_std=hf_config.norm_std,
-            reg_tokens=(
-                hf_config_vision.args.get("register_multiple")
-                if hasattr(hf_config_vision, "args")
-                and isinstance(hf_config_vision.args, dict)
-                else None
-            ),
-        )
-
-        return RadioModel(config=radio_config)
 
 
 EntryClass = [NemotronH_Nano_VL_V2]
