@@ -367,6 +367,24 @@ suite_ascend = {
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
     ],
+    "nightly-test-npu-1-a3": [
+        TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_hicache_mha.py", 400),
+        TestFile("ascend/test_ascend_sampling_backend.py", 400),
+        TestFile("ascend/test_ascend_tokenizer_mode.py", 400),
+    ],
+    "nightly-test-npu-2-a3": [
+        
+    ],
+    "nightly-test-npu-4-a3": [
+        
+    ],
+    "nightly-test-npu-8-a3": [
+        
+    ],
+    "nightly-test-npu-16-a3": [
+        
+    ],
 }
 
 suites.update(suite_amd)
