@@ -20,6 +20,7 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -630,6 +631,11 @@ class TboForwardBatchPreparer:
             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
             output_dict[key] = old_value[start_token_index:end_token_index]
 
+        attention_tp_size = get_attention_tp_size()
+        output_dict["tbo_padded_len"] = (
+            (end_token_index - start_token_index - 1) // attention_tp_size + 1
+        ) * attention_tp_size
+
         for key in [
             "req_pool_indices",
             "seq_lens",
@@ -840,6 +846,7 @@ def _model_forward_tbo(
         input_data_scatter_mode=input_data_scatter_mode,
         layer_input_scatter_mode=layer_input_scatter_mode,
     )
+    original_hidden_states_len = inputs["hidden_states"].shape[0]
     del inputs
 
     context = (
@@ -857,7 +864,7 @@ def _model_forward_tbo(
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-    return _model_forward_tbo_merge_outputs(*outputs_arr)
+    return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
@@ -951,23 +958,49 @@ def _model_forward_filter_inputs(
     tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
+    hidden_states = hidden_states[token_slice]
+    residual = None if residual is None else residual[token_slice]
+    positions = positions[token_slice]
+
+    assert output_forward_batch.tbo_padded_len is not None
+    padded_len = output_forward_batch.tbo_padded_len
+
+    def _pad(x):
+        nonlocal padded_len
+        if x is None:
+            return None
+        if x.shape[0] == padded_len:
+            return x
+        res = torch.zeros((padded_len, *x.shape[1:]), dtype=x.dtype, device=x.device)
+        res[: x.shape[0]] = x
+        return res
+
     return dict(
-        hidden_states=hidden_states[token_slice],
-        residual=None if residual is None else residual[token_slice],
-        positions=positions[token_slice],
+        hidden_states=_pad(hidden_states),
+        residual=_pad(residual),
+        positions=_pad(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
     )
 
 
-def _model_forward_tbo_merge_outputs(output_a, output_b):
+def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
     def _handle_key(name):
         value_a = output_a[name]
         value_b = output_b[name]
         assert (value_a is None) == (value_b is None)
         if value_a is None:
             return None
-        return torch.concat([value_a, value_b], dim=0)
+        s0, t0 = output_a["forward_batch"].tbo_parent_token_range
+        s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+        res = torch.zeros(
+            (original_len, *value_a.shape[1:]),
+            dtype=value_a.dtype,
+            device=value_a.device,
+        )
+        res[slice(s0, t0)] = value_a[: t0 - s0]
+        res[slice(s1, t1)] = value_b[: t1 - s1]
+        return res
 
     return _handle_key("hidden_states"), _handle_key("residual")
 
