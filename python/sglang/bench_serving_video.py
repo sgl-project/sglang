@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import aiohttp
 import numpy as np
@@ -318,7 +318,18 @@ async def benchmark(args):
             json.loads(args.extra_request_body) if args.extra_request_body else {}
         )
 
-        tasks = []
+        prompts = []
+        for i in range(args.num_prompts):
+            inp = RequestFuncInput(
+                prompt=f"Describe what is happening in this video (ID {i}) in detail.",
+                api_url=api_url,
+                model=args.model,
+                video_url=video_urls[i],
+                output_len=args.output_len,
+                extra_request_body=extra_body,
+            )
+            prompts.append(inp)
+
         pbar = tqdm(total=args.num_prompts) if not args.disable_tqdm else None
 
         # Pre-warm (always use the first video)
@@ -335,15 +346,9 @@ async def benchmark(args):
         print("Warmup done.")
 
         start_time = time.perf_counter()
-        for i in range(args.num_prompts):
-            inp = RequestFuncInput(
-                prompt=f"Describe what is happening in this video (ID {i}) in detail.",
-                api_url=api_url,
-                model=args.model,
-                video_url=video_urls[i],  # Use unique or reused URL based on config
-                output_len=args.output_len,
-                extra_request_body=extra_body,
-            )
+
+        tasks = []
+        async for inp in get_request(prompts, args.request_rate):
             tasks.append(
                 asyncio.create_task(async_request_openai_chat_completions(inp, pbar))
             )
@@ -397,19 +402,36 @@ async def benchmark(args):
                 },
                 "num_prompts": args.num_prompts,
                 "throughput_vid_sec": metrics.video_throughput_seconds,
+                "output_throughput": metrics.output_throughput,
                 "mean_latency_ms": metrics.mean_e2e_latency_ms,
             }
 
             if args.output_file:
                 with open(args.output_file, "a") as f:
                     f.write(json.dumps(result) + "\n")
+            return result
         else:
             print("All requests failed.")
+            return None
 
     finally:
         # Cleanup
         pass
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def get_request(
+    prompts: List[RequestFuncInput], request_rate: float
+) -> AsyncGenerator[RequestFuncInput, None]:
+    prompts_iter = iter(prompts)
+    for request in prompts_iter:
+        yield request
+
+        if request_rate == float("inf"):
+            continue
+
+        interval = np.random.exponential(1.0 / request_rate)
+        await asyncio.sleep(interval)
 
 
 if __name__ == "__main__":
@@ -422,6 +444,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num-prompts", type=int, default=1, help="Number of requests to send"
+    )
+    parser.add_argument(
+        "--request-rate",
+        type=float,
+        default=float("inf"),
+        help="Number of requests per second.",
     )
     parser.add_argument("--output-len", type=int, default=128, help="Max output tokens")
 
