@@ -1,16 +1,11 @@
 import json
 import logging
 import re
-from typing import List
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    StructureInfo,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -226,14 +221,47 @@ class KimiK2Detector(BaseFormatDetector):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
 
-    def structure_info(self) -> _GetInfoFunc:
-        """Return function that creates StructureInfo for guided generation."""
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build structural tag for Kimi K2 format."""
+        tags = []
+        triggers = set()
 
-        def get_info(name: str) -> StructureInfo:
-            return StructureInfo(
-                begin=f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:0<|tool_call_argument_begin|>",
-                end="<|tool_call_end|><|tool_calls_section_end|>",
-                trigger="<|tool_calls_section_begin|>",
+        for index, tool in enumerate(tools):
+            name = tool.function.name
+            if not name:
+                continue
+            
+            begin = f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>"
+            end = "<|tool_call_end|><|tool_calls_section_end|>"
+            trigger = "<|tool_calls_section_begin|>"
+
+            # Always include schema
+            schema = tool.function.parameters or {}
+
+            tags.append(
+                {
+                    "format": "tag",
+                    "begin": begin,
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": end,
+                }
             )
+            triggers.add(trigger)
 
-        return get_info
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": list(triggers),
+                "tags": tags,
+                "at_least_one": at_least_one,
+                "stop_after_first": stop_after_first,
+            }
+        }
