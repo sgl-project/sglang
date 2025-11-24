@@ -15,8 +15,8 @@ class WeightChecker:
         logger.info(f"[WeightChecker] handle action={action}")
         if action == "snapshot":
             self._snapshot()
-        elif action == "reset_param":
-            self._reset_param()
+        elif action == "reset_tensors":
+            self._reset_tensors()
         elif action == "compare":
             self._compare()
         else:
@@ -31,7 +31,7 @@ class WeightChecker:
             named_tensors
         ), f"should not have duplicated tensor name"
 
-    def _reset_param(self):
+    def _reset_tensors(self):
         for name, param in self._model_state():
             param.copy_(_random_like(param))
 
