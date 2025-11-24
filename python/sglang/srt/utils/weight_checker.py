@@ -44,22 +44,8 @@ def _random_like(t: torch.Tensor, *, low=None, high=None):
     # Integer types
     if dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
         info = torch.iinfo(dtype)
-        # Default integer range: full dtype range
-        if low is None:
-            low = int(info.min)
-        if high is None:
-            # torch.randint high is exclusive; make maxv+1 if safe
-            maxv = int(info.max)
-            if maxv - low + 1 <= (1 << 31):
-                high = maxv + 1
-            else:
-                # huge range fallback to a safe 32-bit window
-                low = max(low, -2**31)
-                high = 2**31 - 1
-
-        if not (low < high):
-            raise ValueError(f"invalid integer bounds: low={low}, high={high}")
-
+        low = int(info.min)
+        high = int(info.max)
         return torch.randint(low=low, high=high, size=shape, device=device, dtype=torch.int64)
 
     raise TypeError(f"unsupported dtype: {dtype}")
