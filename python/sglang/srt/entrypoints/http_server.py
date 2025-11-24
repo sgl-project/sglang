@@ -955,7 +955,7 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.api_route("/check_weights", methods=["POST"])
+@app.post("/check_weights")
 async def check_weights(obj: CheckWeightsReqInput, request: Request):
     try:
         await _global_state.tokenizer_manager.check_weights(obj, request)
