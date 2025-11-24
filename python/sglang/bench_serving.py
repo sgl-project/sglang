@@ -1418,7 +1418,7 @@ def sample_image_requests(
     image_format: str,
     image_resolution: str,
     backend: str,
-    skip_special_tokens: bool
+    skip_special_tokens: bool,
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -1470,14 +1470,16 @@ def sample_image_requests(
     total_image_bytes = 0
 
     special_tokens = None
-    if skip_special_tokens and hasattr(processor.tokenizer, "all_special_ids") and processor.tokenizer.all_special_ids is not None:
+    if (
+        skip_special_tokens
+        and hasattr(processor.tokenizer, "all_special_ids")
+        and processor.tokenizer.all_special_ids is not None
+    ):
         special_tokens = set(processor.tokenizer.all_special_ids)
     for i in range(num_requests):
         # Generate text prompt
         text_prompt = gen_mm_prompt(
-            processor.tokenizer,
-            int(input_lens[i]),
-            special_tokens=special_tokens
+            processor.tokenizer, int(input_lens[i]), special_tokens=special_tokens
         )
 
         # Generate image list
@@ -1520,7 +1522,7 @@ def gen_prompt(tokenizer, token_num):
 
 def gen_mm_prompt(tokenizer, token_num, special_tokens):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    if special_tokens is not None: 
+    if special_tokens is not None:
         all_available_tokens = [
             t for t in tokenizer.get_vocab().values() if t not in special_tokens
         ]
