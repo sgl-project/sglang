@@ -208,6 +208,56 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
 
 
+class ScheduleDecisionMaker:
+    def __init__(
+            self,
+            dp_size,
+            attn_tp_size,
+            tp_worker,
+            max_running_requests
+    ):
+        self.dp_size = dp_size
+        self.attn_tp_size = attn_tp_size
+        self.global_info_tensor = torch.empty(
+            (self.dp_size, self.attn_tp_size, 1),
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self.cpu_group = tp_worker.get_tp_group().cpu_group
+        self.max_running_requests = max_running_requests
+        self.stable_count = 0
+
+    def get_schedule_info(self, running_batch):
+        current_running_stream = torch.tensor(
+            [
+                running_batch.batch_size(),
+            ],
+            device="cpu",
+            dtype=torch.int64,
+        )
+        torch.distributed.all_gather_into_tensor(
+            self.global_info_tensor.flatten(),
+            current_running_stream,
+            group=self.cpu_group,
+        )
+        tp0_info = self.global_info_tensor[:, 0, :]
+        return tp0_info
+
+    def get_schedule_decision(self, running_batch):
+        # if running_batch.forward_mode != ForwardMode.DECODE:
+        #     self.stable_count = 0
+        #     return True
+        tp0_info = self.get_schedule_info(running_batch)
+        if (
+                int(tp0_info[:, 0].min().item()) < self.max_running_requests
+                and int(tp0_info[:, 0].max().item()) == self.max_running_requests
+        ):
+            self.stable_count += 1
+            if self.stable_count < 30:
+                return False
+        self.stable_count = 0
+        return True
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -244,8 +294,6 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.schedule_dp_policy = server_args.schedule_dp_policy
-        # self.stable_flag = False
-        self.stable_count = 0
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
@@ -479,6 +527,8 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
+        if self.schedule_dp_policy == "decrease_idle":
+            self.schedule_decision_maker = ScheduleDecisionMaker(self.dp_size, self.attn_tp_size, self.tp_worker, self.max_running_requests)
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
         self.init_new_token_ratio = min(
@@ -1747,46 +1797,10 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        if self.schedule_dp_policy == "fcfs_full_decode":
-            global_info_tensor = torch.empty(
-                (self.dp_size, self.attn_tp_size, 1),
-                dtype=torch.int64,
-                device="cpu",
-            )
-            current_running_stream = torch.tensor(
-                [
-                    self.running_batch.batch_size(),
-                ],
-                device="cpu",
-                dtype=torch.int64,
-            )
-            torch.distributed.all_gather_into_tensor(
-                global_info_tensor.flatten(),
-                current_running_stream,
-                group=self.tp_worker.get_tp_group().cpu_group,
-            )
-            tp0_info = global_info_tensor[:, 0, :]
-            # print(f"{tp0_info=}")
-            # print(f"{self.running_batch.forward_mode=}")
-            if (
-                int(tp0_info[:, 0].min().item()) < self.max_running_requests
-                and int(tp0_info[:, 0].max().item()) == self.max_running_requests
-            ):
-                # self.stable_flag = False
-                self.stable_count += 1
-                if self.stable_count < 50:
-                    return None
-                else:
-                    self.stable_count = 0
-            # d_time, p_time = 100, 100
-            # d_waste_time = self.d_waste_time + d_time *(self.max_running_requests * self.dp_size - sum(tp0_info[:, 0]))
-            # p_waste_time = self.p_waste_time + p_time * sum(tp0_info[:, 0])
-            # if int(tp0_info[:, 0].min().item()) < self.max_running_requests and int(tp0_info[:, 0].max().item()) == self.max_running_requests:
-            #     if p_waste_time >= d_waste_time:
-            #         # print(f"{p_waste_time=}")
-            #         # print(f"{d_waste_time=}")
-            #         self.p_waste_time, self.d_waste_time = p_waste_time, d_waste_time
-            #         return  None
+        if self.schedule_dp_policy == "decrease_idle":
+            decision_flag = self.schedule_decision_maker.get_schedule_decision(self.running_batch)
+            if not decision_flag:
+                return None
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()

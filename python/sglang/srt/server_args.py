@@ -2245,8 +2245,8 @@ class ServerArgs:
             "--schedule-dp-policy",
             type=str,
             default=ServerArgs.schedule_dp_policy,
-            choices=["fcfs_full_decode"],
-            help="The scheduling policy of the requests when dp-size > 1 .",
+            choices=["decrease_idle"],
+            help="The scheduling policy of the requests when dp-size > 1.",
         )
         parser.add_argument(
             "--enable-priority-scheduling",
