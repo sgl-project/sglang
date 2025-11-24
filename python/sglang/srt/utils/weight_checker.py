@@ -56,7 +56,10 @@ def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict
         if torch.all(expect == actual):
             continue
 
-        error_messages.append()
+        error_messages.append(
+            f"name={name} "
+            f"{TODO}"
+        )
 
     raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
