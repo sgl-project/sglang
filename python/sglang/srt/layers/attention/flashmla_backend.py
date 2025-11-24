@@ -75,6 +75,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self.is_fp8_kvcache = model_runner.kv_cache_dtype.startswith("fp8")
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
@@ -104,6 +105,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
+                self.is_fp8_kvcache
             )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
