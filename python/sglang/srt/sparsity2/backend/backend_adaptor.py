@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 class BackendAdaptor(ABC):
     """Base class for attention backend adaptors."""
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, sparse_mode):
         self.device = device
+        self.sparse_mode = sparse_mode
         self._original_metadata = None
 
     def save_original_metadata(self, metadata: Any) -> None:
@@ -22,7 +23,7 @@ class BackendAdaptor(ABC):
         pass
 
     @abstractmethod
-    def adapt_for_page_wise(
+    def adapt_for_attn_metadata(
         self,
         selected_indices: torch.Tensor,
         valid_lengths: torch.Tensor,
@@ -32,21 +33,9 @@ class BackendAdaptor(ABC):
         req_to_token: torch.Tensor,
         page_size: int,
         layer_id: int,
+        **kwargs,
     ) -> Any:
-        pass
-
-    @abstractmethod
-    def adapt_for_token_wise(
-        self,
-        selected_indices: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: Any,
-        forward_batch: "ForwardBatch",
-        req_to_token: torch.Tensor,
-        page_size: int,
-        layer_id: int,
-    ) -> Any:
+        """Adapt attention metadata for sparse attention."""
         pass
 
 
@@ -54,7 +43,6 @@ class FlashAttentionAdaptor(BackendAdaptor):
     """Adaptor for FlashAttention backend."""
 
     def save_original_metadata(self, metadata: Any) -> None:
-        """Clone and save original metadata."""
         self._original_metadata = {
             "page_table": metadata.page_table.clone(),
             "cache_seqlens_int32": metadata.cache_seqlens_int32.clone(),
@@ -62,7 +50,46 @@ class FlashAttentionAdaptor(BackendAdaptor):
             "max_seq_len_k": metadata.max_seq_len_k,
         }
 
-    def adapt_for_page_wise(
+    def adapt_for_attn_metadata(
+        self,
+        selected_indices: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        current_metadata: Any,
+        forward_batch: "ForwardBatch",
+        req_to_token: torch.Tensor,
+        page_size: int,
+        layer_id: int,
+        **kwargs,
+    ) -> Any:
+        from sglang.srt.sparsity2.algorithms.base_algorithm import SparseMode
+
+        if self.sparse_mode == SparseMode.PAGE_WISE:
+            return self._adapt_for_page_wise(
+                selected_indices,
+                valid_lengths,
+                sparse_mask,
+                current_metadata,
+                forward_batch,
+                req_to_token,
+                page_size,
+                layer_id,
+            )
+        elif self.sparse_mode == SparseMode.TOKEN_WISE:
+            return self._adapt_for_token_wise(
+                selected_indices,
+                valid_lengths,
+                sparse_mask,
+                current_metadata,
+                forward_batch,
+                req_to_token,
+                page_size,
+                layer_id,
+            )
+        else:
+            return current_metadata
+
+    def _adapt_for_page_wise(
         self,
         selected_indices: torch.Tensor,
         valid_lengths: torch.Tensor,
@@ -126,7 +153,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
 
         return current_metadata
 
-    def adapt_for_token_wise(
+    def _adapt_for_token_wise(
         self,
         selected_indices: torch.Tensor,
         valid_lengths: torch.Tensor,
@@ -137,51 +164,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         page_size: int,
         layer_id: int,
     ) -> Any:
-        # assert page_size == 1, f"TOKEN_WISE sparse requires page_size=1, got {page_size}"
-
-        pass
-        # if self._original_metadata is None:
-        #     return current_metadata
-
-        # bs = forward_batch.batch_size
-        # device = selected_indices.device
-
-        # if not sparse_mask.any():
-        #     return current_metadata
-
-        # original_page_table = self._original_metadata["page_table"]
-        # max_seq_len_k = self._original_metadata["max_seq_len_k"]
-
-        # max_selected = selected_indices.shape[1]
-        # sparse_page_table = torch.zeros((bs, max_selected), dtype=torch.int32, device=device)
-
-        # valid_mask = selected_indices >= 0
-        # selected_clamped = selected_indices.clamp(0, max_seq_len_k - 1)
-
-        # batch_indices = torch.arange(bs, device=device).unsqueeze(1).expand(-1, max_selected)
-        # gathered = original_page_table[batch_indices, selected_clamped]
-        # sparse_page_table = torch.where(valid_mask, gathered, torch.zeros_like(gathered))
-
-        # sparse_page_table = torch.where(
-        #     sparse_mask.unsqueeze(1).expand(-1, max_selected),
-        #     sparse_page_table,
-        #     original_page_table[:, :max_selected]
-        # )
-
-        # cache_seqlens = torch.where(
-        #     sparse_mask,
-        #     valid_lengths,
-        #     self._original_metadata["cache_seqlens_int32"]
-        # ).to(torch.int32)
-
-        # current_metadata.page_table[:, :max_selected] = sparse_page_table
-        # current_metadata.cache_seqlens_int32 = cache_seqlens
-        # current_metadata.cu_seqlens_k = torch.nn.functional.pad(
-        #     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
-        # )
-        # current_metadata.max_seq_len_k = int(cache_seqlens.max())
-
-        # return current_metadata
+        return current_metadata
 
     def _logical_to_physical_pages(
         self,
@@ -216,3 +199,72 @@ class FlashAttentionAdaptor(BackendAdaptor):
         )
 
         return physical_pages.to(torch.int32)
+
+
+class NSABackendAdaptor(BackendAdaptor):
+    """Adaptor for NSA (Native Sparse Attention) backend."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        sparse_mode,
+        req_to_token_pool,
+        decode_offload_manager,
+    ):
+        super().__init__(device, sparse_mode)
+        self.req_to_token_pool = req_to_token_pool
+        self.decode_offload_manager = decode_offload_manager
+
+    def adapt_for_attn_metadata(
+        self,
+        selected_indices: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        current_metadata: Any,
+        forward_batch: "ForwardBatch",
+        req_to_token: torch.Tensor,
+        page_size: int,
+        layer_id: int,
+        **kwargs,
+    ) -> Optional[torch.Tensor]:
+        """Transform NSA topk indices to physical device indices."""
+        req_pool_indices = forward_batch.req_pool_indices
+        hierarchical_mask = sparse_mask
+        transformed_indices = torch.empty_like(selected_indices, dtype=torch.int32)
+
+        if hierarchical_mask.any():
+            hierarchical_device_indices = (
+                self.decode_offload_manager.transform_sparse_top_k_cache(
+                    req_pool_indices=req_pool_indices[hierarchical_mask],
+                    top_k_result=selected_indices[hierarchical_mask],
+                    layer_id=layer_id,
+                )
+            )
+            transformed_indices[hierarchical_mask] = hierarchical_device_indices.to(
+                torch.int32
+            )
+
+        if (~hierarchical_mask).any():
+            from sglang.srt.layers.attention.nsa.transform_index import (
+                transform_index_page_table_decode,
+            )
+
+            non_hierarchical_mask = ~hierarchical_mask
+            max_seqlen_k = int(forward_batch.seq_lens.max().item())
+            page_table = self.req_to_token_pool.req_to_token[
+                req_pool_indices[non_hierarchical_mask], :max_seqlen_k
+            ]
+            non_hierarchical_device_indices = transform_index_page_table_decode(
+                page_table=page_table,
+                topk_indices=selected_indices[non_hierarchical_mask],
+                page_size=1,
+            )
+            transformed_indices[non_hierarchical_mask] = non_hierarchical_device_indices
+
+        if layer_id == 0:
+            logger.info(
+                f"NSA transformed: shape={transformed_indices.shape}, "
+                f"head={transformed_indices[:, :20].tolist()}"
+            )
+
+        return transformed_indices

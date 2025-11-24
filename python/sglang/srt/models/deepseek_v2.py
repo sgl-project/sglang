@@ -29,7 +29,6 @@ import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
-from python.sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
@@ -118,6 +117,7 @@ from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_lo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.single_batch_overlap import SboFlags
+from sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (

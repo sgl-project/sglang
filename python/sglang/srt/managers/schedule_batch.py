@@ -65,12 +65,11 @@ from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
-    alloc_for_nsa_decode,
     evict_from_tree_cache,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.memory_pool import NSAReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
@@ -1663,13 +1662,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.prepare_encoder_info_decode()
 
         # Allocate memory
-        if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
-            self.out_cache_loc, self.out_index_cache_loc = alloc_for_nsa_decode(
-                self, token_per_req=1
-            )
-        else:
-            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
-            self.out_index_cache_loc = None
+        self.out_cache_loc, self.out_index_cache_loc = alloc_for_decode(
+            self, token_per_req=1
+        )
 
         # Update req-level memory management fields
         for req in self.reqs:
@@ -1932,7 +1927,7 @@ class ModelWorkerBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
-    # NSA: indices of output tokens for indexer_k
+    # The indices of output nsa indexer_k (when enabling hierarchical NSA)
     out_index_cache_loc: Optional[torch.Tensor]
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]

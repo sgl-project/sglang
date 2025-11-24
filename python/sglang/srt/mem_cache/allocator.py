@@ -172,6 +172,12 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
 
+HIERARCHICAL_NSA_DECODE_MAX_TOKENS = 2048 + 1
+def is_enable_hierarchical_nsa(allocator):
+    """Check if NSA hierarchical allocation is enabled."""
+    return isinstance(allocator, NSAHybridTokenToKVPoolAllocator)
+
+
 class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
     NSA Hybrid Allocator for hierarchical NSA
@@ -266,7 +272,6 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         index_k_last_loc: torch.Tensor = None,
     ):
-        """Decode allocation: both KV and nsa indexer_k"""
         return self.kv_allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
     def alloc_index_k_only_decode(
@@ -294,18 +299,6 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.kv_allocator.free(kv_indices)
         if index_k_indices is not None and index_k_indices.numel() > 0:
             self.index_k_allocator.free(index_k_indices)
-
-    def free_kv_only(self, kv_indices: torch.Tensor):
-        """Free only KV cache, keep indexer_k"""
-        if kv_indices.numel() == 0:
-            return
-        self.kv_allocator.free(kv_indices)
-
-    def free_index_k_only(self, index_k_indices: torch.Tensor):
-        """Free only indexer_k, keep KV"""
-        if index_k_indices.numel() == 0:
-            return
-        self.index_k_allocator.free(index_k_indices)
 
     def available_size(self):
         """Return KV allocator's available size (for scheduler memory check)"""

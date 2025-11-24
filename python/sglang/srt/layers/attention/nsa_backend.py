@@ -23,7 +23,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     compute_nsa_seqlens,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.mem_cache.common import HIERARCHICAL_NSA_DECODE_MAX_TOKENS
+from sglang.srt.mem_cache.allocator import (
+    HIERARCHICAL_NSA_DECODE_MAX_TOKENS,
+    is_enable_hierarchical_nsa,
+)
 from sglang.srt.mem_cache.memory_pool import NSAReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_hip
@@ -229,6 +232,9 @@ class NativeSparseAttnBackend(AttentionBackend):
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.use_hierarchical_nsa = is_enable_hierarchical_nsa(
+            model_runner.token_to_kv_pool_allocator
+        )
 
         global NSA_PREFILL_IMPL, NSA_DECODE_IMPL
         NSA_PREFILL_IMPL = model_runner.server_args.nsa_prefill_backend
@@ -305,7 +311,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         # Build index_page_table for indexer_k if enabling hierarchical NSA
         index_page_table = None
-        if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
+        if self.use_hierarchical_nsa:
             index_page_table = self.req_to_token_pool.req_to_nsa_index_k[
                 forward_batch.req_pool_indices, :max_seqlen_k
             ]
@@ -666,6 +672,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
         real_page_table = self._transform_table_1_to_real(page_table_1)
+        index_real_page_table = None
 
         if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
             index_real_page_table = torch.zeros_like(real_page_table)
@@ -832,11 +839,13 @@ class NativeSparseAttnBackend(AttentionBackend):
             metadata.real_page_table[:, :new_len].copy_(real_table)
 
             # Update index_real_page_table
-            if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
+            if self.use_hierarchical_nsa:
+                max_len = int(seq_lens_cpu.max().item())
                 index_page_indices = self.req_to_token_pool.req_to_nsa_index_k[
                     req_pool_indices, :max_len
                 ]
                 index_real_table = self._transform_table_1_to_real(index_page_indices)
+                new_len = index_real_table.shape[1]
                 if metadata.index_real_page_table is None:
                     metadata.index_real_page_table = torch.zeros_like(
                         metadata.real_page_table
@@ -1070,17 +1079,15 @@ class NativeSparseAttnBackend(AttentionBackend):
         if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
-            page_table_1 = transform_index_page_table_decode(
-                page_table=metadata.page_table_1,
-                topk_indices=topk_indices,
-                page_size=1,
-            )
-
-        # TODO: Only Truncate those requests that have prompt length >= 2048
-        if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
-            page_table_1 = metadata.page_table_1[
-                :, : HIERARCHICAL_NSA_DECODE_MAX_TOKENS - 1
-            ]
+            # Reusing topk_indices for hierarchical NSA, as the sparse coodinator will transform the topk_indices to the indexer_k real table
+            if self.use_hierarchical_nsa:
+                page_table_1 = topk_indices
+            else:
+                page_table_1 = transform_index_page_table_decode(
+                    page_table=metadata.page_table_1,
+                    topk_indices=topk_indices,
+                    page_size=1,
+                )
 
         if NSA_DECODE_IMPL == "flashmla_sparse":
             if q_rope is not None:

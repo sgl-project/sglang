@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import triton
@@ -113,15 +113,17 @@ def sparse_diff_triton_kernel(
 class SparseTopKIndicesHelper:
     """Sparse top_k indices helper handles the differences between the top_k indices and extracts the indices that need to be transformed."""
 
-    def __init__(self, server_args: ServerArgs, host_mem_pool: HostKVCache):
+    def __init__(
+        self, server_args: ServerArgs, host_mem_pool: HostKVCache, max_pool_size: int
+    ):
         self.device = server_args.device
         self.max_model_len = server_args.model_config.context_len
-        self.max_req_bs = server_args.max_num_reqs
+        self.max_pool_size = max_pool_size
         self.host_mem_pool = host_mem_pool
 
         # init bitmap
         self.bitmap = torch.full(
-            (self.max_req_bs, self.max_model_len),
+            (self.max_pool_size, self.max_model_len),
             -1,
             dtype=torch.int16,
             device=self.device,
@@ -176,15 +178,16 @@ class SparseTopKIndicesHelper:
             curr_device_indices[i][mask] = should_load_device_indices[i]
         should_load_device_indices = torch.cat(should_load_device_indices)
         should_load_host_indices = torch.cat(should_load_host_indices)
-
-        # load cache from cpu
-        self.host_mem_pool.load_to_device_per_layer(
-            self.host_mem_pool.device_pool,
-            should_load_host_indices,
-            should_load_device_indices,
-            layer_id,
-            "kernel",
-        )
+        assert len(should_load_device_indices) == len(should_load_host_indices)
+        if len(should_load_device_indices) > 0:
+            # load cache from cpu
+            self.host_mem_pool.load_to_device_per_layer(
+                self.host_mem_pool.device_pool,
+                should_load_host_indices,
+                should_load_device_indices,
+                layer_id,
+                "kernel",
+            )
 
         return curr_device_indices
 
@@ -212,7 +215,7 @@ class DecodeKVCacheOffloadManager:
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                1,
                 server_args.hicache_mem_layout,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
@@ -220,7 +223,7 @@ class DecodeKVCacheOffloadManager:
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                self.page_size,
+                1,
                 server_args.hicache_mem_layout,
             )
         else:
@@ -258,16 +261,25 @@ class DecodeKVCacheOffloadManager:
         req_pool_indices,
         top_k_result,
         layer_id,
-        valid_lengths,
     ):
 
         # get prev data from req_states
-        prev_top_k_result = self.req_states.prev_top_k_result[
-            req_pool_indices, layer_id
-        ]
-        prev_device_indices = self.req_states.prev_device_indices[
-            req_pool_indices, layer_id
-        ]
+        prev_top_k_result = (
+            self.req_states.prev_top_k_result[req_pool_indices, layer_id]
+            .detach()
+            .clone()
+        )
+
+        prev_device_indices = (
+            self.req_states.prev_device_indices[req_pool_indices, layer_id]
+            .detach()
+            .clone()
+        )
+
+        self.req_states.prev_top_k_result[req_pool_indices, layer_id] = (
+            top_k_result.detach().clone().long()
+        )
+
         full_host_indices = torch.cat(
             [self.req_states.full_host_indices[idx] for idx in req_pool_indices], dim=0
         )
@@ -282,6 +294,17 @@ class DecodeKVCacheOffloadManager:
         )
         host_start_indices = torch.cumsum(host_indices_lens, dim=-1)
 
+        if layer_id == 0:
+            logger.info(
+                f"shape info: prev topk result shape:{prev_top_k_result.shape}, curr topk result shape:{top_k_result.shape}, device indices shape:{prev_device_indices.shape}, full host indices shape:{full_host_indices.shape}, start indices shape:{host_start_indices.shape}"
+            )
+            logger.info(
+                f"prev topk result:{prev_top_k_result.tolist()}, \n curr topk result:{top_k_result.tolist()}\n"
+            )
+            logger.info(f"device indices: {prev_device_indices.tolist()}")
+            logger.info(
+                f"start indices: {host_start_indices.tolist()}, full host indices: {full_host_indices.tolist()}"
+            )
         curr_device_indices = self.sparse_indices_helper.load_top_k_cache(
             prev_top_k_result=prev_top_k_result,
             curr_top_k_result=top_k_result,
@@ -292,7 +315,6 @@ class DecodeKVCacheOffloadManager:
         )
 
         # update indices
-        self.req_states.prev_top_k_result[req_pool_indices, layer_id] = top_k_result
         self.req_states.prev_device_indices[req_pool_indices, layer_id] = (
             curr_device_indices
         )
@@ -305,7 +327,7 @@ class DecodeKVCacheOffloadManager:
         self.request_counter += 1
         ack_id = self.request_counter
         host_indices = self.cache_controller.write(
-            device_indices=out_alloc_len,
+            device_indices=out_alloc_len.long(),
             node_id=ack_id,
         )
         assert host_indices is not None, "Host out of memory"
@@ -340,14 +362,21 @@ class DecodeKVCacheOffloadManager:
         )
         for i in range(len(req_pool_indices)):
             full_host_indices = self.req_states.full_host_indices[req_pool_indices[i]]
-            self.req_states.full_host_indices[req_pool_indices[i]] = torch.cat(
-                [full_host_indices, host_indices[i].to(self.req_states.device)]
-            )
+            if len(host_indices) > 0:
+                host_idx_i = host_indices[i].to(self.req_states.device).reshape(-1)
+                self.req_states.full_host_indices[req_pool_indices[i]] = torch.cat(
+                    [full_host_indices, host_idx_i]
+                )
+            else:
+                logger.warning(
+                    f"Host indices is empty for request {req_pool_indices[i]}"
+                )
 
     def offload_prefill_full_kv_cache(self, req):
+        offloaded_len = len(req.origin_input_ids)
         token_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.seqlen - 1
-        ]
+            req.req_pool_idx, :offloaded_len
+        ].long()
 
         self.request_counter += 1
         ack_id = self.request_counter
@@ -357,6 +386,9 @@ class DecodeKVCacheOffloadManager:
         )
         assert host_indices is not None, "Host out of memory"
         self.sparse_prefill_ongoing_offload[ack_id] = (host_indices, req)
+        logger.info(
+            f"Offloaded prefill full KV cache for request {req.rid}, offloaded len:{offloaded_len}, host len:{len(host_indices)}"
+        )
         return ack_id
 
     def check_prefill_offload_progress(self):
@@ -364,18 +396,20 @@ class DecodeKVCacheOffloadManager:
             return
 
         cc = self.cache_controller
-        qsizes = torch.tensor(
-            [
-                len(cc.ack_write_queue),
-            ],
-            dtype=torch.int,
-        )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+        while True:
+            qsizes = torch.tensor(
+                [
+                    len(cc.ack_write_queue),
+                ],
+                dtype=torch.int,
             )
-        finish_count = qsizes.tolist()[0]
-        assert finish_count == 1
+            if self.tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                )
+            finish_count = qsizes.tolist()[0]
+            if finish_count > 0:
+                break
 
         _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
         finish_event.synchronize()

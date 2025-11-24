@@ -1,5 +1,5 @@
 import logging
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
-    """Page-wise sparse with mean pooling representation and TopK selection."""
+    """Page-wise sparse attention with mean pooling and TopK selection."""
 
     PAGE_REPR_STORAGE_NAME = "page_repr"
 
@@ -20,7 +20,6 @@ class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
         self, config, device: torch.device, start_layer: int, end_layer: int, **kwargs
     ):
         super().__init__(config, device, **kwargs)
-        # self.sparse_ratio = getattr(config, "sparse_ratio", 0.9)
         self.sparse_ratio = 0.9
         self.page_size = getattr(config, "page_size", 64)
         self.num_recent_pages = 4
@@ -49,14 +48,12 @@ class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
         repr_constructed,
         prompt_lens,
     ) -> torch.Tensor:
-        is_prefill = forward_batch.forward_mode.is_extend()
-        if not is_prefill:
+        if not forward_batch.forward_mode.is_extend():
             return torch.zeros_like(req_pool_indices, dtype=torch.bool)
 
-        mask = ~repr_constructed[req_pool_indices] & (
+        return ~repr_constructed[req_pool_indices] & (
             seq_lens >= prompt_lens[req_pool_indices]
         )
-        return mask
 
     def construct_representations(
         self,
@@ -161,14 +158,19 @@ class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
         queries: torch.Tensor,
         layer_id: int,
         req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
         sparse_mask: torch.Tensor,
+        attn_metadata: Optional[Any],
         **kwargs,
     ) -> tuple:
-        queries = queries.view(bs, -1)
+        seq_lens = (
+            attn_metadata.cache_seqlens_int32 if attn_metadata is not None else None
+        )
         bs, device = queries.shape[0], queries.device
+        queries = queries.view(bs, -1)
         num_pages = (seq_lens + self.page_size - 1) // self.page_size
-        max_pages = int(torch.max(num_pages).item()) if num_pages.numel() > 0 else 1
+        max_pages = max(
+            int(torch.max(num_pages).item()) if num_pages.numel() > 0 else 1, 1
+        )
 
         selected_indices = torch.full(
             (bs, max_pages), -1, dtype=torch.int32, device=device

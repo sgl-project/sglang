@@ -1886,7 +1886,7 @@ class Scheduler(
             sparse_coordinator = get_sparse_coordinator()
             if sparse_coordinator is not None:
                 for req in new_batch.reqs:
-                    sparse_coordinator.request_begin(req)
+                    sparse_coordinator.on_request_begin(req)
 
         # Mixed-style chunked prefill
         if (

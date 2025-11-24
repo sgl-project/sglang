@@ -440,14 +440,7 @@ class Indexer(CustomOp):
         key = self._get_k_bf16(x, positions, enable_dual_stream)
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-        index_loc = (
-            forward_batch.out_index_cache_loc
-            if forward_batch.out_index_cache_loc is not None
-            else forward_batch.out_cache_loc
-        )
-        if not index_loc.is_contiguous():
-            index_loc = index_loc.contiguous()
-
+        index_loc = self._get_index_cache_loc(forward_batch)
         forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=index_loc,
@@ -627,14 +620,7 @@ class Indexer(CustomOp):
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
         # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
-        index_loc = (
-            forward_batch.out_index_cache_loc
-            if forward_batch.out_index_cache_loc is not None
-            else forward_batch.out_cache_loc
-        )
-        if not index_loc.is_contiguous():
-            index_loc = index_loc.contiguous()
-
+        index_loc = self._get_index_cache_loc(forward_batch)
         forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=index_loc,
@@ -678,6 +664,16 @@ class Indexer(CustomOp):
                 layer_id=layer_id,
             )
         return topk_result
+
+    def _get_index_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        index_loc = (
+            forward_batch.out_index_cache_loc
+            if forward_batch.out_index_cache_loc is not None
+            else forward_batch.out_cache_loc
+        )
+        if not index_loc.is_contiguous():
+            index_loc = index_loc.contiguous()
+        return index_loc
 
     def forward_npu(
         self,

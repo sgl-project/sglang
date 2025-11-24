@@ -1692,11 +1692,10 @@ class ModelRunner:
                 )
             else:
                 # Check if we should use NSA ReqToTokenPool
-                is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
                 if (
                     self.server_args.enable_hierarchical_nsa
-                    and is_nsa_model
-                    and self.page_size > 1
+                    # and self.server_args.enable_sparse_attn
+                    and is_deepseek_nsa(self.model_config.hf_config)
                 ):
                     self.req_to_token_pool = NSAReqToTokenPool(
                         size=max_num_reqs,
@@ -1890,6 +1889,7 @@ class ModelRunner:
                     # Check if we should use NSA hybrid allocator
                     if (
                         self.server_args.enable_hierarchical_nsa
+                        # and self.server_args.enable_sparse_attn
                         and is_nsa_model
                         and isinstance(self.token_to_kv_pool, NSATokenToKVPool)
                     ):

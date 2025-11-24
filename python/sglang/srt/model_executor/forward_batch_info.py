@@ -198,7 +198,7 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
-    # NSA: indices for nsa indexer_k
+    # The indices of output nsa indexer_k (when enabling hierarchical NSA)
     out_index_cache_loc: Optional[torch.Tensor] = None
 
     # The original sequence length without being chunked. Qwen-1M related.

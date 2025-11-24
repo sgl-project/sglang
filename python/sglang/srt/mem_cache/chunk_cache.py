@@ -8,12 +8,14 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.mem_cache.allocator import (
+    HIERARCHICAL_NSA_DECODE_MAX_TOKENS,
     BaseTokenToKVPoolAllocator,
-    NSAHybridTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
+    is_enable_hierarchical_nsa,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -58,22 +60,34 @@ class ChunkCache(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_committed_len = req.pop_committed_kv_cache()
 
-        if isinstance(self.token_to_kv_pool_allocator, NSAHybridTokenToKVPoolAllocator):
-            kv_free_len = kv_committed_len
+        if is_enable_hierarchical_nsa(self.token_to_kv_pool_allocator):
+            if len(req.origin_input_ids) >= HIERARCHICAL_NSA_DECODE_MAX_TOKENS:
+                kv_free_len = ceil_align(
+                    HIERARCHICAL_NSA_DECODE_MAX_TOKENS, self.page_size
+                )
+            else:
+                kv_free_len = kv_committed_len
+
+            index_k_free_len = len(req.origin_input_ids) + max(
+                len(req.output_ids) - 1, 0
+            )
+
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_free_len
             ]
-            index_k_len = req.seqlen
             index_k_indices = self.req_to_token_pool.req_to_nsa_index_k[
-                req.req_pool_idx, :index_k_len
+                req.req_pool_idx, :index_k_free_len
             ]
 
             self.req_to_token_pool.free(req.req_pool_idx)
             self.protected_size_ -= len(req.prefix_indices)
-
             self.token_to_kv_pool_allocator.free((kv_indices, index_k_indices))
+
             logger.info(
-                f"Free KV and index_k cache for request {req.rid} with shape {kv_indices.shape} and {index_k_indices.shape}"
+                f"Free KV and index_k cache for request {req.rid}: "
+                f"kv_shape={kv_indices.shape}, index_k_shape={index_k_indices.shape}, "
+                f"kv_committed={kv_committed_len}, prompt_len={len(req.origin_input_ids)}, "
+                f"output_len={len(req.output_ids)}"
             )
         else:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -82,10 +96,10 @@ class ChunkCache(BasePrefixCache):
 
             self.req_to_token_pool.free(req.req_pool_idx)
             self.protected_size_ -= len(req.prefix_indices)
-
             self.token_to_kv_pool_allocator.free(kv_indices)
+
             logger.info(
-                f"Only Free KV cache for request {req.rid} with shape {kv_indices.shape}"
+                f"Free KV cache for request {req.rid}: kv_shape={kv_indices.shape}"
             )
 
     def cache_unfinished_req(self, req: Req, chunked=False):

@@ -104,6 +104,7 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             logprob_pt = 0
+            sparse_coordinator = get_sparse_coordinator()
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
@@ -121,6 +122,9 @@ class SchedulerOutputProcessorMixin:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+
+                        if sparse_coordinator is not None:
+                            sparse_coordinator.on_request_prefill_end(req)
 
                         # Truncate KV cache after prefill completes
                         truncate_kv_cache_after_prefill(
@@ -353,7 +357,7 @@ class SchedulerOutputProcessorMixin:
 
                 req.time_stats.completion_time = time.perf_counter()
                 if sparse_coordinator is not None:
-                    sparse_coordinator.request_end(req)
+                    sparse_coordinator.on_request_end(req)
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
