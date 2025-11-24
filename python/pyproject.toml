@@ -93,6 +93,7 @@ diffusion = [
     "remote-pdb",
     "st_attn ==0.0.7",
     "vsa==0.0.4",
+    "runai_model_streamer",
 ]
 
 [tool.uv.extra-build-dependencies]
