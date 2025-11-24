@@ -1,3 +1,5 @@
+import torch
+
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
@@ -27,22 +29,14 @@ class WeightChecker:
         yield from self._model_runner.model.named_parameters()
 
 def _random_fill_tensor(t: torch.Tensor, *, low=None, high=None):
-    """
-    Fill tensor `t` in-place with uniform random values.
-    - Floating: U(0,1)
-    - Complex: real/imag both U(0,1)
-    - Bool: Bernoulli with p=0.5
-    - Integer: uniform integer in [low, high)
-    """
     device = t.device
     shape = t.shape
     dtype = t.dtype
 
-    # Floating types (float32/64/16 + bfloat16)
     if dtype.is_floating_point:
         gen_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
         tmp = torch.rand(shape, device=device, dtype=gen_dtype)
-        t.copy_(tmp.to(dtype, copy=False))
+        t.copy_(tmp.to(dtype))
         return
 
     # Complex types
