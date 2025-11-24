@@ -113,14 +113,17 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        if dtype == torch.float32 or (
+        if (
             (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
             and not (_is_xpu)
         ):
             from vllm._custom_ops import rotary_embedding
 
-            self.vllm_rotary_embedding = rotary_embedding
+            self.use_fallback_kernel = True
+            self.fallback_rotary_embedding = rotary_embedding
+        else:
+            self.use_fallback_kernel = False
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
@@ -273,11 +276,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if (
-            _is_cuda
-            and (self.head_size in [64, 128, 256, 512])
-            and self.dtype != torch.float32
-        ):
+        if not self.use_fallback_kernel:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -297,7 +296,7 @@ class RotaryEmbedding(CustomOp):
                 fused_set_kv_buffer_arg is None
             ), "save kv cache is not supported for vllm_rotary_embedding."
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            self.vllm_rotary_embedding(
+            self.fallback_rotary_embedding(
                 positions,
                 query,
                 key,
@@ -1301,7 +1300,6 @@ def triton_mrope(
     return q, k
 
 
-@torch._dynamo.disable()
 def triton_mrope_wrapper(
     query,
     key,
@@ -1428,15 +1426,18 @@ class MRotaryEmbedding(RotaryEmbedding):
                     dim=-1,
                 )
 
+        seq_len_q = query.shape[0]
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
+        query = query.view(seq_len_q, -1, self.head_size)
+
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
+        seq_len_k = key.shape[0]
         key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
+        key = key.view(seq_len_k, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
@@ -1467,7 +1468,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         else:
             return self._forward_native(positions, query, key)
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_triton(
         self,
         positions: torch.Tensor,
@@ -1502,7 +1502,9 @@ class MRotaryEmbedding(RotaryEmbedding):
 
             return q.reshape(query_shape), k.reshape(key_shape)
 
-        query = query.view(num_tokens, -1, self.head_size)
+        seq_len_q = query.shape[0]
+        query = query.view(seq_len_q, -1, self.head_size)
+
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)

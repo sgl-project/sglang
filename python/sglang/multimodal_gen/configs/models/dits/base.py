@@ -43,7 +43,7 @@ class DiTArchConfig(ArchConfig):
 class DiTConfig(ModelConfig):
     arch_config: DiTArchConfig = field(default_factory=DiTArchConfig)
 
-    # sgl-diffusionDiT-specific parameters
+    # sglang-diffusion DiT-specific parameters
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
 

@@ -562,8 +562,8 @@ class Req:
         self.host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
-        # The prefix length of the last prefix matching
-        self.last_matched_prefix_len: int = 0
+        # The prefix length that is inserted into the tree cache
+        self.cache_protected_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -775,7 +775,7 @@ class Req:
                     else {}
                 ),
             )
-            self.last_matched_prefix_len = len(self.prefix_indices)
+            self.cache_protected_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -1760,7 +1760,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def merge_batch(self, other: "ScheduleBatch"):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
-        # 1) current batch is always prefill, whose seq_lens and allocate_lens are not a future
+        # 1) current batch is always prefill, whose seq_lens is not a future
         # 2) other batch is always decode, which is finished in previous step
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because

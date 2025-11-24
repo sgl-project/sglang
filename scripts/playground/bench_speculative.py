@@ -13,6 +13,7 @@ import json
 import os
 import time
 from types import SimpleNamespace
+from typing import List
 
 import numpy as np
 import requests
@@ -54,17 +55,18 @@ class FakeTokenizer:
         return []
 
 
-def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
+def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
     # format: (prompt, input_len, output len). We set input_len as a dummy value 0.
     if is_multimodal:
         backend = "sglang-oai-chat"
         api_url = f"{base_url}/v1/chat/completions"
         input_requests = sample_mmmu_requests(
             num_prompts,
-            tokenizer,
+            processor,
             backend=backend,
             fixed_output_len=512,
         )
+        tokenizer = processor.tokenizer
     else:
         padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
             :num_prompts
@@ -74,6 +76,7 @@ def send_one_batch(base_url, num_prompts, batch_size, tokenizer, is_multimodal):
         ]
         backend = "sglang"
         api_url = f"{base_url}/generate"
+        tokenizer = processor
 
     # We need to set some dummy values in order to call `benchmark` below.
     args = SimpleNamespace(
@@ -227,14 +230,21 @@ def main(args, server_args):
             },
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path, trust_remote_code=server_args.trust_remote_code
-        )
+        if args.is_multimodal:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                args.model_path, trust_remote_code=server_args.trust_remote_code
+            )
+        else:
+            processor = AutoTokenizer.from_pretrained(
+                args.model_path, trust_remote_code=server_args.trust_remote_code
+            )
 
         try:
             # Warmup
             send_one_batch(
-                base_url, batch_size, batch_size, tokenizer, args.is_multimodal
+                base_url, batch_size, batch_size, processor, args.is_multimodal
             )
 
             # Benchmark
@@ -242,7 +252,7 @@ def main(args, server_args):
                 base_url,
                 max(args.num_prompts, batch_size),
                 batch_size,
-                tokenizer,
+                processor,
                 args.is_multimodal,
             )
         finally:

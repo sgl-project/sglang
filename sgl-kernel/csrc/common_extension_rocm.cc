@@ -100,6 +100,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "moe_softcapping, Tensor? correction_bias) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
+  m.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
+
   /*
    * From csrc/speculative
    */

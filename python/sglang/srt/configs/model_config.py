@@ -959,6 +959,9 @@ multimodal_model_archs = [
     "JetVLMForConditionalGeneration",
 ]
 
+if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
+    multimodal_model_archs.append(envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value)
+
 
 def is_multimodal_model(model_architectures: List[str]):
     if any(
