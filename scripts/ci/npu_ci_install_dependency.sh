@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PIP_INSTALL="pip install --no-cache-dir"
+PIP_INSTALL="python3 -m pip install --no-cache-dir"
 DEVICE_TYPE=$1
 
 
@@ -19,29 +19,23 @@ apt update -y && apt install -y \
     ccache \
     ca-certificates
 update-ca-certificates
-python3 -m ${PIP_INSTALL} --upgrade pip
+${PIP_INSTALL} --upgrade pip
+# Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
+${PIP_INSTALL} wheel==0.45.1
 
 
-### Download MemFabricV2
-MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl"
-MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
-wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && ${PIP_INSTALL} "./${MF_WHL_NAME}"
-
-
-### Install vLLM
-VLLM_TAG=v0.8.5
-git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
-(cd vllm && VLLM_TARGET_DEVICE="empty" ${PIP_INSTALL} -v -e .)
+### Install MemFabric
+${PIP_INSTALL} mf-adapter==1.0.0
 
 
 ### Install PyTorch and PTA
-PYTORCH_VERSION=2.6.0
-TORCHVISION_VERSION=0.21.0
-${PIP_INSTALL} torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
+PYTORCH_VERSION="2.8.0"
+TORCHVISION_VERSION="0.23.0"
+${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu
 
-PTA_VERSION="v7.1.0.1-pytorch2.6.0"
-PTA_NAME="torch_npu-2.6.0.post2+git95d6260-cp311-cp311-linux_aarch64.whl"
-PTA_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/torch_npu-2.6.0.post2%2Bgit95d6260-cp311-cp311-linux_aarch64.whl"
+PTA_VERSION="v7.2.0-pytorch${PYTORCH_VERSION}"
+PTA_NAME="torch_npu-${PYTORCH_VERSION}-cp311-cp311-manylinux_2_28_aarch64.whl"
+PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_NAME}"
 wget -O "${PTA_NAME}" "${PTA_URL}" && ${PIP_INSTALL} "./${PTA_NAME}"
 
 
@@ -59,11 +53,9 @@ wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./
 
 
 ### Install sgl-kernel-npu
-SGL_KERNEL_NPU_TAG="20251110"
+SGL_KERNEL_NPU_TAG="20251120"
 git clone --depth 1 https://github.com/sgl-project/sgl-kernel-npu.git --branch ${SGL_KERNEL_NPU_TAG}
-# pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
-pip install wheel==0.45.1
-(cd sgl-kernel-npu && bash ./build.sh && pip install output/deep_ep*.whl output/sgl_kernel_npu*.whl && cd "$(pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so)
+(cd sgl-kernel-npu && bash ./build.sh && ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl && cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so)
 
 
 ### Install CustomOps (TODO: to be removed once merged into sgl-kernel-npu)
