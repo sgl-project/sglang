@@ -163,7 +163,8 @@ class VisionSdpaAttention(nn.Module):
         Returns:
             attention mask tensor or None
         """
-        if cu_seqlens is None:
+        # Avoid creating a mask if there is only one sequence
+        if cu_seqlens is None or len(cu_seqlens) <= 2:
             return None
 
         cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
