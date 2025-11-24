@@ -216,6 +216,7 @@ class DecodingStage(PipelineStage):
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             trajectory_decoded=trajectory_decoded,
+            timings=batch.timings,
         )
 
         # Offload models if needed

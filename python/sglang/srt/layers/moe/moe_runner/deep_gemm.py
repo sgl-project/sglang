@@ -104,6 +104,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
         assert self.config.activation == "silu"
+        assert self.config.is_gated
 
     def run(
         self,
@@ -111,7 +112,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> DeepGemmRunnerOutput:
-
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(
                 runner_input, quant_info, running_state
@@ -128,7 +128,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-
         from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
@@ -212,7 +211,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.ep_moe.kernels import (
             silu_and_mul_masked_post_quant_fwd,
@@ -339,10 +337,12 @@ def pre_permute_standard_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-
     from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
 
-    hidden_states, topk_output = dispatch_output
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
     topk_weights, topk_ids, _ = topk_output
 
     hidden_states_shape = hidden_states.shape
@@ -429,7 +429,6 @@ def pre_permute_deepep_ll_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
         dispatch_output
     )
@@ -456,7 +455,6 @@ def post_permute_deep_gemm_to_deepep_ll(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPLLCombineInput:
-
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
     return DeepEPLLCombineInput(
@@ -473,7 +471,6 @@ def pre_permute_deepep_normal_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-
     from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
 
     (
@@ -566,7 +563,6 @@ def post_permute_deep_gemm_to_deepep_normal(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPNormalCombineInput:
-
     from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
 
