@@ -60,6 +60,8 @@ from sglang.srt.multimodal.mm_utils import (
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
+from sglang.srt.server_args import get_global_server_args
+
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -655,7 +657,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
-        self.use_data_parallel = use_data_parallel
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
 
         self.visual = Qwen3VLMoeVisionModel(
@@ -665,6 +667,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
+            use_data_parallel=self.use_data_parallel
         )
 
         # TODO: make it more elegant
