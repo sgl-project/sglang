@@ -40,7 +40,6 @@ from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
-from sglang.srt.diffusion.config import DiffusionConfig
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -61,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -289,8 +289,8 @@ class Scheduler(
         # Init model config
         self.model_config = ModelConfig.from_server_args(server_args)
 
-        # Init diffusion config
-        self.diffusion_config = DiffusionConfig.from_server_args(server_args)
+        # Init diffusion LLM config
+        self.dllm_config = DllmConfig.from_server_args(server_args)
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
@@ -453,10 +453,10 @@ class Scheduler(
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
-        if self.diffusion_config is not None:
+        if self.dllm_config is not None:
             # We currently leverage chunked prefill to implement block diffusion
-            # for diffusion models.
-            self.chunked_prefill_size = self.diffusion_config.block_size
+            # for diffusion LLM.
+            self.chunked_prefill_size = self.dllm_config.block_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
@@ -1292,7 +1292,7 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
-                diffusion_config=self.diffusion_config,
+                dllm_config=self.dllm_config,
             )
             req.tokenizer = self.tokenizer
 
@@ -1669,7 +1669,7 @@ class Scheduler(
         )
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        if self.diffusion_config is not None:
+        if self.dllm_config is not None:
             if self.chunked_req is not None and self.chunked_req.finished():
                 self.chunked_req = None
 
@@ -1905,7 +1905,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
-            diffusion_config=self.diffusion_config,
+            dllm_config=self.dllm_config,
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -2140,8 +2140,8 @@ class Scheduler(
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
-            if batch.is_diffusion():
-                self.process_batch_result_diffusion(batch, result)
+            if batch.is_dllm():
+                self.process_batch_result_dllm(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():

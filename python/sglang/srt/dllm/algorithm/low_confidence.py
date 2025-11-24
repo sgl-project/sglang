@@ -4,13 +4,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.diffusion.algorithm.base import DiffusionAlgorithm
+from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-class LowConfidence(DiffusionAlgorithm):
+class LowConfidence(DllmAlgorithm):
 
     def run(
         self,

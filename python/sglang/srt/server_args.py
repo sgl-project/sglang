@@ -240,9 +240,9 @@ class ServerArgs:
     revision: Optional[str] = None
     model_impl: str = "auto"
 
-    # Diffusion
-    diffusion_algorithm: Optional[str] = None
-    diffusion_block_size: Optional[int] = None
+    # Diffusion LLM
+    dllm_algorithm: Optional[str] = None
+    dllm_block_size: Optional[int] = None
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -651,8 +651,8 @@ class ServerArgs:
         # Handle exporting request-level metrics.
         self._handle_request_metrics_exporters()
 
-        # Handle diffusion inference.
-        self._handle_diffusion_inference()
+        # Handle diffusion LLM inference.
+        self._handle_dllm_inference()
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -1875,27 +1875,27 @@ class ServerArgs:
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
 
-    def _handle_diffusion_inference(self):
-        if self.diffusion_algorithm is None:
+    def _handle_dllm_inference(self):
+        if self.dllm_algorithm is None:
             return
         if not self.disable_cuda_graph:
             logger.warning(
-                "Cuda graph is disabled because of using diffusion inference"
+                "Cuda graph is disabled because of using diffusion LLM inference"
             )
             self.disable_cuda_graph = True
         if not self.disable_overlap_schedule:
             logger.warning(
-                "Overlap schedule is disabled because of using diffusion inference"
+                "Overlap schedule is disabled because of using diffusion LLM inference"
             )
             self.disable_overlap_schedule = True
         if not self.disable_radix_cache:
             logger.warning(
-                "Radix cache is disabled because of using diffusion inference"
+                "Radix cache is disabled because of using diffusion LLM inference"
             )
             self.disable_radix_cache = True
         if not self.pp_size > 1:
             logger.warning(
-                "Pipeline parallelism is disabled because of using diffusion inference"
+                "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
             self.pp_size = 1
 
@@ -2017,18 +2017,18 @@ class ServerArgs:
             "implementation.\n",
         )
 
-        # Diffusion
+        # Diffusion LLM
         parser.add_argument(
-            "--diffusion-algorithm",
+            "--dllm-algorithm",
             type=str,
-            default=ServerArgs.diffusion_algorithm,
-            help="The diffusion algorithm.",
+            default=ServerArgs.dllm_algorithm,
+            help="The diffusion LLM algorithm.",
         )
         parser.add_argument(
-            "--diffusion-block-size",
+            "--dllm-block-size",
             type=int,
-            default=ServerArgs.diffusion_block_size,
-            help="The number of tokens processed in each iteration of the block diffusion model.",
+            default=ServerArgs.dllm_block_size,
+            help="The number of tokens processed in each iteration of the block diffusion LLM.",
         )
 
         # HTTP server

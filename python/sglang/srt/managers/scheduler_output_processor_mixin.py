@@ -280,7 +280,7 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
-    def process_batch_result_diffusion(
+    def process_batch_result_dllm(
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,

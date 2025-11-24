@@ -126,6 +126,8 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner.server_args.multi_item_scoring_delimiter
         )
 
+        self.is_dllm_model = model_runner.server_args.dllm_algorithm is not None
+
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
@@ -766,6 +768,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
+                if not self.is_dllm_model:
+                    # TODO: design a better interface
+                    # For other models, use causal attention for the ragged part as previously
+                    causal = True
+
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),

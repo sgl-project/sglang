@@ -99,7 +99,7 @@ class LogitsProcessorOutput:
     )
     input_token_ids_logprobs_idx: Optional[List] = None
 
-    ## Part 4: Diffusion-only.
+    ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
 

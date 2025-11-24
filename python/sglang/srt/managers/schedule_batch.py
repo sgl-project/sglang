@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 
-from sglang.srt.diffusion.config import DiffusionConfig
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Copyright 2023-2024 SGLang Team
@@ -443,7 +443,7 @@ class Req:
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
-        diffusion_config: Optional[DiffusionConfig] = None,
+        dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
@@ -683,10 +683,10 @@ class Req:
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
-        # For diffusion
-        self.diffusion_ids = []
-        self.diffusion_block_offset = 0
-        self.diffusion_config = diffusion_config
+        # For diffusion LLM
+        self.dllm_ids = []
+        self.dllm_block_offset = 0
+        self.dllm_config = dllm_config
 
     @property
     def seqlen(self):
@@ -756,25 +756,25 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def is_diffusion(self):
-        return self.diffusion_config is not None
+    def is_dllm(self):
+        return self.dllm_config is not None
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
-        if self.is_diffusion():
+        if self.is_dllm():
             if not self.fill_ids:
-                self.diffusion_ids = (
+                self.dllm_ids = (
                     self.origin_input_ids
                     + [
-                        self.diffusion_config.mask_id,
+                        self.dllm_config.mask_id,
                     ]
-                    * self.diffusion_config.block_size
+                    * self.dllm_config.block_size
                 )
             else:
-                self.diffusion_block_offset += self.diffusion_config.block_size
-                self.diffusion_ids += [
-                    self.diffusion_config.mask_id
-                ] * self.diffusion_config.block_size
-            self.fill_ids = self.diffusion_ids
+                self.dllm_block_offset += self.dllm_config.block_size
+                self.dllm_ids += [
+                    self.dllm_config.mask_id
+                ] * self.dllm_config.block_size
+            self.fill_ids = self.dllm_ids
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
@@ -1145,8 +1145,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
-    # Diffusion
-    diffusion_config: Optional[DiffusionConfig] = None
+    # Diffusion LLM
+    dllm_config: Optional[DllmConfig] = None
 
     @classmethod
     def init_new(
@@ -1159,7 +1159,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
-        diffusion_config: Optional[DiffusionConfig] = None,
+        dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -1188,7 +1188,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
-            diffusion_config=diffusion_config,
+            dllm_config=dllm_config,
         )
 
     def batch_size(self):
@@ -1197,8 +1197,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def is_diffusion(self):
-        return self.diffusion_config is not None
+    def is_dllm(self):
+        return self.dllm_config is not None
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1900,8 +1900,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
-            diffusion_block_offsets=[req.diffusion_block_offset for req in self.reqs],
-            diffusion_config=self.diffusion_config,
+            dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
+            dllm_config=self.dllm_config,
         )
 
     def copy(self):
@@ -2016,6 +2016,6 @@ class ModelWorkerBatch:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
-    # Diffusion
-    diffusion_block_offsets: Optional[List[int]] = None
-    diffusion_config: Optional[DiffusionConfig] = None
+    # Diffusion LLM
+    dllm_block_offsets: Optional[List[int]] = None
+    dllm_config: Optional[DllmConfig] = None
