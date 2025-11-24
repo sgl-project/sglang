@@ -50,8 +50,11 @@ def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict
     for name in expect_tensors:
         expect = expect_tensors[name]
         actual = actual_tensors[name]
-        if not torch.all(curr_tensor == snapshot_tensor):
-            TODO
+
+        if torch.all(expect == actual):
+            continue
+
+        TODO
 
 
 def _random_like(t: torch.Tensor):
