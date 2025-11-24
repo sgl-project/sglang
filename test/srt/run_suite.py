@@ -373,6 +373,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tokenizer_mode.py", 400),
         TestFile("openai_server/basic/test_openai_embedding.py", 400),
+        TestFile("ascend/test_ascend_skip_warmup.py", 400),
     ],
     "nightly-test-npu-2-a3": [
         
