@@ -18,6 +18,7 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
@@ -1483,6 +1484,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32), requires_grad=False
         )
 
+        # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
@@ -1671,20 +1673,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = torch.bfloat16
 
-            # If x_sf is not None, x is FP4 packed (half size), so we need * 2
-            # If x_sf is None, x is not packed, so output_col = x.shape[1]
-            output_col = x.shape[1]
-            if x_sf is not None and layer.moe_runner_config.is_gated:
-                output_col *= 2
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+            if (
+                hasattr(dispatch_output, "moe_output")
+                and dispatch_output.moe_output is not None
             ):
-                symm_output = torch.empty(
-                    x.shape[0],
-                    output_col,
-                    dtype=output_dtype,
-                    device=x.device,
-                )
+                symm_output = dispatch_output.moe_output
+            else:
+                # If x_sf is not None, x is FP4 packed (half size), so we need * 2
+                # If x_sf is None, x is not packed, so output_col = x.shape[1]
+                output_col = x.shape[1]
+                if x_sf is not None and layer.moe_runner_config.is_gated:
+                    output_col *= 2
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    symm_output = torch.empty(
+                        x.shape[0],
+                        output_col,
+                        dtype=output_dtype,
+                        device=x.device,
+                    )
 
             output = flashinfer_cutlass_fused_moe(
                 output=symm_output,
@@ -1695,6 +1703,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 fc2_expert_weights=layer.w2_weight.view(torch.long),
                 output_dtype=output_dtype,
                 input_sf=x_sf,
+                # swizzled_input_sf=not get_moe_a2a_backend().is_flashinfer(),
                 quant_scales=[
                     layer.w13_input_scale_quant,
                     layer.w13_blockscale_swizzled.view(torch.int32),
@@ -1709,6 +1718,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 activation_type=ACT_STR_TO_TYPE_MAP[activation],
+                enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
             )[0]
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput

@@ -178,7 +178,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
-MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
+MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep", "flashinfer"]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -442,7 +442,9 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
+    moe_a2a_backend: Literal[
+        "none", "deepep", "mooncake", "ascend_fuseep", "flashinfer"
+    ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -1928,6 +1930,14 @@ class ServerArgs:
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+        if self.moe_a2a_backend == "flashinfer":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+            if self.deepep_mode != "auto":
+                logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
+            # TODO: check compatible runner backend
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
