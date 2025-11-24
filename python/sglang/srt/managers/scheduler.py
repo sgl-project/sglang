@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -112,7 +113,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
-    CheckWeightsReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -194,7 +194,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
 
 logger = logging.getLogger(__name__)
 
