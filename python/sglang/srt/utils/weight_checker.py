@@ -96,8 +96,6 @@ def _random_like(t: torch.Tensor):
         info = torch.iinfo(dtype)
         low = int(info.min)
         high = int(info.max)
-        return torch.randint(
-            low=low, high=high, size=shape, device=device, dtype=torch.int64
-        )
+        return torch.randint(low=low, high=high, size=shape, device=device, dtype=dtype)
 
     raise TypeError(f"unsupported dtype: {dtype}")
