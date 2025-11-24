@@ -3,7 +3,7 @@ import unittest
 from test_ascend_llm_models import TestMistral
 
 
-class TestGEMMA_3_1B_IT(TestMistral):
+class TestGLM4v9BChat(TestMistral):
     model = "/root/.cache/modelscope/hub/models/ZhipuAI/glm-4-9b-chat"
     accuracy = -1
 
