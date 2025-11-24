@@ -326,7 +326,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
             )
             gemm_overlap_args_dict = {
-                "overlap_arg": down_gemm_overlap_args,
+                "overlap_args": down_gemm_overlap_args,
                 "max_block_n": max_block_n,
             }
 
