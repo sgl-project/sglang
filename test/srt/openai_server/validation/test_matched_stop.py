@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.srt.sampling.sampling_params import MAX_LEN, get_max_seq_length
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -14,13 +14,31 @@ from sglang.test.test_utils import (
 class TestMatchedStop(CustomTestCase, MatchedStopMixin):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        if is_npu():
+            cls.model = (
+                "/root/.cache/modelscope/hub/models/AI-ModelScope/Llama-3.1-8B-Instruct"
+            )
+        else:
+            cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.other_args = (
+            [
+                "--max-running-requests",
+                10,
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+                "--mem-fraction-static",
+                0.8,
+            ]
+            if is_npu()
+            else ["--max-running-requests", 10]
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=300,
-            other_args=["--max-running-requests", "10"],
+            other_args=cls.other_args,
         )
 
     @classmethod
