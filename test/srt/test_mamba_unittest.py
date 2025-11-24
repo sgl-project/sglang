@@ -6,6 +6,7 @@ import torch
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -186,13 +187,14 @@ class TestMamba(unittest.TestCase):
             kvcache=pool,
             need_sort=False,
         )
-        # setup radix cache
-        tree = MambaRadixCache(
+        params = CacheInitParams(
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             disable=False,
         )
+        # setup radix cache
+        tree = MambaRadixCache(params=params)
 
         def make_dummy_req():
             sampling_params = SamplingParams(
