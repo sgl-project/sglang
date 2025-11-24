@@ -22,9 +22,9 @@
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
 /sgl-kernel @zhyncs @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
-/sgl-router @slin1237 @ByronHsu @CatherineSue
+/sgl-router @slin1237 @CatherineSue
 /sgl-router/benches @slin1237
-/sgl-router/py_src @CatherineSue @key4ng @slin1237
+/sgl-router/bindings/python @CatherineSue @key4ng @slin1237
 /sgl-router/py_test @CatherineSue @key4ng
 /sgl-router/src/config @slin1237
 /sgl-router/src/core @slin1237
