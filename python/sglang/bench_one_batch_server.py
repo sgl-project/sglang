@@ -734,6 +734,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     if is_in_ci() and bench_args.append_to_github_summary:
         write_github_step_summary(summary)
+    else:
+        print(summary)
 
 
 def main():
