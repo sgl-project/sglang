@@ -11,7 +11,7 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,18 +24,33 @@ from sglang.test.test_utils import (
 class TestEnableThinking(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST
+        if is_npu():
+            cls.model = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B"
+        else:
+            cls.model = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
+        cls.other_args = (
+            [
+                "--reasoning-parser",
+                "qwen3",
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+                "--mem-fraction-static",
+                0.95,
+                "--tp",
+                2,
+            ]
+            if is_npu()
+            else ["--reasoning-parser", "qwen3"]
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=[
-                "--reasoning-parser",
-                "qwen3",
-            ],
+            other_args=cls.other_args,
         )
         cls.additional_chat_kwargs = {}
 
