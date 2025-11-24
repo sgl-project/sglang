@@ -170,7 +170,7 @@ class SchedulerUpdateWeightsMixin:
     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
         try:
             self.tp_worker.check_weights(action=recv_req.action)
-            return CheckWeightsReqOutput(success=True, message="")
+            return CheckWeightsReqOutput(success=True, message="Success.")
         except Exception as e:
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
