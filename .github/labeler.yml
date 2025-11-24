@@ -40,6 +40,11 @@ Multi-modal:
       - '**/*vision*'
       - '**/*vlm*'
 
+# Diffusion
+diffusion:
+  - changed-files:
+    - any-glob-to-any-file: 'python/sglang/multimodal_gen/**/*'
+
 # LoRA
 lora:
   - changed-files:
@@ -73,6 +78,15 @@ npu:
       - '**/*npu*'
       - '**/*ascend*'
 
+# Blackwell
+blackwell:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*nvfp4*'
+      - 'sgl-kernel/csrc/attention/cutlass_sm100_mla/**/*'
+      - 'python/sglang/srt/layers/attention/trtllm_mla_backend.py'
+      - 'python/sglang/srt/layers/attention/trtllm_mha_backend.py'
+
 # DeepSeek specific
 deepseek:
   - changed-files:
@@ -84,3 +98,13 @@ hicache:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*hicache*'
+
+# Deterministic
+deterministic:
+  - changed-files:
+    - any-glob-to-any-file: 'python/sglang/srt/batch_invariant_ops/**/*'
+
+# Piecewise CUDA Graph
+piecewise-cuda-graph:
+  - changed-files:
+    - any-glob-to-any-file: 'python/sglang/srt/compilation/**/*'
