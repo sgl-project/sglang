@@ -27,8 +27,8 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.model_loader.loader import ModelOptModelLoader
-from sglang.test.test_utils import CustomTestCase
 from sglang.srt.utils import get_device
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestModelOptModelLoader(CustomTestCase):

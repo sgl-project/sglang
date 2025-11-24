@@ -9,7 +9,6 @@ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 
-
 NUM_EXPERTS = [8, 64]
 TOP_KS = [2, 6]
 

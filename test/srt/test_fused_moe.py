@@ -9,7 +9,7 @@ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import is_hip, get_device, get_device_capability
+from sglang.srt.utils import get_device, get_device_capability, is_hip
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 _is_hip = is_hip()

@@ -29,7 +29,6 @@ import os
 import time
 import unittest
 
-import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
@@ -38,6 +37,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -48,7 +48,6 @@ from sglang.test.test_utils import (
     get_gpu_memory_gb,
     get_gpu_rank,
 )
-from sglang.srt.utils import get_device
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = False

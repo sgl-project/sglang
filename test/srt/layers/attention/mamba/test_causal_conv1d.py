@@ -13,8 +13,8 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.test.test_utils import empty_gpu_cache
 from sglang.srt.utils import get_device
+from sglang.test.test_utils import empty_gpu_cache
 
 
 def causal_conv1d_ref(

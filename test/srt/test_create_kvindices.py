@@ -4,8 +4,8 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.test.test_utils import CustomTestCase
 from sglang.srt.utils import get_device
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestCreateKvIndices(CustomTestCase):
@@ -47,7 +47,9 @@ class TestCreateKvIndices(CustomTestCase):
         ).contiguous()
 
         # triton
-        kv_indices_triton = torch.empty(kv_indptr[-1], dtype=torch.int32, device=get_device())
+        kv_indices_triton = torch.empty(
+            kv_indptr[-1], dtype=torch.int32, device=get_device()
+        )
         create_flashinfer_kv_indices_triton[(batch,)](
             req_to_token,
             req_pool_indices,

@@ -7,16 +7,16 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.srt.utils import is_cuda, is_xpu, get_device
+from sglang.srt.utils import get_device, is_cuda, is_xpu
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_gpu_count,
     is_in_ci,
     popen_launch_server,
-    get_gpu_count
 )
 from sglang.utils import terminate_process
 

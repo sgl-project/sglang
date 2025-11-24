@@ -7,8 +7,6 @@ import torch
 from sglang.srt.batch_invariant_ops import batch_invariant_ops
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
 from sglang.test.test_utils import CustomTestCase
-from sglang.srt.utils import get_device
-
 
 # Just to get the logging out of the way
 with set_batch_invariant_mode(True):

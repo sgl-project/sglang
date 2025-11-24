@@ -1950,4 +1950,3 @@ def get_gpu_memory_gb():
         return torch.xpu.memory_allocated() / 1024**3
     else:
         return 0
-

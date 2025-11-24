@@ -197,13 +197,17 @@ class TestWaveAttention(unittest.TestCase):
 
         # k_buffer and v_buffer represent all previous tokens
         k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=get_device())
-        v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=get_device())
+        v_buffer = torch.randn(
+            total_tokens, H_KV, D_V, dtype=dtype, device=get_device()
+        )
 
         # o will have the same shape as q
         o_triton = torch.zeros(B, H_Q, D_V, dtype=dtype, device=get_device())
         o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=get_device())
 
-        req_to_token = torch.arange(total_tokens, device=get_device(), dtype=torch.int32)
+        req_to_token = torch.arange(
+            total_tokens, device=get_device(), dtype=torch.int32
+        )
         b_req_idx = torch.zeros(B + 1, device=get_device(), dtype=torch.int32)
         b_seq_len = torch.full((B,), seq_len, device=get_device(), dtype=torch.int32)
         b_req_idx[1 : B + 1] = torch.cumsum(b_seq_len, dim=0)
