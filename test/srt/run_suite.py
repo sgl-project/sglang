@@ -220,8 +220,6 @@ suite_amd = {
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 20),
         TestFile("models/test_cross_encoder_models.py", 100),
         TestFile("models/test_embedding_models.py", 73),
-        TestFile("models/test_generation_models.py", 103),
-        TestFile("quant/test_autoround.py", 60),
         TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("rl/test_fp32_lm_head.py", 30),
         TestFile("test_build_eagle_tree.py", 8),
