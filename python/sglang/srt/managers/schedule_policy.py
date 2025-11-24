@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -94,12 +95,7 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
 
         # It is used to find the matching prefix for in-batch prefix caching.
-        self.waiting_queue_radix_tree = RadixCache(
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=None,
-            page_size=1,
-            disable=False,
-        )
+        self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(self, waiting_queue: List[Req]) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
@@ -363,6 +359,7 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -565,6 +562,11 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # TODO support cp with multiple requests
+        # Enabling context parallelism currently presents precision issues;
+        # therefore, the prefill-batch setting is temporarily set to 1.
+        if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
+            return AddReqResult.OTHER
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
@@ -596,7 +598,7 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 prefix_len = len(req.prefix_indices)
-                req.last_matched_prefix_len = prefix_len
+                req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -697,7 +699,7 @@ class PrefillAdder:
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
                 self.rem_total_token_offset -= (
-                    self._get_running_request_total_token_offset(req)
+                    self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1
                 self.running_batch.release_req(

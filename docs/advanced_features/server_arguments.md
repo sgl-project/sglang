@@ -156,6 +156,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--base-gpu-id` | The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine. | `0` | Type: int |
 | `--gpu-id-step` | The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,... | `1` | Type: int |
 | `--sleep-on-idle` | Reduce CPU usage when sglang is idle. | `False` | bool flag (set to enable) |
+| `--mm-process-config` | A JSON string for multimodal preprocessing configuration. It can contain keys: `image`, `video`, `audio`. | `{}` |
 
 ## Logging
 | Argument | Description | Defaults | Options |
@@ -370,6 +371,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-single-batch-overlap` | Let computation and communication overlap within one micro batch. | `False` | bool flag (set to enable) |
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | `0.48` | Type: float |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | `False` | bool flag (set to enable) |
+| `--enable-torch-compile-debug-mode` | Enable debug mode for torch compile. | `False` | bool flag (set to enable) |
 | `--enable-piecewise-cuda-graph` | Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature. | `False` | bool flag (set to enable) |
 | `--piecewise-cuda-graph-tokens` | Set the list of tokens when using piecewise cuda graph. | `None` | Type: JSON list |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | `32` | Type: int |
@@ -396,6 +398,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--numa-node` | Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. | `None` | List[int] |
 | `--enable-layerwise-nvtx-marker` | Enable layerwise NVTX profiling annotations for the model. This adds NVTX markers to every layer for detailed per-layer performance analysis with Nsight Systems. | `False` | bool flag (set to enable) |
 | `--enable-attn-tp-input-scattered` | Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.                                                                                                      | `False`  | bool flag (set to enable) |
+| `--enable-nsa-prefill-context-parallel` | Context parallelism used in the long sequence prefill phase of DeepSeek v3.2 | `False` | bool flag (set to enable) |
+
+## Forward hooks
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--hooks` | JSON-formatted list of hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
 
 ## Debug tensor dumps
 | Argument | Description | Defaults | Options |
