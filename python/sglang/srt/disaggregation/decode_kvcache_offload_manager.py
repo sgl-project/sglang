@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -53,6 +53,21 @@ def sparse_diff_triton_kernel(
     prev_top_k_result = tl.load(
         prev_top_k_result_ptr + prev_top_k_result_stride * bid + offset
     )
+    max_val = tl.max(prev_top_k_result)
+    if max_val == -1:
+        # After prefilling the first round, the entire cache needs to be loaded.
+        no_exist_top_k_result = tl.load(
+            curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
+        )
+        start_index = tl.load(host_start_indices_ptr + bid)
+        no_exist_host_indices = tl.load(
+            full_host_indices_ptr + start_index + no_exist_top_k_result
+        )
+        tl.store(
+            curr_host_indices_ptr + curr_host_indices_stride * bid + offset,
+            no_exist_host_indices,
+        )
+        return
     tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset)
 
     curr_top_k_result = tl.load(
@@ -146,6 +161,7 @@ class SparseTopKIndicesHelper:
             curr_device_indices.stride(0),
             self.bitmap.stride(0),
             curr_host_indices.stride(0),
+            top_k,
         )
 
         # TODO(huangtingwei9988)：Further optimization is needed.
@@ -228,9 +244,11 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_offload = {}
         self.ongoing_backup = {}
         if server_args.enable_sparse_attn:
-            self.sparse_ongoing_offload = {}
+            self.sparse_decode_ongoing_offload = {}
+            self.sparse_prefill_ongoing_offload = {}
+            max_pool_size = self.req_to_token_pool.req_to_token.shape[0]
             self.sparse_indices_helper = SparseTopKIndicesHelper(
-                server_args, self.decode_host_mem_pool
+                server_args, self.decode_host_mem_pool, max_pool_size
             )
             self.req_states = None
         logger.info("Enable offload kv cache for decode side")
@@ -244,10 +262,6 @@ class DecodeKVCacheOffloadManager:
     ):
 
         # get prev data from req_states
-        host_start_indices = (
-            self.req_states.prompt_lens[req_pool_indices]
-            + self.req_states.decode_steps[req_pool_indices]
-        )
         prev_top_k_result = self.req_states.prev_top_k_result[
             req_pool_indices, layer_id
         ]
@@ -257,6 +271,16 @@ class DecodeKVCacheOffloadManager:
         full_host_indices = torch.cat(
             [self.req_states.full_host_indices[idx] for idx in req_pool_indices], dim=0
         )
+
+        host_indices_lens = [0] + [
+            len(self.req_states.full_host_indices[idx]) for idx in req_pool_indices
+        ][:-1]
+        host_indices_lens = torch.tensor(
+            host_indices_lens,
+            dtype=torch.int64,
+            device=full_host_indices.device,
+        )
+        host_start_indices = torch.cumsum(host_indices_lens, dim=-1)
 
         curr_device_indices = self.sparse_indices_helper.load_top_k_cache(
             prev_top_k_result=prev_top_k_result,
@@ -275,24 +299,24 @@ class DecodeKVCacheOffloadManager:
 
         return curr_device_indices
 
-    def offload_sparse_req_tokens(self, req_pool_indices):
+    def offload_sparse_decode_req_tokens(self, req_pool_indices, out_alloc_len):
         """Offload incremental token KV cache for sparse attention."""
-        decode_lens = self.req_states.decode_steps[req_pool_indices] - 1
-        mask = decode_lens % 2
-        offload_token_indices = self.req_states.extra_2_token[req_pool_indices, mask]
 
         self.request_counter += 1
         ack_id = self.request_counter
         host_indices = self.cache_controller.write(
-            device_indices=offload_token_indices,
+            device_indices=out_alloc_len,
             node_id=ack_id,
         )
         assert host_indices is not None, "Host out of memory"
-        self.sparse_ongoing_offload[ack_id] = host_indices
+        self.sparse_decode_ongoing_offload[ack_id] = (host_indices, req_pool_indices)
         return ack_id
 
-    def check_sparse_offload_progress(self, req_pool_indices):
+    def check_sparse_offload_progress(self):
         """Check the progress of offload from device to host for sparse schedule every step"""
+        if len(self.sparse_decode_ongoing_offload) == 0:
+            return
+
         cc = self.cache_controller
         qsizes = torch.tensor(
             [
@@ -305,19 +329,61 @@ class DecodeKVCacheOffloadManager:
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
         finish_count = qsizes.tolist()[0]
-
-        assert finish_count == 0
+        assert finish_count == 1
 
         _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
         finish_event.synchronize()
 
         # update full_host_indices
-        host_indices = self.sparse_ongoing_offload.pop(ack_list[0])
-        for i in range(req_pool_indices):
+        host_indices, req_pool_indices = self.sparse_decode_ongoing_offload.pop(
+            ack_list[0]
+        )
+        for i in range(len(req_pool_indices)):
             full_host_indices = self.req_states.full_host_indices[req_pool_indices[i]]
             self.req_states.full_host_indices[req_pool_indices[i]] = torch.cat(
-                full_host_indices, host_indices[i]
+                [full_host_indices, host_indices[i].to(self.req_states.device)]
             )
+
+    def offload_prefill_full_kv_cache(self, req):
+        token_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : req.seqlen - 1
+        ]
+
+        self.request_counter += 1
+        ack_id = self.request_counter
+        host_indices = self.cache_controller.write(
+            device_indices=token_indices,
+            node_id=ack_id,
+        )
+        assert host_indices is not None, "Host out of memory"
+        self.sparse_prefill_ongoing_offload[ack_id] = (host_indices, req)
+        return ack_id
+
+    def check_prefill_offload_progress(self):
+        if len(self.sparse_prefill_ongoing_offload) == 0:
+            return
+
+        cc = self.cache_controller
+        qsizes = torch.tensor(
+            [
+                len(cc.ack_write_queue),
+            ],
+            dtype=torch.int,
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+        finish_count = qsizes.tolist()[0]
+        assert finish_count == 1
+
+        _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+        finish_event.synchronize()
+
+        (host_indices, req) = self.sparse_prefill_ongoing_offload.pop(ack_list[0])
+        self.req_states.full_host_indices[req.req_pool_idx] = host_indices.to(
+            self.req_states.device
+        )
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
