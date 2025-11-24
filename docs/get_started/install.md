@@ -154,7 +154,83 @@ sky status --endpoint 30000 sglang
 
 </details>
 
-## Method 7: Run on AWS SageMaker
+## Method 7: Using dstack
+
+<details>
+<summary>More</summary>
+
+[dstack](https://github.com/dstackai/dstack) simplifies GPU provisioning and workload orchestration across clouds, Kubernetes, and on-prem systems.
+
+Deploying SGLang as a secure, auto-scalable endpoint is straightforward:
+
+1. Install dstack: see [dstack's documentation](https://dstack.ai/docs/installation/)
+2. Create a dstack [service](https://dstack.ai/docs/concepts/services/):
+
+<details>
+<summary>Service configuration: <code>service.yaml</code></summary>
+
+```yaml
+type: service
+name: qwen
+
+image: lmsysorg/sglang:latest
+env:
+  - MODEL_ID=qwen/qwen2.5-0.5b-instruct
+commands:
+  - |
+    python3 -m sglang.launch_server \
+    --model-path $MODEL_ID \
+    --port 8000 \
+    --trust-remote-code
+port: 8000
+model: qwen/qwen2.5-0.5b-instruct
+
+resources:
+  gpu: 8GB..24GB:1
+```
+</details>
+
+Apply the configuration:
+
+```bash
+HF_TOKEN=<secret> dstack apply -f service.yaml
+```
+
+3. If you want to enable auto-scaling, cache-aware routing, HTTPS, or bring your own custom domain,
+create a [gateway](https://dstack.ai/docs/concepts/gateways/):
+
+<details>
+<summary>Gateway configuration: <code>gateway.yaml</code></summary>
+
+```yaml
+type: gateway
+name: sglang-gateway
+
+backend: aws
+region: eu-west-1
+
+# Specify your domain
+domain: example.com
+
+router:
+  # (Optional) Enable cache-aware routing
+  type: sglang
+  policy: cache_aware
+```
+</details>
+
+Apply the gateway configuration.
+
+```bash
+dstack apply -f gateway.yaml
+```
+
+Once the gateway is assigned a hostname, go to your domain's DNS settings and add a DNS record for `*.<gateway domain>`.
+
+See the [SGLang example](https://dstack.ai/examples/inference/sglang/) for more details.
+</details>
+
+## Method 8: Run on AWS SageMaker
 
 <details>
 <summary>More</summary>
