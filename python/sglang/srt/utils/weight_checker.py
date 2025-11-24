@@ -47,6 +47,8 @@ class WeightChecker:
 def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict[str, torch.Tensor]):
     assert len(expect_tensors) == len(actual_tensors)
 
+    error_messages = []
+
     for name in expect_tensors:
         expect = expect_tensors[name]
         actual = actual_tensors[name]
@@ -54,7 +56,9 @@ def _check_tensors(expect_tensors: Dict[str, torch.Tensor], actual_tensors: Dict
         if torch.all(expect == actual):
             continue
 
-        TODO
+        error_messages.append()
+
+    raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
 def _random_like(t: torch.Tensor):
