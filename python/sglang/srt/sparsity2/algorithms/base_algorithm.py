@@ -16,6 +16,7 @@ class SparseMode(Enum):
 
     PAGE_WISE = "page_wise"
     TOKEN_WISE = "token_wise"
+    ORIGINAL_WISE = "original_wise"
 
 
 class BaseSparseAlgorithm(ABC):

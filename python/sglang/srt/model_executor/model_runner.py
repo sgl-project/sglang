@@ -1942,22 +1942,24 @@ class ModelRunner:
             return
 
         try:
-            from sglang.srt.sparsity2 import create_sparse_coordinator
-
             from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
                 DecodeKVCacheOffloadManager,
             )
             from sglang.srt.sparsity2 import create_sparse_coordinator
 
+            # Get CPU group for offload communication
+            if self.server_args.enable_dp_attention:
+                from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+                tp_group_cpu = get_attention_tp_group().cpu_group
+            else:
+                tp_group_cpu = get_tp_group().cpu_group
+
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=(
-                    self.attn_tp_cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_cpu_group
-                ),
-                tree_cache=self.tree_cache,
+                tp_group=tp_group_cpu,
+                tree_cache=None,
                 server_args=self.server_args,
             )
 
@@ -2282,6 +2284,9 @@ class ModelRunner:
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
 
+        if self.sparse_coordinator is not None:
+            self.sparse_coordinator.forward_begin(forward_batch)
+
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -2304,6 +2309,9 @@ class ModelRunner:
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        if self.sparse_coordinator is not None:
+            self.sparse_coordinator.forward_end(forward_batch)
 
         if (
             forward_batch.global_num_tokens_cpu is not None

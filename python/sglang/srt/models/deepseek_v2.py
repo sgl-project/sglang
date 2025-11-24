@@ -29,6 +29,7 @@ import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
+from python.sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
@@ -1768,13 +1769,28 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         topk_indices = None
         if q_lora is not None:
-            topk_indices = self.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-            )
+            sparse_coordinator = get_sparse_coordinator()
+            if sparse_coordinator is not None:
+                topk_indices = sparse_coordinator.attention_begin(
+                    query=q_nope_out,
+                    key=k_nope,
+                    value=k_nope,
+                    layer=self,
+                    forward_batch=forward_batch,
+                    attn_metadata=None,
+                    indexer=self.indexer,
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                )
+            else:
+                topk_indices = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
 
         return (
             q_pe,

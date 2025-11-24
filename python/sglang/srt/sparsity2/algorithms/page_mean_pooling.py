@@ -165,6 +165,7 @@ class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
         sparse_mask: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        queries = queries.view(bs, -1)
         bs, device = queries.shape[0], queries.device
         num_pages = (seq_lens + self.page_size - 1) // self.page_size
         max_pages = int(torch.max(num_pages).item()) if num_pages.numel() > 0 else 1
