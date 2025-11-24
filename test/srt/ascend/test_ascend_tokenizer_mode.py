@@ -17,7 +17,7 @@ class TestEnableTokenizerMode(CustomTestCase):
     def test_tokenzier_mode(self):
         tokenizer_path = (
             "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-11B-Vision-Instruct"
-            if is_npu
+            if is_npu()
             else DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE
         )
         for i in ["slow", "auto"]:
