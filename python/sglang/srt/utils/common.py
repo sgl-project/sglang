@@ -104,6 +104,16 @@ show_time_cost = False
 time_infos = {}
 
 
+def get_or_create_event_loop():
+    """Gets the running event loop or creates a new one if it doesn't exist."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
