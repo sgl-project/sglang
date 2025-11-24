@@ -1,4 +1,7 @@
 class WeightChecker:
+    def __init__(self, model_runner):
+        self._model_runner = model_runner
+
     def handle(self, action: str):
         if action == "snapshot":
             self._snapshot()

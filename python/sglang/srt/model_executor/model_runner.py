@@ -172,6 +172,8 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+from sglang.srt.utils.weight_checker import WeightChecker
+
 MLA_ATTENTION_BACKENDS = [
     "aiter",
     "flashinfer",
@@ -323,6 +325,8 @@ class ModelRunner:
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+
+        self._weight_checker = WeightChecker(model_runner=self)
 
         if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
             slow_rank_detector.execute()
@@ -2445,7 +2449,7 @@ class ModelRunner:
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
     def check_weight(self, action: str):
-        TODO
+        self._weight_checker.handle(action=action)
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""

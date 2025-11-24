@@ -168,7 +168,7 @@ class SchedulerUpdateWeightsMixin:
         return ResumeMemoryOccupationReqOutput()
 
     def check_weight(self: Scheduler, recv_req: CheckWeightReqInput):
-        self.tp_worker.model_runner.check_weight(action=recv_req.action)
+        self.tp_worker.check_weight(action=recv_req.action)
         return CheckWeightReqOutput()
 
     def save_remote_model(self: Scheduler, params):
