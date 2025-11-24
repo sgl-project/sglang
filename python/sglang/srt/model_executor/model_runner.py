@@ -2444,6 +2444,9 @@ class ModelRunner:
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
+    def handle_weight_checker(self, action: str):
+        TODO
+
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         try:

@@ -1273,6 +1273,16 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 
 @dataclass
+class WeightCheckerReqInput(BaseReq):
+    tags: str
+
+
+@dataclass
+class WeightCheckerReqOutput(BaseReq):
+    pass
+
+
+@dataclass
 class SlowDownReqInput(BaseReq):
     forward_sleep_time: Optional[float]
 

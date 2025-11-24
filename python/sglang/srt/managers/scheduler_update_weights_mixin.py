@@ -30,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    WeightCheckerReqInput,
+    WeightCheckerReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -183,6 +185,10 @@ class SchedulerUpdateWeightsMixin:
             pattern=params["pattern"],
             max_size=params["max_size"],
         )
+
+    def weight_checker(self: Scheduler, recv_req: WeightCheckerReqInput):
+        self.tp_worker.model_runner.handle_weight_checker(action=recv_req.action)
+        return WeightCheckerReqOutput()
 
 
 def _export_static_state(model):
