@@ -158,7 +158,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 )
             video_feature = torch.cat(preprocessed_videos, dim=0)
 
-        prompt_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"].flatten()
+        prompt_ids = self.tokenizer(
+            prompt, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"].flatten()
         offsets = self.get_mm_items_offset(prompt_ids, self.mm_tokens.image_token_id)
         img_offsets = [
             (start, end)
