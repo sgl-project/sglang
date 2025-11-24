@@ -1,4 +1,4 @@
-name: Nightly Test
+name: Nightly Test (NPU)
 
 on:
   schedule:
@@ -72,11 +72,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            .github
-            scripts
-            test
 
       - name: Copy dataset
         run: |
@@ -100,9 +95,9 @@ jobs:
         run: |
           pip install accelerate
           cd test/srt
-          python3 run_suite.py --suite daily-test-2-ascend-npu --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+          python3 run_suite.py --suite daily-test-2-ascend-npu --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
- nightly-test-npu-4-a3:
+  nightly-test-npu-4-a3:
     needs: [ build-arm-image ]
     if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-4
@@ -115,12 +110,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: 'upstream/251031'
-          sparse-checkout: |
-            .github
-            scripts
-            test
 
       - name: Copy dataset
         run: |
@@ -154,7 +143,7 @@ jobs:
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           cd ../
           cd test/srt
-          python3 run_suite.py --suite daily-test-4-ascend-npu --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+          python3 run_suite.py --suite daily-test-4-ascend-npu --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   nightly-test-npu-8-a3:
     needs: [ build-arm-image ]
@@ -169,8 +158,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: 'upstream/251031'
 
       - name: Copy dataset
         run: |
@@ -203,7 +190,7 @@ jobs:
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           cd ../
           cd test/srt
-          python3 run_suite.py --suite daily-test-8-ascend-npu --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+          python3 run_suite.py --suite daily-test-8-ascend-npu --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   nightly-test-npu-16-a3:
     needs: [ build-arm-image ]
@@ -250,7 +237,7 @@ jobs:
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           cd ../
           cd test/srt
-          python3 run_suite.py --suite daily-test-16-ascend-npu --timeout-per-file 7200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite daily-test-16-ascend-npu --continue-on-error --timeout-per-file 7200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
