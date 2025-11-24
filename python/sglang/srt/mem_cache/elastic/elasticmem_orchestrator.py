@@ -130,6 +130,9 @@ class ElasticAllocator(ABC):
         """Update the internal size tracking."""
         pass
 
+    def free_all(self) -> None:
+        self.evict(self.evictable_size())
+
 
 class ElasticMempoolOrchestrator:
     """Orchestrator for managing elastic memory pools.
@@ -148,6 +151,10 @@ class ElasticMempoolOrchestrator:
         vmm_ops.init_emem(current_device_id, cu_page_size)
 
         self.allocators = []
+        self.free_all = False
+        self.free_all_allocator = None
+
+        self.remaining_page = 0
 
     def register_allocator(self, allocator: ElasticAllocator):
         allocator.register_emem_orch(self)
@@ -162,11 +169,30 @@ class ElasticMempoolOrchestrator:
                 or (allocator.token_usage() > map_candidate.token_usage())
             ):
                 map_candidate = allocator
+
+        if map_candidate is None:
+            if self.free_all and self.free_all_allocator.token_usage() < 0.1:
+                self.free_all_allocator.free_all()
+                self.free_all = False
+                self.free_all_allocator = None
+            return
+
+        min_token_usage = 1
+        min_token_usage_allocator = None
+        for allocator in self.allocators:
+            if allocator.token_usage() < min_token_usage:
+                min_token_usage = allocator.token_usage()
+                min_token_usage_allocator = allocator
+
             if allocator.can_unmap() and (
                 (unmap_candidate is None)
                 or (allocator.token_usage() < unmap_candidate.token_usage())
             ):
                 unmap_candidate = allocator
+
+        if unmap_candidate is None and min_token_usage < 0.9:
+            self.free_all = True
+            self.free_all_allocator = min_token_usage_allocator
 
         if (
             map_candidate is not None
@@ -187,14 +213,20 @@ class ElasticMempoolOrchestrator:
         unmap_page = 0
         unmap_allocator.evict(unmap_allocator.evictable_size())
         unmap_page = unmap_allocator.reduce()
-        logger.info(f"{unmap_allocator._kvcache.pool_name} unmap {unmap_page} cu_page")
+        logger.info(
+            f"{unmap_allocator._kvcache.pool_name} unmap {unmap_page}, remain {self.remaining_page} cu_page"
+        )
 
         # The approximate number of tokens that can be expanded by mapping cu_page_num cu_pages.
-        map_token = map_allocator.cu_page_to_token(unmap_page)
+        to_map_page = unmap_page + self.remaining_page
+        map_token = map_allocator.cu_page_to_token(to_map_page)
         map_page = 0
         if map_token > 0:
             map_page = map_allocator.expand(map_token)
-        logger.info(f"{map_allocator._kvcache.pool_name} map {map_page} cu_page")
+        self.remaining_page = to_map_page - map_page
+        logger.info(
+            f"{map_allocator._kvcache.pool_name} map {map_page}, remain {self.remaining_page} cu_page"
+        )
 
         for _allocator in self.allocators:
             _allocator.update_size()

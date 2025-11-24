@@ -50,11 +50,18 @@ class ElasticTokenToKVPoolAllocator(TokenToKVPoolAllocator, ElasticAllocator):
         else:
             self.free_pages, _ = torch.sort(self.free_pages)
 
+    # TODO: a more efficient way
+    @override
+    def alloc(self, need_size: int):
+        self.merge_and_sort_free()
+        return super().alloc(need_size)
+
     @override
     def can_unmap(self) -> bool:
         if self.token_usage() > 0.9:
             return False
 
+        self.evict(self.evictable_size())
         self.merge_and_sort_free()
         cu_page_token = (cu_page_size // self._kvcache.state_memsize + 1) * 2
         return (
@@ -225,7 +232,7 @@ class ElasticSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator, ElasticAllocat
 
     @override
     def token_usage(self) -> float:
-        raise NotImplementedError()
+        return 1
 
     @override
     def evictable_size(self) -> int:
