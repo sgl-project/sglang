@@ -112,6 +112,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    CheckWeightsReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -193,6 +194,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
 
 logger = logging.getLogger(__name__)
 
@@ -561,7 +563,7 @@ class Scheduler(
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
-                (CheckWeightReqInput, self.check_weight),
+                (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
                 (FreezeGCReq, self.handle_freeze_gc),

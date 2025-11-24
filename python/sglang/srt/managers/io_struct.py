@@ -1273,12 +1273,12 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 
 @dataclass
-class CheckWeightReqInput(BaseReq):
+class CheckWeightsReqInput(BaseReq):
     action: str
 
 
 @dataclass
-class CheckWeightReqOutput(BaseReq):
+class CheckWeightsReqOutput(BaseReq):
     pass
 
 

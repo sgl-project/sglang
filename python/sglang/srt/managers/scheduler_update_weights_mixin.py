@@ -12,8 +12,8 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.managers.io_struct import (
-    CheckWeightReqInput,
-    CheckWeightReqOutput,
+    CheckWeightsReqInput,
+    CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
@@ -167,9 +167,9 @@ class SchedulerUpdateWeightsMixin:
 
         return ResumeMemoryOccupationReqOutput()
 
-    def check_weight(self: Scheduler, recv_req: CheckWeightReqInput):
-        self.tp_worker.check_weight(action=recv_req.action)
-        return CheckWeightReqOutput()
+    def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
+        self.tp_worker.check_weights(action=recv_req.action)
+        return CheckWeightsReqOutput()
 
     def save_remote_model(self: Scheduler, params):
         url = params["url"]

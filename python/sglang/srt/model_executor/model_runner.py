@@ -2447,7 +2447,7 @@ class ModelRunner:
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-    def check_weight(self, action: str):
+    def check_weights(self, action: str):
         self._weight_checker.handle(action=action)
 
     def update_weights_from_ipc(self, recv_req):
