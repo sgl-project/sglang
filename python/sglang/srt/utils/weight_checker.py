@@ -8,3 +8,12 @@ class WeightChecker:
             self._compare()
         else:
             raise Exception(f"Unsupported {action=}")
+
+    def _snapshot(self):
+        TODO
+
+    def _reset_param(self):
+        TODO
+
+    def _compare(self):
+        TODO
