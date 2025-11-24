@@ -362,6 +362,10 @@ class ModelRunner:
                     elif hasattr(layer.self_attn, "attn_mqa"):
                         # For DeepSeek model
                         self.attention_layers.append(layer.self_attn.attn_mqa)
+                # For InternVL model
+                elif hasattr(layer, "attention"):
+                    if hasattr(layer.attention, "attn"):
+                        self.attention_layers.append(layer.attention.attn)
 
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
                 # TODO(yuwei): support Non-Standard GQA
