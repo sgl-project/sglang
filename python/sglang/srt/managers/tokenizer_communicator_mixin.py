@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    CheckWeightReqInput,
+    CheckWeightReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -183,6 +185,9 @@ class TokenizerCommunicatorMixin:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.check_weight_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.slow_down_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -255,6 +260,10 @@ class TokenizerCommunicatorMixin:
                 (
                     ResumeMemoryOccupationReqOutput,
                     self.resume_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    CheckWeightReqOutput,
+                    self.check_weight_communicator.handle_recv,
                 ),
                 (
                     SlowDownReqOutput,
@@ -655,6 +664,14 @@ class TokenizerCommunicatorMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def check_weight(
+        self: TokenizerManager,
+        obj: CheckWeightReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        await self.check_weight_communicator(obj)
 
     async def slow_down(
         self: TokenizerManager,
