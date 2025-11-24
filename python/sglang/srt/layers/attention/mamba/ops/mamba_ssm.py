@@ -166,7 +166,7 @@ def _selective_scan_update_kernel(
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     if HAS_STATE_BATCH_INDICES:
         mask &= state_batch_idx != pad_slot_id
-    state = tl.load(state_ptrs, mask=mask, other=0.0)
+    state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_DT_BIAS:
         dt_bias_ptrs = dt_bias_ptr + offs_m * stride_dt_bias_dim
@@ -203,7 +203,7 @@ def _selective_scan_update_kernel(
                         + offs_m[:, None] * dstate
                         + offs_n[None, :]
                     )
-                    state = tl.load(cache_ptr, mask=mask, other=0.0)
+                    state = tl.load(cache_ptr, mask=mask, other=0.0).to(tl.float32)
 
         x_ptrs = x_ptr + offs_m * stride_x_dim
         dt_ptrs = dt_ptr + offs_m * stride_dt_dim
@@ -257,7 +257,9 @@ def _selective_scan_update_kernel(
                     cache_ptrs = cache_ptr_base + (
                         offs_m[:, None] * dstate + offs_n[None, :]
                     )
-                    tl.store(cache_ptrs, state, mask=mask)
+                    tl.store(
+                        cache_ptrs, state.to(cache_ptrs.dtype.element_ty), mask=mask
+                    )
 
         out = tl.sum(state * C[None, :], axis=1)
         if HAS_D:
@@ -277,7 +279,7 @@ def _selective_scan_update_kernel(
             z_ptr += stride_z_T
 
     if not DISABLE_STATE_UPDATE:
-        tl.store(state_ptrs, state, mask=mask)
+        tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
 
 
 def selective_state_update(

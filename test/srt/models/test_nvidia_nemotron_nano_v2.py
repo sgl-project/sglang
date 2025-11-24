@@ -28,8 +28,6 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, CustomTestCase):
     accuracy = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     other_args = [
-        "--max-mamba-cache-size",
-        "256",
         "--speculative-algorithm",
         "STANDALONE",
         "--speculative-num-steps",
@@ -48,6 +46,33 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, CustomTestCase):
         "2048",
         "--json-model-override-args",
         '{"vocab_size": 131072}',
+    ]
+
+
+class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(GSM8KMixin, CustomTestCase):
+    accuracy = 0.87
+    model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    other_args = [
+        "--speculative-algorithm",
+        "STANDALONE",
+        "--speculative-num-steps",
+        "2",
+        "--speculative-eagle-topk",
+        "3",
+        "--speculative-num-draft-tokens",
+        "5",
+        "--speculative-draft-model-path",
+        "meta-llama/Llama-3.2-1B",
+        "--speculative-draft-load-format",
+        "dummy",
+        "--max-running-requests",
+        "8",
+        "--max-total-tokens",
+        "2048",
+        "--json-model-override-args",
+        '{"vocab_size": 131072}',
+        "--mamba-ssm-dtype",
+        "bfloat16",
     ]
 
 
