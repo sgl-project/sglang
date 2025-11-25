@@ -75,7 +75,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         )
         warmup.run_text_warmups(case.server_args.warmup_text)
 
-        if case.server_args.warmup_edit > 0 and case.edit_prompt and sampling_params.image_path:
+        if (
+            case.server_args.warmup_edit > 0
+            and case.edit_prompt
+            and sampling_params.image_path
+        ):
             # Handle URL or local path
             image_path = sampling_params.image_path
             if is_image_url(sampling_params.image_path):
