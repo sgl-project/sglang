@@ -7,6 +7,7 @@ If the actual run is significantly better than the baseline, the improved cases 
 
 from __future__ import annotations
 
+import base64
 import os
 import time
 from pathlib import Path
@@ -28,11 +29,11 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
-    DIFFUSION_CASES,
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
 )
+from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     read_perf_logs,
@@ -44,24 +45,21 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 
-@pytest.fixture(params=DIFFUSION_CASES, ids=lambda c: c.id)
-def case(request) -> DiffusionTestCase:
-    """Provide a DiffusionTestCase for each test."""
-    return request.param
-
-
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
 
+    extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
+    extra_args += f" --num-gpus {case.num_gpus} --ulysses-degree {case.num_gpus}"
+
     # start server
     manager = ServerManager(
         model=case.model_path,
         port=port,
         wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
-        extra_args=os.environ.get("SGLANG_TEST_SERVE_ARGS", ""),
+        extra_args=extra_args,
     )
     ctx = manager.start()
 
@@ -98,10 +96,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         ctx.cleanup()
 
 
-class TestDiffusionPerformance:
+class DiffusionServerBase:
     """Performance tests for all diffusion models/scenarios.
 
-    This single test class runs against all cases defined in DIFFUSION_CASES.
+    This single test class runs against all cases defined in ONE_GPU_CASES.
     Each case gets its own server instance via the parametrized fixture.
     """
 
@@ -148,7 +146,7 @@ Consider updating perf_baselines.json with the snippets below:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
         prev_len = len(read_perf_logs(log_path))
-        log_wait_timeout = 1200
+        log_wait_timeout = 30
 
         rid = generate_fn()
 
@@ -200,7 +198,7 @@ Consider updating perf_baselines.json with the snippets below:
             is_baseline_generation_mode = (
                 os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
             )
-            timeout = 3600.0 if is_baseline_generation_mode else 600.0
+            timeout = 3600.0 if is_baseline_generation_mode else 1200.0
             deadline = time.time() + timeout
             while True:
                 page = client.videos.list()  # type: ignore[attr-defined]
@@ -229,6 +227,19 @@ Consider updating perf_baselines.json with the snippets below:
             resp = client.videos.download_content(video_id=video_id)  # type: ignore[attr-defined]
             content = resp.read()
             validate_openai_video(content)
+
+            tmp_path = f"{video_id}.mp4"
+            with open(tmp_path, "wb") as f:
+                f.write(content)
+            upload_file_to_slack(
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.prompt,
+                file_path=tmp_path,
+                origin_file_path=case.image_path,
+            )
+            os.remove(tmp_path)
+
             return video_id
 
         # for all tests, seconds = case.seconds or fallback 4 seconds
@@ -252,6 +263,19 @@ Consider updating perf_baselines.json with the snippets below:
             )
             result = response.parse()
             validate_image(result.data[0].b64_json)
+
+            img_data = base64.b64decode(result.data[0].b64_json)
+            tmp_path = f"{result.created}.png"
+            with open(tmp_path, "wb") as f:
+                f.write(img_data)
+            upload_file_to_slack(
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.prompt,
+                file_path=tmp_path,
+            )
+            os.remove(tmp_path)
+
             return str(result.created)
 
         def generate_image_edit() -> str:
@@ -277,10 +301,23 @@ Consider updating perf_baselines.json with the snippets below:
                     response_format="b64_json",
                 )
             rid = response.headers.get("x-request-id", "")
-            print(f"{response=}")
 
             result = response.parse()
             validate_image(result.data[0].b64_json)
+
+            img_data = base64.b64decode(result.data[0].b64_json)
+            tmp_path = f"{rid}.png"
+            with open(tmp_path, "wb") as f:
+                f.write(img_data)
+            upload_file_to_slack(
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.edit_prompt,
+                file_path=tmp_path,
+                origin_file_path=case.image_path,
+            )
+            os.remove(tmp_path)
+
             return rid
 
         # -------------------------
@@ -395,7 +432,7 @@ Consider updating perf_baselines.json with the snippets below:
         summary = validator.collect_metrics(perf_record)
 
         if is_baseline_generation_mode or missing_scenario:
-            self._dump_baseline_for_testcase(case, summary)
+            self._dump_baseline_for_testcase(case, summary, missing_scenario)
             if missing_scenario:
                 pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
             return
@@ -406,7 +443,7 @@ Consider updating perf_baselines.json with the snippets below:
             validator.validate(perf_record, case.num_frames)
         except AssertionError as e:
             logger.error(f"Performance validation failed for {case.id}:\n{e}")
-            self._dump_baseline_for_testcase(case, summary)
+            self._dump_baseline_for_testcase(case, summary, missing_scenario)
             raise
 
         result = {
@@ -510,7 +547,10 @@ Consider updating perf_baselines.json with the snippets below:
             self._improved_baselines.append({"id": case.id, "baseline": new_baseline})
 
     def _dump_baseline_for_testcase(
-        self, case: DiffusionTestCase, summary: "PerformanceSummary"
+        self,
+        case: DiffusionTestCase,
+        summary: "PerformanceSummary",
+        missing_scenario: bool = False,
     ) -> None:
         """Dump performance metrics as a JSON scenario for baselines."""
         import json
@@ -536,10 +576,9 @@ Consider updating perf_baselines.json with the snippets below:
                     if summary.avg_frame_time_ms
                     else None
                 )
-
+        action = "add" if missing_scenario else "update"
         output = f"""
-To add this baseline, copy the following JSON snippet into
-the "scenarios" section of perf_baselines.json:
+{action} this baseline in the "scenarios" section of perf_baselines.json:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
@@ -553,7 +592,7 @@ the "scenarios" section of perf_baselines.json:
     ):
         """Single parametrized test that runs for all cases.
 
-        Pytest will execute this test once per case in DIFFUSION_CASES,
+        Pytest will execute this test once per case in ONE_GPU_CASES,
         with test IDs like:
         - test_diffusion_perf[qwen_image_text]
         - test_diffusion_perf[qwen_image_edit]
