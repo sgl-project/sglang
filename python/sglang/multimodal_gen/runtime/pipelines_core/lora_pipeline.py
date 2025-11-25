@@ -14,8 +14,8 @@ from safetensors.torch import load_file
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
-    get_lora_layer,
     replace_submodule,
+    wrap_with_lora_layer,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -35,12 +35,15 @@ class LoRAPipeline(ComposedPipelineBase):
     Pipeline that supports injecting LoRA adapters into the diffusion transformer.
     """
 
+    # [lora_nickname][target_LoRA_weight_name_in_SGLang_dit] = weight
+    # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
     lora_adapters: dict[str, dict[str, torch.Tensor]] = defaultdict(
         dict
     )  # state dicts of loaded lora adapters
     loaded_adapter_paths: dict[str, str] = {}  # nickname -> lora_path
     cur_adapter_name: str = ""
     cur_adapter_path: str = ""
+    # [dit_layer_name] = wrapped_lora_layer
     lora_layers: dict[str, BaseLayerWithLoRA] = {}
     lora_layers_critic: dict[str, BaseLayerWithLoRA] = {}
     server_args: ServerArgs
@@ -94,14 +97,14 @@ class LoRAPipeline(ComposedPipelineBase):
             if excluded:
                 continue
 
-            layer = get_lora_layer(
+            lora_layer = wrap_with_lora_layer(
                 layer,
                 lora_rank=self.lora_rank,
                 lora_alpha=self.lora_alpha,
             )
-            if layer is not None:
-                self.lora_layers[name] = layer
-                replace_submodule(self.modules["transformer"], name, layer)
+            if lora_layer is not None:
+                self.lora_layers[name] = lora_layer
+                replace_submodule(self.modules["transformer"], name, lora_layer)
                 converted_count += 1
         logger.info("Converted %d layers to LoRA layers", converted_count)
 
@@ -109,7 +112,7 @@ class LoRAPipeline(ComposedPipelineBase):
             for name, layer in self.modules["fake_score_transformer"].named_modules():
                 if not self.is_target_layer(name):
                     continue
-                layer = get_lora_layer(
+                layer = wrap_with_lora_layer(
                     layer,
                     lora_rank=self.lora_rank,
                     lora_alpha=self.lora_alpha,
@@ -124,6 +127,69 @@ class LoRAPipeline(ComposedPipelineBase):
                 "Converted %d layers to LoRA layers in the critic model",
                 converted_count,
             )
+
+    def is_lora_effective(self):
+        return self.is_lora_merged
+
+    def is_lora_set(self):
+        return self.lora_initialized and self.cur_adapter_name is not None
+
+    def load_lora_adapter(self, lora_path: str, lora_nickname: str, rank: int):
+        """
+        Load the LoRA, and setup the lora_adapters for later weight replacement
+        """
+        assert lora_path is not None
+        lora_local_path = maybe_download_lora(lora_path)
+        lora_state_dict = load_file(lora_local_path)
+
+        # Clear existing weights for this nickname if they exist (e.g. reloading with new path)
+        if lora_nickname in self.lora_adapters:
+            self.lora_adapters[lora_nickname].clear()
+
+        # Map the hf layer names to our custom layer names
+        config = self.server_args.pipeline_config.dit_config.arch_config
+
+        param_names_mapping_fn = get_param_names_mapping(
+            config.param_names_mapping
+            or self.modules["transformer"].param_names_mapping
+        )
+        lora_param_names_mapping_fn = get_param_names_mapping(
+            config.lora_param_names_mapping
+            or self.modules["transformer"].lora_param_names_mapping
+        )
+
+        to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
+        for name, weight in lora_state_dict.items():
+            name = name.replace("diffusion_model.", "")
+            name = name.replace(".weight", "")
+            # misc-format -> HF-format
+            name, _, _ = lora_param_names_mapping_fn(name)
+            # HF-format (LoRA) -> SGLang-dit-format
+            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
+            # for (in_dim, r) @ (r, out_dim), we only merge (r, out_dim * n) where n is the number of linear layers to fuse
+            # see param mapping in HunyuanVideoArchConfig
+            if merge_index is not None and "lora_B" in name:
+                to_merge_params[target_name][merge_index] = weight
+                if len(to_merge_params[target_name]) == num_params_to_merge:
+                    # cat at output dim according to the merge_index order
+                    sorted_tensors = [
+                        to_merge_params[target_name][i]
+                        for i in range(num_params_to_merge)
+                    ]
+                    weight = torch.cat(sorted_tensors, dim=1)
+                    del to_merge_params[target_name]
+                else:
+                    continue
+
+            print(f"{name} -> {target_name}")
+            if target_name in self.lora_adapters[lora_nickname]:
+                raise ValueError(
+                    f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
+                )
+            self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
+        self.cur_adapter_path = lora_path
+        self.loaded_adapter_paths[lora_nickname] = lora_path
+        logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
     def set_lora(
         self, lora_nickname: str, lora_path: str | None = None
@@ -160,56 +226,8 @@ class LoRAPipeline(ComposedPipelineBase):
                 should_load = True
 
         if should_load:
-            assert lora_path is not None
-            lora_local_path = maybe_download_lora(lora_path)
-            lora_state_dict = load_file(lora_local_path)
-
-            # Clear existing weights for this nickname if they exist (e.g. reloading with new path)
-            if lora_nickname in self.lora_adapters:
-                self.lora_adapters[lora_nickname].clear()
-
-            # Map the hf layer names to our custom layer names
-            param_names_mapping_fn = get_param_names_mapping(
-                self.modules["transformer"].param_names_mapping
-            )
-            lora_param_names_mapping_fn = get_param_names_mapping(
-                self.modules["transformer"].lora_param_names_mapping
-            )
-
-            to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
-            for name, weight in lora_state_dict.items():
-                name = name.replace("diffusion_model.", "")
-                name = name.replace(".weight", "")
-                name, _, _ = lora_param_names_mapping_fn(name)
-                target_name, merge_index, num_params_to_merge = param_names_mapping_fn(
-                    name
-                )
-                # for (in_dim, r) @ (r, out_dim), we only merge (r, out_dim * n) where n is the number of linear layers to fuse
-                # see param mapping in HunyuanVideoArchConfig
-                if merge_index is not None and "lora_B" in name:
-                    to_merge_params[target_name][merge_index] = weight
-                    if len(to_merge_params[target_name]) == num_params_to_merge:
-                        # cat at output dim according to the merge_index order
-                        sorted_tensors = [
-                            to_merge_params[target_name][i]
-                            for i in range(num_params_to_merge)
-                        ]
-                        weight = torch.cat(sorted_tensors, dim=1)
-                        del to_merge_params[target_name]
-                    else:
-                        continue
-
-                if target_name in self.lora_adapters[lora_nickname]:
-                    # Just overwrite instead of raising error
-                    # raise ValueError(
-                    #     f"Target name {target_name} already exists in lora_adapters[{lora_nickname}]"
-                    # )
-                    pass
-                self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
             adapter_updated = True
-            self.cur_adapter_path = lora_path
-            self.loaded_adapter_paths[lora_nickname] = lora_path
-            logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
+            self.load_lora_adapter(lora_path, lora_nickname, rank)
 
         if (
             not adapter_updated
@@ -237,7 +255,7 @@ class LoRAPipeline(ComposedPipelineBase):
             else:
                 if rank == 0:
                     logger.warning(
-                        "LoRA adapter %s does not contain the weights for layer %s. LoRA will not be applied to it.",
+                        "LoRA adapter %s does not contain the weights for layer '%s'. LoRA will not be applied to it.",
                         lora_path,
                         name,
                     )
@@ -252,11 +270,12 @@ class LoRAPipeline(ComposedPipelineBase):
 
     def merge_lora_weights(self) -> None:
         if self.is_lora_merged:
-            logger.warning("LoRA weights are already merged.")
+            logger.warning("LoRA weights are already merged")
             return
 
         for name, layer in self.lora_layers.items():
             layer.merge_lora_weights()
+        logger.info("LoRA weights merged")
         self.is_lora_merged = True
 
     def unmerge_lora_weights(self) -> None:

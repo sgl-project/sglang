@@ -116,7 +116,7 @@ class ServerContext:
                 while not self._log_stream_stop.is_set():
                     line = f.readline()
                     if line:
-                        print(f"[Server Log] {line.strip()}")
+                        pass
                     else:
                         time.sleep(0.1)
 

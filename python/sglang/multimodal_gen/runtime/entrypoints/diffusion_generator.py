@@ -34,8 +34,11 @@ from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
+    suppress_loggers,
     suppress_other_loggers,
 )
+
+suppress_loggers(["imageio", "imageio_ffmpeg", "PIL", "PIL_Image"])
 
 logger = init_logger(__name__)
 
@@ -404,7 +407,6 @@ class DiffGenerator:
         self._is_lora_merged = False
 
     def merge_lora_weights(self) -> None:
-        """Merge LoRA weights."""
         req = MergeLoraWeightsReq()
         self._send_lora_request(
             req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
