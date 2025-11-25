@@ -380,7 +380,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             if self.num_shared_experts > 0:
                 shared_output = self.shared_experts(hidden_states)
 
-            topk_weights, topk_idx, _ = self.topk(
+            topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
@@ -389,53 +389,15 @@ class BailingMoESparseMoeBlock(nn.Module):
                 ),
             )
         else:
-            topk_idx = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            topk_weights = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
-
-        if self.ep_size > 1:
-            (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                reorder_topk_ids,
-                num_recv_tokens_per_expert,
-                seg_indptr,
-                masked_m,
-                expected_m,
-            ) = self.deepep_dispatcher.dispatch(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                forward_batch=forward_batch,
-            )
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            reorder_topk_ids=reorder_topk_ids,
-            seg_indptr=seg_indptr,
-            masked_m=masked_m,
-            expected_m=expected_m,
-            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
-            forward_batch=forward_batch,
+            topk_output=topk_output,
         )
-        if self.ep_size > 1:
-            final_hidden_states = self.deepep_dispatcher.combine(
-                final_hidden_states,
-                topk_idx,
-                topk_weights,
-                forward_batch=forward_batch,
-            )
-
-        final_hidden_states *= self.routed_scaling_factor
 
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            final_hidden_states += shared_output
         return final_hidden_states
 
 
