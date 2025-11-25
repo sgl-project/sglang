@@ -73,7 +73,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             prompt=sampling_params.prompt or "A colorful raccoon icon",
             output_size=output_size,
         )
-        warmup.run_text_warmups(server_args.server_args.warmup_text)
+        warmup.run_text_warmups(server_args.warmup_text)
 
         if (
             case.server_args.warmup_edit > 0
@@ -81,7 +81,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             and sampling_params.image_path
         ):
             # Handle URL or local path
-            image_path = sampling_params.image_path
             if is_image_url(sampling_params.image_path):
                 image_path = download_image_from_url(str(sampling_params.image_path))
             else:
