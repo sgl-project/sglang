@@ -140,7 +140,7 @@ mod tests {
     async fn test_pipeline_stage_names() {
         let pipeline = RequestPipeline::new(vec!["http://localhost:8000".to_string()]);
 
-        let expected_names = vec![
+        let expected_names = [
             "Validation",
             "ModelDiscovery",
             "ContextLoading",

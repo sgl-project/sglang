@@ -44,6 +44,7 @@ use crate::{
 
 /// Helper that parses SSE frames from the OpenAI responses stream and
 /// accumulates enough information to persist the final response locally.
+#[allow(dead_code)]
 pub(super) struct StreamingResponseAccumulator {
     /// The initial `response.created` payload (if emitted).
     initial_response: Option<Value>,
@@ -56,6 +57,7 @@ pub(super) struct StreamingResponseAccumulator {
     encountered_error: Option<Value>,
 }
 
+#[allow(dead_code)]
 impl StreamingResponseAccumulator {
     pub fn new() -> Self {
         Self {
@@ -215,6 +217,7 @@ impl StreamingResponseAccumulator {
 // ============================================================================
 
 /// Handles streaming responses with MCP tool call interception
+#[allow(dead_code)]
 pub(super) struct StreamingToolHandler {
     /// Accumulator for response persistence
     pub accumulator: StreamingResponseAccumulator,
@@ -228,6 +231,7 @@ pub(super) struct StreamingToolHandler {
     pub original_response_id: Option<String>,
 }
 
+#[allow(dead_code)]
 impl StreamingToolHandler {
     pub fn with_starting_index(start: usize) -> Self {
         Self {
@@ -520,6 +524,7 @@ impl StreamingToolHandler {
 ///
 /// Returns borrowed strings when possible to avoid allocations in hot paths.
 /// Only allocates when multiple data lines need to be joined.
+#[allow(dead_code)]
 pub(super) fn parse_sse_block(block: &str) -> (Option<&str>, Cow<'_, str>) {
     let mut event_name: Option<&str> = None;
     let mut data_lines: Vec<&str> = Vec::new();
@@ -548,6 +553,7 @@ pub(super) fn parse_sse_block(block: &str) -> (Option<&str>, Cow<'_, str>) {
 /// Apply all transformations to event data in-place (rewrite + transform)
 /// Optimized to parse JSON only once instead of multiple times
 /// Returns true if any changes were made
+#[allow(dead_code)]
 pub(super) fn apply_event_transformations_inplace(
     parsed_data: &mut Value,
     server_label: &str,
@@ -665,6 +671,7 @@ pub(super) fn apply_event_transformations_inplace(
 }
 
 /// Helper to build MCP tools value
+#[allow(dead_code)]
 fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
     let tools = original_body.tools.as_ref()?;
     let mcp_tool = tools
@@ -683,6 +690,7 @@ fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
 /// Forward and transform a streaming event to the client
 /// Returns false if client disconnected
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) fn forward_streaming_event(
     raw_block: &str,
     event_name: Option<&str>,
@@ -900,6 +908,7 @@ pub(super) fn forward_streaming_event(
 /// Send final response.completed event to client
 /// Returns false if client disconnected
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) fn send_final_response_event(
     handler: &StreamingToolHandler,
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -956,6 +965,7 @@ pub(super) fn send_final_response_event(
 
 /// Simple pass-through streaming without MCP interception
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) async fn handle_simple_streaming_passthrough(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
@@ -1126,6 +1136,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
 /// Handle streaming WITH MCP tool call interception and execution
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) async fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
     response_storage: Arc<dyn ResponseStorage>,
@@ -1486,6 +1497,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
 /// Main entry point for handling streaming responses
 /// Delegates to simple passthrough or MCP tool interception based on configuration
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) async fn handle_streaming_response(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,

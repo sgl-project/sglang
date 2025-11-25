@@ -3,7 +3,7 @@
 //! This module provides the core context types that flow through the router pipeline,
 //! providing a single source of truth for request state.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use axum::http::HeaderMap;
 use dashmap::DashMap;
@@ -16,7 +16,7 @@ use crate::{
     mcp::McpManager,
     protocols::{
         chat::ChatCompletionRequest,
-        responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest},
+        responses::{ResponseInputOutputItem, ResponsesRequest},
     },
 };
 

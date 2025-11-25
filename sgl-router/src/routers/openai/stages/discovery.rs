@@ -120,7 +120,6 @@ impl PipelineStage for ModelDiscoveryStage {
 mod tests {
     use std::sync::Arc;
 
-    use axum::http::{HeaderMap, HeaderValue};
     use dashmap::DashMap;
 
     use super::*;
