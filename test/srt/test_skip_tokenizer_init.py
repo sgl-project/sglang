@@ -218,8 +218,8 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     @classmethod
     def setUpClass(cls):
         cls.image_url = (
-            ("https://gh.llkk.cc/" + DEFAULT_IMAGE_URL) 
-            if is_npu() 
+            ("https://gh.llkk.cc/" + DEFAULT_IMAGE_URL)
+            if is_npu()
             else DEFAULT_IMAGE_URL
         )
         cls.image = download_image_with_retry(cls.image_url)
