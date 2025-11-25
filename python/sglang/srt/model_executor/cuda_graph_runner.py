@@ -834,6 +834,11 @@ class CudaGraphRunner:
                     if output.hidden_states is not None
                     else None
                 ),
+                last_hidden_states=(
+                    output.last_hidden_states[: self.raw_num_token]
+                    if output.last_hidden_states is not None
+                    else None
+                ),
             )
         else:
             assert isinstance(output, PPProxyTensors)
