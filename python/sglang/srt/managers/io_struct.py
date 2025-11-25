@@ -1067,7 +1067,7 @@ class FlushCacheReqOutput(BaseReq):
 @dataclass
 class PauseGenerationReqInput(BaseReq):
     """
-    abort: Abort all requests currently being processed.
+    abort: Abort and return all requests currently being processed.
 
     in_place: Pause the scheduler's event_loop from performing inference;
             only non-inference requests (e.g., control commands) will be handled.

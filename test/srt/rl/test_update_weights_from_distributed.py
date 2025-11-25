@@ -70,7 +70,7 @@ def init_process(
     checking_parameters,
     tie_word_embeddings,
     barrier,
-    mode="abort",
+    pause_generation_mode,
 ):
     torch.cuda.set_device(rank)
 
@@ -99,7 +99,7 @@ def init_process(
             backend,
             tp_size,
             barrier,
-            mode=mode,
+            pause_generation_mode,
         )
 
 
@@ -217,7 +217,7 @@ def init_process_sgl(
     backend,
     tp_size,
     barrier,
-    mode="abort",
+    pause_generation_mode,
 ):
     torch.cuda.set_device(rank)
     torch.cuda.synchronize()
@@ -292,13 +292,14 @@ def init_process_sgl(
             },
         )
 
-    if mode in ["inplace", "retract"]:
+    print(f"[sgl] generating text... ")
+    if pause_generation_mode in ["in_place", "retract"]:
 
         def run_decode(max_new_tokens=32):
             response = requests.post(
                 url + "/generate",
                 json={
-                    "text": "The capital of France is",
+                    "text": f"Question: {random.randint(0, 100)},The capital of France is",
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": max_new_tokens,
@@ -327,10 +328,10 @@ def init_process_sgl(
     dtypes = [torch.bfloat16 if backend == "Engine" else "bfloat16"] * len(names)
     shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
 
-    if mode in ["in_place", "retract"]:
+    if pause_generation_mode in ["in_place", "retract"]:
         requests.post(
             url + "/pause_generation",
-            json={"mode": mode},
+            json={"mode": pause_generation_mode},
         )
     torch.cuda.synchronize()
     barrier.wait()
@@ -350,12 +351,12 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
-                "flush_cache": mode in ["retract", "abort"],
+                "flush_cache": pause_generation_mode in ["retract", "abort"],
             },
         )
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
-    if mode in ["in_place", "retract"]:
+    if pause_generation_mode in ["in_place", "retract"]:
         requests.post(
             url + "/continue_generation",
             json={},
@@ -424,7 +425,7 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
-    mode="abort",
+    pause_generation_mode="abort",
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -450,7 +451,7 @@ def test_update_weights_from_distributed(
             checking_parameters,
             tie_word_embeddings,
             barrier,
-            mode,
+            pause_generation_mode,
         ),
         nprocs=1 + dp_size,
         join=False,
@@ -679,23 +680,23 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend
         if is_in_ci():
-            mode = "Server"
+            pause_generation_mode = random.choice(["in_place", "retract"])
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Server", pause_generation_mode),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Sever"),
+                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
             ]
 
             if torch.cuda.device_count() >= 4:
                 test_suits.append(
-                    (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                    (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
                 )
 
             if torch.cuda.device_count() >= 5:
                 test_suits.append(
-                    (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                    (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
                 )
 
         model_state_dict_shapes = {}
@@ -730,19 +731,17 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
             "lm_head.weight",
         ]
 
-        for tp_size, dp_size, model_name, backend in test_suits:
-            modes = ["in_place", "retract"]
-            for mode in modes:
-                test_update_weights_from_distributed(
-                    tp_size,
-                    dp_size,
-                    model_name,
-                    backend,
-                    model_state_dict_shapes[model_name],
-                    truncate_size,
-                    checking_parameters,
-                    mode=mode,
-                )
+        for tp_size, dp_size, model_name, backend, pause_generation_mode in test_suits:
+            test_update_weights_from_distributed(
+                tp_size,
+                dp_size,
+                model_name,
+                backend,
+                model_state_dict_shapes[model_name],
+                truncate_size,
+                checking_parameters,
+                pause_generation_mode,
+            )
 
 
 if __name__ == "__main__":

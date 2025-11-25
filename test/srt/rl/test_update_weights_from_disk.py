@@ -251,7 +251,7 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "The capital of France is",
+                "text": f"Question: {random.randint(0, 100)},The capital of France is",
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
@@ -298,8 +298,8 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
         origin_model_path = self.get_model_info()
         print(f"[Server Mode] origin_model_path: {origin_model_path}")
 
-        modes = ["in_place", "retract"]
-        for mode in modes:
+        pause_generation_modes = ["in_place", "retract"]
+        for pause_generation_mode in pause_generation_modes:
             num_requests = 32
             with ThreadPoolExecutor(num_requests) as executor:
                 futures = [
@@ -312,9 +312,9 @@ class TestServerUpdateWeightsFromDiskNonBlocking(CustomTestCase):
                 new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace(
                     "-Instruct", ""
                 )
-                ret = self.pause_generation(mode)
+                ret = self.pause_generation(pause_generation_mode)
                 ret = self.run_update_weights(
-                    new_model_path, flush_cache=mode == "retract"
+                    new_model_path, flush_cache=pause_generation_mode == "retract"
                 )
                 self.assertTrue(ret["success"])
                 ret = self.continue_generation()

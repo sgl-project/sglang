@@ -1,5 +1,6 @@
 import gc
 import json
+import random
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -197,7 +198,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "The capital of France is",
+                "text": f"Question: {random.randint(0, 100)},The capital of France is",
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
@@ -243,8 +244,8 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         return ret
 
     def test_update_weights(self):
-        modes = ["in_place", "retract"]
-        for mode in modes:
+        pause_generation_modes = ["in_place", "retract"]
+        for pause_generation_mode in pause_generation_modes:
             num_requests = 32
             with ThreadPoolExecutor(num_requests) as executor:
                 futures = [
@@ -260,9 +261,9 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
                 new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
                 named_tensors = [(x, new_tensor) for x in param_names]
 
-                ret = self.pause_generation(mode)
+                ret = self.pause_generation(pause_generation_mode)
                 ret = self.run_update_weights(
-                    named_tensors, flush_cache=mode == "retract"
+                    named_tensors, flush_cache=pause_generation_mode == "retract"
                 )
                 self.assertTrue(ret["success"])
                 ret = self.continue_generation()
