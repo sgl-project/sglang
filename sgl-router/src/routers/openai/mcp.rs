@@ -45,7 +45,7 @@ impl Default for McpLoopConfig {
 }
 
 /// State for tracking multi-turn tool calling loop
-pub(crate) struct ToolLoopState {
+pub struct ToolLoopState {
     /// Current iteration number (starts at 0, increments with each tool call)
     pub iteration: usize,
     /// Total number of tool calls executed
