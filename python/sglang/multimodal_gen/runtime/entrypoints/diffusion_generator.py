@@ -413,10 +413,6 @@ class DiffGenerator:
         lora_nickname: str | None = None,
         merge_lora: bool = True,
     ) -> None:
-        """
-        Helper that keeps track of currently active LoRA and guarantees that
-        the backend matches the requested state.
-        """
         if lora_path is None:
             if self._is_lora_merged:
                 self.unmerge_lora_weights()
@@ -451,10 +447,6 @@ class DiffGenerator:
         merge_lora: bool = True,
         **kwargs,
     ):
-        """
-        High level helper that automatically loads / unloads LoRA adapters
-        before running generation.
-        """
         self._ensure_lora_state(
             lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
         )
@@ -469,9 +461,7 @@ class DiffGenerator:
         Shutdown the generator.
         If in local mode, it also shuts down the scheduler server.
         """
-        # This sends the shutdown command to the server
-        # self.scheduler.shutdown()
-
+        # sends the shutdown command to the server
         if self.local_scheduler_process:
             logger.info("Waiting for local worker processes to terminate...")
             for process in self.local_scheduler_process:
