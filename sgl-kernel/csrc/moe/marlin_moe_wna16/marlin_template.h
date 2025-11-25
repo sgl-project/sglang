@@ -517,10 +517,14 @@ __global__ void Marlin(
   int64_t B_expert_off = 0;
 
   int4* sh_block_sorted_ids_int4 = sh;
+  int4* sh_rd_block_sorted_ids_int4 = sh_block_sorted_ids_int4 + moe_block_size / 4;
+  int4* sh_block_topk_weights_int4 = sh_rd_block_sorted_ids_int4 + moe_block_size / 4;
+  // sh_block_topk_weights_int4 only need (moe_block_size / 4);
+  // but we pad to align to 256 bytes
+  int4* sh_new = sh_block_topk_weights_int4 + moe_block_size / 2 + moe_block_size;
   int32_t* sh_block_sorted_ids = reinterpret_cast<int*>(sh_block_sorted_ids_int4);
-  int4* sh_block_topk_weights_int4 = sh_block_sorted_ids_int4 + moe_block_size / 4;
+  int32_t* sh_rd_block_sorted_ids = reinterpret_cast<int*>(sh_rd_block_sorted_ids_int4);
   scalar_t2* sh_block_topk_weights = reinterpret_cast<scalar_t2*>(sh_block_topk_weights_int4);
-  int4* sh_new = sh_block_topk_weights_int4 + moe_block_size / 4;
 
   int32_t block_num_valid_tokens = 0;
   int32_t locks_off = 0;
@@ -563,6 +567,10 @@ __global__ void Marlin(
     if (threadIdx.x % 4 == 0 && threadIdx.x < block_num_valid_tokens) {
       sh_block_sorted_ids_int4[tid4] =
           reinterpret_cast<const int4*>(sorted_token_ids_ptr)[block_id * moe_block_size / 4 + tid4];
+
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+        sh_rd_block_sorted_ids[tid4 * 4 + i] = sh_block_sorted_ids[tid4 * 4 + i] / top_k;
 
       if (mul_topk_weights) {
 #pragma unroll
@@ -812,7 +820,7 @@ __global__ void Marlin(
   // each warp must also write a consecutive memory segment?
   auto transform_a = [&](int i) {
     int row = i / a_gl_rd_delta_o;
-    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ row;
+    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
   };
   // Since the computation of this remapping is non-trivial and, due to our main
   // loop unrolls, all shared memory accesses are static, we simply precompute
@@ -911,7 +919,7 @@ __global__ void Marlin(
           int a_idx = a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off;
           int row = a_idx / a_gl_stride;
           int64_t sorted_row = 0;
-          if (!m_block_size_8 || row < 8) sorted_row = sh_block_sorted_ids[row] / top_k;
+          if (!m_block_size_8 || row < 8) sorted_row = sh_rd_block_sorted_ids[row];
           int64_t true_idx = sorted_row * a_gl_stride + a_idx % a_gl_stride;
           cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx], row < block_num_valid_tokens);
         }
