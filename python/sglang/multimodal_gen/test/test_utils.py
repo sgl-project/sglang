@@ -25,6 +25,15 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 logger = init_logger(__name__)
 
 
+def is_image_url(self) -> bool:
+    """Check if image_edit_path is a URL."""
+    if self.image_path is None:
+        return False
+    return isinstance(self.image_path, str) and (
+        self.image_path.startswith("http://") or self.image_path.startswith("https://")
+    )
+
+
 def run_command(command) -> Optional[float]:
     """Runs a command and returns the execution time and status."""
     print(f"Running command: {shlex.join(command)}")

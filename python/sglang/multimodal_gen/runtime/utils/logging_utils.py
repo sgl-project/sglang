@@ -409,6 +409,13 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
             original_levels[logger_name] = logger.level
             logger.setLevel(logging.WARNING)
 
+        # Suppress verbose logging from imageio, which is triggered when saving images.
+        logging.getLogger("imageio").setLevel(logging.WARNING)
+        logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
+        # Suppress Pillow plugin import logs when app log level is DEBUG
+        logging.getLogger("PIL").setLevel(logging.WARNING)
+        logging.getLogger("PIL.Image").setLevel(logging.WARNING)
+
     try:
         yield
     finally:
