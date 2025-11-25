@@ -20,12 +20,10 @@ import logging
 import math
 import os
 import pickle
-import random
 import signal
 import sys
 import threading
 import time
-import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -33,7 +31,6 @@ from enum import Enum
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
-import aiohttp
 import fastapi
 import orjson
 import torch
@@ -100,13 +97,11 @@ from sglang.srt.tracing.trace import (
     trace_slice_start,
 )
 from sglang.srt.utils import (
-    ImageData,
     configure_gc_warning,
     dataclass_to_string_truncated,
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
-    get_multi_free_port,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -320,13 +315,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
         # E Disaggregation
-        if self.model_config.is_multimodal and self.server_args.language_only:
+        if self.server_args.language_only:
             self.mm_receiver = MMReceiver(
-                server_args.host,
-                server_args.encode_urls,
-                server_args.mm_transfer_backend,
-                server_args.disaggregation_ib_device,
-                self.model_config.dtype,
+                server_args,
+                dtype=self.model_config.dtype,
             )
 
         # Request states
@@ -444,91 +436,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             ]
         )
         self.init_communicators(server_args)
-        # self.host = self.server_args.host
-        # self.ports_pool = get_multi_free_port(self.server_args.tp_size * 20)
-        self.encode_idx = list(range(len(self.server_args.encode_urls)))
-        self.encode_urls = self.server_args.encode_urls
-        self.riq_2_images = {}
-
-    @staticmethod
-    def extrac_and_clean_image_url(obj: GenerateReqInput):
-        image_urls = []
-        for image in obj.image_data:
-            if isinstance(image, ImageData):
-                image_urls.append(image.url)
-                image.url = ""
-        return image_urls
-
-    def _run_encode_in_thread(
-        self, req_id, img_data, endpoint_encode, num_items_assigned, encode_idx
-    ):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        try:
-            loop.run_until_complete(
-                self._encode_in_background(
-                    req_id, img_data, endpoint_encode, num_items_assigned, encode_idx
-                )
-            )
-            # logger.info(f"Encode completed for request {req_id}")
-        except Exception as e:
-            logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
-        finally:
-            # self.ports_pool.extend(embedding_ports)
-            del self.riq_2_images[req_id]
-            loop.close()
-
-    async def _encode_in_background(
-        self, req_id, img_data, endpoint_encode, num_items_assigned, encode_idx
-    ):
-        if len(img_data) == 0:
-            return
-
-        # Split mm_items
-        encode_requests = []
-
-        num_parts = sum(1 for x in num_items_assigned if x != 0)
-        cum_num_items = 0
-        cum_idx = 0
-        for idx, assigned_num in enumerate(num_items_assigned):
-            if assigned_num == 0:
-                continue
-            encode_requests.append(
-                {
-                    "encoder_idx": encode_idx[idx],
-                    "mm_items": img_data[cum_num_items : cum_num_items + assigned_num],
-                    "num_parts": num_parts,
-                    "part_idx": cum_idx,
-                    "req_id": req_id,
-                }
-            )
-            cum_idx += 1
-            cum_num_items += assigned_num
-
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=1800
-            )  # Add timeout for request reliability
-        ) as session:
-            # Send encode requests
-
-            tasks = [
-                session.post(
-                    f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
-                    json=encode_request,
-                )
-                for encode_request in encode_requests
-            ]
-
-            responses = await asyncio.gather(*tasks)
-            response_json_list_unsort = [
-                await response.json() for response in responses
-            ]
-
-            # zmq backend: return is None
-            if None in response_json_list_unsort:
-                return
 
     async def generate_request(
         self,
@@ -538,36 +445,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         created_time = time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
-        if isinstance(obj, GenerateReqInput):
-            image_urls = TokenizerManager.extrac_and_clean_image_url(obj)
-            if obj.rid is None:
-                obj.rid = uuid.uuid4().hex
-            if image_urls and len(image_urls) > 0:
-                logger.info(
-                    f"Processing {len(image_urls)} images for request {obj.rid}"
-                )
-                self.riq_2_images[obj.rid] = image_urls
-                obj.embedding_ports = get_multi_free_port(self.server_args.tp_size)
-                obj.need_wait_for_image = True
-
-                random.shuffle(self.encode_idx)
-                obj.encode_idx = self.encode_idx
-                obj.num_items_assigned = [
-                    (idx + len(image_urls)) // len(self.server_args.encode_urls)
-                    for idx in self.encode_idx
-                ]
-                encode_thread = threading.Thread(
-                    target=self._run_encode_in_thread,
-                    args=(
-                        obj.rid,
-                        image_urls,
-                        "encode",
-                        obj.num_items_assigned,
-                        obj.encode_idx,
-                    ),
-                    daemon=True,
-                )
-                encode_thread.start()
+        if (
+            self.server_args.language_only
+            and isinstance(obj, GenerateReqInput)
+            and self.server_args.mm_transfer_backend == "zmq_s"
+        ):
+            self.mm_receiver.send_encode_requset(obj)
 
         if self.enable_trace:
             external_trace_header = None
@@ -846,8 +729,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             mm_inputs = None
 
-            if self.server_args.language_only is False:
-
+            if (
+                not self.server_args.language_only
+                or self.server_args.mm_transfer_backend != "zmq_s"
+            ):
+                if self.server_args.language_only:
+                    mm_inputs = await self.mm_receiver.recv_mm_data(
+                        img_data=obj.image_data,
+                        mm_processor=self.mm_processor,
+                        prompt=(input_text or input_ids),
+                    )
                 if mm_inputs is None:
                     mm_inputs: Dict = await self.mm_data_processor.process(
                         image_data=obj.image_data,
@@ -1034,7 +925,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 extra_key=obj.extra_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
-                encode_idx=obj.encode_idx,
+                embedding_ports=obj.embedding_ports,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

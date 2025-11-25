@@ -1,10 +1,12 @@
 import asyncio
+import ctypes
 import logging
 import multiprocessing as mp
 import pickle
+import sys
 import time
 import traceback
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import numpy as np
@@ -37,13 +39,10 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
 
 logger = logging.getLogger(__name__)
-import ctypes
-import sys
-from typing import Dict, Set, Tuple
 
-rid_2_receive_endpoint: Dict[str, List[str]] = dict()
-rid_2_receive_count: Dict[str, int] = dict()
-rid_2_ready_event: Dict[str, asyncio.Event] = dict()
+rid_to_receive_endpoint: Dict[str, List[str]] = dict()
+rid_to_receive_count: Dict[str, int] = dict()
+rid_to_ready_event: Dict[str, asyncio.Event] = dict()
 
 
 class TensorWrapper:
@@ -89,14 +88,6 @@ def _convert(data):
 _image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
 
 
-class ReceivePortsManager:
-    def __init__(
-        self,
-    ):
-        self.rid_2_ports = dict()
-        self.rid_2_tp_size = dict()
-
-
 def _get_image_grid_dim(images_input):
     for attr in _image_grid_attrs:
         if attr in images_input:
@@ -104,16 +95,6 @@ def _get_image_grid_dim(images_input):
     raise ValueError(
         f"Image grid dim ({_image_grid_attrs}) not found in {images_input}"
     )
-
-
-def get_ports_for_rank(embedding_ports, rank, tp_size):
-    total_ports = len(embedding_ports)
-    ports_per_rank = (total_ports + tp_size - 1) // tp_size
-
-    start_idx = rank * ports_per_rank
-    end_idx = min(start_idx + ports_per_rank, total_ports)
-
-    return embedding_ports[start_idx:end_idx]
 
 
 class MMEncoder:
@@ -230,40 +211,50 @@ class MMEncoder:
 
     async def _send(
         self,
-        url,
         embedding: torch.Tensor,
         mm_data: EmbeddingData,
         session_id=None,
-        peer_buffer_address=None,
+        buffer_address=None,
+        prefill_host=None,
+        embedding_port=None,
+        url=None,
     ):
         if self.server_args.mm_transfer_backend == "mooncake":
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
             self.engine.transfer_sync(
-                session_id, embedding.data_ptr(), peer_buffer_address, embedding.nbytes
+                session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
             )
             self.engine.deregister(embedding.data_ptr())
 
             mm_data.embedding = None
             mm_data.embedding_list[mm_data.part_idx] = None
-        logger.info(f" [{self.rank}] Sending to {url}")
+
         # Send ack/data
+        endpoint = (
+            f"tcp://{url}"
+            if url is not None
+            else f"tcp://{prefill_host}:{embedding_port}"
+        )
+        logger.info(f"{endpoint = }")
         socket = get_zmq_socket(
             self.context,
             zmq.PUSH,
-            f"tcp://{url}",
+            endpoint,
             False,
         )
 
-        new_mm_data = mm_data.copy_without_embedding()
-        embedding_tensor = TensorWrapper(mm_data.embedding)
-        new_mm_data.send_time = time.time()
-        socket.send_multipart([pickle.dumps(new_mm_data), embedding_tensor._buffer])
+        if self.server_args.mm_transfer_backend == "mooncake":
+            socket.send_multipart([pickle.dumps(mm_data)])
+        else:
+            new_mm_data = mm_data.copy_without_embedding()
+            embedding_tensor = TensorWrapper(mm_data.embedding)
+            socket.send_multipart([pickle.dumps(new_mm_data), embedding_tensor._buffer])
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
         start_time = time.time()
         image_grid_dim, mm_embedding = await self._encode(mm_items)
         end_time = time.time()
-        print(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
+        logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
         if self.rank == 0:
             mm_data = EmbeddingData(
                 req_id,
@@ -275,11 +266,24 @@ class MMEncoder:
             self.embedding_to_send[mm_data.req_id] = mm_data
         return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
+    # For zmq_t zmq_s and mooncake
     async def send(
+        self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
+    ):
+        mm_data: EmbeddingData = self.embedding_to_send[req_id]
+        await self._send(
+            mm_data.embedding,
+            mm_data,
+            session_id=session_id,
+            buffer_address=buffer_address,
+            prefill_host=prefill_host,
+            embedding_port=embedding_port,
+        )
+
+    # For zmq_s
+    async def send_with_url(
         self,
         req_id,
-        session_id=None,
-        buffer_address=None,
     ):
         mm_data = self.embedding_to_send.get(req_id)
         if not mm_data:
@@ -291,8 +295,8 @@ class MMEncoder:
 
         try:
             while True:
-                current_targets = rid_2_receive_endpoint.get(req_id, set()).copy()
-                expected_count = rid_2_receive_count.get(req_id)
+                current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
+                expected_count = rid_to_receive_count.get(req_id)
 
                 new_targets = current_targets - sent_urls
 
@@ -303,11 +307,9 @@ class MMEncoder:
                     for url in new_targets:
                         task = asyncio.create_task(
                             self._send(
-                                url,
                                 mm_data.embedding,
                                 mm_data,
-                                session_id,
-                                buffer_address,
+                                url=url,
                             )
                         )
                         all_tasks.append((task, url))
@@ -345,8 +347,8 @@ class MMEncoder:
 
         finally:
             logger.info(f"Cleaning up resources for req_id {req_id}")
-            rid_2_receive_endpoint.pop(req_id, None)
-            rid_2_receive_count.pop(req_id, None)
+            rid_to_receive_endpoint.pop(req_id, None)
+            rid_to_receive_count.pop(req_id, None)
             self.embedding_to_send.pop(req_id, None)
 
     async def get_embedding_port(self, prefill_url):
@@ -426,8 +428,6 @@ async def handle_encode_request(request: dict):
         num_parts=request["num_parts"],
         part_idx=request["part_idx"],
     )
-    time3 = time.time()
-    # print(f"🕛 send_time = {(time2 - time1) * 1000:.2f}ms, encode_time = {(time3 - time2) * 1000:.2f}ms")
     if encoder.server_args.mm_transfer_backend == "mooncake":
         del request["mm_items"]
         request.update(
@@ -438,10 +438,33 @@ async def handle_encode_request(request: dict):
             }
         )
         return ORJSONResponse(content=request)
-    elif encoder.server_args.mm_transfer_backend == "zmq":
+    elif encoder.server_args.mm_transfer_backend == "zmq_s":
+        logger.info(f"{request["embedding_port"] = }")
+        if request["embedding_port"] is None:
+            await encoder.send_with_url(
+                req_id=request["req_id"],
+            )
+        else:
+            assert type(request["embedding_port"]) == list
+            tasks = []
+            for embedding_port in request["embedding_port"]:
+                tasks.append(
+                    encoder.send(
+                        req_id=request["req_id"],
+                        prefill_host=request["prefill_host"],
+                        embedding_port=embedding_port,
+                    )
+                )
+            await asyncio.gather(*tasks)
+            encoder.embedding_to_send.pop(request["req_id"], None)
+        return ORJSONResponse(content=None)
+    elif encoder.server_args.mm_transfer_backend == "zmq_t":
         await encoder.send(
             req_id=request["req_id"],
+            prefill_host=request["prefill_host"],
+            embedding_port=request["embedding_port"],
         )
+        encoder.embedding_to_send.pop(request["req_id"], None)
         return ORJSONResponse(content=None)
 
 
@@ -455,15 +478,16 @@ async def handle_send_request(request: dict):
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
+    encoder.embedding_to_send.pop(request["req_id"], None)
     return ORJSONResponse(content=None)
 
 
 @app.post("/scheduler_receive_url")
 async def handle_scheduler_receive_url_request(request: dict):
     rid = request["req_id"]
-    global rid_2_receive_endpoint
-    if rid not in rid_2_receive_endpoint:
-        rid_2_receive_endpoint[rid] = set()
-        rid_2_receive_count[rid] = request["receive_count"]
-    assert rid_2_receive_count[rid] == request["receive_count"]
-    rid_2_receive_endpoint[rid].add(request["receive_url"])
+    global rid_to_receive_endpoint
+    if rid not in rid_to_receive_endpoint:
+        rid_to_receive_endpoint[rid] = set()
+        rid_to_receive_count[rid] = request["receive_count"]
+    assert rid_to_receive_count[rid] == request["receive_count"]
+    rid_to_receive_endpoint[rid].add(request["receive_url"])

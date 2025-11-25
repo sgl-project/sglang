@@ -135,7 +135,7 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
-MM_TRANSFER_BACKEND_CHOICES = ["zmq", "mooncake"]
+MM_TRANSFER_BACKEND_CHOICES = ["zmq_s", "zmq_t", "mooncake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -259,7 +259,7 @@ class ServerArgs:
     # Encode prefill disaggregation
     mm_only: bool = False
     language_only: bool = False
-    mm_transfer_backend: str = "zmq"
+    mm_transfer_backend: str = MM_TRANSFER_BACKEND_CHOICES[0]
     encode_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Quantization and data type
