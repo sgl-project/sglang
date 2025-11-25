@@ -44,3 +44,13 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
     ...
     ```
 4. **Paste**: paste the table into the PR description
+
+## 3. CI-Based Change Protection
+
+Consider adding tests to the `pr-test` or `nightly-test` suites to safeguard your changes, especially for PRs that:
+
+1. support a new model
+2. support or fix important features
+3. significantly improve performance
+
+See [test](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/test) for examples
