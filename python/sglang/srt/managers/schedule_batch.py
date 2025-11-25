@@ -788,32 +788,15 @@ class Req:
             and self.multimodal_inputs is not None
             and self.multimodal_inputs.mrope_positions is not None
         ):
-            output_ids_len = len(self.output_ids)
-            if output_ids_len > 0:
-                # Get the last position value corresponding to origin_input_ids
-                # mrope_positions shape: (3, origin_input_ids_len)
-                last_position = self.multimodal_inputs.mrope_positions[
-                    :, -1
-                ]  # shape: (3,)
+            from sglang.srt.managers.mm_utils import (
+                extend_mrope_positions_for_retracted_request,
+            )
 
-                # Generate pure text mrope positions for output_ids
-                # All three dimensions for pure text are the same incremental sequence
-                start_pos = last_position[0] + 1  # Start from last position + 1
-                output_positions = (
-                    torch.arange(
-                        start_pos,
-                        start_pos + output_ids_len,
-                        dtype=torch.int64,
-                        device=self.multimodal_inputs.mrope_positions.device,
-                    )
-                    .unsqueeze(0)
-                    .expand(3, -1)
-                )  # shape: (3, output_ids_len)
-
-                # Concatenate to the original mrope_positions
-                self.multimodal_inputs.mrope_positions = torch.cat(
-                    [self.multimodal_inputs.mrope_positions, output_positions], dim=1
+            self.multimodal_inputs.mrope_positions = (
+                extend_mrope_positions_for_retracted_request(
+                    self.multimodal_inputs.mrope_positions, len(self.output_ids)
                 )
+            )
 
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
