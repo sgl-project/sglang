@@ -350,7 +350,7 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
-                "flush_cache": pause_generation_mode in ["retract", "abort"],
+                "flush_cache": not (pause_generation_mode == "in_place"),
             },
         )
     torch.cuda.synchronize()
@@ -431,7 +431,7 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
-    pause_generation_mode="abort",
+    pause_generation_mode=None,
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -613,13 +613,13 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             if mode == "Server":
                 pause_generation_mode = random.choice(["in_place", "retract"])
             else:
-                pause_generation_mode = "abort"
+                pause_generation_mode = None
             test_suits = [
                 (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode, pause_generation_mode),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None),
                 (
                     1,
                     1,
@@ -632,7 +632,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             if torch.cuda.device_count() >= 4:
                 test_suits.extend(
                     [
-                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
+                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None),
                         (
                             1,
                             2,
@@ -646,7 +646,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             if torch.cuda.device_count() >= 5:
                 test_suits.extend(
                     [
-                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
+                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None),
                         (
                             2,
                             2,
