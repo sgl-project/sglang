@@ -689,6 +689,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
         merge_profiles=obj.merge_profiles,
+        profile_prefix=obj.profile_prefix,
     )
     return Response(
         content="Start profiling.\n",
