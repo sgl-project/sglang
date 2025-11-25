@@ -214,8 +214,7 @@ def maybe_download_lora(
     """
 
     local_path = maybe_download_model(model_name_or_path, local_dir, download)
-    # If local_path is a file, return it directly. This handles cases where
-    # model_name_or_path points directly to a .safetensors file.
+    # return it directly if local_path is a file,
     if os.path.isfile(local_path):
         return local_path
 

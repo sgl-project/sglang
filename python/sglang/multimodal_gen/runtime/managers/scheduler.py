@@ -76,15 +76,16 @@ class Scheduler:
         }
 
     def _handle_set_lora(self, reqs: List[Any]):
+        # TODO: return set status
         req = reqs[0]
         self.worker.set_lora(req.lora_nickname, req.lora_path)
         return {"status": "ok"}
 
-    def _handle_merge_lora(self, reqs: List[Any]):
+    def _handle_merge_lora(self, _reqs: List[Any]):
         self.worker.merge_lora_weights()
         return {"status": "ok"}
 
-    def _handle_unmerge_lora(self, reqs: List[Any]):
+    def _handle_unmerge_lora(self, _reqs: List[Any]):
         self.worker.unmerge_lora_weights()
         return {"status": "ok"}
 
@@ -106,8 +107,7 @@ class Scheduler:
             try:
                 recv_reqs = self.receiver.recv_pyobj()
             except zmq.ZMQError:
-                # In case of ZMQ error (like EFSM), we should not crash the loop
-                # Instead re-raise or handle appropriately to let the outer loop continue
+                # re-raise or handle appropriately to let the outer loop continue
                 raise
 
             # Ensure recv_reqs is a list
@@ -170,14 +170,12 @@ class Scheduler:
 
             # 2: execute, make sure a reply is always sent
             try:
-                # reqs is guaranteed to be a list by recv_reqs
                 first_req = reqs[0] if reqs else None
 
                 handler = self.request_handlers.get(type(first_req))
                 if handler:
                     output_batch = handler(reqs)
                 else:
-                    # Unknown request type
                     output_batch = {
                         "status": "error",
                         "message": f"Unknown request type: {type(first_req)}",

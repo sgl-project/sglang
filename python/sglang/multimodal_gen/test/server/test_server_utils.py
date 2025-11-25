@@ -103,16 +103,14 @@ class ServerContext:
             pass
 
     def start_log_streaming(self) -> None:
-        """Start streaming server logs to stdout in a background thread."""
         if self._log_stream_thread is not None:
             return
 
         self._log_stream_stop = threading.Event()
 
         def _streamer():
-            # Open a new handle for reading
             with open(self.stdout_file, "r") as f:
-                f.seek(0, 2)  # Go to end
+                f.seek(0, 2)
                 while not self._log_stream_stop.is_set():
                     line = f.readline()
                     if line:

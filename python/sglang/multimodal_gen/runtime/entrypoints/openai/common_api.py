@@ -15,7 +15,6 @@ logger = init_logger(__name__)
 
 
 async def _handle_lora_request(req: Any, success_msg: str, failure_msg: str):
-    """Helper to handle LoRA-related API requests, including error handling."""
     try:
         response = await scheduler_client.forward(req)
         if isinstance(response, dict) and response.get("status") == "ok":
@@ -39,9 +38,6 @@ async def set_lora(
     lora_nickname: str = Body(..., embed=True),
     lora_path: Optional[str] = Body(None, embed=True),
 ):
-    """
-    Set the LoRA adapter for the pipeline.
-    """
     req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
     return await _handle_lora_request(
         req,
@@ -52,9 +48,6 @@ async def set_lora(
 
 @router.post("/merge_lora_weights")
 async def merge_lora_weights():
-    """
-    Merge LoRA weights into the base model.
-    """
     req = MergeLoraWeightsReq()
     return await _handle_lora_request(
         req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
@@ -63,9 +56,6 @@ async def merge_lora_weights():
 
 @router.post("/unmerge_lora_weights")
 async def unmerge_lora_weights():
-    """
-    Unmerge LoRA weights from the base model.
-    """
     req = UnmergeLoraWeightsReq()
     return await _handle_lora_request(
         req, "Successfully unmerged LoRA weights", "Failed to unmerge LoRA weights"

@@ -1,7 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 
 # SPDX-License-Identifier: Apache-2.0
+
+from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )

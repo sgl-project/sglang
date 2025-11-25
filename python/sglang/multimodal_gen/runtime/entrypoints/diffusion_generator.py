@@ -372,7 +372,6 @@ class DiffGenerator:
 
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
-        """Helper to send a LoRA-related request and handle the response."""
         response = sync_scheduler_client.forward(req)
         if isinstance(response, dict) and response.get("status") == "ok":
             logger.info(success_msg)
@@ -385,7 +384,6 @@ class DiffGenerator:
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
     def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
-        """Set the LoRA adapter."""
         req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
         self._send_lora_request(
             req,
@@ -394,10 +392,6 @@ class DiffGenerator:
         )
 
     def unmerge_lora_weights(self) -> None:
-        """
-        Use unmerged weights for inference to produce outputs that align with
-        validation outputs generated during training.
-        """
         req = UnmergeLoraWeightsReq()
         self._send_lora_request(
             req,
