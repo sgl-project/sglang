@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use super::utils::event_types;
+use super::super::utils::event_types;
 use crate::{
     data_connector::{ResponseId, StoredResponse},
     protocols::responses::{ResponseToolType, ResponsesRequest},
@@ -16,7 +16,7 @@ use crate::{
 // ============================================================================
 
 /// Build a StoredResponse from response JSON and original request
-pub(super) fn build_stored_response(
+pub(crate) fn build_stored_response(
     response_json: &Value,
     original_body: &ResponsesRequest,
 ) -> StoredResponse {
@@ -82,7 +82,7 @@ pub(super) fn build_stored_response(
 // ============================================================================
 
 /// Patch streaming response JSON with metadata from original request
-pub(super) fn patch_streaming_response_json(
+pub(crate) fn patch_streaming_response_json(
     response_json: &mut Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<&str>,
@@ -166,7 +166,7 @@ pub(super) fn patch_streaming_response_json(
 
 /// Rewrite streaming SSE block to include metadata from original request
 #[allow(dead_code)]
-pub(super) fn rewrite_streaming_block(
+pub(crate) fn rewrite_streaming_block(
     block: &str,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<&str>,
@@ -276,7 +276,7 @@ pub(super) fn rewrite_streaming_block(
 }
 
 /// Mask function tools as MCP tools in response for client
-pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
+pub(crate) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
     let mcp_tool = original_body.tools.as_ref().and_then(|tools| {
         tools
             .iter()

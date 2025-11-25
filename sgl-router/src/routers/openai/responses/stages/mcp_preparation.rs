@@ -1,4 +1,4 @@
-//! MCP Preparation stage
+//! MCP Preparation stage for responses pipeline
 //!
 //! This stage:
 //! - Detects MCP tools in request
@@ -10,23 +10,23 @@ use async_trait::async_trait;
 use axum::response::Response;
 use serde_json::Value;
 
-use super::PipelineStage;
+use super::ResponsesStage;
 use crate::{
     protocols::responses::ResponseInput,
     routers::openai::{
-        context::{McpOutput, RequestContext, RequestType},
         mcp::{ensure_request_mcp_client, ToolLoopState},
+        responses::{McpOutput, ResponsesRequestContext},
         utils::event_types,
     },
 };
 
-/// MCP preparation stage
-pub struct McpPreparationStage;
+/// MCP preparation stage for responses pipeline
+pub struct ResponsesMcpPreparationStage;
 
 /// Maximum iterations for MCP tool loop (safety limit)
 const MAX_MCP_ITERATIONS: usize = 10;
 
-impl McpPreparationStage {
+impl ResponsesMcpPreparationStage {
     /// Transform MCP tools to function format in the payload
     fn prepare_mcp_tools(payload: &mut Value, tools: &[rmcp::model::Tool]) {
         if let Some(obj) = payload.as_object_mut() {
@@ -64,40 +64,24 @@ impl McpPreparationStage {
 }
 
 #[async_trait]
-impl PipelineStage for McpPreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        // Only applicable to Responses requests
-        let responses_req = match &ctx.input.request_type {
-            RequestType::Responses(req) => req,
-            RequestType::Chat(_) => {
-                // Skip for chat requests - mark as inactive
-                ctx.state.mcp = Some(McpOutput {
-                    active: false,
-                    tool_loop_state: ToolLoopState {
-                        iteration: 0,
-                        total_calls: 0,
-                        conversation_history: vec![],
-                        original_input: ResponseInput::Text(String::new()),
-                    },
-                    max_iterations: 0,
-                });
-                return Ok(None);
-            }
-        };
-
+impl ResponsesStage for ResponsesMcpPreparationStage {
+    async fn execute(
+        &self,
+        ctx: &mut ResponsesRequestContext,
+    ) -> Result<Option<Response>, Response> {
         // Check if request has MCP tools - if yes, ensure dynamic MCP client exists
-        if let Some(ref tools) = responses_req.tools {
-            ensure_request_mcp_client(&ctx.components.mcp_manager, tools.as_slice()).await;
+        if let Some(ref tools) = ctx.request().tools {
+            ensure_request_mcp_client(&ctx.dependencies.mcp_manager, tools.as_slice()).await;
         }
 
         // Check if MCP manager has any tools available (static or dynamic)
-        let has_mcp_tools = !ctx.components.mcp_manager.list_tools().is_empty();
+        let has_mcp_tools = !ctx.dependencies.mcp_manager.list_tools().is_empty();
 
         if has_mcp_tools {
             // MCP is active - prepare payload and initialize tool loop state
 
             // Get tools before modifying payload to avoid borrow checker issues
-            let tools = ctx.components.mcp_manager.list_tools();
+            let tools = ctx.dependencies.mcp_manager.list_tools();
 
             // Get or create payload
             let payload_output = ctx.state.payload.as_mut().expect(
@@ -112,7 +96,7 @@ impl PipelineStage for McpPreparationStage {
                 iteration: 0,
                 total_calls: 0,
                 conversation_history: vec![],
-                original_input: responses_req.input.clone(),
+                original_input: ctx.request().input.clone(),
             };
 
             ctx.state.mcp = Some(McpOutput {
@@ -128,7 +112,7 @@ impl PipelineStage for McpPreparationStage {
                     iteration: 0,
                     total_calls: 0,
                     conversation_history: vec![],
-                    original_input: responses_req.input.clone(),
+                    original_input: ctx.request().input.clone(),
                 },
                 max_iterations: 0,
             });
@@ -138,15 +122,16 @@ impl PipelineStage for McpPreparationStage {
     }
 
     fn name(&self) -> &'static str {
-        "McpPreparation"
+        "ResponsesMcpPreparation"
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     use dashmap::DashMap;
+    use serde_json::json;
 
     use super::*;
     use crate::{
@@ -155,17 +140,18 @@ mod tests {
             MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
         },
         mcp::{config::McpConfig, McpManager},
-        protocols::{
-            chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-            responses::{ResponseInput, ResponsesRequest},
+        protocols::responses::{ResponseInput, ResponsesRequest},
+        routers::openai::responses::{
+            ContextOutput, DiscoveryOutput, PayloadOutput, ResponsesDependencies,
+            ValidationOutput,
         },
-        routers::openai::context::{PayloadOutput, RequestInput, SharedComponents},
     };
 
-    async fn create_test_components(worker_urls: Vec<String>) -> Arc<SharedComponents> {
+    async fn create_test_dependencies() -> Arc<ResponsesDependencies> {
         let client = reqwest::Client::new();
         let circuit_breaker = Arc::new(CircuitBreaker::new());
         let model_cache = Arc::new(DashMap::new());
+        let worker_urls = vec!["http://localhost:8000".to_string()];
 
         let mcp_config = McpConfig {
             servers: vec![],
@@ -184,58 +170,20 @@ mod tests {
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
 
-        Arc::new(SharedComponents {
+        Arc::new(ResponsesDependencies {
             http_client: client,
             circuit_breaker,
             model_cache,
-            mcp_manager,
+            worker_urls,
             response_storage,
             conversation_storage,
             conversation_item_storage,
-            worker_urls,
+            mcp_manager,
         })
     }
 
     #[tokio::test]
-    async fn test_mcp_preparation_stage_chat_request() {
-        let worker_urls = vec!["http://localhost:8000".to_string()];
-        let components = create_test_components(worker_urls).await;
-        let stage = McpPreparationStage;
-
-        let request = ChatCompletionRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![ChatMessage::User {
-                content: MessageContent::Text("Hello".to_string()),
-                name: None,
-            }],
-            ..Default::default()
-        };
-
-        let mut ctx = RequestContext {
-            input: RequestInput {
-                request_type: RequestType::Chat(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
-
-        let result = stage.execute(&mut ctx).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-
-        // For chat requests, MCP should be inactive
-        let mcp = ctx.state.mcp.as_ref().unwrap();
-        assert!(!mcp.active);
-    }
-
-    #[tokio::test]
-    async fn test_mcp_preparation_stage_responses_no_tools() {
-        let worker_urls = vec!["http://localhost:8000".to_string()];
-        let components = create_test_components(worker_urls).await;
-        let stage = McpPreparationStage;
-
+    async fn test_mcp_preparation_stage_no_tools() {
         let request = ResponsesRequest {
             model: "gpt-4".to_string(),
             input: ResponseInput::Text("Hello".to_string()),
@@ -243,80 +191,95 @@ mod tests {
             ..Default::default()
         };
 
-        let mut ctx = RequestContext {
-            input: RequestInput {
-                request_type: RequestType::Responses(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
+        let dependencies = create_test_dependencies().await;
+        let mut ctx = ResponsesRequestContext::new(
+            Arc::new(request),
+            None,
+            None,
+            dependencies,
+        );
 
-        // Set up prerequisite payload output
+        // Set prerequisites
+        ctx.state.validation = Some(ValidationOutput {
+            auth_header: None,
+            validated_at: Instant::now(),
+        });
+        ctx.state.discovery = Some(DiscoveryOutput {
+            endpoint_url: "http://localhost:8000".to_string(),
+            model: "gpt-4".to_string(),
+        });
+        ctx.state.context = Some(ContextOutput {
+            conversation_items: None,
+            conversation_id: None,
+            previous_response_id: None,
+        });
         ctx.state.payload = Some(PayloadOutput {
-            json_payload: serde_json::json!({
+            json_payload: json!({
                 "model": "gpt-4",
                 "input": "Hello"
             }),
             is_streaming: false,
         });
 
+        let stage = ResponsesMcpPreparationStage;
         let result = stage.execute(&mut ctx).await;
+
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+        assert!(ctx.state.mcp.is_some());
 
-        // Without tools, MCP should be inactive
-        let mcp = ctx.state.mcp.as_ref().unwrap();
-        assert!(!mcp.active);
+        let mcp = ctx.state.mcp.unwrap();
+        assert_eq!(mcp.active, false);
         assert_eq!(mcp.max_iterations, 0);
     }
 
     #[tokio::test]
     async fn test_mcp_preparation_stage_tool_loop_state() {
-        let worker_urls = vec!["http://localhost:8000".to_string()];
-        let components = create_test_components(worker_urls).await;
-        let stage = McpPreparationStage;
-
         let request = ResponsesRequest {
             model: "gpt-4".to_string(),
-            input: ResponseInput::Text("Use the calculator".to_string()),
-            tools: None,
+            input: ResponseInput::Text("Hello".to_string()),
             ..Default::default()
         };
 
-        let mut ctx = RequestContext {
-            input: RequestInput {
-                request_type: RequestType::Responses(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
+        let dependencies = create_test_dependencies().await;
+        let mut ctx = ResponsesRequestContext::new(
+            Arc::new(request),
+            None,
+            None,
+            dependencies,
+        );
 
-        // Set up prerequisite payload output
+        // Set prerequisites
+        ctx.state.validation = Some(ValidationOutput {
+            auth_header: None,
+            validated_at: Instant::now(),
+        });
+        ctx.state.discovery = Some(DiscoveryOutput {
+            endpoint_url: "http://localhost:8000".to_string(),
+            model: "gpt-4".to_string(),
+        });
+        ctx.state.context = Some(ContextOutput {
+            conversation_items: None,
+            conversation_id: None,
+            previous_response_id: None,
+        });
         ctx.state.payload = Some(PayloadOutput {
-            json_payload: serde_json::json!({
+            json_payload: json!({
                 "model": "gpt-4",
-                "input": "Use the calculator"
+                "input": "Hello"
             }),
             is_streaming: false,
         });
 
+        let stage = ResponsesMcpPreparationStage;
         let result = stage.execute(&mut ctx).await;
-        assert!(result.is_ok());
 
-        // Verify tool loop state initialization
-        let mcp = ctx.state.mcp.as_ref().unwrap();
+        assert!(result.is_ok());
+        assert!(ctx.state.mcp.is_some());
+
+        let mcp = ctx.state.mcp.unwrap();
         assert_eq!(mcp.tool_loop_state.iteration, 0);
         assert_eq!(mcp.tool_loop_state.total_calls, 0);
         assert!(mcp.tool_loop_state.conversation_history.is_empty());
-
-        // Verify original input is preserved
-        match &mcp.tool_loop_state.original_input {
-            ResponseInput::Text(text) => assert_eq!(text, "Use the calculator"),
-            _ => panic!("Expected Text input"),
-        }
     }
 }

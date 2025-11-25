@@ -22,11 +22,7 @@ use super::conversations::{
     create_conversation, create_conversation_items, delete_conversation, delete_conversation_item,
     get_conversation, get_conversation_item, list_conversation_items, update_conversation,
 };
-use super::{
-    context::{CachedEndpoint, RequestType, SharedComponents},
-    pipeline::RequestPipeline,
-    utils::apply_provider_headers,
-};
+use super::utils::apply_provider_headers;
 use crate::{
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
@@ -41,6 +37,20 @@ use crate::{
         responses::{generate_id, ResponsesGetParams, ResponsesRequest},
     },
 };
+
+// ============================================================================
+// Cached Endpoint Type
+// ============================================================================
+
+/// Cached endpoint information for model discovery
+///
+/// Used by both chat and responses pipelines to cache model endpoint URLs,
+/// avoiding repeated endpoint probing.
+#[derive(Clone, Debug)]
+pub struct CachedEndpoint {
+    pub url: String,
+    pub cached_at: std::time::Instant,
+}
 
 // ============================================================================
 // OpenAIRouter Struct
@@ -305,26 +315,21 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Create shared components from router fields
-        let components = Arc::new(SharedComponents {
+        // Create chat dependencies from router fields
+        let dependencies = Arc::new(super::chat::ChatDependencies {
             http_client: self.client.clone(),
             circuit_breaker: Arc::new(self.circuit_breaker.clone()),
             model_cache: self.model_cache.clone(),
-            mcp_manager: self.mcp_manager.clone(),
-            response_storage: self.response_storage.clone(),
-            conversation_storage: self.conversation_storage.clone(),
-            conversation_item_storage: self.conversation_item_storage.clone(),
             worker_urls: self.worker_urls.clone(),
         });
 
-        // Execute pipeline
-        let pipeline = RequestPipeline::new(self.worker_urls.clone());
+        // Execute chat pipeline (4 stages, lightweight)
+        let pipeline = super::chat::ChatPipeline::new(dependencies);
         pipeline
             .execute(
-                RequestType::Chat(Arc::new(body.clone())),
+                Arc::new(body.clone()),
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
-                components,
             )
             .await
     }
@@ -349,26 +354,25 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Create shared components from router fields
-        let components = Arc::new(SharedComponents {
+        // Create responses dependencies from router fields
+        let dependencies = Arc::new(super::responses::ResponsesDependencies {
             http_client: self.client.clone(),
             circuit_breaker: Arc::new(self.circuit_breaker.clone()),
             model_cache: self.model_cache.clone(),
-            mcp_manager: self.mcp_manager.clone(),
+            worker_urls: self.worker_urls.clone(),
             response_storage: self.response_storage.clone(),
             conversation_storage: self.conversation_storage.clone(),
             conversation_item_storage: self.conversation_item_storage.clone(),
-            worker_urls: self.worker_urls.clone(),
+            mcp_manager: self.mcp_manager.clone(),
         });
 
-        // Execute pipeline
-        let pipeline = RequestPipeline::new(self.worker_urls.clone());
+        // Execute responses pipeline (8 stages, full-featured with MCP)
+        let pipeline = super::responses::ResponsesPipeline::new(dependencies);
         pipeline
             .execute(
-                RequestType::Responses(Arc::new(body.clone())),
+                Arc::new(body.clone()),
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
-                components,
             )
             .await
     }

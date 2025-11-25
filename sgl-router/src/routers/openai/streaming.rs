@@ -29,7 +29,7 @@ use super::{
         inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
         send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
     },
-    responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
+    responses::utils::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
     utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
 };
 use crate::{

@@ -1,4 +1,4 @@
-//! Model Discovery stage
+//! Model Discovery stage for responses pipeline
 //!
 //! This stage:
 //! - Determines which endpoint has the requested model
@@ -13,29 +13,27 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::PipelineStage;
+use super::ResponsesStage;
 use crate::routers::openai::{
-    context::{CachedEndpoint, DiscoveryOutput, RequestContext, RequestType},
+    responses::{DiscoveryOutput, ResponsesRequestContext},
+    router::CachedEndpoint,
     utils::probe_endpoint_for_model,
 };
 
-/// Model discovery stage
-pub struct ModelDiscoveryStage {
-    worker_urls: Vec<String>,
-}
+/// Model discovery stage for responses pipeline
+pub struct ResponsesModelDiscoveryStage;
 
-impl ModelDiscoveryStage {
-    pub fn new(worker_urls: Vec<String>) -> Self {
-        Self { worker_urls }
-    }
-
+impl ResponsesModelDiscoveryStage {
     /// Model discovery cache TTL (1 hour)
     const MODEL_CACHE_TTL_SECS: u64 = 3600;
 }
 
 #[async_trait]
-impl PipelineStage for ModelDiscoveryStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+impl ResponsesStage for ResponsesModelDiscoveryStage {
+    async fn execute(
+        &self,
+        ctx: &mut ResponsesRequestContext,
+    ) -> Result<Option<Response>, Response> {
         // Get validation output
         let validation = ctx.state.validation.as_ref().ok_or_else(|| {
             (
@@ -46,22 +44,19 @@ impl PipelineStage for ModelDiscoveryStage {
         })?;
 
         // Get model name
-        let model = match &ctx.input.request_type {
-            RequestType::Chat(req) => &req.model,
-            RequestType::Responses(req) => ctx.input.model_id.as_deref().unwrap_or(&req.model),
-        };
+        let model = ctx.model();
 
         // Fast path: single endpoint
-        if self.worker_urls.len() == 1 {
+        if ctx.dependencies.worker_urls.len() == 1 {
             ctx.state.discovery = Some(DiscoveryOutput {
-                endpoint_url: self.worker_urls[0].clone(),
+                endpoint_url: ctx.dependencies.worker_urls[0].clone(),
                 model: model.to_string(),
             });
             return Ok(None);
         }
 
         // Check cache
-        if let Some(entry) = ctx.components.model_cache.get(model) {
+        if let Some(entry) = ctx.dependencies.model_cache.get(model) {
             if entry.cached_at.elapsed() < Duration::from_secs(Self::MODEL_CACHE_TTL_SECS) {
                 ctx.state.discovery = Some(DiscoveryOutput {
                     endpoint_url: entry.url.clone(),
@@ -76,9 +71,9 @@ impl PipelineStage for ModelDiscoveryStage {
         let model_str = model.to_string();
         let auth = validation.auth_header.clone();
 
-        for url in &self.worker_urls {
+        for url in &ctx.dependencies.worker_urls {
             let handle = tokio::spawn(probe_endpoint_for_model(
-                ctx.components.http_client.clone(),
+                ctx.dependencies.http_client.clone(),
                 url.clone(),
                 model_str.clone(),
                 auth.clone(),
@@ -90,7 +85,7 @@ impl PipelineStage for ModelDiscoveryStage {
         for handle in handles {
             if let Ok(Ok(url)) = handle.await {
                 // Cache it
-                ctx.components.model_cache.insert(
+                ctx.dependencies.model_cache.insert(
                     model_str.clone(),
                     CachedEndpoint {
                         url: url.clone(),
@@ -115,13 +110,13 @@ impl PipelineStage for ModelDiscoveryStage {
     }
 
     fn name(&self) -> &'static str {
-        "ModelDiscovery"
+        "ResponsesModelDiscovery"
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     use dashmap::DashMap;
 
@@ -132,11 +127,11 @@ mod tests {
             MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
         },
         mcp::{config::McpConfig, McpManager},
-        protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        routers::openai::context::{SharedComponents, ValidationOutput},
+        protocols::responses::{ResponseInput, ResponsesRequest},
+        routers::openai::responses::{ResponsesDependencies, ValidationOutput},
     };
 
-    async fn create_test_components(worker_urls: Vec<String>) -> Arc<SharedComponents> {
+    async fn create_test_dependencies(worker_urls: Vec<String>) -> Arc<ResponsesDependencies> {
         let client = reqwest::Client::new();
         let circuit_breaker = Arc::new(CircuitBreaker::new());
         let model_cache = Arc::new(DashMap::new());
@@ -158,129 +153,33 @@ mod tests {
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
 
-        Arc::new(SharedComponents {
+        Arc::new(ResponsesDependencies {
             http_client: client,
             circuit_breaker,
             model_cache,
-            mcp_manager,
+            worker_urls,
             response_storage,
             conversation_storage,
             conversation_item_storage,
-            worker_urls,
+            mcp_manager,
         })
     }
 
     #[tokio::test]
     async fn test_discovery_stage_single_endpoint() {
-        let worker_urls = vec!["http://localhost:8000".to_string()];
-        let components = create_test_components(worker_urls.clone()).await;
-        let stage = ModelDiscoveryStage::new(worker_urls);
-
-        let request = ChatCompletionRequest {
+        let request = ResponsesRequest {
             model: "gpt-4".to_string(),
-            messages: vec![ChatMessage::User {
-                content: MessageContent::Text("Hello".to_string()),
-                name: None,
-            }],
+            input: ResponseInput::Text("Hello".to_string()),
             ..Default::default()
         };
 
-        let mut ctx = RequestContext {
-            input: crate::routers::openai::context::RequestInput {
-                request_type: RequestType::Chat(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
-
-        // Set validation output (prerequisite)
-        ctx.state.validation = Some(ValidationOutput {
-            auth_header: None,
-            validated_at: Instant::now(),
-        });
-
-        let result = stage.execute(&mut ctx).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-
-        // Verify discovery output
-        let discovery = ctx.state.discovery.as_ref().unwrap();
-        assert_eq!(discovery.endpoint_url, "http://localhost:8000");
-        assert_eq!(discovery.model, "gpt-4");
-    }
-
-    #[tokio::test]
-    async fn test_discovery_stage_validation_not_completed() {
-        let worker_urls = vec!["http://localhost:8000".to_string()];
-        let components = create_test_components(worker_urls.clone()).await;
-        let stage = ModelDiscoveryStage::new(worker_urls);
-
-        let request = ChatCompletionRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![ChatMessage::User {
-                content: MessageContent::Text("Hello".to_string()),
-                name: None,
-            }],
-            ..Default::default()
-        };
-
-        let mut ctx = RequestContext {
-            input: crate::routers::openai::context::RequestInput {
-                request_type: RequestType::Chat(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
-
-        // Don't set validation output - should error
-        let result = stage.execute(&mut ctx).await;
-        assert!(result.is_err());
-
-        let response = result.unwrap_err();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn test_discovery_stage_cache_hit() {
-        let worker_urls = vec![
-            "http://localhost:8000".to_string(),
-            "http://localhost:8001".to_string(),
-        ];
-        let components = create_test_components(worker_urls.clone()).await;
-
-        // Pre-populate cache
-        components.model_cache.insert(
-            "gpt-4".to_string(),
-            CachedEndpoint {
-                url: "http://localhost:8001".to_string(),
-                cached_at: Instant::now(),
-            },
+        let dependencies = create_test_dependencies(vec!["http://localhost:8000".to_string()]).await;
+        let mut ctx = ResponsesRequestContext::new(
+            Arc::new(request),
+            None,
+            None,
+            dependencies,
         );
-
-        let stage = ModelDiscoveryStage::new(worker_urls);
-
-        let request = ChatCompletionRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![ChatMessage::User {
-                content: MessageContent::Text("Hello".to_string()),
-                name: None,
-            }],
-            ..Default::default()
-        };
-
-        let mut ctx = RequestContext {
-            input: crate::routers::openai::context::RequestInput {
-                request_type: RequestType::Chat(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
 
         // Set validation output
         ctx.state.validation = Some(ValidationOutput {
@@ -288,11 +187,82 @@ mod tests {
             validated_at: Instant::now(),
         });
 
+        let stage = ResponsesModelDiscoveryStage;
         let result = stage.execute(&mut ctx).await;
-        assert!(result.is_ok());
 
-        // Verify cache hit - should use cached URL
-        let discovery = ctx.state.discovery.as_ref().unwrap();
-        assert_eq!(discovery.endpoint_url, "http://localhost:8001");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        assert!(ctx.state.discovery.is_some());
+
+        let discovery = ctx.state.discovery.unwrap();
+        assert_eq!(discovery.endpoint_url, "http://localhost:8000");
+        assert_eq!(discovery.model, "gpt-4");
+    }
+
+    #[tokio::test]
+    async fn test_discovery_stage_no_validation() {
+        let request = ResponsesRequest {
+            model: "gpt-4".to_string(),
+            input: ResponseInput::Text("Hello".to_string()),
+            ..Default::default()
+        };
+
+        let dependencies = create_test_dependencies(vec!["http://localhost:8000".to_string()]).await;
+        let mut ctx = ResponsesRequestContext::new(
+            Arc::new(request),
+            None,
+            None,
+            dependencies,
+        );
+
+        // Don't set validation output
+        let stage = ResponsesModelDiscoveryStage;
+        let result = stage.execute(&mut ctx).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_discovery_stage_cache_hit() {
+        let request = ResponsesRequest {
+            model: "gpt-4".to_string(),
+            input: ResponseInput::Text("Hello".to_string()),
+            ..Default::default()
+        };
+
+        let dependencies = create_test_dependencies(vec![
+            "http://localhost:8000".to_string(),
+            "http://localhost:8001".to_string(),
+        ]).await;
+
+        // Pre-populate cache
+        dependencies.model_cache.insert(
+            "gpt-4".to_string(),
+            CachedEndpoint {
+                url: "http://localhost:8000".to_string(),
+                cached_at: Instant::now(),
+            },
+        );
+
+        let mut ctx = ResponsesRequestContext::new(
+            Arc::new(request),
+            None,
+            None,
+            dependencies,
+        );
+
+        ctx.state.validation = Some(ValidationOutput {
+            auth_header: None,
+            validated_at: Instant::now(),
+        });
+
+        let stage = ResponsesModelDiscoveryStage;
+        let result = stage.execute(&mut ctx).await;
+
+        assert!(result.is_ok());
+        assert!(ctx.state.discovery.is_some());
+
+        let discovery = ctx.state.discovery.unwrap();
+        assert_eq!(discovery.endpoint_url, "http://localhost:8000");
     }
 }

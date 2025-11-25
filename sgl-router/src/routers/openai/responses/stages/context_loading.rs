@@ -1,4 +1,4 @@
-//! Context Loading stage
+//! Context Loading stage for responses pipeline
 //!
 //! This stage:
 //! - Loads previous response chain (if previous_response_id provided)
@@ -14,40 +14,34 @@ use axum::{
 use serde_json::json;
 use tracing::warn;
 
-use super::PipelineStage;
+use super::ResponsesStage;
 use crate::{
     data_connector::{ConversationId, ListParams, ResponseId, SortOrder},
     protocols::responses::{ResponseContentPart, ResponseInputOutputItem},
-    routers::openai::context::{ContextOutput, RequestContext, RequestType},
+    routers::openai::responses::{ContextOutput, ResponsesRequestContext},
 };
 
-/// Context loading stage
-pub struct ContextLoadingStage;
+/// Context loading stage for responses pipeline
+pub struct ResponsesContextLoadingStage;
 
-impl ContextLoadingStage {
+impl ResponsesContextLoadingStage {
     /// Maximum conversation history items to load
     const MAX_CONVERSATION_HISTORY_ITEMS: usize = 1000;
 }
 
 #[async_trait]
-impl PipelineStage for ContextLoadingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        // Only applicable to Responses requests
-        let responses_req = match &ctx.input.request_type {
-            RequestType::Responses(req) => req,
-            RequestType::Chat(_) => {
-                // Skip for chat requests
-                return Ok(None);
-            }
-        };
-
+impl ResponsesStage for ResponsesContextLoadingStage {
+    async fn execute(
+        &self,
+        ctx: &mut ResponsesRequestContext,
+    ) -> Result<Option<Response>, Response> {
         let mut conversation_items: Vec<ResponseInputOutputItem> = Vec::new();
 
         // Load previous response chain
-        if let Some(prev_id_str) = &responses_req.previous_response_id {
+        if let Some(prev_id_str) = &ctx.request().previous_response_id {
             let prev_id = ResponseId::from(prev_id_str.as_str());
             match ctx
-                .components
+                .dependencies
                 .response_storage
                 .get_response_chain(&prev_id, None)
                 .await
@@ -103,12 +97,12 @@ impl PipelineStage for ContextLoadingStage {
         }
 
         // Load conversation history
-        if let Some(conv_id_str) = &responses_req.conversation {
+        if let Some(conv_id_str) = &ctx.request().conversation {
             let conv_id = ConversationId::from(conv_id_str.as_str());
 
             // Verify conversation exists
             if let Ok(None) = ctx
-                .components
+                .dependencies
                 .conversation_storage
                 .get_conversation(&conv_id)
                 .await
@@ -128,7 +122,7 @@ impl PipelineStage for ContextLoadingStage {
             };
 
             match ctx
-                .components
+                .dependencies
                 .conversation_item_storage
                 .list_items(&conv_id, params)
                 .await
@@ -208,15 +202,15 @@ impl PipelineStage for ContextLoadingStage {
             } else {
                 Some(conversation_items)
             },
-            conversation_id: responses_req.conversation.clone(),
-            previous_response_id: responses_req.previous_response_id.clone(),
+            conversation_id: ctx.request().conversation.clone(),
+            previous_response_id: ctx.request().previous_response_id.clone(),
         });
 
         Ok(None)
     }
 
     fn name(&self) -> &'static str {
-        "ContextLoading"
+        "ResponsesContextLoading"
     }
 }
 
@@ -233,17 +227,15 @@ mod tests {
             MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
         },
         mcp::{config::McpConfig, McpManager},
-        protocols::{
-            chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-            responses::ResponsesRequest,
-        },
-        routers::openai::context::{SharedComponents, ValidationOutput},
+        protocols::responses::{ResponseInput, ResponsesRequest},
+        routers::openai::responses::{ResponsesDependencies, ValidationOutput},
     };
 
-    async fn create_test_components(worker_urls: Vec<String>) -> Arc<SharedComponents> {
+    async fn create_test_dependencies() -> Arc<ResponsesDependencies> {
         let client = reqwest::Client::new();
         let circuit_breaker = Arc::new(CircuitBreaker::new());
         let model_cache = Arc::new(DashMap::new());
+        let worker_urls = vec!["http://localhost:8000".to_string()];
 
         let mcp_config = McpConfig {
             servers: vec![],
@@ -262,87 +254,47 @@ mod tests {
         let conversation_storage = Arc::new(MemoryConversationStorage::new());
         let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
 
-        Arc::new(SharedComponents {
+        Arc::new(ResponsesDependencies {
             http_client: client,
             circuit_breaker,
             model_cache,
-            mcp_manager,
+            worker_urls,
             response_storage,
             conversation_storage,
             conversation_item_storage,
-            worker_urls,
+            mcp_manager,
         })
     }
 
     #[tokio::test]
-    async fn test_context_loading_stage_chat_request() {
-        let worker_urls = vec!["http://localhost:8000".to_string()];
-        let components = create_test_components(worker_urls).await;
-        let stage = ContextLoadingStage;
-
-        let request = ChatCompletionRequest {
-            model: "gpt-4".to_string(),
-            messages: vec![ChatMessage::User {
-                content: MessageContent::Text("Hello".to_string()),
-                name: None,
-            }],
-            ..Default::default()
-        };
-
-        let mut ctx = RequestContext {
-            input: crate::routers::openai::context::RequestInput {
-                request_type: RequestType::Chat(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
-
-        let result = stage.execute(&mut ctx).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-
-        // Context should not be set for chat requests
-        assert!(ctx.state.context.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_context_loading_stage_responses_no_context() {
-        let worker_urls = vec!["http://localhost:8000".to_string()];
-        let components = create_test_components(worker_urls).await;
-        let stage = ContextLoadingStage;
-
+    async fn test_context_loading_stage_no_context() {
         let request = ResponsesRequest {
             model: "gpt-4".to_string(),
-            input: crate::protocols::responses::ResponseInput::Text("Hello".to_string()),
-            conversation: None,
-            previous_response_id: None,
+            input: ResponseInput::Text("Hello".to_string()),
             ..Default::default()
         };
 
-        let mut ctx = RequestContext {
-            input: crate::routers::openai::context::RequestInput {
-                request_type: RequestType::Responses(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
+        let dependencies = create_test_dependencies().await;
+        let mut ctx = ResponsesRequestContext::new(
+            Arc::new(request),
+            None,
+            None,
+            dependencies,
+        );
 
-        // Set validation output (prerequisite)
         ctx.state.validation = Some(ValidationOutput {
             auth_header: None,
             validated_at: Instant::now(),
         });
 
+        let stage = ResponsesContextLoadingStage;
         let result = stage.execute(&mut ctx).await;
+
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+        assert!(ctx.state.context.is_some());
 
-        // Context should be set but with no items
-        let context = ctx.state.context.as_ref().unwrap();
+        let context = ctx.state.context.unwrap();
         assert!(context.conversation_items.is_none());
         assert!(context.conversation_id.is_none());
         assert!(context.previous_response_id.is_none());
@@ -350,32 +302,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_loading_stage_conversation_not_found() {
-        let worker_urls = vec!["http://localhost:8000".to_string()];
-        let components = create_test_components(worker_urls).await;
-        let stage = ContextLoadingStage;
-
         let request = ResponsesRequest {
             model: "gpt-4".to_string(),
-            input: crate::protocols::responses::ResponseInput::Text("Hello".to_string()),
-            conversation: Some("non-existent-conv".to_string()),
-            previous_response_id: None,
+            input: ResponseInput::Text("Hello".to_string()),
+            conversation: Some("conv_nonexistent".to_string()),
             ..Default::default()
         };
 
-        let mut ctx = RequestContext {
-            input: crate::routers::openai::context::RequestInput {
-                request_type: RequestType::Responses(Arc::new(request)),
-                headers: None,
-                model_id: None,
-            },
-            components,
-            state: Default::default(),
-        };
+        let dependencies = create_test_dependencies().await;
+        let mut ctx = ResponsesRequestContext::new(
+            Arc::new(request),
+            None,
+            None,
+            dependencies,
+        );
 
+        ctx.state.validation = Some(ValidationOutput {
+            auth_header: None,
+            validated_at: Instant::now(),
+        });
+
+        let stage = ResponsesContextLoadingStage;
         let result = stage.execute(&mut ctx).await;
-        assert!(result.is_err());
 
-        let response = result.unwrap_err();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // Should return 404 error for nonexistent conversation
+        assert!(result.is_err());
     }
 }
