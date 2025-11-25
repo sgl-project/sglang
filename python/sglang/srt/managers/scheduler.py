@@ -926,7 +926,11 @@ class Scheduler(
         ).stream(self.copy_stream)
 
         self.future_map = FutureMap(
-            self.max_running_requests, self.device, self.spec_algorithm
+            self.max_running_requests,
+            self.chunked_prefill_size,
+            self.model_config.context_len,
+            self.device,
+            self.spec_algorithm,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
