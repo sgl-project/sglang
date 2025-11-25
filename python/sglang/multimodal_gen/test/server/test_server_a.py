@@ -29,6 +29,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 
 logger = init_logger(__name__)
 
+
 # duplicate with `maybe_download_lora`?
 def download_lora_weights(url: str, file_name: str) -> str:
     target_dir: str = "~/.cache"
