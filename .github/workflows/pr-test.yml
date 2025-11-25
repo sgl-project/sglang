@@ -567,7 +567,6 @@ jobs:
       - name: Install dependencies
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
-
       - name: Run diffusion server tests
         timeout-minutes: 60
         run: |
