@@ -6,7 +6,7 @@ from typing import Any
 import zmq
 
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -133,7 +133,7 @@ class Scheduler:
 
             # 2: execute, make sure a reply is always sent
             try:
-                output_batch = self.worker.execute_forward(reqs, self.server_args)
+                output_batch = self.worker.execute_forward(reqs)
             except Exception as e:
                 logger.error(
                     f"Error executing forward in scheduler event loop: {e}",

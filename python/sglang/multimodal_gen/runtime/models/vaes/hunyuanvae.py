@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from diffusers
 
-# Copyright 2024 The Hunyuan Team, The HuggingFace Team and The sgl-diffusion Team. All rights reserved.
+# Copyright 2024 The Hunyuan Team, The HuggingFace Team and The sglang-diffusion Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

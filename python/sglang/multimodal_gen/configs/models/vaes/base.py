@@ -26,7 +26,7 @@ class VAEArchConfig(ArchConfig):
 class VAEConfig(ModelConfig):
     arch_config: VAEArchConfig = field(default_factory=VAEArchConfig)
 
-    # sgl-diffusionVAE-specific parameters
+    # sglang-diffusion VAE-specific parameters
     load_encoder: bool = True
     load_decoder: bool = True
 
