@@ -6,8 +6,8 @@ import subprocess
 import time
 from typing import List, Optional, Tuple
 
-from sglang.bench_one_batch_server import BenchmarkResult, generate_markdown_report
 from sglang.srt.utils import kill_process_tree
+from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
