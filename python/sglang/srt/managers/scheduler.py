@@ -1947,13 +1947,6 @@ class Scheduler(
                 model_worker_batch = batch_or_worker_batch
                 self.record_batch_in_overlap(model_worker_batch)
                 forward_batch.record_stream(self.forward_stream)
-                if self.model_worker.can_run_graph(forward_batch):
-                    skip_attn_backend_init = True
-                    self.model_worker.model_runner.graph_runner.replay_prepare(
-                        forward_batch, None
-                    )
-                else:
-                    skip_attn_backend_init = False
 
                 # Sampling info will be modified during forward
                 model_worker_batch.sampling_info = (
@@ -1963,12 +1956,21 @@ class Scheduler(
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
+                # Prepare staging buffers on default stream (decoupled from forward stream)
+                # input_ids will be copied after resolve_future on forward stream
+                if self.model_worker.can_run_graph(forward_batch):
+                    graph_runner = self.model_worker.model_runner.graph_runner
+                    # Wait for previous copy_from to finish reading staging buffers
+                    graph_runner.wait_staging_copy_done(self.default_stream)
+                    # Populate staging (input_ids copied later after resolve_future)
+                    graph_runner.populate_staging_buffers(forward_batch)
+
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(forward_batch)
+                    # forward_batch_generation will copy resolved input_ids from forward_batch to compute buffers in replay_prepare
                     batch_result = self.model_worker.forward_batch_generation(
                         forward_batch,
-                        skip_attn_backend_init=skip_attn_backend_init,
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(

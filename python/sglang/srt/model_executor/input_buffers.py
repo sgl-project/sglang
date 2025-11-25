@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Self
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.utils.common import get_compiler_backend
 
 
-@dataclass
+@dataclass(frozen=True)
 class GraphInputBuffers:
+    # Note (csy): in overlap mode, input_ids will be overwritten.
     input_ids: torch.Tensor
     input_embeds: torch.Tensor
     req_pool_indices: torch.Tensor
@@ -43,7 +45,7 @@ class GraphInputBuffers:
         seq_len_fill_value: int,
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
-    ) -> "GraphInputBuffers":
+    ) -> Self:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
@@ -86,7 +88,6 @@ class GraphInputBuffers:
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
-        # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
         seq_lens_cpu = torch.full(
             (max_bs,),
             seq_len_fill_value,
@@ -112,6 +113,7 @@ class GraphInputBuffers:
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+    @torch.compile(backend=get_compiler_backend(), fullgraph=True, dynamic=True)
     def populate_from_forward_batch(
         self,
         *,
@@ -127,7 +129,7 @@ class GraphInputBuffers:
         attn_tp_size: int,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Optional[torch.Tensor]:
+    ):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
@@ -139,12 +141,10 @@ class GraphInputBuffers:
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
 
-        seq_lens_cpu: Optional[torch.Tensor] = None
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-            seq_lens_cpu = self.seq_lens_cpu[:bs]
 
         if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
@@ -176,4 +176,52 @@ class GraphInputBuffers:
                 dim = src.shape[0]
                 buf[:dim].copy_(src)
 
-        return seq_lens_cpu
+    def get_seq_lens_cpu(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+    ) -> Optional[torch.Tensor]:
+        if forward_batch.seq_lens_cpu is None:
+            return None
+        return self.seq_lens_cpu[:bs]
+
+    @torch.compile(backend=get_compiler_backend(), fullgraph=True, dynamic=True)
+    def copy_from(self, other: Self):
+        # FIXME(csy): overwrite input_ids will crash
+        # self.input_ids.copy_(other.input_ids, non_blocking=True)
+        self.req_pool_indices.copy_(other.req_pool_indices, non_blocking=True)
+        self.seq_lens.copy_(other.seq_lens, non_blocking=True)
+        # Keep CPU mirror in sync with GPU seq_lens.
+        self.seq_lens_cpu.copy_(other.seq_lens_cpu, non_blocking=True)
+        self.out_cache_loc.copy_(other.out_cache_loc, non_blocking=True)
+        self.positions.copy_(other.positions, non_blocking=True)
+        self.mrope_positions.copy_(other.mrope_positions, non_blocking=True)
+        self.num_token_non_padded.copy_(other.num_token_non_padded, non_blocking=True)
+        self.custom_mask.copy_(other.custom_mask)
+        self.next_token_logits_buffer.copy_(
+            other.next_token_logits_buffer,
+            non_blocking=True,
+        )
+        if self.encoder_lens is not None and other.encoder_lens is not None:
+            self.encoder_lens.copy_(other.encoder_lens, non_blocking=True)
+        if self.pp_proxy_tensors is not None and other.pp_proxy_tensors is not None:
+            for dst, src in zip(
+                self.pp_proxy_tensors.values(), other.pp_proxy_tensors.values()
+            ):
+                dst.copy_(src, non_blocking=True)
+        if (
+            self.global_num_tokens_gpu is not None
+            and other.global_num_tokens_gpu is not None
+        ):
+            self.global_num_tokens_gpu.copy_(
+                other.global_num_tokens_gpu,
+                non_blocking=True,
+            )
+        if (
+            self.global_num_tokens_for_logprob_gpu is not None
+            and other.global_num_tokens_for_logprob_gpu is not None
+        ):
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                other.global_num_tokens_for_logprob_gpu,
+                non_blocking=True,
+            )
