@@ -103,14 +103,6 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, 
 /*
  * From csrc/attention
  */
-void lightning_attention_decode(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& past_kv,
-    const torch::Tensor& slope,
-    torch::Tensor output,
-    torch::Tensor new_kv);
 void merge_state(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
@@ -315,6 +307,13 @@ void topk_softmax(
     torch::Tensor& gating_output,
     bool renormalize,
     double moe_softcapping,
+    const c10::optional<torch::Tensor>& correction_bias);
+
+void topk_sigmoid(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
     const c10::optional<torch::Tensor>& correction_bias);
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
