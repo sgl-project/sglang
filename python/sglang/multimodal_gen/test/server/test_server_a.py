@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+
 import pytest
 import requests
 from openai import OpenAI
@@ -93,8 +94,13 @@ class TestLoraWorkflow:
             if not os.path.exists(lora_a_path):
                 print(f"Downloading {lora_a_name}...")
                 subprocess.run(
-                    ["wget", "-O", lora_a_path, "https://civitai.com/api/download/models/2144921?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"],
-                    check=True
+                    [
+                        "wget",
+                        "-O",
+                        lora_a_path,
+                        "https://civitai.com/api/download/models/2144921?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b",
+                    ],
+                    check=True,
                 )
 
             # wget -O "Qwen-Image-Lora-Rem-and-Ram-Re:Zero.safetensors" "https://civitai.com/api/download/models/2123706?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"
@@ -103,8 +109,13 @@ class TestLoraWorkflow:
             if not os.path.exists(lora_b_path):
                 print(f"Downloading {lora_b_name}...")
                 subprocess.run(
-                    ["wget", "-O", lora_b_path, "https://civitai.com/api/download/models/2123706?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"],
-                    check=True
+                    [
+                        "wget",
+                        "-O",
+                        lora_b_path,
+                        "https://civitai.com/api/download/models/2123706?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b",
+                    ],
+                    check=True,
                 )
 
             try:

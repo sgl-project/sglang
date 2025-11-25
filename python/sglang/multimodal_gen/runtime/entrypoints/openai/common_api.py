@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException
 
@@ -14,6 +14,26 @@ router = APIRouter(prefix="/v1")
 logger = init_logger(__name__)
 
 
+async def _handle_lora_request(req: Any, success_msg: str, failure_msg: str):
+    """Helper to handle LoRA-related API requests, including error handling."""
+    try:
+        response = await scheduler_client.forward(req)
+        if isinstance(response, dict) and response.get("status") == "ok":
+            return {"status": "ok", "message": success_msg}
+        else:
+            error_msg = (
+                response.get("message", "Unknown error")
+                if isinstance(response, dict)
+                else "Unknown response format"
+            )
+            raise HTTPException(status_code=500, detail=f"{failure_msg}: {error_msg}")
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logger.error(f"Error during '{failure_msg}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/set_lora")
 async def set_lora(
     lora_nickname: str = Body(..., embed=True),
@@ -22,29 +42,12 @@ async def set_lora(
     """
     Set the LoRA adapter for the pipeline.
     """
-    try:
-        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
-        # Use the singleton scheduler client to forward the request
-        response = await scheduler_client.forward(req)
-
-        if isinstance(response, dict) and response.get("status") == "ok":
-            return {
-                "status": "ok",
-                "message": f"Successfully set LoRA adapter: {lora_nickname}",
-            }
-        else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
-            raise HTTPException(
-                status_code=500, detail=f"Failed to set LoRA adapter: {error_msg}"
-            )
-
-    except Exception as e:
-        logger.error(f"Error setting LoRA adapter: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
+    return await _handle_lora_request(
+        req,
+        f"Successfully set LoRA adapter: {lora_nickname}",
+        "Failed to set LoRA adapter",
+    )
 
 
 @router.post("/merge_lora_weights")
@@ -52,24 +55,10 @@ async def merge_lora_weights():
     """
     Merge LoRA weights into the base model.
     """
-    try:
-        req = MergeLoraWeightsReq()
-        response = await scheduler_client.forward(req)
-
-        if isinstance(response, dict) and response.get("status") == "ok":
-            return {"status": "ok", "message": "Successfully merged LoRA weights"}
-        else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
-            raise HTTPException(
-                status_code=500, detail=f"Failed to merge LoRA weights: {error_msg}"
-            )
-    except Exception as e:
-        logger.error(f"Error merging LoRA weights: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    req = MergeLoraWeightsReq()
+    return await _handle_lora_request(
+        req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
+    )
 
 
 @router.post("/unmerge_lora_weights")
@@ -77,21 +66,7 @@ async def unmerge_lora_weights():
     """
     Unmerge LoRA weights from the base model.
     """
-    try:
-        req = UnmergeLoraWeightsReq()
-        response = await scheduler_client.forward(req)
-
-        if isinstance(response, dict) and response.get("status") == "ok":
-            return {"status": "ok", "message": "Successfully unmerged LoRA weights"}
-        else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
-            raise HTTPException(
-                status_code=500, detail=f"Failed to unmerge LoRA weights: {error_msg}"
-            )
-    except Exception as e:
-        logger.error(f"Error unmerging LoRA weights: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    req = UnmergeLoraWeightsReq()
+    return await _handle_lora_request(
+        req, "Successfully unmerged LoRA weights", "Failed to unmerge LoRA weights"
+    )

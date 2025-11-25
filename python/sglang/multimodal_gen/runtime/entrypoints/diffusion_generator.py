@@ -261,7 +261,7 @@ class DiffGenerator:
         data_type = (
             DataType.IMAGE
             if self.server_args.pipeline_config.task_type.is_image_gen()
-               or pretrained_sampling_params.num_frames == 1
+            or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )
         pretrained_sampling_params.data_type = data_type
