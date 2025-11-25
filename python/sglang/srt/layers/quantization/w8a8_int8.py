@@ -1080,7 +1080,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
         )
         layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+            layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32), requires_grad=False
         )
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
@@ -1145,7 +1145,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         # act_fn: swiglu
         hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
             x=hidden_states,
-            weight_scale=layer.w13_weight_scale.to(torch.float32),
+            weight_scale=layer.w13_weight_scale,
             activation_scale=hidden_states_scale,
             bias=None,
             quant_scale=None,
