@@ -108,6 +108,16 @@ show_time_cost = False
 time_infos = {}
 
 
+def get_or_create_event_loop():
+    """Gets the running event loop or creates a new one if it doesn't exist."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
@@ -3657,6 +3667,61 @@ def cached_triton_kernel(key_fn=None):
             return fn
 
     return decorator
+
+
+def reserve_rope_cache_for_long_sequences(
+    model, server_args, model_config, logger=None
+):
+    """Pre-expand RoPE cache for long sequences and speculative decoding."""
+    from sglang.srt.environ import envs
+
+    if logger is None:
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
+
+    # 1) Estimate base context upper bound
+    base_ctx = (
+        getattr(server_args, "context_length", None)
+        or getattr(model_config, "context_len", None)
+        or getattr(model_config, "max_model_len", None)
+        or getattr(model_config.hf_text_config, "max_position_embeddings", None)
+        or 2048
+    )
+
+    # 2) Speculative decoding expansion
+    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
+    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+
+    # 3) Align to reduce reallocation frequency
+    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+    logger.info(
+        f"RoPE cache reserve={reserve} (cap={base_ctx}, steps={steps}, draft={draft}, k={SAFETY_FACTOR}, margin={MARGIN})"
+    )
+
+    # Recursively expand all RoPE layers
+    def reserve_rope_cache_recursive(module):
+        for child in module.children():
+            if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
+                child, "cos_sin_cache"
+            ):
+                old_len = child.cos_sin_cache.shape[0]
+                child._ensure_cos_sin_cache_length(reserve - 1)
+                new_len = child.cos_sin_cache.shape[0]
+                if new_len > old_len:
+                    logger.info(
+                        f"Expanded RoPE cache from {old_len} to {new_len} positions"
+                    )
+            else:
+                reserve_rope_cache_recursive(child)
+
+    reserve_rope_cache_recursive(model)
 
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py

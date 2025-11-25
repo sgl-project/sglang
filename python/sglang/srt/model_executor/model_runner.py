@@ -156,6 +156,7 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
+    reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
     xpu_has_xmx_support,
@@ -363,6 +364,10 @@ class ModelRunner:
                     elif hasattr(layer.self_attn, "attn_mqa"):
                         # For DeepSeek model
                         self.attention_layers.append(layer.self_attn.attn_mqa)
+                # For InternVL model
+                elif hasattr(layer, "attention"):
+                    if hasattr(layer.attention, "attn"):
+                        self.attention_layers.append(layer.attention.attn)
 
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
                 # TODO(yuwei): support Non-Standard GQA
@@ -593,9 +598,12 @@ class ModelRunner:
                 )
             moe_tp_size = self.tp_size // self.moe_ep_size
 
-            moe_intermediate_size = (
-                self.model_config.hf_text_config.moe_intermediate_size
+            moe_intermediate_size = getattr(
+                self.model_config.hf_text_config, "moe_intermediate_size", None
             )
+            if moe_intermediate_size is None:
+                return
+
             if moe_intermediate_size % moe_tp_size != 0:
                 raise ValueError(
                     f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
@@ -862,6 +870,14 @@ class ModelRunner:
                 self.tp_rank,
                 self.pp_rank,
             )
+
+        # Pre-expand RoPE cache before CUDA Graph capture
+        reserve_rope_cache_for_long_sequences(
+            self.model,
+            self.server_args,
+            self.model_config,
+            logger,
+        )
 
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
