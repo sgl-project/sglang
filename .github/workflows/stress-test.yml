@@ -1,0 +1,317 @@
+name: Stress Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_prompts:
+        description: 'Number of prompts per model'
+        required: true
+        default: '50000'
+        type: string
+      duration_minutes:
+        description: 'Timeout per model in minutes'
+        required: true
+        default: '45'
+        type: string
+
+jobs:
+  # DeepSeek-V3 stress test
+  stress-test-deepseek-v3:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Start SGLang server
+        run: |
+          python3 -m sglang.launch_server \
+            --model-path deepseek-ai/DeepSeek-V3 \
+            --tp 8 \
+            --trust-remote-code \
+            --host 127.0.0.1 \
+            --port 30000 &
+
+          echo "Waiting for server to start..."
+          for i in {1..120}; do
+            if curl -s http://127.0.0.1:30000/health > /dev/null 2>&1; then
+              echo "Server is ready!"
+              break
+            fi
+            if [ $i -eq 120 ]; then
+              echo "Server failed to start within 10 minutes"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Run stress test
+        timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
+        run: |
+          python3 -m sglang.bench_serving \
+            --backend sglang-oai \
+            --base-url http://127.0.0.1:30000 \
+            --dataset-name random \
+            --random-input-len 16384 \
+            --random-output-len 1024 \
+            --random-range-ratio 0.2 \
+            --num-prompts ${{ inputs.num_prompts }} \
+            --output-file stress_test_deepseek_v3.jsonl
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-deepseek-v3
+          path: stress_test_deepseek_v3.jsonl
+
+      - name: Print summary
+        if: always()
+        run: |
+          if [ -f stress_test_deepseek_v3.jsonl ]; then
+            echo "### DeepSeek-V3 Stress Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "- Model: deepseek-ai/DeepSeek-V3" >> $GITHUB_STEP_SUMMARY
+            echo "- TP Size: 8" >> $GITHUB_STEP_SUMMARY
+            echo "- Num Prompts: ${{ inputs.num_prompts }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Input Length: 16384" >> $GITHUB_STEP_SUMMARY
+            echo "- Output Length: 1024" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### DeepSeek-V3 Stress Test Failed" >> $GITHUB_STEP_SUMMARY
+            echo "No results file generated" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Qwen3-235B stress test
+  stress-test-qwen3-235b:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Start SGLang server
+        run: |
+          python3 -m sglang.launch_server \
+            --model-path Qwen/Qwen3-235B-A22B-Instruct-2507 \
+            --tp 8 \
+            --trust-remote-code \
+            --host 127.0.0.1 \
+            --port 30000 &
+
+          echo "Waiting for server to start..."
+          for i in {1..120}; do
+            if curl -s http://127.0.0.1:30000/health > /dev/null 2>&1; then
+              echo "Server is ready!"
+              break
+            fi
+            if [ $i -eq 120 ]; then
+              echo "Server failed to start within 10 minutes"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Run stress test
+        timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
+        run: |
+          python3 -m sglang.bench_serving \
+            --backend sglang-oai \
+            --base-url http://127.0.0.1:30000 \
+            --dataset-name random \
+            --random-input-len 4096 \
+            --random-output-len 512 \
+            --random-range-ratio 0.2 \
+            --num-prompts ${{ inputs.num_prompts }} \
+            --output-file stress_test_qwen3_235b.jsonl
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-qwen3-235b
+          path: stress_test_qwen3_235b.jsonl
+
+      - name: Print summary
+        if: always()
+        run: |
+          if [ -f stress_test_qwen3_235b.jsonl ]; then
+            echo "### Qwen3-235B Stress Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "- Model: Qwen/Qwen3-235B-A22B-Instruct-2507" >> $GITHUB_STEP_SUMMARY
+            echo "- TP Size: 8" >> $GITHUB_STEP_SUMMARY
+            echo "- Num Prompts: ${{ inputs.num_prompts }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Input Length: 4096" >> $GITHUB_STEP_SUMMARY
+            echo "- Output Length: 512" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Qwen3-235B Stress Test Failed" >> $GITHUB_STEP_SUMMARY
+            echo "No results file generated" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Kimi-K2-Thinking stress test
+  stress-test-kimi-k2:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Start SGLang server
+        run: |
+          python3 -m sglang.launch_server \
+            --model-path moonshotai/Kimi-K2-Thinking \
+            --tp 8 \
+            --trust-remote-code \
+            --tool-call-parser kimi_k2 \
+            --reasoning-parser kimi_k2 \
+            --host 127.0.0.1 \
+            --port 30000 &
+
+          echo "Waiting for server to start..."
+          for i in {1..120}; do
+            if curl -s http://127.0.0.1:30000/health > /dev/null 2>&1; then
+              echo "Server is ready!"
+              break
+            fi
+            if [ $i -eq 120 ]; then
+              echo "Server failed to start within 10 minutes"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Run stress test
+        timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
+        run: |
+          python3 -m sglang.bench_serving \
+            --backend sglang-oai \
+            --base-url http://127.0.0.1:30000 \
+            --dataset-name random \
+            --random-input-len 4096 \
+            --random-output-len 512 \
+            --random-range-ratio 0.2 \
+            --num-prompts ${{ inputs.num_prompts }} \
+            --output-file stress_test_kimi_k2.jsonl
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-kimi-k2
+          path: stress_test_kimi_k2.jsonl
+
+      - name: Print summary
+        if: always()
+        run: |
+          if [ -f stress_test_kimi_k2.jsonl ]; then
+            echo "### Kimi-K2-Thinking Stress Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "- Model: moonshotai/Kimi-K2-Thinking" >> $GITHUB_STEP_SUMMARY
+            echo "- TP Size: 8" >> $GITHUB_STEP_SUMMARY
+            echo "- Num Prompts: ${{ inputs.num_prompts }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Input Length: 4096" >> $GITHUB_STEP_SUMMARY
+            echo "- Output Length: 512" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Kimi-K2-Thinking Stress Test Failed" >> $GITHUB_STEP_SUMMARY
+            echo "No results file generated" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # GLM-4.6 stress test
+  stress-test-glm-4-6:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Start SGLang server
+        run: |
+          python3 -m sglang.launch_server \
+            --model-path zai-org/GLM-4.6 \
+            --tp 8 \
+            --trust-remote-code \
+            --host 127.0.0.1 \
+            --port 30000 &
+
+          echo "Waiting for server to start..."
+          for i in {1..120}; do
+            if curl -s http://127.0.0.1:30000/health > /dev/null 2>&1; then
+              echo "Server is ready!"
+              break
+            fi
+            if [ $i -eq 120 ]; then
+              echo "Server failed to start within 10 minutes"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Run stress test
+        timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
+        run: |
+          python3 -m sglang.bench_serving \
+            --backend sglang-oai \
+            --base-url http://127.0.0.1:30000 \
+            --dataset-name random \
+            --random-input-len 4096 \
+            --random-output-len 512 \
+            --random-range-ratio 0.2 \
+            --num-prompts ${{ inputs.num_prompts }} \
+            --output-file stress_test_glm_4_6.jsonl
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-glm-4-6
+          path: stress_test_glm_4_6.jsonl
+
+      - name: Print summary
+        if: always()
+        run: |
+          if [ -f stress_test_glm_4_6.jsonl ]; then
+            echo "### GLM-4.6 Stress Test Results" >> $GITHUB_STEP_SUMMARY
+            echo "- Model: zai-org/GLM-4.6" >> $GITHUB_STEP_SUMMARY
+            echo "- TP Size: 8" >> $GITHUB_STEP_SUMMARY
+            echo "- Num Prompts: ${{ inputs.num_prompts }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Input Length: 4096" >> $GITHUB_STEP_SUMMARY
+            echo "- Output Length: 512" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### GLM-4.6 Stress Test Failed" >> $GITHUB_STEP_SUMMARY
+            echo "No results file generated" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Final check job
+  check-stress-tests:
+    if: github.repository == 'sgl-project/sglang' && always()
+    needs:
+      - stress-test-deepseek-v3
+      - stress-test-qwen3-235b
+      - stress-test-kimi-k2
+      - stress-test-glm-4-6
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any stress test failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more stress tests failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more stress tests were cancelled"
+            exit 1
+          fi
+          echo "All stress tests passed"
+
