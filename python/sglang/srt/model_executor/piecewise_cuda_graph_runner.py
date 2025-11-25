@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -610,6 +611,9 @@ class PiecewiseCudaGraphRunner:
                             else None
                         ),
                     )
+                elif isinstance(output, EmbeddingPoolerOutput):
+                    # The pooler layer handles correct slicing and computation by using seq-lens
+                    return output
                 else:
                     assert isinstance(output, PPProxyTensors)
                     # TODO(Yuwei): support PP Support
