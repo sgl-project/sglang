@@ -30,7 +30,7 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
+      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -68,7 +68,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
+      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -106,7 +106,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
+      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -154,7 +154,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
+      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -199,9 +199,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.2.rc1-a3
+      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -237,7 +237,7 @@ jobs:
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           cd ../
           cd test/srt
-          python3 run_suite.py --suite nightly-test-npu-16-a3 --continue-on-error --timeout-per-file 7200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite nightly-test-npu-16-a3 --continue-on-error --timeout-per-file 7200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
@@ -247,7 +247,7 @@ jobs:
       - nightly-test-npu-4-a3
       - nightly-test-npu-8-a3
       - nightly-test-npu-16-a3
-    runs-on: linux-amd64-cpu-1
+    runs-on: ubuntu-latest
     container:
       image: docker.m.daocloud.io/ubuntu:22.04
     steps:
