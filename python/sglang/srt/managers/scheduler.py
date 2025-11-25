@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import pickle
 import signal
 import sys
 import threading
@@ -1035,7 +1036,8 @@ class Scheduler(
 
                 while True:
                     try:
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        frame = self.recv_from_tokenizer.recv(zmq.NOBLOCK, copy=False)
+                        recv_req = pickle.loads(frame)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
