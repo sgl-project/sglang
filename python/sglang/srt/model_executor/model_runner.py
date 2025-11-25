@@ -134,6 +134,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -2175,123 +2176,96 @@ class ModelRunner:
         num_tokens = batch_size * num_tokens_per_bs
 
         seq_len_fill_value = self.attn_backend.get_cuda_graph_seq_len_fill_value()
-        seq_lens_cpu = torch.full((batch_size,), seq_len_fill_value, dtype=torch.int32)
-
-        if not self.is_generation:
-            extend_prefix_lens_cpu = [0] * batch_size
-            extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
-        else:
-            extend_prefix_lens_cpu = None
-            extend_seq_lens_cpu = None
 
         if self.server_args.enable_torch_compile:
             set_torch_compile_config()
 
-        with torch.device(self.device):
-            input_ids = torch.zeros((num_tokens,), dtype=torch.int64)
-            req_pool_indices = torch.zeros((batch_size,), dtype=torch.int32)
-            seq_lens = torch.full((batch_size,), seq_len_fill_value, dtype=torch.int32)
-            out_cache_loc = torch.zeros((num_tokens,), dtype=torch.int64)
-            positions = torch.zeros((num_tokens,), dtype=torch.int64)
-            mrope_positions = torch.zeros((3, num_tokens), dtype=torch.int64)
-            num_token_non_padded = torch.tensor([num_tokens], dtype=torch.int32)
+        if self.spec_algorithm.is_eagle3():
+            self.model.set_eagle3_layers_to_capture()
 
-            if self.server_args.pp_size > 1:
-                pp_proxy_tensors = {
-                    "hidden_states": torch.zeros(
-                        (batch_size, self.model_config.hidden_size),
-                        dtype=torch.bfloat16,
-                    ),
-                    "residual": torch.zeros(
-                        (batch_size, self.model_config.hidden_size),
-                        dtype=torch.bfloat16,
-                    ),
-                }
-                pp_proxy_tensors = PPProxyTensors(
-                    {k: v[:num_tokens] for k, v in pp_proxy_tensors.items()}
-                )
+        require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
+        if require_gathered_buffer(self.server_args):
+            assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
-            if self.spec_algorithm.is_eagle3():
-                self.model.set_eagle3_layers_to_capture()
+        buffers: GraphInputBuffers = GraphInputBuffers.create(
+            device=self.device,
+            max_bs=batch_size,
+            max_num_token=num_tokens,
+            hidden_size=self.model_config.hidden_size,
+            vocab_size=self.model_config.vocab_size,
+            dtype=self.model_config.dtype,
+            dp_size=self.server_args.dp_size,
+            pp_size=self.server_args.pp_size,
+            is_encoder_decoder=self.model_config.is_encoder_decoder,
+            require_mlp_tp_gather=require_mlp_tp_gather_,
+            seq_len_fill_value=seq_len_fill_value,
+            encoder_len_fill_value=0,
+            num_tokens_per_bs=num_tokens_per_bs,
+            cache_loc_dtype=torch.int64,
+        )
+        buffers.num_token_non_padded[...] = num_tokens
 
-            if self.model_config.is_encoder_decoder:
-                encoder_lens = torch.zeros((batch_size,), dtype=torch.int32)
-            else:
-                encoder_lens = None
+        # For extend mode
+        if not self.is_generation:
+            extend_prefix_lens_cpu = [0] * batch_size
+            extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
+            extend_num_tokens = num_tokens
+            extend_seq_lens = torch.full(
+                (batch_size,), seq_len_fill_value, dtype=torch.int32, device=self.device
+            )
+            extend_prefix_lens = torch.zeros(
+                (batch_size,), dtype=torch.int32, device=self.device
+            )
+            extend_start_loc = torch.arange(
+                0, num_tokens, num_tokens_per_bs, dtype=torch.int32, device=self.device
+            )
+        else:
+            extend_prefix_lens_cpu = None
+            extend_seq_lens_cpu = None
+            extend_num_tokens = None
+            extend_seq_lens = None
+            extend_prefix_lens = None
+            extend_start_loc = None
 
-            if require_gathered_buffer(self.server_args):
-                if require_mlp_tp_gather(self.server_args):
-                    global_num_tokens_gpu = torch.zeros(
-                        (self.server_args.dp_size,), dtype=torch.int32
-                    )
-                    global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (self.server_args.dp_size,), dtype=torch.int32
-                    )
-                else:
-                    assert require_attn_tp_gather(self.server_args)
-                    global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-                    global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (1,), dtype=torch.int32
-                    )
-            else:
-                global_num_tokens_gpu = None
-                global_num_tokens_for_logprob_gpu = None
-
-            custom_mask = torch.ones(
-                ((seq_lens.sum().item() + num_tokens) * num_tokens_per_bs),
-                dtype=torch.bool,
+        if self.server_args.pp_size > 1:
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
-            next_token_logits_buffer = torch.zeros(
-                (num_tokens, self.model_config.vocab_size),
-                dtype=torch.float,
+        if require_mlp_tp_gather_:
+            buffers.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [num_tokens] * self.server_args.dp_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             )
-
-            if require_mlp_tp_gather(self.server_args):
-                global_num_tokens_gpu.copy_(
-                    torch.tensor(
-                        [num_tokens] * self.server_args.dp_size,
-                        dtype=torch.int32,
-                    )
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [num_tokens] * self.server_args.dp_size,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
-                global_num_tokens_for_logprob_gpu.copy_(
-                    torch.tensor(
-                        [num_tokens] * self.server_args.dp_size,
-                        dtype=torch.int32,
-                    )
+            )
+            global_dp_buffer_len = num_tokens * self.server_args.dp_size
+        elif require_attn_tp_gather(self.server_args):
+            buffers.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=self.device,
                 )
-                global_dp_buffer_len = num_tokens * self.server_args.dp_size
-            elif require_attn_tp_gather(self.server_args):
-                global_num_tokens_gpu.copy_(
-                    torch.tensor(
-                        [num_tokens],
-                        dtype=torch.int32,
-                    )
+            )
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=self.device,
                 )
-                global_num_tokens_for_logprob_gpu.copy_(
-                    torch.tensor(
-                        [num_tokens],
-                        dtype=torch.int32,
-                    )
-                )
-                global_dp_buffer_len = num_tokens
-            else:
-                global_dp_buffer_len = None
-
-            if not self.is_generation:
-                extend_num_tokens = num_tokens
-                extend_seq_lens = torch.full(
-                    (batch_size,), seq_len_fill_value, dtype=torch.int32
-                )
-                extend_prefix_lens = torch.zeros((batch_size,), dtype=torch.int32)
-                extend_start_loc = torch.arange(
-                    0, num_tokens, num_tokens_per_bs, dtype=torch.int32
-                )
-            else:
-                extend_num_tokens = None
-                extend_seq_lens = None
-                extend_prefix_lens = None
-                extend_start_loc = None
+            )
+            global_dp_buffer_len = num_tokens
+        else:
+            global_dp_buffer_len = None
 
         def get_spec_info():
             spec_info = None
@@ -2303,7 +2277,7 @@ class ModelRunner:
                 else:
                     spec_info = EagleVerifyInput(
                         draft_token=None,
-                        custom_mask=custom_mask,
+                        custom_mask=buffers.custom_mask,
                         positions=None,
                         retrive_index=None,
                         retrive_next_token=None,
@@ -2322,7 +2296,7 @@ class ModelRunner:
 
                 spec_info = NgramVerifyInput(
                     draft_token=None,
-                    tree_mask=custom_mask,
+                    tree_mask=buffers.custom_mask,
                     positions=None,
                     retrive_index=None,
                     retrive_next_token=None,
@@ -2347,35 +2321,35 @@ class ModelRunner:
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
             batch_size=batch_size,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            next_token_logits_buffer=next_token_logits_buffer,
-            orig_seq_lens=seq_lens,
+            input_ids=buffers.input_ids,
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
+            seq_lens_cpu=buffers.seq_lens_cpu,
+            next_token_logits_buffer=buffers.next_token_logits_buffer,
+            orig_seq_lens=buffers.seq_lens,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
             attn_backend=self.attn_backend,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
-            encoder_lens=encoder_lens,
+            out_cache_loc=buffers.out_cache_loc,
+            seq_lens_sum=buffers.seq_lens.sum().item(),
+            encoder_lens=buffers.encoder_lens,
             return_logprob=False,
-            positions=positions,
+            positions=buffers.positions,
             extend_num_tokens=extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_start_loc=extend_start_loc,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            global_num_tokens_gpu=global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
-            mrope_positions=mrope_positions,
+            mrope_positions=buffers.mrope_positions,
             spec_algorithm=self.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
-            num_token_non_padded=num_token_non_padded,
+            num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
@@ -2407,7 +2381,7 @@ class ModelRunner:
                 kwargs["get_embedding"] = True
 
             logits_output_or_pp_proxy_tensors = self.model.forward(
-                input_ids,
+                buffers.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
