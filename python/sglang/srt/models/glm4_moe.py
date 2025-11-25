@@ -1050,6 +1050,9 @@ class Glm4MoeForCausalLM(nn.Module):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
+        assert (
+            self.num_fused_shared_experts == 1
+        ), "Only 1 fused shared expert is supported for Glm4MoeForCausalLM"
 
     @torch.no_grad()
     def forward(
