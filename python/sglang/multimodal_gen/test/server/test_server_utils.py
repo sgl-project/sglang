@@ -20,12 +20,12 @@ from urllib.request import urlopen
 import pytest
 from openai import Client, OpenAI
 
+from sglang.multimodal_gen import SamplingParams
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.testcase_configs import (
-    DiffusionSamplingParams,
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
@@ -470,7 +470,7 @@ VALIDATOR_REGISTRY = {
 def get_generate_fn(
     model_path: str,
     modality: str,
-    sampling_params: DiffusionSamplingParams,
+    sampling_params: SamplingParams,
 ) -> Callable[[str, Client], str]:
     """Return appropriate generation function for the case."""
 
