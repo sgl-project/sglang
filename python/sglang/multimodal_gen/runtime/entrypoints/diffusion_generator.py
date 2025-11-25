@@ -376,8 +376,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 
 
 class DiffGenerator:
-    # ... existing code ...
-
     def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
         """
         Set the LoRA adapter.

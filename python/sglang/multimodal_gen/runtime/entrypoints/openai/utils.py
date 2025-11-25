@@ -92,3 +92,22 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     with open(target_path, "wb") as f:
         f.write(content)
     return target_path
+
+
+async def process_generation_batch(
+    scheduler_client,
+    batch,
+):
+    result = await scheduler_client.forward([batch])
+    if not result.output:
+        raise RuntimeError("Model generation returned no output.")
+
+    save_file_path = os.path.join(batch.output_path, batch.output_file_name)
+    post_process_sample(
+        result.output[0],
+        batch.data_type,
+        batch.fps,
+        batch.save_output,
+        save_file_path,
+    )
+    return save_file_path

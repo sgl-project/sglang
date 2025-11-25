@@ -1,4 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 
 # SPDX-License-Identifier: Apache-2.0
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -54,7 +55,7 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     return "mu", mu
 
 
-class FluxPipeline(ComposedPipelineBase):
+class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "FluxPipeline"
 
     _required_config_modules = [
