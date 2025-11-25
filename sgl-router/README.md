@@ -319,7 +319,7 @@ protocol: "sse"
 ```yaml
 name: "streaming-tools"
 url: "https://mcp.example.com/stream"
-transport: "streamable"
+protocol: "streamable"
 required: true
 ```
 
