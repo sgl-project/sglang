@@ -682,21 +682,45 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
         if is_in_ci():
             pause_generation_mode = random.choice(["in_place", "retract"])
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Server", pause_generation_mode),
+                (
+                    1,
+                    1,
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "Server",
+                    pause_generation_mode,
+                ),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
+                (
+                    1,
+                    1,
+                    DEFAULT_MODEL_NAME_FOR_TEST,
+                    "Server",
+                    random.choice(["in_place", "retract"]),
+                ),
             ]
 
             if torch.cuda.device_count() >= 4:
                 test_suits.append(
-                    (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
+                    (
+                        1,
+                        2,
+                        DEFAULT_MODEL_NAME_FOR_TEST,
+                        "Server",
+                        random.choice(["in_place", "retract"]),
+                    ),
                 )
 
             if torch.cuda.device_count() >= 5:
                 test_suits.append(
-                    (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
+                    (
+                        2,
+                        2,
+                        DEFAULT_MODEL_NAME_FOR_TEST,
+                        "Server",
+                        random.choice(["in_place", "retract"]),
+                    ),
                 )
 
         model_state_dict_shapes = {}
