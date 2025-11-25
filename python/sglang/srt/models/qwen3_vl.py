@@ -28,6 +28,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -47,14 +51,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,9 @@ class Qwen3_VisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
         self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
@@ -219,7 +221,9 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
         self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
@@ -274,7 +278,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.use_data_parallel = use_data_parallel
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-        self.out_dim = vision_config.out_hidden_size*(1+len(self.deepstack_visual_indexes))
+        self.out_dim = vision_config.out_hidden_size * (
+            1 + len(self.deepstack_visual_indexes)
+        )
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
