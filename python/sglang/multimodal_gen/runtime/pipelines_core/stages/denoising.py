@@ -592,6 +592,9 @@ class DenoisingStage(PipelineStage):
                 active=batch.num_profiled_timesteps,
                 repeat=5,
             ),
+            on_trace_ready=lambda _: torch.profiler.tensorboard_trace_handler(
+                f"./logs"
+            ),
             record_shapes=True,
             with_stack=True,
         )
