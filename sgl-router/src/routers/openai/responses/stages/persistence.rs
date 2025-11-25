@@ -97,12 +97,9 @@ mod tests {
         },
         mcp::{config::McpConfig, McpManager},
         protocols::responses::{ResponseInput, ResponsesRequest},
-        routers::openai::{
-            mcp::ToolLoopState,
-            responses::{
-                ContextOutput, DiscoveryOutput, McpOutput, PayloadOutput, ProcessedResponse,
-                ResponsesDependencies, ValidationOutput,
-            },
+        routers::openai::responses::{
+            mcp::ToolLoopState, ContextOutput, DiscoveryOutput, McpOutput, PayloadOutput,
+            ProcessedResponse, ResponsesDependencies, ValidationOutput,
         },
     };
 

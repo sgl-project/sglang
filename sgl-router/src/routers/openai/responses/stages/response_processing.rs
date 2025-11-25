@@ -13,11 +13,11 @@ use axum::{
 };
 use serde_json::Value;
 
-use super::ResponsesStage;
-use crate::routers::openai::{
-    mcp::{execute_tool_loop, McpLoopConfig},
-    responses::{ProcessedResponse, ResponsesRequestContext},
+use super::{
+    super::mcp::{execute_tool_loop, McpLoopConfig},
+    ResponsesStage,
 };
+use crate::routers::openai::responses::{ProcessedResponse, ResponsesRequestContext};
 
 /// Response processing stage for responses pipeline
 pub struct ResponsesResponseProcessingStage;
@@ -152,12 +152,9 @@ mod tests {
         },
         mcp::{config::McpConfig, McpManager},
         protocols::responses::{ResponseInput, ResponsesRequest},
-        routers::openai::{
-            mcp::ToolLoopState,
-            responses::{
-                ContextOutput, DiscoveryOutput, McpOutput, PayloadOutput, ResponsesDependencies,
-                ValidationOutput,
-            },
+        routers::openai::responses::{
+            mcp::ToolLoopState, ContextOutput, DiscoveryOutput, McpOutput, PayloadOutput,
+            ResponsesDependencies, ValidationOutput,
         },
     };
 

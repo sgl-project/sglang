@@ -10,9 +10,7 @@ pub mod responses;
 
 // Shared modules
 pub mod conversations;
-pub mod mcp;
 mod router;
-mod streaming;
 mod utils;
 
 // Re-export the main router type for external use

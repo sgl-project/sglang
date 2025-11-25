@@ -46,8 +46,6 @@ static SGLANG_RESPONSES_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         "return_hidden_states",
         "repetition_penalty",
         "sampling_seed",
-        "conversation",
-        "previous_response_id",
     ])
 });
 
@@ -116,7 +114,7 @@ impl ResponsesStage for ResponsesRequestBuildingStage {
         // Always set store=false for upstream (we store internally)
         request_body.store = Some(false);
 
-        // Remove conversation and previous_response_id (SGLang-specific, not forwarded)
+        // Remove conversation and previous_response_id since router handles them internally
         request_body.conversation = None;
         request_body.previous_response_id = None;
 

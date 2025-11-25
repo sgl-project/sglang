@@ -12,8 +12,10 @@ use serde_json::Value;
 
 use super::ResponsesStage;
 use crate::routers::openai::{
-    mcp::{ensure_request_mcp_client, ToolLoopState},
-    responses::{McpOutput, ResponsesRequestContext},
+    responses::{
+        mcp::{ensure_request_mcp_client, ToolLoopState},
+        McpOutput, ResponsesRequestContext,
+    },
     utils::event_types,
 };
 

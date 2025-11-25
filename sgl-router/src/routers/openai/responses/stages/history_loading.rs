@@ -1,9 +1,9 @@
-//! Context Loading stage for responses pipeline
+//! History Loading stage for responses pipeline
 //!
 //! This stage:
 //! - Loads previous response chain (if previous_response_id provided)
 //! - Loads conversation history (if conversation ID provided)
-//! - Builds conversation context for the request
+//! - Builds conversation history context for the request
 
 use async_trait::async_trait;
 use axum::{
@@ -21,16 +21,16 @@ use crate::{
     routers::openai::responses::{ContextOutput, ResponsesRequestContext},
 };
 
-/// Context loading stage for responses pipeline
-pub struct ResponsesContextLoadingStage;
+/// History loading stage for responses pipeline
+pub struct ResponsesHistoryLoadingStage;
 
-impl ResponsesContextLoadingStage {
+impl ResponsesHistoryLoadingStage {
     /// Maximum conversation history items to load
     const MAX_CONVERSATION_HISTORY_ITEMS: usize = 1000;
 }
 
 #[async_trait]
-impl ResponsesStage for ResponsesContextLoadingStage {
+impl ResponsesStage for ResponsesHistoryLoadingStage {
     async fn execute(
         &self,
         ctx: &mut ResponsesRequestContext,
@@ -210,7 +210,7 @@ impl ResponsesStage for ResponsesContextLoadingStage {
     }
 
     fn name(&self) -> &'static str {
-        "ResponsesContextLoading"
+        "ResponsesHistoryLoading"
     }
 }
 
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_context_loading_stage_no_context() {
+    async fn test_history_loading_stage_no_history() {
         let request = ResponsesRequest {
             model: "gpt-4".to_string(),
             input: ResponseInput::Text("Hello".to_string()),
@@ -282,7 +282,7 @@ mod tests {
             validated_at: Instant::now(),
         });
 
-        let stage = ResponsesContextLoadingStage;
+        let stage = ResponsesHistoryLoadingStage;
         let result = stage.execute(&mut ctx).await;
 
         assert!(result.is_ok());
@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_context_loading_stage_conversation_not_found() {
+    async fn test_history_loading_stage_conversation_not_found() {
         let request = ResponsesRequest {
             model: "gpt-4".to_string(),
             input: ResponseInput::Text("Hello".to_string()),
@@ -312,7 +312,7 @@ mod tests {
             validated_at: Instant::now(),
         });
 
-        let stage = ResponsesContextLoadingStage;
+        let stage = ResponsesHistoryLoadingStage;
         let result = stage.execute(&mut ctx).await;
 
         // Should return 404 error for nonexistent conversation

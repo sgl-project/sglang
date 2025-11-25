@@ -21,16 +21,19 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
-// Import from sibling modules
-use super::conversations::persist_conversation_items;
+// Import from parent openai module
+use super::super::{
+    conversations::persist_conversation_items,
+    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
+};
+// Import from sibling modules within responses
 use super::{
     mcp::{
         build_resume_payload, ensure_request_mcp_client, execute_streaming_tool_calls,
         inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
         send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
     },
-    responses::utils::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
-    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
+    utils::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
 };
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},

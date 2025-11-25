@@ -3,7 +3,7 @@
 //! This module contains the 8 stages of the responses pipeline:
 //! 1. Validation - Auth and circuit breaker checks
 //! 2. ModelDiscovery - Find endpoint URL for model
-//! 3. ContextLoading - Load conversation history and previous response
+//! 3. HistoryLoading - Load conversation history and previous response
 //! 4. RequestBuilding - Build request payload with history
 //! 5. McpPreparation - Setup MCP tool loop state
 //! 6. RequestExecution - Execute HTTP request
@@ -16,7 +16,7 @@ use axum::response::Response;
 use super::ResponsesRequestContext;
 
 // Stage modules
-pub mod context_loading;
+pub mod history_loading;
 pub mod mcp_preparation;
 pub mod model_discovery;
 pub mod persistence;
@@ -26,7 +26,7 @@ pub mod response_processing;
 pub mod validation;
 
 // Re-export stage types
-pub use context_loading::ResponsesContextLoadingStage;
+pub use history_loading::ResponsesHistoryLoadingStage;
 pub use mcp_preparation::ResponsesMcpPreparationStage;
 pub use model_discovery::ResponsesModelDiscoveryStage;
 pub use persistence::ResponsesPersistenceStage;

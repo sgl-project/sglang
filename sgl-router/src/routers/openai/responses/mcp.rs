@@ -16,13 +16,12 @@ use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::utils::event_types;
 use crate::{
     mcp,
     protocols::responses::{
         generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
     },
-    routers::header_utils::apply_request_headers,
+    routers::{header_utils::apply_request_headers, openai::utils::event_types},
 };
 
 // ============================================================================

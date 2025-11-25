@@ -3,7 +3,7 @@
 //! This module provides the full 8-stage pipeline for /v1/responses:
 //! 1. Validation - Auth and circuit breaker checks
 //! 2. ModelDiscovery - Find endpoint URL
-//! 3. ContextLoading - Load conversation history
+//! 3. HistoryLoading - Load conversation history
 //! 4. RequestBuilding - Build payload with history
 //! 5. McpPreparation - Setup MCP tool loop
 //! 6. RequestExecution - Execute HTTP request
@@ -22,7 +22,7 @@ use tracing::{debug, error};
 
 use super::{
     stages::{
-        ResponsesContextLoadingStage, ResponsesMcpPreparationStage, ResponsesModelDiscoveryStage,
+        ResponsesHistoryLoadingStage, ResponsesMcpPreparationStage, ResponsesModelDiscoveryStage,
         ResponsesPersistenceStage, ResponsesRequestBuildingStage, ResponsesRequestExecutionStage,
         ResponsesResponseProcessingStage, ResponsesStage, ResponsesValidationStage,
     },
@@ -33,7 +33,7 @@ use crate::protocols::responses::ResponsesRequest;
 /// Responses pipeline for /v1/responses
 ///
 /// This pipeline is full-featured with 8 stages:
-/// - Validation, ModelDiscovery, ContextLoading, RequestBuilding
+/// - Validation, ModelDiscovery, HistoryLoading, RequestBuilding
 /// - McpPreparation, RequestExecution, ResponseProcessing, Persistence
 pub struct ResponsesPipeline {
     dependencies: Arc<ResponsesDependencies>,
@@ -46,7 +46,7 @@ impl ResponsesPipeline {
         let stages: Vec<Box<dyn ResponsesStage>> = vec![
             Box::new(ResponsesValidationStage),
             Box::new(ResponsesModelDiscoveryStage),
-            Box::new(ResponsesContextLoadingStage),
+            Box::new(ResponsesHistoryLoadingStage),
             Box::new(ResponsesRequestBuildingStage),
             Box::new(ResponsesMcpPreparationStage),
             Box::new(ResponsesRequestExecutionStage),

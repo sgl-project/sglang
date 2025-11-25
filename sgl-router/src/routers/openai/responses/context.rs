@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use super::super::mcp::ToolLoopState;
+use super::mcp::ToolLoopState;
 use crate::{
     core::CircuitBreaker,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},

@@ -21,7 +21,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use super::ResponsesStage;
 use crate::routers::{
     header_utils::apply_request_headers,
-    openai::responses::{ExecutionResult, ResponsesRequestContext},
+    openai::responses::{
+        streaming::handle_streaming_response, ExecutionResult, ResponsesRequestContext,
+    },
 };
 
 /// Request execution stage for responses pipeline
@@ -100,9 +102,6 @@ impl ResponsesStage for ResponsesRequestExecutionStage {
             let mcp_active = ctx.state.mcp.as_ref().map(|m| m.active).unwrap_or(false);
 
             if mcp_active {
-                // Use MCP-aware streaming handler
-                use crate::routers::openai::streaming::handle_streaming_response;
-
                 let previous_response_id = ctx
                     .state
                     .context
