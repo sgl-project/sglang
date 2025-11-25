@@ -861,9 +861,7 @@ def _model_forward_tbo(
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-    return _model_forward_tbo_merge_outputs(
-        *outputs_arr, *inputs_arr, original_hidden_states_len
-    )
+    return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
@@ -983,17 +981,15 @@ def _model_forward_filter_inputs(
     )
 
 
-def _model_forward_tbo_merge_outputs(
-    output_a, output_b, inputs_a, inputs_b, original_len
-):
+def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
     def _handle_key(name):
         value_a = output_a[name]
         value_b = output_b[name]
         assert (value_a is None) == (value_b is None)
         if value_a is None:
             return None
-        s0, t0 = inputs_a["forward_batch"].tbo_parent_token_range
-        s1, t1 = inputs_b["forward_batch"].tbo_parent_token_range
+        s0, t0 = output_a["forward_batch"].tbo_parent_token_range
+        s1, t1 = output_b["forward_batch"].tbo_parent_token_range
         res = torch.zeros(
             (original_len, *value_a.shape[1:]),
             dtype=value_a.dtype,
