@@ -217,7 +217,11 @@ class TestSkipTokenizerInit(CustomTestCase):
 class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     @classmethod
     def setUpClass(cls):
-        cls.image_url = ("https://gh.llkk.cc/" + DEFAULT_IMAGE_URL) if is_npu() else DEFAULT_IMAGE_URL
+        cls.image_url = (
+            ("https://gh.llkk.cc/" + DEFAULT_IMAGE_URL) 
+            if is_npu() 
+            else DEFAULT_IMAGE_URL
+        )
         cls.image = download_image_with_retry(cls.image_url)
         if is_npu():
             cls.model = "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-VL-3B-Instruct"
