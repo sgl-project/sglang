@@ -276,7 +276,7 @@ inventory:
 - `command` + `args`: For STDIO transport (local process execution)
 - `url`: For SSE or Streamable transports (HTTP/HTTPS endpoints)
 - `token`: Optional authentication token for HTTP-based transports
-- `protocol`: Transport type (`"stdio"`, `"sse"`, or `"streamable"`)
+- `protocol`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
 - `required`: If `true`, router fails to start if server is unreachable (default: `false`)
 - `envs`: Environment variables for STDIO processes (optional)
 - `proxy`: Per-server proxy override (set to `null` to bypass global proxy)
