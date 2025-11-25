@@ -66,7 +66,6 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 
-
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
