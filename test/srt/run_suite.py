@@ -366,6 +366,7 @@ suite_ascend = {
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
     "nightly-test-npu-1-a3": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
