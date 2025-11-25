@@ -1665,6 +1665,15 @@ def get_cpu_memory_capacity():
         return float(numa_mem // (1 << 20))
 
 
+def get_xpu_memory_capacity():
+    try:
+        if torch.xpu.is_available():
+            return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.xpu is not available.")
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1676,6 +1685,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_npu_memory_capacity()
     elif device == "cpu":
         gpu_mem = get_cpu_memory_capacity()
+    elif device == "xpu":
+        gpu_mem = get_xpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
