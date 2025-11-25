@@ -124,15 +124,20 @@ def _print_warning_once(logger: Logger, msg: str) -> None:
     logger.warning(msg, stacklevel=2)
 
 
-def _get_rank_info():
-    """Get rank and local rank from environment variables."""
+def get_is_main_process():
     try:
         rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
     except (KeyError, ValueError):
         rank = 0
-        local_rank = 0
-    return rank, local_rank
+    return rank == 0
+
+
+def get_is_local_main_process():
+    try:
+        rank = int(os.environ["LOCAL_RANK"])
+    except (KeyError, ValueError):
+        rank = 0
+    return rank == 0
 
 
 def _log_process_aware(
@@ -145,9 +150,8 @@ def _log_process_aware(
     **kwargs: Any,
 ) -> None:
     """Helper function to log a message if the process rank matches the criteria."""
-    rank, local_rank = _get_rank_info()
-    is_main_process = rank == 0
-    is_local_main_process = local_rank == 0
+    is_main_process = get_is_main_process()
+    is_local_main_process = get_is_local_main_process()
 
     should_log = (
         not main_process_only
@@ -393,8 +397,7 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
 
     should_suppress = True
     if not_suppress_on_main_rank:
-        rank, _ = _get_rank_info()
-        if rank == 0:
+        if get_is_main_process() == 0:
             should_suppress = False
 
     loggers_to_suppress = ["urllib3"]
@@ -405,6 +408,13 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
             logger = logging.getLogger(logger_name)
             original_levels[logger_name] = logger.level
             logger.setLevel(logging.WARNING)
+
+    # Suppress verbose logging from imageio, which is triggered when saving images.
+    logging.getLogger("imageio").setLevel(logging.WARNING)
+    logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
+    # Suppress Pillow plugin import logs when app log level is DEBUG
+    logging.getLogger("PIL").setLevel(logging.WARNING)
+    logging.getLogger("PIL.Image").setLevel(logging.WARNING)
 
     try:
         yield
