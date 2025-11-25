@@ -133,8 +133,8 @@ def assign_req_to_token_pool_func(
         torch.ops.npu.cache_loc_assign(
             req_pool_indices,
             req_to_token,
-            start_offset,
-            end_offset,
+            start_offset.to(torch.int64),
+            end_offset.to(torch.int64),
             out_cache_loc,
         )
 

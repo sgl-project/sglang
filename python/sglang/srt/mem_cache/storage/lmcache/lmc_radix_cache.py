@@ -217,7 +217,8 @@ class LMCRadixCache(RadixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        _, new_last_node, _, _ = self.match_prefix(RadixKey(token_ids, req.extra_key))
+        match_result = self.match_prefix(RadixKey(token_ids, req.extra_key))
+        new_last_node = match_result.last_device_node
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)
