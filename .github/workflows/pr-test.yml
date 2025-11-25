@@ -363,6 +363,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
@@ -370,6 +376,7 @@ jobs:
           path: sgl-kernel/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
+
       - name: Install dependencies
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
@@ -380,7 +387,7 @@ jobs:
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions 2
 
 
   multimodal-gen-test-2-gpu:
@@ -394,6 +401,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
