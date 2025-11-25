@@ -329,6 +329,7 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
+            cache_loc_dtype=self._cache_loc_dtype(),
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()

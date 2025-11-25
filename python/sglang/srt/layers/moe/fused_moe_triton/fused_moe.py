@@ -325,6 +325,7 @@ def fused_experts(
             b1,
             b2,
             moe_runner_config.activation,
+            moe_runner_config.is_gated,
             moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
