@@ -250,8 +250,6 @@ class Scheduler(
         self.priority_scheduling_preemption_threshold = (
             server_args.priority_scheduling_preemption_threshold
         )
-        self.extend_input_length_ratio = server_args.extend_input_length_ratio
-        self.waiting_time_ratio = server_args.waiting_time_ratio
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -474,8 +472,6 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
-            self.extend_input_length_ratio,
-            self.waiting_time_ratio,
         )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling

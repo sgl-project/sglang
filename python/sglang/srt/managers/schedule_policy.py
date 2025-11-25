@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
@@ -89,8 +90,6 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
-        sel_length_ratio: float = 0.9,
-        sel_waiting_time_ratio: float = 0.1,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -99,8 +98,8 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
 
         # It is used by CacheAgnosticPolicy.SEL policy
-        self.sel_length_ratio = sel_length_ratio
-        self.sel_waiting_time_ratio = sel_waiting_time_ratio
+        self.sel_length_ratio = envs.SGLANG_SEL_LENGTH_RATIO.get()
+        self.sel_waiting_time_ratio = envs.SGLANG_SEL_WAITING_TIME_RATIO.get()
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()

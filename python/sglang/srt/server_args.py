@@ -275,8 +275,6 @@ class ServerArgs:
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
-    extend_input_length_ratio: float = 0.9
-    waiting_time_ratio: float = 0.1
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
@@ -2285,18 +2283,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.priority_scheduling_preemption_threshold,
             help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
-        )
-        parser.add_argument(
-            "--extend-input-length-ratio",
-            type=float,
-            default=ServerArgs.extend_input_length_ratio,
-            help="Extend input length ratio for SEL policy.",
-        )
-        parser.add_argument(
-            "--waiting-time-ratio",
-            type=float,
-            default=ServerArgs.waiting_time_ratio,
-            help="Waiting time ratio for SEL policy.",
         )
         parser.add_argument(
             "--schedule-conservativeness",
