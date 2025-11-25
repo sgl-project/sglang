@@ -287,6 +287,14 @@ jobs:
   #         cd sgl-kernel
   #         pytest tests/
 
+  sgl-kernel-b200-test:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    runs-on: 4-gpu-b200
+    env:
+      RUNNER_LABELS: 4-gpu-b200
+    steps:
+      - uses: actions/checkout@v4
   # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
   # TODO: Add back this test when it can pass on CI
   # cuda13-kernel-smoke-test:
@@ -1040,6 +1048,7 @@ jobs:
         sgl-kernel-unit-test,
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
+        sgl-kernel-b200-test
 
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
