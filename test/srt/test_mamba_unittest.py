@@ -6,6 +6,7 @@ import torch
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -41,6 +42,7 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
+            enable_memory_saver=False,
             mamba_pool=None,
         )
         assert pool._transfer_full_attention_id(global_interval - 1) == 0
@@ -173,6 +175,7 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
+            enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
         )
 
@@ -184,13 +187,14 @@ class TestMamba(unittest.TestCase):
             kvcache=pool,
             need_sort=False,
         )
-        # setup radix cache
-        tree = MambaRadixCache(
+        params = CacheInitParams(
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             disable=False,
         )
+        # setup radix cache
+        tree = MambaRadixCache(params=params)
 
         def make_dummy_req():
             sampling_params = SamplingParams(
@@ -320,8 +324,8 @@ class TestMamba(unittest.TestCase):
         kv_indices, last_node = result.device_indices, result.last_device_node
         assert req9.mamba_pool_idx is not None
         assert torch.all(
-            mamba_pool.mamba_cache.conv[:, req9.mamba_pool_idx]
-            == mamba_pool.mamba_cache.conv[:, last_node.mamba_value]
+            mamba_pool.mamba_cache.conv[0][:, req9.mamba_pool_idx]
+            == mamba_pool.mamba_cache.conv[0][:, last_node.mamba_value]
         )
         assert torch.all(
             mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]

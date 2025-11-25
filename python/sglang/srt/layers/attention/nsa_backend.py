@@ -123,6 +123,27 @@ class TopkTransformMethod(IntEnum):
     RAGGED = auto()
 
 
+@torch.compile
+def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
+    return torch.cat(tensors, dim=dim)
+
+
+def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
+    """
+    Concatenate two tensors along the last dimension.
+    Use this function to concatenate q_nope and q_rope or k_nope and k_rope.
+    """
+    assert len(tensors) == 2
+
+    qk_nope, qk_rope = tensors
+    assert qk_nope.ndim == 3 and qk_rope.ndim == 3
+
+    torch._dynamo.mark_dynamic(qk_nope, 0)
+    torch._dynamo.mark_dynamic(qk_rope, 0)
+
+    return _compiled_cat([qk_nope, qk_rope], dim=dim)
+
+
 @dataclass(frozen=True)
 class NSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: NSAMetadata
@@ -434,7 +455,14 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ]
             )
 
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            # Generate page_table_1_flattened when needed:
+            mha_dequantize_needed = (
+                self.nsa_kv_cache_store_fp8 and max_seqlen_k <= self.nsa_index_topk
+            )
+            if (
+                topk_transform_method == TopkTransformMethod.RAGGED
+                or mha_dequantize_needed
+            ):
                 page_table_1_flattened = torch.cat(
                     [
                         page_table[i, :kv_len]
@@ -447,6 +475,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                     page_table_1_flattened.shape[0] == forward_batch.seq_lens_sum
                 ), f"{page_table_1_flattened.shape[0] = } must be the same as {forward_batch.seq_lens_sum = }"
 
+            if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = torch.repeat_interleave(
                     cu_seqlens_k[:-1],
                     forward_batch.extend_seq_lens,
@@ -942,7 +971,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                         kv_cache, page_table_1_flattened
                     )
                 else:
-                    kv_cache = torch.cat([k, k_rope], dim=-1)
+                    kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
 
             return self._forward_flashmla_sparse(
