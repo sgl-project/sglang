@@ -177,7 +177,10 @@ def init_process_hf(
         broadcast_parameters.remove("lm_head.weight")
 
     if load_format == "flattened_bucket":
-        named_tensors = [(parameter_name, hf_base_model.get_parameter(parameter_name)) for parameter_name in broadcast_parameters]
+        named_tensors = [
+            (parameter_name, hf_base_model.get_parameter(parameter_name))
+            for parameter_name in broadcast_parameters
+        ]
         bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         flattened_tensor = bucket.get_flattened_tensor()
         torch.distributed.broadcast(flattened_tensor, src=0, group=group)
@@ -653,6 +656,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 checking_parameters,
                 load_format="flattened_bucket",
             )
+
 
 if __name__ == "__main__":
     unittest.main()

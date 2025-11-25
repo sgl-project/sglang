@@ -1146,8 +1146,14 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(self, names, dtypes, shapes, group_name, 
-        load_format: Optional[str] = None,):
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -1162,9 +1168,11 @@ class ModelRunner:
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
-        
+
         if load_format == "flattened_bucket":
-            return self._update_bucketed_weights_from_distributed(names, dtypes, shapes, group_name)
+            return self._update_bucketed_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
         try:
             weights = []
             handles = []
@@ -1197,14 +1205,18 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def _update_bucketed_weights_from_distributed(self, names, dtypes, shapes, group_name):
+    def _update_bucketed_weights_from_distributed(
+        self, names, dtypes, shapes, group_name
+    ):
         try:
             named_tensors = []
             for name, dtype, shape in zip(names, dtypes, shapes):
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
-                named_tensors.append((name, torch.empty(shape, dtype=target_dtype, device=self.device)))
+                named_tensors.append(
+                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
+                )
             bucket = FlattenedTensorBucket(named_tensors=named_tensors)
             flattened_tensor = bucket.get_flattened_tensor()
             torch.distributed.broadcast(
