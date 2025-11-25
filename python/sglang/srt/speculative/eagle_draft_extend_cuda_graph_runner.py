@@ -188,7 +188,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
+                if self.model_runner.spec_algorithm.is_eagle() or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
