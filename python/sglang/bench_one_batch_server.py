@@ -684,7 +684,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                         continue
                     profile_prefix = (
                         bench_args.profile_prefix or ""
-                    ) + f"-bs-{bs}-il-{il}"
+                    ) + f"bs-{bs}-il-{il}"
                     profile_results.append(
                         run_one_case(
                             base_url,

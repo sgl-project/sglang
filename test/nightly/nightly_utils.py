@@ -123,7 +123,7 @@ class NightlyBenchmarkRunner:
             "--show-report",
             "--profile",
             "--profile-by-stage",
-            "--profile-output-folder",
+            "--profile-output-dir",
             profile_path_prefix,
             f"--pydantic-result-filename={json_output_file}",
             "--no-append-to-github-summary",
