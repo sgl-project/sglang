@@ -77,6 +77,18 @@ class LoRAMemoryPool:
         self.A_buffer: Dict[str, List[torch.Tensor]] = {}
         self.B_buffer: Dict[str, List[torch.Tensor]] = {}
 
+        ##############################
+        ##########emb lora############
+        ##############################   
+        # NEW: Buffers for embedding and lm_head (not per-layer)
+        self.embedding_A_buffer: Optional[torch.Tensor] = None
+        self.embedding_B_buffer: Optional[torch.Tensor] = None
+        self.lm_head_A_buffer: Optional[torch.Tensor] = None
+        self.lm_head_B_buffer: Optional[torch.Tensor] = None
+        ##############################
+        ##############################
+        ##############################
+
         # Lora uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
 
@@ -186,6 +198,50 @@ class LoRAMemoryPool:
             self.get_lora_B_shape,
         )
 
+        ##############################
+        ##########emb lora############
+        ##############################        
+        # Initialize embedding buffers if embed_tokens is in target_modules
+        if "embed_tokens" in self.target_modules:
+            vocab_size = self.base_hf_config.vocab_size
+            hidden_size = self.base_hf_config.hidden_size
+            
+            # embedding_A: (max_loras_per_batch, max_rank, vocab_size)
+            self.embedding_A_buffer = torch.empty(
+                (self.max_loras_per_batch, self.max_lora_rank, vocab_size),
+                dtype=self.dtype,
+                device=device,
+            )
+            
+            # embedding_B: (max_loras_per_batch, hidden_size, max_rank)
+            self.embedding_B_buffer = torch.empty(
+                (self.max_loras_per_batch, hidden_size, self.max_lora_rank),
+                dtype=self.dtype,
+                device=device,
+            )
+        
+        # Initialize lm_head buffers if lm_head is in target_modules
+        if "lm_head" in self.target_modules:
+            vocab_size = self.base_hf_config.vocab_size
+            hidden_size = self.base_hf_config.hidden_size
+            
+            # lm_head_A: (max_loras_per_batch, max_rank, hidden_size)
+            self.lm_head_A_buffer = torch.empty(
+                (self.max_loras_per_batch, self.max_lora_rank, hidden_size),
+                dtype=self.dtype,
+                device=device,
+            )
+            
+            # lm_head_B: (max_loras_per_batch, vocab_size, max_rank)
+            self.lm_head_B_buffer = torch.empty(
+                (self.max_loras_per_batch, vocab_size, self.max_lora_rank),
+                dtype=self.dtype,
+                device=device,
+            )
+        ##############################
+        ##############################
+        ##############################      
+
     def prepare_lora_batch(
         self,
         cur_uids: Set[Optional[str]],
@@ -277,6 +333,70 @@ class LoRAMemoryPool:
 
         assert lora_adapter is not None
         lora_rank = lora_adapter.config.r
+
+        ##############################
+        ##########emb lora############
+        ##############################
+
+        # Handle embedding weights (not per-layer)
+        if "embed_tokens" in self.target_modules:
+            embedding_A = None
+            embedding_B = None
+            
+            # Look for embedding weights in layer 0 (embeddings are usually stored there)
+            if lora_adapter.layers:
+                layer_weights = lora_adapter.layers[0].weights
+                for name, weights in layer_weights.items():
+                    if "embed_tokens" in name or "model.embed_tokens" in name:
+                        if "lora_A" in name:
+                            embedding_A = weights
+                        elif "lora_B" in name:
+                            embedding_B = weights
+            
+            # Load into buffers
+            if embedding_A is not None:
+                buffer_view = self.embedding_A_buffer[buffer_id, :lora_rank, :]
+                buffer_view.copy_(embedding_A)
+            else:
+                self.embedding_A_buffer[buffer_id].zero_()
+            
+            if embedding_B is not None:
+                buffer_view = self.embedding_B_buffer[buffer_id, :, :lora_rank]
+                buffer_view.copy_(embedding_B)
+            else:
+                self.embedding_B_buffer[buffer_id].zero_()
+        
+        # Handle lm_head weights (not per-layer)
+        if "lm_head" in self.target_modules:
+            lm_head_A = None
+            lm_head_B = None
+            
+            # Look for lm_head weights
+            if lora_adapter.layers:
+                layer_weights = lora_adapter.layers[0].weights
+                for name, weights in layer_weights.items():
+                    if "lm_head" in name:
+                        if "lora_A" in name:
+                            lm_head_A = weights
+                        elif "lora_B" in name:
+                            lm_head_B = weights
+            
+            # Load into buffers
+            if lm_head_A is not None:
+                buffer_view = self.lm_head_A_buffer[buffer_id, :lora_rank, :]
+                buffer_view.copy_(lm_head_A)
+            else:
+                self.lm_head_A_buffer[buffer_id].zero_()
+            
+            if lm_head_B is not None:
+                buffer_view = self.lm_head_B_buffer[buffer_id, :, :lora_rank]
+                buffer_view.copy_(lm_head_B)
+            else:
+                self.lm_head_B_buffer[buffer_id].zero_()
+        ##############################
+        ##############################
+        ##############################
+        
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
             temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {

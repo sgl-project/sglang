@@ -51,6 +51,7 @@ def get_hidden_dim(
     """
     Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
     """
+    
 
     if hasattr(base_model, "get_hidden_dim"):
         return base_model.get_hidden_dim(module_name, layer_idx)
@@ -78,6 +79,22 @@ def get_hidden_dim(
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
+
+        ##############################
+        ##########emb lora############
+        ############################## 
+        #Handle embed_tokens
+        elif "embed_tokens" in module_name:
+            # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
+            return config.vocab_size, config.hidden_size
+        
+        #Handle lm_head
+        elif "lm_head" in module_name:
+            # For lm_head: input is hidden_size, output is vocab_size
+            return config.hidden_size, config.vocab_size
+        ##############################
+        ##############################
+        ############################## 
         else:
             raise NotImplementedError()
 
@@ -95,6 +112,18 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        ##############################
+        ##########emb lora############
+        ############################## 
+        "embed_tokens": "embed_tokens",
+        "vocab_emb": "embed_tokens",
+        "embeddings": "embed_tokens",
+        "word_embeddings": "embed_tokens",
+        "lm_head": "lm_head",
+        "output": "lm_head",
+        ############################## 
+        ############################## 
+        ############################## 
     }
 
     result = set()

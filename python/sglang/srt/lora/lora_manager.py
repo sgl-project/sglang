@@ -40,6 +40,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
+
 if is_npu():
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
@@ -299,6 +301,26 @@ class LoRAManager:
                     ),
                 )
 
+        ##############################
+        ##########emb lora############
+        ##############################
+        # Update embedding layer if present
+        if self.embed_tokens_module is not None and hasattr(self.memory_pool, 'embedding_A_buffer') and self.memory_pool.embedding_A_buffer is not None:
+            self.embed_tokens_module.set_lora_info(
+                self.memory_pool.embedding_A_buffer,
+                self.memory_pool.embedding_B_buffer,
+            )
+        
+        # Update lm_head layer if present
+        if self.lm_head_module is not None and hasattr(self.memory_pool, 'lm_head_A_buffer') and self.memory_pool.lm_head_A_buffer is not None:
+            self.lm_head_module.set_lora_info(
+                self.memory_pool.lm_head_A_buffer,
+                self.memory_pool.lm_head_B_buffer,
+            )
+        ##############################
+        ##############################
+        ##############################
+
     def init_state(
         self,
         max_lora_rank: Optional[int] = None,
@@ -432,6 +454,16 @@ class LoRAManager:
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
 
+        ##############################
+        ##########emb lora############
+        ############################## 
+        self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
+        self.lm_head_module: Optional[BaseLayerWithLoRA] = None
+        ############################## 
+        ############################## 
+        ############################## 
+        
+
         for module_name, module in self.base_model.named_modules():
             # TODO (lifuhuang): in the future, we should consider generalizing the
             # should_apply_lora function to support mapping by full module name instead
@@ -442,6 +474,26 @@ class LoRAManager:
                 self.base_model, "should_apply_lora", None
             ) and not self.base_model.should_apply_lora(module_name):
                 continue
+
+            ##############################
+            ##########emb lora############
+            ############################## 
+            # Handle embed_tokens
+            if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
+                if isinstance(module, VocabParallelEmbedding) and not isinstance(module, BaseLayerWithLoRA):
+                    lora_module = self.set_lora_module(module_name, module)
+                    self.embed_tokens_module = lora_module 
+                    continue
+            
+            # Handle lm_head
+            if "lm_head" in module_name and "lm_head" in self.target_modules:
+                if isinstance(module, ParallelLMHead) and not isinstance(module, BaseLayerWithLoRA):
+                    lora_module = self.set_lora_module(module_name, module)
+                    self.lm_head_module = lora_module 
+                    continue
+            ############################## 
+            ############################## 
+            ############################## 
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:

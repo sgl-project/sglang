@@ -71,6 +71,15 @@ class LoRAAdapter(nn.Module):
             ]
         )
 
+        ##############################
+        ##########emb lora############
+        ############################## 
+        self.embedding_layer = LoRALayer(config, base_hf_config)
+        self.lm_head_layer = LoRALayer(config, base_hf_config)
+        ############################## 
+        ############################## 
+        ############################## 
+
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
@@ -84,6 +93,16 @@ class LoRAAdapter(nn.Module):
             layer_id = get_layer_id(name)
             if layer_id is not None:
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
+            ##############################
+            ##########emb lora############
+            ############################## 
+            elif "embed_tokens" in name:
+                self.embedding_layer.weights[name] = loaded_weight.cpu()
+            elif "lm_head" in name:
+                self.lm_head_layer.weights[name] = loaded_weight.cpu()
+            ##############################
+            ##############################
+            ##############################
 
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:
