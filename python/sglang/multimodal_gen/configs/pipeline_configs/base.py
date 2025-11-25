@@ -203,9 +203,24 @@ class PipelineConfig:
 
         return shape
 
+    def calculate_decode_scale_inv_and_shift(self, latents, vae):
+        vae_arch_config = self.vae_config.arch_config
+        return vae_arch_config.scaling_factor, getattr(vae_arch_config, "shift_factor", None)
+
     # called after latents are prepared
     def maybe_pack_latents(self, latents, batch_size, batch):
         return latents
+
+    def maybe_prepare_latent_ids(self, latents):
+        return None
+
+    def post_process_vae_encode(self, image_latents, vae):
+        return image_latents
+
+    # called after scale_and_shift, before vae decoding
+    def pre_decoding(self, latents):
+        return latents
+
 
     def gather_latents_for_sp(self, latents):
         # For video latents [B, C, T_local, H, W], gather along time dim=2

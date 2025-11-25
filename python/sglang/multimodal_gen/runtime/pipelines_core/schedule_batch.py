@@ -93,6 +93,8 @@ class Req:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    # Flux-2
+    latent_ids: torch.Tensor | None = None
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
     image_latent: torch.Tensor | None = None

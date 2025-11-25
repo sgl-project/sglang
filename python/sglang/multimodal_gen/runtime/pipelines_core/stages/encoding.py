@@ -72,8 +72,8 @@ class EncodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                                   vae_dtype != torch.float32
+                               ) and not server_args.disable_autocast
 
         # Normalize input to [-1, 1] range (reverse of decoding normalization)
         latents = (batch.latents * 2.0 - 1.0).clamp(-1, 1)
@@ -92,6 +92,8 @@ class EncodingStage(PipelineStage):
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
             latents = self.vae.encode(latents).mean
+
+        latents = self.server_args.pipeline_config.post_process_vae_encode(latents, self.vae)
 
         # Update batch with encoded latents
         batch.latents = latents

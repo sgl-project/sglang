@@ -304,6 +304,7 @@ class TextEncoderLoader(ComponentLoader):
             with target_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+                print(f"{model_cls=}")
                 model = model_cls(model_config)
 
             weights_to_load = {name for name, _ in model.named_parameters()}

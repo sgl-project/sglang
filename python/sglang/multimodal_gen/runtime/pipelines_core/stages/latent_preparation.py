@@ -90,6 +90,10 @@ class LatentPreparationStage(PipelineStage):
             latents = server_args.pipeline_config.maybe_pack_latents(
                 latents, batch_size, batch
             )
+
+            latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+            if latent_ids is not None:
+                batch.latent_ids = latent_ids
         else:
             latents = latents.to(device)
 

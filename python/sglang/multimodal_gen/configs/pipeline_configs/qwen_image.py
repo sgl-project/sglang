@@ -123,6 +123,18 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         # pack latents
         return _pack_latents(latents, batch_size, num_channels_latents, height, width)
 
+    def calculate_decode_scale_inv_and_shift(self, latents, vae):
+        vae_arch_config = self.vae_config.arch_config
+        scaling_factor = 1.0 / torch.tensor(
+            vae_arch_config.latents_std, device=latents.device
+        ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
+        shift_factor = (
+            torch.tensor(vae_arch_config.latents_mean)
+            .view(1, vae_arch_config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        return scaling_factor, shift_factor
+
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
         # img_shapes: for global entire image

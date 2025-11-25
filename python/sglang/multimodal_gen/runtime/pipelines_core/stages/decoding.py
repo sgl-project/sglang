@@ -9,11 +9,6 @@ import weakref
 
 import torch
 
-from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    QwenImageEditPipelineConfig,
-    QwenImagePipelineConfig,
-)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import VAELoader
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -65,35 +60,18 @@ class DecodingStage(PipelineStage):
         return result
 
     def scale_and_shift(
-        self, vae_arch_config: VAEArchConfig, latents: torch.Tensor, server_args
+        self, latents: torch.Tensor, server_args
     ):
-        # 1. scale
-        is_qwen_image = isinstance(
-            server_args.pipeline_config, QwenImagePipelineConfig
-        ) or isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig)
-        if is_qwen_image:
-            scaling_factor = 1.0 / torch.tensor(
-                vae_arch_config.latents_std, device=latents.device
-            ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
-        else:
-            scaling_factor = vae_arch_config.scaling_factor
+        scaling_factor, shift_factor = server_args.pipeline_config.calculate_decode_scale_inv_and_shift(latents,
+                                                                                                        self.vae)
 
+        # 1. scale
         if isinstance(scaling_factor, torch.Tensor):
             latents = latents / scaling_factor.to(latents.device, latents.dtype)
         else:
             latents = latents / scaling_factor
 
-        # 2. shift
-        if is_qwen_image:
-            shift_factor = (
-                torch.tensor(vae_arch_config.latents_mean)
-                .view(1, vae_arch_config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-        else:
-            shift_factor = getattr(vae_arch_config, "shift_factor", None)
-
-        # Apply shifting if needed
+        # 2. apply shifting if needed
         if shift_factor is not None:
             if isinstance(shift_factor, torch.Tensor):
                 latents += shift_factor.to(latents.device, latents.dtype)
@@ -122,12 +100,13 @@ class DecodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                                   vae_dtype != torch.float32
+                               ) and not server_args.disable_autocast
         vae_arch_config = server_args.pipeline_config.vae_config.arch_config
 
         # scale and shift
-        latents = self.scale_and_shift(vae_arch_config, latents, server_args)
+        latents = self.scale_and_shift(latents, server_args)
+        latents = self.server_args.pipeline_config.pre_decoding(latents)
 
         # Decode latents
         with torch.autocast(

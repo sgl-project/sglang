@@ -12,7 +12,8 @@ from sglang.multimodal_gen.configs.models.encoders import (
     CLIPTextConfig,
     T5Config,
 )
-from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
+from sglang.multimodal_gen.configs.models.encoders.mistral import Mistral3Config
+from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig, Flux2VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
@@ -176,3 +177,120 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 batch.neg_pooled_embeds[0] if batch.neg_pooled_embeds else None
             ),
         }
+
+
+def _prepare_latent_ids(
+    latents: torch.Tensor,  # (B, C, H, W)
+):
+    r"""
+    Generates 4D position coordinates (T, H, W, L) for latent tensors.
+
+    Args:
+        latents (torch.Tensor):
+            Latent tensor of shape (B, C, H, W)
+
+    Returns:
+        torch.Tensor:
+            Position IDs tensor of shape (B, H*W, 4) All batches share the same coordinate structure: T=0,
+            H=[0..H-1], W=[0..W-1], L=0
+    """
+
+    batch_size, _, height, width = latents.shape
+
+    t = torch.arange(1)  # [0] - time dimension
+    h = torch.arange(height)
+    w = torch.arange(width)
+    l = torch.arange(1)  # [0] - layer dimension
+
+    # Create position IDs: (H*W, 4)
+    latent_ids = torch.cartesian_prod(t, h, w, l)
+
+    # Expand to batch: (B, H*W, 4)
+    latent_ids = latent_ids.unsqueeze(0).expand(batch_size, -1, -1)
+
+    return latent_ids
+
+
+def _unpack_latents_with_ids(x: torch.Tensor, x_ids: torch.Tensor) -> list[torch.Tensor]:
+    """
+    using position ids to scatter tokens into place
+    """
+    x_list = []
+    for data, pos in zip(x, x_ids):
+        _, ch = data.shape  # noqa: F841
+        h_ids = pos[:, 1].to(torch.int64)
+        w_ids = pos[:, 2].to(torch.int64)
+
+        h = torch.max(h_ids) + 1
+        w = torch.max(w_ids) + 1
+
+        flat_ids = h_ids * w + w_ids
+
+        out = torch.zeros((h * w, ch), device=data.device, dtype=data.dtype)
+        out.scatter_(0, flat_ids.unsqueeze(1).expand(-1, ch), data)
+
+        # reshape from (H * W, C) to (H, W, C) and permute to (C, H, W)
+
+        out = out.view(h, w, ch).permute(2, 0, 1)
+        x_list.append(out)
+
+    return torch.stack(x_list, dim=0)
+
+
+def _patchify_latents(latents):
+    batch_size, num_channels_latents, height, width = latents.shape
+    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+    latents = latents.permute(0, 1, 3, 5, 2, 4)
+    latents = latents.reshape(batch_size, num_channels_latents * 4, height // 2, width // 2)
+    return latents
+
+
+def _unpatchify_latents(latents):
+    batch_size, num_channels_latents, height, width = latents.shape
+    latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), 2, 2, height, width)
+    latents = latents.permute(0, 1, 4, 2, 5, 3)
+    latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), height * 2, width * 2)
+    return latents
+
+
+class Flux2PipelineConfig(ImagePipelineConfig):
+    text_encoder_configs: tuple[EncoderConfig, ...] = field(
+        default_factory=lambda: (Mistral3Config(),)
+    )
+    vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
+
+    def maybe_pack_latents(self, latents, batch_size, batch):
+        batch_size, num_channels, height, width = latents.shape
+        latents = latents.reshape(batch_size, num_channels, height * width).permute(0, 2, 1)
+        return latents
+
+    def maybe_prepare_latent_ids(self, latents):
+        return _prepare_latent_ids(latents)
+
+    def post_process_vae_encode(self, image_latents, vae):
+        vae_arch_config = self.vae_config.arch_config
+        # 1. patchify
+        image_latents = _patchify_latents(image_latents)
+
+        # 2. scale and shift
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(image_latents.device, image_latents.dtype)
+        latents_bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps)
+        image_latents = (image_latents - latents_bn_mean) / latents_bn_std
+        return image_latents
+
+    def pre_decoding(self, latents):
+        latents = _unpatchify_latents(latents)
+        return latents
+
+    def calculate_decode_scale_inv_and_shift(self, latents, vae):
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        latents_bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(
+            latents.device, latents.dtype
+        )
+        return 1 / latents_bn_std, latents_bn_mean
+
+    def post_denoising_loop(self, latents, batch):
+        latent_ids = batch.latent_ids
+        latents = _unpack_latents_with_ids(latents, latent_ids)
+
+        return latents

@@ -1,5 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
+from sglang.multimodal_gen.runtime.pipelines.flux import prepare_mu
 # SPDX-License-Identifier: Apache-2.0
 
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
@@ -24,66 +24,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
-
-
-def compute_empirical_mu(batch: Req, server_args: ServerArgs):
-    num_steps = batch.num_inference_steps
-    image_seq_len = batch.raw_latent_shape[1]
-    a1, b1 = 8.73809524e-05, 1.89833333
-    a2, b2 = 0.00016927, 0.45666666
-
-    if image_seq_len > 4300:
-        mu = a2 * image_seq_len + b2
-        return float(mu)
-
-    m_200 = a2 * image_seq_len + b2
-    m_10 = a1 * image_seq_len + b1
-
-    a = (m_200 - m_10) / 190.0
-    b = m_200 - 200.0 * a
-    mu = a * num_steps + b
-
-    return "mu", float(mu)
-
-
-def prepare_mu(batch: Req, server_args: ServerArgs):
-    height = batch.height
-    width = batch.width
-    vae_scale_factor = (
-        server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-    )
-    image_seq_len = (int(height) // vae_scale_factor) * (int(width) // vae_scale_factor)
-
-    mu = calculate_shift(
-        image_seq_len,
-        # hard code, since scheduler_config is not in PipelineConfig now
-        256,
-        4096,
-        0.5,
-        1.15,
-    )
-    return "mu", mu
-
-
-class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
-    pipeline_name = "FluxPipeline"
+class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "Flux2Pipeline"
 
     _required_config_modules = [
         "text_encoder",
-        "text_encoder_2",
         "tokenizer",
-        "tokenizer_2",
         "vae",
         "transformer",
         "scheduler",
@@ -116,7 +62,7 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
             stage_name="timestep_preparation_stage",
             stage=TimestepPreparationStage(
                 scheduler=self.get_module("scheduler"),
-                prepare_extra_set_timesteps_kwargs=[compute_empirical_mu],
+                prepare_extra_set_timesteps_kwargs=[prepare_mu],
             ),
         )
 
@@ -141,4 +87,4 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = FluxPipeline
+EntryClass = Flux2Pipeline
