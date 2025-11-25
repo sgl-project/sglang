@@ -207,7 +207,6 @@ class LMCRadixCache(RadixCache):
 
     def cache_finished_req(self, req: "Req", is_insert: bool = True) -> None:  # type: ignore[override]
         """Cache finished request and write committed KV to LMCache."""
-
         if self.disable_finished_insert:
             is_insert = False
 
@@ -276,9 +275,7 @@ class LMCRadixCache(RadixCache):
 
         committed_indices = kv_indices[:kv_committed_len].clone()
 
-        _, new_last_node, _, _ = self.match_prefix(
-            RadixKey(token_ids, req.extra_key)
-        )
+        _, new_last_node, _, _ = self.match_prefix(RadixKey(token_ids, req.extra_key))
         if new_last_node is None:
             return
 
