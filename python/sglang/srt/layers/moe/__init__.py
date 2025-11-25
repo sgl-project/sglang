@@ -27,4 +27,10 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
+    "is_peo_enabled",
+    "get_peo_num_rounds",
+    "get_peo_deepep_send_num_sms",
+    "get_peo_deepep_recv_num_sms",
+    "get_peo_up_deepgemm_num_sms",
+    "get_peo_down_deepgemm_num_sms",
 ]

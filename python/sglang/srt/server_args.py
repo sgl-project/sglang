@@ -532,6 +532,14 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    # PEO(Per-Expert-Overlap)
+    enable_per_expert_overlap: Optional[bool] = False
+    peo_overlap_method: Optional[int] = 4
+    peo_num_rounds: Optional[int] = 2
+    peo_deepep_send_num_sms: Optional[int] = -1
+    peo_deepep_recv_num_sms: Optional[int] = -1
+    peo_up_deepgemm_num_sms: Optional[int] = -1
+    peo_down_deepgemm_num_sms: Optional[int] = -1
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -3081,6 +3089,49 @@ class ServerArgs:
             help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
             "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
+        )
+
+        # PEO(Per-Expert-Overlap)
+        parser.add_argument(
+            "--enable-per-expert-overlap",
+            action="store_true",
+            help="Enable DeepEP low latency kernel peo(per expert overlap)",
+        )
+        parser.add_argument(
+            "--peo-overlap-method",
+            type=int,
+            default=ServerArgs.peo_overlap_method,
+            help="PEO: overlap method, ",
+        )
+        parser.add_argument(
+            "--peo-num-rounds",
+            type=int,
+            default=ServerArgs.peo_num_rounds,
+            help="PEO: Number of rounds for splitting dispatch/combine.",
+        )
+        parser.add_argument(
+            "--peo-deepep-send-num-sms",
+            type=int,
+            default=ServerArgs.peo_deepep_send_num_sms,
+            help="PEO: Number of SMs used for dispatch/combine send.",
+        )
+        parser.add_argument(
+            "--peo-deepep-recv-num-sms",
+            type=int,
+            default=ServerArgs.peo_deepep_recv_num_sms,
+            help="PEO: Number of SMs used for dispatch/combine recv.",
+        )
+        parser.add_argument(
+            "--peo-up-deepgemm-num-sms",
+            type=int,
+            default=ServerArgs.peo_up_deepgemm_num_sms,
+            help="PEO: Number of SMs used for UP GEMM.",
+        )
+        parser.add_argument(
+            "--peo-down-deepgemm-num-sms",
+            type=int,
+            default=ServerArgs.peo_down_deepgemm_num_sms,
+            help="PEO: Number of SMs used for DOWN GEMM.",
         )
 
         # Mamba Cache
