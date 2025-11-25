@@ -149,7 +149,7 @@ sglang serve "${SERVER_ARGS[@]}"
 - **--model-path**: Which model to load. The example uses `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
 - **--port**: HTTP port to listen on (the default here is `30010`).
 
-For detailed API usage, including Video Generation and LoRA management, please refer to the [OpenAI API Documentation](openai_api.md).
+For detailed API usage, including Image, Video Generation and LoRA management, please refer to the [OpenAI API Documentation](openai_api.md).
 
 
 ## Generate

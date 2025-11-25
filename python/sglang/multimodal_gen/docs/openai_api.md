@@ -227,8 +227,8 @@ Loads a LoRA adapter and merges its weights into the model.
 curl -X POST http://localhost:30010/v1/set_lora \
   -H "Content-Type: application/json" \
   -d '{
-        "lora_nickname": "jinx_style",
-        "lora_path": "/path/to/jinx.safetensors"
+        "lora_nickname": "lora_name",
+        "lora_path": "/path/to/lora.safetensors"
       }'
 ```
 
@@ -267,7 +267,7 @@ curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
 
 1.  Set LoRA A:
     ```bash
-    curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "style_A", "lora_path": "path/to/A"}'
+    curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "lora_a", "lora_path": "path/to/A"}'
     ```
 2.  Generate with LoRA A...
 3.  Unmerge LoRA A:
@@ -276,6 +276,6 @@ curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
     ```
 4.  Set LoRA B:
     ```bash
-    curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "style_B", "lora_path": "path/to/B"}'
+    curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "lora_b", "lora_path": "path/to/B"}'
     ```
 5.  Generate with LoRA B...
