@@ -360,7 +360,7 @@ def init_process_sgl(
             url + "/continue_generation",
             json={},
         )
-    
+
         # discard unfinished requests to save test overhead
         time.sleep(2)
         requests.post(
@@ -620,14 +620,26 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
         else:
             test_suits = [
                 (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
-                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Sever", random.choice(["in_place", "retract"])),
+                (
+                    1,
+                    1,
+                    DEFAULT_MODEL_NAME_FOR_TEST,
+                    "Sever",
+                    random.choice(["in_place", "retract"]),
+                ),
             ]
 
             if torch.cuda.device_count() >= 4:
                 test_suits.extend(
                     [
                         (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
-                        (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
+                        (
+                            1,
+                            2,
+                            DEFAULT_MODEL_NAME_FOR_TEST,
+                            "Server",
+                            random.choice(["in_place", "retract"]),
+                        ),
                     ]
                 )
 
@@ -635,7 +647,13 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 test_suits.extend(
                     [
                         (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
-                        (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
+                        (
+                            2,
+                            2,
+                            DEFAULT_MODEL_NAME_FOR_TEST,
+                            "Server",
+                            random.choice(["in_place", "retract"]),
+                        ),
                     ]
                 )
 

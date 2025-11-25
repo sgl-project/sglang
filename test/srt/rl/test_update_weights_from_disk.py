@@ -179,7 +179,8 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
             num_requests = 32
             with ThreadPoolExecutor(num_requests) as executor:
                 futures = [
-                    executor.submit(self.run_decode_random, 1600) for _ in range(num_requests)
+                    executor.submit(self.run_decode_random, 1600)
+                    for _ in range(num_requests)
                 ]
 
                 # ensure the decode has been started
