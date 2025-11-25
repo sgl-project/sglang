@@ -15,7 +15,7 @@ from typing import (
     List,
     Optional,
     Tuple,
-    TypeVar,
+    TypeVar, Callable,
 )
 
 import fastapi
@@ -71,6 +71,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
+
+from sglang.srt.managers.io_struct import ModelWorkerTaskOutput, ModelWorkerTask
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -153,6 +155,9 @@ class TokenizerCommunicatorMixin:
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         # Communicators
+        self.model_worker_execute_task_group_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.init_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -216,6 +221,10 @@ class TokenizerCommunicatorMixin:
     def _get_communicator_dispatcher(self: TokenizerManager):
         return TypeBasedDispatcher(
             [
+                (
+                    ModelWorkerTaskOutput,
+                    self.model_worker_execute_task_group_communicator.handle_recv,
+                ),
                 (
                     InitWeightsUpdateGroupReqOutput,
                     self.init_weights_update_group_communicator.handle_recv,
@@ -639,6 +648,13 @@ class TokenizerCommunicatorMixin:
             return all_parameters[0]
         else:
             return all_parameters
+
+    async def execute_task_in_model_worker(self, task_func: Callable, **kwargs) -> List:
+        """Execute a task on every model worker subprocess"""
+        self.auto_create_handle_loop()
+        task = ModelWorkerTask(task_func=task_func, kwargs=kwargs)
+        results = await self.model_worker_execute_task_group_communicator(task)
+        return results[0].result
 
     async def release_memory_occupation(
         self: TokenizerManager,
