@@ -3,17 +3,17 @@ import unittest
 
 import numpy as np
 import requests
-import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.srt.utils import get_device, is_cuda, is_xpu
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    empty_gpu_cache,
     get_gpu_count,
     is_in_ci,
     popen_launch_server,
@@ -63,10 +63,7 @@ class TestGetWeightsByName(CustomTestCase):
     def clean_up(self):
         del self.hf_model
         gc.collect()
-        if is_cuda():
-            torch.cuda.empty_cache()
-        elif is_xpu():
-            torch.xpu.empty_cache()
+        empty_gpu_cache()
         if self.backend == "Engine":
             self.engine.shutdown()
         else:

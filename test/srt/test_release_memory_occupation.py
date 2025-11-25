@@ -148,7 +148,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             hf_model_new = AutoModelForCausalLM.from_pretrained(
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
                 torch_dtype="bfloat16",
-                device=get_device(),
+                device_map=get_device(),
             )
             engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
@@ -303,7 +303,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             hf_model_new = AutoModelForCausalLM.from_pretrained(
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
                 torch_dtype="bfloat16",
-                device=get_device(),
+                device_map=get_device(),
             )
             gpu_memory_usage_after_loaded_hf_model = get_gpu_memory_gb()
             engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
@@ -382,7 +382,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         hf_model_new = AutoModelForCausalLM.from_pretrained(
             DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
             torch_dtype="bfloat16",
-            device=get_device(),
+            device_map=get_device(),
         )
         engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
