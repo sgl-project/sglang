@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 from pathlib import Path
 
 from sglang.test.ci.ci_utils import TestFile, run_unittest_files
@@ -76,11 +77,12 @@ def main():
     print(f"Running {len(files)} tests from suite: {args.suite}")
     print(f"Test files: {[f.name for f in files]}")
 
-    run_unittest_files(
+    exit_code = run_unittest_files(
         files,
         timeout_per_file=args.timeout_per_file,
         continue_on_error=args.continue_on_error,
     )
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
