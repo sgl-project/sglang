@@ -17,10 +17,10 @@ from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
 
-SGL_DIFFUSION_CONFIGURE_LOGGING = envs.SGL_DIFFUSION_CONFIGURE_LOGGING
-SGL_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGL_DIFFUSION_LOGGING_CONFIG_PATH
-SGL_DIFFUSION_LOGGING_LEVEL = envs.SGL_DIFFUSION_LOGGING_LEVEL
-SGL_DIFFUSION_LOGGING_PREFIX = envs.SGL_DIFFUSION_LOGGING_PREFIX
+SGLANG_DIFFUSION_CONFIGURE_LOGGING = envs.SGLANG_DIFFUSION_CONFIGURE_LOGGING
+SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
+SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
+SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -28,7 +28,7 @@ YELLOW = "\033[93m"
 RESET = "\033[0;0m"
 
 _FORMAT = (
-    f"{SGL_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
+    f"{SGLANG_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
     "[%(filename)s: %(lineno)d] %(message)s"
 )
 
@@ -47,7 +47,7 @@ DEFAULT_LOGGING_CONFIG = {
         "sgl_diffusion": {
             "class": "logging.StreamHandler",
             "formatter": "sgl_diffusion",
-            "level": SGL_DIFFUSION_LOGGING_LEVEL,
+            "level": SGLANG_DIFFUSION_LOGGING_LEVEL,
             "stream": "ext://sys.stdout",
         },
     },
@@ -124,15 +124,20 @@ def _print_warning_once(logger: Logger, msg: str) -> None:
     logger.warning(msg, stacklevel=2)
 
 
-def _get_rank_info():
-    """Get rank and local rank from environment variables."""
+def get_is_main_process():
     try:
         rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
     except (KeyError, ValueError):
         rank = 0
-        local_rank = 0
-    return rank, local_rank
+    return rank == 0
+
+
+def get_is_local_main_process():
+    try:
+        rank = int(os.environ["LOCAL_RANK"])
+    except (KeyError, ValueError):
+        rank = 0
+    return rank == 0
 
 
 def _log_process_aware(
@@ -145,9 +150,8 @@ def _log_process_aware(
     **kwargs: Any,
 ) -> None:
     """Helper function to log a message if the process rank matches the criteria."""
-    rank, local_rank = _get_rank_info()
-    is_main_process = rank == 0
-    is_local_main_process = local_rank == 0
+    is_main_process = get_is_main_process()
+    is_local_main_process = get_is_local_main_process()
 
     should_log = (
         not main_process_only
@@ -340,7 +344,7 @@ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     will have the trace enabled. Other threads will not be affected.
     """
     logger.warning(
-        "SGL_DIFFUSION_TRACE_FUNCTION is enabled. It will record every"
+        "SGLANG_DIFFUSION_TRACE_FUNCTION is enabled. It will record every"
         " function executed by Python. This will slow down the code. It "
         "is suggested to be used for debugging hang or crashes only."
     )
@@ -393,8 +397,7 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
 
     should_suppress = True
     if not_suppress_on_main_rank:
-        rank, _ = _get_rank_info()
-        if rank == 0:
+        if get_is_main_process() == 0:
             should_suppress = False
 
     loggers_to_suppress = ["urllib3"]
@@ -405,6 +408,13 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
             logger = logging.getLogger(logger_name)
             original_levels[logger_name] = logger.level
             logger.setLevel(logging.WARNING)
+
+    # Suppress verbose logging from imageio, which is triggered when saving images.
+    logging.getLogger("imageio").setLevel(logging.WARNING)
+    logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
+    # Suppress Pillow plugin import logs when app log level is DEBUG
+    logging.getLogger("PIL").setLevel(logging.WARNING)
+    logging.getLogger("PIL.Image").setLevel(logging.WARNING)
 
     try:
         yield
