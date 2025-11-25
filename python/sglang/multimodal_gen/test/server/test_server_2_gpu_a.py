@@ -10,11 +10,8 @@ from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
 )
-from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
 from sglang.multimodal_gen.test.server.testcase_configs import (
     TWO_GPU_CASES_A,
-    DiffusionSamplingParams,
-    DiffusionServerArgs,
     DiffusionTestCase,
 )
 

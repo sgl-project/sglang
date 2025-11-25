@@ -15,6 +15,7 @@ import openai
 import pytest
 from openai import OpenAI
 
+from sglang.multimodal_gen.configs.sample.base import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
@@ -65,19 +66,17 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     ctx = manager.start()
 
     try:
+        # Reconstruct output size for OpenAI API
+        output_size = f"{sampling_params.width}x{sampling_params.height}"
         warmup = WarmupRunner(
             port=ctx.port,
             model=server_args.model_path,
             prompt=sampling_params.prompt or "A colorful raccoon icon",
-            output_size=sampling_params.output_size,
+            output_size=output_size,
         )
-        warmup.run_text_warmups(server_args.warmup_text)
+        warmup.run_text_warmups(case.warmup_text)
 
-        if (
-            server_args.warmup_edit > 0
-            and sampling_params.edit_prompt
-            and sampling_params.image_path
-        ):
+        if case.warmup_edit > 0 and case.edit_prompt and sampling_params.image_path:
             # Handle URL or local path
             image_path = sampling_params.image_path
             if is_image_url(sampling_params.image_path):
@@ -86,8 +85,8 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
                 image_path = Path(sampling_params.image_path)
 
             warmup.run_edit_warmups(
-                count=server_args.warmup_edit,
-                edit_prompt=sampling_params.edit_prompt,
+                count=case.warmup_edit,
+                edit_prompt=case.edit_prompt,
                 image_path=image_path,
             )
     except Exception as exc:
@@ -192,7 +191,7 @@ Consider updating perf_baselines.json with the snippets below:
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
-        validator_name = case.server_args.custom_validator or "default"
+        validator_name = case.custom_validator or "default"
         validator_class = VALIDATOR_REGISTRY.get(validator_name, PerformanceValidator)
 
         validator = validator_class(
@@ -220,7 +219,7 @@ Consider updating perf_baselines.json with the snippets below:
 
         result = {
             "test_name": case.id,
-            "modality": case.server_args.modality,
+            "modality": case.sampling_params.data_type.name.lower(),
             "e2e_ms": summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
@@ -341,7 +340,7 @@ Consider updating perf_baselines.json with the snippets below:
         }
 
         # Video-specific metrics
-        if case.server_args.modality == "video":
+        if case.sampling_params.data_type == DataType.VIDEO:
             if "per_frame_generation" not in baseline["stages_ms"]:
                 baseline["stages_ms"]["per_frame_generation"] = (
                     round(summary.avg_frame_time_ms, 2)
@@ -372,8 +371,9 @@ Consider updating perf_baselines.json with the snippets below:
         """
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
-            modality=case.server_args.modality,
+            data_type=case.sampling_params.data_type,
             sampling_params=case.sampling_params,
+            edit_prompt=case.edit_prompt,
         )
         perf_record = self.run_and_collect(
             diffusion_server,
