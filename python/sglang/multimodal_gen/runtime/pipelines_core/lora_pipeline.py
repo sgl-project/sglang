@@ -29,7 +29,6 @@ logger = init_logger(__name__)
 class LoRAPipeline(ComposedPipelineBase):
     """
     Pipeline that supports injecting LoRA adapters into the diffusion transformer.
-    TODO: support training.
     """
 
     lora_adapters: dict[str, dict[str, torch.Tensor]] = defaultdict(

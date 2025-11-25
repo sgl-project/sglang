@@ -200,6 +200,7 @@ suites = {
     ],
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
+        TestFile("models/test_dummy_grok_models.py"),
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
