@@ -1,112 +1,141 @@
-# Expert Parallelism
+# Expert Parallelism in SGLang
 
-SGLang’s Mixture-of-Experts (MoE) stack can scale beyond one GPU by splitting experts across *expert parallel* (EP) ranks while continuing to share activations with tensor parallel (TP), data parallel (DP), and (optionally) pipeline parallel groups. This page explains how EP is wired in the current codebase, how it interacts with DeepEP and Mooncake A2A backends, and which server arguments govern expert placement, redundancy, and monitoring.
+Expert Parallelism (EP) in SGLang distributes expert weights across multiple devices in Mixture-of-Experts (MoE) models, addressing memory bottlenecks and enabling efficient scaling for high-performance inference. It is particularly vital for serving large-scale MoE models where tokens are dynamically routed to specialized experts across GPUs. By leveraging optimized all-to-all communication and grouped matrix multiplications (GEMMs), EP reduces latency, boosts throughput, and minimizes idle GPU time. SGLang's EP offers strong extensibility through its modular framework, allowing seamless integration of custom kernels, backends, and optimizations without refactoring core logic, supporting diverse hardware and quantization schemes.
 
-## Terminology and prerequisites
+## Supported Backends and Selection Guidance
 
-- `--tp-size` (`tp_size`) controls how many ranks participate in tensor-parallel compute inside each MoE layer. `--ep-size` (`ep_size`) partitions those TP ranks into EP subgroups. SGLang enforces `tp_size % ep_size == 0` and uses `moe_tp_size = tp_size / ep_size` when building MoE kernels; misconfigured shapes raise validation errors in `python/sglang/srt/model_executor/model_runner.py`.
-- `--moe-runner-backend` chooses the per-expert GEMM backend (DeepGEMM, Triton, FlashInfer variants, Cutlass, etc.). Some backends enforce constraints: FP8 Cutlass only works with `ep_size == 1`, and FlashInfer Cutlass (FP4) requires `ep_size ∈ {1, tp_size}` because each backend determines how activations are split (`python/sglang/srt/server_args.py`).
-- `--moe-a2a-backend` decides how router outputs are exchanged: `"none"` keeps the default all-reduce broadcast, `"deepep"` uses DeepSeek’s DeepEP transport, `"mooncake"` uses Mooncake EP (`python/sglang/srt/layers/moe/utils.py`).
-- `--moe-dense-tp-size` (currently `None` or `1`) lets you clamp dense MLP tensor parallel size when large EP groups make GEMM tile sizes too small.
-- EP-aware models read `get_moe_expert_parallel_world_size()` inside their constructors – for example `python/sglang/srt/models/deepseek_v2.py`, `python/sglang/srt/models/qwen3_moe.py`, `python/sglang/srt/models/glm4_moe.py`, `python/sglang/srt/models/minimax_m2.py`, `python/sglang/srt/models/gpt_oss.py`, and `python/sglang/srt/models/qwen3_vl_moe.py`. These families (and their quantized variants) are the primary beneficiaries of EP today.
+SGLang's EP integrates diverse, highly efficient backends for different use cases, allowing fine-grained control over performance trade-offs. Users specify backends via command-line flags:
+- `--moe-a2a-backend`: Selects the backend for all-to-all communication.
+- `--moe-runner-backend`: Selects the backend for MoE computation.
 
-## Configuring `--ep-size`
+### Backends for All-to-All Communication
 
-1. Decide how many experts each GPU can store. `ep_size` should match the number of unique expert shards you want across the TP group. For example, on an 8×H200 DeepSeek-V3.2 deployment, set `--tp 8 --ep 8` so every GPU owns a different expert shard (see `docs/basic_usage/deepseek_v32.md`).
-2. Keep `tp_size / ep_size` integral. A non-integer ratio produces `ValueError: tp_size ... must be divisible by moe_ep_size ...` at startup and also breaks the Qwen3-VL FP8 shape guard that checks `moe_intermediate_size / (tp_size / ep_size)` (`python/sglang/srt/model_executor/model_runner.py`).
-3. Combine with DP carefully. Under DP-attention, `moe_dense_tp_size` defaults to `None`, so TP activations are gathered before MLPs. Setting `--moe-dense-tp-size 1` relaxes this and matches the fast-path assumptions used when an A2A backend is enabled (`python/sglang/srt/utils/common.py`).
-4. When you select `--moe-a2a-backend deepep` or `--moe-a2a-backend mooncake`, SGLang automatically overrides `ep_size = tp_size`. DeepEP “normal” mode also disables CUDA graphs (`python/sglang/srt/server_args.py`).
+| Backend      | Description                                                                 | Use Cases                          |
+|--------------|-----------------------------------------------------------------------------|------------------------------------|
+| **`none` (default)** | Disables all-to-all for EP. Uses All-Reduce or All-Gather for token dispatch. | Hybrid EP and TP setups.           |
+| `deepep`     | DeepEP, a communication library for efficient token shuffling in MoE models. | Large-scale EP deployments.        |
+| `mooncake`   | An extension of DeepEP for elastic inference, leveraging RDMA for high-performance data transfers. | Elastic EP serving. |
 
-## Choosing runner and A2A backends
+DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
 
-### Runner backend
+Currently, DeepEP and Mooncake only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
 
-Use `--moe-runner-backend auto` unless you have to pin a kernel. The enum in `python/sglang/srt/layers/moe/utils.py` exposes the supported backends. Pay attention to these guardrails from `python/sglang/srt/server_args.py`:
+### Backends for MoE Computation
 
-```1387:1418:python/sglang/srt/server_args.py
-        if self.moe_runner_backend == "flashinfer_cutlass":
-            assert (
-                self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer Cutlass MOE"
-            assert self.ep_size in [
-                1,
-                self.tp_size,
-            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-...
-        if self.moe_runner_backend == "cutlass" and self.quantization == "fp8":
-            assert (
-                self.ep_size == 1
-            ), "FP8 Cutlass MoE is only supported with ep_size == 1"
-```
+| Backend                  | Description                                                                 | Use Cases                          |
+|--------------------------|-----------------------------------------------------------------------------|------------------------------------|
+| **`auto` (default)**     | Automatically selects the optimal backend based on model architecture, hardware (e.g., NVIDIA architecture like Ampere, Hopper, Blackwell), quantization scheme (e.g., FP8, FP4), and runtime conditions. | General-purpose deployments; ensures compatibility and performance without user intervention. |
+| `triton`                 | Triton-based implementation for grouped GEMMs, providing flexible kernel fusion and custom optimizations. | Custom kernel development or scenarios requiring high extensibility with Torch compilation support. |
+| `deep_gemm`              | DeepGEMM backend optimized for MoE matrix multiplications, supporting contiguous layouts for prefill and masked layouts for decode; often JIT-compiled for performance. | Large-scale EP deployments with FP8 block-wise quantization. |
+| `cutlass`                | CUTLASS-based backend for efficient GEMMs. | NVIDIA architectures with CUTLASS support. |
+| `flashinfer_trtllm`      | FlashInfer integrated with TensorRT-LLM for accelerated MoE computations, supporting FP4 communication operators and high-performance GEMMs. | NVIDIA architectures with TRT-LLM. |
+| `flashinfer_cutlass`     | FlashInfer combined with CUTLASS for high-performance grouped GEMMs in MoE layers, handling FP4/FP8 quantization efficiently. | Optimized for Blackwell (e.g., B200) and FP4/FP8 models. |
+| `flashinfer_mxfp4`       | FlashInfer variant optimized for MXFP4 (mixed FP4) quantization in MoE runners, focusing on memory-efficient low-precision inference. | Low-precision models with MXFP4. |
+| `flashinfer_cutedsl`     | FlashInfer with a custom DSL for flexible and efficient MoE kernel generation, integrated with modelopt quantization. | Low-precision models with NVFP4. |
 
-### All-to-all backend
+### Examples
 
-| Backend | When to use | Notes |
-| --- | --- | --- |
-| `none` | Use the default NCCL all-reduce broadcast for token exchange. | Allows `ep_size != tp_size`; relies on the standard fused MoE dispatcher. |
-| `deepep` | GPU-only DeepEP deployments. | Forces `ep_size = tp_size`, supports both normal (prefill) and low-latency (decode) modes, and requires DeepEP + DeepGEMM for low-latency unless you run on Ascend NPUs or FlashInfer CuTeDSL FP4. |
-| `mooncake` | Clusters with Mooncake EP installed. | Forces `ep_size = tp_size`, currently low-latency only, integrates with Elastic EP for rank health tracking. |
-
-## DeepEP backend
-
-- **Modes.** `--deepep-mode auto` resolves to normal for prefill batches and low-latency for decode batches (`python/sglang/srt/layers/moe/utils.py`). Normal mode keeps CUDA graphing off; low-latency overlaps communication and compute but demands DeepGEMM unless you are on NPU or using FlashInfer CuTeDSL FP4 (`python/sglang/srt/layers/moe/ep_moe/layer.py`).
-- **Library + env.** Install DeepEP from upstream (`sgl-project` images already bundle it) and set env vars when needed:
-  - `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (≤ 1024) caps inflight tokens per rank.
-  - `SGLANG_DEEPEP_BF16_DISPATCH=1` forces bf16 dispatch, which W4A-FP8 requires (`python/sglang/srt/layers/moe/token_dispatcher/deepep.py` and `python/sglang/srt/layers/moe/ep_moe/layer.py`).
-  - `SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS` can rebalance SM usage for low-latency combines (`python/sglang/srt/single_batch_overlap.py`).
-- **Configuration.** Pass tuned transport parameters via `--deepep-config` (JSON string or file). DeepEP’s dispatcher also respects redundant experts and EPLB metadata when routing tokens.
-- **Example.**
+Launch with DeepEP and DeepGEMM for DeepSeek-V3:
 
 ```bash
-python -m sglang.launch_server \
-  --model deepseek-ai/DeepSeek-V3.2-Exp \
-  --tp 8 --ep 8 --dp 8 --enable-dp-attention \
-  --moe-a2a-backend deepep --deepep-mode auto \
-  --deepep-config /opt/deepep_config.json
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --moe-a2a-backend deepep --moe-runner-backend deep_gemm --tp 8 --ep 8
 ```
 
-## Mooncake backend and Elastic EP
+## Extensible EP Framework
 
-- **Requirements.** Install Mooncake with EP support (`mooncake.mooncake_ep_buffer`). The dispatcher allocates buffers sized by `SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (default 128, must be ≤ 1024) when it is first used (`python/sglang/srt/layers/moe/token_dispatcher/mooncake.py`).
-- **Modes.** Only low-latency dispatch is implemented today; normal mode will raise `NotImplementedError`.
-- **Elastic EP.** Set `--elastic-ep-backend mooncake` to monitor rank health. When Elastic EP is enabled, `--enable-eplb` must also be active and `--eplb-algorithm` automatically becomes `elasticity_aware` if it was left as `auto` (`python/sglang/srt/server_args.py`). `python/sglang/srt/elastic_ep/elastic_ep.py` tracks active ranks so Mooncake can skip unhealthy endpoints.
-- **Networking.** Pin InfiniBand devices with `--mooncake-ib-device mlx5_0,mlx5_1`; Mooncake will call its `set_device_filter` during distributed init (`python/sglang/srt/model_executor/model_runner.py`).
+SGLang's EP framework provides modular abstractions for easy integration of custom kernels, backends, and optimizations. It decouples the MoE forward pass into stages (dispatch → pre-permute → core runner → post-permute → combine), enabling seamless extensions without refactoring core logic.
 
-## Expert placement, redundancy, and load balancing
+### Framework Overview
 
-- **Redundant experts.** Add hot spares with `--ep-num-redundant-experts N`. SGLang increases the `num_physical_experts` tensor by `N` per layer (`python/sglang/srt/eplb/expert_location.py`). Some models (e.g., `bailing_moe`) still assert `ep_num_redundant_experts == 0`, so keep the flag off there (`python/sglang/srt/models/bailing_moe.py`).
-- **Dispatch algorithms.** `--ep-dispatch-algorithm` supports `static`, `dynamic`, or `fake`. When unspecified, enabling EPLB or providing `--init-expert-location` forces `"static"` so spans stay deterministic (`python/sglang/srt/server_args.py` and `python/sglang/srt/eplb/expert_location_dispatch.py`).
-- **Initial layouts.** `--init-expert-location trivial` maps logical experts round-robin. You can also pass a JSON/`.pt` snapshot containing `physical_to_logical_map` or `logical_count` to resume from a previous EPLB snapshot (`python/sglang/srt/eplb/expert_location.py`).
-- **EPLB.** `--enable-eplb` activates Expert Placement Load Balancing. The manager periodically triggers rebalancing after `--eplb-rebalance-num-iterations` forward passes, optionally limiting to `--eplb-rebalance-layers-per-chunk` layers per pass and only when average GPU utilization drops below `--eplb-min-rebalancing-utilization-threshold`. EPLB also auto-enables the expert distribution recorder.
-- **Elastic EP + EPLB.** When `--elastic-ep-backend` is set (currently only `"mooncake"`), EPLB must run in `elasticity_aware` mode to keep logical-to-physical maps consistent if ranks are muted (`python/sglang/srt/server_args.py`).
-- **Metrics.** `--enable-expert-distribution-metrics` exports Prometheus counters. Set `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL` to a positive integer to log per-layer occupancy histograms (`python/sglang/srt/eplb/expert_distribution.py`).
+The framework centers on `FusedMoE` as the unified entry point for a single, extensible structure. Key components include:
+- **Dispatcher**: Manages dispatch/combine for backends like DeepEP (implements `BaseDispatcher` subclasses).
+- **MoeRunner**: Orchestrates grouped-GEMM execution via `MoeRunnerCore` implementations (e.g., `TritonRunnerCore`).
+- **PermuteMethodPool**: Auto-registers layout conversions (e.g., pre/post-permute via `register_pre_permute` and `register_post_permute` for dynamic modes, or `register_fused_func` for static, torch.compile-compatible fused operations).
+- **TopK Router**: Backend-agnostic expert selection.
 
-## Hybrid CPU/GPU experts (KTransformers)
+This design supports multiple backends via `--moe-a2a-backend` and `--moe-runner-backend`, with quantization integrated through a standardized `apply()` method. The computation flow ensures modularity:
 
-If you want to keep some experts on CPUs (e.g., AMX INT4) while others run on GPUs, wrap the GPU quantization method with the KTransformers EP wrapper (`python/sglang/srt/layers/moe/kt_ep_wrapper.py`). Provide CPU weights, thread counts, and deferred expert limits via `--kt-*` arguments; the wrapper masks CPU-only expert IDs on the GPU side and streams CPU outputs back into the combine step. This is orthogonal to GPU EP sizing—you can still run DeepEP or Mooncake for GPU experts while offloading a tail of experts to CPU cores.
+```
+[input_hidden_states]
+          |
+          v
+     TopK.forward -> select_experts / triton_kernels.routing / bypass
+          |
+          v
+     [TopKOutput]
+          |
+          v
+   FusedMoE.forward -> Dispatcher.dispatch -> DeepEP / bypass
+          |                     |
+          |                     v
+          |              [DispatchOutput]
+          |                     |
+          |                     v
+          |             quant_method.apply -> MoeRunner.forward
+          |                     |              |
+          |                     |              v
+          |                     | pre-permute + grouped_gemm + post-permute
+          |                     |              |
+          |                     |--------------
+          |                     v
+          |               [CombineInput]
+          |                     |
+          |                     v
+          |            Dispatcher.combine -> DeepEP / bypass
+          |                     |
+          |---------------------
+          v
+[final_hidden_states]
+```
 
-## Monitoring and troubleshooting
+For details, see the [MoE Refactor Roadmap](https://github.com/sgl-project/sglang/issues/8715).
 
-- **Common launch errors.**
-  - `tp_size ... must be divisible by moe_ep_size ...` → adjust `--tp`/`--ep`.
-  - `moe_intermediate_size ... must be divisible by moe_tp_size ...` → some FP8 models require specific TP×EP factorizations.
-  - `DeepEP low_latency mode requires deep_gemm` → either enable JIT DeepGEMM (default on Hopper+) or choose `--deepep-mode normal`.
-  - `W4AFP8 does not support FP8 dispatch` → set `SGLANG_DEEPEP_BF16_DISPATCH=1` when using W4A-FP8 weights.
-- **Metrics to watch.** Enable `--expert-distribution-recorder-mode stat --enable-expert-distribution-metrics` to log `sglang:eplb_gpu_physical_count` histograms every `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL` passes. DeepEP also logs masked token counts via `get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency`.
-- **Environment variables.**
-  - `SGLANG_DEEPEP_*` controls DeepEP dispatch precision and buffer sizing.
-  - `SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` caps Mooncake queue depth.
-  - `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL` controls histogram cadence.
+### Implementing New Backends
 
-## Example launch recipes
+To add a new backend:
+1. For a new all-to-all dispatcher, implement a `BaseDispatcher` subclass with `dispatch` and `combine` methods.
+2. For a new MoE runner backend, define a `MoeRunnerCore` subclass for core operations (e.g., grouped GEMMs).
+3. Define new input/output formats for the dispatcher or model runner (e.g., `RunnerInput`, `RunnerOutput`).
+4. Register permute/unpermute methods to ensure compatibility:
+   - **Fused Mode** (static, torch.compile-compatible): Use `register_fused_func` for end-to-end operations.
+   - **Permute Mode** (dynamic): Register `register_pre_permute` and `register_post_permute` for flexible layouts.
 
-| Scenario | Command | Notes |
-| --- | --- | --- |
-| 8×H200 DeepSeek-V3.2 with DeepEP | `python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep 8 --dp 8 --enable-dp-attention --moe-a2a-backend deepep --deepep-mode auto` | Matches the template in `docs/basic_usage/deepseek_v32.md`; DP attention is recommended for DeepSeek models. |
-| 8×H200 Qwen3-VL-235B FP8 | `python -m sglang.launch_server --model Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 --tp 8 --ep 8` | FP8 variants require `(moe_intermediate_size=1536 / moe_tp_size) % weight_block_size_n=128 == 0`, where `moe_tp_size = tp_size / ep_size` → You can choose `ep_size` in 2, 4 or 8. |
+See the [MoE Refactor Implementation PR](https://github.com/sgl-project/sglang/pull/9269) for full changes, including type hints and config expansions.
 
-## Related docs
+### Examples
 
-- `docs/advanced_features/server_arguments.md` lists every EP-related flag.
-- `docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd.md` shows production launch manifests that combine DeepEP, EPLB, and PD disaggregation.
-- `docs/advanced_features/hyperparameter_tuning.md` covers how to benchmark different parallelism strategies, including EP.
+For an example implementation, see [moe_runner/triton.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/moe/moe_runner/triton.py), which demonstrates Triton-based grouped GEMMs with registered fused and permutation functions.
+
+## Computation and Communication Overlap
+
+SGLang's EP employs advanced overlap techniques to hide communication latency behind computation, maximizing GPU utilization in MoE layers.
+
+### Two-Batch Overlap (TBO)
+
+TBO splits requests into micro-batches, interleaving attention computation with dispatch/combine operations. Yield points in the execution graph allow pausing for overlaps, increasing overall throughput without peak memory spikes:
+
+```python
+operations = [
+    self._forward_attn,
+    YieldOperation(),  # Overlap with dispatch of prior micro-batch
+    self._forward_dispatch,
+    self._forward_mlp,
+    YieldOperation(),  # Overlap with combine
+    self._forward_combine,
+]
+```
+
+Users need to specify `--enable-two-batch-overlap` to unlock up to 2x throughput. For details, see the [Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/#two-batch-overlap).
+
+### Single-Batch Overlap (SBO)
+
+SGLang introduces a dispatcher-hook system for Single-Batch Overlap (SBO), enabling the overlap of operations within a single batch—such as shared experts computation with communication—while decentralizing logic to enhance modularity. These hooks execute before and after the `dispatch` and `combine` operations without modifying core MoE modules. This design simplifies interfaces, reduces coupling, and improves extensibility. For implementation details and an example of overlapping shared experts with DeepEP's combine operation, refer to [PR #13327](https://github.com/sgl-project/sglang/pull/13327). Users can set `--enable-single-batch-overlap` to enable this feature.
+
+
+## Workload Balancer
+
+SGLang integrates the [Expert Parallelism Load Balancer (EPLB)](https://github.com/deepseek-ai/EPLB) from DeepSeek to address routing imbalances in MoE models. By analyzing expert activation statistics, EPLB computes an optimal expert arrangement, strategically placing or replicating experts to minimize GPU utilization variance, reduce idle cycles, and enhance scalability.
+
+To enable EPLB, use the flags `--enable-eplb true --load-balance-method eplb`. For optimal performance, increase batch sizes to stabilize activation statistics and configure periodic rebalancing (e.g., every 1000 requests) to adapt to evolving workloads. Simulations demonstrate significant improvements in load balancedness (ratio of mean to max computation time), correlating strongly with throughput gains.
+
+For more details, refer to the [EPLB Section in the Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/#expert-parallelism-load-balancer) and the [EPLB Repository](https://github.com/deepseek-ai/eplb).
