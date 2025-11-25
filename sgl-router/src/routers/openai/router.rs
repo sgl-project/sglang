@@ -2,7 +2,6 @@
 
 use std::{
     any::Any,
-    collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
@@ -10,16 +9,12 @@ use std::{
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use dashmap::DashMap;
-use futures_util::StreamExt;
-use once_cell::sync::Lazy;
-use serde_json::{json, to_value, Value};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use serde_json::{json, Value};
 use tracing::warn;
 
 // Import from sibling modules
@@ -29,19 +24,19 @@ use super::conversations::{
     update_conversation,
 };
 use super::{
+    context::{CachedEndpoint, RequestType, SharedComponents},
     mcp::{
         ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
         McpLoopConfig,
     },
+    pipeline::RequestPipeline,
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
-    streaming::handle_streaming_response,
-    utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
+    utils::{apply_provider_headers, probe_endpoint_for_model},
 };
 use crate::{
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{
-        ConversationId, ConversationItemStorage, ConversationStorage, ListParams, ResponseId,
-        ResponseStorage, SortOrder,
+        ConversationId, ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage,
     },
     mcp::McpManager,
     protocols::{
@@ -51,10 +46,7 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
-        responses::{
-            generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-            ResponsesGetParams, ResponsesRequest,
-        },
+        responses::{generate_id, ResponsesGetParams, ResponsesRequest},
     },
     routers::header_utils::apply_request_headers,
 };
@@ -62,39 +54,6 @@ use crate::{
 // ============================================================================
 // OpenAIRouter Struct
 // ============================================================================
-
-/// Fields specific to SGLang that should be stripped when forwarding to OpenAI-compatible endpoints
-static SGLANG_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    HashSet::from([
-        "request_id",
-        "priority",
-        "top_k",
-        "min_p",
-        "min_tokens",
-        "regex",
-        "ebnf",
-        "stop_token_ids",
-        "no_stop_trim",
-        "ignore_eos",
-        "continue_final_message",
-        "skip_special_tokens",
-        "lora_path",
-        "session_params",
-        "separate_reasoning",
-        "stream_reasoning",
-        "chat_template_kwargs",
-        "return_hidden_states",
-        "repetition_penalty",
-        "sampling_seed",
-    ])
-});
-
-/// Cached endpoint information
-#[derive(Clone, Debug)]
-struct CachedEndpoint {
-    url: String,
-    cached_at: Instant,
-}
 
 /// Router for OpenAI backend
 pub struct OpenAIRouter {
@@ -544,123 +503,30 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        if !self.circuit_breaker.can_execute() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response();
-        }
+        // Create shared components from router fields
+        let components = Arc::new(SharedComponents {
+            http_client: self.client.clone(),
+            circuit_breaker: Arc::new(self.circuit_breaker.clone()),
+            model_cache: self.model_cache.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            response_storage: self.response_storage.clone(),
+            conversation_storage: self.conversation_storage.clone(),
+            conversation_item_storage: self.conversation_item_storage.clone(),
+            worker_urls: self.worker_urls.clone(),
+        });
 
-        // Extract auth header
-        let auth = extract_auth_header(headers);
-
-        // Find endpoint for model
-        let base_url = match self
-            .find_endpoint_for_model(body.model.as_str(), auth)
+        // Execute pipeline
+        let pipeline = RequestPipeline::new(self.worker_urls.clone());
+        pipeline
+            .execute(
+                RequestType::Chat(Arc::new(body.clone())),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                components,
+            )
             .await
-        {
-            Ok(url) => url,
-            Err(response) => return response,
-        };
-
-        // Serialize request body, removing SGLang-only fields
-        let mut payload = match to_value(body) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize request: {}", e),
-                )
-                    .into_response();
-            }
-        };
-        if let Some(obj) = payload.as_object_mut() {
-            // Always remove SGLang-specific fields (unsupported by OpenAI)
-            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
-            // Remove logprobs if false (Gemini don't accept it)
-            if obj.get("logprobs").and_then(|v| v.as_bool()) == Some(false) {
-                obj.remove("logprobs");
-            }
-        }
-
-        let url = format!("{}/v1/chat/completions", base_url);
-        let mut req = self.client.post(&url).json(&payload);
-
-        // Forward Authorization header if provided
-        if let Some(h) = headers {
-            if let Some(auth) = h.get("authorization").or_else(|| h.get("Authorization")) {
-                req = req.header("Authorization", auth);
-            }
-        }
-
-        // Accept SSE when stream=true
-        if body.stream {
-            req = req.header("Accept", "text/event-stream");
-        }
-
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                self.circuit_breaker.record_failure();
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to contact upstream: {}", e),
-                )
-                    .into_response();
-            }
-        };
-
-        let status = StatusCode::from_u16(resp.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        if !body.stream {
-            // Capture Content-Type before consuming response body
-            let content_type = resp.headers().get(CONTENT_TYPE).cloned();
-            match resp.bytes().await {
-                Ok(body) => {
-                    self.circuit_breaker.record_success();
-                    let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    if let Some(ct) = content_type {
-                        response.headers_mut().insert(CONTENT_TYPE, ct);
-                    }
-                    response
-                }
-                Err(e) => {
-                    self.circuit_breaker.record_failure();
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read response: {}", e),
-                    )
-                        .into_response()
-                }
-            }
-        } else {
-            // Stream SSE bytes to client
-            let stream = resp.bytes_stream();
-            let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(async move {
-                let mut s = stream;
-                while let Some(chunk) = s.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-            let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
-            *response.status_mut() = status;
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            response
-        }
     }
 
     async fn route_completion(
@@ -683,340 +549,28 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Extract auth header
-        let auth = extract_auth_header(headers);
+        // Create shared components from router fields
+        let components = Arc::new(SharedComponents {
+            http_client: self.client.clone(),
+            circuit_breaker: Arc::new(self.circuit_breaker.clone()),
+            model_cache: self.model_cache.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            response_storage: self.response_storage.clone(),
+            conversation_storage: self.conversation_storage.clone(),
+            conversation_item_storage: self.conversation_item_storage.clone(),
+            worker_urls: self.worker_urls.clone(),
+        });
 
-        // Find endpoint for model (use model_id if provided, otherwise use body.model)
-        let model = model_id.unwrap_or(body.model.as_str());
-        let base_url = match self.find_endpoint_for_model(model, auth).await {
-            Ok(url) => url,
-            Err(response) => return response,
-        };
-
-        let url = format!("{}/v1/responses", base_url);
-
-        // Clone the body for validation and logic, but we'll build payload differently
-        let mut request_body = body.clone();
-        if let Some(model) = model_id {
-            request_body.model = model.to_string();
-        }
-        // Do not forward conversation field upstream; retain for local persistence only
-        request_body.conversation = None;
-
-        // Store the original previous_response_id for the response
-        let original_previous_response_id = request_body.previous_response_id.clone();
-
-        // Handle previous_response_id by loading prior context
-        let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
-        if let Some(prev_id_str) = request_body.previous_response_id.clone() {
-            let prev_id = ResponseId::from(prev_id_str.as_str());
-            match self
-                .response_storage
-                .get_response_chain(&prev_id, None)
-                .await
-            {
-                Ok(chain) => {
-                    let mut items = Vec::new();
-                    for stored in chain.responses.iter() {
-                        // Convert input items from stored input (which is now a JSON array)
-                        if let Some(input_arr) = stored.input.as_array() {
-                            for item in input_arr {
-                                match serde_json::from_value::<ResponseInputOutputItem>(
-                                    item.clone(),
-                                ) {
-                                    Ok(input_item) => {
-                                        items.push(input_item);
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to deserialize stored input item: {}. Item: {}",
-                                            e, item
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Convert output items from stored output (which is now a JSON array)
-                        if let Some(output_arr) = stored.output.as_array() {
-                            for item in output_arr {
-                                match serde_json::from_value::<ResponseInputOutputItem>(
-                                    item.clone(),
-                                ) {
-                                    Ok(output_item) => {
-                                        items.push(output_item);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to deserialize stored output item: {}. Item: {}", e, item);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    conversation_items = Some(items);
-                    request_body.previous_response_id = None;
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to load previous response chain for {}: {}",
-                        prev_id_str, e
-                    );
-                }
-            }
-        }
-
-        // Handle conversation by loading history
-        if let Some(conv_id_str) = body.conversation.clone() {
-            let conv_id = ConversationId::from(conv_id_str.as_str());
-
-            // Verify conversation exists
-            if let Ok(None) = self.conversation_storage.get_conversation(&conv_id).await {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "Conversation not found"})),
-                )
-                    .into_response();
-            }
-
-            // Load conversation history (ascending order for chronological context)
-            let params = ListParams {
-                limit: Self::MAX_CONVERSATION_HISTORY_ITEMS,
-                order: SortOrder::Asc,
-                after: None,
-            };
-
-            match self
-                .conversation_item_storage
-                .list_items(&conv_id, params)
-                .await
-            {
-                Ok(stored_items) => {
-                    let mut items: Vec<ResponseInputOutputItem> = Vec::new();
-                    for item in stored_items.into_iter() {
-                        // Include messages, function calls, and function call outputs
-                        // Skip reasoning items as they're internal processing details
-                        match item.item_type.as_str() {
-                            "message" => {
-                                match serde_json::from_value::<Vec<ResponseContentPart>>(
-                                    item.content.clone(),
-                                ) {
-                                    Ok(content_parts) => {
-                                        items.push(ResponseInputOutputItem::Message {
-                                            id: item.id.0.clone(),
-                                            role: item
-                                                .role
-                                                .clone()
-                                                .unwrap_or_else(|| "user".to_string()),
-                                            content: content_parts,
-                                            status: item.status.clone(),
-                                        });
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to deserialize message content: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            "function_call" => {
-                                // The entire function_call item is stored in content field
-                                match serde_json::from_value::<ResponseInputOutputItem>(
-                                    item.content.clone(),
-                                ) {
-                                    Ok(func_call) => items.push(func_call),
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to deserialize function_call: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            "function_call_output" => {
-                                // The entire function_call_output item is stored in content field
-                                tracing::debug!(
-                                    "Loading function_call_output from DB - content: {}",
-                                    serde_json::to_string_pretty(&item.content)
-                                        .unwrap_or_else(|_| "failed to serialize".to_string())
-                                );
-                                match serde_json::from_value::<ResponseInputOutputItem>(
-                                    item.content.clone(),
-                                ) {
-                                    Ok(func_output) => {
-                                        tracing::debug!(
-                                            "Successfully deserialized function_call_output"
-                                        );
-                                        items.push(func_output);
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to deserialize function_call_output: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            "reasoning" => {
-                                // Skip reasoning items - they're internal processing details
-                            }
-                            _ => {
-                                // Skip unknown item types
-                                warn!("Unknown item type in conversation: {}", item.item_type);
-                            }
-                        }
-                    }
-
-                    // Append current request
-                    match &request_body.input {
-                        ResponseInput::Text(text) => {
-                            items.push(ResponseInputOutputItem::Message {
-                                id: format!("msg_u_{}", conv_id.0),
-                                role: "user".to_string(),
-                                content: vec![ResponseContentPart::InputText {
-                                    text: text.clone(),
-                                }],
-                                status: Some("completed".to_string()),
-                            });
-                        }
-                        ResponseInput::Items(current_items) => {
-                            // Process all item types, converting SimpleInputMessage to Message
-                            for item in current_items.iter() {
-                                let normalized =
-                                    crate::protocols::responses::normalize_input_item(item);
-                                items.push(normalized);
-                            }
-                        }
-                    }
-
-                    request_body.input = ResponseInput::Items(items);
-                }
-                Err(e) => {
-                    warn!("Failed to load conversation history: {}", e);
-                }
-            }
-        }
-
-        // If we have conversation_items from previous_response_id, use them
-        if let Some(mut items) = conversation_items {
-            // Append current request
-            match &request_body.input {
-                ResponseInput::Text(text) => {
-                    items.push(ResponseInputOutputItem::Message {
-                        id: format!(
-                            "msg_u_{}",
-                            original_previous_response_id
-                                .as_ref()
-                                .unwrap_or(&"new".to_string())
-                        ),
-                        role: "user".to_string(),
-                        content: vec![ResponseContentPart::InputText { text: text.clone() }],
-                        status: Some("completed".to_string()),
-                    });
-                }
-                ResponseInput::Items(current_items) => {
-                    // Process all item types, converting SimpleInputMessage to Message
-                    for item in current_items.iter() {
-                        let normalized = crate::protocols::responses::normalize_input_item(item);
-                        items.push(normalized);
-                    }
-                }
-            }
-
-            request_body.input = ResponseInput::Items(items);
-        }
-
-        // Always set store=false for upstream (we store internally)
-        request_body.store = Some(false);
-        // Filter out reasoning items from input - they're internal processing details
-        if let ResponseInput::Items(ref mut items) = request_body.input {
-            items.retain(|item| !matches!(item, ResponseInputOutputItem::Reasoning { .. }));
-        }
-
-        // Convert to JSON and strip SGLang-specific fields
-        let mut payload = match to_value(&request_body) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize request: {}", e),
-                )
-                    .into_response();
-            }
-        };
-
-        // Remove SGLang-specific fields only
-        if let Some(obj) = payload.as_object_mut() {
-            // Remove SGLang-specific fields (not part of OpenAI API)
-            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
-            // XAI (Grok models) requires special handling of input items
-            // Check if model is a Grok model
-            let is_grok_model = obj
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(|m| m.starts_with("grok"))
-                .unwrap_or(false);
-
-            if is_grok_model {
-                // XAI doesn't support the OPENAI item type input: https://platform.openai.com/docs/api-reference/responses/create#responses-create-input-input-item-list-item
-                // To Achieve XAI compatibility, strip extra fields from input messages (id, status)
-                // XAI doesn't support output_text as type for content with role of assistant
-                // so normalize content types: output_text -> input_text
-                if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut) {
-                    for item_obj in input_arr.iter_mut().filter_map(Value::as_object_mut) {
-                        // Remove fields not universally supported
-                        item_obj.remove("id");
-                        item_obj.remove("status");
-
-                        // Normalize content types to input_text (xAI compatibility)
-                        if let Some(content_arr) =
-                            item_obj.get_mut("content").and_then(Value::as_array_mut)
-                        {
-                            for content_obj in
-                                content_arr.iter_mut().filter_map(Value::as_object_mut)
-                            {
-                                // Change output_text to input_text
-                                if content_obj.get("type").and_then(Value::as_str)
-                                    == Some("output_text")
-                                {
-                                    content_obj.insert(
-                                        "type".to_string(),
-                                        Value::String("input_text".to_string()),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Delegate to streaming or non-streaming handler
-        if body.stream.unwrap_or(false) {
-            handle_streaming_response(
-                &self.client,
-                &self.circuit_breaker,
-                Some(&self.mcp_manager),
-                self.response_storage.clone(),
-                self.conversation_storage.clone(),
-                self.conversation_item_storage.clone(),
-                url,
-                headers,
-                payload,
-                body,
-                original_previous_response_id,
+        // Execute pipeline
+        let pipeline = RequestPipeline::new(self.worker_urls.clone());
+        pipeline
+            .execute(
+                RequestType::Responses(Arc::new(body.clone())),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                components,
             )
             .await
-        } else {
-            self.handle_non_streaming_response(
-                url,
-                headers,
-                payload,
-                body,
-                original_previous_response_id,
-            )
-            .await
-        }
     }
 
     async fn get_response(
