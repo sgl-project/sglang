@@ -92,6 +92,25 @@ jobs:
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_qwen3_235b
 
+      - name: Run Kimi-K2-Thinking nightly performance test
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-h200"
+        run: |
+          rm -rf test/srt/performance_profiles_kimi_k2_thinking/
+          cd test
+          python3 nightly/test_kimi_k2_thinking_perf.py
+
+      - name: Publish Kimi-K2-Thinking traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_kimi_k2_thinking
+
       # MiniMax-M2 test temporarily disabled due to compatibility issues
       # See MINIMAX_M2_ISSUES.md for details
       # - name: Run MiniMax-M2 nightly performance test
