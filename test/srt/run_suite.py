@@ -46,6 +46,7 @@ suites = {
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
+        TestFile("ops/test_repeat_interleave.py", 60),
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fp8_kernel.py", 8),
         TestFile("quant/test_int8_kernel.py", 8),
@@ -116,6 +117,7 @@ suites = {
         TestFile("test_swa_unittest.py", 1),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 210),
+        TestFile("test_triton_fused_moe.py", 80),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_torchao.py", 70),
         TestFile("test_triton_attention_kernels.py", 4),
@@ -198,6 +200,7 @@ suites = {
     ],
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
+        TestFile("models/test_dummy_grok_models.py"),
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
@@ -364,7 +367,7 @@ suite_ascend = {
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
 }
 

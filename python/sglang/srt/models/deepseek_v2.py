@@ -108,7 +108,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    ENABLE_FLASHINFER_FP8_GEMM,
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
@@ -173,10 +172,14 @@ _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
+
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    from aiter.ops.triton.fused_fp8_quant import (
+        fused_flatten_fp8_group_quant,
+        fused_rms_fp8_group_quant,
+    )
 
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
@@ -783,12 +786,13 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
-                and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+                and get_is_capture_mode()
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -2063,6 +2067,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
+            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                attn_bmm_output = attn_bmm_output.transpose(0, 1)
+                attn_bmm_output = fused_flatten_fp8_group_quant(
+                    attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
+                )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
@@ -3409,7 +3418,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             }
         )
         self.capture_aux_hidden_states = False
-        self._executed_weight_requant_ue8m0 = False
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -3584,13 +3592,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
+                    # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
                     if (
                         should_deepgemm_weight_requant_ue8m0(
                             weight_block_size=getattr(
                                 self.quant_config, "weight_block_size", None
                             )
                         )
-                        and self._executed_weight_requant_ue8m0
+                        and self_attn.kv_b_proj.executed_weight_requant_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
@@ -3706,27 +3715,15 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if (
-            not ENABLE_FLASHINFER_FP8_GEMM
-            and should_deepgemm_weight_requant_ue8m0(
-                weight_block_size=getattr(self.quant_config, "weight_block_size", None)
-            )
-            and not self._executed_weight_requant_ue8m0
-        ):
-            self._executed_weight_requant_ue8m0 = True
-            self._weight_requant_ue8m0(is_nextn)
-
-        # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
-        ):
-            self._transform_scale_ue8m0(is_nextn)
+        # Requant the weights and scales of MoE layers
+        if get_moe_runner_backend().is_deep_gemm():
+            self._maybe_moe_weight_requant_ue8m0(is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._transform_scale_nextn_moe_ue8m0()
 
-    def _weight_requant_ue8m0(self, is_nextn=False):
+    def _maybe_moe_weight_requant_ue8m0(self, is_nextn=False):
+        # Dense fp8 layers will be processed in Fp8LinearMethod.process_weights_after_loading
+        # So we only need to process sparse MoE layers here
         weight_block_size = self.quant_config.weight_block_size
 
         moe_layers = list(
@@ -3745,70 +3742,15 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 layer = self.model.layers[layer_id]
 
-            module_list = [
-                layer.self_attn.kv_b_proj,
-                layer.self_attn.o_proj,
-            ]
-
-            if self.config.q_lora_rank is not None:
-                module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
-                module_list.append(layer.self_attn.q_b_proj)
-            else:
-                module_list.append(layer.self_attn.kv_a_proj_with_mqa)
-                module_list.append(layer.self_attn.q_proj)
-
-            for module in module_list:
-                requant_weight_ue8m0_inplace(
-                    module.weight, module.weight_scale_inv, weight_block_size
-                )
-
             if layer_id in moe_layers or is_nextn:
-                shared_experts = getattr(layer.mlp, "shared_experts", None)
-                if shared_experts is not None:
-                    for module in [
-                        shared_experts.gate_up_proj,
-                        shared_experts.down_proj,
-                    ]:
-                        requant_weight_ue8m0_inplace(
-                            module.weight, module.weight_scale_inv, weight_block_size
-                        )
-
                 experts = layer.mlp.experts
+                # TODO: move this logic to Fp8MoEMethod.process_weights_after_loading
                 if isinstance(experts, DeepEPMoE):
                     for w in [
                         (experts.w13_weight, experts.w13_weight_scale_inv),
                         (experts.w2_weight, experts.w2_weight_scale_inv),
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
-            else:
-                mlp = layer.mlp
-                assert isinstance(mlp, DeepseekV2MLP)
-                for module in [
-                    mlp.gate_up_proj,
-                    mlp.down_proj,
-                ]:
-                    requant_weight_ue8m0_inplace(
-                        module.weight, module.weight_scale_inv, weight_block_size
-                    )
-
-    # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
-    def _transform_scale_ue8m0(self, is_nextn=False):
-        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
-
-        for layer_id in range(num_hidden_layers):
-            if is_nextn:
-                layer = self.model.decoder
-            else:
-                layer = self.model.layers[layer_id]
-
-            module_list = []
-            if self.config.q_lora_rank is not None:
-                module_list.append(layer.self_attn.q_b_proj)
-
-            for module in module_list:
-                transform_scale_ue8m0_inplace(
-                    module.weight_scale_inv, mn=module.weight.shape[-2]
-                )
 
     # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
     def _transform_scale_nextn_moe_ue8m0(self):
@@ -3970,6 +3912,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
+                    if _is_npu:
+                        name = name.replace("weight_packed", "weight")
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
                     # we need to skip here BEFORE we update the name, otherwise
@@ -3997,7 +3941,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
+                        if _is_npu:
+                            name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
