@@ -33,7 +33,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import numpy as np
 import orjson
 import torch
 import uvloop
@@ -131,16 +130,13 @@ class TensorWrapper:
         self.shape = list(tensor.shape)
         self.dtype = tensor.dtype
 
-        # Create buffer view based on Python version
-        if sys.version_info >= (3, 12):
-            data_ptr = tensor.data_ptr()
-            total_bytes = tensor.numel() * tensor.element_size()
-            self._buffer = memoryview(
-                (ctypes.c_char * total_bytes).from_address(data_ptr)
-            )
-        else:
-            # For Python 3.10, just use numpy - it already supports buffer protocol
-            self._buffer = np.asarray(tensor)
+    def __buffer__(self):
+        data_ptr = self.tensor.data_ptr()
+        total_bytes = self.tensor.numel() * self.tensor.element_size()
+        c_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
+        c_obj._keep_alive_ref = self
+        return memoryview(c_obj)
+
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
     is_cross_node = server_args.dist_init_addr
@@ -1066,9 +1062,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             ]
             # Add wrappers - they keep tensors alive and provide buffer interface
             for wrapper in feature_wrappers:
-                parts.append(wrapper._buffer)
-
-
+                parts.append(wrapper.__buffer__())
             self.send_to_scheduler.send_multipart(parts, copy=False)
         else:
             self.send_to_scheduler.send_multipart(
