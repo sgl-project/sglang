@@ -99,10 +99,10 @@ async def process_generation_batch(
     batch,
 ):
     result = await scheduler_client.forward([batch])
-    if not result.output:
+    if result.output is None:
         raise RuntimeError("Model generation returned no output.")
 
-    save_file_path = os.path.join(batch.output_path, batch.output_file_name)
+    save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
     post_process_sample(
         result.output[0],
         batch.data_type,

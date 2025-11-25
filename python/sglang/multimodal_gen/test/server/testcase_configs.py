@@ -346,6 +346,11 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt="generate",
+            custom_validator="video",
+            num_gpus=2,
+        ),
+        DiffusionSamplingParams(
+            prompt="generate",
             output_size="832x1104",
             image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
             num_frames=1,
