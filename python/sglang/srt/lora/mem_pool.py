@@ -50,6 +50,7 @@ class LoRAMemoryPool:
         self,
         base_hf_config: AutoConfig,
         max_loras_per_batch: int,
+        max_loras_prefetch: int,
         dtype: torch.dtype,
         tp_size: int,
         tp_rank: int,
@@ -61,6 +62,7 @@ class LoRAMemoryPool:
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
+        self.max_loras_prefetch: int = max_loras_prefetch
         self.dtype: torch.dtype = dtype
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
@@ -72,9 +74,9 @@ class LoRAMemoryPool:
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
-        #   (max_loras_per_batch, stacked_num * max_lora_dim, input_dim)
+        #   (max_loras_per_batch + max_loras_prefetch, stacked_num * max_lora_dim, input_dim)
         # B_buffer contains num_layer number of column-major tensors with shape
-        #   (stacked_num, max_loras_per_batch, output_dim, max_lora_dim)
+        #   (stacked_num, max_loras_per_batch + max_loras_prefetch, output_dim, max_lora_dim)
         self.A_buffer: Dict[str, List[torch.Tensor]] = {}
         self.B_buffer: Dict[str, List[torch.Tensor]] = {}
 
@@ -84,9 +86,9 @@ class LoRAMemoryPool:
         # Buffer idx -> lora uid in memory pool
         # All uids are initialized as `EmptySlot` for empty buffer slots
         # Here we don't initialize to None since None is a valid uid
-        self.buffer_id_to_uid: List[Union[str, None, EmptySlot]] = [
-            EMPTY_SLOT
-        ] * self.max_loras_per_batch
+        self.buffer_id_to_uid: List[Union[str, None, EmptySlot]] = [EMPTY_SLOT] * (
+            self.max_loras_per_batch + self.max_loras_prefetch
+        )
 
         self.init_buffers(base_model)
 
@@ -126,7 +128,7 @@ class LoRAMemoryPool:
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
         return (
-            self.max_loras_per_batch,
+            self.max_loras_per_batch + self.max_loras_prefetch,
             max_lora_dim * c,
             input_dim,
         )
@@ -147,7 +149,7 @@ class LoRAMemoryPool:
         if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             output_dim = divide(output_dim, self.tp_size)
         return (
-            self.max_loras_per_batch,
+            self.max_loras_per_batch + self.max_loras_prefetch,
             output_dim,
             max_lora_dim,
         )
@@ -193,16 +195,25 @@ class LoRAMemoryPool:
         lora_adapters: Dict[str, LoRAAdapter],
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         lora_refs: Dict[str, LoRARef],
+        prefetch: bool,
     ):
         start_time = time.perf_counter()
         num_loaded = 0
         eviction_time = 0.0
         loading_time = 0.0
-        sync_time = 0.0
 
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
-            for buffer_id in range(self.max_loras_per_batch):
+            start_slot, stop_slot = (
+                (0, self.max_loras_per_batch)
+                if not prefetch
+                else (
+                    self.max_loras_per_batch,
+                    self.max_loras_per_batch + self.max_loras_prefetch,
+                )
+            )
+
+            for buffer_id in range(start_slot, stop_slot):
                 if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
 
@@ -266,8 +277,14 @@ class LoRAMemoryPool:
 
         total_time = (time.perf_counter() - start_time) * 1000
         if num_loaded > 0:
+            headline = (
+                f"📊 prepare_lora_batch breakdown"
+                if not prefetch
+                else f"🚌 prepare_lora_batch breakdown for prefetch"
+            )
+
             logger.info(
-                f"📊 prepare_lora_batch breakdown: "
+                f"{headline}, "
                 f"total={total_time:.2f}ms, "
                 f"eviction={eviction_time:.2f}ms, "
                 f"loading={loading_time:.2f}ms, "

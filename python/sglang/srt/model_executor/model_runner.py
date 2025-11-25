@@ -1332,6 +1332,7 @@ class ModelRunner:
             base_model=self.model,
             base_hf_config=self.model_config.hf_config,
             max_loras_per_batch=self.server_args.max_loras_per_batch,
+            max_loras_prefetch=self.server_args.max_loras_prefetch,
             load_config=self.load_config,
             dtype=self.dtype,
             lora_backend=self.server_args.lora_backend,

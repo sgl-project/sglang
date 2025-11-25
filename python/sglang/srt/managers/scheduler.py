@@ -255,6 +255,7 @@ class Scheduler(
         )
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.max_loras_prefetch = server_args.max_loras_prefetch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -1683,7 +1684,11 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
 
                 # Prefetch LoRAs for next batch
-                upper_bound_bs = get_global_server_args().pp_max_micro_batch_size
+                upper_bound_bs = min(
+                    self.max_loras_prefetch,
+                    get_global_server_args().pp_max_micro_batch_size,
+                )
+
                 running_batch_lora_ids = set(
                     [req.lora_id for req in self.running_batch.reqs]
                 )
