@@ -691,6 +691,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
         merge_profiles=obj.merge_profiles,
+        profile_prefix=obj.profile_prefix,
     )
     return Response(
         content="Start profiling.\n",
@@ -1546,7 +1547,6 @@ def _execute_server_warmup(
     try:
         warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
         if server_args.disaggregation_mode == "null":
-            logger.info(f"Start of co-locate warmup ...")
             res = requests.post(
                 url + request_name,
                 json=json_data,

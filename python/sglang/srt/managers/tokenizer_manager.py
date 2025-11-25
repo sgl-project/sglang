@@ -100,6 +100,7 @@ from sglang.srt.utils import (
     dataclass_to_string_truncated,
     freeze_gc,
     get_bool_env_var,
+    get_or_create_event_loop,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -434,18 +435,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        external_trace_header = None
-        if request:
-            if "trace_context" in request.headers:
-                trace_set_remote_propagate_context(request.headers["trace_context"])
-            else:
-                external_trace_header = extract_trace_headers(request.headers)
+        if self.enable_trace:
+            external_trace_header = None
+            if request:
+                if "trace_context" in request.headers:
+                    trace_set_remote_propagate_context(request.headers["trace_context"])
+                else:
+                    external_trace_header = extract_trace_headers(request.headers)
+
+            self._trace_request_start(obj, created_time, external_trace_header)
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
-
-        if self.enable_trace:
-            self._trace_request_start(obj, created_time, external_trace_header)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -1365,12 +1366,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
     def auto_create_handle_loop(self):
         if self._chosen_loop is not None:
+            current_loop = get_or_create_event_loop()
             assert (
-                asyncio.get_event_loop() == self._chosen_loop
-            ), f"Please ensure only one event loop is ever used with SGLang. Previous loop: {self._chosen_loop}, current loop: {asyncio.get_event_loop()}"
+                current_loop == self._chosen_loop
+            ), f"Please ensure only one event loop is ever used with SGLang. Previous loop: {self._chosen_loop}, current loop: {current_loop}"
             return
 
-        loop = asyncio.get_event_loop()
+        loop = get_or_create_event_loop()
         self._chosen_loop = loop
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
