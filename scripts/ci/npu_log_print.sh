@@ -9,7 +9,7 @@ get_version() {
 }
 get_version "./python/sglang/version.py" "sglang"
 get_version "./sgl-kernel/python/sgl_kernel/version.py" "sgl_kernel"
-SGLANG_URL="https://github.com/Ascend/sglang.git"
+SGLANG_URL="https://github.com/sgl-project/sglang.git"
 SGL_KERNEL_URL="https://github.com/sgl-project/sgl-kernel-npu.git"
 SGLANG_BRANCH="main"
 SGL_KERNEL_BRANCH="main"
