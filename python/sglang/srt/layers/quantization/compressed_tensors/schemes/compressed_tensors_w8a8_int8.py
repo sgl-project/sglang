@@ -36,7 +36,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
     @classmethod
     def get_min_capability(cls) -> int:
         # lovelace and up
-        return 89
+        return 80
 
     def process_weights_after_loading(self, layer) -> None:
         # If per tensor, when we have a fused module (e.g. QKV) with per
