@@ -16,14 +16,15 @@ concurrency:
 
 jobs:
   # Building images
-  build-arm-image:
-    if: github.repository == 'sgl-project/sglang'
-    uses: ./.github/workflows/release-docker-npu.yml
-    secrets: inherit
+  # build-arm-image:
+  #   if: github.repository == 'sgl-project/sglang'
+  #   uses: ./.github/workflows/release-docker-npu.yml
+  #   secrets: inherit
 
   nightly-test-npu-1-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    # needs: [ build-arm-image ]
+    # if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-2
     strategy:
       fail-fast: false
@@ -53,15 +54,18 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           pip install sentence_transformers accelerate
           cd test/srt
           python3 run_suite.py --suite nightly-test-npu-1-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   nightly-test-npu-2-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    # needs: [ build-arm-image ]
+    # if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-2
     strategy:
       fail-fast: false
@@ -91,15 +95,18 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           pip install accelerate
           cd test/srt
           python3 run_suite.py --suite nightly-test-npu-2-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   nightly-test-npu-4-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    # needs: [ build-arm-image ]
+    # if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-4
     strategy:
       fail-fast: false
@@ -129,8 +136,10 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0 torch_npu==2.8.0
           pip install protobuf==3.20 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
@@ -146,8 +155,9 @@ jobs:
           python3 run_suite.py --suite nightly-test-npu-4-a3--continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   nightly-test-npu-8-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    # needs: [ build-arm-image ]
+    # if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-8
     strategy:
       fail-fast: false
@@ -177,7 +187,9 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0 torch_npu==2.8.0
           pip install protobuf==3.20 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
@@ -193,8 +205,9 @@ jobs:
           python3 run_suite.py --suite nightly-test-npu-8-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   nightly-test-npu-16-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    # needs: [ build-arm-image ]
+    # if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-16
     strategy:
       fail-fast: false
@@ -224,7 +237,9 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0 torch_npu==2.8.0
           pip install protobuf==3.20 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
