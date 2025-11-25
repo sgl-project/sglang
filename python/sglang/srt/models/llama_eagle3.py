@@ -119,13 +119,11 @@ class LlamaModel(nn.Module):
         # fix rope_scaling for qwen2.5-vl/qwen3-vl
         if self.is_mrope_enabled:
             rope_scaling = config.rope_scaling
-            mrope_interleaved = rope_scaling.get("mrope_interleaved", False)
-            if not mrope_interleaved:
+            self.mrope_interleaved = rope_scaling.setdefault("mrope_interleaved", False)
+            if not self.mrope_interleaved:
                 rope_scaling["rope_type"] = "default"
-            rope_scaling["mrope_interleaved"] = mrope_interleaved
         else:
-            mrope_interleaved = False
-        self.mrope_interleaved = mrope_interleaved
+            self.mrope_interleaved = False
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
