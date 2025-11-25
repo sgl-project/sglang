@@ -656,9 +656,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-                # Setup local attention if enabled
-                if forward_batch.forward_mode == ForwardMode.EXTEND:
-                    self._init_local_attn_metadata(forward_batch, metadata, device)
+            # Setup local attention if enabled
+            if forward_batch.forward_mode == ForwardMode.EXTEND:
+                self._init_local_attn_metadata(forward_batch, metadata, device)
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
@@ -1051,7 +1051,6 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
-
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
             self.attention_chunk_size is not None
@@ -1195,7 +1194,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                     **kwargs,
-                    )
+                )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (

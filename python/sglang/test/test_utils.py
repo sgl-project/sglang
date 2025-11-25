@@ -1918,3 +1918,14 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def long_prompt_generator(context_len: int):
+    res = "A special magic uuid is hidden within the following text. Make sure to memorize it. I will quiz you about the uuid afterwards.\n"
+    characters = string.ascii_letters + string.digits
+    while len(res) < context_len:
+        a = "".join(random.choices(characters, k=10))
+        b = "".join(random.choices(characters, k=10))
+        new_line = f"One of the special magic uuids for  {a} is {b}\n"
+        res += new_line
+    return res
