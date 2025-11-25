@@ -315,10 +315,28 @@ class CudaGraphRunner:
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
-        # compute_buffers: the static inputs used during graph capture/replay.
-        # staging_buffers: per-batch staging area that we copy from before replay.
-        self.compute_buffers, self.staging_buffers = [
-            GraphInputBuffers.create(
+
+        # In overlap mode, we use double-buffering: staging_buffers are populated
+        # on the default stream while compute_buffers are used by the graph.
+        # In non-overlap mode, they point to the same object - no copy needed.
+        self.enable_overlap = not model_runner.server_args.disable_overlap_schedule
+        self.compute_buffers = GraphInputBuffers.create(
+            device=self.device,
+            max_bs=self.max_bs,
+            max_num_token=self.max_num_token,
+            hidden_size=self.model_runner.model_config.hidden_size,
+            vocab_size=self.model_runner.model_config.vocab_size,
+            dtype=self.model_runner.model_config.dtype,
+            dp_size=self.dp_size,
+            pp_size=self.pp_size,
+            is_encoder_decoder=self.is_encoder_decoder,
+            require_mlp_tp_gather=self.require_mlp_tp_gather,
+            seq_len_fill_value=self.seq_len_fill_value,
+            encoder_len_fill_value=self.encoder_len_fill_value,
+            num_tokens_per_bs=self.num_tokens_per_bs,
+        )
+        if self.enable_overlap:
+            self.staging_buffers = GraphInputBuffers.create(
                 device=self.device,
                 max_bs=self.max_bs,
                 max_num_token=self.max_num_token,
@@ -333,13 +351,15 @@ class CudaGraphRunner:
                 encoder_len_fill_value=self.encoder_len_fill_value,
                 num_tokens_per_bs=self.num_tokens_per_bs,
             )
-            for _ in range(2)
-        ]
+            # Event to signal staging buffer copy is done (for overlap synchronization)
+            self.staging_copy_done_event = self.device_module.Event()
+        else:
+            # Non-overlap: staging and compute are the same buffer
+            self.staging_buffers = self.compute_buffers
+            self.staging_copy_done_event = None
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # Event to signal staging buffer copy is done (for overlap synchronization)
-        self.staging_copy_done_event = self.device_module.Event()
         # Flag to track if staging buffers are already populated by scheduler
         self.staging_populated = False
 
@@ -751,7 +771,7 @@ class CudaGraphRunner:
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
-        # Decide the padded batch size used for graph replay.
+        # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
@@ -792,7 +812,8 @@ class CudaGraphRunner:
 
         Call this on the stream that will run populate_staging_buffers (typically default stream).
         """
-        stream.wait_event(self.staging_copy_done_event)
+        if self.staging_copy_done_event is not None:
+            stream.wait_event(self.staging_copy_done_event)
 
     def replay_prepare(
         self,
@@ -812,14 +833,13 @@ class CudaGraphRunner:
         raw_num_token = self.raw_num_token
         bs = self.bs
 
-        # Copy from staging into the static compute buffers used by the captured graph.
-        # input_ids are copied directly from forward_batch (after resolve_future).
-        buffers.copy_from(self.staging_buffers)
-        buffers.input_ids[:raw_num_token].copy_(
-            forward_batch.input_ids, non_blocking=True
-        )
-        # Signal that staging buffer read is complete (for overlap with next populate)
-        self.staging_copy_done_event.record()
+        # In overlap mode, copy from staging into compute buffers.
+        if self.enable_overlap:
+            buffers.copy_from(self.staging_buffers)
+            buffers.input_ids[:raw_num_token].copy_(
+                forward_batch.input_ids, non_blocking=True
+            )
+            self.staging_copy_done_event.record()
         seq_lens_cpu = buffers.get_seq_lens_cpu(
             forward_batch,
             bs,
