@@ -762,18 +762,24 @@ class Req:
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
+            match_result = tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
                     if isinstance(tree_cache, MambaRadixCache)
                     else {}
                 ),
+            )
+            (
+                self.prefix_indices,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length,
+            ) = (
+                match_result.device_indices,
+                match_result.last_device_node,
+                match_result.last_host_node,
+                match_result.host_hit_length,
             )
             self.cache_protected_len = len(self.prefix_indices)
 
