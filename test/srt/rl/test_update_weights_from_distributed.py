@@ -292,7 +292,6 @@ def init_process_sgl(
             },
         )
 
-    print(f"[sgl] generating text... ")
     if pause_generation_mode in ["in_place", "retract"]:
 
         def run_decode(max_new_tokens=32):
@@ -686,7 +685,6 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
                     1,
                     1,
                     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    "Server",
                     pause_generation_mode,
                 ),
             ]
@@ -696,7 +694,6 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
                     1,
                     1,
                     DEFAULT_MODEL_NAME_FOR_TEST,
-                    "Server",
                     random.choice(["in_place", "retract"]),
                 ),
             ]
@@ -707,7 +704,6 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
                         1,
                         2,
                         DEFAULT_MODEL_NAME_FOR_TEST,
-                        "Server",
                         random.choice(["in_place", "retract"]),
                     ),
                 )
@@ -718,7 +714,6 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
                         2,
                         2,
                         DEFAULT_MODEL_NAME_FOR_TEST,
-                        "Server",
                         random.choice(["in_place", "retract"]),
                     ),
                 )
@@ -755,12 +750,12 @@ class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
             "lm_head.weight",
         ]
 
-        for tp_size, dp_size, model_name, backend, pause_generation_mode in test_suits:
+        for tp_size, dp_size, model_name, pause_generation_mode in test_suits:
             test_update_weights_from_distributed(
                 tp_size,
                 dp_size,
                 model_name,
-                backend,
+                "Server", # pause is only supported in server mode
                 model_state_dict_shapes[model_name],
                 truncate_size,
                 checking_parameters,

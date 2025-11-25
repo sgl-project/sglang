@@ -1071,12 +1071,16 @@ class PauseGenerationReqInput(BaseReq):
 
     in_place: Pause the scheduler's event_loop from performing inference;
             only non-inference requests (e.g., control commands) will be handled.
+            The requests in the engine will be paused and stay in the event_loop,
+            then continue generation after continue_generation with the old kv cache.
             Note: In 'inplace' mode, flush_cache will fail if there are any requests
             in the running_batch.
 
     retract: Pause the scheduler's event loop from performing inference;
             only non-inference requests will be handled, and all currently running
             requests will be retracted back to the waiting_queue.
+            Note: The KV cache can be flushed in this mode and will be automatically
+            recomputed after continue_generation.
     """
 
     mode: Literal["abort", "retract", "in_place"] = "abort"
