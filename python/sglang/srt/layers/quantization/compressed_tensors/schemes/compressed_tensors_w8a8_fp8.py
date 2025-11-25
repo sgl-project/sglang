@@ -1,99 +1,141 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, List, Optional
+from typing import Callable
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
 from sglang.srt.layers.parameter import (
+    BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
-    ModelWeightParameter,
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    normalize_e4m3fn_to_e4m3fnuz,
+    create_fp8_input_scale,
+    create_fp8_scale_parameter,
+    create_fp8_weight_parameter,
+    dispatch_w8a8_block_fp8_linear,
+    maybe_create_device_identity,
+    process_fp8_weight_block_strategy,
+    process_fp8_weight_channel_strategy,
+    process_fp8_weight_tensor_strategy,
+    validate_fp8_block_shape,
 )
-from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
+strategy_to_parameter_type = {
+    QuantizationStrategy.BLOCK: BlockQuantScaleParameter,
+    QuantizationStrategy.CHANNEL: ChannelQuantScaleParameter,
+    QuantizationStrategy.TENSOR: PerTensorScaleParameter,
+}
 
 
 class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
-
-    def __init__(self, strategy: str, is_static_input_scheme: bool):
-        self.strategy = strategy
+    def __init__(self, weight_quant: QuantizationArgs, is_static_input_scheme: bool):
+        self.weight_quant = weight_quant
+        self.strategy = weight_quant.strategy
+        self.out_dtype = torch.get_default_dtype()
         self.is_static_input_scheme = is_static_input_scheme
+        self.weight_block_size = self.weight_quant.block_structure
+        if self.weight_block_size is not None:
+            assert not self.is_static_input_scheme
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     @classmethod
     def get_min_capability(cls) -> int:
         # lovelace and up
         return 89
 
-    def process_weights_after_loading(self, layer) -> None:
-        # If per tensor, when we have a fused module (e.g. QKV) with per
-        # tensor scales (thus N scales being passed to the kernel),
-        # requantize so we can always run per tensor
-        if self.strategy == QuantizationStrategy.TENSOR:
-            max_w_scale, weight = requantize_with_max_scale(
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                logical_widths=layer.logical_widths,
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        weight_loader: Callable,
+        **kwargs,
+    ):
+        maybe_create_device_identity()
+
+        output_size_per_partition = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        layer.weight_block_size = None
+        layer.orig_dtype = params_dtype
+
+        if self.strategy == QuantizationStrategy.BLOCK:
+            assert self.weight_block_size is not None
+            layer.weight_block_size = self.weight_block_size
+            # Validate block quantization shapes
+            validate_fp8_block_shape(
+                layer,
+                input_size,
+                output_size,
+                input_size_per_partition,
+                output_partition_sizes,
+                self.weight_block_size,
             )
 
-            if is_fp8_fnuz():
-                input_scale = getattr(layer, "input_scale", None)
+        # WEIGHT
+        weight = create_fp8_weight_parameter(
+            output_size_per_partition, input_size_per_partition, weight_loader
+        )
+        layer.register_parameter("weight", weight)
 
-                weight, max_w_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=max_w_scale, input_scale=input_scale
-                )
-                if input_scale is not None:
-                    layer.input_scale = Parameter(input_scale, requires_grad=False)
+        # WEIGHT SCALE
+        weight_scale = create_fp8_scale_parameter(
+            strategy_to_parameter_type[self.strategy],
+            output_partition_sizes,
+            input_size_per_partition,
+            layer.weight_block_size,
+            weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
 
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+        # INPUT SCALE
+        if self.is_static_input_scheme:
+            input_scale = create_fp8_input_scale(output_partition_sizes, weight_loader)
+            layer.register_parameter("input_scale", input_scale)
 
-        # If channelwise, scales are already lined up, so just transpose.
+    def process_weights_after_loading(self, layer) -> None:
+        if self.strategy == QuantizationStrategy.TENSOR:
+            weight, weight_scale, input_scale = process_fp8_weight_tensor_strategy(
+                layer.weight,
+                layer.weight_scale,
+                layer.logical_widths,
+                getattr(layer, "input_scale", None),
+            )
+            weight = weight.t()
+
         elif self.strategy == QuantizationStrategy.CHANNEL:
-            weight = layer.weight
+            weight, weight_scale, input_scale = process_fp8_weight_channel_strategy(
+                layer.weight, layer.weight_scale, getattr(layer, "input_scale", None)
+            )
+            weight = weight.t()
 
-            if is_fp8_fnuz():
-                input_scale = getattr(layer, "input_scale", None)
-
-                weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight,
-                    weight_scale=layer.weight_scale,
-                    input_scale=input_scale,
-                )
-                if input_scale is not None:
-                    layer.input_scale = Parameter(input_scale, requires_grad=False)
-            else:
-                weight_scale = layer.weight_scale.data
-
-            if _use_aiter:
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)).t(), requires_grad=False
-                )
-            else:
-                layer.weight = Parameter(weight.t(), requires_grad=False)
-
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+        elif self.strategy == QuantizationStrategy.BLOCK:
+            assert self.is_static_input_scheme is False
+            weight, weight_scale = process_fp8_weight_block_strategy(
+                layer.weight, layer.weight_scale
+            )
+            input_scale = None
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
+
+        # required by torch.compile to be torch.nn.Parameter
+        layer.weight = Parameter(weight.data, requires_grad=False)
+        layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
+        if input_scale is not None:
+            layer.input_scale = Parameter(input_scale.data, requires_grad=False)
 
         # INPUT SCALE
         if self.is_static_input_scheme and hasattr(layer, "input_scale"):
@@ -101,66 +143,22 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         else:
             layer.input_scale = None
 
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        output_partition_sizes: List[int],
-        input_size_per_partition: int,
-        params_dtype: torch.dtype,
-        weight_loader: Callable,
-        **kwargs,
-    ):
-        output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-
-        # WEIGHT
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition,
-                dtype=torch.float8_e4m3fn,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
-
-        # WEIGHT SCALE
-        # TODO: update create_xxx_parameter functions to return
-        # the newly added parameters
-        if self.strategy == QuantizationStrategy.CHANNEL:
-            weight_scale = ChannelQuantScaleParameter(
-                data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
-                output_dim=0,
-                weight_loader=weight_loader,
-            )
-        else:
-            assert self.strategy == QuantizationStrategy.TENSOR
-            weight_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-
-        # min requirement for fp8 kernels
-        weight_scale[:] = torch.finfo(torch.float32).min
-        layer.register_parameter("weight_scale", weight_scale)
-
-        # INPUT SCALE
-        if self.is_static_input_scheme:
-            input_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            input_scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("input_scale", input_scale)
-
     def apply_weights(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.weight_block_size is not None:
+            return self.w8a8_block_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                block_size=self.weight_block_size,
+                weight_scale=layer.weight_scale,
+                input_scale=None,
+                bias=bias,
+            )
+
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,

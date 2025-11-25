@@ -71,6 +71,13 @@ use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 TORCH_DEVICE_IDENTITY = None
 
 
+def maybe_create_device_identity():
+    # Allocate dummy ones tensor for torch._scaled_mm
+    global TORCH_DEVICE_IDENTITY
+    if TORCH_DEVICE_IDENTITY is None:
+        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
+
+
 def use_rowwise_torch_scaled_mm():
     _TORCH_VERSION = torch.__version__.split("+")[0]
     try:
@@ -605,9 +612,7 @@ def _apply_fallback_scaled_mm(
     bias,
     input_dtype,
 ):
-    global TORCH_DEVICE_IDENTITY
-    if TORCH_DEVICE_IDENTITY is None:
-        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
+    maybe_create_device_identity()
 
     output = torch._scaled_mm(
         qinput,
@@ -820,3 +825,182 @@ def can_auto_enable_marlin_fp8() -> bool:
         return 80 <= sm < 89
     except Exception:
         return False
+
+
+from sglang.srt.layers.parameter import (
+    BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
+    PerTensorScaleParameter,
+)
+
+
+def validate_fp8_block_shape(
+    layer: torch.nn.Module,
+    input_size: int,
+    output_size: int,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    block_size: list[int],
+) -> None:
+    """Validate block quantization shapes for tensor parallelism."""
+    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+    tp_size = getattr(layer, "tp_size", get_tensor_model_parallel_world_size())
+    block_n, block_k = block_size[0], block_size[1]
+
+    # Required by row parallel
+    if (
+        tp_size > 1
+        and input_size // input_size_per_partition == tp_size
+        and input_size_per_partition % block_k != 0
+    ):
+        raise ValueError(
+            f"Weight input_size_per_partition = {input_size_per_partition} "
+            f"is not divisible by weight quantization block_k = {block_k}."
+        )
+
+    # Required by column parallel or enabling merged weights
+    is_tp_split = tp_size > 1 and output_size // sum(output_partition_sizes) == tp_size
+    is_merged_gemm = len(output_partition_sizes) > 1
+    if is_tp_split or is_merged_gemm:
+        sizes_to_check = output_partition_sizes
+        if not is_tp_split and is_merged_gemm:
+            # In case of merged matrices, we allow the last
+            # matrix to not be a multiple of block size
+            sizes_to_check = output_partition_sizes[:-1]
+        for output_partition_size in sizes_to_check:
+            if output_partition_size % block_n != 0:
+                raise ValueError(
+                    f"Weight output_partition_size = "
+                    f"{output_partition_size} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )
+
+
+def create_fp8_weight_parameter(
+    output_size_per_partition: int,
+    input_size_per_partition: int,
+    weight_loader: Callable | None,
+) -> torch.nn.Parameter:
+    """Create FP8 weight parameter."""
+    from sglang.srt.layers.parameter import ModelWeightParameter
+
+    return ModelWeightParameter(
+        data=torch.empty(
+            output_size_per_partition,
+            input_size_per_partition,
+            dtype=torch.float8_e4m3fn,
+        ),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=weight_loader,
+    )
+
+
+def create_fp8_scale_parameter(
+    parameter_type: torch.nn.Parameter,
+    output_partition_sizes: list[int],
+    input_size_per_partition: int,
+    block_size: list[int] | None,
+    weight_loader: Callable | None,
+) -> torch.nn.Parameter:
+    """Create scale parameter based on quantization strategy."""
+    if parameter_type == ChannelQuantScaleParameter:
+        scale = parameter_type(
+            data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+    elif parameter_type == BlockQuantScaleParameter:
+        assert block_size is not None
+        block_n, block_k = block_size[0], block_size[1]
+        output_size_per_partition = sum(output_partition_sizes)
+        scale = parameter_type(
+            data=torch.empty(
+                (output_size_per_partition + block_n - 1) // block_n,
+                (input_size_per_partition + block_k - 1) // block_k,
+                dtype=torch.float32,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+    elif parameter_type == PerTensorScaleParameter:
+        scale = parameter_type(
+            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+    else:
+        raise ValueError(f"Unknown parameter type: {parameter_type}")
+
+    scale[:] = torch.finfo(torch.float32).min
+    return scale
+
+
+def create_fp8_input_scale(
+    output_partition_sizes: list[int], weight_loader: Callable | None
+) -> torch.nn.Parameter:
+    """Create input scale parameter for static activation quantization."""
+
+    scale = PerTensorScaleParameter(
+        data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+        weight_loader=weight_loader,
+    )
+    scale[:] = torch.finfo(torch.float32).min
+    return scale
+
+
+def process_fp8_weight_tensor_strategy(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    logical_widths: list[int],
+    input_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Process weights for tensor-wise quantization strategy."""
+    from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+    from sglang.srt.layers.quantization.utils.utils import requantize_with_max_scale
+
+    if _is_fp8_fnuz:
+        weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+            weight=weight, weight_scale=weight_scale, input_scale=input_scale
+        )
+
+    # Requantize with max scale
+    weight_scale, weight = requantize_with_max_scale(
+        weight=weight,
+        weight_scale=weight_scale,
+        logical_widths=logical_widths,
+    )
+
+    return weight, weight_scale, input_scale
+
+
+def process_fp8_weight_channel_strategy(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Process weights for channel-wise quantization strategy."""
+    from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+
+    if _is_fp8_fnuz:
+        weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+            weight=weight, weight_scale=weight_scale, input_scale=input_scale
+        )
+
+    return weight, weight_scale, input_scale
+
+
+def process_fp8_weight_block_strategy(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Process weights for block-wise quantization strategy."""
+    from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+
+    if _is_fp8_fnuz:
+        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+            weight=weight, weight_scale=weight_scale
+        )
+
+    return weight, weight_scale
