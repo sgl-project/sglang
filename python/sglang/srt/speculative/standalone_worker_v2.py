@@ -7,11 +7,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2, EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
+from sglang.srt.speculative.eagle_utils import TreeMaskMode
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -102,11 +104,11 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(self.draft_runner.tp_group):
+        with self.draft_tp_context(
+            self.draft_runner.tp_group
+        ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
-
-        from sglang.srt.speculative.eagle_utils import TreeMaskMode
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
