@@ -10,7 +10,7 @@ The symbols used have the following meanings:
 
 ## Models x Optimization
 
-The `HuggingFace Model ID` can be passed directly to `from_pretrained()` methods, and sgl-diffusion will use the optimal
+The `HuggingFace Model ID` can be passed directly to `from_pretrained()` methods, and sglang-diffusion will use the optimal
 default parameters when initializing and generating videos.
 
 ### Video Generation Models

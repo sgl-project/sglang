@@ -877,3 +877,74 @@ def moe_sum_reduce_triton(
         num_warps=num_warps,
     )
     return
+
+
+@triton.jit
+def _fused_append_shared_experts_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    N_BASE,  # runtime scalar
+    scale_factor,  # runtime scalar
+    K: tl.constexpr,
+    S: tl.constexpr,
+):
+    """
+    for m in range(M):
+        for n in range(K):
+            fused_ids[m, n] = topk_ids[m, n]
+            fused_weights[m, n] = topk_weights[m, n]
+        for s in range(S):
+            fused_ids[m, K + s] = N + s
+            fused_weights[m, K + s] = scale_factor
+    """
+    pid = tl.program_id(0)
+
+    ids_row_ptr = pid * K
+    w_row_ptr = pid * K
+    out_ids_row_ptr = pid * (K + S)
+    out_w_row_ptr = pid * (K + S)
+
+    offs_k = tl.arange(0, K)
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
+    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws)
+
+    offs_s = tl.arange(0, S)
+
+    shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
+    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
+    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws)
+
+
+def fused_append_shared_experts(
+    topk_ids, topk_weights, num_fused_shared_experts, scale_factor, N=None
+):
+    assert N is not None, "N (shared expert base id) must be provided"
+    m, k = topk_ids.shape
+    s = int(num_fused_shared_experts)
+    if s <= 0:
+        return topk_ids, topk_weights
+
+    out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
+    out_weights = torch.empty(
+        (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    _fused_append_shared_experts_kernel[(m,)](
+        topk_ids,
+        topk_weights,
+        out_ids,
+        out_weights,
+        N_BASE=N,
+        scale_factor=scale_factor,
+        K=k,
+        S=s,
+        num_warps=1,
+    )
+    return out_ids, out_weights
