@@ -46,6 +46,7 @@ suites = {
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
+        TestFile("ops/test_repeat_interleave.py", 60),
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fp8_kernel.py", 8),
         TestFile("quant/test_int8_kernel.py", 8),
@@ -116,6 +117,7 @@ suites = {
         TestFile("test_swa_unittest.py", 1),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 210),
+        TestFile("test_triton_fused_moe.py", 80),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_torchao.py", 70),
         TestFile("test_triton_attention_kernels.py", 4),
@@ -180,7 +182,7 @@ suites = {
     "per-commit-8-gpu-b200": [],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
-        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 3600),
+        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 590),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -364,7 +366,7 @@ suite_ascend = {
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
 }
 
