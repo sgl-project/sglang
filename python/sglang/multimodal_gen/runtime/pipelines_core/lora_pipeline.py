@@ -52,6 +52,7 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_rank: int | None = None
     lora_alpha: int | None = None
     lora_initialized: bool = False
+    is_lora_merged: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -133,6 +134,11 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_nickname: The "nick name" of the adapter when referenced in the pipeline.
             lora_path: The path to the adapter, either a local path or a Hugging Face repo id.
         """
+        if self.is_lora_merged and self.cur_adapter_name != lora_nickname:
+            raise ValueError(
+                f"LoRA '{self.cur_adapter_name}' is currently merged. "
+                "Please call 'unmerge_lora_weights' before setting a new LoRA."
+            )
 
         if lora_nickname not in self.lora_adapters and lora_path is None:
             raise ValueError(
@@ -205,7 +211,11 @@ class LoRAPipeline(ComposedPipelineBase):
             self.loaded_adapter_paths[lora_nickname] = lora_path
             logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
-        if not adapter_updated and self.cur_adapter_name == lora_nickname:
+        if (
+            not adapter_updated
+            and self.cur_adapter_name == lora_nickname
+            and self.is_lora_merged
+        ):
             return
         self.cur_adapter_name = lora_nickname
 
@@ -232,6 +242,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         name,
                     )
                 layer.disable_lora = True
+        self.is_lora_merged = True
         logger.info(
             "Rank %d: LoRA adapter %s applied to %d layers",
             rank,
@@ -240,9 +251,19 @@ class LoRAPipeline(ComposedPipelineBase):
         )
 
     def merge_lora_weights(self) -> None:
+        if self.is_lora_merged:
+            logger.warning("LoRA weights are already merged.")
+            return
+
         for name, layer in self.lora_layers.items():
             layer.merge_lora_weights()
+        self.is_lora_merged = True
 
     def unmerge_lora_weights(self) -> None:
+        if not self.is_lora_merged:
+            logger.warning("LoRA weights are not merged.")
+            return
+
         for name, layer in self.lora_layers.items():
             layer.unmerge_lora_weights()
+        self.is_lora_merged = False
