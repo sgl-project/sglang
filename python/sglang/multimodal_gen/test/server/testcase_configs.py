@@ -195,7 +195,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         "qwen_image_t2i",
-        ServerArgs(model_path="Qwen/Qwen-Image", num_gpus=1),
+        ServerArgs.from_kwargs(model_path="Qwen/Qwen-Image", num_gpus=1),
         SamplingParams(
             prompt="A futuristic cityscape at sunset with flying cars",
             width=1024,
@@ -206,7 +206,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
     DiffusionTestCase(
         "flux_image_t2i",
-        ServerArgs(model_path="black-forest-labs/FLUX.1-dev", num_gpus=1),
+        ServerArgs.from_kwargs(model_path="black-forest-labs/FLUX.1-dev", num_gpus=1),
         SamplingParams(
             prompt="A futuristic cityscape at sunset with flying cars",
             width=1024,
@@ -218,7 +218,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
-        ServerArgs(model_path="Qwen/Qwen-Image-Edit", num_gpus=1),
+        ServerArgs.from_kwargs(model_path="Qwen/Qwen-Image-Edit", num_gpus=1),
         SamplingParams(
             prompt=None,
             width=1024,
@@ -236,7 +236,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_1_t2v_1.3b",
-        ServerArgs(model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", num_gpus=1),
+        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", num_gpus=1),
         SamplingParams(
             prompt="A curious raccoon",
             width=848,
@@ -260,7 +260,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # ),
     DiffusionTestCase(
         "fast_hunyuan_video",
-        ServerArgs(model_path="FastVideo/FastHunyuan-diffusers", num_gpus=1),
+        ServerArgs.from_kwargs(model_path="FastVideo/FastHunyuan-diffusers", num_gpus=1),
         SamplingParams(
             prompt="A curious raccoon",
             width=720,
@@ -274,7 +274,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
         "wan2_2_ti2v_5b",
-        ServerArgs(model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers", num_gpus=1),
+        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers", num_gpus=1),
         SamplingParams(
             prompt="Animate this image",
             width=832,
@@ -309,7 +309,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
-        ServerArgs(model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers", num_gpus=2),
+        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers", num_gpus=2),
         SamplingParams(
             prompt="generate",
             width=832,
@@ -324,7 +324,7 @@ TWO_GPU_CASES_A = [
     ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
-        ServerArgs(model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers", num_gpus=2),
+        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers", num_gpus=2),
         SamplingParams(
             prompt="A curious raccoon",
             width=720,
@@ -337,7 +337,7 @@ TWO_GPU_CASES_A = [
     ),
     DiffusionTestCase(
         "wan2_1_t2v_14b_2gpu",
-        ServerArgs(model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers", num_gpus=2),
+        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers", num_gpus=2),
         SamplingParams(
             prompt="A curious raccoon",
             width=720,
@@ -353,7 +353,7 @@ TWO_GPU_CASES_A = [
 TWO_GPU_CASES_B = [
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
-        ServerArgs(model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers", num_gpus=2),
+        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers", num_gpus=2),
         SamplingParams(
             prompt="Animate this image",
             width=832,
@@ -368,7 +368,7 @@ TWO_GPU_CASES_B = [
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_720P_2gpu",
-        ServerArgs(model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers", num_gpus=2),
+        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers", num_gpus=2),
         SamplingParams(
             prompt="Animate this image",
             width=832,
@@ -383,7 +383,7 @@ TWO_GPU_CASES_B = [
     ),
     DiffusionTestCase(
         "qwen_image_t2i_2_gpus",
-        ServerArgs(model_path="Qwen/Qwen-Image", num_gpus=2),
+        ServerArgs.from_kwargs(model_path="Qwen/Qwen-Image", num_gpus=2),
         SamplingParams(
             prompt="A futuristic cityscape at sunset with flying cars",
             width=1024,
@@ -394,7 +394,7 @@ TWO_GPU_CASES_B = [
     ),
     DiffusionTestCase(
         "flux_image_t2i_2_gpus",
-        ServerArgs(model_path="black-forest-labs/FLUX.1-dev", num_gpus=2),
+        ServerArgs.from_kwargs(model_path="black-forest-labs/FLUX.1-dev", num_gpus=2),
         SamplingParams(
             prompt="A futuristic cityscape at sunset with flying cars",
             width=1024,
