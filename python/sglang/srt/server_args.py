@@ -1202,6 +1202,7 @@ class ServerArgs:
                 )
                 self.disable_overlap_schedule = True
             if is_sm100_supported():
+                self.attention_backend = "triton"
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
@@ -1468,8 +1469,8 @@ class ServerArgs:
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
-                self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer Cutlass MOE"
+                self.quantization == "modelopt_fp4" or self.quantization is None
+            ), "modelopt_fp4 quantization or bf16 is required for Flashinfer Cutlass MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -1616,6 +1617,12 @@ class ServerArgs:
             )
 
     def _handle_speculative_decoding(self):
+        if (
+            self.speculative_draft_model_path is not None
+            and self.speculative_draft_model_revision is None
+        ):
+            self.speculative_draft_model_revision = "main"
+
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
@@ -1664,6 +1671,7 @@ class ServerArgs:
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
+                    self.speculative_draft_model_revision = self.revision
                 else:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
