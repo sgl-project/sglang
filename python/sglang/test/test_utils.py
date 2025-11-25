@@ -1930,10 +1930,24 @@ def get_gpu_count():
 
 
 def empty_gpu_cache():
-    if get_device() == "cpu":
-        print("There is no suitable GPU")
-    else:
-        torch.accelerator.empty_cache()
+    """
+    Unified empty_cache for PyTorch 2.8 (no torch.accelerator)
+    and PyTorch 2.9+ (where torch.accelerator.empty_cache() exists).
+    """
+    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
+        return torch.accelerator.empty_cache()
+
+    # CUDA
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+
+    # XPU (Intel)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+        return
+
+    return
 
 
 def get_gpu_memory_gb():
