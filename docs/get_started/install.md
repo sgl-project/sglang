@@ -175,6 +175,7 @@ name: qwen
 
 image: lmsysorg/sglang:latest
 env:
+  - HF_TOKEN
   - MODEL_ID=qwen/qwen2.5-0.5b-instruct
 commands:
   - |
