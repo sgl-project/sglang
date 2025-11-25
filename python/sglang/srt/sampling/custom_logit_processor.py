@@ -1,3 +1,4 @@
+import importlib
 import json
 from abc import ABC, abstractmethod
 from functools import lru_cache
@@ -20,6 +21,20 @@ def _cache_from_str(json_str: str):
     return dill.loads(bytes.fromhex(data["callable"]))
 
 
+@lru_cache(maxsize=None)
+def _cache_from_class_path(class_path: str):
+    """Get the processor directly from the class path."""
+    class_path_split_list = class_path.split(":")
+    if len(class_path_split_list) != 2:
+        raise ValueError(
+            f"Invalid class path: {class_path}. It should be in the format 'module_path:ClassName'."
+        )
+    module_path, class_name = class_path_split_list[0], class_path_split_list[1]
+    module = importlib.import_module(module_path)
+    clz = getattr(module, class_name)
+    return clz()
+
+
 class CustomLogitProcessor(ABC):
     """Abstract base class for callable functions."""
 
@@ -40,7 +55,40 @@ class CustomLogitProcessor(ABC):
     @classmethod
     def from_str(cls, json_str: str):
         """Deserialize a callable function from a JSON string."""
-        return _cache_from_str(json_str)()
+        try:
+            return _cache_from_class_path(json_str)
+        except (
+            ValueError,
+            ImportError,
+            AttributeError,
+            ModuleNotFoundError,
+        ) as from_class_path_error:
+            try:
+                clz = _cache_from_str(json_str)
+                return clz()
+            except Exception as from_cache_error:
+                raise ValueError(
+                    "Failed to load custom logits processor. "
+                    "The custom_logit_processor parameter should be a valid built-in class path or a serialized string of a class. "
+                    f"Please check the errors:\n- From class path: {from_class_path_error}\n- From serialized string: {from_cache_error}"
+                )
+
+
+class DeterministicLogitProcessor(CustomLogitProcessor):
+    """A dummy logit processor that changes the logits to always
+    sample the given token id.
+    """
+
+    def __call__(self, logits, custom_param_list):
+        assert logits.shape[0] == len(custom_param_list)
+        key = "token_id"
+
+        for i, param_dict in enumerate(custom_param_list):
+            # Mask all other tokens
+            logits[i, :] = -float("inf")
+            # Assign highest probability to the specified token
+            logits[i, param_dict[key]] = 0.0
+        return logits
 
 
 class DisallowedTokensLogitsProcessor(CustomLogitProcessor):

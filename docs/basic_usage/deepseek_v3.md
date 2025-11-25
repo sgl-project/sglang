@@ -270,8 +270,6 @@ Sample Request:
 ```python
 import openai
 from rich.pretty import pprint
-from sglang.srt.sampling.custom_logit_processor import DeepSeekR1ThinkingBudgetLogitProcessor
-
 
 client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
 response = client.chat.completions.create(
@@ -284,7 +282,7 @@ response = client.chat.completions.create(
     ],
     max_tokens=1024,
     extra_body={
-        "custom_logit_processor": DeepSeekR1ThinkingBudgetLogitProcessor().to_str(),
+        "custom_logit_processor": "sglang.srt.sampling.custom_logit_processor:DeepSeekR1ThinkingBudgetLogitProcessor",
         "custom_params": {
             "thinking_budget": 512,
         },

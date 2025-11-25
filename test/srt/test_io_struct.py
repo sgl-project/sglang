@@ -474,6 +474,49 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.custom_logit_processor, ["processor1", "processor2"])
 
+    def test_custom_logit_processor_validation_with_error(self):
+        """Test validation of custom_logit_processor."""
+        # Test single processor
+        req = GenerateReqInput(
+            text=["Hello", "World"], custom_logit_processor="serialized_processor"
+        )
+        try:
+            req.validate()
+        except ValueError as e:
+            self.assertIn("It should be in the format 'module_path:ClassName'", str(e))
+
+        # Test list of processors
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            custom_logit_processor=[
+                "wrong_module_path:DeterministicLogitProcessor",
+                "wrong_module_path:DeterministicLogitProcessor2",
+            ],
+        )
+        try:
+            req.validate()
+        except ValueError as e:
+            self.assertIn("No module named 'wrong_module_path'", str(e))
+
+    def test_custom_logit_processor_validation(self):
+        """Test validation of custom_logit_processor."""
+        # Test single processor
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            custom_logit_processor="sglang.srt.sampling.custom_logit_processor:DeepSeekR1ThinkingBudgetLogitProcessor",
+        )
+        req.validate()
+
+        # Test list of processors
+        multi_req = GenerateReqInput(
+            text=["Hello", "World"],
+            custom_logit_processor=[
+                "sglang.srt.sampling.custom_logit_processor:DeterministicLogitProcessor",
+                "sglang.srt.sampling.custom_logit_processor:DeepSeekR1ThinkingBudgetLogitProcessor",
+            ],
+        )
+        multi_req.validate()
+
     def test_session_params_handling(self):
         """Test handling of session_params."""
         # Test with dict
