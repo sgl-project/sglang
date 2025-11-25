@@ -131,18 +131,12 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
  && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
       python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
    fi \
- && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-      python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-      python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
-    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+ && if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       python3 -m pip uninstall -y torch torchaudio torchvision ; \
-      python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
-    else \
-      echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
+      python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}; \
     fi \
  && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
-# Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 RUN set -eux; \
     if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
@@ -203,11 +197,16 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     nixl \
     py-spy
 
-# Reinstall nccl and cublas for cuda 13
-RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
-  python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-  python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-fi
+# Some patching packages
+# TODO: Remove this when torch version covers these packages
+RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
+elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nixl-cu13 ; \
+fi \
 
 # Install development tools and utilities
 RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
