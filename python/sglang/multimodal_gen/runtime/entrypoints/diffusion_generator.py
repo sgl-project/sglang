@@ -28,7 +28,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    suppress_other_loggers,
+)
 
 logger = init_logger(__name__)
 
@@ -176,15 +179,16 @@ class DiffGenerator:
         if save_output:
             if save_file_path:
                 os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-                if data_type == DataType.VIDEO:
-                    imageio.mimsave(
-                        save_file_path,
-                        frames,
-                        fps=fps,
-                        format=data_type.get_default_extension(),
-                    )
-                else:
-                    imageio.imwrite(save_file_path, frames[0])
+                with suppress_other_loggers():
+                    if data_type == DataType.VIDEO:
+                        imageio.mimsave(
+                            save_file_path,
+                            frames,
+                            fps=fps,
+                            format=data_type.get_default_extension(),
+                        )
+                    else:
+                        imageio.imwrite(save_file_path, frames[0])
                 logger.info("Saved output to %s", save_file_path)
             else:
                 logger.warning("No output path provided, output not saved")

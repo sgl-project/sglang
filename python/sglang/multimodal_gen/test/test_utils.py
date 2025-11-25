@@ -25,12 +25,12 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 logger = init_logger(__name__)
 
 
-def is_image_url(self) -> bool:
-    """Check if image_edit_path is a URL."""
-    if self.image_path is None:
+def is_image_url(image_path: str | Path | None) -> bool:
+    """Check if image_path is a URL."""
+    if image_path is None:
         return False
-    return isinstance(self.image_path, str) and (
-        self.image_path.startswith("http://") or self.image_path.startswith("https://")
+    return isinstance(image_path, str) and (
+        image_path.startswith("http://") or image_path.startswith("https://")
     )
 
 
