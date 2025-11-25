@@ -318,6 +318,12 @@ class SamplingParams:
 
         return sampling_params
 
+    def output_size_str(self) -> str:
+        return f"{self.width}x{self.height}"
+
+    def seconds(self) -> float:
+        return self.num_frames / self.fps
+
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
         """Add CLI arguments for SamplingParam fields"""
@@ -507,6 +513,7 @@ class SamplingParams:
         if user_params is None:
             return
 
+        # user is not allowed to modify any param defined in the SamplingParams subclass
         subclass_defined_fields = set(type(self).__annotations__.keys())
 
         # Compare against current instance to avoid constructing a default instance

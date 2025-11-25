@@ -169,6 +169,39 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        """Ensure cos_sin_cache length > needed_max_pos."""
+        from sglang.srt.environ import envs
+
+        cur_len = int(self.cos_sin_cache.shape[0])
+        if needed_max_pos < cur_len:
+            return
+
+        # Align to reduce realloc frequency
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.value
+        new_len = ((needed_max_pos + align) // align) * align
+        device = self.cos_sin_cache.device
+        dtype = self.cos_sin_cache.dtype
+
+        # Compute inv_freq on same device
+        inv_freq = self._compute_inv_freq(self.base).to(device=device)
+
+        # Incremental computation for new positions only
+        start = cur_len
+        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
+        if t_new.numel() == 0:
+            return
+
+        freqs_new = torch.einsum("i,j->ij", t_new, inv_freq)
+        cos_new = freqs_new.cos()
+        sin_new = freqs_new.sin()
+        new_rows = torch.cat((cos_new, sin_new), dim=-1).to(dtype=dtype)
+
+        # Update cache with new rows
+        self.cos_sin_cache = torch.cat((self.cos_sin_cache, new_rows), dim=0).to(
+            device=device, dtype=dtype
+        )
+
     def forward_native(
         self,
         positions: torch.Tensor,

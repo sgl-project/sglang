@@ -8,7 +8,6 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
-import logging
 import multiprocessing as mp
 import os
 import time
@@ -21,23 +20,18 @@ import torch
 import torchvision
 from einops import rearrange
 
-from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-
-# Suppress verbose logging from imageio, which is triggered when saving images.
-logging.getLogger("imageio").setLevel(logging.WARNING)
-logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
-# Suppress Pillow plugin import logs when app log level is DEBUG
-logging.getLogger("PIL").setLevel(logging.WARNING)
-logging.getLogger("PIL.Image").setLevel(logging.WARNING)
-
 from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.managers.schedulerbase import SchedulerBase
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    suppress_other_loggers,
+)
 
 logger = init_logger(__name__)
 
@@ -185,15 +179,16 @@ class DiffGenerator:
         if save_output:
             if save_file_path:
                 os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-                if data_type == DataType.VIDEO:
-                    imageio.mimsave(
-                        save_file_path,
-                        frames,
-                        fps=fps,
-                        format=data_type.get_default_extension(),
-                    )
-                else:
-                    imageio.imwrite(save_file_path, frames[0])
+                with suppress_other_loggers():
+                    if data_type == DataType.VIDEO:
+                        imageio.mimsave(
+                            save_file_path,
+                            frames,
+                            fps=fps,
+                            format=data_type.get_default_extension(),
+                        )
+                    else:
+                        imageio.imwrite(save_file_path, frames[0])
                 logger.info("Saved output to %s", save_file_path)
             else:
                 logger.warning("No output path provided, output not saved")
@@ -284,7 +279,7 @@ class DiffGenerator:
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
             logger.info(
-                "Processing prompt %d/%d: %s...",
+                "Processing prompt: %d/%d: %s",
                 request_idx + 1,
                 len(requests),
                 req.prompt[:100],

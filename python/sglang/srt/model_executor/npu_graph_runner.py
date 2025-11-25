@@ -204,8 +204,8 @@ class NPUGraphRunner(CudaGraphRunner):
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
-            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
         if self.enable_torch_compile and (
