@@ -162,13 +162,19 @@ def safetensors_weights_iterator(
                 if os.path.islink(file_path):
                     blob_path = os.path.realpath(file_path)
                     os.remove(file_path)
-                    logger.info("Removed corrupted symlink: %s", os.path.basename(file_path))
+                    logger.info(
+                        "Removed corrupted symlink: %s", os.path.basename(file_path)
+                    )
                     if os.path.exists(blob_path):
                         os.remove(blob_path)
-                        logger.info("Removed corrupted blob: %s", os.path.basename(blob_path))
+                        logger.info(
+                            "Removed corrupted blob: %s", os.path.basename(blob_path)
+                        )
                 elif os.path.isfile(file_path):
                     os.remove(file_path)
-                    logger.info("Removed corrupted file: %s", os.path.basename(file_path))
+                    logger.info(
+                        "Removed corrupted file: %s", os.path.basename(file_path)
+                    )
             except Exception as e:
                 logger.warning("Failed to remove corrupted file %s: %s", file_path, e)
 
