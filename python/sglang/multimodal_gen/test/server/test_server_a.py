@@ -7,6 +7,9 @@ If the actual run is significantly better than the baseline, the improved cases 
 
 from __future__ import annotations
 
+import os
+import subprocess
+
 import pytest
 import requests
 from openai import OpenAI
@@ -19,10 +22,25 @@ from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
 from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
 from sglang.multimodal_gen.test.server.testcase_configs import (
     ONE_GPU_CASES_A,
-    DiffusionTestCase, DiffusionServerArgs, DiffusionSamplingParams,
+    DiffusionSamplingParams,
+    DiffusionServerArgs,
+    DiffusionTestCase,
 )
 
 logger = init_logger(__name__)
+
+
+def download_lora_weights(url: str, file_name: str) -> str:
+    target_dir: str = "~/.cache"
+    cache_dir = os.path.expanduser(target_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    file_path = os.path.join(cache_dir, file_name)
+    if not os.path.exists(file_path):
+        print(f"Downloading {file_name}...")
+        subprocess.run(["wget", "-O", file_path, url], check=True)
+
+    return os.path.abspath(file_path)
 
 
 class TestDiffusionServerOneGpu(DiffusionServerBase):
@@ -34,10 +52,7 @@ class TestDiffusionServerOneGpu(DiffusionServerBase):
         return request.param
 
 
-
 class TestLoraWorkflow:
-    """Functional tests for LoRA workflow on 2 GPUs."""
-
     @pytest.fixture
     def case(self) -> DiffusionTestCase:
         """Define the base model configuration for the LoRA test."""
@@ -79,12 +94,17 @@ class TestLoraWorkflow:
         )
         client = self._get_client(port)
         try:
-            print("\n=== Step 1: Base Generation ===")
+            print("\n=== Step 1: Download LoRA ===")
 
-            # wget -O "Qwen-Image-Lora-EliGen.safetensors" "https://civitai.com/api/download/models/2144921?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"
-            lora_a_path = "Qwen-Image-Lora-EliGen.safetensors"
-            # wget -O "Qwen-Image-Lora-Rem-and-Ram-Re:Zero.safetensors" "https://civitai.com/api/download/models/2123706?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"
-            lora_b_path = "Qwen-Image-Lora-Rem-and-Ram-Re:Zero.safetensors"
+            lora_a_path = download_lora_weights(
+                "https://civitai.com/api/download/models/2144921?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b",
+                "Qwen-Image-Lora-EliGen.safetensors",
+            )
+
+            lora_b_path = download_lora_weights(
+                "https://civitai.com/api/download/models/2123706?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b",
+                "Qwen-Image-Lora-Rem-and-Ram-Re:Zero.safetensors",
+            )
 
             try:
                 print("\n=== Step 2: Set LoRA A ===")

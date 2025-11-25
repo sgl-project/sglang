@@ -5,18 +5,13 @@
 from __future__ import annotations
 
 import pytest
-import requests
-from openai import OpenAI
 
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
 )
-from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
 from sglang.multimodal_gen.test.server.testcase_configs import (
     TWO_GPU_CASES_A,
-    DiffusionSamplingParams,
-    DiffusionServerArgs,
     DiffusionTestCase,
 )
 
@@ -28,4 +23,3 @@ class TestDiffusionServerTwoGpu(DiffusionServerBase):
     def case(self, request) -> DiffusionTestCase:
         """Provide a DiffusionTestCase for each 2-GPU test."""
         return request.param
-
