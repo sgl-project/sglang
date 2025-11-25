@@ -59,11 +59,12 @@ class DecodingStage(PipelineStage):
         # result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
         return result
 
-    def scale_and_shift(
-        self, latents: torch.Tensor, server_args
-    ):
-        scaling_factor, shift_factor = server_args.pipeline_config.calculate_decode_scale_inv_and_shift(latents,
-                                                                                                        self.vae)
+    def scale_and_shift(self, latents: torch.Tensor, server_args):
+        scaling_factor, shift_factor = (
+            server_args.pipeline_config.calculate_decode_scale_inv_and_shift(
+                latents, self.vae
+            )
+        )
 
         # 1. scale
         if isinstance(scaling_factor, torch.Tensor):
@@ -100,8 +101,8 @@ class DecodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-                                   vae_dtype != torch.float32
-                               ) and not server_args.disable_autocast
+            vae_dtype != torch.float32
+        ) and not server_args.disable_autocast
         vae_arch_config = server_args.pipeline_config.vae_config.arch_config
 
         # scale and shift

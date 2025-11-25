@@ -3,9 +3,19 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention_processor import AttentionProcessor, ADDED_KV_ATTENTION_PROCESSORS, \
-    AttnAddedKVProcessor, CROSS_ATTENTION_PROCESSORS, AttnProcessor
-from diffusers.models.autoencoders.vae import DecoderOutput, Encoder, Decoder, DiagonalGaussianDistribution
+from diffusers.models.attention_processor import (
+    ADDED_KV_ATTENTION_PROCESSORS,
+    CROSS_ATTENTION_PROCESSORS,
+    AttentionProcessor,
+    AttnAddedKVProcessor,
+    AttnProcessor,
+)
+from diffusers.models.autoencoders.vae import (
+    Decoder,
+    DecoderOutput,
+    DiagonalGaussianDistribution,
+    Encoder,
+)
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
@@ -27,7 +37,6 @@ class AutoencoderKLFlux2(nn.Module):
     def __init__(
         self,
         config: Flux2VAEConfig,
-
     ):
         super().__init__()
 
@@ -76,8 +85,16 @@ class AutoencoderKLFlux2(nn.Module):
             mid_block_add_attention=mid_block_add_attention,
         )
 
-        self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1) if use_quant_conv else None
-        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1) if use_post_quant_conv else None
+        self.quant_conv = (
+            nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1)
+            if use_quant_conv
+            else None
+        )
+        self.post_quant_conv = (
+            nn.Conv2d(latent_channels, latent_channels, 1)
+            if use_post_quant_conv
+            else None
+        )
 
         self.bn = nn.BatchNorm2d(
             math.prod(patch_size) * latent_channels,
@@ -97,7 +114,9 @@ class AutoencoderKLFlux2(nn.Module):
             if isinstance(self.config.sample_size, (list, tuple))
             else self.config.sample_size
         )
-        self.tile_latent_min_size = int(sample_size / (2 ** (len(self.config.block_out_channels) - 1)))
+        self.tile_latent_min_size = int(
+            sample_size / (2 ** (len(self.config.block_out_channels) - 1))
+        )
         self.tile_overlap_factor = 0.25
 
     @property
@@ -111,7 +130,11 @@ class AutoencoderKLFlux2(nn.Module):
         # set recursively
         processors = {}
 
-        def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
+        def fn_recursive_add_processors(
+            name: str,
+            module: torch.nn.Module,
+            processors: Dict[str, AttentionProcessor],
+        ):
             if hasattr(module, "get_processor"):
                 processors[f"{name}.processor"] = module.get_processor()
 
@@ -126,7 +149,9 @@ class AutoencoderKLFlux2(nn.Module):
         return processors
 
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_attn_processor
-    def set_attn_processor(self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]):
+    def set_attn_processor(
+        self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]
+    ):
         r"""
         Sets the attention processor to use to compute attention.
 
@@ -165,9 +190,15 @@ class AutoencoderKLFlux2(nn.Module):
         """
         Disables custom attention processors and sets the default attention implementation.
         """
-        if all(proc.__class__ in ADDED_KV_ATTENTION_PROCESSORS for proc in self.attn_processors.values()):
+        if all(
+            proc.__class__ in ADDED_KV_ATTENTION_PROCESSORS
+            for proc in self.attn_processors.values()
+        ):
             processor = AttnAddedKVProcessor()
-        elif all(proc.__class__ in CROSS_ATTENTION_PROCESSORS for proc in self.attn_processors.values()):
+        elif all(
+            proc.__class__ in CROSS_ATTENTION_PROCESSORS
+            for proc in self.attn_processors.values()
+        ):
             processor = AttnProcessor()
         else:
             raise ValueError(
@@ -179,7 +210,9 @@ class AutoencoderKLFlux2(nn.Module):
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, num_channels, height, width = x.shape
 
-        if self.use_tiling and (width > self.tile_sample_min_size or height > self.tile_sample_min_size):
+        if self.use_tiling and (
+            width > self.tile_sample_min_size or height > self.tile_sample_min_size
+        ):
             return self._tiled_encode(x)
 
         enc = self.encoder(x)
@@ -216,8 +249,13 @@ class AutoencoderKLFlux2(nn.Module):
 
         return AutoencoderKLOutput(latent_dist=posterior)
 
-    def _decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
-        if self.use_tiling and (z.shape[-1] > self.tile_latent_min_size or z.shape[-2] > self.tile_latent_min_size):
+    def _decode(
+        self, z: torch.Tensor, return_dict: bool = True
+    ) -> Union[DecoderOutput, torch.Tensor]:
+        if self.use_tiling and (
+            z.shape[-1] > self.tile_latent_min_size
+            or z.shape[-2] > self.tile_latent_min_size
+        ):
             return self.tiled_decode(z, return_dict=return_dict)
 
         if self.post_quant_conv is not None:
@@ -258,16 +296,24 @@ class AutoencoderKLFlux2(nn.Module):
 
         return DecoderOutput(sample=decoded)
 
-    def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    def blend_v(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
         blend_extent = min(a.shape[2], b.shape[2], blend_extent)
         for y in range(blend_extent):
-            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, y, :] * (y / blend_extent)
+            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[
+                :, :, y, :
+            ] * (y / blend_extent)
         return b
 
-    def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    def blend_h(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
         blend_extent = min(a.shape[3], b.shape[3], blend_extent)
         for x in range(blend_extent):
-            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, x] * (x / blend_extent)
+            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[
+                :, :, :, x
+            ] * (x / blend_extent)
         return b
 
     def _tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -296,7 +342,12 @@ class AutoencoderKLFlux2(nn.Module):
         for i in range(0, x.shape[2], overlap_size):
             row = []
             for j in range(0, x.shape[3], overlap_size):
-                tile = x[:, :, i: i + self.tile_sample_min_size, j: j + self.tile_sample_min_size]
+                tile = x[
+                    :,
+                    :,
+                    i : i + self.tile_sample_min_size,
+                    j : j + self.tile_sample_min_size,
+                ]
                 tile = self.encoder(tile)
                 if self.config.use_quant_conv:
                     tile = self.quant_conv(tile)
@@ -318,7 +369,9 @@ class AutoencoderKLFlux2(nn.Module):
         enc = torch.cat(result_rows, dim=2)
         return enc
 
-    def tiled_encode(self, x: torch.Tensor, return_dict: bool = True) -> AutoencoderKLOutput:
+    def tiled_encode(
+        self, x: torch.Tensor, return_dict: bool = True
+    ) -> AutoencoderKLOutput:
         r"""Encode a batch of images using a tiled encoder.
 
         When this option is enabled, the VAE will split the input tensor into tiles to compute encoding in several
@@ -352,7 +405,12 @@ class AutoencoderKLFlux2(nn.Module):
         for i in range(0, x.shape[2], overlap_size):
             row = []
             for j in range(0, x.shape[3], overlap_size):
-                tile = x[:, :, i: i + self.tile_sample_min_size, j: j + self.tile_sample_min_size]
+                tile = x[
+                    :,
+                    :,
+                    i : i + self.tile_sample_min_size,
+                    j : j + self.tile_sample_min_size,
+                ]
                 tile = self.encoder(tile)
                 if self.config.use_quant_conv:
                     tile = self.quant_conv(tile)
@@ -379,7 +437,9 @@ class AutoencoderKLFlux2(nn.Module):
 
         return AutoencoderKLOutput(latent_dist=posterior)
 
-    def tiled_decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
+    def tiled_decode(
+        self, z: torch.Tensor, return_dict: bool = True
+    ) -> Union[DecoderOutput, torch.Tensor]:
         r"""
         Decode a batch of images using a tiled decoder.
 
@@ -403,7 +463,12 @@ class AutoencoderKLFlux2(nn.Module):
         for i in range(0, z.shape[2], overlap_size):
             row = []
             for j in range(0, z.shape[3], overlap_size):
-                tile = z[:, :, i: i + self.tile_latent_min_size, j: j + self.tile_latent_min_size]
+                tile = z[
+                    :,
+                    :,
+                    i : i + self.tile_latent_min_size,
+                    j : j + self.tile_latent_min_size,
+                ]
                 if self.config.use_post_quant_conv:
                     tile = self.post_quant_conv(tile)
                 decoded = self.decoder(tile)

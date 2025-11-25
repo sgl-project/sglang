@@ -19,8 +19,11 @@ import torch
 from torch import nn
 from transformers import Cache
 from transformers.activations import ACT2FN
-from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast, LlavaModelOutputWithPast, \
-    LlavaPreTrainedModel
+from transformers.models.llava.modeling_llava import (
+    LlavaCausalLMOutputWithPast,
+    LlavaModelOutputWithPast,
+    LlavaPreTrainedModel,
+)
 from transformers.models.mistral.modeling_mistral import MistralRMSNorm
 
 from sglang.multimodal_gen.configs.models.encoders.mistral import Mistral3Config
@@ -43,25 +46,34 @@ class Mistral3PatchMerger(nn.Module):
         hidden_size = config.vision_config.hidden_size
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = self.config.vision_config.patch_size
-        self.merging_layer = nn.Linear(hidden_size * self.spatial_merge_size ** 2, hidden_size, bias=False)
+        self.merging_layer = nn.Linear(
+            hidden_size * self.spatial_merge_size**2, hidden_size, bias=False
+        )
 
-    def forward(self, image_features: torch.Tensor, image_sizes: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, image_features: torch.Tensor, image_sizes: torch.Tensor
+    ) -> torch.Tensor:
         image_sizes = [
-            (image_size[0] // self.patch_size, image_size[1] // self.patch_size) for image_size in image_sizes
+            (image_size[0] // self.patch_size, image_size[1] // self.patch_size)
+            for image_size in image_sizes
         ]
 
         tokens_per_image = [h * w for h, w in image_sizes]
         d = image_features.shape[-1]
 
         permuted_tensor = []
-        for image_index, image_tokens in enumerate(image_features.split(tokens_per_image)):
+        for image_index, image_tokens in enumerate(
+            image_features.split(tokens_per_image)
+        ):
             # Reshape image_tokens into a 2D grid
             h, w = image_sizes[image_index]
             image_grid = image_tokens.view(h, w, d).permute(2, 0, 1).unsqueeze(0)
             grid = torch.nn.functional.unfold(
-                image_grid, kernel_size=self.spatial_merge_size, stride=self.spatial_merge_size
+                image_grid,
+                kernel_size=self.spatial_merge_size,
+                stride=self.spatial_merge_size,
             )
-            grid = grid.view(d * self.spatial_merge_size ** 2, -1).t()
+            grid = grid.view(d * self.spatial_merge_size**2, -1).t()
             permuted_tensor.append(grid)
 
         image_features = torch.cat(permuted_tensor, dim=0)
@@ -72,10 +84,16 @@ class Mistral3PatchMerger(nn.Module):
 class Mistral3MultiModalProjector(nn.Module):
     def __init__(self, config: Mistral3Config):
         super().__init__()
-        self.norm = Mistral3RMSNorm(config.vision_config.hidden_size, eps=config.text_config.rms_norm_eps)
+        self.norm = Mistral3RMSNorm(
+            config.vision_config.hidden_size, eps=config.text_config.rms_norm_eps
+        )
         self.patch_merger = Mistral3PatchMerger(config)
         # We have hidden_size * the number of vision feature layers
-        num_feature_layers = 1 if isinstance(config.vision_feature_layer, int) else len(config.vision_feature_layer)
+        num_feature_layers = (
+            1
+            if isinstance(config.vision_feature_layer, int)
+            else len(config.vision_feature_layer)
+        )
         self.linear_1 = nn.Linear(
             config.vision_config.hidden_size * num_feature_layers,
             config.text_config.hidden_size,
@@ -83,7 +101,9 @@ class Mistral3MultiModalProjector(nn.Module):
         )
         self.act = ACT2FN[config.projector_hidden_act]
         self.linear_2 = nn.Linear(
-            config.text_config.hidden_size, config.text_config.hidden_size, bias=config.multimodal_projector_bias
+            config.text_config.hidden_size,
+            config.text_config.hidden_size,
+            bias=config.multimodal_projector_bias,
         )
 
     def forward(self, image_features: torch.Tensor, image_sizes: torch.Tensor):
@@ -111,7 +131,6 @@ class Mistral3Model(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-
         position_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
@@ -126,17 +145,29 @@ class Mistral3Model(nn.Module):
         image_sizes: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Union[tuple, Mistral3ModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
         vision_feature_layer = (
-            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
+            vision_feature_layer
+            if vision_feature_layer is not None
+            else self.config.vision_feature_layer
         )
 
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -147,11 +178,15 @@ class Mistral3Model(nn.Module):
                 vision_feature_layer=vision_feature_layer,
                 image_sizes=image_sizes,
             )
-            image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_features = torch.cat(image_features, dim=0).to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
             special_image_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_features
             )
-            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+            inputs_embeds = inputs_embeds.masked_scatter(
+                special_image_mask, image_features
+            )
 
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -213,11 +248,19 @@ class Mistral3ForConditionalGeneration(TextEncoder):
         ```python
         "What is the image?The image depicts two cats lying on a pink blanket."
         ```"""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -237,13 +280,20 @@ class Mistral3ForConditionalGeneration(TextEncoder):
 
         hidden_states = outputs[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
             loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                **kwargs,
             )
 
         return Mistral3CausalLMOutputWithPast(

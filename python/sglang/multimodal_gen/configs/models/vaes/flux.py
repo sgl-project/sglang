@@ -45,8 +45,8 @@ class FluxVAEConfig(VAEConfig):
 
     def __post_init__(self):
         self.blend_num_frames = (
-                                    self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
-                                ) * 2
+            self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
+        ) * 2
 
     def post_init(self):
         self.arch_config.vae_scale_factor = 2 ** (
@@ -61,8 +61,8 @@ class Flux2VAEConfig(FluxVAEConfig):
 
     def __post_init__(self):
         self.blend_num_frames = (
-                                    self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
-                                ) * 2
+            self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
+        ) * 2
 
     def post_init(self):
         self.arch_config.vae_scale_factor = 2 ** (

@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     T5Config,
 )
 from sglang.multimodal_gen.configs.models.encoders.mistral import Mistral3Config
-from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig, Flux2VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
@@ -211,7 +211,9 @@ def _prepare_latent_ids(
     return latent_ids
 
 
-def _unpack_latents_with_ids(x: torch.Tensor, x_ids: torch.Tensor) -> list[torch.Tensor]:
+def _unpack_latents_with_ids(
+    x: torch.Tensor, x_ids: torch.Tensor
+) -> list[torch.Tensor]:
     """
     using position ids to scatter tokens into place
     """
@@ -239,20 +241,29 @@ def _unpack_latents_with_ids(x: torch.Tensor, x_ids: torch.Tensor) -> list[torch
 
 def _patchify_latents(latents):
     batch_size, num_channels_latents, height, width = latents.shape
-    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+    latents = latents.view(
+        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+    )
     latents = latents.permute(0, 1, 3, 5, 2, 4)
-    latents = latents.reshape(batch_size, num_channels_latents * 4, height // 2, width // 2)
+    latents = latents.reshape(
+        batch_size, num_channels_latents * 4, height // 2, width // 2
+    )
     return latents
 
 
 def _unpatchify_latents(latents):
     batch_size, num_channels_latents, height, width = latents.shape
-    latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), 2, 2, height, width)
+    latents = latents.reshape(
+        batch_size, num_channels_latents // (2 * 2), 2, 2, height, width
+    )
     latents = latents.permute(0, 1, 4, 2, 5, 3)
-    latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), height * 2, width * 2)
+    latents = latents.reshape(
+        batch_size, num_channels_latents // (2 * 2), height * 2, width * 2
+    )
     return latents
 
 
+@dataclass
 class Flux2PipelineConfig(ImagePipelineConfig):
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Mistral3Config(),)
@@ -261,7 +272,9 @@ class Flux2PipelineConfig(ImagePipelineConfig):
 
     def maybe_pack_latents(self, latents, batch_size, batch):
         batch_size, num_channels, height, width = latents.shape
-        latents = latents.reshape(batch_size, num_channels, height * width).permute(0, 2, 1)
+        latents = latents.reshape(batch_size, num_channels, height * width).permute(
+            0, 2, 1
+        )
         return latents
 
     def maybe_prepare_latent_ids(self, latents):
@@ -273,8 +286,12 @@ class Flux2PipelineConfig(ImagePipelineConfig):
         image_latents = _patchify_latents(image_latents)
 
         # 2. scale and shift
-        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(image_latents.device, image_latents.dtype)
-        latents_bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps)
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(
+            image_latents.device, image_latents.dtype
+        )
+        latents_bn_std = torch.sqrt(
+            vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps
+        )
         image_latents = (image_latents - latents_bn_mean) / latents_bn_std
         return image_latents
 
@@ -283,10 +300,12 @@ class Flux2PipelineConfig(ImagePipelineConfig):
         return latents
 
     def calculate_decode_scale_inv_and_shift(self, latents, vae):
-        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        latents_bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(
             latents.device, latents.dtype
         )
+        latents_bn_std = torch.sqrt(
+            vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps
+        ).to(latents.device, latents.dtype)
         return 1 / latents_bn_std, latents_bn_mean
 
     def post_denoising_loop(self, latents, batch):
