@@ -16,15 +16,15 @@ concurrency:
 
 jobs:
   # Building images
-  build-arm-image:
-    if: github.repository == 'sgl-project/sglang'
-    uses: ./.github/workflows/release-docker-npu.yml
-    secrets: inherit
+  # build-arm-image:
+  #   if: github.repository == 'sgl-project/sglang'
+  #   uses: ./.github/workflows/release-docker-npu.yml
+  #   secrets: inherit
 
   nightly-test-npu-1-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    # if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    # needs: [ build-arm-image ]
+    # if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-2
     strategy:
       fail-fast: false
@@ -63,9 +63,9 @@ jobs:
           python3 run_suite.py --suite nightly-test-npu-1-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   nightly-test-npu-2-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    # if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+  #   needs: [ build-arm-image ]
+  #   if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-2
     strategy:
       fail-fast: false
@@ -104,9 +104,9 @@ jobs:
           python3 run_suite.py --suite nightly-test-npu-2-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   nightly-test-npu-4-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    # if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    # needs: [ build-arm-image ]
+    # if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-4
     strategy:
       fail-fast: false
@@ -155,9 +155,9 @@ jobs:
           python3 run_suite.py --suite nightly-test-npu-4-a3--continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   nightly-test-npu-8-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    # if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+  #   needs: [ build-arm-image ]
+  #   if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-8
     strategy:
       fail-fast: false
@@ -205,9 +205,9 @@ jobs:
           python3 run_suite.py --suite nightly-test-npu-8-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   nightly-test-npu-16-a3:
-    needs: [ build-arm-image ]
-    if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    # if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    # needs: [ build-arm-image ]
+    # if: ${{ needs.build-arm-image.result == 'success' && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-16
     strategy:
       fail-fast: false
