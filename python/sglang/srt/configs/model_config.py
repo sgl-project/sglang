@@ -626,6 +626,19 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is not None and not isinstance(quant_cfg, dict):
+            quant_cfg = quant_cfg.to_dict()
+        if quant_cfg is not None:
+            # Identify modelopt quantization
+            quant_algo = quant_cfg.get("quant_algo", None)
+            if quant_algo and "quant_method" not in quant_cfg:
+                if quant_algo == "MIXED_PRECISION":
+                    quant_cfg["quant_method"] = "w4afp8"
+                elif "FP4" in quant_algo or "NVFP4" in quant_algo:
+                    quant_cfg["quant_method"] = "modelopt_fp4"
+                elif "FP8" in quant_algo:
+                    quant_cfg["quant_method"] = "modelopt_fp8"
+
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
@@ -736,6 +749,12 @@ class ModelConfig:
 
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
+        # Check for quantization in hf_config (config.json)
+        if getattr(self.hf_config, "quantization_config", None):
+            return True
+        if getattr(self.hf_config, "compression_config", None):
+            return True
+
         # Check for HuggingFace quantization config
         from sglang.srt.utils import has_hf_quant_config
 
