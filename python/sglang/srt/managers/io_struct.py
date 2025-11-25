@@ -1067,6 +1067,7 @@ class FlushCacheReqOutput(BaseReq):
 @dataclass
 class PauseGenerationReqInput(BaseReq):
     """
+    Note that the PauseGenerationRequests is only supported in SGLang Server.
     abort: Abort and return all requests currently being processed.
 
     in_place: Pause the scheduler's event_loop from performing inference;
