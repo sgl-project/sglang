@@ -7,6 +7,7 @@ If the actual run is significantly better than the baseline, the improved cases 
 
 from __future__ import annotations
 
+import base64
 import os
 import time
 from pathlib import Path
@@ -32,6 +33,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
 )
+from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     read_perf_logs,
@@ -225,6 +227,19 @@ Consider updating perf_baselines.json with the snippets below:
             resp = client.videos.download_content(video_id=video_id)  # type: ignore[attr-defined]
             content = resp.read()
             validate_openai_video(content)
+
+            tmp_path = f"{video_id}.mp4"
+            with open(tmp_path, "wb") as f:
+                f.write(content)
+            upload_file_to_slack(
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.prompt,
+                file_path=tmp_path,
+                origin_file_path=case.image_path,
+            )
+            os.remove(tmp_path)
+
             return video_id
 
         # for all tests, seconds = case.seconds or fallback 4 seconds
@@ -248,6 +263,19 @@ Consider updating perf_baselines.json with the snippets below:
             )
             result = response.parse()
             validate_image(result.data[0].b64_json)
+
+            img_data = base64.b64decode(result.data[0].b64_json)
+            tmp_path = f"{result.created}.png"
+            with open(tmp_path, "wb") as f:
+                f.write(img_data)
+            upload_file_to_slack(
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.prompt,
+                file_path=tmp_path,
+            )
+            os.remove(tmp_path)
+
             return str(result.created)
 
         def generate_image_edit() -> str:
@@ -276,6 +304,20 @@ Consider updating perf_baselines.json with the snippets below:
 
             result = response.parse()
             validate_image(result.data[0].b64_json)
+
+            img_data = base64.b64decode(result.data[0].b64_json)
+            tmp_path = f"{rid}.png"
+            with open(tmp_path, "wb") as f:
+                f.write(img_data)
+            upload_file_to_slack(
+                case_id=case.id,
+                model=case.model_path,
+                prompt=case.edit_prompt,
+                file_path=tmp_path,
+                origin_file_path=case.image_path,
+            )
+            os.remove(tmp_path)
+
             return rid
 
         # -------------------------
