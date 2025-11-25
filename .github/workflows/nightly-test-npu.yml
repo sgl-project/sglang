@@ -30,7 +30,7 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -68,7 +68,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -106,7 +106,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -154,7 +154,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -201,7 +201,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: docker.io/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
