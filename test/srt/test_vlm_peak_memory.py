@@ -61,10 +61,14 @@ class PeakMemoryMonitor(threading.Thread):
                 return max(usages) / 1024
             return 0.0
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"[Monitor Error] Failed to run nvidia-smi to detect total memory: {e}")
+            print(
+                f"[Monitor Error] Failed to run nvidia-smi to detect total memory: {e}"
+            )
             return 1.0  # Avoid division by zero later, safe fallback
         except ValueError as e:
-            print(f"[Monitor Error] Failed to parse memory size from nvidia-smi output: {e}")
+            print(
+                f"[Monitor Error] Failed to parse memory size from nvidia-smi output: {e}"
+            )
             return 1.0  # Avoid division by zero later, safe fallback
 
     def run(self):
@@ -93,7 +97,9 @@ class PeakMemoryMonitor(threading.Thread):
                         if current_max_gb > self.peak_memory_gb:
                             self.peak_memory_gb = current_max_gb
             except Exception as e:
-                print(f"[Monitor Error] Polling nvidia-smi failed: {e}. Stopping monitor.")
+                print(
+                    f"[Monitor Error] Polling nvidia-smi failed: {e}. Stopping monitor."
+                )
                 break
 
             time.sleep(self.interval)
