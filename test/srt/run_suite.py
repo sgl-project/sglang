@@ -165,7 +165,6 @@ suites = {
         TestFile("test_deepseek_v32_mtp.py", 275),
     ],
     "per-commit-8-gpu-h20": [
-        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
         TestFile("test_disaggregation_dp_attention.py", 155),
@@ -189,6 +188,7 @@ suites = {
         # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-h200-deepep": [
+        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("ep/test_deepep_large.py", 338),
     ],
     "quantization_test": [
