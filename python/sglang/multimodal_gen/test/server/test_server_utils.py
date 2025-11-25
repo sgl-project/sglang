@@ -20,13 +20,12 @@ from urllib.request import urlopen
 import pytest
 from openai import Client, OpenAI
 
-from sglang.multimodal_gen import SamplingParams
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    DiffusionSamplingParams,
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
@@ -272,7 +271,7 @@ class WarmupRunner:
     def run_edit_warmups(
         self,
         count: int,
-        prompt: str,
+        edit_prompt: str,
         image_path: Path,
     ) -> None:
         """Run image-edit warmup requests."""
@@ -291,7 +290,7 @@ class WarmupRunner:
                 result = self.client.images.edit(
                     model=self.model,
                     image=fh,
-                    prompt=prompt,
+                    prompt=edit_prompt,
                     n=1,
                     size=self.output_size,
                     response_format="b64_json",
@@ -470,8 +469,8 @@ VALIDATOR_REGISTRY = {
 
 def get_generate_fn(
     model_path: str,
-    task_type: ModelTaskType,
-    sampling_params: SamplingParams,
+    modality: str,
+    sampling_params: DiffusionSamplingParams,
 ) -> Callable[[str, Client], str]:
     """Return appropriate generation function for the case."""
 
@@ -550,7 +549,7 @@ def get_generate_fn(
 
         return video_id
 
-    video_seconds = sampling_params.seconds()
+    video_seconds = sampling_params.seconds or 4
 
     def generate_image(case_id, client) -> str:
         """T2I: Text to Image generation."""
@@ -561,7 +560,7 @@ def get_generate_fn(
             model=model_path,
             prompt=sampling_params.prompt,
             n=1,
-            size=sampling_params.output_size_str(),
+            size=sampling_params.output_size,
             response_format="b64_json",
         )
         result = response.parse()
@@ -583,7 +582,7 @@ def get_generate_fn(
 
     def generate_image_edit(case_id, client) -> str:
         """TI2I: Text + Image ? Image edit."""
-        if not sampling_params.prompt or not sampling_params.image_path:
+        if not sampling_params.edit_prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
@@ -597,9 +596,9 @@ def get_generate_fn(
             response = client.images.with_raw_response.edit(
                 model=model_path,
                 image=fh,
-                prompt=sampling_params.prompt,
+                prompt=sampling_params.edit_prompt,
                 n=1,
-                size=sampling_params.output_size_str(),
+                size=sampling_params.output_size,
                 response_format="b64_json",
             )
         rid = response.headers.get("x-request-id", "")
@@ -614,7 +613,7 @@ def get_generate_fn(
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
-            prompt=sampling_params.prompt,
+            prompt=sampling_params.edit_prompt,
             file_path=tmp_path,
             origin_file_path=sampling_params.image_path,
         )
@@ -632,7 +631,7 @@ def get_generate_fn(
             case_id,
             model=model_path,
             prompt=sampling_params.prompt,
-            size=sampling_params.output_size_str(),
+            size=sampling_params.output_size,
             seconds=video_seconds,
         )
 
@@ -653,15 +652,15 @@ def get_generate_fn(
                 client,
                 case_id,
                 model=model_path,
-                prompt=sampling_params.prompt,
-                size=sampling_params.output_size_str(),
+                prompt=sampling_params.edit_prompt,
+                size=sampling_params.output_size,
                 seconds=video_seconds,
                 input_reference=fh,
             )
 
     def generate_text_image_to_video(case_id, client) -> str:
         """TI2V: Text + Image ? Video."""
-        if not sampling_params.prompt or not sampling_params.image_path:
+        if not sampling_params.edit_prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
@@ -676,21 +675,20 @@ def get_generate_fn(
                 client,
                 case_id,
                 model=model_path,
-                prompt=sampling_params.prompt,
-                size=sampling_params.output_size_str(),
+                prompt=sampling_params.edit_prompt,
+                size=sampling_params.output_size,
                 seconds=video_seconds,
                 input_reference=fh,
             )
 
-    if not task_type.is_image_gen():
-        # video_gen
-        if sampling_params.image_path and sampling_params.prompt:
+    if modality == "video":
+        if sampling_params.image_path and sampling_params.edit_prompt:
             fn = generate_text_image_to_video
         elif sampling_params.image_path:
             fn = generate_image_to_video
         else:
             fn = generate_video
-    elif task_type == ModelTaskType.I2I:
+    elif sampling_params.edit_prompt and sampling_params.image_path:
         fn = generate_image_edit
     else:
         fn = generate_image

@@ -25,8 +25,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from sglang.multimodal_gen.configs.sample.base import SamplingParams
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
@@ -110,17 +108,43 @@ class BaselineConfig:
 
 
 @dataclass(frozen=True)
+class DiffusionServerArgs:
+    """Configuration for a single model/scenario test case."""
+
+    model_path: str  # HF repo or local path
+    modality: str = "image"  # "image" or "video" or "3d"
+
+    warmup_text: int = 1  # number of text-to-image/video warmups
+    warmup_edit: int = 0  # number of image/video-edit warmups
+    custom_validator: str | None = None  # optional custom validator name
+    # resources
+    num_gpus: int = 1
+
+
+@dataclass(frozen=True)
+class DiffusionSamplingParams:
+    """Configuration for a single model/scenario test case."""
+
+    output_size: str = "1024x1024"  # output image dimensions (or video resolution)
+
+    # inputs and conditioning
+    prompt: str | None = None  # text prompt for generation
+    edit_prompt: str | None = None  # prompt for editing
+    image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+
+    # duration
+    seconds: int = 1  # for video: duration in seconds
+    num_frames: int | None = None  # for video: number of frames
+    fps: int | None = None  # for video: frames per second
+
+
+@dataclass(frozen=True)
 class DiffusionTestCase:
     """Configuration for a single model/scenario test case."""
 
     id: str  # pytest test id and scenario name
-    server_args: ServerArgs
-    sampling_params: SamplingParams
-    warmup_text: int = 1  # number of text-to-image/video warmups
-    warmup_edit: int = 0  # number of image/video-edit warmups
-    custom_validator: str | None = None  # optional custom validator name
-    # Optional edit prompt, as SamplingParams only has prompt
-    edit_prompt: str | None = None
+    server_args: DiffusionServerArgs
+    sampling_params: DiffusionSamplingParams
 
 
 def sample_step_indices(
@@ -195,40 +219,45 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         "qwen_image_t2i",
-        ServerArgs.from_kwargs(model_path="Qwen/Qwen-Image", num_gpus=1),
-        SamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            width=1024,
-            height=1024,
-            num_frames=1,
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
         ),
-        warmup_text=1,
+        DiffusionSamplingParams(
+            prompt="A futuristic cityscape at sunset with flying cars",
+            output_size="1024x1024",
+        ),
     ),
     DiffusionTestCase(
         "flux_image_t2i",
-        ServerArgs.from_kwargs(model_path="black-forest-labs/FLUX.1-dev", num_gpus=1),
-        SamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            width=1024,
-            height=1024,
-            num_frames=1,
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.1-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
         ),
-        warmup_text=1,
+        DiffusionSamplingParams(
+            prompt="A futuristic cityscape at sunset with flying cars",
+            output_size="1024x1024",
+        ),
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
-        ServerArgs.from_kwargs(model_path="Qwen/Qwen-Image-Edit", num_gpus=1),
-        SamplingParams(
-            prompt=None,
-            width=1024,
-            height=1536,
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-            num_frames=1,
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit",
+            warmup_text=0,
+            warmup_edit=1,
+            modality="image",
         ),
-        edit_prompt="Convert 2D style to 3D style",
-        warmup_text=0,
-        warmup_edit=1,
+        DiffusionSamplingParams(
+            prompt=None,  # not used for editing
+            output_size="1024x1536",
+            edit_prompt="Convert 2D style to 3D style",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
     ),
 ]
 
@@ -236,16 +265,17 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_1_t2v_1.3b",
-        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", num_gpus=1),
-        SamplingParams(
-            prompt="A curious raccoon",
-            width=848,
-            height=480,
-            num_frames=24,  # 1s * 24fps
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
         ),
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
+        DiffusionSamplingParams(
+            prompt="A curious raccoon",
+            output_size="848x480",
+        ),
     ),
     # NOTE(mick): flaky
     # DiffusionTestCase(
@@ -260,148 +290,165 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # ),
     DiffusionTestCase(
         "fast_hunyuan_video",
-        ServerArgs.from_kwargs(model_path="FastVideo/FastHunyuan-diffusers", num_gpus=1),
-        SamplingParams(
-            prompt="A curious raccoon",
-            width=720,
-            height=480,
-            num_frames=24,
+        DiffusionServerArgs(
+            model_path="FastVideo/FastHunyuan-diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
         ),
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
+        DiffusionSamplingParams(
+            prompt="A curious raccoon",
+            output_size="720x480",
+        ),
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
         "wan2_2_ti2v_5b",
-        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers", num_gpus=1),
-        SamplingParams(
-            prompt="Animate this image",
-            width=832,
-            height=1104,
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-            num_frames=24,
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
         ),
-        edit_prompt="Add dynamic motion to the scene",
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
+        DiffusionSamplingParams(
+            output_size="832x1104",
+            prompt="Animate this image",
+            edit_prompt="Add dynamic motion to the scene",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
     ),
     DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
-        ServerArgs(
-            model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers", num_gpus=1
+        DiffusionServerArgs(
+            model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
         ),
-        SamplingParams(
+        DiffusionSamplingParams(
+            output_size="832x1104",
             prompt="Animate this image",
-            width=832,
-            height=1104,
+            edit_prompt="Add dynamic motion to the scene",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-            num_frames=24,
         ),
-        edit_prompt="Add dynamic motion to the scene",
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
     ),
 ]
 
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
-        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers", num_gpus=2),
-        SamplingParams(
-            prompt="generate",
-            width=832,
-            height=1104,
-            image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
-            num_frames=1,  # Explicitly 1 frame? Or maybe it was generating video? Original config had num_frames=1
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=2,
         ),
-        edit_prompt="generate",
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
+        DiffusionSamplingParams(
+            prompt="generate",
+            output_size="832x1104",
+            edit_prompt="generate",
+            image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
+            num_frames=1,
+        ),
     ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
-        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers", num_gpus=2),
-        SamplingParams(
-            prompt="A curious raccoon",
-            width=720,
-            height=480,
-            num_frames=24,
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=2,
         ),
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
+        DiffusionSamplingParams(
+            prompt="A curious raccoon",
+            output_size="720x480",
+        ),
     ),
     DiffusionTestCase(
         "wan2_1_t2v_14b_2gpu",
-        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers", num_gpus=2),
-        SamplingParams(
-            prompt="A curious raccoon",
-            width=720,
-            height=480,
-            num_frames=24,
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
+            warmup_text=0,
+            warmup_edit=0,
+            modality="video",
+            num_gpus=2,
+            custom_validator="video",
         ),
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
+        DiffusionSamplingParams(
+            prompt="A curious raccoon",
+            output_size="720x480",
+        ),
     ),
 ]
 
 TWO_GPU_CASES_B = [
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
-        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers", num_gpus=2),
-        SamplingParams(
-            prompt="Animate this image",
-            width=832,
-            height=1104,
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-            num_frames=24,
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+            warmup_text=0,
+            warmup_edit=0,
+            modality="video",
+            custom_validator="video",
+            num_gpus=2,
         ),
-        edit_prompt="Add dynamic motion to the scene",
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
+        DiffusionSamplingParams(
+            output_size="832x1104",
+            prompt="Animate this image",
+            edit_prompt="Add dynamic motion to the scene",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_720P_2gpu",
-        ServerArgs.from_kwargs(model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers", num_gpus=2),
-        SamplingParams(
-            prompt="Animate this image",
-            width=832,
-            height=1104,
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-            num_frames=24,
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=2,
         ),
-        edit_prompt="Add dynamic motion to the scene",
-        warmup_text=0,
-        warmup_edit=0,
-        custom_validator="video",
+        DiffusionSamplingParams(
+            prompt="Animate this image",
+            edit_prompt="Add dynamic motion to the scene",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+            output_size="832x1104",
+        ),
     ),
     DiffusionTestCase(
         "qwen_image_t2i_2_gpus",
-        ServerArgs.from_kwargs(model_path="Qwen/Qwen-Image", num_gpus=2),
-        SamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            width=1024,
-            height=1024,
-            num_frames=1,
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            num_gpus=2,
         ),
-        warmup_text=1,
+        DiffusionSamplingParams(
+            prompt="A futuristic cityscape at sunset with flying cars",
+            output_size="1024x1024",
+        ),
     ),
     DiffusionTestCase(
         "flux_image_t2i_2_gpus",
-        ServerArgs.from_kwargs(model_path="black-forest-labs/FLUX.1-dev", num_gpus=2),
-        SamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            width=1024,
-            height=1024,
-            num_frames=1,
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.1-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
         ),
-        warmup_text=1,
+        DiffusionSamplingParams(
+            prompt="A futuristic cityscape at sunset with flying cars",
+            output_size="1024x1024",
+        ),
     ),
 ]
 
