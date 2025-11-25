@@ -592,3 +592,10 @@ def swizzle_blockscale(scale: torch.Tensor):
         if scale_ndim == 2
         else swizzled_scale.reshape(B, M_padded, K_padded)
     )
+
+
+def maybe_create_device_identity():
+    # Allocate dummy ones tensor for torch._scaled_mm
+    global TORCH_DEVICE_IDENTITY
+    if TORCH_DEVICE_IDENTITY is None:
+        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)

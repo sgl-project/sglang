@@ -40,7 +40,10 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supports_shape,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
+from sglang.srt.layers.quantization.utils.utils import (
+    get_scalar_types,
+    replace_parameter,
+)
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
