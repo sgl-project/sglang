@@ -126,6 +126,7 @@ class SamplingParams:
     # Profiling
     profile: bool = False
     num_profiled_timesteps: int = 2
+
     # Debugging
     debug: bool = False
     perf_dump_path: str | None = None
