@@ -150,10 +150,7 @@ def safetensors_weights_iterator(
     device = "cpu" if to_cpu else str(get_local_torch_device())
 
     # Validate files before loading
-    corrupted_files = []
-    for st_file in hf_weights_files:
-        if not _validate_safetensors_file(st_file):
-            corrupted_files.append(st_file)
+    corrupted_files = [st_file for st_file in hf_weights_files if not _validate_safetensors_file(st_file)]
 
     if corrupted_files:
         # Delete corrupted files (both symlink and blob if applicable)
