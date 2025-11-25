@@ -246,7 +246,6 @@ int get_kernel_cache_size(
   // With padding alignment, we need: moe_block_size/4 + moe_block_size/4 + (moe_block_size/2 + moe_block_size) int4s
   // = 2 * moe_block_size int4s = 2 * tb_m * 16 bytes = 32 * tb_m bytes
   int sh_block_meta_size = tb_m * 32;
-  int sh_block_meta_size = tb_m * 24;
   int sh_a_size = pipe_stages * (tb_m * tb_k) * 2;
   int sh_b_size = pipe_stages * (tb_k * tb_n / pack_factor) * 4;
   int sh_s_size =
