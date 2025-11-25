@@ -3,7 +3,7 @@
 use std::{
     any::Any,
     sync::{atomic::AtomicBool, Arc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use axum::{
@@ -20,23 +20,17 @@ use tracing::warn;
 // Import from sibling modules
 use super::conversations::{
     create_conversation, create_conversation_items, delete_conversation, delete_conversation_item,
-    get_conversation, get_conversation_item, list_conversation_items, persist_conversation_items,
-    update_conversation,
+    get_conversation, get_conversation_item, list_conversation_items, update_conversation,
 };
 use super::{
     context::{CachedEndpoint, RequestType, SharedComponents},
-    mcp::{
-        ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
-        McpLoopConfig,
-    },
     pipeline::RequestPipeline,
-    responses::{mask_tools_as_mcp, patch_streaming_response_json},
-    utils::{apply_provider_headers, probe_endpoint_for_model},
+    utils::apply_provider_headers,
 };
 use crate::{
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
     data_connector::{
-        ConversationId, ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage,
+        ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage,
     },
     mcp::McpManager,
     protocols::{
@@ -48,7 +42,6 @@ use crate::{
         rerank::RerankRequest,
         responses::{generate_id, ResponsesGetParams, ResponsesRequest},
     },
-    routers::header_utils::apply_request_headers,
 };
 
 // ============================================================================
@@ -87,12 +80,6 @@ impl std::fmt::Debug for OpenAIRouter {
 }
 
 impl OpenAIRouter {
-    /// Maximum number of conversation items to attach as input when a conversation is provided
-    const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
-
-    /// Model discovery cache TTL (1 hour)
-    const MODEL_CACHE_TTL_SECS: u64 = 3600;
-
     /// Create a new OpenAI router
     pub async fn new(
         worker_urls: Vec<String>,
@@ -136,191 +123,6 @@ impl OpenAIRouter {
             conversation_item_storage: ctx.conversation_item_storage.clone(),
             mcp_manager,
         })
-    }
-
-    /// Discover which endpoint has the model
-    async fn find_endpoint_for_model(
-        &self,
-        model_id: &str,
-        auth_header: Option<&str>,
-    ) -> Result<String, Response> {
-        // Single endpoint - fast path
-        if self.worker_urls.len() == 1 {
-            return Ok(self.worker_urls[0].clone());
-        }
-
-        // Check cache
-        if let Some(entry) = self.model_cache.get(model_id) {
-            if entry.cached_at.elapsed() < Duration::from_secs(Self::MODEL_CACHE_TTL_SECS) {
-                return Ok(entry.url.clone());
-            }
-        }
-
-        // Probe all endpoints in parallel
-        let mut handles = vec![];
-        let model = model_id.to_string();
-        let auth = auth_header.map(|s| s.to_string());
-
-        for url in &self.worker_urls {
-            let handle = tokio::spawn(probe_endpoint_for_model(
-                self.client.clone(),
-                url.clone(),
-                model.clone(),
-                auth.clone(),
-            ));
-            handles.push(handle);
-        }
-
-        // Return first successful endpoint
-        for handle in handles {
-            if let Ok(Ok(url)) = handle.await {
-                // Cache it
-                self.model_cache.insert(
-                    model_id.to_string(),
-                    CachedEndpoint {
-                        url: url.clone(),
-                        cached_at: Instant::now(),
-                    },
-                );
-                return Ok(url);
-            }
-        }
-
-        // Model not found on any endpoint
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {
-                    "message": format!("Model '{}' not found on any endpoint", model_id),
-                    "type": "model_not_found",
-                }
-            })),
-        )
-            .into_response())
-    }
-
-    /// Handle non-streaming response with optional MCP tool loop
-    async fn handle_non_streaming_response(
-        &self,
-        url: String,
-        headers: Option<&HeaderMap>,
-        mut payload: Value,
-        original_body: &ResponsesRequest,
-        original_previous_response_id: Option<String>,
-    ) -> Response {
-        // Check if MCP is active for this request
-        // Ensure dynamic client is created if needed
-        if let Some(ref tools) = original_body.tools {
-            ensure_request_mcp_client(&self.mcp_manager, tools.as_slice()).await;
-        }
-
-        // Use the tool loop if the manager has any tools available (static or dynamic).
-        let active_mcp = if self.mcp_manager.list_tools().is_empty() {
-            None
-        } else {
-            Some(&self.mcp_manager)
-        };
-
-        let mut response_json: Value;
-
-        // If MCP is active, execute tool loop
-        if let Some(mcp) = active_mcp {
-            let config = McpLoopConfig::default();
-
-            // Transform MCP tools to function tools
-            prepare_mcp_payload_for_streaming(&mut payload, mcp);
-
-            match execute_tool_loop(
-                &self.client,
-                &url,
-                headers,
-                payload,
-                original_body,
-                mcp,
-                &config,
-            )
-            .await
-            {
-                Ok(resp) => response_json = resp,
-                Err(err) => {
-                    self.circuit_breaker.record_failure();
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": {"message": err}})),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            // No MCP - simple request
-
-            let mut request_builder = self.client.post(&url).json(&payload);
-            if let Some(h) = headers {
-                request_builder = apply_request_headers(h, request_builder, true);
-            }
-
-            let response = match request_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    self.circuit_breaker.record_failure();
-                    tracing::error!(
-                        url = %url,
-                        error = %e,
-                        "Failed to forward request to OpenAI"
-                    );
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Failed to forward request to OpenAI: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-
-            if !response.status().is_success() {
-                self.circuit_breaker.record_failure();
-                let status = StatusCode::from_u16(response.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let body = response.text().await.unwrap_or_default();
-                return (status, body).into_response();
-            }
-
-            response_json = match response.json::<Value>().await {
-                Ok(r) => r,
-                Err(e) => {
-                    self.circuit_breaker.record_failure();
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to parse upstream response: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-
-            self.circuit_breaker.record_success();
-        }
-
-        // Patch response with metadata
-        mask_tools_as_mcp(&mut response_json, original_body);
-        patch_streaming_response_json(
-            &mut response_json,
-            original_body,
-            original_previous_response_id.as_deref(),
-        );
-
-        // Always persist conversation items and response (even without conversation)
-        if let Err(err) = persist_conversation_items(
-            self.conversation_storage.clone(),
-            self.conversation_item_storage.clone(),
-            self.response_storage.clone(),
-            &response_json,
-            original_body,
-        )
-        .await
-        {
-            warn!("Failed to persist conversation items: {}", err);
-        }
-
-        (StatusCode::OK, Json(response_json)).into_response()
     }
 }
 
