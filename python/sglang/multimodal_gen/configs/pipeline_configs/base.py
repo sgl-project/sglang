@@ -105,7 +105,7 @@ def shard_rotary_emb_for_sp(emb):
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
-    task_type: ModelTaskType
+    task_type: ModelTaskType = ModelTaskType.I2I
 
     model_path: str = ""
     pipeline_config_path: str | None = None
