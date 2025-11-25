@@ -697,10 +697,7 @@ def general_mm_embed_routine(
             # just being defensive here
             forward_batch.mm_inputs = None
         else:
-            if input_ids is None:
-                inputs_embeds = forward_batch.input_embeds
-            else:
-                inputs_embeds = embed_tokens(input_ids)
+            inputs_embeds = embed_tokens(input_ids)
     else:
         inputs_embeds = None
 
