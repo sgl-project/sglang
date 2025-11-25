@@ -48,7 +48,7 @@ class KVPoll:
 
 
 class BaseKVManager(ABC):
-    """Base class for managing transfers states"""
+    """Base class for managing transfer states"""
 
     @abstractmethod
     def __init__(
@@ -75,7 +75,7 @@ class BaseKVSender(ABC):
     @abstractmethod
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         """
-        Notify the decoder server about the kv indices length and aux index
+        Set req's index metadata locally or notify the decoder server about the kv indices length and aux index.
         """
         ...
 
@@ -86,21 +86,21 @@ class BaseKVSender(ABC):
         state_indices: Optional[List[int]] = None,
     ):
         """
-        Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server
+        Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
         """
         ...
 
     @abstractmethod
     def poll(self) -> KVPoll:
         """
-        Check the status of the kv cache transfer
+        Check the status of the kv cache transfer.
         """
         ...
 
     @abstractmethod
     def failure_exception(self):
         """
-        Raise an exception if the kv cache transfer fails
+        Raise an exception if the kv cache transfer fails.
         """
         ...
 
@@ -123,23 +123,35 @@ class BaseKVReceiver(ABC):
         state_indices: Optional[List[int]] = None,
     ):
         """
-        Notify the prefill server about the kv indices, aux index, and state_indices.
+        Set req's index metadata locally or notify the prefill server about the kv indices, aux index, and state_indices.
         """
         ...
 
     @abstractmethod
     def poll(self) -> KVPoll:
         """
-        Check the status of the kv cache transfer
+        Check the status of the kv cache transfer.
         """
         ...
 
     @abstractmethod
     def failure_exception(self):
         """
-        Raise an exception if the kv cache transfer fails
+        Raise an exception if the kv cache transfer fails.
         """
         ...
+
+    def clear(self):
+        """
+        Clear any internal states.
+        """
+        pass
+
+    def abort(self):
+        """
+        Abort the current transfer.
+        """
+        pass
 
 
 class BaseKVBootstrapServer(ABC):

@@ -16,13 +16,22 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
 from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.utils import is_npu
+
+is_npu = is_npu()
+
+if is_npu:
+    import torch_npu
+    from torch_npu.profiler import ProfilerActivity, profile
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +69,34 @@ class NPUGraphRunner(CudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int32
 
+    def _init_profile_context_and_memory_record(self):
+        output_dir = os.path.join(
+            os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp"), "graph_capture_profile"
+        )
+        if not Path(output_dir).exists():
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(
+            f"Profiling starts for graph capture for NPU. Traces will be saved to: {output_dir}"
+        )
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=[torch_npu.profiler.ExportType.Text],
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        )
+        profile_context = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+            record_shapes=True,
+            profile_memory=True,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                output_dir, async_mode=True
+            ),
+            experimental_config=experimental_config,
+        )
+        return profile_context
+
+    def _post_process_after_profile(self, prof_context):
+        # for NPU, profile data will be saved to disk for further analysis.
+        pass
+
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -70,8 +107,8 @@ class NPUGraphRunner(CudaGraphRunner):
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
-            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):

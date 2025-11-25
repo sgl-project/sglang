@@ -54,6 +54,7 @@ class SchedulerProfilerMixin:
         profile_by_stage: bool,
         profile_id: str,
         merge_profiles: bool = False,
+        profile_prefix: str = "",
     ) -> ProfileReqOutput:
         if self.profile_in_progress:
             return ProfileReqOutput(
@@ -74,6 +75,7 @@ class SchedulerProfilerMixin:
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
         self.profile_id = profile_id
+        self.profile_prefix = profile_prefix
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
@@ -139,7 +141,7 @@ class SchedulerProfilerMixin:
                 schema.writeSchema(connection)
                 connection.commit()
                 del connection
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(self.cpu_group)
 
             self.rpd_profiler = rpdTracerControl()
             self.rpd_profiler.setPythonTrace(True)
@@ -236,14 +238,14 @@ class SchedulerProfilerMixin:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(self.cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
             self.rpd_profiler.flush()
 
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(self.cpu_group)
             if self.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
@@ -327,6 +329,7 @@ class SchedulerProfilerMixin:
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
                     recv_req.merge_profiles,
+                    recv_req.profile_prefix,
                 )
             else:
                 self.init_profile(
@@ -339,6 +342,7 @@ class SchedulerProfilerMixin:
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
                     recv_req.merge_profiles,
+                    recv_req.profile_prefix,
                 )
                 return self.start_profile()
         else:

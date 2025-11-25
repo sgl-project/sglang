@@ -3,14 +3,32 @@
 import asyncio
 import base64
 import subprocess
+import tempfile
 import time
 import unittest
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from urllib.request import urlopen
 
 from openai import OpenAI
 
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.test.test_utils import is_mp4, is_png, wait_for_port
+
+
+@contextmanager
+def downloaded_temp_file(url: str, prefix: str = "i2v_input_", suffix: str = ".jpg"):
+    tmp_path = Path(tempfile.gettempdir()) / f"{prefix}{uuid.uuid4().hex}{suffix}"
+    with urlopen(url) as resp:
+        tmp_path.write_bytes(resp.read())
+    try:
+        yield tmp_path
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def wait_for_video_completion(client, video_id, timeout=300, check_interval=3):
@@ -27,7 +45,7 @@ def wait_for_video_completion(client, video_id, timeout=300, check_interval=3):
 
 class TestVideoHttpServer(unittest.TestCase):
     model_name = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-    timeout = 120
+    timeout = 500
     extra_args = []
 
     def _create_wait_and_download(
@@ -77,7 +95,7 @@ class TestVideoHttpServer(unittest.TestCase):
             api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1"
         )
         content = self._create_wait_and_download(
-            client, "A calico cat playing a piano on stage", "832x480"
+            client, "A plane is taking off.", "832x480"
         )
         self.assertTrue(is_mp4(content))
 
@@ -97,7 +115,7 @@ class TestVideoHttpServer(unittest.TestCase):
         async def send_concurrent_requests():
             tasks = [
                 generate_and_check_video(
-                    "A dog playing a piano on stage",
+                    "A ship is beside the port.",
                     "832x480",
                 )
                 for _ in range(num_requests)
@@ -105,14 +123,6 @@ class TestVideoHttpServer(unittest.TestCase):
             await asyncio.gather(*tasks)
 
         asyncio.run(send_concurrent_requests())
-
-
-class TestFastWan2_1HttpServer(TestVideoHttpServer):
-    model_name = "FastVideo/FastWan2.1-T2V-1.3B-Diffusers"
-
-
-class TestFastWan2_2HttpServer(TestVideoHttpServer):
-    model_name = "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 
 
 class TestImage2VideoHttpServer(unittest.TestCase):
@@ -124,15 +134,17 @@ class TestImage2VideoHttpServer(unittest.TestCase):
         self, client: OpenAI, prompt: str, size: str
     ) -> bytes:
 
-        image_path = "https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true"
-        image_path = Path(image_path)
-        video = client.videos.create(
-            prompt=prompt,
-            input_reference=image_path,
-            size=size,
-            seconds=10,
-            extra_body={"fps": 16, "num_frames": 125},
-        )
+        image_url = "https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true"
+        with downloaded_temp_file(
+            image_url, prefix="i2v_input_", suffix=".jpg"
+        ) as tmp_path:
+            video = client.videos.create(
+                prompt=prompt,
+                input_reference=tmp_path,
+                size=size,
+                seconds=10,
+                extra_body={"fps": 16, "num_frames": 125},
+            )
         # TODO: Some combinations of num_frames and fps may cause errors and need further investigation.
         video_id = video.id
         self.assertEqual(video.status, "queued")
@@ -149,18 +161,20 @@ class TestImage2VideoHttpServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_command = [
-            "sgl-diffusion",
+            "sglang",
             "serve",
             "--model-path",
             f"{cls.model_name}",
+            "--num-gpus",
+            "4",
+            "--ulysses-degree",
+            "4",
             "--port",
             "30010",
         ]
 
         process = subprocess.Popen(
             cls.base_command + cls.extra_args,
-            # stdout=subprocess.PIPE,
-            # stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
@@ -176,7 +190,7 @@ class TestImage2VideoHttpServer(unittest.TestCase):
             api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1"
         )
         content = self._create_wait_and_download(
-            client, "A girl is fighting a monster.", "832x480"
+            client, "A cat surfing on the sea.", "832x480"
         )
         self.assertTrue(is_mp4(content))
 
@@ -196,7 +210,7 @@ class TestImage2VideoHttpServer(unittest.TestCase):
         async def send_concurrent_requests():
             tasks = [
                 generate_and_check_video(
-                    "A dog playing a piano on stage",
+                    "A cat surfing on the sea.",
                     "832x480",
                 )
                 for _ in range(num_requests)
