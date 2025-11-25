@@ -463,7 +463,6 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
-        chunked_prefill_sizes: Optional[List[int]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -683,9 +682,6 @@ class Req:
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
-
-        # For dynamic chunked prefill
-        self.chunked_prefill_sizes = None
 
     @property
     def seqlen(self):
