@@ -384,14 +384,12 @@ impl ConfigValidator {
         let port_str = parts[1];
 
         // check host: must be "localhost" or valid IPv4 address
-        if host != "localhost" {
-            if Ipv4Addr::from_str(host).is_err() {
-                return Err(ConfigError::InvalidValue {
-                    field: "trace_config.otlp_traces_endpoint".to_string(),
-                    value: endpoint.clone(),
-                    reason: "host must be 'localhost' or a valid IPv4 address (e.g., 127.0.0.1)".to_string(),
-                });
-            }
+        if host != "localhost" && Ipv4Addr::from_str(host).is_err() {
+            return Err(ConfigError::InvalidValue {
+                field: "trace_config.otlp_traces_endpoint".to_string(),
+                value: endpoint.clone(),
+                reason: "host must be 'localhost' or a valid IPv4 address (e.g., 127.0.0.1)".to_string(),
+            });
         }
 
         // check port: must be 1~65535

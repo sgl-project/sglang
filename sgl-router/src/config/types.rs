@@ -918,7 +918,7 @@ mod tests {
     fn test_trace_config_default() {
         let config = TraceConfig::default();
 
-        assert_eq!(config.enable_trace, false);
+        assert!(!config.enable_trace);
         assert_eq!(config.otlp_traces_endpoint, "localhost:4317");
     }
 
@@ -929,7 +929,7 @@ mod tests {
             otlp_traces_endpoint: "otel-collector:4317".to_string(),
         };
 
-        assert_eq!(config.enable_trace, true);
+        assert!(config.enable_trace);
         assert_eq!(config.otlp_traces_endpoint, "otel-collector:4317");
     }
 

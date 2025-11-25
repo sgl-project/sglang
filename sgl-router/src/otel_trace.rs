@@ -56,9 +56,9 @@ where
         meta: &'static Metadata<'static>,
     ) -> tracing::subscriber::Interest {
         if self.allowed_targets.contains(meta.target()) {
-            return tracing::subscriber::Interest::always();
+            tracing::subscriber::Interest::always()
         } else {
-            return tracing::subscriber::Interest::never();
+            tracing::subscriber::Interest::never()
         }
     }
 }
@@ -199,5 +199,5 @@ pub fn inject_trace_context_http(headers: &mut HeaderMap) -> Result<()> {
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&context, &mut HeaderInjector(headers));
     });
-    return Ok(());
+    Ok(())
 }
