@@ -223,7 +223,13 @@ template <typename scalar_t>
 inline void
 copy_stub(at::Float8_e4m3fn* __restrict__ out, const scalar_t* __restrict__ src, int64_t size, float scale) {
   for (int64_t d = 0; d < size; ++d) {
-    out[d] = static_cast<at::Float8_e4m3fn>(src[d] * scale);
+    float scaled_src = static_cast<float>(src[d]) * scale;
+    if (scaled_src < FP8_MIN) {
+      scaled_src = FP8_MIN;
+    } else if (scaled_src > FP8_MAX) {
+      scaled_src = FP8_MAX;
+    }
+    out[d] = static_cast<at::Float8_e4m3fn>(scaled_src);
   }
 }
 
@@ -267,11 +273,12 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 //   B : [N, K] indexed
 //   C : [M, N]
 //
-template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
+template <typename scalar_t, typename kvcache_t, typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nt {
   static inline void apply(
       const scalar_t* __restrict__ A,
-      const scalar_t* __restrict__ B,
+      const kvcache_t* __restrict__ B,
+      const float* __restrict__ B_scale,
       float* __restrict__ C,
       const index_t* __restrict__ indices,
       float scale,
@@ -284,9 +291,11 @@ struct tinygemm_kernel_nt {
       for (int64_t n = 0; n < BLOCK_N; ++n) {
         float sum = 0.f;
         int64_t b_idx = indices[n];
+        float b_scale = B_scale != nullptr ? B_scale[b_idx] : 1.0f;
+        float new_scale = scale * b_scale;
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         for (int64_t k = 0; k < K; ++k) {
-          sum += scale * static_cast<float>(A[m * lda + k]) * static_cast<float>(B[b_idx * ldb + k]);
+          sum += new_scale * static_cast<float>(A[m * lda + k]) * static_cast<float>(B[b_idx * ldb + k]);
         }
         C[m * ldc + n] = sum;
       }
@@ -296,10 +305,11 @@ struct tinygemm_kernel_nt {
 
 #if defined(CPU_CAPABILITY_AVX512)
 template <typename index_t, int BLOCK_M, int BLOCK_N>
-struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
+struct tinygemm_kernel_nt<at::BFloat16, at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const at::BFloat16* __restrict__ A,
       const at::BFloat16* __restrict__ B,
+      const float* __restrict__ B_scale,
       float* __restrict__ C,
       const index_t* __restrict__ indices,
       float scale,
@@ -377,10 +387,11 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
 
 #if defined(CPU_CAPABILITY_AVX512)
 template <typename index_t, int BLOCK_M, int BLOCK_N>
-struct tinygemm_kernel_nt<at::Half, index_t, BLOCK_M, BLOCK_N> {
+struct tinygemm_kernel_nt<at::Half, at::Half, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const at::Half* __restrict__ A,
       const at::Half* __restrict__ B,
+      const float* __restrict__ B_scale,
       float* __restrict__ C,
       const index_t* __restrict__ indices,
       float scale,
@@ -462,9 +473,19 @@ struct tinygemm_kernel_nt<at::Half, index_t, BLOCK_M, BLOCK_N> {
 };
 #endif
 
-#define LAUNCH_TINYGEMM_KERNEL_NT(MB_SIZE, NB_SIZE)               \
-  tinygemm_kernel_nt<scalar_t, index_t, MB_SIZE, NB_SIZE>::apply( \
-      A + mb_start * lda, B, C + mb_start * ldc + nb_start, indices + nb_start, scale, lda, ldb, ldc, K, max_tokens);
+#define LAUNCH_TINYGEMM_KERNEL_NT(MB_SIZE, NB_SIZE)                          \
+  tinygemm_kernel_nt<scalar_t, kvcache_t, index_t, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                                    \
+      B,                                                                     \
+      B_scale,                                                               \
+      C + mb_start * ldc + nb_start,                                         \
+      indices + nb_start,                                                    \
+      scale,                                                                 \
+      lda,                                                                   \
+      ldb,                                                                   \
+      ldc,                                                                   \
+      K,                                                                     \
+      max_tokens);
 
 // this is used when N isn't multiple of 16,
 // N corresponds to `head_size_v` which should be 16x
@@ -472,6 +493,7 @@ template <typename scalar_t, typename index_t>
 inline void tinygemm_kernel_nn_scalar(
     const float* __restrict__ A,
     const scalar_t* __restrict__ B,
+    const float* __restrict__ B_scale,
     float* __restrict__ C,
     const index_t* __restrict__ indices,
     const float* __restrict__ scale,
@@ -487,8 +509,9 @@ inline void tinygemm_kernel_nn_scalar(
       C[m * ldc + n] *= scale[m];
       for (int64_t k = 0; k < K; ++k) {
         int64_t b_idx = indices[k];
+        float b_scale = B_scale != nullptr ? B_scale[b_idx] : 1.0f;
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-        C[m * ldc + n] += A[m * lda + k] * static_cast<float>(B[b_idx * ldb + n]);
+        C[m * ldc + n] += A[m * lda + k] * static_cast<float>(B[b_idx * ldb + n]) * b_scale;
       }
     }
   }
@@ -504,6 +527,7 @@ struct tinygemm_kernel_nn {
   static inline void apply(
       const float* __restrict__ A,
       const scalar_t* __restrict__ B,
+      const float* __restrict__ B_scale,
       float* __restrict__ C,
       const index_t* __restrict__ indices,
       const float* __restrict__ scale,
@@ -512,7 +536,7 @@ struct tinygemm_kernel_nn {
       int64_t ldc,
       int64_t K,
       int64_t max_tokens) {
-    tinygemm_kernel_nn_scalar(A, B, C, indices, scale, BLOCK_M, BLOCK_N, K, lda, ldb, ldc, max_tokens);
+    tinygemm_kernel_nn_scalar(A, B, B_scale, C, indices, scale, BLOCK_M, BLOCK_N, K, lda, ldb, ldc, max_tokens);
   }
 };
 
@@ -522,6 +546,7 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const float* __restrict__ A,
       const at::BFloat16* __restrict__ B,
+      const float* __restrict__ B_scale,
       float* __restrict__ C,
       const index_t* __restrict__ indices,
       const float* __restrict__ scale,
@@ -603,6 +628,7 @@ struct tinygemm_kernel_nn<at::Half, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const float* __restrict__ A,
       const at::Half* __restrict__ B,
+      const float* __restrict__ B_scale,
       float* __restrict__ C,
       const index_t* __restrict__ indices,
       const float* __restrict__ scale,
@@ -682,6 +708,7 @@ struct tinygemm_kernel_nn<at::Half, index_t, BLOCK_M, BLOCK_N> {
   tinygemm_kernel_nn<scalar_t, index_t, MB_SIZE, NB_SIZE>::apply( \
       A + mb_start * lda,                                         \
       B + nb_start,                                               \
+      B_scale,                                                    \
       C + mb_start * ldc + nb_start,                              \
       indices,                                                    \
       scale + mb_start,                                           \
@@ -691,10 +718,11 @@ struct tinygemm_kernel_nn<at::Half, index_t, BLOCK_M, BLOCK_N> {
       K,                                                          \
       max_tokens);
 
-template <typename scalar_t, typename index_t>
+template <typename scalar_t, typename kvcache_t, typename index_t>
 void index_gemm_kernel_nt(
     const scalar_t* __restrict__ A,
-    const scalar_t* __restrict__ B,
+    const kvcache_t* __restrict__ B,
+    const float* __restrict__ B_scale,
     float* __restrict__ C,
     const index_t* __restrict__ indices,
     float scale,
@@ -849,6 +877,7 @@ template <typename scalar_t, typename index_t>
 void index_gemm_kernel_nn(
     const float* __restrict__ A,
     const scalar_t* __restrict__ B,
+    const float* __restrict__ B_scale,
     float* __restrict__ C,
     const index_t* __restrict__ indices,
     float* __restrict__ scale,
@@ -860,8 +889,8 @@ void index_gemm_kernel_nn(
     int64_t ldc,
     int64_t max_tokens) {
   constexpr int kVecSize = 16;
-  if ((N & (kVecSize - 1)) != 0) {
-    tinygemm_kernel_nn_scalar(A, B, C, indices, scale, M, N, K, lda, ldb, ldc, max_tokens);
+  if (B_scale != nullptr || (N & (kVecSize - 1)) != 0) {
+    tinygemm_kernel_nn_scalar(A, B, B_scale, C, indices, scale, M, N, K, lda, ldb, ldc, max_tokens);
     return;
   }
 
@@ -1089,7 +1118,6 @@ void decode_set_kv_buffer(
     int64_t nv_strideN,
     int64_t nv_strideH,
     bool is_mla) {
-  constexpr float FP8_MAX = 448.0f;
   constexpr float eps = 1e-12;
   at::parallel_for(0, batches, 0, [&](int64_t begin, int64_t end) {
     int64_t bs{0};
@@ -1185,13 +1213,15 @@ void decode_accumulate_kv_splits(
   });
 }
 
-template <typename scalar_t, typename index_t, int64_t BLOCK_N>
+template <typename scalar_t, typename kvcache_t, typename index_t, int64_t BLOCK_N>
 void decode_attention_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
+    const kvcache_t* __restrict__ k_buffer,
+    const kvcache_t* __restrict__ v_buffer,
+    const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale,
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
@@ -1255,9 +1285,10 @@ void decode_attention_kernel_impl(
         int64_t n_size = std::min(BLOCK_N, kv_end - n);
 
         // calculate s_i <- scale * Q @ K
-        index_gemm_kernel_nt<scalar_t, index_t>(
+        index_gemm_kernel_nt<scalar_t, kvcache_t, index_t>(
             /* A   */ q_ptr,
             /* B   */ k_buffer + head_id * k_strideH,
+            /* B_scale */ k_scale,
             /* C   */ s_i,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
             /* scl */ scaling,
@@ -1295,9 +1326,10 @@ void decode_attention_kernel_impl(
         m_prime = m_i;
 
         // calculate V' <- s_delta @ V + V' * m_delta
-        index_gemm_kernel_nn<scalar_t, index_t>(
+        index_gemm_kernel_nn<kvcache_t, index_t>(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_id * v_strideH,
+            /* B_scale */ v_scale,
             /* C   */ v_prime,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
             /* scl */ &m_delta,
@@ -1522,13 +1554,15 @@ void decode_attention_mla_kernel_impl(
       output, attn_logits, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2);
 }  // MLA
 
-template <typename scalar_t, typename index_t, int64_t BLOCK_N>
+template <typename scalar_t, typename kvcache_t, typename index_t, int64_t BLOCK_N>
 void decode_attention_grouped_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
+    const kvcache_t* __restrict__ k_buffer,
+    const kvcache_t* __restrict__ v_buffer,
+    const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale,
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
@@ -1612,9 +1646,10 @@ void decode_attention_grouped_kernel_impl(
         int64_t n_size = std::min(BLOCK_N, kv_end - n);
 
         // calculate Q @ K
-        index_gemm_kernel_nt<scalar_t, index_t>(
+        index_gemm_kernel_nt<scalar_t, kvcache_t, index_t>(
             /* A   */ q_ptr,
             /* B   */ k_buffer + head_kv_id * k_strideH,
+            /* B_scale */ k_scale,
             /* C   */ s_i,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
             /* scl */ scaling,
@@ -1656,9 +1691,10 @@ void decode_attention_grouped_kernel_impl(
         }
 
         // calculate V' <- s_delta @ V + V' * m_delta
-        index_gemm_kernel_nn<scalar_t, index_t>(
+        index_gemm_kernel_nn<kvcache_t, index_t>(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_kv_id * v_strideH,
+            /* B_scale */ v_scale,
             /* C   */ v_prime,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
             /* scl */ m_delta,
@@ -1827,7 +1863,36 @@ void decode_attention_cpu(
             nv_strideN,
             nv_strideH,
             is_mla);
-        if (is_mla) {
+        if (num_heads == num_heads_kv) {
+          // MHA
+          decode_attention_kernel_impl<scalar_t, at::Float8_e4m3fn, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const at::Float8_e4m3fn*)k_buffer_data,
+              (const at::Float8_e4m3fn*)v_buffer_data,
+              k_scale.data_ptr<float>(),
+              v_scale.data_ptr<float>(),
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              num_seqs,
+              num_heads,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens);
+        } else if (is_mla) {
           decode_attention_mla_kernel_impl<scalar_t, at::Float8_e4m3fn, index_t, BLOCK_N>(
               output.data_ptr<scalar_t>(),
               attn_logits.data_ptr<float>(),
@@ -1857,6 +1922,36 @@ void decode_attention_cpu(
               max_context_len,
               max_total_num_tokens,
               size_per_thread);
+        } else {
+          // GQA/MQA
+          decode_attention_grouped_kernel_impl<scalar_t, at::Float8_e4m3fn, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const at::Float8_e4m3fn*)k_buffer_data,
+              (const at::Float8_e4m3fn*)v_buffer_data,
+              k_scale.data_ptr<float>(),
+              v_scale.data_ptr<float>(),
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              num_seqs,
+              num_heads,
+              num_heads_kv,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens);
         }
       } else {
         decode_set_kv_buffer(
@@ -1880,12 +1975,14 @@ void decode_attention_cpu(
             is_mla);
         if (num_heads == num_heads_kv) {
           // MHA
-          decode_attention_kernel_impl<scalar_t, index_t, BLOCK_N>(
+          decode_attention_kernel_impl<scalar_t, scalar_t, index_t, BLOCK_N>(
               output.data_ptr<scalar_t>(),
               attn_logits.data_ptr<float>(),
               query.data_ptr<scalar_t>(),
               (const scalar_t*)k_buffer_data,
               (const scalar_t*)v_buffer_data,
+              nullptr,
+              nullptr,
               req_to_token.data_ptr<index_t>(),
               req_pool_indices.data_ptr<int64_t>(),
               seq_lens.data_ptr<int64_t>(),
@@ -1938,12 +2035,14 @@ void decode_attention_cpu(
               size_per_thread);
         } else {
           // GQA/MQA
-          decode_attention_grouped_kernel_impl<scalar_t, index_t, BLOCK_N>(
+          decode_attention_grouped_kernel_impl<scalar_t, scalar_t, index_t, BLOCK_N>(
               output.data_ptr<scalar_t>(),
               attn_logits.data_ptr<float>(),
               query.data_ptr<scalar_t>(),
               (const scalar_t*)k_buffer_data,
               (const scalar_t*)v_buffer_data,
+              nullptr,
+              nullptr,
               req_to_token.data_ptr<index_t>(),
               req_pool_indices.data_ptr<int64_t>(),
               seq_lens.data_ptr<int64_t>(),

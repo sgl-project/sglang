@@ -111,6 +111,8 @@ class TestDecodeAttention(CustomTestCase):
             q,
             k_buffer,
             v_buffer,
+            None,
+            None,
             o,
             key,
             value,
@@ -141,6 +143,100 @@ class TestDecodeAttention(CustomTestCase):
         self.assertGreater(cos_sim.item(), 0.99)
         torch.testing.assert_close(o, o_grouped, atol=3e-2, rtol=1e-6)
 
+    def _test_grouped_decode_attention_fp8kvcache_once(
+        self, B, H_Q, H_KV, D, D_V, dtype, device
+    ):
+        # This represents the number of tokens already in the sequence
+        seq_len = 1024
+        total_tokens = B * seq_len
+        sm_scale = 1.0 / (D**0.5)
+        logit_cap = 0.0
+        num_kv_splits = 8
+        enable_gqa = H_Q != H_KV
+
+        # q represents the new token being generated, one per batch
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+
+        # k_buffer and v_buffer represent all previous tokens
+        k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+        v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=device)
+        from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+        k_scale = torch.empty((total_tokens, 1, 1), dtype=torch.float32)
+        v_scale = torch.empty((total_tokens, 1, 1), dtype=torch.float32)
+        k_buffer_fp8, k_scale0 = input_to_float8(k_buffer)
+        v_buffer_fp8, v_scale0 = input_to_float8(v_buffer)
+        k_scale.copy_(k_scale0)
+        v_scale.copy_(v_scale0)
+        k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
+        v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
+
+        key = torch.randn(B, H_KV, D, dtype=dtype)
+        value = torch.randn(B, H_KV, D_V, dtype=dtype)
+        loc = torch.randint(0, 10, (B,)).to(torch.int64)
+
+        # set kv cache
+        k_buffer[loc] = key
+        v_buffer[loc] = value
+
+        # o will have the same shape as q
+        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
+        o_grouped = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
+
+        req_to_token = (
+            torch.arange(total_tokens, device=device)
+            .reshape(B, seq_len)
+            .to(torch.int32)
+        )
+        b_req_idx = torch.arange(B, device=device).to(torch.int64)
+        b_seq_len = torch.full((B,), seq_len, device=device).to(torch.int64)
+
+        attn_logits = torch.empty(
+            (B, H_Q, num_kv_splits, D_V + 1),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        # k_buffer, v_buffer, query, key and value supports non-contiguous tensors
+        k_buffer = k_buffer.transpose(0, 1).contiguous().transpose(0, 1)
+        v_buffer = v_buffer.transpose(0, 1).contiguous().transpose(0, 1)
+        q = q.transpose(0, 1).contiguous().transpose(0, 1)
+        key = key.transpose(0, 1).contiguous().transpose(0, 1)
+        value = value.transpose(0, 1).contiguous().transpose(0, 1)
+        torch.ops.sgl_kernel.decode_attention_cpu(
+            q,
+            k_buffer_fp8,
+            v_buffer_fp8,
+            k_scale,
+            v_scale,
+            o,
+            key,
+            value,
+            loc,
+            attn_logits,
+            req_to_token,
+            b_req_idx,
+            b_seq_len,
+            sm_scale,
+            logit_cap,
+        )
+        self._run_sdpa_forward_decode(
+            q,
+            o_grouped,
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            b_req_idx,
+            b_seq_len,
+            scaling=sm_scale,
+            enable_gqa=enable_gqa,
+        )
+        cos_sim = torch.nn.functional.cosine_similarity(
+            o.flatten(), o_grouped.flatten(), dim=0
+        )
+        self.assertGreater(cos_sim.item(), 0.99)
+        torch.testing.assert_close(o, o_grouped, atol=3e-2, rtol=1e-6)
+
     def _test_grouped_decode_attention(self, device="cuda"):
         configs = [
             (2, 16, 16, 64, 64),
@@ -159,6 +255,9 @@ class TestDecodeAttention(CustomTestCase):
         for B, H_Q, H_KV, D, D_V in configs:
             for dtype in [torch.bfloat16, torch.float16]:
                 self._test_grouped_decode_attention_once(
+                    B, H_Q, H_KV, D, D_V, dtype=dtype, device=device
+                )
+                self._test_grouped_decode_attention_fp8kvcache_once(
                     B, H_Q, H_KV, D, D_V, dtype=dtype, device=device
                 )
 

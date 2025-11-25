@@ -120,6 +120,9 @@ namespace {
 // grain size for each thread
 constexpr int GRAIN_SIZE = 1024;
 
+constexpr float FP8_MAX = 448.0f;
+constexpr float FP8_MIN = -FP8_MAX;
+
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
   return (x + y - 1) / y;
