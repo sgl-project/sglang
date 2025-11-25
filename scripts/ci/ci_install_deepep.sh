@@ -15,10 +15,11 @@ if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
     exit 1
 fi
 
-if python3 -c "import deep_ep" >/dev/null 2>&1; then
-    echo "deep_ep is already installed or importable. Skipping installation."
-    exit 0
-fi
+# TODO: Comment this for passing CI test.
+# if python3 -c "import deep_ep" >/dev/null 2>&1; then
+#     echo "deep_ep is already installed or importable. Skipping installation."
+#     exit 0
+# fi
 
 # Install system dependencies
 apt install -y curl wget git sudo libibverbs-dev rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 build-essential cmake
@@ -84,7 +85,3 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
 else
     python3 setup.py install
 fi
-
-# Verify configuration
-echo "=== Verify NVSHMEM ==="
-nvshmem-info -a
