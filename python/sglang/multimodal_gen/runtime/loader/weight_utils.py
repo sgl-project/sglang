@@ -16,6 +16,13 @@ import torch
 from safetensors.torch import safe_open
 from tqdm.auto import tqdm
 
+try:
+    from runai_model_streamer import SafetensorsStreamer
+
+    HAS_RUNAI_MODEL_STREAMER = True
+except ImportError:
+    HAS_RUNAI_MODEL_STREAMER = False
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -118,22 +125,38 @@ _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elap
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
+    use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
-    device = "cpu" if to_cpu else str(get_local_torch_device())
-    for st_file in tqdm(
-        hf_weights_files,
-        desc="Loading safetensors checkpoint shards",
-        disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
-    ):
-        with safe_open(st_file, framework="pt", device=device) as f:
-            for name in f.keys():  # noqa: SIM118
-                param = f.get_tensor(name)
-                yield name, param
+    if use_runai_model_streamer:
+        name2weights = {}
+        with SafetensorsStreamer() as streamer:
+            streamer.stream_files(hf_weights_files)
+            for name, tensor in streamer.get_tensors():
+                if not to_cpu:
+                    tensor = tensor.to(str(get_local_torch_device()), non_blocking=True)
+                else:
+                    tensor = tensor.clone()
+                name2weights[name] = tensor
+
+        torch.cuda.synchronize()
+        for name, tensor in name2weights.items():
+            yield name, tensor
+    else:
+        enable_tqdm = (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        )
+        device = "cpu" if to_cpu else str(get_local_torch_device())
+        for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        ):
+            with safe_open(st_file, framework="pt", device=device) as f:
+                for name in f.keys():  # noqa: SIM118
+                    param = f.get_tensor(name)
+                    yield name, param
 
 
 def pt_weights_iterator(
