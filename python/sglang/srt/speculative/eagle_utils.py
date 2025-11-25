@@ -365,7 +365,7 @@ class HiddenStateDumper:
 
 def dump_hidden_states(
     dump_path: str,
-    hidden_states: torch.Tensor,
+    last_hidden_states: torch.Tensor,
     aux_hidden_states: torch.Tensor,
     origin_input_ids: List[int],
     output_ids: List[int],
@@ -378,7 +378,7 @@ def dump_hidden_states(
     save_dict = {
         "input_ids": input_ids,
         "loss_mask": loss_mask,
-        "hidden_state": hidden_states,
+        "hidden_state": last_hidden_states,
         "aux_hidden_state": aux_hidden_states,
     }
     torch.save(save_dict, dump_path)
