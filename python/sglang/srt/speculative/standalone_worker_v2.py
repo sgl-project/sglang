@@ -109,8 +109,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
-
-        from sglang.srt.speculative.eagle_utils import TreeMaskMode
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)

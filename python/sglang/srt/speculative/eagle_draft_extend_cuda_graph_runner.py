@@ -35,7 +35,6 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
-
 class EAGLEDraftExtendCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
         # Parse args
