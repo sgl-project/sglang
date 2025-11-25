@@ -101,9 +101,9 @@ def run_a_suite(args):
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
     if not test_files:
-        raise ValueError(
-            f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}"
-        )
+        print(f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}")
+        print("This is expected during incremental migration. Skipping.")
+        return
 
     if auto_partition_size:
         test_files = auto_partition(test_files, auto_partition_id, auto_partition_size)
