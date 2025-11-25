@@ -60,8 +60,11 @@ class PeakMemoryMonitor(threading.Thread):
             if usages:
                 return max(usages) / 1024
             return 0.0
-        except Exception as e:
-            print(f"[Monitor Error] Failed to detect total memory: {e}")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"[Monitor Error] Failed to run nvidia-smi to detect total memory: {e}")
+            return 1.0  # Avoid division by zero later, safe fallback
+        except ValueError as e:
+            print(f"[Monitor Error] Failed to parse memory size from nvidia-smi output: {e}")
             return 1.0  # Avoid division by zero later, safe fallback
 
     def run(self):
@@ -89,8 +92,9 @@ class PeakMemoryMonitor(threading.Thread):
                         # Update the High-Water Mark
                         if current_max_gb > self.peak_memory_gb:
                             self.peak_memory_gb = current_max_gb
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Monitor Error] Polling nvidia-smi failed: {e}. Stopping monitor.")
+                break
 
             time.sleep(self.interval)
 
@@ -211,9 +215,7 @@ class TestVLMPeakMemory(unittest.TestCase):
         # Check against the Ratio (Dynamic Threshold)
         if peak_usage > safe_limit_gb:
             print(f"WARNING: Peak usage exceeded safe threshold!")
-            # We can choose to fail here, or just warn.
-            # Given this is a stress test, failing on OOM-risk is reasonable.
-            # self.fail(f"Memory usage {peak_usage:.2f}GB > {safe_limit_gb:.2f}GB")
+            self.fail(f"Memory usage {peak_usage:.2f}GB > {safe_limit_gb:.2f}GB")
         else:
             print(
                 f"Memory usage is within safe limits (< {self.MAX_MEMORY_USAGE_RATIO*100}%)."
