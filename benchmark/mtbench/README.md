@@ -26,19 +26,18 @@ python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3-8B-Instruct --sp
 python3 bench_sglang_eagle.py --num-questions 80 --parallel 1
 ```
 
-### Benchmark sglang EAGLE3 with AdaServe
+### Benchmark sglang EAGLE3 with dynamic speculative decoding
 ```
 python3 -m sglang.launch_server \
-    --model Qwen/Qwen3-8B \
+    --model deepseek-ai/DeepSeek-R1-Distill-Qwen-14B \
     --watchdog-timeout 300 \
-    --disable-cuda-graph \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path Zjcxy-SmartAI/Eagle3-Qwen3-8B-zh \
+    --speculative-draft-model-path  QiaolingChen/EAGLE3-DeepSeek-R1-Distill-Qwen-14B \
     --speculative-num-steps 5 \
     --speculative-eagle-topk 8 \
     --speculative-num-draft-tokens 32 \
     --enable-dynamic-spec \
-    --speculative-batch-size-threshold 30 \
+    --speculative-batch-size-threshold 16 \
     --dtype bfloat16 \
     --host 0.0.0.0 \
     --port 30000 \
