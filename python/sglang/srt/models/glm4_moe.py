@@ -582,10 +582,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
-        shared_output = None
-        if hasattr(self, "shared_experts") and hidden_states.shape[0] > 0:
-            shared_output = self.shared_experts(hidden_states)
-        return shared_output
+        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            return self.shared_experts(hidden_states)
+        else:
+            return None
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
