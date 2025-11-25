@@ -41,6 +41,8 @@ class UsageProcessor:
         return UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=cached_details,
             reasoning_tokens=reasoning_tokens,
         )
 
