@@ -9,7 +9,7 @@ pub mod stages;
 
 // Re-export main types
 pub use context::{
-    ChatDependencies, ChatProcessingState, ChatRequestContext, ChatRequestInput,
-    DiscoveryOutput, PayloadOutput, ValidationOutput,
+    ChatDependencies, ChatProcessingState, ChatRequestContext, ChatRequestInput, DiscoveryOutput,
+    PayloadOutput, ValidationOutput,
 };
 pub use pipeline::ChatPipeline;

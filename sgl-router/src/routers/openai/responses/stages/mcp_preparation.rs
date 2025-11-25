@@ -11,13 +11,10 @@ use axum::response::Response;
 use serde_json::Value;
 
 use super::ResponsesStage;
-use crate::{
-    protocols::responses::ResponseInput,
-    routers::openai::{
-        mcp::{ensure_request_mcp_client, ToolLoopState},
-        responses::{McpOutput, ResponsesRequestContext},
-        utils::event_types,
-    },
+use crate::routers::openai::{
+    mcp::{ensure_request_mcp_client, ToolLoopState},
+    responses::{McpOutput, ResponsesRequestContext},
+    utils::event_types,
 };
 
 /// MCP preparation stage for responses pipeline
@@ -142,8 +139,7 @@ mod tests {
         mcp::{config::McpConfig, McpManager},
         protocols::responses::{ResponseInput, ResponsesRequest},
         routers::openai::responses::{
-            ContextOutput, DiscoveryOutput, PayloadOutput, ResponsesDependencies,
-            ValidationOutput,
+            ContextOutput, DiscoveryOutput, PayloadOutput, ResponsesDependencies, ValidationOutput,
         },
     };
 
@@ -192,12 +188,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies().await;
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ResponsesRequestContext::new(Arc::new(request), None, None, dependencies);
 
         // Set prerequisites
         ctx.state.validation = Some(ValidationOutput {
@@ -229,7 +220,7 @@ mod tests {
         assert!(ctx.state.mcp.is_some());
 
         let mcp = ctx.state.mcp.unwrap();
-        assert_eq!(mcp.active, false);
+        assert!(!mcp.active);
         assert_eq!(mcp.max_iterations, 0);
     }
 
@@ -242,12 +233,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies().await;
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ResponsesRequestContext::new(Arc::new(request), None, None, dependencies);
 
         // Set prerequisites
         ctx.state.validation = Some(ValidationOutput {

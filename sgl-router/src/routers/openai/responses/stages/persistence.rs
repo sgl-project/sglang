@@ -17,7 +17,10 @@ use tracing::warn;
 use super::ResponsesStage;
 use crate::routers::openai::{
     conversations::persist_conversation_items,
-    responses::{utils::{mask_tools_as_mcp, patch_streaming_response_json}, ResponsesRequestContext},
+    responses::{
+        utils::{mask_tools_as_mcp, patch_streaming_response_json},
+        ResponsesRequestContext,
+    },
 };
 
 /// Persistence stage for responses pipeline
@@ -94,11 +97,13 @@ mod tests {
         },
         mcp::{config::McpConfig, McpManager},
         protocols::responses::{ResponseInput, ResponsesRequest},
-        routers::openai::responses::{
-            ContextOutput, DiscoveryOutput, McpOutput, PayloadOutput, ProcessedResponse,
-            ResponsesDependencies, ValidationOutput,
+        routers::openai::{
+            mcp::ToolLoopState,
+            responses::{
+                ContextOutput, DiscoveryOutput, McpOutput, PayloadOutput, ProcessedResponse,
+                ResponsesDependencies, ValidationOutput,
+            },
         },
-        routers::openai::mcp::ToolLoopState,
     };
 
     async fn create_test_dependencies() -> Arc<ResponsesDependencies> {

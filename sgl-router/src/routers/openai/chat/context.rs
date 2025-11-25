@@ -10,8 +10,7 @@ use dashmap::DashMap;
 use serde_json::Value;
 
 use crate::{
-    core::CircuitBreaker,
-    protocols::chat::ChatCompletionRequest,
+    core::CircuitBreaker, protocols::chat::ChatCompletionRequest,
     routers::openai::router::CachedEndpoint,
 };
 
@@ -64,7 +63,6 @@ pub struct ChatProcessingState {
 
     // Stage 3: Request Building output
     pub payload: Option<PayloadOutput>,
-
     // Note: No execution or response fields
     // RequestExecution stage returns Response directly via Ok(Some(response))
 }
@@ -134,6 +132,9 @@ impl ChatRequestContext {
 
     /// Get model name
     pub fn model(&self) -> &str {
-        self.input.model_id.as_deref().unwrap_or(&self.input.request.model)
+        self.input
+            .model_id
+            .as_deref()
+            .unwrap_or(&self.input.request.model)
     }
 }

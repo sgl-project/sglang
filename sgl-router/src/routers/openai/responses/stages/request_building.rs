@@ -95,9 +95,7 @@ impl ResponsesStage for ResponsesRequestBuildingStage {
                                     .unwrap_or(&"new".to_string())
                             ),
                             role: "user".to_string(),
-                            content: vec![ResponseContentPart::InputText {
-                                text: text.clone(),
-                            }],
+                            content: vec![ResponseContentPart::InputText { text: text.clone() }],
                             status: Some("completed".to_string()),
                         });
                     }
@@ -153,8 +151,7 @@ impl ResponsesStage for ResponsesRequestBuildingStage {
                 // XAI doesn't support the full OpenAI item type input
                 // Strip extra fields from input messages (id, status)
                 // Normalize content types: output_text -> input_text
-                if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut)
-                {
+                if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut) {
                     for item_obj in input_arr.iter_mut().filter_map(Value::as_object_mut) {
                         // Remove fields not universally supported
                         item_obj.remove("id");
@@ -260,12 +257,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies().await;
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ResponsesRequestContext::new(Arc::new(request), None, None, dependencies);
 
         // Set prerequisite state
         ctx.state.validation = Some(ValidationOutput {
@@ -290,7 +282,7 @@ mod tests {
         assert!(ctx.state.payload.is_some());
 
         let payload = ctx.state.payload.unwrap();
-        assert_eq!(payload.is_streaming, false);
+        assert!(!payload.is_streaming);
         assert!(payload.json_payload.is_object());
 
         // Check SGLang fields are stripped
@@ -309,12 +301,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies().await;
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ResponsesRequestContext::new(Arc::new(request), None, None, dependencies);
 
         ctx.state.validation = Some(ValidationOutput {
             auth_header: None,
@@ -349,7 +336,10 @@ mod tests {
         let payload_obj = payload.json_payload.as_object().unwrap();
 
         // Check input is Items (not Text) because history was injected
-        assert!(payload_obj.get("input").and_then(|v| v.as_array()).is_some());
+        assert!(payload_obj
+            .get("input")
+            .and_then(|v| v.as_array())
+            .is_some());
         let input_arr = payload_obj.get("input").and_then(|v| v.as_array()).unwrap();
         assert_eq!(input_arr.len(), 2); // Previous message + new message
     }

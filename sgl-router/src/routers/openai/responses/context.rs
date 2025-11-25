@@ -11,17 +11,14 @@ use dashmap::DashMap;
 use reqwest::StatusCode;
 use serde_json::Value;
 
+use super::super::mcp::ToolLoopState;
 use crate::{
     core::CircuitBreaker,
-    data_connector::{
-        ConversationItemStorage, ConversationStorage, ResponseStorage,
-    },
+    data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     mcp::McpManager,
     protocols::responses::{ResponseInputOutputItem, ResponsesRequest},
     routers::openai::router::CachedEndpoint,
 };
-
-use super::super::mcp::ToolLoopState;
 
 // ============================================================================
 // Responses Request Context
@@ -196,6 +193,9 @@ impl ResponsesRequestContext {
 
     /// Get model name
     pub fn model(&self) -> &str {
-        self.input.model_id.as_deref().unwrap_or(&self.input.request.model)
+        self.input
+            .model_id
+            .as_deref()
+            .unwrap_or(&self.input.request.model)
     }
 }

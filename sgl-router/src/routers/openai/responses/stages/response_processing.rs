@@ -81,7 +81,9 @@ impl ResponsesStage for ResponsesResponseProcessingStage {
                 ctx.request(),
                 &ctx.dependencies.mcp_manager,
                 &mcp_config,
-            ).await {
+            )
+            .await
+            {
                 Ok(json) => json,
                 Err(e) => {
                     return Err((
@@ -123,7 +125,9 @@ impl ResponsesStage for ResponsesResponseProcessingStage {
         };
 
         // Store processed response
-        ctx.state.processed = Some(ProcessedResponse { json_response: response_json });
+        ctx.state.processed = Some(ProcessedResponse {
+            json_response: response_json,
+        });
 
         Ok(None) // Continue to persistence stage
     }

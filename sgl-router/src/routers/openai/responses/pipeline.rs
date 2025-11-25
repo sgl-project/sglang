@@ -22,9 +22,8 @@ use tracing::{debug, error};
 
 use super::{
     stages::{
-        ResponsesContextLoadingStage, ResponsesMcpPreparationStage,
-        ResponsesModelDiscoveryStage, ResponsesPersistenceStage,
-        ResponsesRequestBuildingStage, ResponsesRequestExecutionStage,
+        ResponsesContextLoadingStage, ResponsesMcpPreparationStage, ResponsesModelDiscoveryStage,
+        ResponsesPersistenceStage, ResponsesRequestBuildingStage, ResponsesRequestExecutionStage,
         ResponsesResponseProcessingStage, ResponsesStage, ResponsesValidationStage,
     },
     ResponsesDependencies, ResponsesRequestContext,
@@ -187,7 +186,7 @@ mod tests {
         let response = pipeline.execute(request, None, None).await;
 
         // Should return error response (400 Bad Request)
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -210,9 +209,6 @@ mod tests {
         let response = pipeline.execute(request, None, None).await;
 
         // Should return service unavailable
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

@@ -149,12 +149,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies(vec!["http://localhost:8000".to_string()]);
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         // Set validation output
         ctx.state.validation = Some(ValidationOutput {
@@ -182,12 +177,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies(vec!["http://localhost:8000".to_string()]);
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         // Don't set validation output
         let stage = ChatModelDiscoveryStage;
@@ -218,12 +208,7 @@ mod tests {
             },
         );
 
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         ctx.state.validation = Some(ValidationOutput {
             auth_header: None,

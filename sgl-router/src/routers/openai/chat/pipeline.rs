@@ -18,8 +18,8 @@ use tracing::{debug, error};
 
 use super::{
     stages::{
-        ChatModelDiscoveryStage, ChatRequestBuildingStage, ChatRequestExecutionStage,
-        ChatStage, ChatValidationStage,
+        ChatModelDiscoveryStage, ChatRequestBuildingStage, ChatRequestExecutionStage, ChatStage,
+        ChatValidationStage,
     },
     ChatDependencies, ChatRequestContext,
 };
@@ -63,12 +63,8 @@ impl ChatPipeline {
         model_id: Option<String>,
     ) -> Response {
         // Create request context
-        let mut ctx = ChatRequestContext::new(
-            request,
-            headers,
-            model_id,
-            Arc::clone(&self.dependencies),
-        );
+        let mut ctx =
+            ChatRequestContext::new(request, headers, model_id, Arc::clone(&self.dependencies));
 
         // Execute stages sequentially
         for (i, stage) in self.stages.iter().enumerate() {
@@ -154,7 +150,7 @@ mod tests {
         let response = pipeline.execute(request, None, None).await;
 
         // Should return error response (400 Bad Request)
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -180,9 +176,6 @@ mod tests {
         let response = pipeline.execute(request, None, None).await;
 
         // Should return service unavailable
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

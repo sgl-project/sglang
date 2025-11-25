@@ -65,7 +65,7 @@ mod tests {
     use crate::{
         core::CircuitBreaker,
         protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        routers::openai::chat::{ChatDependencies, ChatRequestInput},
+        routers::openai::chat::ChatDependencies,
     };
 
     fn create_test_dependencies() -> Arc<ChatDependencies> {
@@ -100,12 +100,7 @@ mod tests {
         );
 
         let dependencies = create_test_dependencies();
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            Some(headers),
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), Some(headers), None, dependencies);
 
         let stage = ChatValidationStage;
         let result = stage.execute(&mut ctx).await;
@@ -114,7 +109,10 @@ mod tests {
         assert!(ctx.state.validation.is_some());
 
         let validation = ctx.state.validation.unwrap();
-        assert_eq!(validation.auth_header, Some("Bearer test-token".to_string()));
+        assert_eq!(
+            validation.auth_header,
+            Some("Bearer test-token".to_string())
+        );
     }
 
     #[tokio::test]
@@ -132,12 +130,7 @@ mod tests {
             dependencies.circuit_breaker.record_failure();
         }
 
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         let stage = ChatValidationStage;
         let result = stage.execute(&mut ctx).await;
@@ -154,12 +147,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies();
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         let stage = ChatValidationStage;
         let result = stage.execute(&mut ctx).await;

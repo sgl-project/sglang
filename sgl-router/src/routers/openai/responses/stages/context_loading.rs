@@ -275,12 +275,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies().await;
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ResponsesRequestContext::new(Arc::new(request), None, None, dependencies);
 
         ctx.state.validation = Some(ValidationOutput {
             auth_header: None,
@@ -310,12 +305,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies().await;
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ResponsesRequestContext::new(Arc::new(request), None, None, dependencies);
 
         ctx.state.validation = Some(ValidationOutput {
             auth_header: None,

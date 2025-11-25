@@ -99,7 +99,6 @@ mod tests {
     use std::{sync::Arc, time::Instant};
 
     use dashmap::DashMap;
-    use serde_json::json;
 
     use super::*;
     use crate::{
@@ -135,12 +134,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies();
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         // Set prerequisite state
         ctx.state.validation = Some(ValidationOutput {
@@ -159,7 +153,7 @@ mod tests {
         assert!(ctx.state.payload.is_some());
 
         let payload = ctx.state.payload.unwrap();
-        assert_eq!(payload.is_streaming, false);
+        assert!(!payload.is_streaming);
         assert!(payload.json_payload.is_object());
 
         // Check SGLang fields are stripped
@@ -178,12 +172,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies();
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         // Set validation but not discovery
         ctx.state.validation = Some(ValidationOutput {
@@ -207,12 +196,7 @@ mod tests {
 
         // Add SGLang-specific fields (not normally in ChatCompletionRequest, but testing serialization)
         let dependencies = create_test_dependencies();
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         ctx.state.validation = Some(ValidationOutput {
             auth_header: None,
@@ -233,7 +217,11 @@ mod tests {
 
         // Verify SGLang fields are not present
         for field in SGLANG_CHAT_FIELDS.iter() {
-            assert!(!payload_obj.contains_key(*field), "Field {} should be stripped", field);
+            assert!(
+                !payload_obj.contains_key(*field),
+                "Field {} should be stripped",
+                field
+            );
         }
     }
 
@@ -247,12 +235,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies();
-        let mut ctx = ChatRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ChatRequestContext::new(Arc::new(request), None, None, dependencies);
 
         ctx.state.validation = Some(ValidationOutput {
             auth_header: None,

@@ -125,12 +125,8 @@ mod tests {
         );
 
         let dependencies = create_test_dependencies().await;
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            Some(headers),
-            None,
-            dependencies,
-        );
+        let mut ctx =
+            ResponsesRequestContext::new(Arc::new(request), Some(headers), None, dependencies);
 
         let stage = ResponsesValidationStage;
         let result = stage.execute(&mut ctx).await;
@@ -140,7 +136,10 @@ mod tests {
         assert!(ctx.state.validation.is_some());
 
         let validation = ctx.state.validation.unwrap();
-        assert_eq!(validation.auth_header, Some("Bearer test-token".to_string()));
+        assert_eq!(
+            validation.auth_header,
+            Some("Bearer test-token".to_string())
+        );
     }
 
     #[tokio::test]
@@ -158,12 +157,7 @@ mod tests {
             dependencies.circuit_breaker.record_failure();
         }
 
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ResponsesRequestContext::new(Arc::new(request), None, None, dependencies);
 
         let stage = ResponsesValidationStage;
         let result = stage.execute(&mut ctx).await;
@@ -180,12 +174,7 @@ mod tests {
         };
 
         let dependencies = create_test_dependencies().await;
-        let mut ctx = ResponsesRequestContext::new(
-            Arc::new(request),
-            None,
-            None,
-            dependencies,
-        );
+        let mut ctx = ResponsesRequestContext::new(Arc::new(request), None, None, dependencies);
 
         let stage = ResponsesValidationStage;
         let result = stage.execute(&mut ctx).await;

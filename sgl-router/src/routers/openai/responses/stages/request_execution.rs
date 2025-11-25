@@ -97,12 +97,7 @@ impl ResponsesStage for ResponsesRequestExecutionStage {
         // Handle streaming responses - return early
         if payload_output.is_streaming {
             // Check if MCP is active for this request
-            let mcp_active = ctx
-                .state
-                .mcp
-                .as_ref()
-                .map(|m| m.active)
-                .unwrap_or(false);
+            let mcp_active = ctx.state.mcp.as_ref().map(|m| m.active).unwrap_or(false);
 
             if mcp_active {
                 // Use MCP-aware streaming handler
@@ -193,8 +188,7 @@ mod tests {
         mcp::{config::McpConfig, McpManager},
         protocols::responses::{ResponseInput, ResponsesRequest},
         routers::openai::responses::{
-            ContextOutput, DiscoveryOutput, PayloadOutput, ResponsesDependencies,
-            ValidationOutput,
+            ContextOutput, DiscoveryOutput, PayloadOutput, ResponsesDependencies, ValidationOutput,
         },
     };
 

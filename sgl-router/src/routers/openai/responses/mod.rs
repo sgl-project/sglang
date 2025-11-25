@@ -10,8 +10,8 @@ pub(super) mod utils;
 
 // Re-export main types
 pub use context::{
-    ContextOutput, DiscoveryOutput, ExecutionResult, FinalResponse, McpOutput,
-    PayloadOutput, ProcessedResponse, ResponsesDependencies, ResponsesProcessingState,
-    ResponsesRequestContext, ResponsesRequestInput, ValidationOutput,
+    ContextOutput, DiscoveryOutput, ExecutionResult, FinalResponse, McpOutput, PayloadOutput,
+    ProcessedResponse, ResponsesDependencies, ResponsesProcessingState, ResponsesRequestContext,
+    ResponsesRequestInput, ValidationOutput,
 };
 pub use pipeline::ResponsesPipeline;
