@@ -11,16 +11,13 @@ import torch
 import zmq
 import zmq.asyncio
 
-from python.sglang.srt.managers.multimodal_processor import (
-    get_mm_processor,
-    import_processors,
-)
-from python.sglang.srt.utils.common import get_multi_free_port
-from python.sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_free_port, get_local_ip_auto, get_zmq_socket
+from sglang.srt.utils.common import get_multi_free_port
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
