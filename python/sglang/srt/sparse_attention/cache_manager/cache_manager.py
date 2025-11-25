@@ -5,7 +5,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.model_executor.graph_runner import get_global_graph_memory_pool
+from sglang.srt.model_executor.cuda_graph_runner import get_global_graph_memory_pool
 from sglang.srt.sparse_attention.kernels.moving_average import moving_average_update
 
 
