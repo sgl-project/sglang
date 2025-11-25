@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import bisect
+from functools import partial
 from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -24,11 +26,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
+    get_bool_env_var,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -163,7 +167,19 @@ class EAGLEDraftCudaGraphRunner:
             run_once_fn()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with torch.cuda.graph(graph, pool=pool, stream=stream):
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.model_runner.server_args.enable_memory_saver
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        )
+        graph_fn = (
+            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if memory_saver_adapter.enabled
+            else torch.cuda.graph
+        )
+
+        with graph_fn(
+            cuda_graph=graph, pool=pool, stream=stream
+        ):
             out = run_once_fn()
         return out
 
