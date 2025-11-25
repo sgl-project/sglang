@@ -64,34 +64,26 @@ def filter_tests(
 def auto_partition(files, rank, size):
     """
     Partition files into size sublists with approximately equal sums of estimated times
-    using stable sorting, and return the partition for the specified rank.
+    using a greedy algorithm (LPT heuristic), and return the partition for the specified rank.
     """
-    weights = [f.estimated_time for f in files]
-
-    if not weights or size <= 0 or size > len(weights):
+    if not files or size <= 0:
         return []
 
-    # Create list of (weight, original_index) tuples
-    indexed_weights = [(w, -i) for i, w in enumerate(weights)]
-    # Stable sort in descending order by weight
-    indexed_weights = sorted(indexed_weights, reverse=True)
+    # Sort files by estimated_time in descending order (LPT heuristic)
+    sorted_files = sorted(files, key=lambda f: f.estimated_time, reverse=True)
 
-    # Extract original indices (negate back to positive)
-    indexed_weights = [(w, -i) for w, i in indexed_weights]
-
-    # Initialize partitions and their sums
     partitions = [[] for _ in range(size)]
-    sums = [0.0] * size
+    partition_sums = [0.0] * size
 
-    # Greedy approach: assign each weight to partition with smallest current sum
-    for weight, idx in indexed_weights:
-        min_sum_idx = sums.index(min(sums))
-        partitions[min_sum_idx].append(idx)
-        sums[min_sum_idx] += weight
+    # Greedily assign each file to the partition with the smallest current total time
+    for file in sorted_files:
+        min_sum_idx = min(range(size), key=partition_sums.__getitem__)
+        partitions[min_sum_idx].append(file)
+        partition_sums[min_sum_idx] += file.estimated_time
 
-    # Return the files corresponding to the indices in the specified rank's partition
-    indices = partitions[rank]
-    return [files[i] for i in indices]
+    if rank < size:
+        return partitions[rank]
+    return []
 
 
 def run_a_suite(args):
