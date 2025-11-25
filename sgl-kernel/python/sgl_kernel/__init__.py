@@ -13,7 +13,6 @@ from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,
     cutlass_mla_get_workspace_size,
-    lightning_attention_decode,
     merge_state,
     merge_state_v2,
 )
