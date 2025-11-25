@@ -140,14 +140,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_k = b_k * k_norm
 
         b_q = b_q * scale
-
-        # Apply gating to hidden state: h *= exp(g)
         # Use fast_exp for potentially faster exponential computation
         exp_g = tl.exp(b_g)
         b_h = b_h * exp_g
 
         # Delta rule: v -= sum(h * k, dim=0)
-        # Fuse the computation to reduce intermediate storage
         b_v = b_v - tl.sum(b_h * b_k[:, None], 0)
 
         # Apply beta gating: v *= beta
