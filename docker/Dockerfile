@@ -131,10 +131,6 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
  && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
       python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
    fi \
- && if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      python3 -m pip uninstall -y torch torchaudio torchvision ; \
-      python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}; \
-    fi \
  && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
