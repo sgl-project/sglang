@@ -84,14 +84,6 @@ class HarmonyContext(ConversationContext):
         if isinstance(output, dict) and "output_ids" in output:
             output_token_ids = output["output_ids"]
 
-            # TODO: REMOVE here:
-            # Very hacky, find the first occurrence of token 200006 and cut from there
-            try:
-                start_index = output_token_ids.index(200006)
-                output_token_ids = output_token_ids[start_index:]
-            except ValueError:
-                pass
-
             for token_id in output_token_ids:
                 self.parser.process(token_id)
             output_msgs = self.parser.messages
@@ -198,15 +190,6 @@ class StreamingHarmonyContext(HarmonyContext):
         if isinstance(output, dict) and "output_ids" in output:
             # RequestOutput from SGLang with outputs
             output_token_ids = output["output_ids"]
-
-            # TODO: REMOVE here:
-            # Very hacky, find the first occurrence of token 200006 and cut from there
-            # Find the first occurrence of token 200006 and cut from there
-            try:
-                start_index = output_token_ids.index(200006)
-                output_token_ids = output_token_ids[start_index:]
-            except ValueError:
-                pass
 
             for token_id in output_token_ids:
                 self.parser.process(token_id)
