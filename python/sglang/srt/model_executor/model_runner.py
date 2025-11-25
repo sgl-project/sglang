@@ -363,6 +363,11 @@ class ModelRunner:
                     elif hasattr(layer.self_attn, "attn_mqa"):
                         # For DeepSeek model
                         self.attention_layers.append(layer.self_attn.attn_mqa)
+                # For hybrid model
+                elif hasattr(layer, "attn"):
+                    self.attention_layers.append(layer.attn)
+                elif hasattr(layer, "linear_attn"):
+                    self.attention_layers.append(layer.linear_attn)
                 # For InternVL model
                 elif hasattr(layer, "attention"):
                     if hasattr(layer.attention, "attn"):
