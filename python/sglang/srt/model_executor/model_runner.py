@@ -538,6 +538,7 @@ class ModelRunner:
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
+                model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
 
