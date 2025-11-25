@@ -744,6 +744,25 @@ def ep_scatter(
     ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
     assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
 
+    assert (
+        recv_x.stride(1) == 1
+    ), f"recv_x must be contiguous (stride1 == 1), got stride1={recv_x.stride(1)}"
+    assert (
+        recv_x_scale.stride(1) == 1
+    ), f"recv_x_scale must be contiguous (stride1 == 1), got stride1={recv_x_scale.stride(1)}"
+    assert (
+        recv_topk.stride(1) == 1
+    ), f"recv_topk must be contiguous (stride1 == 1), got stride1={recv_topk.stride(1)}"
+    assert (
+        output_tensor.stride(1) == 1
+    ), f"output_tensor must be contiguous (stride1 == 1), got stride1={output_tensor.stride(1)}"
+    assert (
+        output_tensor_scale.stride(1) == 1
+    ), f"output_tensor_scale must be contiguous (stride1 == 1), got stride1={output_tensor_scale.stride(1)}"
+    assert (
+        output_index.stride(1) == 1
+    ), f"output_index must be contiguous (stride1 == 1), got stride1={output_index.stride(1)}"
+
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
         expert_start_loc,
@@ -866,6 +885,23 @@ def ep_gather(
     hidden_size = input_tensor.shape[1]
     BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
     assert hidden_size % BLOCK_D == 0
+
+    assert (
+        input_tensor.stride(1) == 1
+    ), f"input_tensor must be contiguous (stride1 == 1), got stride1={input_tensor.stride(1)}"
+    assert (
+        recv_topk_ids.stride(1) == 1
+    ), f"recv_topk_ids must be contiguous (stride1 == 1), got stride1={recv_topk_ids.stride(1)}"
+    assert (
+        recv_topk_weight.stride(1) == 1
+    ), f"recv_topk_weight must be contiguous (stride1 == 1), got stride1={recv_topk_weight.stride(1)}"
+    assert (
+        input_index.stride(1) == 1
+    ), f"input_index must be contiguous (stride1 == 1), got stride1={input_index.stride(1)}"
+    assert (
+        output_tensor.stride(1) == 1
+    ), f"output_tensor must be contiguous (stride1 == 1), got stride1={output_tensor.stride(1)}"
+
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     _fwd_kernel_ep_gather[grid](
         num_tokens,
