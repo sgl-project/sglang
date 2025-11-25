@@ -371,9 +371,8 @@ Consider updating perf_baselines.json with the snippets below:
         """
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
-            data_type=case.sampling_params.data_type,
+            task_type=case.server_args.pipeline_config.task_type,
             sampling_params=case.sampling_params,
-            edit_prompt=case.edit_prompt,
         )
         perf_record = self.run_and_collect(
             diffusion_server,

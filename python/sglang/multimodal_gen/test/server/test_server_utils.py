@@ -22,6 +22,7 @@ from openai import Client, OpenAI
 
 from sglang.multimodal_gen import SamplingParams
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
@@ -469,7 +470,7 @@ VALIDATOR_REGISTRY = {
 
 def get_generate_fn(
     model_path: str,
-    modality: str,
+    task_type: ModelTaskType,
     sampling_params: SamplingParams,
 ) -> Callable[[str, Client], str]:
     """Return appropriate generation function for the case."""
@@ -681,14 +682,15 @@ def get_generate_fn(
                 input_reference=fh,
             )
 
-    if modality == "video":
+    if not task_type.is_image_gen():
+        # video_gen
         if sampling_params.image_path and sampling_params.prompt:
             fn = generate_text_image_to_video
         elif sampling_params.image_path:
             fn = generate_image_to_video
         else:
             fn = generate_video
-    elif sampling_params.prompt and sampling_params.image_path:
+    elif task_type == ModelTaskType.I2I:
         fn = generate_image_edit
     else:
         fn = generate_image
