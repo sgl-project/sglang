@@ -129,7 +129,6 @@ class DiffusionSamplingParams:
 
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
-    edit_prompt: str | None = None  # prompt for editing
     image_path: Path | str | None = None  # input image/video for editing (Path or URL)
 
     # duration
@@ -253,9 +252,8 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             modality="image",
         ),
         DiffusionSamplingParams(
-            prompt=None,  # not used for editing
+            prompt="Convert 2D style to 3D style",
             output_size="1024x1536",
-            edit_prompt="Convert 2D style to 3D style",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         ),
     ),
@@ -314,8 +312,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             output_size="832x1104",
-            prompt="Animate this image",
-            edit_prompt="Add dynamic motion to the scene",
+            prompt="Add dynamic motion to the scene",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         ),
     ),
@@ -330,8 +327,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             output_size="832x1104",
-            prompt="Animate this image",
-            edit_prompt="Add dynamic motion to the scene",
+            prompt="Add dynamic motion to the scene",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         ),
     ),
@@ -351,7 +347,6 @@ TWO_GPU_CASES_A = [
         DiffusionSamplingParams(
             prompt="generate",
             output_size="832x1104",
-            edit_prompt="generate",
             image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
             num_frames=1,
         ),
@@ -401,8 +396,7 @@ TWO_GPU_CASES_B = [
         ),
         DiffusionSamplingParams(
             output_size="832x1104",
-            prompt="Animate this image",
-            edit_prompt="Add dynamic motion to the scene",
+            prompt="Add dynamic motion to the scene",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         ),
     ),
@@ -417,8 +411,7 @@ TWO_GPU_CASES_B = [
             num_gpus=2,
         ),
         DiffusionSamplingParams(
-            prompt="Animate this image",
-            edit_prompt="Add dynamic motion to the scene",
+            prompt="Add dynamic motion to the scene",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
             output_size="832x1104",
         ),

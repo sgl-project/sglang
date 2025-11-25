@@ -77,7 +77,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
         if (
             case.server_args.warmup_edit > 0
-            and case.edit_prompt
+            and case.sampling_params.prompt
             and sampling_params.image_path
         ):
             # Handle URL or local path
@@ -89,7 +89,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
             warmup.run_edit_warmups(
                 count=case.server_args.warmup_edit,
-                edit_prompt=case.edit_prompt,
+                edit_prompt=case.sampling_params.prompt,
                 image_path=image_path,
             )
     except Exception as exc:

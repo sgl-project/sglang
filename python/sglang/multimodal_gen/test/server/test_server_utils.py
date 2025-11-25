@@ -582,7 +582,7 @@ def get_generate_fn(
 
     def generate_image_edit(case_id, client) -> str:
         """TI2I: Text + Image ? Image edit."""
-        if not sampling_params.edit_prompt or not sampling_params.image_path:
+        if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
@@ -596,7 +596,7 @@ def get_generate_fn(
             response = client.images.with_raw_response.edit(
                 model=model_path,
                 image=fh,
-                prompt=sampling_params.edit_prompt,
+                prompt=sampling_params.prompt,
                 n=1,
                 size=sampling_params.output_size,
                 response_format="b64_json",
@@ -613,7 +613,7 @@ def get_generate_fn(
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
-            prompt=sampling_params.edit_prompt,
+            prompt=sampling_params.prompt,
             file_path=tmp_path,
             origin_file_path=sampling_params.image_path,
         )
@@ -652,7 +652,7 @@ def get_generate_fn(
                 client,
                 case_id,
                 model=model_path,
-                prompt=sampling_params.edit_prompt,
+                prompt=sampling_params.prompt,
                 size=sampling_params.output_size,
                 seconds=video_seconds,
                 input_reference=fh,
@@ -660,7 +660,7 @@ def get_generate_fn(
 
     def generate_text_image_to_video(case_id, client) -> str:
         """TI2V: Text + Image ? Video."""
-        if not sampling_params.edit_prompt or not sampling_params.image_path:
+        if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
@@ -675,20 +675,20 @@ def get_generate_fn(
                 client,
                 case_id,
                 model=model_path,
-                prompt=sampling_params.edit_prompt,
+                prompt=sampling_params.prompt,
                 size=sampling_params.output_size,
                 seconds=video_seconds,
                 input_reference=fh,
             )
 
     if modality == "video":
-        if sampling_params.image_path and sampling_params.edit_prompt:
+        if sampling_params.image_path and sampling_params.prompt:
             fn = generate_text_image_to_video
         elif sampling_params.image_path:
             fn = generate_image_to_video
         else:
             fn = generate_video
-    elif sampling_params.edit_prompt and sampling_params.image_path:
+    elif sampling_params.prompt and sampling_params.image_path:
         fn = generate_image_edit
     else:
         fn = generate_image
