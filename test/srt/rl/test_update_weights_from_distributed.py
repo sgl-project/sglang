@@ -360,6 +360,13 @@ def init_process_sgl(
             url + "/continue_generation",
             json={},
         )
+    
+        # discard unfinished requests to save test overhead
+        time.sleep(2)
+        requests.post(
+            url + "/pause_generation",
+            json={"mode": "abort"},
+        )
 
     # Measure the latency of broadcast/weights update.
     update_time = time_end_update - time_begin_update
@@ -603,28 +610,32 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
         # test_suits : tp, dp, model_name, backend
         if is_in_ci():
             mode = random.choice(["Engine", "Server"])
+            if mode == "Server":
+                pause_generation_mode = random.choice(["in_place", "retract"])
+            else:
+                pause_generation_mode = "abort"
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode, pause_generation_mode),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Sever"),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
+                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Sever", random.choice(["in_place", "retract"])),
             ]
 
             if torch.cuda.device_count() >= 4:
                 test_suits.extend(
                     [
-                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                        (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
+                        (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
                     ]
                 )
 
             if torch.cuda.device_count() >= 5:
                 test_suits.extend(
                     [
-                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                        (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", "abort"),
+                        (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server", random.choice(["in_place", "retract"])),
                     ]
                 )
 
@@ -660,102 +671,12 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             "lm_head.weight",
         ]
 
-        for tp_size, dp_size, model_name, backend in test_suits:
+        for tp_size, dp_size, model_name, backend, pause_generation_mode in test_suits:
             test_update_weights_from_distributed(
                 tp_size,
                 dp_size,
                 model_name,
                 backend,
-                model_state_dict_shapes[model_name],
-                truncate_size,
-                checking_parameters,
-            )
-
-
-class TestUpdateWeightsFromDistributedNonBlocking(CustomTestCase):
-
-    def test_update_weights_from_distributed(self):
-
-        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
-        # test_suits : tp, dp, model_name, backend
-        if is_in_ci():
-            pause_generation_mode = random.choice(["in_place", "retract"])
-            test_suits = [
-                (
-                    1,
-                    1,
-                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    pause_generation_mode,
-                ),
-            ]
-        else:
-            test_suits = [
-                (
-                    1,
-                    1,
-                    DEFAULT_MODEL_NAME_FOR_TEST,
-                    random.choice(["in_place", "retract"]),
-                ),
-            ]
-
-            if torch.cuda.device_count() >= 4:
-                test_suits.append(
-                    (
-                        1,
-                        2,
-                        DEFAULT_MODEL_NAME_FOR_TEST,
-                        random.choice(["in_place", "retract"]),
-                    ),
-                )
-
-            if torch.cuda.device_count() >= 5:
-                test_suits.append(
-                    (
-                        2,
-                        2,
-                        DEFAULT_MODEL_NAME_FOR_TEST,
-                        random.choice(["in_place", "retract"]),
-                    ),
-                )
-
-        model_state_dict_shapes = {}
-        test_models = [test_suit[2] for test_suit in test_suits]
-
-        for model_name in test_models:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name, torch_dtype="bfloat16"
-            ).to("cuda:0")
-            state_dict = model.state_dict()
-            state_dict_keys = list(state_dict.keys())
-            model_state_dict_shapes[model_name] = {
-                key: state_dict[key].shape for key in state_dict_keys
-            }
-            del model
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        truncate_size = 10
-        checking_parameters = [
-            "model.embed_tokens.weight",
-            "model.layers.0.input_layernorm.weight",
-            "model.layers.1.self_attn.q_proj.weight",
-            "model.layers.2.self_attn.k_proj.weight",
-            "model.layers.3.self_attn.v_proj.weight",
-            "model.layers.4.self_attn.o_proj.weight",
-            "model.layers.5.mlp.gate_proj.weight",
-            "model.layers.6.mlp.up_proj.weight",
-            "model.layers.7.mlp.down_proj.weight",
-            "model.layers.8.post_attention_layernorm.weight",
-            "model.norm.weight",
-            "lm_head.weight",
-        ]
-
-        for tp_size, dp_size, model_name, pause_generation_mode in test_suits:
-            test_update_weights_from_distributed(
-                tp_size,
-                dp_size,
-                model_name,
-                "Server",  # pause is only supported in server mode
                 model_state_dict_shapes[model_name],
                 truncate_size,
                 checking_parameters,
