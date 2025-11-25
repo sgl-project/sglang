@@ -704,12 +704,19 @@ def get_tokenizer(
 
         return get_tokenizer(pretrained_model_name_or_path)
 
-    if pretrained_model_name_or_path is not None and not os.path.exists(
-        pretrained_model_name_or_path
-    ):
+    # If path exists locally, use local files only; otherwise try remote
+    if os.path.exists(pretrained_model_name_or_path):
+        local_files_only = True
+    else:
+        # Path doesn't exist locally, try to get model (may download or use cache)
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+        # After get_model, check if it's now a local path
+        local_files_only = os.path.exists(pretrained_model_name_or_path)
+
     return AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
+        pretrained_model_name_or_path,
+        trust_remote_code=True,
+        local_files_only=local_files_only,
     )
 
 
@@ -2182,7 +2189,12 @@ async def benchmark(
 
 def check_chat_template(model_path):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        # If path exists locally, use local files only; otherwise try remote
+        local_files_only = os.path.exists(model_path)
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=local_files_only
+        )
         return "chat_template" in tokenizer.init_kwargs
     except Exception as e:
         print(f"Fail to load tokenizer config with error={e}")
@@ -2324,11 +2336,19 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if not check_chat_template(args.model):
-        print(
-            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
-            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
-        )
+    # Determine tokenizer path for chat template check
+    # Use tokenizer path if specified, otherwise use model path
+    tokenizer_id_for_check = (
+        args.tokenizer if args.tokenizer is not None else args.model
+    )
+
+    # Only check chat template if we have a local path (to avoid unnecessary network requests)
+    if os.path.exists(tokenizer_id_for_check):
+        if not check_chat_template(tokenizer_id_for_check):
+            print(
+                "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+                "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+            )
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
