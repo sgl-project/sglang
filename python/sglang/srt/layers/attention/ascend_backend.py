@@ -142,12 +142,21 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
 
-        if forward_batch.forward_mode.is_extend() and sum(forward_batch.extend_prefix_lens_cpu) > 0:
-            self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.int().to("cpu")
-            self.forward_metadata.prefix_len_list = self.forward_metadata.prefix_lens.tolist()
+        if (
+            forward_batch.forward_mode.is_extend()
+            and sum(forward_batch.extend_prefix_lens_cpu) > 0
+        ):
+            self.forward_metadata.prefix_lens = (
+                forward_batch.extend_prefix_lens.int().to("cpu")
+            )
+            self.forward_metadata.prefix_len_list = (
+                self.forward_metadata.prefix_lens.tolist()
+            )
             seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
             flatten_tlbs = torch.empty(0, dtype=torch.int32)
-            for req_idx, seq_len in zip (forward_batch.req_pool_indices.tolist(), seq_prefix_lens):
+            for req_idx, seq_len in zip(
+                forward_batch.req_pool_indices.tolist(), seq_prefix_lens
+            ):
                 indices = forward_batch.req_to_token_pool.req_to_token[req_idx]
                 tlbs = indices[:seq_len][:: self.page_size] // self.page_size
                 flatten_tlbs = torch.cat((flatten_tlbs, torch.flatten(tlbs).to("cpu")))
@@ -461,7 +470,9 @@ class AscendAttnBackend(AttentionBackend):
                         causal=causal,
                     )
         elif self.use_mla and sum(forward_batch.extend_prefix_lens_cpu) > 0:
-            q, k, v = [data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]]
+            q, k, v = [
+                data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+            ]
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -494,8 +505,8 @@ class AscendAttnBackend(AttentionBackend):
                 prev_lse=None,
                 qk_scale=layer.scaling,
                 kernel_type="kernel_type_high_precision",
-                mask_type='mask_type_triu',
-                calc_type='calc_type_first_ring',
+                mask_type="mask_type_triu",
+                calc_type="calc_type_first_ring",
                 output=attn_output,
                 softmax_lse=attn_lse,
             )
@@ -504,20 +515,37 @@ class AscendAttnBackend(AttentionBackend):
             # TODO support chunked prefill and more models
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-            kv_cached = torch.index_select(k_buffer, 0, self.forward_metadata.flatten_block_tables)
-            k_rope_cached = torch.index_select(v_buffer, 0, self.forward_metadata.flatten_block_tables).flatten(0, 1)
+            kv_cached = torch.index_select(
+                k_buffer, 0, self.forward_metadata.flatten_block_tables
+            )
+            k_rope_cached = torch.index_select(
+                v_buffer, 0, self.forward_metadata.flatten_block_tables
+            ).flatten(0, 1)
 
             assert layer.kv_b_proj is not None
-            kv = layer.kv_b_proj(kv_cached)[0].view(-1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim)
+            kv = layer.kv_b_proj(kv_cached)[0].view(
+                -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
+            )
             k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
-            k_shape = (k_nope.shape[0], layer.tp_k_head_num, self.qk_nope_head_dim + self.qk_rope_head_dim)
+            k_shape = (
+                k_nope.shape[0],
+                layer.tp_k_head_num,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+            )
             k = k_nope.new_empty(*k_shape)
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_rope_cached
 
             # 3rd, compute history attn_out and attn_lse
-            k_nope, k_rope = k.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-            seq_len = torch.stack([self.forward_metadata.extend_seq_lens_cpu_int, self.forward_metadata.prefix_lens])
+            k_nope, k_rope = k.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            seq_len = torch.stack(
+                [
+                    self.forward_metadata.extend_seq_lens_cpu_int,
+                    self.forward_metadata.prefix_lens,
+                ]
+            )
             torch_npu.atb.npu_ring_mla(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -532,12 +560,14 @@ class AscendAttnBackend(AttentionBackend):
                 prev_lse=attn_lse,
                 qk_scale=layer.scaling,
                 kernel_type="kernel_type_high_precision",
-                mask_type='no_mask',
-                calc_type='calc_type_default',
+                mask_type="no_mask",
+                calc_type="calc_type_default",
                 output=attn_output,
-                softmax_lse=attn_lse
+                softmax_lse=attn_lse,
             )
-            attn_output = attn_output.reshape([-1, layer.tp_q_head_num, layer.v_head_dim])
+            attn_output = attn_output.reshape(
+                [-1, layer.tp_q_head_num, layer.v_head_dim]
+            )
         else:
             assert (
                 layer.qk_head_dim != layer.v_head_dim
