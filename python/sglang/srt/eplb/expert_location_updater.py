@@ -13,19 +13,24 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import einops
 import torch
 import torch.distributed
 from torch.distributed import P2POp
 
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,7 @@ class ExpertLocationUpdater:
         update_layer_ids: List[int],
         nnodes: int,
         rank: int,
+        model_runner: "ModelRunner",
     ):
         if self._first_execution:
             self._first_execution = False
@@ -52,7 +58,7 @@ class ExpertLocationUpdater:
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
 
-        _update_expert_weights(
+        all_missing_logical_experts = _update_expert_weights(
             routed_experts_weights_of_layer=routed_experts_weights_of_layer,
             old_expert_location_metadata=old_expert_location_metadata,
             new_expert_location_metadata=new_expert_location_metadata,
@@ -64,6 +70,33 @@ class ExpertLocationUpdater:
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
         )
+
+        if len(all_missing_logical_experts) > 0:
+            logger.info(
+                f"[ExpertLocationUpdater] All missing logical experts: {all_missing_logical_experts}"
+            )
+
+            # Load the missing expert weights from disk
+            if callable(
+                getattr(model_runner.model, "generate_weight_name_filter", None)
+            ):
+                # Filter and load only missing expert weights
+                weight_name_filter = model_runner.model.generate_weight_name_filter(
+                    all_missing_logical_experts
+                )
+            else:
+                # Do a full reload from disk
+                logger.info(
+                    "[ExpertLocationUpdater] Model does not implement generate_weight_name_filter. "
+                    "Performing full weight reload."
+                )
+                weight_name_filter = None
+
+            model_runner.update_weights_from_disk(
+                model_runner.server_args.model_path,
+                model_runner.server_args.load_format,
+                weight_name_filter=weight_name_filter,
+            )
 
 
 def _update_expert_weights(**kwargs):
@@ -101,7 +134,7 @@ def _update_expert_weights_with_canary(
         )
         routed_experts_weights_of_layer[layer_id].append(canary_tensor)
 
-    _update_expert_weights_raw(
+    all_missing_logical_experts = _update_expert_weights_raw(
         routed_experts_weights_of_layer=routed_experts_weights_of_layer,
         old_expert_location_metadata=old_expert_location_metadata,
         new_expert_location_metadata=new_expert_location_metadata,
@@ -119,6 +152,8 @@ def _update_expert_weights_with_canary(
             f"{old_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
             f"{new_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
         )
+
+    return all_missing_logical_experts
 
 
 def _update_expert_weights_raw(
@@ -139,8 +174,12 @@ def _update_expert_weights_raw(
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
     num_gpu_per_node = world_size // nnodes
 
+    # Due to rank failures, some logical experts could not be transferred P2P between GPUs.
+    # The ModelRunner will reload these experts from disk.
+    all_missing_logical_experts: List[Tuple[int, List[int]]] = []
+
     for layer_id in update_layer_ids:
-        update_expert_weights_single_layer(
+        _, missing_logical_experts = update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[
@@ -155,6 +194,9 @@ def _update_expert_weights_raw(
             world_size=world_size,
             log_metrics=log_metrics,
         )
+        if len(missing_logical_experts) > 0:
+            all_missing_logical_experts.append((layer_id, missing_logical_experts))
+    return all_missing_logical_experts
 
 
 def create_temp_buffers(sample_tensors):
@@ -204,6 +246,14 @@ def update_expert_weights_single_layer(
         rank * num_local_physical_experts,
         (rank + 1) * num_local_physical_experts,
     )
+
+    elastic_ep_state = ElasticEPStateManager.instance()
+    if elastic_ep_state is None:
+        active_ranks = [1] * torch.distributed.get_world_size()
+    else:
+        active_ranks = elastic_ep_state.active_ranks_cpu
+
+    missing_logical_experts: List[int] = []
 
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
@@ -325,6 +375,10 @@ def update_expert_weights_single_layer(
         src_rank: int,
         dst_expert_location: int,
     ):
+        if not active_ranks[src_rank]:
+            # The logical expert cannot be loaded from peers
+            missing_logical_experts.append(logical_expert_id)
+            return
         p2p_op_infos.append(
             (
                 logical_expert_id,
@@ -385,6 +439,7 @@ def update_expert_weights_single_layer(
                         peer=dst_rank,
                     )
                     for dst_rank in all_dst_ranks
+                    if active_ranks[dst_rank]
                     for i in range(num_tensors)
                 ],
             )
@@ -467,7 +522,7 @@ def update_expert_weights_single_layer(
 
     _entrypoint()
 
-    return output_logs
+    return output_logs, missing_logical_experts
 
 
 class _ChunkUtils:
