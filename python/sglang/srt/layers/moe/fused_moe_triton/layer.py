@@ -548,9 +548,12 @@ class FusedMoE(torch.nn.Module):
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:
+            require_global_experts = getattr(
+                param, "_sglang_require_global_experts", False
+            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
-                    self.layer_id, expert_id
+                    self.layer_id, expert_id, require_global_experts
                 )
             )
 
@@ -1034,7 +1037,9 @@ class FlashInferFusedMoE(FusedMoE):
         final_hidden_states = self.quant_method.apply_with_router_logits(
             layer=self,
             dispatch_output=StandardDispatchOutput(
-                hidden_states=hidden_states, topk_output=topk_output
+                hidden_states=hidden_states,
+                hidden_states_scale=None,
+                topk_output=topk_output,
             ),
         )
 

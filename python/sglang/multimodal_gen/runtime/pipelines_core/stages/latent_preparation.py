@@ -87,7 +87,7 @@ class LatentPreparationStage(PipelineStage):
             latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )
-            latents = server_args.pipeline_config.pack_latents(
+            latents = server_args.pipeline_config.maybe_pack_latents(
                 latents, batch_size, batch
             )
         else:
