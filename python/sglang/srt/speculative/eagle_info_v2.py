@@ -30,6 +30,8 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
 
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -79,6 +81,12 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        if isinstance(batch.tree_cache, SWAChunkCache):
+            for req in batch.reqs:
+                batch.tree_cache.evict_swa(
+                    req, req.seqlen - 1, batch.model_config.attention_chunk_size
+                )
+
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
