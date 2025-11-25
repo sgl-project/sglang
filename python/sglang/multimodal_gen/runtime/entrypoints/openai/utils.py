@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
+import dataclasses
 import os
+from typing import Optional
 
 import imageio
 import numpy as np
@@ -13,6 +14,22 @@ from sglang.multimodal_gen.configs.sample.base import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclasses.dataclass
+class SetLoraReq:
+    lora_nickname: str
+    lora_path: Optional[str] = None
+
+
+@dataclasses.dataclass
+class MergeLoraWeightsReq:
+    pass
+
+
+@dataclasses.dataclass
+class UnmergeLoraWeightsReq:
+    pass
 
 
 def post_process_sample(

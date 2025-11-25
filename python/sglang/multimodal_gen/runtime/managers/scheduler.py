@@ -1,11 +1,17 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from typing import Any
+from typing import Any, List
 
 import zmq
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    UnmergeLoraWeightsReq,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
@@ -69,13 +75,21 @@ class Scheduler:
         if self.receiver is not None:
             self.receiver.send_pyobj(output_batch)
 
-    def recv_reqs(self):
+    def recv_reqs(self) -> List[Any]:
         """
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
         """
         if self.receiver is not None:
-            recv_reqs = self.receiver.recv_pyobj()
-            assert isinstance(recv_reqs, list)
+            try:
+                recv_reqs = self.receiver.recv_pyobj()
+            except zmq.ZMQError:
+                # In case of ZMQ error (like EFSM), we should not crash the loop
+                # Instead re-raise or handle appropriately to let the outer loop continue
+                raise
+
+            # Ensure recv_reqs is a list
+            if not isinstance(recv_reqs, list):
+                recv_reqs = [recv_reqs]
         else:
             recv_reqs = None
 
@@ -133,27 +147,39 @@ class Scheduler:
 
             # 2: execute, make sure a reply is always sent
             try:
-                # reqs can be a list of Reqs (for forward) or a dict (for control messages)
-                if isinstance(reqs, dict):
-                    method = reqs.get("method")
-                    if method == "set_lora_adapter":
-                        self.worker.set_lora_adapter(
-                            reqs["lora_nickname"],
-                            reqs["lora_path"],
+                # reqs is guaranteed to be a list by recv_reqs
+                first_req = reqs[0] if reqs else None
+
+                if isinstance(first_req, SetLoraReq):
+                    self.worker.set_lora(first_req.lora_nickname, first_req.lora_path)
+                    output_batch = {"status": "ok"}
+                elif isinstance(first_req, MergeLoraWeightsReq):
+                    self.worker.merge_lora_weights()
+                    output_batch = {"status": "ok"}
+                elif isinstance(first_req, UnmergeLoraWeightsReq):
+                    self.worker.unmerge_lora_weights()
+                    output_batch = {"status": "ok"}
+                elif isinstance(first_req, dict) and "method" in first_req:
+                    # Fallback for legacy dict-based requests (e.g. from DiffGenerator)
+                    method = first_req.get("method")
+                    if method == "set_lora":
+                        self.worker.set_lora(
+                            first_req["lora_nickname"], first_req["lora_path"]
                         )
-                        output_batch = {"status": "ok"}
-                    elif method == "unmerge_lora_weights":
-                        self.worker.unmerge_lora_weights()
                         output_batch = {"status": "ok"}
                     elif method == "merge_lora_weights":
                         self.worker.merge_lora_weights()
                         output_batch = {"status": "ok"}
+                    elif method == "unmerge_lora_weights":
+                        self.worker.unmerge_lora_weights()
+                        output_batch = {"status": "ok"}
                     else:
-                        error_msg = f"Unknown method: {method}"
-                        logger.error(error_msg)
-                        output_batch = {"status": "error", "message": error_msg}
+                        output_batch = {
+                            "status": "error",
+                            "message": f"Unknown method: {method}",
+                        }
                 else:
-                    # Assume it's a forward request (list of Reqs)
+                    # Assume standard generation request (list of Reqs)
                     output_batch = self.worker.execute_forward(reqs)
             except Exception as e:
                 logger.error(
@@ -161,10 +187,11 @@ class Scheduler:
                     exc_info=True,
                 )
                 # Determine appropriate error response format
-                if isinstance(reqs, dict):
-                    output_batch = {"status": "error", "message": str(e)}
-                else:
-                    output_batch = OutputBatch(error=str(e))
+                output_batch = (
+                    OutputBatch(error=str(e))
+                    if reqs and isinstance(reqs[0], Req)
+                    else {"status": "error", "message": str(e)}
+                )
 
             try:
                 self.return_result(output_batch)
@@ -196,7 +223,7 @@ class Scheduler:
             return {"status": "ok", "result": result}
         return {"status": "error", "error": f"Unknown method: {method}"}
 
-    def _collect_slave_results(self) -> list[dict[str, Any]]:
+    def _collect_slave_results(self) -> List[dict[str, Any]]:
         """Collect results from all slave worker processes."""
         results = []
         for pipe in self.result_pipes_from_slaves:

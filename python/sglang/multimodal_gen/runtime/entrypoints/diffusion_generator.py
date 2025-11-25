@@ -21,6 +21,11 @@ import torchvision
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    UnmergeLoraWeightsReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -70,6 +75,9 @@ class DiffGenerator:
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None
         self.owns_scheduler_client: bool = False
+        self._current_lora_path: str | None = None
+        self._current_lora_nickname: str | None = None
+        self._is_lora_merged: bool = False
 
     @classmethod
     def from_pretrained(
@@ -359,19 +367,24 @@ class DiffGenerator:
         """
         return sync_scheduler_client.forward(batch)
 
-    def set_lora_adapter(
-        self, lora_nickname: str, lora_path: str | None = None
-    ) -> None:
+
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    UnmergeLoraWeightsReq,
+)
+
+
+class DiffGenerator:
+    # ... existing code ...
+
+    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
         """
         Set the LoRA adapter.
         """
-        payload = {
-            "method": "set_lora_adapter",
-            "lora_nickname": lora_nickname,
-            "lora_path": lora_path,
-        }
+        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
         # We use the sync client's forward method which sends any object via send_pyobj
-        response = sync_scheduler_client.forward(payload)
+        response = sync_scheduler_client.forward(req)
         if isinstance(response, dict) and response.get("status") == "ok":
             logger.info(f"Successfully set LoRA adapter: {lora_nickname}")
         else:
@@ -387,8 +400,8 @@ class DiffGenerator:
         Use unmerged weights for inference to produce outputs that align with
         validation outputs generated during training.
         """
-        payload = {"method": "unmerge_lora_weights"}
-        response = sync_scheduler_client.forward(payload)
+        req = UnmergeLoraWeightsReq()
+        response = sync_scheduler_client.forward(req)
         if isinstance(response, dict) and response.get("status") == "ok":
             logger.info("Successfully unmerged LoRA weights")
         else:
@@ -398,13 +411,14 @@ class DiffGenerator:
                 else "Unknown response format"
             )
             raise RuntimeError(f"Failed to unmerge LoRA weights: {error_msg}")
+        self._is_lora_merged = False
 
     def merge_lora_weights(self) -> None:
         """
         Merge LoRA weights.
         """
-        payload = {"method": "merge_lora_weights"}
-        response = sync_scheduler_client.forward(payload)
+        req = MergeLoraWeightsReq()
+        response = sync_scheduler_client.forward(req)
         if isinstance(response, dict) and response.get("status") == "ok":
             logger.info("Successfully merged LoRA weights")
         else:
@@ -414,6 +428,64 @@ class DiffGenerator:
                 else "Unknown response format"
             )
             raise RuntimeError(f"Failed to merge LoRA weights: {error_msg}")
+        self._is_lora_merged = True
+
+    def _ensure_lora_state(
+        self,
+        lora_path: str | None,
+        lora_nickname: str | None = None,
+        merge_lora: bool = True,
+    ) -> None:
+        """
+        Helper that keeps track of currently active LoRA and guarantees that
+        the backend matches the requested state.
+        """
+        if lora_path is None:
+            if self._is_lora_merged:
+                self.unmerge_lora_weights()
+            self._current_lora_path = None
+            self._current_lora_nickname = None
+            self._is_lora_merged = False
+            return
+
+        lora_nickname = lora_nickname or self.server_args.lora_nickname
+
+        if self._current_lora_path != lora_path:
+            if self._is_lora_merged:
+                self.unmerge_lora_weights()
+                self._is_lora_merged = False
+            self.set_lora(lora_nickname, lora_path)
+            self._current_lora_path = lora_path
+            self._current_lora_nickname = lora_nickname
+            self._is_lora_merged = False
+
+        if merge_lora and not self._is_lora_merged:
+            self.merge_lora_weights()
+        elif not merge_lora:
+            self._is_lora_merged = False
+
+    def generate_with_lora(
+        self,
+        prompt: str | list[str] | None = None,
+        sampling_params: SamplingParams | None = None,
+        *,
+        lora_path: str | None = None,
+        lora_nickname: str | None = None,
+        merge_lora: bool = True,
+        **kwargs,
+    ):
+        """
+        High level helper that automatically loads / unloads LoRA adapters
+        before running generation.
+        """
+        self._ensure_lora_state(
+            lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
+        )
+        return self.generate(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            **kwargs,
+        )
 
     def shutdown(self):
         """

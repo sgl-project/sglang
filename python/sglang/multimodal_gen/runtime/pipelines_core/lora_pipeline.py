@@ -1,6 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# Set TOKENIZERS_PARALLELISM to false to avoid deadlocks when forking
+import os
 from collections import defaultdict
 from collections.abc import Hashable
 from typing import Any
@@ -23,6 +25,8 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 logger = init_logger(__name__)
 
 
@@ -34,6 +38,7 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_adapters: dict[str, dict[str, torch.Tensor]] = defaultdict(
         dict
     )  # state dicts of loaded lora adapters
+    loaded_adapter_paths: dict[str, str] = {}  # nickname -> lora_path
     cur_adapter_name: str = ""
     cur_adapter_path: str = ""
     lora_layers: dict[str, BaseLayerWithLoRA] = {}
@@ -59,7 +64,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_nickname = self.server_args.lora_nickname
         if self.lora_path is not None:
             self.convert_to_lora_layers()
-            self.set_lora_adapter(
+            self.set_lora(
                 self.lora_nickname, self.lora_path  # type: ignore
             )  # type: ignore
 
@@ -119,7 +124,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 converted_count,
             )
 
-    def set_lora_adapter(
+    def set_lora(
         self, lora_nickname: str, lora_path: str | None = None
     ):  # type: ignore
         """
@@ -135,11 +140,27 @@ class LoRAPipeline(ComposedPipelineBase):
             )
         if not self.lora_initialized:
             self.convert_to_lora_layers()
+
         adapter_updated = False
         rank = dist.get_rank()
-        if lora_path is not None and lora_path != self.cur_adapter_path:
+
+        # Check if we need to load or reload the adapter
+        should_load = False
+        if lora_path is not None:
+            # If the nickname is not known, or if the path for this nickname has changed
+            if lora_nickname not in self.loaded_adapter_paths:
+                should_load = True
+            elif self.loaded_adapter_paths[lora_nickname] != lora_path:
+                should_load = True
+
+        if should_load:
+            assert lora_path is not None
             lora_local_path = maybe_download_lora(lora_path)
             lora_state_dict = load_file(lora_local_path)
+
+            # Clear existing weights for this nickname if they exist (e.g. reloading with new path)
+            if lora_nickname in self.lora_adapters:
+                self.lora_adapters[lora_nickname].clear()
 
             # Map the hf layer names to our custom layer names
             param_names_mapping_fn = get_param_names_mapping(
@@ -173,12 +194,15 @@ class LoRAPipeline(ComposedPipelineBase):
                         continue
 
                 if target_name in self.lora_adapters[lora_nickname]:
-                    raise ValueError(
-                        f"Target name {target_name} already exists in lora_adapters[{lora_nickname}]"
-                    )
+                    # Just overwrite instead of raising error
+                    # raise ValueError(
+                    #     f"Target name {target_name} already exists in lora_adapters[{lora_nickname}]"
+                    # )
+                    pass
                 self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
             adapter_updated = True
             self.cur_adapter_path = lora_path
+            self.loaded_adapter_paths[lora_nickname] = lora_path
             logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
         if not adapter_updated and self.cur_adapter_name == lora_nickname:

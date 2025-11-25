@@ -60,9 +60,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_path: str | None = None
 
         if training_mode:
-            assert (
-                self.lora_rank is not None
-            ), "LoRA rank  must be set for training mode"
+            assert self.lora_rank is not None, "LoRA rank must be set for training mode"
             if self.lora_rank is None or self.lora_alpha is None:
                 self.lora_alpha = lora_rank
             self.base_layer.requires_grad_(False)
