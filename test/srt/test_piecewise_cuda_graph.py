@@ -328,3 +328,7 @@ class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
         print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
         self.assertGreaterEqual(metrics["score"], 0.70)
+
+
+if __name__ == "__main__":
+    unittest.main()
